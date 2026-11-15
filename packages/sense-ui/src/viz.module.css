@@ -1,18 +1,62 @@
-/* sparkline / token-ring 等 SVG 可视化的样式。数值色由父级 data-sev 决定。 */
+/* sparkline / token-ring 等 SVG 可视化的样式。
+   正常段保持中性色，越界段与阈值线用状态色。 */
+
+.chartBox,
+.chartBoxExpanded {
+  width: 100%;
+  min-width: 0;
+}
+
+/* 绘图区：svg + y 轴/阈值标注的相对定位容器（标注 % 对齐实际 svg 高度）。
+   x 轴在容器外，不占定位高度。 */
+.chartPlot {
+  position: relative;
+  width: 100%;
+}
 
 .spark {
-  color: var(--dsw-alias-label-tertiary, #81858c);
-  flex-shrink: 0;
-  transition: color var(--ds-transition-duration, 0.2s)
-    var(--ds-ease-in-out, cubic-bezier(0.4, 0, 0.2, 1));
+  display: block;
+  width: 100%;
+  height: 30px;
 }
 
-.spark[data-sev='warn'] {
-  color: var(--sev-warn, #f59e0b);
+.chartExpanded {
+  display: block;
+  width: 100%;
+  height: 110px;
 }
 
-.spark[data-sev='critical'] {
-  color: var(--sev-critical, #ec1313);
+.segNormal {
+  fill: none;
+  stroke: var(--dsw-alias-label-tertiary, #81858c);
+  stroke-width: 1.4;
+}
+
+.segWarn {
+  fill: none;
+  stroke: var(--sev-warn, #f59e0b);
+  stroke-width: 1.6;
+}
+
+.segCritical {
+  fill: none;
+  stroke: var(--sev-critical, #ec1313);
+  stroke-width: 1.6;
+}
+
+.thrWarn,
+.thrCritical {
+  stroke-dasharray: 3 3;
+  stroke-width: 1;
+  opacity: 0.75;
+}
+
+.thrWarn {
+  stroke: var(--sev-warn, #f59e0b);
+}
+
+.thrCritical {
+  stroke: var(--sev-critical, #ec1313);
 }
 
 .sparkBand {
@@ -24,8 +68,60 @@
 }
 
 .sparkEmpty {
+  display: block;
   font-size: var(--sense-fs-s);
   color: var(--dsw-alias-label-secondary, #61666b);
+  padding: 4px 0;
+}
+
+.axisYMax,
+.axisYMin,
+.thrLabel {
+  position: absolute;
+  left: 2px;
+  font-size: 10px;
+  line-height: 12px;
+  font-variant-numeric: tabular-nums;
+  color: var(--dsw-alias-label-secondary, #61666b);
+  background: color-mix(
+    in srgb,
+    var(--dsw-specific-sidebar-fill, #f9fafb) 72%,
+    transparent
+  );
+  border-radius: 2px;
+  padding: 0 2px;
+  pointer-events: none;
+}
+
+.axisYMax {
+  top: 0;
+}
+
+.axisYMin {
+  bottom: 0;
+}
+
+.thrLabel {
+  left: auto;
+  right: 2px;
+  transform: translateY(-50%);
+}
+
+.thrLabel[data-sev='warn'] {
+  color: var(--sev-warn-ink);
+}
+
+.thrLabel[data-sev='critical'] {
+  color: var(--sev-critical-ink);
+}
+
+.axisX {
+  display: flex;
+  justify-content: space-between;
+  font-size: 10px;
+  line-height: 12px;
+  color: var(--dsw-alias-label-secondary, #61666b);
+  margin-top: 2px;
 }
 
 .ring {
@@ -56,7 +152,6 @@
 
 .ringText {
   fill: var(--dsw-alias-label-primary, #0f1115);
-  font-size: 12px;
   font-variant-numeric: tabular-nums;
 }
 

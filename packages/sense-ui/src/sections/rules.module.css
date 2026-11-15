@@ -151,3 +151,20 @@
   color: var(--dsw-alias-label-secondary, #61666b);
   flex-shrink: 0;
 }
+
+.tuneView:focus {
+  outline: none;
+}
+
+.tunePrev {
+  color: var(--dsw-alias-label-secondary, #61666b);
+}
+
+.tuneNext {
+  color: var(--dsw-alias-label-primary, #0f1115);
+  font-weight: 500;
+}
+
+.tuneArrow {
+  color: var(--dsw-alias-label-secondary, #61666b);
+}

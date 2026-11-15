@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { formatTimestamp, formatTuningValue } from '../format'
 import { EyeOffIcon, PauseIcon } from '../icons'
 import type {
@@ -120,8 +120,24 @@ function TuningView({
           <li key={e.id} className={css.tuneEntry} data-reverted={e.reverted || undefined}>
             <span className={css.tuneMain}>
               <span>
-                {labelOf(e.paramKey)} · {formatTuningValue(e.previous, unitOf(e.paramKey))}{' '}
-                → {formatTuningValue(e.next, unitOf(e.paramKey))} · {BY_TEXT[e.by]}
+                {labelOf(e.paramKey)} ·{' '}
+                <span
+                  className={css.tunePrev}
+                  aria-label={`原值 ${formatTuningValue(e.previous, unitOf(e.paramKey))}`}
+                >
+                  {formatTuningValue(e.previous, unitOf(e.paramKey))}
+                </span>
+                <span className={css.tuneArrow} aria-hidden="true">
+                  {' '}
+                  →{' '}
+                </span>
+                <span
+                  className={css.tuneNext}
+                  aria-label={`新值 ${formatTuningValue(e.next, unitOf(e.paramKey))}`}
+                >
+                  {formatTuningValue(e.next, unitOf(e.paramKey))}
+                </span>{' '}
+                · {BY_TEXT[e.by]}
               </span>
               <span className={css.ruleDesc}>
                 {e.reason} · {formatTimestamp(e.at)}
@@ -141,9 +157,18 @@ function TuningView({
   )
 }
 
-export function RulesSection(props: SensePanelProps) {
-  const { model, onPause, onToggleTitles } = props
+export function RulesSection(props: SensePanelProps & { tuningReq?: number }) {
+  const { model, onPause, onToggleTitles, tuningReq } = props
   const [view, setView] = useState<'rules' | 'tuning'>('rules')
+  const tuneRef = useRef<HTMLDivElement | null>(null)
+  // 「调整」入口：分区被打开后切到调整日志并把焦点带过去
+  useEffect(() => {
+    if (tuningReq) setView('tuning')
+  }, [tuningReq])
+  // tuningReq 也进依赖：已在调整视图时再点卡片「调整」仍重新聚焦
+  useEffect(() => {
+    if (view === 'tuning') tuneRef.current?.focus()
+  }, [view, tuningReq])
 
   return (
     <>
@@ -183,7 +208,13 @@ export function RulesSection(props: SensePanelProps) {
         </button>
       </div>
 
-      {view === 'rules' ? <RuleList {...props} /> : <TuningView {...props} />}
+      {view === 'rules' ? (
+        <RuleList {...props} />
+      ) : (
+        <div ref={tuneRef} tabIndex={-1} className={css.tuneView}>
+          <TuningView {...props} />
+        </div>
+      )}
     </>
   )
 }

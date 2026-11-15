@@ -177,7 +177,7 @@ const ROW_EVALUATORS: Record<BodyRowKey, (body: Body, now: number) => RowResult>
 }
 
 /** 每个行对应可查询的指标 key（网络/进程各两条，磁盘按挂载点展开）。 */
-function rowMetricKeys(key: BodyRowKey, body: Body): MetricKey[] {
+export function rowMetricKeys(key: BodyRowKey, body: Body): MetricKey[] {
   switch (key) {
     case 'cpu':
     case 'memory':
@@ -195,7 +195,7 @@ function rowMetricKeys(key: BodyRowKey, body: Body): MetricKey[] {
 }
 
 /** 行事实是否新鲜可用（才可并入 insight 严重度，stale/denied 不假装当前）。 */
-function rowUsable(key: BodyRowKey, body: Body, now: number): boolean {
+export function rowUsable(key: BodyRowKey, body: Body, now: number): boolean {
   const f: Fact<unknown> = {
     cpu: body.cpu,
     memory: body.memory,

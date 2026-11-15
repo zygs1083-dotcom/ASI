@@ -18,17 +18,61 @@ interface MetaProps {
   now: number
 }
 
-/** 事实的元信息：新鲜度 + 来源（title 提供 api/host）。 */
+/** 事实的元信息：新鲜度 + 来源（title 提供 api/host）。刚刚采集的不写文字。 */
 export function FactMeta({ fact, now }: MetaProps) {
   const status = effectiveStatus(fact, now)
+  const age = formatAge(now, fact.observedAt)
+  if (status !== 'stale' && age === '刚刚') return null
   return (
     <span
       className={css.factMeta}
       title={`来源 ${fact.source.api} @ ${fact.source.host}`}
     >
       {status === 'stale' ? `${STATUS_TEXT.stale} · ` : ''}
-      {formatAge(now, fact.observedAt)}
+      {age}
     </span>
+  )
+}
+
+/**
+ * 事实的纯文本状态（不含按钮等交互控件）：
+ * 供 <summary> 内使用——summary 里不能嵌交互元素，授权按钮放明细里。
+ */
+export function FactStatusText<T>({
+  fact,
+  now,
+  children,
+}: {
+  fact: Fact<T>
+  now: number
+  children: (value: T) => ReactNode
+}) {
+  const status = effectiveStatus(fact, now)
+  if ((status === 'ok' || status === 'stale') && fact.value !== null) {
+    if (status === 'stale') {
+      // 过期保留值：整体去色 + 明确「已过期」与年龄，不伪装成新鲜数据
+      return (
+        <span className={css.factStale} data-status="stale">
+          {children(fact.value)}
+          <span className={css.factMeta}>
+            已过期 · {formatAge(now, fact.observedAt)}
+          </span>
+        </span>
+      )
+    }
+    return <>{children(fact.value)}</>
+  }
+  if (status === 'denied') {
+    return <>无权限{fact.reason ? `（${fact.reason}）` : ''}</>
+  }
+  if (status === 'stale') {
+    return <>已过期 · {formatAge(now, fact.observedAt)}</>
+  }
+  return (
+    <>
+      {STATUS_TEXT[status] || STATUS_TEXT.unknown}
+      {fact.reason ? `（${fact.reason}）` : ''}
+    </>
   )
 }
 
@@ -59,7 +103,9 @@ export function FactValue<T>({
     return (
       <span className={css.factStale} title={sourceTitle}>
         {children(fact.value)}
-        <span className={css.factMeta}> · {formatAge(now, fact.observedAt)}</span>
+        <span className={css.factMeta}>
+          已过期 · {formatAge(now, fact.observedAt)}
+        </span>
       </span>
     )
   }

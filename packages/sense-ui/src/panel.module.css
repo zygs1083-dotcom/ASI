@@ -22,6 +22,7 @@
   font-size: var(--sense-fs);
   line-height: 20px;
   font-weight: 400;
+  font-variant-numeric: tabular-nums;
   color: var(--dsw-alias-label-primary, #0f1115);
   background: var(--dsw-specific-sidebar-fill, transparent);
   padding: 0 var(--sense-pad-inline) var(--sense-pad-inline);
@@ -73,6 +74,13 @@
   font-weight: 500;
   cursor: pointer;
   user-select: none;
+  /* 粘性分区标题：不透明 DSH 侧栏底色 + z-index，
+     scroll-margin 给宿主/预览工具栏留出高度。 */
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  background: var(--dsw-specific-sidebar-fill, #f9fafb);
+  scroll-margin-top: 36px;
 }
 
 .section > summary::before {
@@ -105,6 +113,9 @@
 }
 
 .factStale {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sense-gap);
   color: var(--dsw-alias-label-secondary, #61666b);
   /* 过期内容整体去色：子级柱状条/走势图/图标一律变灰。 */
   filter: grayscale(1);
@@ -131,7 +142,7 @@
 }
 
 .linkButton:focus-visible,
-.section > summary:focus-visible,
+.panel summary:focus-visible,
 .panel button:focus-visible,
 .panel input:focus-visible {
   outline: 2px solid var(--dsw-alias-state-business-primary, #4176e6);

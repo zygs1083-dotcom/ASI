@@ -55,6 +55,8 @@ export interface Body {
     used: number
     pressure: 'normal' | 'warn' | 'critical'
     swapUsed: number
+    /** 内存细分（原始字节）；未提供时 UI 只画 used/free，不虚构比例。 */
+    breakdown?: { app: number; wired: number; compressed: number; cached: number }
   }>
   disks: Fact<Array<{ mount: string; total: number; free: number }>>
   battery: Fact<{ percent: number; charging: boolean; minutesLeft?: number } | null>
@@ -75,6 +77,8 @@ export interface TokenVitals {
   compressionThreshold?: number
   balanceStatus?: FactStatus
   balanceReason?: string
+  /** 宿主投影的上下文增速（tokens/分钟）；未提供或为 0 时 UI 不估算填满时间。 */
+  contextGrowthPerMinute?: number
 }
 
 export interface SenseState {
@@ -210,6 +214,13 @@ export type MetricKey =
 export interface MetricInsight {
   /** 与 history 同单位的学习基线区间；未提供则不画基线带。 */
   baseline?: { low: number; high: number }
+  /**
+   * 宿主提供的各层阈值。value 默认与 history 同单位；
+   * unit 显式给出且与 history 单位不一致时 UI 只在明细中展示、不画线。
+   */
+  thresholds?: Partial<
+    Record<ThresholdLayer, { value: number; source: string; unit?: DetailUnit }>
+  >
   sources: ThresholdLayer[]
   triggered: ThresholdLayer[]
   severity?: 'warn' | 'critical'

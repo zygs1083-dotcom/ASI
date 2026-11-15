@@ -95,7 +95,13 @@ export function makeInsights(
 export function makeBody(): SenseState['self']['body'] {
   return {
     cpu: fact({ usage: 0.34, perCore: [0.3, 0.5, 0.28, 0.42, 0.36, 0.31, 0.4, 0.29], load1: 2.1, load5: 1.8, load15: 1.6 }),
-    memory: fact({ total: 32e9, used: 19.4e9, pressure: 'normal', swapUsed: 0.4e9 }),
+    memory: fact({
+      total: 32e9,
+      used: 19.4e9,
+      pressure: 'normal',
+      swapUsed: 0.4e9,
+      breakdown: { app: 11e9, wired: 5e9, compressed: 3.4e9, cached: 4e9 },
+    }),
     disks: fact([
       { mount: '/', total: 460e9, free: 175e9 },
       { mount: '/demo/vol', total: 120e9, free: 72e9 },
@@ -111,6 +117,7 @@ export function makeBody(): SenseState['self']['body'] {
       sessionUsage: { input: 96_400, output: 12_800, cacheRead: 61_000, cacheWrite: 9_200 },
       balance: { amount: 12.34, currency: 'CNY', source: 'demo-provider' },
       compressionThreshold: 115_200,
+      contextGrowthPerMinute: 720,
     }),
   }
 }

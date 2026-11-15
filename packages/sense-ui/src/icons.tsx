@@ -124,6 +124,31 @@ export function InfoIcon(p: IconProps) {
   )
 }
 
+export function AppIcon(p: IconProps) {
+  return (
+    <svg {...base(p)}>
+      <rect x="2.5" y="2.5" width="11" height="11" rx="2.5" />
+      <path d="M6 10.5 8 5.5l2 5M6.7 9h2.6" />
+    </svg>
+  )
+}
+
+export function ThumbUpIcon(p: IconProps) {
+  return (
+    <svg {...base(p)}>
+      <path d="M5 7v6H2.5V7H5Zm0 0 3-4.5c.9 0 1.6.7 1.4 1.7L9 6.5h3.4a1.5 1.5 0 0 1 1.4 2l-1.4 4a1.5 1.5 0 0 1-1.4 1H5" />
+    </svg>
+  )
+}
+
+export function ThumbDownIcon(p: IconProps) {
+  return (
+    <svg {...base(p)}>
+      <path d="M11 9V3h2.5v6H11Zm0 0-3 4.5c-.9 0-1.6-.7-1.4-1.7L7 9.5H3.6a1.5 1.5 0 0 1-1.4-2l1.4-4a1.5 1.5 0 0 1 1.4-1H11" />
+    </svg>
+  )
+}
+
 export function PauseIcon(p: IconProps) {
   return <svg {...base(p)}><path d="M5.5 3.5v9M10.5 3.5v9" /></svg>
 }

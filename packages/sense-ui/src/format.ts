@@ -7,6 +7,11 @@ const oneDecimal = new Intl.NumberFormat('zh-CN', {
   minimumFractionDigits: 1,
   maximumFractionDigits: 1,
 })
+const minuteFmt = new Intl.DateTimeFormat('zh-CN', {
+  hour: '2-digit',
+  minute: '2-digit',
+  hour12: false,
+})
 const timeFmt = new Intl.DateTimeFormat('zh-CN', {
   hour: '2-digit',
   minute: '2-digit',
@@ -105,6 +110,11 @@ export function formatThermalOrdinal(v: number): string {
 
 export function formatClock(at: number): string {
   return timeFmt.format(new Date(at))
+}
+
+/** 分钟级时刻（事件分组标题用，秒位省略）。 */
+export function formatMinute(at: number): string {
+  return minuteFmt.format(new Date(at))
 }
 
 /** 日历日期 + 时分秒，用于跨天的调整日志时间。 */

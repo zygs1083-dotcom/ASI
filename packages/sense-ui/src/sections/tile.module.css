@@ -1,0 +1,92 @@
+/* 卡片展开明细区：事实状态、逐指标大图与阈值/触发行、来源与调整入口。 */
+
+.tileDetail {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sense-gap, 6px);
+  margin-top: var(--sense-gap, 6px);
+  padding-top: var(--sense-gap, 6px);
+  border-top: 0.5px solid var(--dsw-alias-border-l1, rgba(0, 0, 0, 0.04));
+}
+
+.detailFact {
+  font-size: var(--sense-fs-s);
+  color: var(--dsw-alias-label-secondary, #61666b);
+}
+
+.metricBlock {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding-bottom: var(--sense-gap, 6px);
+  border-bottom: 0.5px solid var(--dsw-alias-border-l1, rgba(0, 0, 0, 0.04));
+}
+
+.metricBlock:last-of-type {
+  border-bottom: none;
+  padding-bottom: 0;
+}
+
+.metricBlock[data-sev='warn'] .metricHead {
+  color: var(--sev-warn-ink);
+}
+
+.metricBlock[data-sev='critical'] .metricHead {
+  color: var(--sev-critical-ink);
+}
+
+.metricHead {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--sense-gap, 6px);
+  font-size: var(--sense-fs-s);
+  font-variant-numeric: tabular-nums;
+}
+
+.metricRows {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.metricRow {
+  display: flex;
+  gap: var(--sense-gap, 6px);
+  font-size: var(--sense-fs-s);
+  color: var(--dsw-alias-label-secondary, #61666b);
+  font-variant-numeric: tabular-nums;
+}
+
+.metricRowKey {
+  flex-shrink: 0;
+  min-width: 42px;
+  color: var(--dsw-alias-label-secondary, #61666b);
+}
+
+.badge {
+  font-style: normal;
+  margin-left: var(--sense-gap, 6px);
+  padding: 0 4px;
+  border-radius: var(--dsw-radius-xs, 4px);
+  border: 0.5px solid var(--dsw-alias-border-l4, rgba(0, 0, 0, 0.16));
+  color: var(--dsw-alias-label-secondary, #61666b);
+}
+
+.detailMeta {
+  display: flex;
+  align-items: center;
+  gap: var(--sense-gap, 6px);
+  font-size: var(--sense-fs-s);
+  color: var(--dsw-alias-label-secondary, #61666b);
+}
+
+.adjustBtn {
+  margin-left: auto;
+  border: none;
+  background: none;
+  padding: 0;
+  font: inherit;
+  color: var(--sev-business-ink);
+  cursor: pointer;
+}
