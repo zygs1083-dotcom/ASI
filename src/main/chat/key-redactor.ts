@@ -72,18 +72,24 @@ function kmpPrefixTable(pattern: string): number[] {
  * 跨分片流式脱敏器：key 可能被切成任意多片到达。
  * 每个请求一个实例，构造时归一化并缓存 key 集合、KMP 前缀表与各 key 的替换文本。
  * push 维护一个持久的增量匹配器：只对新到达的 code unit 推进各 key 的 KMP 状态
- * 并入档；完整匹配按最长优先删除其字符与状态档（原始输入的匹配随后插入该 key
- * 的替换文本，替换期间产生的匹配只删除不再插入——与 redactNormalized 的兜底清理
- * 同一收敛原则）；任一时刻所有状态归零即安全边界，整段缓冲放出。
- * 工作量与处理过的字符数成正比，扣留文本再长也不重复扫描；flush 是终端例外，
- * 扣留残片过同一 redact 原语后全部放出。
+ * 并入档；完整匹配按最长优先删除其仍在缓冲中的字符与状态档（原始输入的匹配随后
+ * 插入该 key 的替换文本，替换期间产生的匹配只删除不再插入——与 redactNormalized
+ * 的兜底清理同一收敛原则）；任一时刻所有状态归零即安全边界，整段缓冲放出。
+ * 每次 push 收尾再放出缓冲的安全前缀，只保留能继续拼出某个 key 的最长真前缀后缀
+ * （长度上界 = 最长 key 减一，扣留不再随输入无界增长）；emittedStates 记录已放出
+ * 输出末尾的各 key 状态基线，跨放出边界重组的完整匹配仍会被捕获并压制其缓冲内
+ * 部分。已放出文本允许以某个 key 的真前缀结尾——累计输出承诺的只是不含完整 key。
+ * 增量匹配不重复扫描已处理文本，但每次放出都要搬移保留的后缀，扣留极长时
+ * 这部分搬移随片段数累积。flush 是终端例外，扣留残片过同一 redact 原语后全部放出。
  */
 export class KeyRedactor {
   /** 扣留的 UTF-16 code unit（每元素一个字符，按 raw[i] 切分，与 string.length 一致） */
   private pending: string[] = [];
   /** 平铺的逐位置状态档：位置 i 占 hist[i*K .. i*K+K)，删除 key 时同步截尾 */
   private hist: number[] = [];
-  /** 当前各 key 的 KMP 状态 */
+  /** 已放出输出末尾的各 key KMP 状态基线：hist/states 描述包含该基线在内的整体有效输出 */
+  private readonly emittedStates: number[];
+  /** 当前各 key 的 KMP 状态（已放出基线 + 扣留缓冲的末尾） */
   private readonly states: number[];
   private readonly keys: string[];
   private readonly tables: number[][];
@@ -95,6 +101,7 @@ export class KeyRedactor {
     this.tables = this.keys.map(kmpPrefixTable);
     this.replacements = this.keys.map((k) => redactNormalized(k, this.keys));
     this.states = new Array<number>(this.keys.length).fill(0);
+    this.emittedStates = new Array<number>(this.keys.length).fill(0);
   }
 
   /** 与请求快照一致的整段脱敏（终态正文/错误信息等一次性出口共用） */
@@ -104,8 +111,10 @@ export class KeyRedactor {
 
   /**
    * 追加一个 code unit：各 key 的 KMP 状态前进一步并入档。
-   * 完整 key 收尾时取最长匹配（keys 已按长度降序），删字符、删状态行、
-   * 从存档恢复当前状态——被删的只是后缀，剩余前缀的存档状态依旧准确，
+   * 完整 key 收尾时取最长匹配（keys 已按长度降序），只删除仍在缓冲中的字符
+   * 与状态行——匹配可能跨越已放出边界，但绝不回撤已放出文本；随后从存档恢复
+   * 当前状态（缓冲删空时恢复 emittedStates 基线而非清零，已放出末尾的
+   * key 前缀状态仍在保护中）。被删的只是后缀，剩余前缀的存档状态依旧准确，
    * 不可能在存档里藏着未处理的完整匹配。
    */
   private append(unit: string, inserting: boolean): void {
@@ -137,11 +146,15 @@ export class KeyRedactor {
     if (matched === -1) {
       return;
     }
-    const drop = this.keys[matched].length;
+    // 匹配可能跨越已放出边界：只删仍在缓冲中的部分，不回撤已放出文本
+    const drop = Math.min(this.keys[matched].length, this.pending.length);
     this.pending.length -= drop;
     this.hist.length -= drop * K;
     if (this.hist.length === 0) {
-      this.states.fill(0);
+      // 缓冲删空：恢复已放出末尾的基线状态，已放出文本里的 key 前缀状态依然有效
+      for (let k = 0; k < K; k++) {
+        this.states[k] = this.emittedStates[k];
+      }
     } else {
       for (let k = 0; k < K; k++) {
         this.states[k] = this.hist[this.hist.length - K + k];
@@ -158,7 +171,8 @@ export class KeyRedactor {
   }
 
   push(raw: string): string {
-    if (this.keys.length === 0) {
+    const K = this.keys.length;
+    if (K === 0) {
       return raw;
     }
     const parts: string[] = [];
@@ -169,6 +183,33 @@ export class KeyRedactor {
         parts.push(this.pending.join(''));
         this.pending.length = 0;
         this.hist.length = 0;
+        this.emittedStates.fill(0);
+      }
+    }
+    // 收尾放出安全前缀：只保留能继续拼出某个 key 的最长真前缀后缀。
+    // 匹配状态可能伸进已放出文本（s > 扣留长度）：沿失配链回退到扣留范围内，
+    // 取各 key 中最大的剩余状态（完整匹配都已在 append 中处理，剩下的必是真前缀）。
+    const pendingLength = this.pending.length;
+    if (pendingLength > 0) {
+      let retain = 0;
+      for (let k = 0; k < K; k++) {
+        let s = this.states[k];
+        while (s > pendingLength) {
+          s = this.tables[k][s - 1];
+        }
+        if (s > retain) {
+          retain = s;
+        }
+      }
+      const release = pendingLength - retain;
+      if (release > 0) {
+        parts.push(this.pending.slice(0, release).join(''));
+        // 新放出段最后一行的状态即已放出末尾基线（覆盖被删空前缀时的旧基线）
+        for (let k = 0; k < K; k++) {
+          this.emittedStates[k] = this.hist[(release - 1) * K + k];
+        }
+        this.pending.splice(0, release);
+        this.hist.splice(0, release * K);
       }
     }
     return parts.join('');
@@ -180,6 +221,7 @@ export class KeyRedactor {
     this.pending.length = 0;
     this.hist.length = 0;
     this.states.fill(0);
+    this.emittedStates.fill(0);
     return out;
   }
 }

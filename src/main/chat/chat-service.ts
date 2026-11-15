@@ -10,7 +10,7 @@ import type {
   TestResult,
 } from '../../shared/types';
 import type { ConversationStore } from '../stores/conversation-store';
-import { FAUX_PROVIDER_ID, type ProviderStore } from '../stores/provider-store';
+import { FAUX_PROVIDER_ID, type ProviderKeySnapshot, type ProviderStore } from '../stores/provider-store';
 import { KeyRedactor, redactKeys } from './key-redactor';
 import type { ModelResolver } from './model-resolver';
 
@@ -66,17 +66,19 @@ export class ChatService {
   ) {}
 
   async send(conversationId: string, text: string): Promise<{ user: ChatMessage; assistant: ChatMessage }> {
-    // 请求开始时的脱敏 key 快照：之后厂商被删除/轮换也不影响本次保护范围；
+    // 请求开始时的 key 快照：脱敏集合与取 key 走同一次枚举（每条密文只解密一次），
+    // 之后厂商被删除/轮换也不影响本次保护范围与取到的 key；
     // 请求中途新保存的 key 有意不在本请求内（下一次请求生效，见架构 §6）
-    const requestKeys = this.providers.getRedactionKeys();
+    const snapshot = this.providers.getKeySnapshot();
+    const requestKeys = snapshot.redactionKeys;
     try {
       // 同步校验（首个 await 之前完成）：任何失败都不追加消息
       const conv = this.requireIdle(conversationId);
       if (text.trim() === '') {
         throw new Error('消息内容不能为空');
       }
-      const target = this.resolveTarget(conv);
-      // 活动 key 单独进快照：faux 哨兵与遗留读取的 key 不在 keys.json 集合里
+      const target = this.resolveTarget(conv, snapshot);
+      // 活动 key 一并进脱敏集合：faux 哨兵等未落盘的 key 不在 keys.json 集合里
       requestKeys.push(target.apiKey);
 
       const now = Date.now();
@@ -105,7 +107,8 @@ export class ChatService {
   }
 
   async retry(conversationId: string): Promise<{ assistant: ChatMessage }> {
-    const requestKeys = this.providers.getRedactionKeys();
+    const snapshot = this.providers.getKeySnapshot();
+    const requestKeys = snapshot.redactionKeys;
     try {
       const conv = this.requireIdle(conversationId);
       const last = conv.messages[conv.messages.length - 1];
@@ -113,7 +116,7 @@ export class ChatService {
         throw new Error('只能重试最后一轮失败或已停止的回复');
       }
       // 全部校验（模型/厂商/key）通过后才允许改动会话
-      const target = this.resolveTarget(conv);
+      const target = this.resolveTarget(conv, snapshot);
       requestKeys.push(target.apiKey);
       const assistant = this.newAssistant(Date.now(), target.modelRef);
       // 上下文 = 被替换 assistant 之前的 done 历史（原 user 消息已在其中，不重复追加）
@@ -144,7 +147,7 @@ export class ChatService {
   }
 
   /** 同步解析模型/厂商/key；任何一步失败都不允许调用方改动会话（错误由调用方统一脱敏） */
-  private resolveTarget(conv: Conversation): StreamTarget {
+  private resolveTarget(conv: Conversation, snapshot: ProviderKeySnapshot): StreamTarget {
     const modelRef = conv.model;
     if (!modelRef) {
       throw new Error('请先为会话选择模型');
@@ -157,7 +160,7 @@ export class ChatService {
       throw new Error('模型所属厂商已停用');
     }
     const model = this.resolver.resolve(provider, modelRef.modelId);
-    const apiKey = provider.id === FAUX_PROVIDER_ID ? FAUX_API_KEY : this.providers.getApiKey(provider.id);
+    const apiKey = provider.id === FAUX_PROVIDER_ID ? FAUX_API_KEY : snapshot.getApiKey(provider.id);
     if (!apiKey) {
       throw new Error('厂商未设置 API Key');
     }
@@ -222,9 +225,11 @@ export class ChatService {
   }
 
   async test(providerId: string, modelId: string): Promise<TestResult> {
-    // 本次请求的脱敏 key 快照：测试挂起期间被删除/轮换的已存 key 仍受保护；
-    // 活动 apiKey 解析后也并入同一快照（push 生效于之后的 failure 调用）
-    const requestKeys = this.providers.getRedactionKeys();
+    // 本次请求的 key 快照：脱敏集合与取 key 走同一次枚举，测试挂起期间被
+    // 删除/轮换的已存 key 仍受保护；活动 apiKey 解析后也并入同一集合
+    // （push 生效于之后的 failure 调用）
+    const snapshot = this.providers.getKeySnapshot();
+    const requestKeys = snapshot.redactionKeys;
     // 所有失败出口统一过同一脱敏原语：静态错误与兜底串也不例外
     const failure = (err: unknown): TestResult => ({
       ok: false,
@@ -245,7 +250,7 @@ export class ChatService {
     }
     let apiKey: string | undefined;
     try {
-      apiKey = provider.id === FAUX_PROVIDER_ID ? FAUX_API_KEY : this.providers.getApiKey(provider.id);
+      apiKey = provider.id === FAUX_PROVIDER_ID ? FAUX_API_KEY : snapshot.getApiKey(provider.id);
     } catch (err) {
       return failure(err);
     }

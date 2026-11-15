@@ -39,6 +39,18 @@ interface KeyEntry {
   value: string;
 }
 
+/**
+ * 请求级 key 快照：一次枚举 keys 得到。
+ * - redactionKeys：全部可解密的非空已存 key 原值（含不可用/孤儿条目），供脱敏枚举；
+ * - getApiKey：与独立 getApiKey 同语义（解密失败抛统一错误、缺失/不可用返回
+ *   undefined），但只读快照内捕获的数据——之后 save/remove/轮换不回看，
+ *   也不再触碰 store 或解密器。
+ */
+export interface ProviderKeySnapshot {
+  redactionKeys: string[];
+  getApiKey(id: string): string | undefined;
+}
+
 // safeStorage 不可用时明文回退的告警，整个进程只报一次（告警不含任何 key 内容）
 let warnedPlaintextKeys = false;
 
@@ -455,6 +467,55 @@ export class ProviderStore {
   }
 
   /**
+   * 请求级 key 快照：单次枚举 keys，每条密文恰好解密一次（含失败尝试），
+   * 一次调用同时产出脱敏集合与冻结的 getApiKey：
+   * - redactionKeys 收集全部可解密的非空原值，含被标记不可用/被忽略的
+   *   遗留与孤儿条目（与 getRedactionKeys 语义一致）；
+   * - usable 只收不可用条目之外的值，decryptFailed 同样排除不可用条目，
+   *   与 getApiKey 的判定顺序一致（不可用 → undefined 优先于解密错误）；
+   * - 返回的闭包只读这两份捕获数据，不引用 this.unavailableKeys 等可变
+   *   状态，后续 save/remove/轮换不影响快照。
+   */
+  getKeySnapshot(): ProviderKeySnapshot {
+    const redactionKeys: string[] = [];
+    const usable = new Map<string, string>();
+    const decryptFailed = new Set<string>();
+    for (const [id, entry] of Object.entries(this.keys)) {
+      const unavailable = this.unavailableKeys.has(id);
+      let value: string;
+      if (entry.encrypted) {
+        try {
+          value = this.encryption.decryptString(Buffer.from(entry.value, 'base64'));
+        } catch {
+          // 单条损坏只跳过：枚举绝不因一条坏数据泄漏或中断
+          if (!unavailable) {
+            decryptFailed.add(id);
+          }
+          continue;
+        }
+      } else {
+        value = entry.value;
+      }
+      if (value !== '') {
+        redactionKeys.push(value);
+      }
+      if (!unavailable) {
+        usable.set(id, value);
+      }
+    }
+    return {
+      redactionKeys,
+      getApiKey: (id: string) => {
+        if (decryptFailed.has(id)) {
+          // 与独立 getApiKey 一致：底层错误信息可能携带 key/密文内容，不向外透传
+          throw new Error('无法解密已保存的 API Key');
+        }
+        return usable.get(id);
+      },
+    };
+  }
+
+  /**
    * 主进程内部使用：返回全部可解密的非空持久化 key 值（含被标记不可用的/被忽略的遗留条目），
    * 供流式输出脱敏枚举。已接受边界（架构 §6）：不可解密的条目被有意排除——解不出来的值
    * 应用不会发给本次请求的目标厂商，契约明确将其排除（而非承诺该值不可能出现在模型
@@ -462,21 +523,6 @@ export class ProviderStore {
    * 单条密文损坏只跳过该条，不影响其余，也不改变 getApiKey 的行为。
    */
   getRedactionKeys(): string[] {
-    const out: string[] = [];
-    for (const entry of Object.values(this.keys)) {
-      if (entry.encrypted) {
-        try {
-          const value = this.encryption.decryptString(Buffer.from(entry.value, 'base64'));
-          if (value !== '') {
-            out.push(value);
-          }
-        } catch {
-          // 单条损坏只跳过：枚举绝不因一条坏数据泄漏或中断
-        }
-      } else if (entry.value !== '') {
-        out.push(entry.value);
-      }
-    }
-    return out;
+    return this.getKeySnapshot().redactionKeys;
   }
 }

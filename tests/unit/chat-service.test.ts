@@ -59,16 +59,21 @@ function fakeCipher(value: string): string {
   ]).toString('base64');
 }
 
-/** 统计 decryptString 次数的加密实现：断言流式期间不做逐 delta 解密 */
-function countingEncryption(): { enc: StorageEncryption; counts: { decrypt: number } } {
+/** 统计 decryptString 次数的加密实现：断言流式期间不做逐 delta 解密、每条密文只解密一次 */
+function countingEncryption(): {
+  enc: StorageEncryption;
+  counts: { decrypt: number; perCipher: Map<string, number> };
+} {
   const base = fakeEncryption();
-  const counts = { decrypt: 0 };
+  const counts = { decrypt: 0, perCipher: new Map<string, number>() };
   return {
     enc: {
       isEncryptionAvailable: base.isEncryptionAvailable,
       encryptString: base.encryptString,
       decryptString: (value: Buffer) => {
         counts.decrypt += 1;
+        const cipher = value.toString('base64');
+        counts.perCipher.set(cipher, (counts.perCipher.get(cipher) ?? 0) + 1);
         return base.decryptString(value);
       },
     },
@@ -679,7 +684,10 @@ describe('ChatService.test', () => {
   it('masks snapshot keys in static errors like missing provider', async () => {
     const env = setup();
     // 遗留已存 key 恰好与静态错误文本相同：静态出口也必须过最终脱敏
-    vi.spyOn(env.providers, 'getRedactionKeys').mockReturnValue(['厂商不存在']);
+    vi.spyOn(env.providers, 'getKeySnapshot').mockReturnValue({
+      redactionKeys: ['厂商不存在'],
+      getApiKey: () => undefined,
+    });
     const result = await env.service.test('missing', 'x');
     expect(result.ok).toBe(false);
     expect(result.error).toBe('[已隐藏]');
@@ -696,7 +704,10 @@ describe('ChatService.test', () => {
       enabled: true,
       customModels: [],
     });
-    vi.spyOn(env.providers, 'getRedactionKeys').mockReturnValue(['测试失败']);
+    vi.spyOn(env.providers, 'getKeySnapshot').mockReturnValue({
+      redactionKeys: ['测试失败', 'sk-fallback-9'],
+      getApiKey: () => 'sk-fallback-9',
+    });
     completeMock.mockImplementationOnce(
       async () => ({ stopReason: 'error', errorMessage: '' }) as AssistantMessage,
     );
@@ -1099,11 +1110,14 @@ describe('ChatService key masking (cross-chunk)', () => {
   });
 
   it('masks even a short legacy key in text and errors (defense in depth)', async () => {
-    // 遗留数据里可能存在短 key：save 已拒收，这里只 mock getApiKey 模拟遗留读取
+    // 遗留数据里可能存在短 key：save 已拒收，这里只 mock 快照模拟遗留读取
     const env = setup();
     const SHORT = 'short-7';
     const { conv } = keyedConv(env, 'sk-legacy-9');
-    vi.spyOn(env.providers, 'getApiKey').mockReturnValue(SHORT);
+    vi.spyOn(env.providers, 'getKeySnapshot').mockReturnValue({
+      redactionKeys: ['sk-legacy-9'],
+      getApiKey: () => SHORT,
+    });
     streamDeltas([`echo ${SHORT}`], { error: `denied ${SHORT}` });
     await env.service.send(conv.id, 'hi');
     await waitFor(() => env.events.some((e) => e.type === 'error'));
@@ -1402,7 +1416,7 @@ describe('ChatService key masking (cross-chunk)', () => {
     expect(stored?.text).toBe('[已隐藏] [已隐藏] end');
   });
 
-  it('withholds emissions ending in a competing proper key prefix until resolved', async () => {
+  it('releases the safe prefix immediately and retains only the competing proper prefix', async () => {
     const env = setup();
     const A = 'abcdefgh';
     const B = 'XYZabcde';
@@ -1415,14 +1429,50 @@ describe('ChatService key masking (cross-chunk)', () => {
       enabled: true,
       customModels: [],
     });
-    // 'abc' 是 A 的前缀、'XYZ' 是 B 的前缀：放出 'abc' 会留下受保护前缀结尾
+    // 'abc' 是 A 的前缀、'XYZ' 是 B 的前缀：'abc' 立即放出（允许以受保护前缀结尾），
+    // 只扣留最长真前缀后缀 'XYZ'，后续片段拼不出 B 后整段放出
     streamDeltas(['abcXYZ', 'defgh', ' tail']);
     await env.service.send(conv.id, 'hi');
     await waitFor(() => env.events.some((e) => e.type === 'done'));
     const deltas = deltaTexts(env.events);
-    expect(deltas[0]).toBe('abcXYZdefgh');
+    expect(deltas[0]).toBe('abc');
     expect(deltas.join('')).toBe('abcXYZdefgh tail');
     expect(terminalMessage(env.events)?.text).toBe('abcXYZdefgh tail');
+  });
+
+  it('suppresses a mask char that would complete a legal key across the release boundary', async () => {
+    const env = setup();
+    const A = 'abcdefg[';
+    const B = '12345678';
+    const { conv } = keyedConv(env, A);
+    env.providers.save({
+      name: 'Other',
+      kind: 'builtin',
+      builtinProvider: 'anthropic',
+      apiKey: B,
+      enabled: true,
+      customModels: [],
+    });
+    // 'abcdefg' 放出时已以 A 的 7 位真前缀结尾；'12345678' 匹配后插入的掩码
+    // 首字符 '[' 恰好在边界上拼出完整 A，必须被压制——任何出口都不得出现任一把 key
+    streamDeltas(['abcdefg1234', '5678']);
+    await env.service.send(conv.id, 'hi');
+    await waitFor(() => env.events.some((e) => e.type === 'done'));
+    const deltas = deltaTexts(env.events);
+    expect(deltas[0]).toBe('abcdefg');
+    const final = terminalMessage(env.events);
+    // 掩码首字符 '[' 在已放出边界上拼出完整 A 被压制：输出为 'abcdefg' + '已隐藏]'
+    expect(final?.text).toBe('abcdefg已隐藏]');
+    for (const e of env.events) {
+      const s = JSON.stringify(e);
+      expect(s).not.toContain(A);
+      expect(s).not.toContain(B);
+    }
+    const stored = env.conversations.get(conv.id)?.messages[1];
+    expect(stored?.text).toBe('abcdefg已隐藏]');
+    const raw = readFileSync(join(env.dir, 'conversations', `${conv.id}.json`), 'utf8');
+    expect(raw).not.toContain(A);
+    expect(raw).not.toContain(B);
   });
 
   it('flushes a withheld key-prefix tail into the final text on done', async () => {
@@ -1462,7 +1512,7 @@ describe('ChatService key masking (cross-chunk)', () => {
     const counting = countingEncryption();
     const env = setup(true, counting.enc);
     const { conv } = keyedConv(env, KEY);
-    const keySpy = vi.spyOn(env.providers, 'getRedactionKeys');
+    const keySpy = vi.spyOn(env.providers, 'getKeySnapshot');
     streamDeltas(['chunk-one', 'chunk-two', 'chunk-three']);
     await env.service.send(conv.id, 'hi');
     // 请求开始时取一次快照；流式期间不得再枚举集合或逐 delta 解密
@@ -1486,7 +1536,7 @@ describe('ChatService key masking (cross-chunk)', () => {
       ],
     });
     streamDeltas(['ok']);
-    const keySpy = vi.spyOn(env.providers, 'getRedactionKeys');
+    const keySpy = vi.spyOn(env.providers, 'getKeySnapshot');
     await env.service.retry(conv.id);
     expect(keySpy).toHaveBeenCalledTimes(1);
     await waitFor(() => env.events.some((e) => e.type === 'done'));
@@ -1496,6 +1546,81 @@ describe('ChatService key masking (cross-chunk)', () => {
     expect(result.ok).toBe(true);
     expect(keySpy).toHaveBeenCalledTimes(1);
   });
+
+  it.each(['send', 'retry', 'test'] as const)(
+    'captures the key snapshot once per %s and decrypts each ciphertext exactly once',
+    async (op) => {
+      const counting = countingEncryption();
+      const env = setup(true, counting.enc);
+      const ACTIVE = 'sk-active-99';
+      const OTHER = 'sk-other-999';
+      // 两把不同的已存密文 key：一把属活动厂商，另一把属无关（停用）厂商
+      env.providers.save({
+        name: 'Other',
+        kind: 'builtin',
+        builtinProvider: 'anthropic',
+        apiKey: OTHER,
+        enabled: false,
+        customModels: [],
+      });
+      const { providerId, conv } = keyedConv(env, ACTIVE);
+      if (op === 'retry') {
+        // 直接铺好失败回合，不先走一次 send
+        const snapshot = env.conversations.get(conv.id);
+        env.conversations.save({
+          ...(snapshot as Conversation),
+          messages: [
+            msg({ id: 'u1', text: 'hi', status: 'done' }),
+            msg({ id: 'a1', role: 'assistant', text: '', status: 'error', error: 'x' }),
+          ],
+        });
+      }
+      const snapshotSpy = vi.spyOn(env.providers, 'getKeySnapshot');
+      const apiKeySpy = vi.spyOn(env.providers, 'getApiKey');
+      const decryptsBefore = counting.counts.decrypt;
+      const perCipherBefore = new Map(counting.counts.perCipher);
+
+      let options: StreamOptions | undefined;
+      if (op === 'test') {
+        completeMock.mockImplementationOnce(async (_m, _ctx, o) => {
+          options = o;
+          return { stopReason: 'stop' } as AssistantMessage;
+        });
+        const result = await env.service.test(providerId, 'claude-sonnet-4-5');
+        expect(result.ok).toBe(true);
+      } else {
+        streamMock.mockImplementationOnce((_m, _ctx, o) => {
+          options = o;
+          return {
+            async *[Symbol.asyncIterator]() {
+              yield { type: 'text_delta', contentIndex: 0, delta: 'ok' } as AssistantMessageEvent;
+              yield { type: 'done', reason: 'stop', message: {} } as AssistantMessageEvent;
+            },
+          } as unknown as ReturnType<typeof piai.stream>;
+        });
+        if (op === 'send') {
+          await env.service.send(conv.id, 'hi');
+        } else {
+          await env.service.retry(conv.id);
+        }
+        // 断言覆盖到请求终态，而非只到调用返回
+        await waitFor(() => env.events.some((e) => e.type === 'done' || e.type === 'error'));
+        expect(terminalMessage(env.events)?.status).toBe('done');
+        expect(terminalMessage(env.events)?.text).toBe('ok');
+      }
+
+      // 发给底层的就是快照中活动厂商的 key
+      expect(options?.apiKey).toBe(ACTIVE);
+      // 整个请求只取一次快照、不直接调独立 getApiKey
+      expect(snapshotSpy).toHaveBeenCalledTimes(1);
+      expect(apiKeySpy).not.toHaveBeenCalled();
+      // 从调用前到终态：两条密文各恰好解密一次（快照枚举），此外没有任何解密
+      for (const cipher of [fakeCipher(ACTIVE), fakeCipher(OTHER)]) {
+        expect(counting.counts.perCipher.get(cipher) ?? 0).toBe((perCipherBefore.get(cipher) ?? 0) + 1);
+      }
+      expect(counting.counts.decrypt).toBe(decryptsBefore + 2);
+    },
+  );
 
   it('masks a stored legacy key colliding with static error text in send/retry/test failures', async () => {
     const env = setup();
@@ -1570,7 +1695,7 @@ describe('ChatService key masking (cross-chunk)', () => {
     }
     expect(fragments).toHaveLength(5000);
     streamDeltas(fragments);
-    const keySpy = vi.spyOn(env.providers, 'getRedactionKeys');
+    const keySpy = vi.spyOn(env.providers, 'getKeySnapshot');
     const t0 = performance.now();
     await env.service.send(conv.id, 'perf');
     await waitFor(() => env.events.some((e) => e.type === 'done'), 30000);
