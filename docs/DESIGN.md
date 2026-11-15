@@ -47,7 +47,7 @@
 | 输入框 | 高 26–30px、1px `--line`、圆角 7px、12–13px；focus 边框 `--accent` + 3px `--accent-soft` 光圈 |
 | 药丸按钮 | 背景 `--pill`、hover `--pill-hover`、圆角 7px、高 26px、12px `--ctl-fg` |
 | 主按钮 | `--accent` 底 `--accent-fg` 字，圆角 7px |
-| 开关 | 36×20，开 = `--fg` 深色底白圆点（与 magpie 一致，不用强调色），关 = `--seg-track` |
+| 开关 | 36×20，开 = `--fg` 底 + `--card` 圆点（浅色主题即深底白点，与 magpie 一致；深色主题自然反相为浅底深点，可接受），不用强调色；关 = `--seg-track` |
 | 状态点 | 6px 圆点：`--green` 已配置 / `--faint` 未配置 / `--red` 出错 |
 | 弹出层 | `--pop-bg` + `backdrop-filter: blur(20px)` + `--shadow`，圆角 10px |
 
@@ -82,4 +82,4 @@
 
 ## 4. 验收截图
 
-e2e 在 1100×720 窗口下产出：`artifacts/screens/{chat-empty,chat-streaming,chat-done,providers-list,provider-edit}-{light,dark}.png`。评审对照 magpie 实物检查：灰底+白卡片层级、13px 紧凑感、选中项白底阴影、开关为深色、强调色只用于主操作。
+e2e 在 1100×720 窗口下产出：`artifacts/screens/{chat-empty,chat-streaming,chat-done,providers-list,provider-edit}-{light,dark}.png`。评审对照 magpie 实物检查：灰底+白卡片层级、13px 紧凑感、选中项白底阴影、开关开启态用 `--fg`、强调色只用于主操作。

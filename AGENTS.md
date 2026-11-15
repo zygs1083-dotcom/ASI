@@ -64,7 +64,7 @@ Electron + electron-vite + React + TypeScript，包管理用 **npm**（提交 `p
 
 ## 6. 安全与数据
 
-- **API Key 只存在主进程**，用 Electron `safeStorage` 加密落盘；渲染进程永远拿不到明文 key（只知道 `hasApiKey`）。
+- **API Key 只存在主进程**，用 Electron `safeStorage` 加密落盘；**已保存的** key 永不回传渲染进程（`list/get`、IPC 返回值、事件、错误信息、日志里都不得出现，渲染进程只知道 `hasApiKey`）；用户输入 key 时渲染进程短暂持有明文可以接受，保存或取消后必须立即清空草稿。
 - 测试一律用 pi-ai 的 faux 厂商（`ASI_FAUX=1`）和临时数据目录（`ASI_DATA_DIR`），**不使用任何真实 API Key**，不读 `~/.secrets/`，不连公司生产环境（192.168.0.34/.35）。
 - 日志、截图、测试夹具里不得出现 key、邮箱等个人信息。
 - 渲染进程：`contextIsolation: true`、`nodeIntegration: false`、`sandbox: true`；只通过 preload 暴露的 `window.asi` 通信。

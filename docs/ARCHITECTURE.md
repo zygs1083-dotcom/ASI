@@ -105,7 +105,7 @@ export interface Conversation {
 export interface ConversationSummary { id: string; title: string; updatedAt: number }
 
 export type ChatEvent =
-  | { type: 'delta'; conversationId: string; messageId: string; delta: string }
+  | { type: 'delta'; conversationId: string; messageId: string; delta: string; text: string }   // text = 截至此刻的完整累计正文（权威值）
   | { type: 'done'; conversationId: string; message: ChatMessage }
   | { type: 'error'; conversationId: string; message: ChatMessage };   // message.status 为 'error' 或 'aborted'
 
@@ -137,6 +137,8 @@ export interface AsiApi {
   chat: {
     /** 追加用户消息 + 一条 status=streaming 的 assistant 占位消息，立即返回两者；随后通过 onEvent 推送增量 */
     send(conversationId: string, text: string): Promise<{ user: ChatMessage; assistant: ChatMessage }>;
+    /** 仅重试会话最后一轮：要求最后一条为 status 'error'|'aborted' 的 assistant 消息；删除它并基于其之前的历史重新生成，返回新的 streaming 占位消息 */
+    retry(conversationId: string): Promise<{ assistant: ChatMessage }>;
     abort(conversationId: string): Promise<void>;
     onEvent(cb: (e: ChatEvent) => void): () => void;      // 返回取消订阅函数
   };
@@ -186,3 +188,12 @@ export interface AsiApi {
 | `pe-save` / `pe-cancel` / `pe-delete` | 面板按钮（删除需二次确认：再点一次 `pe-delete-confirm`） |
 | `settings-default-model` | 通用卡片里的默认模型选择器（同 `model-picker` 弹层） |
 | `theme-system` / `theme-light` / `theme-dark` | 外观分段 |
+
+## 6. 评审后补充约定（T6，2026-11-15）
+
+- **流式事件**：`delta.text` 是权威累计正文；渲染进程收到 delta 时直接用 `text` 覆盖该消息正文（窗口重建/重载后也不会丢前缀）。
+- **Key 脱敏**：主进程对流式正文、终态正文、错误信息做跨分片 key 掩码（替换为 `[已隐藏]`），再发送事件和写盘。
+- **重试**：`chat.retry` 只针对最后一轮；界面只在最后一条失败/中止的 assistant 消息上显示「重试」。
+- **启动恢复**：加载会话时若有 `status: 'streaming'` 的遗留消息，改为 `aborted` 并写盘。
+- **中止有界**：`abort` 后最多等 2 秒，底层流仍不结束则强制终结为 `aborted`、写盘、释放会话锁，之后迟到事件全部丢弃。
+- **Electron 边界**：只有未打包时才使用 `ELECTRON_RENDERER_URL`；禁止应用内导航和新窗口（`will-navigate` 阻止、`setWindowOpenHandler` 返回 deny），http/https 链接交给 `shell.openExternal`；每个 IPC handler 校验 sender 是主窗口的主 frame；`chat:event` 只发给主窗口。生产 CSP 不含 `'unsafe-inline'` 脚本。

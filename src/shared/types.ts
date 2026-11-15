@@ -60,7 +60,7 @@ export interface Conversation {
 export interface ConversationSummary { id: string; title: string; updatedAt: number }
 
 export type ChatEvent =
-  | { type: 'delta'; conversationId: string; messageId: string; delta: string }
+  | { type: 'delta'; conversationId: string; messageId: string; delta: string; text: string }   // text = 截至此刻的完整累计正文（权威值）
   | { type: 'done'; conversationId: string; message: ChatMessage }
   | { type: 'error'; conversationId: string; message: ChatMessage };   // message.status 为 'error' 或 'aborted'
 
@@ -92,6 +92,8 @@ export interface AsiApi {
   chat: {
     /** 追加用户消息 + 一条 status=streaming 的 assistant 占位消息，立即返回两者；随后通过 onEvent 推送增量 */
     send(conversationId: string, text: string): Promise<{ user: ChatMessage; assistant: ChatMessage }>;
+    /** 仅重试会话最后一轮：要求最后一条为 status 'error'|'aborted' 的 assistant 消息；删除它并基于其之前的历史重新生成，返回新的 streaming 占位消息 */
+    retry(conversationId: string): Promise<{ assistant: ChatMessage }>;
     abort(conversationId: string): Promise<void>;
     onEvent(cb: (e: ChatEvent) => void): () => void;      // 返回取消订阅函数
   };
