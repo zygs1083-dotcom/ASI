@@ -3,8 +3,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { test as base, type ElectronApplication, _electron as electron, type Page } from '@playwright/test';
 
-export const FAUX_REPLY =
-  'Deterministic faux reply: this response streams in several chunks, then finishes with the same text.';
+export const FAUX_REPLY = `Deterministic faux reply. ${'The response arrives incrementally before it finishes. '.repeat(5)}Finished.`;
 
 type LaunchOptions = { dataDir?: string; fauxReply?: string };
 type LaunchedApp = { app: ElectronApplication; page: Page };

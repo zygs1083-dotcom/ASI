@@ -23,7 +23,7 @@ const EXPECTED_METHODS = [
 
 test('Electron window boots with the secure API boundary', async ({ launchApp }) => {
   const { app, page } = await launchApp();
-  await page.waitForLoadState('domcontentloaded');
+  await expect.poll(() => page.evaluate('document.readyState')).toBe('complete');
 
   const apiMethods = await page.evaluate(() => {
     const api = (globalThis as { asi?: Record<string, Record<string, unknown>> }).asi;
@@ -56,4 +56,18 @@ test('Electron window boots with the secure API boundary', async ({ launchApp })
     processType: 'undefined',
     separateGlobals: true,
   });
+});
+
+test('fixture can restart Electron with the same isolated data directory', async ({ dataDir, launchApp }) => {
+  const first = await launchApp();
+  expect(await first.app.evaluate(({ app }) => app.getPath('userData'))).toBe(dataDir);
+  expect(await first.app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].getSize())).toEqual(
+    [1100, 720],
+  );
+  expect(first.page.viewportSize()).toEqual({ width: 1100, height: 720 });
+  await first.app.close();
+
+  const second = await launchApp({ dataDir });
+  expect(await second.app.evaluate(({ app }) => app.getPath('userData'))).toBe(dataDir);
+  await expect.poll(() => second.page.evaluate('document.readyState')).toBe('complete');
 });
