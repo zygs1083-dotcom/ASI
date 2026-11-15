@@ -18,6 +18,23 @@ import {
 } from '../../src/main/stores/provider-store';
 import type { ProviderInput } from '../../src/shared/types';
 
+/** 写盘故障注入队列：writeJsonAtomic 调用路径匹配队首时出队并抛错 */
+const writeFail = vi.hoisted(() => ({ plan: [] as string[] }));
+
+vi.mock('../../src/main/stores/json-file', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../src/main/stores/json-file')>();
+  return {
+    ...actual,
+    writeJsonAtomic: vi.fn((path: string, value: unknown) => {
+      if (writeFail.plan.length > 0 && writeFail.plan[0] === path) {
+        writeFail.plan.shift();
+        throw new Error('模拟磁盘写入失败');
+      }
+      return actual.writeJsonAtomic(path, value);
+    }),
+  };
+});
+
 /** 可逆但非明文的假加密：密文 = "ENC|" + base64(明文) */
 function fakeEncryption(available = true): StorageEncryption {
   return {
@@ -54,6 +71,7 @@ function tempDir(): string {
 }
 
 afterEach(() => {
+  writeFail.plan.length = 0;
   for (const dir of dirs.splice(0)) {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -403,5 +421,277 @@ describe('ProviderStore', () => {
     const store = new ProviderStore(tempDir(), fakeEncryption());
     expect(store.get(FAUX_PROVIDER_ID)).toBeUndefined();
     expect(store.list()).toEqual([]);
+  });
+});
+
+function fakeCipher(value: string): string {
+  return Buffer.concat([
+    Buffer.from('ENC|'),
+    Buffer.from(Buffer.from(value, 'utf8').toString('base64')),
+  ]).toString('base64');
+}
+
+function providerRecord(id: string): Record<string, unknown> {
+  return {
+    id,
+    name: `P-${id}`,
+    kind: 'builtin',
+    builtinProvider: 'anthropic',
+    enabled: true,
+    customModels: [],
+    createdAt: 1,
+  };
+}
+
+describe('ProviderStore plaintext key migration', () => {
+  it('migrates legacy plaintext entries to encrypted ones on non-test startup', () => {
+    vi.stubEnv('ASI_DATA_DIR', '');
+    const dir = tempDir();
+    writeFileSync(
+      join(dir, 'providers.json'),
+      JSON.stringify([providerRecord('p1'), providerRecord('p2')]),
+      'utf8',
+    );
+    writeFileSync(
+      join(dir, 'keys.json'),
+      JSON.stringify({
+        p1: { encrypted: false, value: 'sk-legacy-plain' },
+        p2: { encrypted: true, value: fakeCipher('sk-legacy-enc') },
+      }),
+      'utf8',
+    );
+    const store = new ProviderStore(dir, fakeEncryption());
+    // 迁移发生在构造返回之前：内存与盘上都是密文
+    expect(store.getApiKey('p1')).toBe('sk-legacy-plain');
+    const keys = JSON.parse(readFileSync(join(dir, 'keys.json'), 'utf8')) as Record<
+      string,
+      { encrypted: boolean; value: string }
+    >;
+    expect(keys.p1.encrypted).toBe(true);
+    expect(keys.p2.encrypted).toBe(true);
+    expect(readFileSync(join(dir, 'keys.json'), 'utf8')).not.toContain('sk-legacy-plain');
+    // 重载后两把 key 都能用
+    const reloaded = new ProviderStore(dir, fakeEncryption());
+    expect(reloaded.getApiKey('p1')).toBe('sk-legacy-plain');
+    expect(reloaded.getApiKey('p2')).toBe('sk-legacy-enc');
+  });
+
+  it('drops plaintext entries from memory only when encryption is unavailable, warning once', async () => {
+    vi.resetModules();
+    vi.stubEnv('ASI_DATA_DIR', '');
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const { ProviderStore: FreshStore } = await import('../../src/main/stores/provider-store');
+    const dir = tempDir();
+    writeFileSync(
+      join(dir, 'providers.json'),
+      JSON.stringify([providerRecord('p1'), providerRecord('p2')]),
+      'utf8',
+    );
+    writeFileSync(
+      join(dir, 'keys.json'),
+      JSON.stringify({
+        p1: { encrypted: false, value: 'sk-plain-drop' },
+        p2: { encrypted: true, value: fakeCipher('sk-enc-keep') },
+      }),
+      'utf8',
+    );
+    const store = new FreshStore(dir, fakeEncryption(false));
+    // 明文条目被丢弃：hasApiKey false、getApiKey undefined；加密条目保留
+    expect(store.get('p1')?.hasApiKey).toBe(false);
+    expect(store.getApiKey('p1')).toBeUndefined();
+    expect(store.get('p2')?.hasApiKey).toBe(true);
+    expect(store.getApiKey('p2')).toBe('sk-enc-keep');
+    // 盘上文件原样保留（只从内存丢弃）
+    const raw = JSON.parse(readFileSync(join(dir, 'keys.json'), 'utf8')) as Record<
+      string,
+      { encrypted: boolean }
+    >;
+    expect(raw.p1.encrypted).toBe(false);
+    // 第二个实例不再重复告警，告警内容不含任何 key
+    new FreshStore(dir, fakeEncryption(false));
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls.flat().join(' ')).not.toContain('sk-');
+  });
+
+  it('keeps tagged plaintext entries usable in test mode (ASI_DATA_DIR set)', () => {
+    vi.stubEnv('ASI_DATA_DIR', '/tmp/asi-test-data');
+    const dir = tempDir();
+    writeFileSync(
+      join(dir, 'keys.json'),
+      JSON.stringify({ p1: { encrypted: false, value: 'sk-test-plain' } }),
+      'utf8',
+    );
+    const store = new ProviderStore(dir, fakeEncryption(false));
+    expect(store.getApiKey('p1')).toBe('sk-test-plain');
+  });
+
+  it('fails construction without touching the file when the migration write fails', () => {
+    vi.stubEnv('ASI_DATA_DIR', '');
+    const dir = tempDir();
+    const keysPath = join(dir, 'keys.json');
+    writeFileSync(keysPath, JSON.stringify({ p1: { encrypted: false, value: 'sk-migrate-me' } }), 'utf8');
+    writeFail.plan = [keysPath];
+    expect(() => new ProviderStore(dir, fakeEncryption())).toThrow();
+    // 构造失败：没有可用实例，原文件未被破坏
+    const raw = JSON.parse(readFileSync(keysPath, 'utf8')) as Record<string, unknown>;
+    expect(raw.p1).toEqual({ encrypted: false, value: 'sk-migrate-me' });
+  });
+
+  it('fails construction without leaking content when migration encryption fails', () => {
+    vi.stubEnv('ASI_DATA_DIR', '');
+    const dir = tempDir();
+    const keysPath = join(dir, 'keys.json');
+    writeFileSync(keysPath, JSON.stringify({ p1: { encrypted: false, value: 'sk-migrate-me' } }), 'utf8');
+    const throwing: StorageEncryption = {
+      isEncryptionAvailable: () => true,
+      encryptString: () => {
+        throw new Error('encrypt blew up with sk-migrate-me');
+      },
+      decryptString: () => {
+        throw new Error('decrypt blew up');
+      },
+    };
+    try {
+      new ProviderStore(dir, throwing);
+      expect.unreachable();
+    } catch (err) {
+      expect((err as Error).message).not.toContain('sk-migrate-me');
+    }
+    const raw = JSON.parse(readFileSync(keysPath, 'utf8')) as Record<string, unknown>;
+    expect(raw.p1).toEqual({ encrypted: false, value: 'sk-migrate-me' });
+  });
+});
+
+describe('ProviderStore two-file rollback', () => {
+  it('restores the old keys.json when the providers.json write fails after setting a new key', () => {
+    const dir = tempDir();
+    const store = new ProviderStore(dir, fakeEncryption());
+    const saved = store.save(input({ apiKey: 'sk-old' }));
+    // 调用前的完整盘上快照：回滚必须逐字节恢复原文件
+    const keysBefore = readFileSync(join(dir, 'keys.json'), 'utf8');
+    const providersBefore = readFileSync(join(dir, 'providers.json'), 'utf8');
+    writeFail.plan = [join(dir, 'providers.json')];
+    expect(() => store.save(input({ id: saved.id, name: 'Renamed', apiKey: 'sk-new' }))).toThrow();
+    // keys.json 已回滚到旧内容，providers.json 未被更新
+    expect(readFileSync(join(dir, 'keys.json'), 'utf8')).toBe(keysBefore);
+    expect(readFileSync(join(dir, 'providers.json'), 'utf8')).toBe(providersBefore);
+    const reloaded = new ProviderStore(dir, fakeEncryption());
+    expect(reloaded.getApiKey(saved.id)).toBe('sk-old');
+    expect(reloaded.get(saved.id)?.name).toBe('Test Provider');
+    expect(reloaded.list()).toEqual(store.list());
+    expect(store.getApiKey(saved.id)).toBe('sk-old');
+    expect(store.get(saved.id)?.name).toBe('Test Provider');
+    expect(readdirSync(dir).filter((f) => f.endsWith('.tmp'))).toEqual([]);
+  });
+
+  it('restores keys.json with the key when the providers.json write fails after clearing a key', () => {
+    const dir = tempDir();
+    const store = new ProviderStore(dir, fakeEncryption());
+    const saved = store.save(input({ apiKey: 'sk-stay' }));
+    const keysBefore = readFileSync(join(dir, 'keys.json'), 'utf8');
+    const providersBefore = readFileSync(join(dir, 'providers.json'), 'utf8');
+    writeFail.plan = [join(dir, 'providers.json')];
+    expect(() => store.save(input({ id: saved.id, apiKey: null }))).toThrow();
+    expect(readFileSync(join(dir, 'keys.json'), 'utf8')).toBe(keysBefore);
+    expect(readFileSync(join(dir, 'providers.json'), 'utf8')).toBe(providersBefore);
+    const reloaded = new ProviderStore(dir, fakeEncryption());
+    expect(reloaded.getApiKey(saved.id)).toBe('sk-stay');
+    expect(reloaded.get(saved.id)?.hasApiKey).toBe(true);
+    expect(reloaded.list()).toEqual(store.list());
+    expect(store.getApiKey(saved.id)).toBe('sk-stay');
+    expect(readdirSync(dir).filter((f) => f.endsWith('.tmp'))).toEqual([]);
+  });
+
+  it('removes the just-created keys.json when a new provider save fails on the second write', () => {
+    const dir = tempDir();
+    const store = new ProviderStore(dir, fakeEncryption());
+    writeFail.plan = [join(dir, 'providers.json')];
+    expect(() => store.save(input({ apiKey: 'sk-new' }))).toThrow();
+    expect(existsSync(join(dir, 'keys.json'))).toBe(false);
+    expect(existsSync(join(dir, 'providers.json'))).toBe(false);
+    expect(store.list()).toEqual([]);
+    expect(readdirSync(dir).filter((f) => f.endsWith('.tmp'))).toEqual([]);
+  });
+
+  it('restores providers.json when the keys.json write fails during remove', () => {
+    const dir = tempDir();
+    const store = new ProviderStore(dir, fakeEncryption());
+    const saved = store.save(input({ apiKey: 'sk-stay' }));
+    const keysBefore = readFileSync(join(dir, 'keys.json'), 'utf8');
+    const providersBefore = readFileSync(join(dir, 'providers.json'), 'utf8');
+    writeFail.plan = [join(dir, 'keys.json')];
+    expect(() => store.remove(saved.id)).toThrow();
+    expect(readFileSync(join(dir, 'providers.json'), 'utf8')).toBe(providersBefore);
+    expect(readFileSync(join(dir, 'keys.json'), 'utf8')).toBe(keysBefore);
+    const reloaded = new ProviderStore(dir, fakeEncryption());
+    expect(reloaded.get(saved.id)?.name).toBe('Test Provider');
+    expect(reloaded.getApiKey(saved.id)).toBe('sk-stay');
+    expect(reloaded.list()).toEqual(store.list());
+    expect(store.get(saved.id)?.name).toBe('Test Provider');
+    expect(store.getApiKey(saved.id)).toBe('sk-stay');
+    expect(readdirSync(dir).filter((f) => f.endsWith('.tmp'))).toEqual([]);
+  });
+
+  it('surfaces a clear rollback failure when the restore also fails', () => {
+    const dir = tempDir();
+    const store = new ProviderStore(dir, fakeEncryption());
+    const saved = store.save(input({ apiKey: 'sk-old' }));
+    // providers 写失败、随后 keys 回滚也失败：必须明确报错而不是默默吞掉
+    writeFail.plan = [join(dir, 'providers.json'), join(dir, 'keys.json')];
+    expect(() => store.save(input({ id: saved.id, apiKey: 'sk-new' }))).toThrow(/回滚/);
+    // 内存保持调用前状态
+    expect(store.getApiKey(saved.id)).toBe('sk-old');
+    expect(store.get(saved.id)?.name).toBe('Test Provider');
+  });
+
+  it('preserves disk-only plaintext entries when rolling back a failed update', () => {
+    // 非测试环境 + 加密不可用：明文条目从内存被丢弃但盘上原样保留。
+    // 回滚必须用盘上真实快照，否则被丢弃的明文条目会被回滚静默删掉
+    vi.stubEnv('ASI_DATA_DIR', '');
+    const dir = tempDir();
+    writeFileSync(
+      join(dir, 'providers.json'),
+      JSON.stringify([providerRecord('p1'), providerRecord('p2')]),
+      'utf8',
+    );
+    // 用 writeJsonAtomic 相同的格式落种子，保证回滚后的内容逐字节一致
+    const keysBefore = `${JSON.stringify(
+      {
+        p1: { encrypted: false, value: 'sk-refused-plain' },
+        p2: { encrypted: true, value: fakeCipher('sk-keep-enc') },
+      },
+      null,
+      2,
+    )}\n`;
+    writeFileSync(join(dir, 'keys.json'), keysBefore, 'utf8');
+    const providersBefore = readFileSync(join(dir, 'providers.json'), 'utf8');
+    const store = new ProviderStore(dir, fakeEncryption(false));
+    expect(store.getApiKey('p1')).toBeUndefined();
+    writeFail.plan = [join(dir, 'providers.json')];
+    expect(() => store.save(input({ id: 'p2', apiKey: null }))).toThrow();
+    // keys.json 回滚到调用前的真实盘上内容：明文条目一字不差地还在
+    expect(readFileSync(join(dir, 'keys.json'), 'utf8')).toBe(keysBefore);
+    expect(readFileSync(join(dir, 'providers.json'), 'utf8')).toBe(providersBefore);
+    // 重载后的可观察状态与调用前一致，明文依旧被拒绝
+    const reloaded = new ProviderStore(dir, fakeEncryption(false));
+    expect(reloaded.getApiKey('p1')).toBeUndefined();
+    expect(reloaded.get('p1')?.hasApiKey).toBe(false);
+    expect(reloaded.getApiKey('p2')).toBe('sk-keep-enc');
+    expect(reloaded.get('p2')?.hasApiKey).toBe(true);
+    expect(reloaded.list()).toEqual(store.list());
+    expect(readdirSync(dir).filter((f) => f.endsWith('.tmp'))).toEqual([]);
+  });
+
+  it('still completes successful save/remove round-trips with the failure hook installed', () => {
+    const dir = tempDir();
+    const store = new ProviderStore(dir, fakeEncryption());
+    const saved = store.save(input({ apiKey: 'sk-ok' }));
+    expect(store.getApiKey(saved.id)).toBe('sk-ok');
+    store.save(input({ id: saved.id, name: 'Renamed' }));
+    expect(store.get(saved.id)?.name).toBe('Renamed');
+    store.remove(saved.id);
+    expect(store.get(saved.id)).toBeUndefined();
+    const reloaded = new ProviderStore(dir, fakeEncryption());
+    expect(reloaded.get(saved.id)).toBeUndefined();
   });
 });

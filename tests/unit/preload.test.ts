@@ -102,6 +102,7 @@ const INVOKE_CASES: ReadonlyArray<{
     args: ['c1', { providerId: 'p1', modelId: 'm1' }],
   },
   { name: 'chat.send', channel: 'chat:send', call: (a) => a.chat.send('c1', 'hi'), args: ['c1', 'hi'] },
+  { name: 'chat.retry', channel: 'chat:retry', call: (a) => a.chat.retry('c1'), args: ['c1'] },
   { name: 'chat.abort', channel: 'chat:abort', call: (a) => a.chat.abort('c1'), args: ['c1'] },
   { name: 'settings.get', channel: 'settings:get', call: (a) => a.settings.get(), args: [] },
   {
@@ -131,7 +132,13 @@ describe('preload bridge', () => {
     expect(mocks.on).toHaveBeenCalledWith(IPC_CHANNELS.chat.onEvent, expect.any(Function));
     const listener = mocks.on.mock.calls[0][1] as (event: unknown, payload: ChatEvent) => void;
 
-    const payload: ChatEvent = { type: 'delta', conversationId: 'c1', messageId: 'm1', delta: '你' };
+    const payload: ChatEvent = {
+      type: 'delta',
+      conversationId: 'c1',
+      messageId: 'm1',
+      delta: '你',
+      text: '你好',
+    };
     listener({ sender: 'ipcRenderer internals must not leak' }, payload);
     expect(received).toEqual([payload]);
 
@@ -144,6 +151,6 @@ describe('preload bridge', () => {
     expect('ipcRenderer' in exposed).toBe(false);
     expect('invoke' in exposed).toBe(false);
     const fns = Object.values(exposed).flatMap((g) => Object.values(g as Record<string, AnyFn>));
-    expect(fns).toHaveLength(18);
+    expect(fns).toHaveLength(19);
   });
 });

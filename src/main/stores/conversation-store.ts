@@ -42,6 +42,19 @@ export class ConversationStore {
       if (!isConversation(conv) || conv.id !== id) {
         throw new Error(`数据文件损坏，会话格式无效：${join(this.dir, file)}`);
       }
+      // 启动恢复：盘上遗留的 streaming 没有对应的活动请求，转成 aborted 并立即写回，
+      // 否则界面会把这条消息永久当成"进行中"
+      let recovered = false;
+      for (const m of conv.messages) {
+        if (m.status === 'streaming') {
+          m.status = 'aborted';
+          m.error = '已停止';
+          recovered = true;
+        }
+      }
+      if (recovered) {
+        this.persist(conv);
+      }
       this.conversations.set(conv.id, conv);
       this.lastTimestamp = Math.max(this.lastTimestamp, conv.createdAt, conv.updatedAt);
     }
@@ -69,7 +82,16 @@ export class ConversationStore {
   }
 
   private persist(conv: Conversation): void {
-    writeJsonAtomic(this.fileFor(conv.id), conv);
+    // 落盘快照里的 streaming 一律转成 aborted：进程退出/崩溃后没有活动请求能推进它，
+    // 盘上若留 streaming，重启后会永久卡在"进行中"。内存中的实时状态不受影响。
+    const snapshot = structuredClone(conv);
+    for (const m of snapshot.messages) {
+      if (m.status === 'streaming') {
+        m.status = 'aborted';
+        m.error = '已停止';
+      }
+    }
+    writeJsonAtomic(this.fileFor(conv.id), snapshot);
   }
 
   create(model: ModelRef | null = null): Conversation {
@@ -103,14 +125,14 @@ export class ConversationStore {
   rename(id: string, title: string): void {
     const conv = this.require(id);
     const next: Conversation = { ...conv, title, updatedAt: this.touch() };
-    writeJsonAtomic(this.fileFor(id), next);
+    this.persist(next);
     this.conversations.set(id, next);
   }
 
   setModel(id: string, model: ModelRef): void {
     const conv = this.require(id);
     const next: Conversation = { ...conv, model: structuredClone(model), updatedAt: this.touch() };
-    writeJsonAtomic(this.fileFor(id), next);
+    this.persist(next);
     this.conversations.set(id, next);
   }
 
@@ -121,9 +143,8 @@ export class ConversationStore {
   }
 
   save(conv: Conversation): void {
-    const file = this.fileFor(conv.id);
     const snapshot = structuredClone(conv);
-    writeJsonAtomic(file, snapshot);
+    this.persist(snapshot);
     this.conversations.set(snapshot.id, snapshot);
   }
 
@@ -139,6 +160,17 @@ export class ConversationStore {
         conv.title = Array.from(firstUser.text).slice(0, 30).join('');
       }
     }
+    conv.updatedAt = this.touch();
+  }
+
+  /** 仅供 ChatService 使用：只改内存，不落盘（配 flush 使用）；要求最后一条仍是 expectedId */
+  replaceLastMessage(id: string, expectedId: string, message: ChatMessage): void {
+    const conv = this.require(id);
+    const last = conv.messages[conv.messages.length - 1];
+    if (!last || last.id !== expectedId) {
+      throw new Error(`最后一条消息已变化，无法替换：${expectedId}`);
+    }
+    conv.messages[conv.messages.length - 1] = structuredClone(message);
     conv.updatedAt = this.touch();
   }
 

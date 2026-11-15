@@ -1,6 +1,8 @@
-import { mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import type { AssistantMessageEvent } from '@mariozechner/pi-ai';
+import * as piai from '@mariozechner/pi-ai';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ChatService } from '../../src/main/chat/chat-service';
 import { ModelResolver } from '../../src/main/chat/model-resolver';
@@ -23,7 +25,7 @@ const mocks = vi.hoisted(() => {
     handle: vi.fn((channel: string, fn: (...args: unknown[]) => unknown) => {
       handlers.set(channel, fn);
     }),
-    getAllWindows: vi.fn((): Array<{ webContents: { send: ReturnType<typeof vi.fn> } }> => []),
+    getMainWindow: vi.fn((): unknown => undefined),
     getPath: vi.fn(() => '/default/userData'),
     setPath: vi.fn(),
     nativeTheme: { themeSource: 'system' as 'system' | 'light' | 'dark' },
@@ -44,11 +46,27 @@ const mocks = vi.hoisted(() => {
 
 vi.mock('electron', () => ({
   ipcMain: { handle: mocks.handle },
-  BrowserWindow: { getAllWindows: mocks.getAllWindows },
   app: { getPath: mocks.getPath, setPath: mocks.setPath },
   safeStorage: mocks.safeStorage,
   nativeTheme: mocks.nativeTheme,
 }));
+
+vi.mock('../../src/main/main-window', () => ({
+  getMainWindow: () => mocks.getMainWindow(),
+}));
+
+vi.mock('@mariozechner/pi-ai', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@mariozechner/pi-ai')>();
+  return {
+    ...actual,
+    stream: vi.fn(actual.stream),
+    complete: vi.fn(actual.complete),
+    __actual: actual,
+  };
+});
+
+const REAL_PIAI = (piai as unknown as { __actual: typeof piai }).__actual;
+const streamMock = vi.mocked(piai.stream);
 
 const doneMessage: ChatMessage = {
   id: 'm1',
@@ -71,9 +89,19 @@ function fakeEncryption(): StorageEncryption {
   return mocks.safeStorage;
 }
 
+interface FakeWebContents {
+  send: ReturnType<typeof vi.fn>;
+  isDestroyed: () => boolean;
+  mainFrame: { url: string };
+}
+
 interface TestEnv extends MainServices {
+  dir: string;
   events: ChatEvent[];
+  mainWebContents: FakeWebContents;
+  trustedEvent: { sender: FakeWebContents; senderFrame: { url: string } };
   invoke: (channel: string, ...args: unknown[]) => Promise<unknown>;
+  invokeAs: (event: unknown, channel: string, ...args: unknown[]) => Promise<unknown>;
 }
 
 function makeServices(): TestEnv {
@@ -85,12 +113,33 @@ function makeServices(): TestEnv {
   resolvers.push(resolver);
   const events: ChatEvent[] = [];
   const chat = new ChatService(providers, conversations, resolver, (e) => events.push(e));
-  const invoke = async (channel: string, ...args: unknown[]) => {
+  const mainFrame = { url: 'https://app.local/main' };
+  const mainWebContents: FakeWebContents = {
+    send: vi.fn(),
+    isDestroyed: () => false,
+    mainFrame,
+  };
+  mocks.getMainWindow.mockReturnValue({ webContents: mainWebContents });
+  const trustedEvent = { sender: mainWebContents, senderFrame: mainFrame };
+  const invokeAs = async (event: unknown, channel: string, ...args: unknown[]) => {
     const handler = mocks.handlers.get(channel);
     expect(handler, channel).toBeDefined();
-    return handler?.({}, ...args);
+    return handler?.(event, ...args);
   };
-  return { providers, conversations, settings, resolver, chat, events, invoke };
+  const invoke = (channel: string, ...args: unknown[]) => invokeAs(trustedEvent, channel, ...args);
+  return {
+    dir,
+    providers,
+    conversations,
+    settings,
+    resolver,
+    chat,
+    events,
+    mainWebContents,
+    trustedEvent,
+    invoke,
+    invokeAs,
+  };
 }
 
 async function waitFor(cond: () => boolean, ms = 5000): Promise<void> {
@@ -113,11 +162,13 @@ const validProviderInput = {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  streamMock.mockImplementation(REAL_PIAI.stream);
   mocks.handlers.clear();
   mocks.nativeTheme.themeSource = 'system';
 });
 
 afterEach(() => {
+  vi.useRealTimers();
   for (const r of resolvers.splice(0)) {
     r.dispose();
   }
@@ -128,10 +179,10 @@ afterEach(() => {
 });
 
 describe('registerIpc', () => {
-  it('registers exactly the 17 request channels and no chat event handle', () => {
+  it('registers exactly the 18 request channels and no chat event handle', () => {
     const env = makeServices();
     registerIpc(env);
-    expect(mocks.handle).toHaveBeenCalledTimes(17);
+    expect(mocks.handle).toHaveBeenCalledTimes(18);
     expect([...mocks.handlers.keys()].sort()).toEqual([...IPC_INVOKE_CHANNELS].sort());
     expect(mocks.handlers.has(IPC_CHANNELS.chat.onEvent)).toBe(false);
   });
@@ -140,9 +191,76 @@ describe('registerIpc', () => {
     const dir = tempDir();
     vi.stubEnv('ASI_DATA_DIR', dir);
     registerIpc();
-    expect(mocks.handle).toHaveBeenCalledTimes(17);
+    expect(mocks.handle).toHaveBeenCalledTimes(18);
     const get = mocks.handlers.get(IPC_CHANNELS.settings.get);
-    await expect(get?.({})).resolves.toEqual({ defaultModel: null, theme: 'system' });
+    await expect(get?.({ webContents: { mainFrame: {} }, sender: {}, senderFrame: null })).rejects.toThrow();
+  });
+});
+
+describe('IPC sender validation', () => {
+  function untrustedEvents(env: TestEnv): Array<[string, unknown]> {
+    const otherContents: FakeWebContents = {
+      send: vi.fn(),
+      isDestroyed: () => false,
+      mainFrame: { url: env.mainWebContents.mainFrame.url },
+    };
+    return [
+      ['null senderFrame', { sender: env.mainWebContents, senderFrame: null }],
+      ['missing senderFrame', { sender: env.mainWebContents }],
+      [
+        'subframe of the same webContents',
+        { sender: env.mainWebContents, senderFrame: { url: env.mainWebContents.mainFrame.url } },
+      ],
+      [
+        'other window with a matching frame url',
+        { sender: otherContents, senderFrame: otherContents.mainFrame },
+      ],
+      ['empty sender', {}],
+    ];
+  }
+
+  it('rejects every invoke channel from untrusted senders before parsing args', async () => {
+    const env = makeServices();
+    registerIpc(env);
+    for (const channel of IPC_INVOKE_CHANNELS) {
+      for (const [name, event] of untrustedEvents(env)) {
+        await expect(env.invokeAs(event, channel, 'garbage'), `${channel} / ${name}`).rejects.toThrow();
+      }
+    }
+  });
+
+  it('rejects every invoke channel when the main window is missing', async () => {
+    const env = makeServices();
+    registerIpc(env);
+    mocks.getMainWindow.mockReturnValue(undefined);
+    for (const channel of IPC_INVOKE_CHANNELS) {
+      await expect(env.invoke(channel)).rejects.toThrow();
+    }
+  });
+
+  it('does not touch services or validate args for an untrusted sender', async () => {
+    const env = makeServices();
+    registerIpc(env);
+    const listSpy = vi.spyOn(env.providers, 'list');
+    const saveSpy = vi.spyOn(env.providers, 'save');
+    const sendSpy = vi.spyOn(env.chat, 'send');
+    const untrusted = { sender: {}, senderFrame: null };
+    await expect(env.invokeAs(untrusted, IPC_CHANNELS.providers.list)).rejects.toThrow();
+    // 参数本身非法，但必须先因来源不可信被拒，而不是先暴露参数校验
+    await expect(env.invokeAs(untrusted, IPC_CHANNELS.providers.save, Symbol('x'))).rejects.toThrow();
+    await expect(env.invokeAs(untrusted, IPC_CHANNELS.chat.send, 'c1', 'hi')).rejects.toThrow();
+    expect(listSpy).not.toHaveBeenCalled();
+    expect(saveSpy).not.toHaveBeenCalled();
+    expect(sendSpy).not.toHaveBeenCalled();
+  });
+
+  it('serves the authorized main-window sender', async () => {
+    const env = makeServices();
+    registerIpc(env);
+    await expect(env.invoke(IPC_CHANNELS.settings.get)).resolves.toEqual({
+      defaultModel: null,
+      theme: 'system',
+    });
   });
 });
 
@@ -292,6 +410,81 @@ describe('IPC handlers: conversations, chat and settings', () => {
     expect(env.conversations.get(conv.id)).toBeNull();
   });
 
+  it.each(['delta', 'done', 'end', 'reject'] as const)(
+    'conversation.remove resolves by the abort deadline and a late %s cannot resurrect the file',
+    async (lateKind) => {
+      vi.useFakeTimers();
+      vi.stubEnv('ASI_FAUX', '1');
+      const env = makeServices();
+      registerIpc(env);
+      const conv = (await env.invoke(IPC_CHANNELS.conversations.create)) as { id: string };
+      await env.invoke(IPC_CHANNELS.conversations.setModel, conv.id, {
+        providerId: FAUX_PROVIDER_ID,
+        modelId: 'faux-chat',
+      });
+      // 完全不配合的迭代器：next() 挂起等待测试放出结果，return() 也永远挂起
+      let resolveNext: (r: IteratorResult<AssistantMessageEvent>) => void = () => {};
+      let rejectNext: (e: unknown) => void = () => {};
+      streamMock.mockImplementationOnce(
+        () =>
+          ({
+            [Symbol.asyncIterator]() {
+              return {
+                next: () =>
+                  new Promise<IteratorResult<AssistantMessageEvent>>((res, rej) => {
+                    resolveNext = res;
+                    rejectNext = rej;
+                  }),
+                return: () => new Promise<IteratorResult<AssistantMessageEvent>>(() => {}),
+              };
+            },
+          }) as unknown as ReturnType<typeof piai.stream>,
+      );
+      await env.invoke(IPC_CHANNELS.chat.send, conv.id, 'hi');
+      await vi.advanceTimersByTimeAsync(0);
+      const file = join(env.dir, 'conversations', `${conv.id}.json`);
+      const removing = env.invoke(IPC_CHANNELS.conversations.remove, conv.id);
+      let settled = false;
+      void removing.then(() => {
+        settled = true;
+      });
+      // remove 内部的 abort 最多等 2000ms：1999ms 时仍 pending，2000ms 时完成删除
+      await vi.advanceTimersByTimeAsync(1999);
+      expect(settled).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      await removing;
+      expect(settled).toBe(true);
+      expect(env.conversations.get(conv.id)).toBeNull();
+      expect(existsSync(file)).toBe(false);
+      // 强终只发了一个终态 error，没有 delta
+      expect(env.events).toHaveLength(1);
+      expect(env.events[0].type).toBe('error');
+      // 迟到的流结果不得复活会话（不 await 挂起的 return）
+      if (lateKind === 'delta') {
+        resolveNext({
+          value: { type: 'text_delta', contentIndex: 0, delta: 'late' } as AssistantMessageEvent,
+          done: false,
+        });
+      } else if (lateKind === 'done') {
+        resolveNext({
+          value: { type: 'done', reason: 'stop', message: {} } as AssistantMessageEvent,
+          done: false,
+        });
+      } else if (lateKind === 'end') {
+        resolveNext({ value: undefined, done: true });
+      } else {
+        rejectNext(new Error('late iterator failure'));
+      }
+      await vi.advanceTimersByTimeAsync(0);
+      await Promise.resolve();
+      expect(env.events).toHaveLength(1);
+      expect(env.conversations.get(conv.id)).toBeNull();
+      expect(existsSync(file)).toBe(false);
+      const fresh = new ConversationStore(env.dir);
+      expect(fresh.get(conv.id)).toBeNull();
+    },
+  );
+
   it('chat send streams events through the service and abort stops them', async () => {
     vi.stubEnv('ASI_FAUX', '1');
     const env = makeServices();
@@ -319,6 +512,51 @@ describe('IPC handlers: conversations, chat and settings', () => {
     await waitFor(() => env.events.some((e) => e.type === 'error' && e.conversationId === conv2.id));
     const aborted = env.conversations.get(conv2.id)?.messages[1];
     expect(aborted?.status).toBe('aborted');
+  });
+
+  it('chat.retry validates args and forwards to the service', async () => {
+    vi.stubEnv('ASI_FAUX', '1');
+    const env = makeServices();
+    registerIpc(env);
+    const conv = (await env.invoke(IPC_CHANNELS.conversations.create)) as { id: string };
+    await env.invoke(IPC_CHANNELS.conversations.setModel, conv.id, {
+      providerId: FAUX_PROVIDER_ID,
+      modelId: 'faux-chat',
+    });
+    // 参数校验优先：坏 id 必须先被拒
+    await expect(env.invoke(IPC_CHANNELS.chat.retry, 42)).rejects.toThrow();
+    await expect(env.invoke(IPC_CHANNELS.chat.retry, '../x')).rejects.toThrow();
+    await expect(env.invoke(IPC_CHANNELS.chat.retry, conv.id)).rejects.toThrow();
+
+    const user: ChatMessage = {
+      id: 'u-seed',
+      role: 'user',
+      text: '你好',
+      createdAt: 1,
+      status: 'done',
+    };
+    const failed: ChatMessage = {
+      id: 'a-seed',
+      role: 'assistant',
+      text: '',
+      createdAt: 2,
+      status: 'error',
+      error: '失败',
+    };
+    const snapshot = env.conversations.get(conv.id);
+    if (snapshot === null) {
+      throw new Error('会话应存在');
+    }
+    env.conversations.save({ ...snapshot, messages: [user, failed] });
+    const retried = (await env.invoke(IPC_CHANNELS.chat.retry, conv.id)) as {
+      assistant: ChatMessage;
+    };
+    expect(retried.assistant.status).toBe('streaming');
+    expect(retried.assistant.id).not.toBe(failed.id);
+    await waitFor(() => env.events.some((e) => e.type === 'done' && e.conversationId === conv.id));
+    const stored = env.conversations.get(conv.id);
+    expect(stored?.messages.map((m) => m.id)).toEqual([user.id, retried.assistant.id]);
+    expect(stored?.messages[1].status).toBe('done');
   });
 
   it('chat send rejects invalid args and validation failures without appending', async () => {
@@ -362,33 +600,33 @@ describe('IPC handlers: conversations, chat and settings', () => {
 });
 
 describe('emitChatEvent', () => {
-  it('broadcasts the event to every window', () => {
-    const sends = [vi.fn(), vi.fn(), vi.fn()];
-    mocks.getAllWindows.mockReturnValue(sends.map((send) => ({ webContents: { send } })));
+  it('sends the event only to the main window webContents', () => {
+    const send = vi.fn();
+    const otherSend = vi.fn();
+    mocks.getMainWindow.mockReturnValue({
+      webContents: { send, isDestroyed: () => false },
+    });
     const event: ChatEvent = { type: 'done', conversationId: 'c1', message: doneMessage };
     emitChatEvent(event);
-    for (const send of sends) {
-      expect(send).toHaveBeenCalledWith(IPC_CHANNELS.chat.onEvent, event);
-    }
+    expect(send).toHaveBeenCalledWith(IPC_CHANNELS.chat.onEvent, event);
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(otherSend).not.toHaveBeenCalled();
   });
 
-  it('skips destroyed windows and isolates a failing receiver from the rest', () => {
-    const destroyedSend = vi.fn();
-    const throwingSend = vi.fn(() => {
+  it('does nothing when there is no main window', () => {
+    mocks.getMainWindow.mockReturnValue(undefined);
+    const event: ChatEvent = { type: 'done', conversationId: 'c1', message: doneMessage };
+    expect(() => emitChatEvent(event)).not.toThrow();
+  });
+
+  it('tolerates a send that throws because the window closed mid-delivery', () => {
+    const send = vi.fn(() => {
       throw new Error('webContents gone');
     });
-    const goodSend = vi.fn();
-    mocks.getAllWindows.mockReturnValue([
-      { isDestroyed: () => true, webContents: { send: destroyedSend } },
-      { webContents: { isDestroyed: () => true, send: vi.fn() } },
-      { isDestroyed: () => false, webContents: { send: throwingSend } },
-      { isDestroyed: () => false, webContents: { isDestroyed: () => false, send: goodSend } },
-    ] as unknown as Array<{ webContents: { send: ReturnType<typeof vi.fn> } }>);
+    mocks.getMainWindow.mockReturnValue({ webContents: { send } });
     const event: ChatEvent = { type: 'done', conversationId: 'c1', message: doneMessage };
-    emitChatEvent(event);
-    expect(destroyedSend).not.toHaveBeenCalled();
-    expect(throwingSend).toHaveBeenCalled();
-    expect(goodSend).toHaveBeenCalledWith(IPC_CHANNELS.chat.onEvent, event);
+    expect(() => emitChatEvent(event)).not.toThrow();
+    expect(send).toHaveBeenCalledWith(IPC_CHANNELS.chat.onEvent, event);
   });
 });
 
