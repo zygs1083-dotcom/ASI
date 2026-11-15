@@ -1,0 +1,31 @@
+stream-proof — two real compositor rasters proving the panel stream advances
+============================================================================
+Method: fresh asi-dev runtime (run-asi-dev.sh), ego-browser taskspace
+"ASI P0 stream proof", page.goto token URL, click "ASI sense" sidebar icon,
+then TWO independent CDP Page.captureScreenshot(format:png) calls 4.5 s
+apart with a matching DOM read of the panel at each capture. Raw bytes
+written to disk; no compositing, cropping, or pixel editing.
+
+Capture A  (2026-11-15T19:38:05.346Z read)
+  panel: stream=live  sample="#15 2026-11-15T19:38:03.617Z"  cpu=34.8%
+  file: stream-proof-a.png  193920 bytes
+  sha256: eb469d8266265b77ed6a1fe98012e848bd966bcbf889ed98b9a420e29b2ff65d
+
+Capture B  (2026-11-15T19:38:10.013Z read)
+  panel: stream=live  sample="#18 2026-11-15T19:38:09.622Z"  cpu=29.1%
+  file: stream-proof-b.png  194505 bytes
+  sha256: e5137dbdb9405f8f9cc2cd1cfe738d8c6df00bcee4b0d364e6083a280639562d
+
+Verification
+  - SHA256 differ (A != B); both decode as 2080x1614 PNG rasters; both < 500 KB.
+  - DOM reads show the visible change: seq #15 -> #18, time 19:38:03 -> 19:38:09,
+    cpu 34.8% -> 29.1% (three 2 s stream ticks between captures).
+  - Pixel diff (24-bit BMP decode): 3636 differing bytes confined to rows
+    297-419 of 1614 — the panel's data band (sample/cpu/helper rows), not
+    browser chrome or cursor.
+
+Note on superseded evidence: stream-before.png / stream-after.png
+(sha256 0caf62fb..4d9f77, byte-identical) remain frozen for the record but
+are NOT valid visual-change proof; the DOM JSON pair is unaffected.
+Companion JSON sample: spikes/p0/logs/asi-dev-web.log (this boot).
+Runtime during capture: server pid 89138, helper pid 89334 (stopped after).

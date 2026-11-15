@@ -1,0 +1,18 @@
+{
+  "compilerOptions": {
+    "target": "es2024",
+    "module": "nodenext",
+    "moduleResolution": "nodenext",
+    "strict": true,
+    "skipLibCheck": true,
+    "noEmit": true,
+    "types": ["node"],
+    "paths": {
+      "@deepseek-ai/dsh-typert-protocol": ["./packages/asi-sense-spike/src/typert-protocol-shim.ts"],
+      "@deepseek-ai/dsh-agent": ["./packages/asi-sense-spike/src/dsh-agent-shim.ts"],
+      "@deepseek-ai/dsh-session/types": ["./packages/asi-sense-spike/src/types.ts"]
+    }
+  },
+  "files": [],
+  "references": [{ "path": "packages/asi-sense-spike/tsconfig.host.json" }]
+}
