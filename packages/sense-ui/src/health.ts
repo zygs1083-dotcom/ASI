@@ -47,6 +47,8 @@ export interface RowResult {
   severity: Severity
   /** 台式机无电池（status ok 且 value null）时该行不展示、不计入缺失。 */
   hidden: boolean
+  /** unknown 但不计入聚合缺失（如 contextWindow 回退估值，容量未确认而非数据缺失）。 */
+  uncounted?: boolean
 }
 
 export interface BodyEvaluation {
@@ -74,6 +76,22 @@ const SEV_RANK: Record<Severity, number> = {
 
 export function maxSeverity(a: Severity, b: Severity): Severity {
   return SEV_RANK[b] > SEV_RANK[a] ? b : a
+}
+
+/**
+ * insight 的有效严重度：severity 优先；triggered 非空但宿主没给 severity → warn
+ * （宿主已声明触发，不能显示为良好）；否则 good。
+ */
+export function effectiveSeverity(
+  item?: MetricInsight,
+): 'warn' | 'critical' | 'good' {
+  if (item?.severity) return item.severity
+  return item?.triggered?.length ? 'warn' : 'good'
+}
+
+/** 有效磁盘读数：total 为正有限、free 有限（free 可为 0）。 */
+export function diskValid(d: { total: number; free: number }): boolean {
+  return Number.isFinite(d.total) && d.total > 0 && Number.isFinite(d.free)
 }
 
 /** 单个磁盘剩余比例 → 严重度（每个盘独立着色用）。 */
@@ -108,9 +126,10 @@ function evalMemory(body: Body, now: number): RowResult {
 function evalDisks(body: Body, now: number): RowResult {
   const f = body.disks
   if (!isUsable(f, now)) return unusable()
+  const valid = f.value!.filter(diskValid)
+  if (valid.length === 0) return unusable()
   let severity: Severity = 'good'
-  for (const d of f.value!) {
-    if (d.total <= 0) continue
+  for (const d of valid) {
     severity = maxSeverity(severity, diskSeverity(d.free / d.total))
   }
   return { severity, hidden: false }
@@ -155,7 +174,11 @@ function evalProcess(body: Body, now: number): RowResult {
 function evalTokens(body: Body, now: number): RowResult {
   const f = body.tokens
   if (!isUsable(f, now)) return unusable()
-  const { contextWindow, contextUsed } = f.value!
+  const { contextWindow, contextUsed, contextWindowSource } = f.value!
+  // 回退估值容量未确认：磁贴标未知，但不计入聚合缺失（会话用量等仍然有效）
+  if (contextWindowSource === 'fallback') {
+    return { severity: 'unknown', hidden: false, uncounted: true }
+  }
   if (contextWindow == null || contextWindow <= 0 || contextUsed == null) {
     return unusable()
   }
@@ -190,7 +213,10 @@ export function rowMetricKeys(key: BodyRowKey, body: Body): MetricKey[] {
     case 'process':
       return ['processCpu', 'processRss']
     case 'disks':
-      return (body.disks.value ?? []).map((d) => `disk:${d.mount}` as const)
+      // 无效挂载点（total<=0/NaN）不产生可聚合的 insight key
+      return (body.disks.value ?? [])
+        .filter(diskValid)
+        .map((d) => `disk:${d.mount}` as const)
   }
 }
 
@@ -209,7 +235,15 @@ export function rowUsable(key: BodyRowKey, body: Body, now: number): boolean {
   if (!isUsable(f, now)) return false
   if (key === 'tokens') {
     const v = body.tokens.value!
-    return v.contextWindow != null && v.contextWindow > 0 && v.contextUsed != null
+    return (
+      v.contextWindowSource !== 'fallback' &&
+      v.contextWindow != null &&
+      v.contextWindow > 0 &&
+      v.contextUsed != null
+    )
+  }
+  if (key === 'disks') {
+    return body.disks.value!.some(diskValid)
   }
   return true
 }
@@ -224,8 +258,8 @@ export function evaluateBody(
     const r = ROW_EVALUATORS[key](body, now)
     if (insights && !r.hidden && rowUsable(key, body, now)) {
       for (const mk of rowMetricKeys(key, body)) {
-        const sev = insights[mk]?.severity
-        if (sev) r.severity = maxSeverity(r.severity, sev)
+        const sev = effectiveSeverity(insights[mk])
+        if (sev !== 'good') r.severity = maxSeverity(r.severity, sev)
       }
     }
     rows[key] = r
@@ -235,8 +269,9 @@ export function evaluateBody(
   let hasUnknown = false
   for (const key of BODY_ROW_PRIORITY) {
     const s = rows[key].severity
-    if (s === 'unknown') hasUnknown = true
-    else if (s === 'critical') worst = 'critical'
+    if (s === 'unknown') {
+      if (!rows[key].uncounted) hasUnknown = true
+    } else if (s === 'critical') worst = 'critical'
     else if (s === 'warn' && worst !== 'critical') worst = 'warn'
   }
 

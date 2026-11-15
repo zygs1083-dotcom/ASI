@@ -7,7 +7,7 @@ import {
   type BodyEvaluation,
   type BodyRowKey,
 } from './health'
-import type { MetricKey, SensePanelModel } from './view-model'
+import type { MetricInsight, MetricKey, SensePanelModel } from './view-model'
 
 const ROW_LABEL: Record<BodyRowKey, string> = {
   cpu: 'CPU',
@@ -20,13 +20,43 @@ const ROW_LABEL: Record<BodyRowKey, string> = {
   process: 'DSH 进程',
 }
 
-const RECENT_MS = 5 * 60 * 1000
+/** 估算显示上限：超过 7 天的触阈时间不显示。 */
+const MAX_ETA_MS = 7 * 24 * 3600_000
+
+/** 耗尽类指标（剩余量向下耗尽）：磁盘剩余字节、电池百分点。其余指标向上触及阈值。 */
+const DEPLETES = (k: MetricKey) => k === 'battery' || k.startsWith('disk:')
+
+type Eta = NonNullable<MetricInsight['currentEta']>
+
+/**
+ * 宿主当前投影是否有效：
+ * asOf 有限且 ≤ now、间隔有限且为正、asOf 不早于 2× 采样间隔、
+ * 给出有限非负 timeToThresholdMs、ratePerMinute 有限且朝恶化方向。
+ */
+function validEta(key: MetricKey, eta: Eta | undefined, now: number): Eta | null {
+  if (!eta) return null
+  const { asOf, sampleIntervalMs, timeToThresholdMs, ratePerMinute } = eta
+  if (!Number.isFinite(asOf) || asOf > now) return null
+  if (!Number.isFinite(sampleIntervalMs) || sampleIntervalMs <= 0) return null
+  if (now - asOf > 2 * sampleIntervalMs) return null
+  if (
+    timeToThresholdMs == null ||
+    !Number.isFinite(timeToThresholdMs) ||
+    timeToThresholdMs < 0
+  ) {
+    return null
+  }
+  if (!Number.isFinite(ratePerMinute)) return null
+  if (DEPLETES(key) ? ratePerMinute >= 0 : ratePerMinute <= 0) return null
+  return eta
+}
 
 /**
  * 优先警示行：
  * 先按严重度选出当前最差行（不先看事件紧急度，避免 warn 磁盘掩盖 critical 内存），
- * 再在最近 5 分钟事件里找匹配该行且对应事实可用的 body.rate 投影；
- * 事件给出 timeToFloorMs 才显示「N 分钟后见底」，否则回退 evaluateBody 的句子。
+ * 再从该行各指标的 insight.currentEta 里挑最新且仍有效的宿主投影；
+ * 更新的匹配 body.rate 信号使旧投影失效（信号意味着宿主已重新评估，
+ * 包括新的无 ETA / 零速率 / 反向更新，不做历史 ETA 替补）。
  */
 export function attentionLine(
   model: SensePanelModel,
@@ -38,21 +68,33 @@ export function attentionLine(
   if (!rowKey) return null
   const body = model.state.self.body
   if (!rowUsable(rowKey, body, model.now)) return null
-  const keys = new Set<MetricKey>(rowMetricKeys(rowKey, body))
+  const keys = rowMetricKeys(rowKey, body)
 
-  let latest: { at: number; timeToFloorMs: number } | null = null
+  // 每指标最近一次 body.rate 信号时间（> now 的不算）
+  const latestRateAt = new Map<string, number>()
   for (const e of model.events) {
     const d = e.detail
     if (!d || d.kind !== 'body.rate') continue
-    if (!keys.has(d.metric as MetricKey)) continue
     const at = e.signal.at
-    if (!Number.isFinite(at) || at > model.now || at < model.now - RECENT_MS)
-      continue
-    const ms = d.timeToFloorMs
-    if (ms == null || !Number.isFinite(ms) || ms < 0) continue
-    if (!latest || at > latest.at) latest = { at, timeToFloorMs: ms }
+    if (!Number.isFinite(at) || at > model.now) continue
+    const cur = latestRateAt.get(d.metric)
+    if (cur == null || at > cur) latestRateAt.set(d.metric, at)
   }
-  if (!latest) return null
-  const minutes = Math.max(0, Math.round(latest.timeToFloorMs / 60_000))
-  return `${ROW_LABEL[rowKey]} ${minutes} 分钟后见底`
+
+  let best: { key: MetricKey; asOf: number; ms: number } | null = null
+  for (const key of keys) {
+    const eta = validEta(key, model.insights?.[key]?.currentEta, model.now)
+    if (!eta) continue
+    // 更新的匹配 body.rate 信号使旧投影失效：宿主已重新评估
+    //（含新的无 ETA / 零速率 / 反向更新，不做历史 ETA 替补）。
+    const signalAt = latestRateAt.get(key)
+    if (signalAt != null && signalAt > eta.asOf) continue
+    if (!best || eta.asOf > best.asOf) {
+      best = { key, asOf: eta.asOf, ms: eta.timeToThresholdMs! }
+    }
+  }
+  if (!best || best.ms > MAX_ETA_MS) return null
+  const minutes = Math.max(0, Math.round(best.ms / 60_000))
+  const verb = DEPLETES(best.key) ? '见底' : '触及阈值'
+  return `${ROW_LABEL[rowKey]} ${minutes} 分钟后${verb}`
 }

@@ -28,6 +28,17 @@
   grid-column: 1 / -1;
 }
 
+/*
+ * 末位卡片若单独落在半空行则拉满整行：
+ * 只对最后一个整行卡（span2/open）之后的尾部序列按非整行卡奇偶计数。
+ */
+.tiles
+  > .tile:last-child:nth-child(
+    odd of .tile:not([data-span2]):not([open]):not(:has(~ .tile:is([data-span2], [open])))
+  ) {
+  grid-column: 1 / -1;
+}
+
 .tileSummary {
   list-style: none;
   display: flex;

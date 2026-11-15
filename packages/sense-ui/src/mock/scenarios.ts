@@ -24,6 +24,7 @@ export const SCENARIOS = [
   'desktop-no-battery',
   'learning',
   'rapid-change',
+  'token-fallback',
 ] as const
 
 export type ScenarioName = (typeof SCENARIOS)[number]
@@ -67,6 +68,7 @@ function contextAlmostFull(): SensePanelModel {
   const body = makeBody()
   body.tokens = fact({
     contextWindow: 128_000,
+    contextWindowSource: 'catalog',
     contextUsed: 118_500,
     contextProjected: 124_000,
     sessionUsage: { input: 410_000, output: 38_000, cacheRead: 290_000, cacheWrite: 21_000 },
@@ -197,6 +199,13 @@ function rapidChange(): SensePanelModel {
         sources: ['floor', 'rate', 'baseline'],
         triggered: ['rate'],
         severity: 'warn',
+        // 宿主当前投影：采样点 T0，9 分钟后见底；事件里的 timeToFloorMs 只是当时预计
+        currentEta: {
+          asOf: T0,
+          sampleIntervalMs: 30_000,
+          timeToThresholdMs: 9 * 60_000,
+          ratePerMinute: -2.1 * 1024 ** 3,
+        },
       },
       networkRx: {
         baseline: { low: 100_000, high: 700_000 },
@@ -254,6 +263,17 @@ const BUILDERS: Record<ScenarioName, () => SensePanelModel> = {
   'desktop-no-battery': desktopNoBattery,
   learning,
   'rapid-change': rapidChange,
+  'token-fallback': tokenFallback,
+}
+
+/** 上下文窗口容量来自回退估值：环/余量降饱和为「容量未确认」，无告警。 */
+function tokenFallback(): SensePanelModel {
+  const m = contextAlmostFull()
+  m.state.self.body.tokens = fact({
+    ...m.state.self.body.tokens.value!,
+    contextWindowSource: 'fallback',
+  })
+  return m
 }
 
 export function makeScenario(name: ScenarioName): SensePanelModel {

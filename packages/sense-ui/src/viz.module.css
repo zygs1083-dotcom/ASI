@@ -46,17 +46,27 @@
 
 .thrWarn,
 .thrCritical {
-  stroke-dasharray: 3 3;
   stroke-width: 1;
-  opacity: 0.75;
+  opacity: 1;
 }
 
+/* warn 虚线 / critical 实线：线型区分不依赖颜色；墨色保证浅色底 ≥3:1 对比。 */
 .thrWarn {
-  stroke: var(--sev-warn, #f59e0b);
+  stroke: var(--sev-warn-ink);
+  stroke-dasharray: 3 3;
 }
 
 .thrCritical {
-  stroke: var(--sev-critical, #ec1313);
+  stroke: var(--sev-critical-ink);
+}
+
+/* 末点当前状态标记：行级告警在无可比阈值时仍可见。 */
+.curWarn {
+  fill: var(--sev-warn-ink);
+}
+
+.curCritical {
+  fill: var(--sev-critical-ink);
 }
 
 .sparkBand {
@@ -126,6 +136,19 @@
 
 .ring {
   flex-shrink: 0;
+}
+
+/* 容量未确认（contextWindow 为回退估值）：环与百分比整体降饱和。 */
+.ring[data-unconfirmed] {
+  opacity: 0.45;
+}
+
+.ring[data-unconfirmed] .ringFill {
+  stroke: var(--dsw-alias-label-tertiary, #81858c);
+}
+
+.ring[data-unconfirmed] .ringText {
+  fill: var(--dsw-alias-label-secondary, #61666b);
 }
 
 .ringTrack {

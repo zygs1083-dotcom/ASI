@@ -32,8 +32,9 @@ import type { SensePanelModel, SensePanelProps } from '@asi/sense-ui'
 
 - **单位**：CPU `usage`/`perCore` 与 DSH 进程 `cpu` 为 0..1 比例，CPU `load1`/`load5`/`load15` 为系统平均负载（不限制在 0..1）；内存/磁盘 `used`/`total`/`free`、进程 `rss` 为**原始字节**；token `contextUsed`/`contextWindow`/sessionUsage 为**token 计数**；电池 `percent` 为 **0..100**；温控为档位枚举。
 - **历史**：`history.*` 为 `{at, value}` 点列，UI 只渲染 `[now-300000, now]`，x 域固定为该窗口（稀疏点按真实时间摆位）。单位：cpu 为 0..1 比例、memory 与 disks 为**占用比例**（磁盘是 used/total）、networkRx/Tx 为 B/s、tokens 为 token 计数、thermal 为序数 0..3、battery 为百分值、processCpu 0..1、processRss 字节。
-- **insights**：`baseline.low/high` 与 history 同单位（画基线带）；`sources`/`triggered` 为 `floor|rate|baseline`，UI 只展示不判定。可选 `thresholds.<层>` 提供宿主阈值（`{value, source, unit?}`）：floor 会画成虚线并优先于既有显示底线，`unit` 显式与 history 单位不符时不画线；rate/baseline 不做数值假设。
-- **可选字段**：`body.memory.value.breakdown`（`{app, wired, compressed, cached}` 原始字节）提供时画四段细分条（App/联动/压缩/缓存），缺失时只画 used/free 单段并在明细明示「未提供」；`body.tokens.value.contextGrowthPerMinute`（tokens/分）有限且 >0、且 `contextWindow`/`contextUsed` 均有限时，卡片摘要估算「按当前速度约 N 分钟填满」；缺失/非正/非有限一律不估算。无 `contextWindow`/`contextUsed` 时不出现压缩措辞，「本会话」用量行仍然显示。
+- **insights**：`baseline.low/high` 与 history 同单位（画基线带）；`sources`/`triggered` 为 `floor|rate|baseline`，UI 只展示不判定。可选 `thresholds.<层>` 提供宿主阈值（`{value, source, unit?}`）：floor 优先于既有显示底线，warn 虚线、critical 实线；`unit` 显式与 history 单位不符时不画线；rate/baseline 同值可比较时也会画线（标签「变化率」/「基线」），单位不符只在明细文本展示。`severity` 缺失但 `triggered` 非空时按 warn 处理并在明细标注「宿主未给严重度」。`currentEta` 为宿主当前投影（`{asOf, sampleIntervalMs, timeToThresholdMs?, ratePerMinute}`）：仅 asOf ≤ now、now-asOf ≤ 2×间隔、速率为恶化方向（磁盘/电池负、其余正）且 timeToThresholdMs ≤7 天时在监护句显示「N 分钟后见底/触及阈值」；同指标更新的 body.rate 信号使旧投影失效，事件里的历史 ETA 只作「当时预计」。
+- **token 容量来源**：`body.tokens.value.contextWindowSource` 为 `configured`（配置值）/`catalog`（模型目录）/`fallback`（回退估值）。`fallback` 表示容量未确认：环与百分比降饱和、明示「容量未确认」、不显示剩余量/填满估算/压缩距离，行级视为未知但不计入聚合未知与告警；缺省保持旧版行为。
+- **可选字段**：`body.memory.value.breakdown`（`{app, wired, compressed, cached}` 原始字节）提供时画四段细分条（App/联动/压缩/缓存），缺失时只画 used/free 单段并在明细明示「未提供」；`body.tokens.value.contextGrowthPerMinute`（tokens/分）有限且 >0、且 `contextWindow`/`contextUsed` 均有限时，新鲜且容量已确认的卡片摘要估算「按当前速度约 N 分钟填满」；结果非有限或超过 7 天也不估算。无 `contextWindow`/`contextUsed` 时不出现压缩措辞，「本会话」用量行仍然显示。
 - **learning**：`collectedMs/targetMs` 由宿主给，UI 只算 `clamp(collected/target)`，target 非法显示"进度不可用"。
 - **tuning**：参数列表 + 调整日志（`previous→next`、`agent|user|auto`、`reverted`）。锁定/撤销只是回调，宿主拥有护栏。
 - **events**：`detail` 为宿主投影的告警明细（body.rate / body.anomaly / file.burst），`feedback` 状态只在 model 中。窗口类事件在 `sendTitles=false` 时隐藏主体/原因/规则名/detail。
@@ -48,4 +49,19 @@ import type { SensePanelModel, SensePanelProps } from '@asi/sense-ui'
 
 ## 规模
 
-每个 src 文件 ≤300 行。E2E 截图矩阵 32 张（8 场景 × 320/420 × 明暗）+ 卡片明细 4 张，存于 `test/screenshots/`。
+每个 src 文件 ≤300 行。E2E 截图矩阵 32 张（8 场景 × 320/420 × 明暗）+ 卡片明细 4 张 + fallback 容量 2 张（420px 明暗），存于 `test/screenshots/`。
+
+## 评审修复对应测试
+
+| 评审发现 | 回归测试 |
+|---|---|
+| 触发无 severity 误判健康 | `health.test.ts` 缺省严重度用例、`regressions.test.tsx`「宿主未给严重度」 |
+| fallback 容量与真容量不分 | `regressions.test.tsx`「容量未确认」用例、`panel.spec.ts`「容量未确认」截图 |
+| 历史事件 ETA 冒充当前 | `attention.test.ts`「insight 无 currentEta 时不从事件 detail 推导见底时间」等 |
+| stale 仍称「当前速度」 | `regressions.test.tsx`「过期事实禁用当前推算」 |
+| 极小增速溢出 Infinity | `format.test.ts`「formatDuration 边界」、`regressions.test.tsx`「fillMinutes 结果护栏」 |
+| 阈值层/单位/边界/线型 | `attention.test.ts`「阈值解析」、`panel.spec.ts`「告警线为虚线、严重线为实线」 |
+| 大 history 渲染崩溃/磁贴重复渲染 | `sparkline.test.tsx`「sampleHistory 降采样」200k 用例、`regressions.test.tsx`「磁贴渲染隔离」 |
+| 无效磁盘读数误报健康 | `health.test.ts` diskValid 用例、`regressions.test.tsx`「无有效磁盘读数」 |
+| 工具栏无 landmark | `panel.spec.ts` axeCheck（region 也拒绝） |
+| 标签拥挤/末位半空行 | `panel.spec.ts`「不与标签重叠」「末位配对」 |

@@ -1,7 +1,4 @@
-/**
- * 侧栏面板视图模型。
- * 合并后对齐 @asi/sense-types（docs/DESIGN.md §2.2/§2.2b/§2.3）。
- */
+// 侧栏面板视图模型；合并后对齐 @asi/sense-types（docs/DESIGN.md §2.2/§2.2b/§2.3）。
 
 export interface SourceRef {
   id: string
@@ -68,6 +65,12 @@ export interface Body {
 
 export interface TokenVitals {
   contextWindow?: number
+  /**
+   * 上下文窗口来源：configured=用户配置 / catalog=模型目录 / fallback=宿主回退估值。
+   * fallback=容量未确认：环与占用百分比淡显，不展示余量/填满估算、不参与阈值告警；
+   * 缺省保持旧版行为（视为已确认）。
+   */
+  contextWindowSource?: 'configured' | 'catalog' | 'fallback'
   contextUsed?: number
   contextProjected?: number
   /** input 已包含 cacheRead（缓存命中率 = cacheRead / input）。 */
@@ -111,7 +114,11 @@ export interface SenseState {
 
 export type EventLevel = 'record' | 'context' | 'wake' | 'suppressed'
 
-export type DetailUnit = 'bytes' | 'ratio' | 'tokens' | 'count'
+// 事件/detail 数值单位：基础单位 + 显式导数单位（/s、/min）。
+// 网络 history 序列本来就是 B/s，旧版标注 'bytes' 一律按 bytes/s 解读。
+type BaseUnit = 'bytes' | 'ratio' | 'tokens' | 'count'
+type RateUnit = `${BaseUnit}/s` | `${BaseUnit}/min`
+export type DetailUnit = BaseUnit | RateUnit
 
 /**
  * 事件附加展示的宿主投影数据（结构化 detail）。
@@ -224,6 +231,12 @@ export interface MetricInsight {
   sources: ThresholdLayer[]
   triggered: ThresholdLayer[]
   severity?: 'warn' | 'critical'
+  /**
+   * 宿主当前投影：ratePerMinute 方向 磁盘/电池负=耗尽、其余正=增长。
+   * UI 只在 asOf ≤ now、now-asOf ≤ 2×间隔、速率为恶化方向时采用；
+   * 更新的匹配 body.rate 信号使旧投影失效。
+   */
+  currentEta?: { asOf: number; sampleIntervalMs: number; timeToThresholdMs?: number; ratePerMinute: number }
 }
 
 /** 基线学习进度；UI 只展示，不推断截止时间与统计量。 */

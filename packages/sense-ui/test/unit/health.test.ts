@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { effectiveStatus, evaluateBody } from '../../src/health'
+import { effectiveSeverity, effectiveStatus, evaluateBody } from '../../src/health'
 import { T0, emptyFact, fact, makeBody } from '../../src/mock/fixtures'
 import type { Body } from '../../src/view-model'
 
@@ -239,4 +239,105 @@ describe('内存 max(pressure, ratio) 与 insight 合并', () => {
     expect(r.severity).toBe('warn')
     expect(r.sentence).toBe('网络流量异常')
   })
+})
+
+describe('effectiveSeverity：宿主触发缺省严重度', () => {
+  it('triggered 无 severity → warn；空 triggered → good；severity 优先', () => {
+    expect(effectiveSeverity({ sources: ['floor'], triggered: ['floor'] })).toBe('warn')
+    expect(effectiveSeverity({ sources: ['floor'], triggered: [] })).toBe('good')
+    expect(effectiveSeverity({ sources: ['rate'], triggered: ['rate'], severity: 'critical' })).toBe('critical')
+    expect(effectiveSeverity(undefined)).toBe('good')
+  })
+
+  it.each(['floor', 'rate', 'baseline'] as const)(
+    '%s 层 triggered 无 severity 的 insight 并入为 warn（不会显示为良好）',
+    (layer) => {
+      const r = evaluateBody(makeBody(), T0, {
+        cpu: { sources: [layer], triggered: [layer] },
+      })
+      expect(r.rows.cpu.severity).toBe('warn')
+      expect(r.severity).toBe('warn')
+      expect(r.sentence).toBe('CPU 负载较高')
+    },
+  )
+})
+
+describe('磁盘有效性', () => {
+  const critInsight: import('../../src/view-model').MetricInsight = {
+    sources: ['floor'], triggered: ['floor'], severity: 'critical',
+  }
+
+  it.each([
+    { disks: [] as { mount: string; total: number; free: number }[], sev: 'unknown' },
+    { disks: [{ mount: '/', total: 0, free: 5e9 }, { mount: '/x', total: -1, free: 1e9 }], sev: 'unknown' },
+  ])('空/全无效列表 → $sev 而非 good', ({ disks, sev }) => {
+    const r = evaluateBody(bodyWith({ disks: fact(disks) }), T0)
+    expect(r.rows.disks.severity).toBe(sev)
+    expect(r.severity).toBe('unknown')
+  })
+
+  it('无效条目不参与极值/聚合；有效盘照常告警', () => {
+    const r = evaluateBody(
+      bodyWith({ disks: fact([
+        { mount: '/', total: 0, free: 5e9 },
+        { mount: '/d', total: 100e9, free: 2e9 },
+      ]) }),
+      T0,
+    )
+    expect(r.rows.disks.severity).toBe('critical')
+  })
+
+  it('无效挂载点上的 critical insight 不能复活/升级磁盘行', () => {
+    const r = evaluateBody(
+      bodyWith({ disks: fact([{ mount: '/', total: 0, free: 0 }]) }), T0, { 'disk:/': critInsight })
+    expect(r.rows.disks.severity).toBe('unknown')
+    // 混合列表：只聚合有效挂载点的 insight
+    const r2 = evaluateBody(
+      bodyWith({ disks: fact([
+        { mount: '/', total: 100e9, free: 90e9 },
+        { mount: '/bad', total: 0, free: 0 },
+      ]) }),
+      T0,
+      { 'disk:/bad': critInsight },
+    )
+    expect(r2.rows.disks.severity).toBe('good')
+  })
+})
+
+describe('contextWindow 回退估值', () => {
+  const fallbackBody = () =>
+    bodyWith({
+      tokens: fact({
+        contextWindow: 1_000_000,
+        contextWindowSource: 'fallback',
+        contextUsed: 46_200,
+        sessionUsage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 },
+      }),
+    })
+
+  it('fallback → 行 unknown 但不计入聚合缺失，也不并入 insight 告警', () => {
+    const r = evaluateBody(fallbackBody(), T0)
+    expect(r.rows.tokens.severity).toBe('unknown')
+    expect(r.severity).toBe('good')
+    const r2 = evaluateBody(fallbackBody(), T0, {
+      tokens: { sources: ['floor'], triggered: ['floor'], severity: 'critical' },
+    })
+    expect(r2.rows.tokens.severity).toBe('unknown')
+    expect(r2.severity).not.toBe('critical')
+  })
+
+  it.each(['configured', 'catalog', undefined] as const)(
+    '%s 来源保持原有窗口判定',
+    (source) => {
+      const b = bodyWith({
+        tokens: fact({
+          contextWindow: 100_000,
+          contextWindowSource: source,
+          contextUsed: 96_000,
+          sessionUsage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        }),
+      })
+      expect(evaluateBody(b, T0).rows.tokens.severity).toBe('critical')
+    },
+  )
 })

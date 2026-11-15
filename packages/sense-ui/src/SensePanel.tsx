@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useCallback, useState } from 'react'
 import type { SensePanelProps } from './view-model'
 import { PauseIcon, ShieldIcon } from './icons'
 import { BodySection } from './sections/body'
@@ -17,10 +17,10 @@ export function SensePanel(props: SensePanelProps) {
   const [rulesOpen, setRulesOpen] = useState(false)
   // 自增信号：每次点卡片「调整」+1，RulesSection 据此切到调整日志视图并聚焦
   const [tuningReq, setTuningReq] = useState(0)
-  const openTuning = () => {
+  const openTuning = useCallback(() => {
     setRulesOpen(true)
     setTuningReq((n) => n + 1)
-  }
+  }, [])
 
   return (
     <div className={css.panel} data-panel>

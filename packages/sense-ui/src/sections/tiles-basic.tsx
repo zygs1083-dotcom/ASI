@@ -1,16 +1,17 @@
 /** CPU / 内存 指标卡片（温控/电池见 tiles-extra）。 */
 
+import { memo, type ReactNode } from 'react'
 import { FactStatusText } from '../fact'
 import {
   formatBytes,
   formatLoad,
   formatPercent,
 } from '../format'
-import { isUsable } from '../health'
+import { isUsable, type BodyRowKey } from '../health'
 import { Sparkline } from '../sparkline'
 import { chartThresholds } from '../thresholds'
 import { CpuIcon, MemoryIcon } from '../icons'
-import type { SensePanelProps } from '../view-model'
+import type { SensePanelModel, SensePanelProps } from '../view-model'
 import { Tile, TileDetail } from './tile'
 import css from './body.module.css'
 
@@ -21,6 +22,35 @@ export interface TileCtx {
 }
 
 type Rows = ReturnType<typeof import('../health').evaluateBody>['rows']
+
+export interface MetricTileProps {
+  model: SensePanelModel
+  rows: Rows
+  ctx: TileCtx
+}
+
+// 指标卡片 memo：仅自身事实/相关引用、行严重度、now/events、回调变化才重渲。
+export function memoTile(
+  key: BodyRowKey,
+  deps: (m: SensePanelModel) => readonly unknown[],
+  C: (p: MetricTileProps) => ReactNode,
+) {
+  return memo(C, (a, b) => {
+    if (
+      a.model.now !== b.model.now ||
+      a.model.events !== b.model.events ||
+      a.rows[key].severity !== b.rows[key].severity ||
+      a.rows[key].hidden !== b.rows[key].hidden ||
+      a.ctx.onAdjust !== b.ctx.onAdjust ||
+      a.ctx.onOpenPermissionSettings !== b.ctx.onOpenPermissionSettings
+    ) {
+      return false
+    }
+    const da = deps(a.model)
+    const db = deps(b.model)
+    return da.length === db.length && da.every((d, i) => d === db[i])
+  })
+}
 
 const PRESSURE_TEXT = {
   normal: '压力正常',
@@ -35,11 +65,15 @@ const MEM_PARTS = [
   { key: 'cached', label: '缓存', cls: css.memCached },
 ] as const
 
-export function CpuTile({ model, rows, ctx }: { model: TileCtx['model']; rows: Rows; ctx: TileCtx }) {
+export const CpuTile = memoTile(
+  'cpu',
+  (m) => [m.state.self.body.cpu, m.insights?.cpu, m.history.cpu],
+  function CpuTile({ model, rows, ctx }: MetricTileProps) {
   const { cpu } = model.state.self.body
   const { now } = model
-  const v = isUsable(cpu, now) ? cpu.value! : null
-  const thr = chartThresholds('cpu', model.insights?.cpu)
+  const fresh = isUsable(cpu, now)
+  const v = fresh ? cpu.value! : null
+  const thr = fresh ? chartThresholds('cpu', model.insights?.cpu) : { lines: [] }
   return (
     <Tile
       tileKey="cpu"
@@ -59,7 +93,7 @@ export function CpuTile({ model, rows, ctx }: { model: TileCtx['model']; rows: R
               label: 'CPU 使用率',
               points: model.history.cpu,
               format: formatPercent,
-              valueText: v ? formatPercent(v.usage) : undefined,
+              valueText: cpu.value ? formatPercent(cpu.value.usage) : undefined,
               insight: model.insights?.cpu,
               severity: rows.cpu.severity,
             },
@@ -89,7 +123,7 @@ export function CpuTile({ model, rows, ctx }: { model: TileCtx['model']; rows: R
               label="CPU 使用率"
               format={formatPercent}
               severity={rows.cpu.severity}
-              baseline={model.insights?.cpu?.baseline}
+              baseline={fresh ? model.insights?.cpu?.baseline : undefined}
               thresholds={thr.lines}
             />
             <span className={css.cores} aria-hidden="true">
@@ -102,13 +136,17 @@ export function CpuTile({ model, rows, ctx }: { model: TileCtx['model']; rows: R
       </FactStatusText>
     </Tile>
   )
-}
+})
 
-export function MemoryTile({ model, rows, ctx }: { model: TileCtx['model']; rows: Rows; ctx: TileCtx }) {
+export const MemoryTile = memoTile(
+  'memory',
+  (m) => [m.state.self.body.memory, m.insights?.memory, m.history.memory],
+  function MemoryTile({ model, rows, ctx }: MetricTileProps) {
   const { memory } = model.state.self.body
   const { now } = model
-  const v = isUsable(memory, now) ? memory.value! : null
-  const thr = chartThresholds('memory', model.insights?.memory)
+  const fresh = isUsable(memory, now)
+  const v = fresh ? memory.value! : null
+  const thr = fresh ? chartThresholds('memory', model.insights?.memory) : { lines: [] }
   return (
     <Tile
       tileKey="memory"
@@ -128,7 +166,9 @@ export function MemoryTile({ model, rows, ctx }: { model: TileCtx['model']; rows
               label: '内存占用',
               points: model.history.memory,
               format: formatPercent,
-              valueText: v ? `${formatBytes(v.used)} / ${formatBytes(v.total)}` : undefined,
+              valueText: memory.value
+                ? `${formatBytes(memory.value.used)} / ${formatBytes(memory.value.total)}`
+                : undefined,
               insight: model.insights?.memory,
               severity: rows.memory.severity,
             },
@@ -190,7 +230,7 @@ export function MemoryTile({ model, rows, ctx }: { model: TileCtx['model']; rows
               label="内存占用"
               format={formatPercent}
               severity={rows.memory.severity}
-              baseline={model.insights?.memory?.baseline}
+              baseline={fresh ? model.insights?.memory?.baseline : undefined}
               thresholds={thr.lines}
             />
           </>
@@ -198,5 +238,4 @@ export function MemoryTile({ model, rows, ctx }: { model: TileCtx['model']; rows
       </FactStatusText>
     </Tile>
   )
-}
-
+})

@@ -8,11 +8,13 @@ interface TokenRingProps {
   threshold?: number
   /** 环直径（px）；缺省 56，主展示区用 88~96。 */
   size?: number
+  /** total 为回退估值（容量未确认）：整体降饱和、不画阈值刻度。 */
+  unconfirmed?: boolean
   className?: string
 }
 
 /** 上下文占用环形图：弧长 = used/total，阈值刻度按提供值定位。 */
-export function TokenRing({ used, total, threshold, size = 56, className }: TokenRingProps) {
+export function TokenRing({ used, total, threshold, size = 56, unconfirmed, className }: TokenRingProps) {
   const r = size * 0.41
   const cx = size / 2
   const circ = 2 * Math.PI * r
@@ -23,7 +25,7 @@ export function TokenRing({ used, total, threshold, size = 56, className }: Toke
 
   // 从正上方顺时针起算，阈值比例对应的角度（弧度）
   const thresholdAngle =
-    threshold != null && total > 0
+    !unconfirmed && threshold != null && total > 0
       ? Math.min(1, threshold / total) * 2 * Math.PI
       : null
   const tick =
@@ -43,6 +45,7 @@ export function TokenRing({ used, total, threshold, size = 56, className }: Toke
       height={size}
       viewBox={`0 0 ${size} ${size}`}
       aria-hidden="true"
+      data-unconfirmed={unconfirmed || undefined}
     >
       <circle
         className={css.ringTrack}

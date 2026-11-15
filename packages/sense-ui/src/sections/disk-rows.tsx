@@ -7,7 +7,9 @@ import { FactStatusText } from '../fact'
 import { formatBytes, formatPercent, formatSignedDelta } from '../format'
 import {
   diskSeverity,
+  diskValid,
   effectiveStatus,
+  effectiveSeverity,
   isUsable,
   maxSeverity,
   type Severity,
@@ -22,11 +24,10 @@ import type {
   SenseEvent,
 } from '../view-model'
 import { Tile, TileDetail, type DetailMetric } from './tile'
-import type { TileCtx } from './tiles-basic'
+import { memoTile, type MetricTileProps } from './tiles-basic'
 import css from './body.module.css'
 
 type Disk = { mount: string; total: number; free: number }
-type Rows = ReturnType<typeof import('../health').evaluateBody>['rows']
 type Insights = Partial<Record<MetricKey, MetricInsight>>
 
 const SEV_RANK: Record<Severity, number> = {
@@ -61,7 +62,7 @@ function diskSev(d: Disk, insights: Insights, fresh: boolean): Severity {
   const freeRatio = d.total > 0 ? d.free / d.total : 0
   return maxSeverity(
     diskSeverity(freeRatio),
-    fresh ? (insights[`disk:${d.mount}`]?.severity ?? 'good') : 'good',
+    fresh ? effectiveSeverity(insights[`disk:${d.mount}`]) : 'good',
   )
 }
 
@@ -92,21 +93,25 @@ function FreeStrip({ d }: { d: Disk }) {
   )
 }
 
-export function DisksTile({
-  model,
-  rows,
-  ctx,
-}: {
-  model: TileCtx['model']
-  rows: Rows
-  ctx: TileCtx
-}) {
+export const DisksTile = memoTile(
+  'disks',
+  (m) => [
+    m.state.self.body.disks,
+    m.history.disks,
+    // 只盯本卡用到的挂载点 insight，无关指标 insight 更新不重渲
+    ...(m.state.self.body.disks.value ?? []).map(
+      (d) => m.insights?.[`disk:${d.mount}` as const],
+    ),
+  ],
+  function DisksTile({ model, rows, ctx }: MetricTileProps) {
   const { disks } = model.state.self.body
   const { now, events, insights } = model
   const fresh = isUsable(disks, now)
   // 过期但保留值：列表仍可展示，严重度/速率徽标一律降级为未知、不引用 insight
   const stale = !fresh && effectiveStatus(disks, now) === 'stale'
-  const list = fresh || (stale && disks.value !== null) ? disks.value! : null
+  const raw = fresh || (stale && disks.value !== null) ? disks.value! : null
+  // 无效读数（total<=0/NaN）不展示、不告警、不参与最差点挑选
+  const list = raw?.filter(diskValid) ?? null
   const focus = list?.length ? attentionDisk(list, insights ?? {}, fresh) : null
   const sev = (d: Disk): Severity =>
     stale ? 'unknown' : diskSev(d, insights ?? {}, fresh)
@@ -152,8 +157,7 @@ export function DisksTile({
     >
       <FactStatusText fact={disks} now={now}>
         {(val) =>
-          focus &&
-          val.length > 0 && (
+          (focus && val.filter(diskValid).length > 0 && (
             <>
               <span className={css.tileValue}>
                 <span className={css.mainLabel}>剩余</span>
@@ -161,7 +165,7 @@ export function DisksTile({
               </span>
               <span className={css.tileSub}>
                 共 {formatBytes(focus.total)} · {focus.mount}
-                {val.length > 1 ? ` · 共 ${val.length} 盘` : ''}
+                {(list?.length ?? 0) > 1 ? ` · 共 ${list!.length} 盘` : ''}
                 {fresh && rateBadge(`disk:${focus.mount}`, events, now) ? (
                   <em className={css.rateEm}>
                     {rateBadge(`disk:${focus.mount}`, events, now)}
@@ -175,18 +179,26 @@ export function DisksTile({
                 label={`磁盘 ${focus.mount} 使用率`}
                 format={formatPercent}
                 severity={sev(focus)}
-                baseline={insights?.[`disk:${focus.mount}`]?.baseline}
+                baseline={
+                  fresh
+                    ? insights?.[`disk:${focus.mount}`]?.baseline
+                    : undefined
+                }
                 thresholds={
-                  chartThresholds(
-                    `disk:${focus.mount}`,
-                    insights?.[`disk:${focus.mount}`],
-                  ).lines
+                  fresh
+                    ? chartThresholds(
+                        `disk:${focus.mount}`,
+                        insights?.[`disk:${focus.mount}`],
+                      ).lines
+                    : []
                 }
               />
             </>
+          )) ?? (
+            <span className={css.tileSub}>无有效磁盘读数</span>
           )
         }
       </FactStatusText>
     </Tile>
   )
-}
+})

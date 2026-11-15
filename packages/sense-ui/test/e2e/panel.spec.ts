@@ -73,7 +73,9 @@ async function axeCheck(page: Page) {
     const axe = (window as unknown as { axe: { run: (o?: unknown) => Promise<{ violations: { impact: string; id: string }[] }> } }).axe
     return axe.run({ resultTypes: ['violations'] })
   })
-  const bad = results.violations.filter((v) => v.impact === 'serious' || v.impact === 'critical')
+  const bad = results.violations.filter(
+    (v) => v.impact === 'serious' || v.impact === 'critical' || v.id === 'region',
+  )
   expect(bad, JSON.stringify(bad.map((v) => v.id))).toEqual([])
 }
 
@@ -446,4 +448,141 @@ test.describe('交互', () => {
     )
     expect(filter).toContain('grayscale')
   })
+})
+
+test.describe('容量未确认（fallback 上下文窗口）', () => {
+  for (const theme of THEMES) {
+    test(`token-fallback 420 ${theme} 截图与降饱和`, async ({ page }) => {
+      const errors = watchErrors(page)
+      await page.setViewportSize({ width: 420, height: 900 })
+      await open(page, 'token-fallback', theme)
+      const t = tile(page, 'tokens')
+      await expect(t).toContainText('容量未确认')
+      await expect(t).not.toContainText('剩余')
+      await expect(t).not.toContainText('按当前速度')
+      // 环标记未确认，告警徽标不出现
+      await expect(t.locator('svg[data-unconfirmed]')).toHaveCount(1)
+      await expect(t.locator('[class*="sevTag"][data-sev="warn"]')).toHaveCount(0)
+      await axeCheck(page)
+      const file = path.join(SHOT_DIR, `token-fallback-420-${theme}.png`)
+      await page.screenshot({ path: file, fullPage: true, animations: 'disabled' })
+      expect(fs.statSync(file).size).toBeLessThan(300 * 1024)
+      expect(errors).toEqual([])
+    })
+  }
+})
+
+test.describe('修复验收：网格末位与阈值图', () => {
+  // 每个卡片矩形：key/top/width；grid 宽用于跨行判断
+  const tilesRect = (page: Page) =>
+    page.evaluate(() => {
+      const gw = document.querySelector('div[class*="tiles"]')!.getBoundingClientRect().width
+      return [...document.querySelectorAll<HTMLElement>('div[class*="tiles"] > [class*="tile"]')]
+        .map((el) => {
+          const r = el.getBoundingClientRect()
+          return { key: el.getAttribute('data-tile'), top: Math.round(r.top), w: r.width, gw }
+        })
+    })
+
+  // 末位是否单独成行只看最后一个整行卡之后的尾部序列
+  for (const c of [
+    { name: 'healthy', openKey: '', lastSpans: true, pairWith: '' },
+    { name: 'desktop-no-battery', openKey: '', lastSpans: false, pairWith: 'thermal' },
+    { name: 'healthy 展开 cpu', openKey: 'cpu', lastSpans: true, pairWith: '' },
+    { name: 'healthy 展开 disks', openKey: 'disks', lastSpans: false, pairWith: 'battery' },
+    { name: 'healthy 展开 network', openKey: 'network', lastSpans: true, pairWith: '' },
+  ]) {
+    test(`末位配对：${c.name}`, async ({ page }) => {
+      await page.setViewportSize({ width: 420, height: 900 })
+      await open(page, c.name.split(' ')[0]!, 'light')
+      if (c.openKey) await openTile(page, c.openKey)
+      const rects = await tilesRect(page)
+      const last = rects[rects.length - 1]!
+      expect(last.key).toBe('process')
+      if (c.lastSpans) {
+        expect(last.w).toBeGreaterThan(last.gw - 8)
+      } else {
+        expect(last.w).toBeLessThan(last.gw * 0.6)
+        expect(last.top).toBe(rects.find((r) => r.key === c.pairWith)!.top)
+      }
+    })
+  }
+  test('展开明细：告警线为虚线、严重线为实线且不与标签重叠', async ({ page }) => {
+    await page.setViewportSize({ width: 420, height: 900 })
+    await open(page, 'rapid-change', 'light')
+    const t = await openTile(page, 'disks')
+    // 末点当前状态标记 + 无障碍摘要含当前状态
+    await expect(t.locator('circle[data-current]').first()).toHaveCount(1)
+    expect(await t.locator('[class*="srOnly"]').first().textContent()).toContain('当前状态')
+    const lines = await t.locator('line[data-threshold]').evaluateAll((els) =>
+      els.map((el) => ({
+        sev: el.getAttribute('data-threshold'),
+        dash: getComputedStyle(el).strokeDasharray,
+        opacity: getComputedStyle(el).opacity,
+      })),
+    )
+    expect(lines.length).toBeGreaterThan(0)
+    for (const l of lines) {
+      expect(Number(l.opacity)).toBeGreaterThanOrEqual(0.99)
+      if (l.sev === 'warn') expect(l.dash).not.toBe('none')
+      if (l.sev === 'critical') expect(l.dash).toBe('none')
+    }
+    // 阈值标签互不重叠（≥2 个标签时逐一比对）
+    const labels = await t.locator('span[class*="thrLabel"]').evaluateAll((els) =>
+      els.map((el) => el.getBoundingClientRect().toJSON() as DOMRect),
+    )
+    for (const a of labels) {
+      for (const b of labels) {
+        if (a === b) continue
+        const overlap = !(a.bottom <= b.top || b.bottom <= a.top || a.right <= b.left || b.right <= a.left)
+        expect(overlap).toBe(false)
+      }
+    }
+  })
+
+  test('阈值线与面板背景对比度 ≥3，证据写 test-results', async ({ page }) => {
+    await page.setViewportSize({ width: 420, height: 900 })
+    await open(page, 'rapid-change', 'light')
+    const t = await openTile(page, 'disks')
+    const ratios = await t.evaluate(() => {
+      // CSS 颜色（含 color(srgb …)）经 1x1 canvas 归一为 [r,g,b,a]
+      const cv = document.createElement('canvas')
+      cv.width = cv.height = 1
+      const cx = cv.getContext('2d')!
+      const norm = (cssColor: string) => {
+        cx.clearRect(0, 0, 1, 1)
+        cx.fillStyle = cssColor
+        cx.fillRect(0, 0, 1, 1)
+        return [...cx.getImageData(0, 0, 1, 1).data] as number[]
+      }
+      const lum = ([r, g, b]: number[]) => {
+        const lin = (c: number) => {
+          const s = c / 255
+          return s <= 0.04045 ? s / 12.92 : ((s + 0.055) / 1.055) ** 2.4
+        }
+        return 0.2126 * lin(r!) + 0.7152 * lin(g!) + 0.0722 * lin(b!)
+      }
+      const bg = norm(getComputedStyle(document.querySelector('[data-panel]')!).backgroundColor)
+      const out: Record<string, { stroke: number[]; ratio: number }> = {}
+      for (const el of document.querySelectorAll('line[data-threshold]')) {
+        const sev = el.getAttribute('data-threshold')!
+        const stroke = norm(getComputedStyle(el).stroke)
+        const L1 = Math.max(lum(stroke), lum(bg))
+        const L2 = Math.min(lum(stroke), lum(bg))
+        out[sev] = { stroke, ratio: (L1 + 0.05) / (L2 + 0.05) }
+      }
+      return { bg, out }
+    })
+    expect(ratios.bg[3]).toBe(255)
+    expect(Object.keys(ratios.out).length).toBeGreaterThan(0)
+    fs.mkdirSync(RESULTS_DIR, { recursive: true })
+    fs.writeFileSync(
+      path.join(RESULTS_DIR, 'threshold-contrast.json'),
+      JSON.stringify(ratios, null, 2),
+    )
+    for (const [sev, r] of Object.entries(ratios.out)) {
+      expect(r.ratio, `${sev} 阈值线对比度`).toBeGreaterThanOrEqual(3)
+    }
+  })
+
 })

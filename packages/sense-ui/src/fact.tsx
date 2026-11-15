@@ -50,9 +50,10 @@ export function FactStatusText<T>({
   const status = effectiveStatus(fact, now)
   if ((status === 'ok' || status === 'stale') && fact.value !== null) {
     if (status === 'stale') {
-      // 过期保留值：整体去色 + 明确「已过期」与年龄，不伪装成新鲜数据
+      // 过期保留值：标注「上次读数」+ 整体去色 + 明确「已过期」与年龄，不伪装成新鲜数据
       return (
         <span className={css.factStale} data-status="stale">
+          <span className={css.factMeta}>上次读数</span>
           {children(fact.value)}
           <span className={css.factMeta}>
             已过期 · {formatAge(now, fact.observedAt)}
@@ -102,6 +103,7 @@ export function FactValue<T>({
   if (status === 'stale' && fact.value !== null) {
     return (
       <span className={css.factStale} title={sourceTitle}>
+        <span className={css.factMeta}>上次读数</span>
         {children(fact.value)}
         <span className={css.factMeta}>
           已过期 · {formatAge(now, fact.observedAt)}

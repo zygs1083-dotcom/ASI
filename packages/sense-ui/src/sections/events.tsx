@@ -53,7 +53,7 @@ function DetailLine({ d }: { d: EventDetail }) {
           指标 {d.metric} · {formatDuration(d.windowMs / 1000)}内变化{' '}
           {formatSignedDelta(d.delta, d.unit)}
           {d.timeToFloorMs != null
-            ? ` · 约 ${formatDuration(d.timeToFloorMs / 1000)}后触及底线`
+            ? ` · 当时预计 ${formatDuration(d.timeToFloorMs / 1000)}后触及底线`
             : ''}
         </span>
       )

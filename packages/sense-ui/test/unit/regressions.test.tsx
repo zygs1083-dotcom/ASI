@@ -316,3 +316,160 @@ describe('调整入口与反馈标记', () => {
     expect(li2.getAttribute('data-feedback')).not.toBeNull()
   })
 })
+
+describe('宿主触发缺省严重度（缺 severity 不显示为良好）', () => {
+  it.each(['floor', 'rate', 'baseline'] as const)(
+    '%s 层 triggered 无 severity：磁贴/总览/图标记 warn，明细标注未给严重度',
+    (layer) => {
+      const state = makeState()
+      state.self.body.cpu = fact({ usage: 0.5, perCore: [0.5], load1: 1, load5: 1, load15: 1 })
+      renderPanel({ ...makeScenario('healthy'), state, insights: { cpu: { sources: [layer], triggered: [layer] } } })
+      const tile = document.querySelector('details[data-tile="cpu"]')!
+      expect(within(tile as HTMLElement).getByText('注意')).toBeTruthy()
+      expect(screen.getByText('CPU 负载较高')).toBeTruthy()
+      // 摘要图末点标记取 effectiveSeverity（无可比阈值也可见 warn）
+      expect(tile.querySelector('summary circle[data-current="warn"]')).not.toBeNull()
+      expect(openTile('cpu').textContent).toContain('宿主未给严重度')
+    },
+  )
+})
+
+describe('contextWindow 回退估值', () => {
+  const tokenState = (source: 'configured' | 'catalog' | 'fallback') => {
+    const s = makeState()
+    s.self.body.tokens = fact({ ...s.self.body.tokens.value!, contextWindowSource: source })
+    return s
+  }
+
+  it('容量未确认：环降饱和、无剩余/填满/压缩派生，磁贴未知但总览不计缺失', () => {
+    renderPanel({ ...makeScenario('healthy'), state: tokenState('fallback') })
+    const tile = document.querySelector('details[data-tile="tokens"]')!
+    expect(tile.getAttribute('data-sev')).toBe('unknown')
+    expect(tile.textContent).toContain('容量未确认')
+    expect(tile.textContent).not.toContain('剩余')
+    expect(tile.textContent).not.toContain('按当前速度')
+    expect(tile.textContent).not.toContain('压缩')
+    expect(tile.querySelector('[data-unconfirmed]')).toBeTruthy()
+    // 会话用量不受影响；总览仍良好；展开图无容量派生底线
+    expect(tile.textContent).toContain('本会话')
+    expect(screen.getByText('状态良好')).toBeTruthy()
+    expect(
+      openTile('tokens').querySelectorAll('[class*="metricBlock"] line[data-threshold]'),
+    ).toHaveLength(0)
+  })
+
+  it.each([
+    ['configured', '配置值'],
+    ['catalog', '模型目录'],
+    ['fallback', '回退估值'],
+  ] as const)('%s 容量来源在明细标注为「%s」', (source, text) => {
+    renderPanel({ ...makeScenario('healthy'), state: tokenState(source) })
+    expect(openTile('tokens').textContent).toContain(text)
+  })
+})
+
+describe('过期事实禁用当前推算', () => {
+  const staleOf = <T,>(value: T) => fact(value, { status: 'ok', ageMs: 120_000, ttlMs: 5_000 })
+
+  it('stale 保留值标「上次读数」+ 已过期，禁用全部当前推算与明细 insight', () => {
+    const state = makeState()
+    state.self.body.tokens = staleOf(state.self.body.tokens.value!)
+    state.self.body.battery = staleOf(state.self.body.battery.value!)
+    state.self.body.cpu = fact(
+      { usage: 0.3, perCore: [0.3], load1: 1, load5: 1, load15: 1 },
+      { status: 'ok', ageMs: 120_000, ttlMs: 5_000 },
+    )
+    renderPanel({
+      ...makeScenario('healthy'),
+      state,
+      insights: { cpu: { baseline: { low: 0.1, high: 0.4 }, sources: ['floor', 'baseline'], triggered: ['baseline'] } },
+    })
+    const tokens = document.querySelector('details[data-tile="tokens"]')!
+    expect(tokens.textContent).not.toContain('按当前速度')
+    expect(tokens.textContent).toContain('上次读数')
+    expect(tokens.textContent).toContain('已过期')
+    const battery = document.querySelector('details[data-tile="battery"]')!
+    expect(battery.textContent).toContain('76%')
+    expect(battery.textContent).not.toContain('约剩')
+    // CPU 摘要图不引用 insight；明细表头为上次读数且触发层清空
+    const summary = document.querySelector('details[data-tile="cpu"] summary')!
+    expect(summary.querySelector('rect[data-baseline]')).toBeNull()
+    const details = openTile('cpu')
+    expect(details.textContent).toContain('上次读数 30%')
+    expect(details.textContent).not.toContain('当前 30%')
+    expect(details.textContent).toContain('未触发')
+  })
+
+  it.each(['denied', 'unavailable'] as const)(
+    '%s 保留值不泄露：摘要/明细都不出现（CPU 与 Token）',
+    (status) => {
+      const state = makeState()
+      state.self.body.cpu = fact(state.self.body.cpu.value!, { status, reason: '受限' })
+      state.self.body.tokens = fact(state.self.body.tokens.value!, { status, reason: '受限' })
+      renderPanel({ ...makeScenario('healthy'), state })
+      for (const key of ['cpu', 'tokens']) {
+        const tile = openTile(key)
+        for (const v of ['34%', '46.2', '12.34', '上次读数']) {
+          expect(tile.textContent).not.toContain(v)
+        }
+      }
+    },
+  )
+})
+
+describe('无有效磁盘读数', () => {
+  it.each([
+    { disks: [] as { mount: string; total: number; free: number }[] },
+    { disks: [{ mount: '/', total: 0, free: 0 }, { mount: '/x', total: -1, free: 0 }] },
+  ])('空/全无效列表 → 明示无有效读数、行未知、不伪造 0', ({ disks }) => {
+    const state = makeState()
+    state.self.body.disks = fact(disks)
+    renderPanel({ ...makeScenario('healthy'), state })
+    const tile = openTile('disks')
+    expect(tile.textContent).toContain('无有效磁盘读数')
+    expect(tile.textContent).not.toContain('0 B')
+    expect(within(tile as HTMLElement).getByText('未知')).toBeTruthy()
+    expect(screen.getByText('数据待补全')).toBeTruthy()
+  })
+})
+
+describe('fillMinutes 结果护栏', () => {
+  it.each([
+    1e-320, // 极小正增速：除法溢出 Infinity → 无估算
+    1,      // (128000-46200)/1 = 81800 分 > 7 天 → 无估算
+  ])('异常增速 %j → 不输出估算', (rate) => {
+    const s = makeState()
+    s.self.body.tokens = fact({ ...s.self.body.tokens.value!, contextGrowthPerMinute: rate })
+    renderPanel({ ...makeScenario('healthy'), state: s })
+    expect(document.body.textContent).not.toContain('按当前速度')
+    expect(document.body.textContent).not.toContain('Infinity')
+  })
+})
+
+describe('磁贴渲染隔离', () => {
+  it('无关更新不重渲 CPU 卡片；CPU 事实变化才重渲', () => {
+    const m = makeScenario('healthy')
+    const spy = vi.spyOn(m.state.self.body.cpu.value!.perCore, 'map')
+    const { view, props } = renderPanel(m)
+    const base = spy.mock.calls.length
+    expect(base).toBeGreaterThan(0)
+    // 无关变化：内存事实与 model 包装更新，CPU 引用与 now/events 不变
+    const body2 = { ...m.state.self.body }
+    body2.memory = fact({ total: 32e9, used: 20e9, pressure: 'warn', swapUsed: 0 })
+    view.rerender(
+      <SensePanel {...props} model={{ ...m, state: { ...m.state, self: { ...m.state.self, body: body2 } } }} />,
+    )
+    expect(spy.mock.calls.length).toBe(base)
+    // CPU 事实变化 → 重渲（新事实的 perCore 也会触发 map）
+    const body3 = { ...body2 }
+    body3.cpu = fact({ usage: 0.91, perCore: [0.9], load1: 1, load5: 1, load15: 1 })
+    const spy3 = vi.spyOn(body3.cpu.value!.perCore, 'map')
+    view.rerender(
+      <SensePanel
+        {...props}
+        model={{ ...m, state: { ...m.state, self: { ...m.state.self, body: body3 } } }}
+      />,
+    )
+    expect(spy3.mock.calls.length).toBeGreaterThan(0)
+  })
+})

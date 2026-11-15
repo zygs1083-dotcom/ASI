@@ -1,10 +1,13 @@
 /**
  * 指标阈值解析：画线用的阈值线集合 + 明细三行文案。
- * 规则：宿主提供的 floor 优先（单位不符则不画线），否则用既有健康底线；
+ * 规则：宿主提供的 floor/rate/baseline 凡单位可比较都画线（各带层名标签），
+ * supplied floor 缺失时回退既有健康底线；显式单位不符的 floor 阻断该回退
+ * （单位对不上时既有底线的数值同样可疑），只在明细行里展示原值。
  * rate/baseline 不做数值假设，未提供即「未提供」。
  */
 
 import { formatMetricValue } from './format'
+import { effectiveSeverity } from './health'
 import type {
   DetailUnit,
   MetricInsight,
@@ -17,16 +20,34 @@ export interface SparkThreshold {
   sev: 'warn' | 'critical'
   /** above = 高于阈值告警；below = 低于阈值告警（电池反向）。 */
   direction: 'above' | 'below'
+  /** 线的短标签（底线 / 变化率 / 基线 / 显示底线）；展开图标注用。 */
+  label?: string
 }
 
 /** 各指标 history 序列的单位（电池按百分点数值、温控按档位序数，均为 count）。 */
 export function metricUnit(key: MetricKey): DetailUnit {
   if (key === 'tokens') return 'tokens'
-  if (key === 'networkRx' || key === 'networkTx' || key === 'processRss') {
-    return 'bytes'
-  }
+  if (key === 'networkRx' || key === 'networkTx') return 'bytes/s'
+  if (key === 'processRss') return 'bytes'
   if (key === 'battery' || key === 'thermal') return 'count'
   return 'ratio'
+}
+
+const NETWORK_KEYS = new Set<MetricKey>(['networkRx', 'networkTx'])
+
+/**
+ * 宿主标注单位能否画在 history 坐标上：
+ * 缺省视为同单位；网络序列本来就是 B/s，兼容旧版 'bytes' 标注。
+ */
+function unitPlottable(key: MetricKey, unit?: DetailUnit): boolean {
+  if (unit == null) return true
+  if (NETWORK_KEYS.has(key)) return unit === 'bytes/s' || unit === 'bytes'
+  return unit === metricUnit(key)
+}
+
+/** 明细文本用的单位：网络旧版 'bytes' 按 B/s 展示，其余原样。 */
+function displayUnit(key: MetricKey, unit: DetailUnit): DetailUnit {
+  return NETWORK_KEYS.has(key) && unit === 'bytes' ? 'bytes/s' : unit
 }
 
 const FLOOR_DEFAULTS: Record<
@@ -39,6 +60,12 @@ const FLOOR_DEFAULTS: Record<
   battery: { warn: 15, critical: 5, direction: 'below' },
   thermal: { warn: 1, critical: 3, direction: 'above' },
   processCpu: { warn: 0.75, critical: 0.9, direction: 'above' },
+}
+
+const LAYER_LABEL: Record<ThresholdLayer, string> = {
+  floor: '底线',
+  rate: '变化率',
+  baseline: '基线',
 }
 
 /** 既有健康底线（history 单位）；无既有底线的指标（网络/processRss）返回 null。 */
@@ -65,39 +92,42 @@ export function defaultFloors(
 
 export interface ChartThresholds {
   lines: SparkThreshold[]
-  /** supplied = 宿主提供；default = 既有显示底线；null = 无线可画。 */
+  /** supplied = 含宿主提供线；default = 仅既有显示底线；null = 无线可画。 */
   source: 'supplied' | 'default' | null
 }
 
 /**
- * 画线阈值：宿主 floor 优先；显式 unit 与 history 单位不符时不画线也不回退
- * （单位对不上时既有底线的数值同样可疑），只在明细行里展示原值。
+ * 画线阈值：收集全部可比较的宿主 floor/rate/baseline 线；
+ * 无 supplied floor 时并入既有显示底线；floor 显式单位不符则阻断回退。
+ * supplied 线的严重度取 effectiveSeverity（warn/critical），否则缺省 warn。
  */
 export function chartThresholds(
   key: MetricKey,
   insight: MetricInsight | undefined,
   tokenWindow?: number,
 ): ChartThresholds {
-  const floor = insight?.thresholds?.floor
-  if (floor && Number.isFinite(floor.value)) {
-    if (floor.unit != null && floor.unit !== metricUnit(key)) {
-      return { lines: [], source: null }
+  const lines: SparkThreshold[] = []
+  const sev = effectiveSeverity(insight) === 'critical' ? 'critical' : 'warn'
+  const direction = key === 'battery' ? 'below' : 'above'
+  let supplied = false
+  let floorBlocked = false
+  for (const layer of ['floor', 'rate', 'baseline'] as const) {
+    const t = insight?.thresholds?.[layer]
+    if (!t || !Number.isFinite(t.value)) continue
+    if (!unitPlottable(key, t.unit)) {
+      if (layer === 'floor') floorBlocked = true
+      continue
     }
-    return {
-      lines: [
-        {
-          value: floor.value,
-          // 单条宿主阈值不带严重度层级，固定按 warn 画；
-          // 方向跟随指标语义（电池越低越糟，其余越高越糟）。
-          sev: 'warn',
-          direction: key === 'battery' ? 'below' : 'above',
-        },
-      ],
-      source: 'supplied',
-    }
+    supplied = true
+    lines.push({ value: t.value, sev, direction, label: LAYER_LABEL[layer] })
   }
-  const d = defaultFloors(key, tokenWindow)
-  return d ? { lines: d, source: 'default' } : { lines: [], source: null }
+  const floorSupplied = lines.some((l) => l.label === LAYER_LABEL.floor)
+  if (!floorSupplied && !floorBlocked) {
+    const d = defaultFloors(key, tokenWindow)
+    if (d) lines.push(...d.map((t) => ({ ...t, label: '显示底线' })))
+  }
+  if (lines.length === 0) return { lines, source: null }
+  return { lines, source: supplied ? 'supplied' : 'default' }
 }
 
 /**
@@ -114,7 +144,7 @@ export function thresholdRowText(
 ): string {
   const t = insight?.thresholds?.[layer]
   if (t && Number.isFinite(t.value)) {
-    return `${formatMetricValue(t.value, t.unit ?? metricUnit(key))}（${t.source}）`
+    return `${formatMetricValue(t.value, displayUnit(key, t.unit ?? metricUnit(key)))}（${t.source}）`
   }
   if (layer === 'baseline') {
     return insight?.baseline

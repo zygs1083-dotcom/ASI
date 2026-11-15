@@ -11,10 +11,8 @@ import { Sparkline } from '../sparkline'
 import { chartThresholds } from '../thresholds'
 import { BatteryIcon, ThermalIcon } from '../icons'
 import { Tile, TileDetail } from './tile'
-import type { TileCtx } from './tiles-basic'
+import { memoTile, type MetricTileProps } from './tiles-basic'
 import css from './body.module.css'
-
-type Rows = ReturnType<typeof import('../health').evaluateBody>['rows']
 
 const THERMAL_TEXT = {
   nominal: '正常',
@@ -23,11 +21,15 @@ const THERMAL_TEXT = {
   critical: '过热',
 } as const
 
-export function ThermalTile({ model, rows, ctx }: { model: TileCtx['model']; rows: Rows; ctx: TileCtx }) {
+export const ThermalTile = memoTile(
+  'thermal',
+  (m) => [m.state.self.body.thermal, m.insights?.thermal, m.history.thermal],
+  function ThermalTile({ model, rows, ctx }: MetricTileProps) {
   const { thermal } = model.state.self.body
   const { now } = model
-  const v = isUsable(thermal, now) ? thermal.value! : null
-  const thr = chartThresholds('thermal', model.insights?.thermal)
+  const fresh = isUsable(thermal, now)
+  const v = fresh ? thermal.value! : null
+  const thr = fresh ? chartThresholds('thermal', model.insights?.thermal) : { lines: [] }
   return (
     <Tile
       tileKey="thermal"
@@ -47,7 +49,7 @@ export function ThermalTile({ model, rows, ctx }: { model: TileCtx['model']; row
               label: '温控档位',
               points: model.history.thermal,
               format: formatThermalOrdinal,
-              valueText: v ? THERMAL_TEXT[v] : undefined,
+              valueText: thermal.value ? THERMAL_TEXT[thermal.value] : undefined,
               insight: model.insights?.thermal,
               severity: rows.thermal.severity,
             },
@@ -66,7 +68,7 @@ export function ThermalTile({ model, rows, ctx }: { model: TileCtx['model']; row
               label="温控档位"
               format={formatThermalOrdinal}
               severity={rows.thermal.severity}
-              baseline={model.insights?.thermal?.baseline}
+              baseline={fresh ? model.insights?.thermal?.baseline : undefined}
               thresholds={thr.lines}
             />
           </>
@@ -74,13 +76,17 @@ export function ThermalTile({ model, rows, ctx }: { model: TileCtx['model']; row
       </FactStatusText>
     </Tile>
   )
-}
+})
 
-export function BatteryTile({ model, rows, ctx }: { model: TileCtx['model']; rows: Rows; ctx: TileCtx }) {
+export const BatteryTile = memoTile(
+  'battery',
+  (m) => [m.state.self.body.battery, m.insights?.battery, m.history.battery],
+  function BatteryTile({ model, rows, ctx }: MetricTileProps) {
   const { battery } = model.state.self.body
   const { now } = model
-  const v = isUsable(battery, now) ? battery.value : null
-  const thr = chartThresholds('battery', model.insights?.battery)
+  const fresh = isUsable(battery, now)
+  const v = fresh ? battery.value : null
+  const thr = fresh ? chartThresholds('battery', model.insights?.battery) : { lines: [] }
   return (
     <Tile
       tileKey="battery"
@@ -100,7 +106,9 @@ export function BatteryTile({ model, rows, ctx }: { model: TileCtx['model']; row
               label: '电池电量',
               points: model.history.battery,
               format: formatPercentValue,
-              valueText: v ? formatPercentValue(v.percent) : undefined,
+              valueText: battery.value
+                ? formatPercentValue(battery.value.percent)
+                : undefined,
               insight: model.insights?.battery,
               severity: rows.battery.severity,
             },
@@ -115,7 +123,7 @@ export function BatteryTile({ model, rows, ctx }: { model: TileCtx['model']; row
               <span className={css.tileValue}>{formatPercentValue(val.percent)}</span>
               <span className={css.tileSub}>
                 {val.charging ? '充电中' : '未充电'}
-                {val.minutesLeft != null
+                {fresh && val.minutesLeft != null
                   ? ` · 约剩 ${formatDuration(val.minutesLeft * 60)}`
                   : ''}
               </span>
@@ -134,4 +142,4 @@ export function BatteryTile({ model, rows, ctx }: { model: TileCtx['model']; row
       </FactStatusText>
     </Tile>
   )
-}
+})

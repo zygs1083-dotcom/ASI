@@ -6,17 +6,25 @@ import { isUsable } from '../health'
 import { Sparkline } from '../sparkline'
 import { chartThresholds } from '../thresholds'
 import { NetworkIcon, ProcessIcon } from '../icons'
-import type { TileCtx } from './tiles-basic'
+import { memoTile, type MetricTileProps } from './tiles-basic'
 import { Tile, TileDetail } from './tile'
 import css from './body.module.css'
 
-type Rows = ReturnType<typeof import('../health').evaluateBody>['rows']
-
-export function NetworkTile({ model, rows, ctx }: { model: TileCtx['model']; rows: Rows; ctx: TileCtx }) {
+export const NetworkTile = memoTile(
+  'network',
+  (m) => [
+    m.state.self.body.network,
+    m.insights?.networkRx,
+    m.insights?.networkTx,
+    m.history.networkRx,
+    m.history.networkTx,
+  ],
+  function NetworkTile({ model, rows, ctx }: MetricTileProps) {
   const { network } = model.state.self.body
   const { now, insights } = model
-  const v = isUsable(network, now) ? network.value! : null
-  const rxThr = chartThresholds('networkRx', insights?.networkRx)
+  const fresh = isUsable(network, now)
+  const v = fresh ? network.value! : null
+  const rxThr = fresh ? chartThresholds('networkRx', insights?.networkRx) : { lines: [] }
   return (
     <Tile
       tileKey="network"
@@ -36,7 +44,7 @@ export function NetworkTile({ model, rows, ctx }: { model: TileCtx['model']; row
               label: '网络下行',
               points: model.history.networkRx,
               format: formatRate,
-              valueText: v ? formatRate(v.rxBps) : undefined,
+              valueText: network.value ? formatRate(network.value.rxBps) : undefined,
               insight: insights?.networkRx,
               severity: rows.network.severity,
             },
@@ -45,7 +53,7 @@ export function NetworkTile({ model, rows, ctx }: { model: TileCtx['model']; row
               label: '网络上行',
               points: model.history.networkTx,
               format: formatRate,
-              valueText: v ? formatRate(v.txBps) : undefined,
+              valueText: network.value ? formatRate(network.value.txBps) : undefined,
               insight: insights?.networkTx,
               severity: rows.network.severity,
             },
@@ -66,7 +74,7 @@ export function NetworkTile({ model, rows, ctx }: { model: TileCtx['model']; row
               label="网络下行"
               format={formatRate}
               severity={rows.network.severity}
-              baseline={insights?.networkRx?.baseline}
+              baseline={fresh ? insights?.networkRx?.baseline : undefined}
               thresholds={rxThr.lines}
             />
           </>
@@ -74,13 +82,23 @@ export function NetworkTile({ model, rows, ctx }: { model: TileCtx['model']; row
       </FactStatusText>
     </Tile>
   )
-}
+})
 
-export function ProcessTile({ model, rows, ctx }: { model: TileCtx['model']; rows: Rows; ctx: TileCtx }) {
+export const ProcessTile = memoTile(
+  'process',
+  (m) => [
+    m.state.self.body.harnessProcess,
+    m.insights?.processCpu,
+    m.insights?.processRss,
+    m.history.processCpu,
+    m.history.processRss,
+  ],
+  function ProcessTile({ model, rows, ctx }: MetricTileProps) {
   const { harnessProcess } = model.state.self.body
   const { now, insights } = model
-  const v = isUsable(harnessProcess, now) ? harnessProcess.value! : null
-  const rssThr = chartThresholds('processRss', insights?.processRss)
+  const fresh = isUsable(harnessProcess, now)
+  const v = fresh ? harnessProcess.value! : null
+  const rssThr = fresh ? chartThresholds('processRss', insights?.processRss) : { lines: [] }
   return (
     <Tile
       tileKey="process"
@@ -100,7 +118,9 @@ export function ProcessTile({ model, rows, ctx }: { model: TileCtx['model']; row
               label: 'DSH 内存',
               points: model.history.processRss,
               format: formatBytes,
-              valueText: v ? formatBytes(v.rss) : undefined,
+              valueText: harnessProcess.value
+                ? formatBytes(harnessProcess.value.rss)
+                : undefined,
               insight: insights?.processRss,
               severity: rows.process.severity,
             },
@@ -109,7 +129,9 @@ export function ProcessTile({ model, rows, ctx }: { model: TileCtx['model']; row
               label: 'DSH CPU',
               points: model.history.processCpu,
               format: formatPercent,
-              valueText: v ? formatPercent(v.cpu) : undefined,
+              valueText: harnessProcess.value
+                ? formatPercent(harnessProcess.value.cpu)
+                : undefined,
               insight: insights?.processCpu,
               severity: rows.process.severity,
             },
@@ -131,7 +153,7 @@ export function ProcessTile({ model, rows, ctx }: { model: TileCtx['model']; row
               label="DSH 内存"
               format={formatBytes}
               severity={rows.process.severity}
-              baseline={insights?.processRss?.baseline}
+              baseline={fresh ? insights?.processRss?.baseline : undefined}
               thresholds={rssThr.lines}
             />
           </>
@@ -139,4 +161,4 @@ export function ProcessTile({ model, rows, ctx }: { model: TileCtx['model']; row
       </FactStatusText>
     </Tile>
   )
-}
+})

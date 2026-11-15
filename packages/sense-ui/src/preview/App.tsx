@@ -49,7 +49,7 @@ export function App() {
 
   return (
     <>
-      <div className="demoBar">
+      <nav className="demoBar" aria-label="预览工具栏">
         <label>
           场景
           <select
@@ -79,7 +79,7 @@ export function App() {
           实时模式
         </label>
         <span className="demoAction">{lastAction}</span>
-      </div>
+      </nav>
       <main className="stage">
         <SensePanel
           model={model}

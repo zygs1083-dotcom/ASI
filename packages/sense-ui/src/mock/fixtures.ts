@@ -112,6 +112,7 @@ export function makeBody(): SenseState['self']['body'] {
     harnessProcess: fact({ rss: 512e6, cpu: 0.07, uptimeSec: 14_200 }),
     tokens: fact({
       contextWindow: 128_000,
+      contextWindowSource: 'configured',
       contextUsed: 46_200,
       contextProjected: 52_800,
       sessionUsage: { input: 96_400, output: 12_800, cacheRead: 61_000, cacheWrite: 9_200 },

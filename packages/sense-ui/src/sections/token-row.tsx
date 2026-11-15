@@ -1,38 +1,42 @@
 /** Token 卡片：跨两列，环形图 + 三条紧凑信息行，明细给大图与精确缓存值。 */
 
 import {
+  MAX_DISPLAY_MINUTES,
   formatMoney,
   formatPercent,
   formatTokens,
 } from '../format'
-import { isUsable } from '../health'
+import { effectiveStatus, isUsable } from '../health'
 import { FactStatusText, STATUS_TEXT } from '../fact'
 import { Sparkline } from '../sparkline'
 import { chartThresholds } from '../thresholds'
 import { TokenRing } from '../token-ring'
 import { TokenIcon } from '../icons'
 import { Tile, TileDetail } from './tile'
-import type { TileCtx } from './tiles-basic'
+import { memoTile, type MetricTileProps } from './tiles-basic'
 import type { TokenVitals } from '../view-model'
 import css from './body.module.css'
 
-type Rows = ReturnType<typeof import('../health').evaluateBody>['rows']
+const WINDOW_SOURCE_TEXT = {
+  configured: '配置值',
+  catalog: '模型目录',
+  fallback: '回退估值（未确认）',
+} as const
 
-export function TokenTile({
-  model,
-  rows,
-  ctx,
-}: {
-  model: TileCtx['model']
-  rows: Rows
-  ctx: TileCtx
-}) {
+export const TokenTile = memoTile(
+  'tokens',
+  (m) => [m.state.self.body.tokens, m.insights?.tokens, m.history.tokens],
+  function TokenTile({ model, rows, ctx }: MetricTileProps) {
   const f = model.state.self.body.tokens
   const { now } = model
-  const insight = model.insights?.tokens
-  const v = isUsable(f, now) ? f.value! : null
-  const win = v?.contextWindow
-  const thr = chartThresholds('tokens', insight, win ?? undefined)
+  const fresh = isUsable(f, now)
+  // denied/unavailable 的保留值不进摘要/明细；stale 保留值仍可灰显
+  const v = fresh || effectiveStatus(f, now) === 'stale' ? f.value : null
+  // 回退估值容量未确认：不画容量派生底线，也不消费 token insight
+  const unconfirmed = v?.contextWindowSource === 'fallback'
+  const insight = fresh && !unconfirmed ? model.insights?.tokens : undefined
+  const win = unconfirmed ? undefined : v?.contextWindow
+  const thr = fresh ? chartThresholds('tokens', insight, win ?? undefined) : { lines: [] }
 
   return (
     <Tile
@@ -55,8 +59,8 @@ export function TokenTile({
               points: model.history.tokens,
               format: formatTokens,
               valueText:
-                v && win != null && v.contextUsed != null
-                  ? `${formatTokens(v.contextUsed)} / ${formatTokens(win)}`
+                v?.contextWindow != null && v.contextUsed != null
+                  ? `${formatTokens(v.contextUsed)} / ${formatTokens(v.contextWindow)}`
                   : undefined,
               insight,
               severity: rows.tokens.severity,
@@ -65,39 +69,48 @@ export function TokenTile({
           ]}
           extra={
             v && (
-              <TokenExtra v={v} onOpenPermissionSettings={ctx.onOpenPermissionSettings} />
+              <>
+                {v.contextWindowSource && v.contextWindow != null && (
+                  <div className={css.detailLine}>
+                    上下文窗口来源：{WINDOW_SOURCE_TEXT[v.contextWindowSource]}
+                  </div>
+                )}
+                <TokenExtra v={v} onOpenPermissionSettings={ctx.onOpenPermissionSettings} />
+              </>
             )
           }
         />
       }
     >
       <FactStatusText fact={f} now={now}>
-        {(val) => <TokenSummary v={val} rows={rows} model={model} thr={thr.lines} />}
+        {(val) => (
+          <TokenSummary
+            v={val}
+            rows={rows}
+            model={model}
+            thr={thr.lines}
+            fresh={fresh}
+            confirmed={!unconfirmed}
+            baseline={insight?.baseline}
+          />
+        )}
       </FactStatusText>
     </Tile>
   )
-}
+})
 
 /**
  * 按宿主投影的增速估算填满剩余上下文所需分钟数。
  * 任一输入缺失/非有限/增速 ≤0 都不估算（不编造斜率）。
  */
 function fillMinutes(v: TokenVitals): number | null {
-  const { contextWindow: win, contextUsed: used, contextGrowthPerMinute: rate } =
-    v
-  if (
-    win == null ||
-    used == null ||
-    rate == null ||
-    !Number.isFinite(win) ||
-    !Number.isFinite(used) ||
-    !Number.isFinite(rate) ||
-    win <= 0 ||
-    rate <= 0
-  ) {
-    return null
-  }
-  return Math.max(0, Math.ceil((win - used) / rate))
+  const { contextWindow: win, contextUsed: used, contextGrowthPerMinute: rate } = v
+  if (win == null || used == null || rate == null) return null
+  if (![win, used, rate].every(Number.isFinite) || win <= 0 || rate <= 0) return null
+  // 结果同样要有限且在 7 天内：极小正增速会让除法溢出为 Infinity。
+  const minutes = (win - used) / rate
+  if (!Number.isFinite(minutes) || minutes > MAX_DISPLAY_MINUTES) return null
+  return Math.max(0, Math.ceil(minutes))
 }
 
 function TokenSummary({
@@ -105,21 +118,29 @@ function TokenSummary({
   rows,
   model,
   thr,
+  fresh,
+  confirmed,
+  baseline,
 }: {
   v: TokenVitals
-  rows: Rows
-  model: TileCtx['model']
+  rows: MetricTileProps['rows']
+  model: MetricTileProps['model']
   thr: ReturnType<typeof chartThresholds>['lines']
+  /** 事实新鲜（非过期保留值）才允许任何当前推算。 */
+  fresh: boolean
+  /** 容量已确认（非回退估值）才给余量/压缩派生。 */
+  confirmed: boolean
+  baseline?: import('../view-model').MetricInsight['baseline']
 }) {
   const { now } = model
   const hasContext =
     v.contextWindow != null && v.contextUsed != null && v.contextWindow > 0
   const { input, output, cacheRead } = v.sessionUsage
   const left =
-    hasContext && v.contextUsed != null
+    hasContext && confirmed && v.contextUsed != null
       ? Math.max(0, v.contextWindow! - v.contextUsed)
       : null
-  const fillMin = fillMinutes(v)
+  const fillMin = fresh && confirmed ? fillMinutes(v) : null
 
   return (
     <>
@@ -130,15 +151,22 @@ function TokenSummary({
             total={v.contextWindow!}
             threshold={v.compressionThreshold}
             size={92}
+            unconfirmed={!confirmed}
           />
           <span className={css.tokenSide}>
             <span className={css.tileValue}>
               {formatTokens(v.contextUsed!)} / {formatTokens(v.contextWindow!)}
             </span>
-            <span className={css.tileSub}>
-              剩余 {formatTokens(left!)}（
-              {formatPercent(Math.max(0, left! / v.contextWindow!))}）
-            </span>
+            {!confirmed ? (
+              <span className={css.tileSub} data-unconfirmed-note>
+                容量未确认（回退估值）
+              </span>
+            ) : (
+              <span className={css.tileSub}>
+                剩余 {formatTokens(left!)}（
+                {formatPercent(Math.max(0, left! / v.contextWindow!))}）
+              </span>
+            )}
             <span className={css.tileSub}>
               预计下次{' '}
               {v.contextProjected != null
@@ -159,7 +187,7 @@ function TokenSummary({
         本会话 输入 {formatTokens(input)} · 输出 {formatTokens(output)} ·
         缓存命中率 {input > 0 ? formatPercent(cacheRead / input) : '暂无输入'}
       </span>
-      {hasContext && (
+      {hasContext && confirmed && (
         <span className={css.tileSub}>
           <CompressionDistance v={v} />
         </span>
@@ -171,7 +199,7 @@ function TokenSummary({
         label="上下文占用"
         format={formatTokens}
         severity={rows.tokens.severity}
-        baseline={model.insights?.tokens?.baseline}
+        baseline={baseline}
         thresholds={thr}
       />
     </>

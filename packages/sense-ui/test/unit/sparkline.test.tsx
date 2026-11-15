@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import { cleanup, render, screen } from '@testing-library/react'
 import { afterEach } from 'vitest'
-import { Sparkline } from '../../src/sparkline'
+import { Sparkline, sampleHistory } from '../../src/sparkline'
 import { formatCount, formatPercent } from '../../src/format'
 import { T0 } from '../../src/mock/fixtures'
 
@@ -254,5 +254,105 @@ describe('Sparkline 展开大图', () => {
     expect(label.closest('[class*="chartPlot"]')).toBeTruthy()
     const axisX = container.querySelector('[class*="axisX"]')!
     expect(axisX.closest('[class*="chartPlot"]')).toBeNull()
+  })
+})
+
+describe('sampleHistory 降采样', () => {
+  const big = () =>
+    Array.from({ length: 200_000 }, (_, i) => ({
+      at: T0 - 300_000 + Math.floor((i * 299_999) / 199_999),
+      value: i === 12_345 ? -50 : i === 150_000 ? 999 : 10 + Math.sin(i / 400),
+    }))
+
+  it('200,000 点 → ≤240，保留首末端点与全局极值，不抛错', () => {
+    const pts = big()
+    const t0 = performance.now()
+    const out = sampleHistory(pts, T0)
+    expect(performance.now() - t0).toBeLessThan(50)
+    expect(out.length).toBeLessThanOrEqual(240)
+    expect(out[0]!.at).toBe(pts[0]!.at)
+    expect(out[out.length - 1]!.at).toBe(pts[199_999]!.at)
+    let mn = Infinity
+    let mx = -Infinity
+    for (const p of out) { if (p.value < mn) mn = p.value; if (p.value > mx) mx = p.value }
+    expect([mn, mx]).toEqual([-50, 999])
+  })
+
+  it('≤240 点：完整保留并按时间排序，窗外观测点被过滤', () => {
+    const pts = [
+      { at: T0 - 10_000, value: 3 },
+      { at: T0, value: 5 },
+      { at: T0 - 20_000, value: 1 },
+      { at: T0 + 1, value: 99 },
+    ]
+    expect(sampleHistory(pts, T0).map((p) => p.value)).toEqual([1, 3, 5])
+  })
+
+  it('200,000 点整图渲染 <50ms（夹具分配不计时）', () => {
+    const pts = big()
+    const t0 = performance.now()
+    const { container } = render(
+      <Sparkline points={pts} now={T0} label="压力" format={formatCount} />,
+    )
+    console.log(`[sparkline-200k] render ${(performance.now() - t0).toFixed(1)}ms`)
+    expect(performance.now() - t0).toBeLessThan(50)
+    const d = container.querySelector('path')!.getAttribute('d')!
+    expect(d.split('L').length).toBeLessThanOrEqual(240)
+  })
+})
+
+describe('当前状态与阈值边界', () => {
+  const twoPts = [{ at: T0 - 10_000, value: 1 }, { at: T0, value: 2 }]
+
+  it.each([
+    ['warn', '注意'],
+    ['critical', '紧急'],
+  ] as const)('%s：末点状态标记 + 无障碍摘要含当前状态', (sev, word) => {
+    const { container } = render(
+      <Sparkline points={twoPts} now={T0} label="测试" format={formatCount} severity={sev} />,
+    )
+    expect(container.querySelector(`circle[data-current="${sev}"]`)).toBeTruthy()
+    expect(screen.getByText(/最近 5 分钟趋势/).textContent).toContain(word)
+  })
+
+  it('值恰等于阈值判为越界（与状态比较 ≥/≤ 一致）', () => {
+    const { container } = render(
+      <Sparkline
+        points={[{ at: T0 - 10_000, value: 5 }, { at: T0, value: 5 }]}
+        now={T0}
+        label="测试"
+        format={formatCount}
+        thresholds={[{ value: 5, sev: 'warn', direction: 'above' }]}
+      />,
+    )
+    expect(container.querySelector('path[data-out-of-range="warn"]')).toBeTruthy()
+  })
+})
+
+describe('展开图多阈值标注间距', () => {
+  it('贴近的多条标注按 ≥13px/110px 间隔排开、夹在图内且含层名', () => {
+    const { container } = render(
+      <Sparkline
+        expanded
+        points={[{ at: T0 - 60_000, value: 3 }, { at: T0, value: 7 }]}
+        now={T0}
+        label="测试"
+        format={(v) => v.toFixed(1)}
+        thresholds={[
+          { value: 8.0, sev: 'warn', direction: 'above', label: '底线' },
+          { value: 8.2, sev: 'warn', direction: 'above', label: '变化率' },
+          { value: 8.4, sev: 'critical', direction: 'above', label: '基线' },
+        ]}
+      />,
+    )
+    const labels = [...container.querySelectorAll<HTMLElement>('[class*="thrLabel"]')]
+    expect(labels).toHaveLength(3)
+    const tops = labels.map((l) => Number.parseFloat(l.style.top)).sort((a, b) => a - b)
+    for (let i = 1; i < tops.length; i++) {
+      expect(tops[i]! - tops[i - 1]!).toBeGreaterThanOrEqual(11.5)
+    }
+    for (const t of tops) { expect(t).toBeGreaterThanOrEqual(0); expect(t).toBeLessThanOrEqual(100) }
+    const joined = labels.map((l) => l.textContent).join(' ')
+    for (const w of ['底线', '变化率', '基线']) expect(joined).toContain(w)
   })
 })

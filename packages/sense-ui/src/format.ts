@@ -79,6 +79,12 @@ export function formatPercentValue(n: number): string {
 
 /** 按单位格式化指标数值（事件 detail、异常对比共用）。 */
 export function formatMetricValue(v: number, unit: DeltaUnit): string {
+  if (unit === 'bytes/s') return formatRate(v)
+  if (unit.endsWith('/s') || unit.endsWith('/min')) {
+    const base = unit.slice(0, unit.indexOf('/')) as DeltaUnit
+    const per = unit.endsWith('/min') ? '/分' : '/s'
+    return `${formatMetricValue(v, base)}${per}`
+  }
   switch (unit) {
     case 'bytes':
       return formatBytes(v)
@@ -88,6 +94,8 @@ export function formatMetricValue(v: number, unit: DeltaUnit): string {
       return formatTokens(v)
     case 'count':
       return formatCount(v)
+    default:
+      return String(v)
   }
 }
 
@@ -123,13 +131,19 @@ export function formatTimestamp(at: number): string {
 }
 
 export function formatDuration(totalSec: number): string {
+  if (!Number.isFinite(totalSec)) return '未知'
   const sec = Math.max(0, Math.round(totalSec))
+  // 显示上限 7 天：更长的跨度以「7 天以上」封顶，不堆天文数字。
+  if (sec > 7 * 86_400) return '7 天以上'
   const h = Math.floor(sec / 3600)
   const m = Math.floor((sec % 3600) / 60)
   if (h > 0) return `${h} 小时 ${m} 分`
   if (m > 0) return `${m} 分 ${sec % 60} 秒`
   return `${sec} 秒`
 }
+
+/** 分钟级估算的显示上限（7 天）。 */
+export const MAX_DISPLAY_MINUTES = 7 * 24 * 60
 
 export function formatMoney(amount: number, currency: string): string {
   try {

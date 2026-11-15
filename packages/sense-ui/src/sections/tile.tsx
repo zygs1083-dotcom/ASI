@@ -1,7 +1,7 @@
 import type { ReactNode } from 'react'
 import { FactMeta, FactValue } from '../fact'
 import { formatClock } from '../format'
-import type { Severity } from '../health'
+import { effectiveStatus, isUsable, type Severity } from '../health'
 import { Sparkline } from '../sparkline'
 import { chartThresholds, thresholdRowText } from '../thresholds'
 import type {
@@ -128,31 +128,38 @@ function latestTriggerEvent(
   return latest
 }
 
+type HeadText = 'current' | 'stale' | 'none'
+
+const HEAD_PREFIX: Record<HeadText, string> = {
+  current: '当前 ',
+  stale: '上次读数 ',
+  none: '',
+}
+
 function MetricBlock({
   m,
   now,
   events,
+  head,
 }: {
   m: DetailMetric
   now: number
   events: SenseEvent[]
+  head: HeadText
 }) {
   const chart = chartThresholds(m.key, m.insight, m.tokenWindow)
-  const thrLabel =
-    chart.source === 'supplied'
-      ? m.insight?.thresholds?.floor?.source
-      : chart.source === 'default'
-        ? '显示底线'
-        : undefined
   const layers = (ls: ThresholdLayer[]) =>
     ls.length ? ls.map((l) => LAYER_TEXT[l]).join(' / ') : '未触发'
   const lastEvent = latestTriggerEvent(m.key, events, now)
+  const missingSev =
+    (m.insight?.triggered?.length ?? 0) > 0 && !m.insight?.severity
   return (
     <div className={dcss.metricBlock} data-metric={m.key} data-sev={m.severity}>
       <div className={dcss.metricHead}>
         <span>{m.label}</span>
         <span>
-          当前 {m.valueText ?? '未提供'}
+          {HEAD_PREFIX[head]}
+          {m.valueText ?? '未提供'}
           {m.badge ? <em className={dcss.badge}>{m.badge}</em> : null}
         </span>
       </div>
@@ -165,7 +172,6 @@ function MetricBlock({
         severity={m.severity}
         baseline={m.insight?.baseline}
         thresholds={chart.lines}
-        thresholdLabel={thrLabel}
       />
       <div className={dcss.metricRows}>
         {LAYERS.map((layer) => (
@@ -180,7 +186,8 @@ function MetricBlock({
       <div className={dcss.metricRow}>
         <span className={dcss.metricRowKey}>触发</span>
         <span>
-          {layers(m.insight?.triggered ?? [])} · 最近触发：
+          {layers(m.insight?.triggered ?? [])}
+          {missingSev ? '（宿主未给严重度）' : ''} · 最近触发：
           {lastEvent ? formatClock(lastEvent.signal.at) : '无'}
         </span>
       </div>
@@ -189,7 +196,9 @@ function MetricBlock({
 }
 
 /**
- * 卡片展开区：事实状态（含授权按钮）→ 每指标大图 + 阈值/触发 → 来源 → 调整入口。
+ * 卡片展开区：事实状态 → 每指标大图 + 阈值/触发 → 来源 → 调整入口。
+ * 事实不可用（stale/denied/…）时消毒指标：清 insight/徽标/动态窗口，
+ * 保留历史曲线；stale 表头标「上次读数」、其余不可用不显示保留值。
  */
 export function TileDetail({
   fact,
@@ -208,6 +217,12 @@ export function TileDetail({
   onOpenPermissionSettings: () => void
   extra?: ReactNode
 }) {
+  const usable = isUsable(fact, now)
+  const head: HeadText = usable
+    ? 'current'
+    : effectiveStatus(fact, now) === 'stale' && fact.value !== null
+      ? 'stale'
+      : 'none'
   return (
     <>
       <div className={dcss.detailFact}>
@@ -220,7 +235,24 @@ export function TileDetail({
         </FactValue>
       </div>
       {metrics.map((m) => (
-        <MetricBlock key={m.key} m={m} now={now} events={events} />
+        <MetricBlock
+          key={m.key}
+          m={
+            usable
+              ? m
+              : {
+                  ...m,
+                  insight: undefined,
+                  badge: undefined,
+                  tokenWindow: undefined,
+                  // 非 stale 的不可用（denied/unavailable…）连保留值也不进明细
+                  valueText: head === 'none' ? undefined : m.valueText,
+                }
+          }
+          now={now}
+          events={events}
+          head={head}
+        />
       ))}
       {extra}
       <div className={dcss.detailMeta}>

@@ -8,7 +8,7 @@ import {
   metricUnit,
   thresholdRowText,
 } from '../../src/thresholds'
-import { formatPercent } from '../../src/format'
+import { formatPercent, formatRate } from '../../src/format'
 import { makeScenario } from '../../src/mock/scenarios'
 import { fact, makeBody, makeEvent, makeState, T0 } from '../../src/mock/fixtures'
 import type { MetricInsight, SenseEvent } from '../../src/view-model'
@@ -30,6 +30,12 @@ function rateEvent(over: Partial<NonNullable<SenseEvent['detail']>> = {}, at = T
   return e
 }
 
+const ins = (o: Partial<MetricInsight>): MetricInsight => ({
+  sources: [],
+  triggered: [],
+  ...o,
+})
+
 describe('attentionLine 严重度优先', () => {
   it('rapid-change：磁盘投影给出见底分钟', () => {
     const m = makeScenario('rapid-change')
@@ -49,19 +55,10 @@ describe('attentionLine 严重度优先', () => {
     expect(ev.sentence).toBe('内存紧张')
   })
 
-  it('事件超出 5 分钟窗口不参与', () => {
+  it('insight 无 currentEta 时不从事件 detail 推导见底时间', () => {
     const m = makeScenario('rapid-change')
-    for (const e of m.events) {
-      if (e.detail?.kind === 'body.rate') e.signal.at = T0 - 400_000
-    }
-    const ev = evaluateBody(m.state.self.body, m.now, m.insights)
-    expect(attentionLine(m, ev)).toBeNull()
-  })
-
-  it('无 timeToFloorMs 的事件不编造见底时间', () => {
-    const m = makeScenario('rapid-change')
-    for (const e of m.events) {
-      if (e.detail?.kind === 'body.rate') delete e.detail.timeToFloorMs
+    for (const key of Object.keys(m.insights ?? {})) {
+      delete m.insights![key as keyof typeof m.insights]!.currentEta
     }
     const ev = evaluateBody(m.state.self.body, m.now, m.insights)
     expect(attentionLine(m, ev)).toBeNull()
@@ -98,58 +95,100 @@ describe('rateBadge 过滤', () => {
 })
 
 describe('阈值解析', () => {
-  it('单位表与既有底线方向', () => {
+  it('单位表与既有底线方向；tokens 底线按窗口计算', () => {
     expect(metricUnit('memory')).toBe('ratio')
     expect(metricUnit('tokens')).toBe('tokens')
-    expect(metricUnit('networkRx')).toBe('bytes')
-    const batt = defaultFloors('battery')!
-    expect(batt.every((t) => t.direction === 'below')).toBe(true)
+    expect(metricUnit('networkRx')).toBe('bytes/s')
+    expect(defaultFloors('battery')!.every((t) => t.direction === 'below')).toBe(true)
     expect(defaultFloors('cpu')!.map((t) => t.value)).toEqual([0.75, 0.9])
-    // 网络/processRss 无既有底线
+    // 网络/processRss 无既有底线；tokens 无窗口无底线
     expect(defaultFloors('networkRx')).toBeNull()
     expect(defaultFloors('processRss')).toBeNull()
-  })
-
-  it('tokens 底线按窗口计算，窗口缺失则无底线', () => {
-    const t = defaultFloors('tokens', 100_000)!
-    expect(t.map((x) => x.value)).toEqual([85_000, 95_000])
     expect(defaultFloors('tokens')).toBeNull()
+    expect(defaultFloors('tokens', 100_000)!.map((x) => x.value)).toEqual([85_000, 95_000])
   })
 
-  it('宿主 floor 优先；显式单位不符时不画线', () => {
-    const supplied: MetricInsight = {
-      sources: ['floor'],
-      triggered: [],
+  it('宿主 floor 优先；floor 单位不符阻断默认回退且不画线', () => {
+    const c = chartThresholds('cpu', ins({
       thresholds: { floor: { value: 0.7, source: 'host-floor' } },
-    }
-    const c = chartThresholds('cpu', supplied)
+    }))
     expect(c.source).toBe('supplied')
     expect(c.lines[0]!.value).toBe(0.7)
-
-    const mismatched: MetricInsight = {
-      sources: ['floor'],
-      triggered: [],
-      thresholds: { floor: { value: 7, source: 'x', unit: 'count' } },
-    }
-    expect(chartThresholds('cpu', mismatched).lines).toHaveLength(0)
+    // 单位不符：不画 floor 线、不回退默认底线，其余层仍画线
+    expect(
+      chartThresholds('cpu', ins({ thresholds: { floor: { value: 7, source: 'x', unit: 'count' } } })).lines,
+    ).toHaveLength(0)
+    expect(
+      chartThresholds('cpu', ins({
+        thresholds: {
+          floor: { value: 7, source: 'x', unit: 'count' },
+          rate: { value: 0.6, source: 'h' },
+        },
+      })).lines.map((l) => l.label),
+    ).toEqual(['变化率'])
   })
 
-  it('宿主 floor：电池方向 below、单条阈值恒为 warn（不随当前 insight 严重度变 critical）', () => {
-    const supplied: MetricInsight = {
+  it('宿主 floor：电池方向 below；supplied 线严重度取 effectiveSeverity', () => {
+    const supplied = ins({
       severity: 'critical',
       sources: ['floor'],
-      triggered: [],
       thresholds: { floor: { value: 15, source: 'host-floor' } },
-    }
-    const c = chartThresholds('battery', supplied)
-    expect(c.source).toBe('supplied')
-    expect(c.lines).toEqual([
-      { value: 15, sev: 'warn', direction: 'below' },
+    })
+    expect(chartThresholds('battery', supplied).lines).toEqual([
+      { value: 15, sev: 'critical', direction: 'below', label: '底线' },
     ])
-    // 其余指标仍是 above
     const cpu = chartThresholds('cpu', supplied)
-    expect(cpu.lines[0]!.direction).toBe('above')
-    expect(cpu.lines[0]!.sev).toBe('warn')
+    expect([cpu.lines[0]!.direction, cpu.lines[0]!.sev]).toEqual(['above', 'critical'])
+    // 无 severity 的 supplied 线缺省 warn
+    expect(
+      chartThresholds('cpu', ins({ thresholds: { floor: { value: 0.7, source: 'x' } } })).lines[0]!.sev,
+    ).toBe('warn')
+  })
+
+  it('收集全部可比较的 floor/rate/baseline 线并标注层名', () => {
+    const i = ins({
+      triggered: ['rate'],
+      thresholds: {
+        floor: { value: 0.7, source: 'h1' },
+        rate: { value: 0.6, source: 'h2' },
+        baseline: { value: 0.5, source: 'h3' },
+      },
+    })
+    const c = chartThresholds('cpu', i)
+    expect(c.lines.map((l) => [l.value, l.label, l.sev])).toEqual([
+      [0.7, '底线', 'warn'],
+      [0.6, '变化率', 'warn'],
+      [0.5, '基线', 'warn'],
+    ])
+  })
+
+  it('无 supplied floor 时保留默认显示底线，rate/baseline 线共存', () => {
+    const i = ins({ thresholds: { rate: { value: 0.6, source: 'h' } } })
+    const c = chartThresholds('cpu', i)
+    expect(c.lines).toHaveLength(3)
+    expect(c.lines.filter((l) => l.label === '显示底线')).toHaveLength(2)
+    expect(c.lines[0]!.label).toBe('变化率')
+  })
+
+  it('rate 层显式导数单位与绘制单位不符 → 只进明细文本', () => {
+    const i = ins({ thresholds: { rate: { value: 5, source: 'h', unit: 'bytes/min' } } })
+    expect(chartThresholds('memory', i).lines.every((l) => l.label !== '变化率')).toBe(true)
+    expect(thresholdRowText('memory', 'rate', i, undefined, formatPercent)).toContain('/分')
+  })
+
+  it('网络单位升级为 bytes/s：supplied bytes/s 可画线，旧 bytes 标注兼容为 B/s', () => {
+    expect(metricUnit('networkRx')).toBe('bytes/s')
+    const bps = ins({ thresholds: { rate: { value: 1e6, source: 'h', unit: 'bytes/s' } } })
+    expect(chartThresholds('networkRx', bps).lines).toHaveLength(1)
+    const legacy = ins({ thresholds: { rate: { value: 1e6, source: 'h', unit: 'bytes' } } })
+    expect(chartThresholds('networkRx', legacy).lines).toHaveLength(1)
+    // 兼容文本仍按 B/s 呈现
+    expect(
+      thresholdRowText('networkRx', 'rate', legacy, undefined, formatRate),
+    ).toContain('/s')
+    // 真正不符的单位（如 count）不可画线
+    const bad = ins({ thresholds: { rate: { value: 1e6, source: 'h', unit: 'count' } } })
+    expect(chartThresholds('networkRx', bad).lines).toHaveLength(0)
   })
 
   it('明细行：默认底线命名「显示底线」，未提供层明示未提供', () => {
@@ -157,5 +196,78 @@ describe('阈值解析', () => {
     expect(thresholdRowText('cpu', 'rate', undefined, undefined, formatPercent)).toBe('未提供')
     expect(thresholdRowText('cpu', 'baseline', undefined, undefined, formatPercent)).toBe('未提供')
     expect(thresholdRowText('networkRx', 'floor', undefined, undefined, formatPercent)).toBe('未提供')
+  })
+})
+
+describe('attentionLine 宿主 currentEta 投影', () => {
+  type M = ReturnType<typeof makeScenario>
+  const setEta = (m: M, over: Partial<NonNullable<MetricInsight['currentEta']>>) => {
+    m.insights = {
+      ...m.insights,
+      'disk:/': { ...m.insights!['disk:/']!, currentEta: { ...m.insights!['disk:/']!.currentEta!, ...over } },
+    }
+  }
+  const line = (m: M) => attentionLine(m, evaluateBody(m.state.self.body, m.now, m.insights))
+  // 去掉场景自带的 disk:/ rate 事件（否则它比新 asOf 更新而失效投影）
+  const noRateEvents = (m: M) => (
+    (m.events = m.events.filter((e) => e.detail?.kind !== 'body.rate')), m
+  )
+
+  it('新鲜有效投影 → N 分钟后见底', () => {
+    expect(line(makeScenario('rapid-change'))).toBe('磁盘 9 分钟后见底')
+  })
+
+  it.each([
+    { ratePerMinute: 0 },
+    { ratePerMinute: 2.1 * 1024 ** 3 }, // 磁盘方向反转
+    { asOf: T0 + 1 },
+    { sampleIntervalMs: 0 },
+    { sampleIntervalMs: Number.NaN },
+    { timeToThresholdMs: undefined },
+    { timeToThresholdMs: -1 },
+    { timeToThresholdMs: Number.NaN },
+    { timeToThresholdMs: 8 * 24 * 3600_000 }, // >7 天抑制
+  ] as const)('无效投影字段 → 无倒计时 %j', (over) => {
+    const m = noRateEvents(makeScenario('rapid-change'))
+    setEta(m, over as Partial<NonNullable<MetricInsight['currentEta']>>)
+    expect(line(m)).toBeNull()
+  })
+
+  it('asOf 恰在 2× 间隔边界仍有效；超过即失效', () => {
+    const m = noRateEvents(makeScenario('rapid-change'))
+    setEta(m, { asOf: T0 - 10_000, sampleIntervalMs: 5_000 })
+    expect(line(m)).toBe('磁盘 9 分钟后见底')
+    setEta(m, { asOf: T0 - 10_001 })
+    expect(line(m)).toBeNull()
+  })
+
+  it.each([
+    { desc: '无 ETA（timeToFloorMs 缺省）', over: { timeToFloorMs: undefined } },
+    { desc: '零速率', over: { delta: 0 } },
+    { desc: '反向速率', over: { delta: 2.1 * 1024 ** 3 } },
+  ] as const)('更新的匹配 body.rate 信号（$desc）使旧投影失效', ({ over }) => {
+    const m = makeScenario('rapid-change')
+    // 事件晚于 asOf 一个间隔以上但仍在 2× 间隔新鲜度内
+    setEta(m, { asOf: T0 - 10_000, sampleIntervalMs: 5_000 })
+    m.events = [...m.events, rateEvent(over as Partial<NonNullable<SenseEvent['detail']>>, T0 - 1_000)]
+    expect(line(m)).toBeNull()
+  })
+
+  it('耗尽类说见底/其余说触及阈值；上行反向速率 → 无投影', () => {
+    const cpuEta = (ratePerMinute: number) => {
+      const m = makeScenario('rapid-change')
+      m.state.self.body.cpu = fact({ usage: 0.95, perCore: [], load1: 0, load5: 0, load15: 0 })
+      m.insights = {
+        ...m.insights,
+        cpu: ins({
+          triggered: ['rate'],
+          severity: 'critical',
+          currentEta: { asOf: T0, sampleIntervalMs: 5_000, timeToThresholdMs: 3 * 60_000, ratePerMinute },
+        }),
+      }
+      return m
+    }
+    expect(line(cpuEta(0.1))).toBe('CPU 3 分钟后触及阈值')
+    expect(line(cpuEta(-0.1))).toBeNull()
   })
 })

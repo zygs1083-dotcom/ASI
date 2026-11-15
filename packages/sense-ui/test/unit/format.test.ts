@@ -4,6 +4,7 @@ import {
   formatBytes,
   formatClock,
   formatDuration,
+  formatMetricValue,
   formatMoney,
   formatPercent,
   formatRate,
@@ -73,5 +74,29 @@ describe('formatTimestamp', () => {
     expect(formatTimestamp(1_763_300_000_000)).toMatch(
       /\d{4}.\d{1,2}.\d{1,2}.+\d{1,2}:\d{2}:\d{2}/,
     )
+  })
+})
+
+describe('formatDuration 边界', () => {
+  it('非有限输入不输出 Infinity/NaN，超过 7 天封顶', () => {
+    expect(formatDuration(Number.POSITIVE_INFINITY)).toBe('未知')
+    expect(formatDuration(Number.NaN)).toBe('未知')
+    expect(formatDuration(10 * 86_400)).toBe('7 天以上')
+    // 7 天以内保持原有粒度，不受影响
+    expect(formatDuration(7 * 86_400 - 1)).toBe('167 小时 59 分')
+  })
+})
+
+describe('formatMetricValue 速率单位', () => {
+  it('bytes/s 走速率格式，其余 /s、/分 后缀拼接基础格式', () => {
+    expect(formatMetricValue(512_000, 'bytes/s')).toBe('500 KB/s')
+    expect(formatMetricValue(2.5e6, 'bytes/s')).toBe('2.4 MB/s')
+    expect(formatMetricValue(2 * 1024 ** 3, 'bytes/min')).toBe('2.0 GB/分')
+    expect(formatMetricValue(0.5, 'ratio/s')).toBe('50%/s')
+    expect(formatMetricValue(0.5, 'ratio/min')).toBe('50%/分')
+    expect(formatMetricValue(12_800, 'tokens/s')).toBe('12.8k/s')
+    expect(formatMetricValue(500, 'tokens/min')).toBe('500/分')
+    expect(formatMetricValue(3, 'count/s')).toBe('3/s')
+    expect(formatMetricValue(3, 'count/min')).toBe('3/分')
   })
 })
