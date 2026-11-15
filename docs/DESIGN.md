@@ -101,6 +101,36 @@ interface SenseState {
 - 宿主插件和侧栏共用这份类型，放在 `packages/sense-types`。
 - `where` 四项分开，是为了以后 harness 与被观察机器不是同一台（远程 DSH、SSH 工具执行）时不出错；首版四项通常相同，但必须分别填写来源。
 
+### 2.2b 身体状况（vitals）
+
+负责人要求（2026-11-15）：把装了插件的 agent 当成一个人，机器资源和 token 就是它的身体状况，会影响"生命"。侧栏必须展示，状态库里作为 `self.body` 一等公民：
+
+```ts
+interface Body {
+  cpu: Fact<{ usage: number /* 0..1 */; perCore: number[]; load1: number; load5: number; load15: number }>;
+  memory: Fact<{ total: number; used: number; pressure: 'normal' | 'warn' | 'critical'; swapUsed: number }>;
+  disks: Fact<Array<{ mount: string; total: number; free: number }>>;   // 至少根卷 + 工作目录所在卷
+  battery: Fact<{ percent: number; charging: boolean; minutesLeft?: number } | null>;  // 台式机为 null
+  thermal: Fact<'nominal' | 'fair' | 'serious' | 'critical'>;           // ProcessInfo.thermalState，经 helper
+  network: Fact<{ online: boolean; rxBps: number; txBps: number }>;
+  harnessProcess: Fact<{ rss: number; cpu: number; uptimeSec: number }>; // DSH 自身进程
+  tokens: Fact<{
+    contextWindow?: number;      // ctx.llm.resolveModelInfo().context 或 contextPressure.contextWindow
+    contextUsed?: number;        // ctx.tokenMeter.contextPressure(session).pressureTokens
+    contextProjected?: number;   // projectedTokens：下一次请求的规模
+    sessionUsage: { input: number; output: number; cacheRead: number; cacheWrite: number };  // tokenUsage 投影
+    balance?: { amount: number; currency: string; source: string };  // 提供方余额，只有提供方有接口时（如 DeepSeek 官方 /user/balance）
+  }>;
+}
+```
+
+- "所剩 token"分三层显示，缺哪层就标 `unavailable`，不编造：
+  1. **上下文余量**（最像"体力"）：`contextWindow - contextUsed`，以及距自动压缩阈值的距离；
+  2. **本会话消耗**：输入/输出/缓存命中，按 `tokenUsage`；
+  3. **账户余额**：只在提供方有余额接口时查询（低频，默认 10 分钟一次），本地网关（magpie）通常没有。
+- 采集：CPU/内存/负载/进程用 Node `os`/`process`（CPU 用两次采样差值）；内存压力用 `vm_stat` + `sysctl kern.memorystatus_vm_pressure_level`；磁盘用 `fs.statfs`；电池 `pmset -g batt`；温控状态由 Swift helper 订阅 `ProcessInfo.thermalStateDidChangeNotification`。默认 2s 采样一次供侧栏实时显示，**只有越过阈值才产生 Signal**（例如内存压力进入 warn、磁盘剩余 < 10%、上下文余量 < 15%、电量 < 15% 且未充电），这些默认等级为 `context`，进入 critical 的为 `wake`。
+- 侧栏把这些画成"体征"：每项一个带阈值色的仪表/迷你走势图（最近 5 分钟），整体给出一个"健康度"概览（取各项最差状态）。
+
 ### 2.3 注意力
 
 每条 Signal 进入后按顺序处理：
@@ -166,8 +196,9 @@ note: 测试失败时看日志并决定是否提醒我
 
 ### 2.6 侧栏界面
 
-左侧栏注册一个图标（`sidebar.panellist`，`id: 'asi-sense'`），对应 `main` 区域面板，三个区块：
+左侧栏注册一个图标（`sidebar.panellist`，`id: 'asi-sense'`），对应 `main` 区域面板，四个区块：
 
+0. **身体**（置顶）：健康度概览 + CPU、内存（含压力）、磁盘、电池、温控、网络、DSH 进程、token（上下文余量环形图 + 会话消耗 + 余额）；数值实时刷新，带 5 分钟迷你走势图和阈值配色。
 1. **现在**：四个"在哪里"、前台应用/窗口、活动任务、agent 自身状态；每项显示新鲜度（ok/过期/无权限），无权限项给出授权引导按钮（打开系统设置对应页，不弹系统对话框）。
 2. **事件流**：最近的信号，标出等级（记录/注入/唤醒/已抑制）和原因（命中哪条规则、是否自因）。这是调试注意力规则的主要工具。
 3. **规则**：列表、启停、编辑；agent 提议的 `wake` 规则在这里确认。另有全局开关：暂停感知、窗口标题是否发给模型。
@@ -209,7 +240,7 @@ plugins/asi-sense/
 |---|---|---|
 | **P0 可行性** | MacPro 上 DSH 安装与版本；最小 bundle（宿主+客户端）出现在左侧栏；Remote API 宿主→客户端推数据；宿主插件对当前会话 `inject`/`followup` 生效；最小 Swift helper 输出应用激活 NDJSON | 每项给出命令与真实输出/截图；不通的项给出替代方案 |
 | M1 骨架 | monorepo、`pnpm check`、sense-types、状态库 + 注意力管线（纯逻辑，全单测） | 单测覆盖 §2.3 全部规则 |
-| M2 信号源 | helper（NSWorkspace + AX）、文件监视、jobs/工具退出 | 实机验收 |
+| M2 信号源 | helper（NSWorkspace + AX + thermal）、文件监视、jobs/工具退出、身体采集（§2.2b，含 token） | 实机验收；采样开销 < 1% CPU |
 | M3 投递与工具 | inject/followup/send、`env_state`/`env_watch`/`env_detail`、系统提示段 | 集成测试：测试失败场景端到端 |
 | M4 侧栏 | 三个区块、授权引导、开关 | Playwright 截图验收 |
 | M5 打包 | `dsh plugin add` 安装即用，`engines.dsh` 固定 | 新 profile 里从零安装验收 |
