@@ -25,6 +25,21 @@ scripts/smoke.sh                  # real-machine smoke: opens TextEdit/Finder, ~
 NDJSON on stdin (commands) / stdout (events). See [PROTOCOL.md](PROTOCOL.md)
 for every field, ordering, error codes, privacy rules and exit statuses.
 
+## Runtime architecture
+
+All I/O is bounded so a slow or dead peer can never hang or exhaust the
+helper (bounds and semantics: PROTOCOL.md):
+
+- **stdin**: nonblocking reader, 16KiB chunks, <=256KiB pending, serialized
+  commands, `input_overflow` on saturation.
+- **stdout**: nonblocking bounded writer (1024 lines / 1MiB); oldest
+  noncritical evictions are reported once via `output_overflow`; criticals
+  never drop - a full critical queue fails fast.
+- **AX**: all IPC on a serial queue with a 0.5s timeout; app/window/privacy
+  generation checks drop stale results.
+- **shutdown**: SIGTERM exits directly on a control queue; EOF/`quit` exit
+  within ~1s under a full stdout pipe; normal shutdown flushes <=200ms.
+
 ## Accessibility permission
 
 Title/focused-window monitoring needs the Accessibility permission. The helper
