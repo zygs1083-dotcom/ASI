@@ -1,5 +1,6 @@
 import react from '@vitejs/plugin-react';
 import { defineConfig } from 'electron-vite';
+import { devCspPlugin } from './src/renderer/dev/csp';
 
 export default defineConfig({
   main: {},
@@ -17,6 +18,6 @@ export default defineConfig({
     },
   },
   renderer: {
-    plugins: [react()],
+    plugins: [react(), devCspPlugin()],
   },
 });

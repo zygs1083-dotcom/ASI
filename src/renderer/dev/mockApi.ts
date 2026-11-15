@@ -160,6 +160,58 @@ export function createMockApi(): AsiApi {
     return conv;
   };
 
+  /** send/retry 共用的前置校验：先验证再允许任何状态变更；返回会话当前模型 */
+  const ensureSendable = (conversationId: string, conv: Conversation) => {
+    if (streams.has(conversationId)) {
+      throw new Error('该会话已有正在进行的回复');
+    }
+    if (!conv.model) {
+      throw new Error('请先为会话选择模型');
+    }
+    const provider = providers.find((p) => p.id === conv.model?.providerId);
+    if (!provider) {
+      throw new Error('该会话绑定的厂商已不存在，请重新选择模型');
+    }
+    if (!provider.enabled) {
+      throw new Error('该会话绑定的厂商已停用，请重新选择模型');
+    }
+    if (!modelsFor(provider).some((m) => m.modelId === conv.model?.modelId)) {
+      throw new Error('该会话绑定的模型已不存在，请重新选择模型');
+    }
+    return conv.model;
+  };
+
+  /** 根据触发文本（新发的用户消息 / 重试时最后一条 user）启动对应的模拟流 */
+  const startStream = (conversationId: string, assistant: ChatMessage, sourceText: string) => {
+    const trimmed = sourceText.trim();
+    const mode = trimmed.startsWith('/slow') ? 'slow' : trimmed.startsWith('/error') ? 'error' : 'normal';
+    const chars = [...(mode === 'slow' ? SLOW_REPLY : mode === 'error' ? ERROR_PARTIAL : REPLY)];
+    const deltaMs = mode === 'slow' ? SLOW_DELTA_MS : DELTA_MS;
+    const stream: Stream = { timer: null, messageId: assistant.id };
+    streams.set(conversationId, stream);
+    let i = 0;
+    const tick = () => {
+      if (!streams.has(conversationId)) return;
+      if (i < chars.length) {
+        const delta = chars[i++];
+        assistant.text += delta;
+        emit({ type: 'delta', conversationId, messageId: assistant.id, delta, text: assistant.text });
+        stream.timer = setTimeout(tick, deltaMs);
+      } else if (mode === 'error') {
+        assistant.status = 'error';
+        assistant.text += '，模拟厂商返回错误。';
+        assistant.error = '模拟厂商返回错误：上游服务不可用（mock 固定错误）';
+        streams.delete(conversationId);
+        emit({ type: 'error', conversationId, message: clone(assistant) });
+      } else {
+        assistant.status = 'done';
+        streams.delete(conversationId);
+        emit({ type: 'done', conversationId, message: clone(assistant) });
+      }
+    };
+    stream.timer = setTimeout(tick, deltaMs);
+  };
+
   return {
     providers: {
       catalog: async (): Promise<CatalogProvider[]> =>
@@ -257,22 +309,7 @@ export function createMockApi(): AsiApi {
     chat: {
       send: async (conversationId: string, text: string) => {
         const conv = getConv(conversationId);
-        if (streams.has(conversationId)) {
-          throw new Error('该会话已有正在进行的回复');
-        }
-        if (!conv.model) {
-          throw new Error('请先为会话选择模型');
-        }
-        const provider = providers.find((p) => p.id === conv.model?.providerId);
-        if (!provider) {
-          throw new Error('该会话绑定的厂商已不存在，请重新选择模型');
-        }
-        if (!provider.enabled) {
-          throw new Error('该会话绑定的厂商已停用，请重新选择模型');
-        }
-        if (!modelsFor(provider).some((m) => m.modelId === conv.model?.modelId)) {
-          throw new Error('该会话绑定的模型已不存在，请重新选择模型');
-        }
+        const model = ensureSendable(conversationId, conv);
         const now = Date.now();
         const user: ChatMessage = { id: nextId('m'), role: 'user', text, createdAt: now, status: 'done' };
         const assistant: ChatMessage = {
@@ -280,7 +317,7 @@ export function createMockApi(): AsiApi {
           role: 'assistant',
           text: '',
           createdAt: now,
-          model: clone(conv.model),
+          model: clone(model),
           status: 'streaming',
         };
         conv.messages.push(user, assistant);
@@ -290,35 +327,31 @@ export function createMockApi(): AsiApi {
           conv.title = [...text.trim()].slice(0, 30).join('') || '新对话';
         }
 
-        const trimmed = text.trim();
-        const mode = trimmed.startsWith('/slow') ? 'slow' : trimmed.startsWith('/error') ? 'error' : 'normal';
-        const chars = [...(mode === 'slow' ? SLOW_REPLY : mode === 'error' ? ERROR_PARTIAL : REPLY)];
-        const deltaMs = mode === 'slow' ? SLOW_DELTA_MS : DELTA_MS;
-        const stream: Stream = { timer: null, messageId: assistant.id };
-        streams.set(conversationId, stream);
-        let i = 0;
-        const tick = () => {
-          if (!streams.has(conversationId)) return;
-          if (i < chars.length) {
-            const delta = chars[i++];
-            assistant.text += delta;
-            emit({ type: 'delta', conversationId, messageId: assistant.id, delta });
-            stream.timer = setTimeout(tick, deltaMs);
-          } else if (mode === 'error') {
-            assistant.status = 'error';
-            assistant.text += '，模拟厂商返回错误。';
-            assistant.error = '模拟厂商返回错误：上游服务不可用（mock 固定错误）';
-            streams.delete(conversationId);
-            emit({ type: 'error', conversationId, message: clone(assistant) });
-          } else {
-            assistant.status = 'done';
-            streams.delete(conversationId);
-            emit({ type: 'done', conversationId, message: clone(assistant) });
-          }
-        };
-        stream.timer = setTimeout(tick, deltaMs);
-
+        startStream(conversationId, assistant, text);
         return clone({ user, assistant });
+      },
+      retry: async (conversationId: string) => {
+        const conv = getConv(conversationId);
+        const model = ensureSendable(conversationId, conv);
+        const last = conv.messages[conv.messages.length - 1];
+        if (last?.role !== 'assistant' || (last.status !== 'error' && last.status !== 'aborted')) {
+          throw new Error('最后一轮回复不可重试');
+        }
+        const lastUser = [...conv.messages].reverse().find((m) => m.role === 'user');
+        const now = Date.now();
+        const assistant: ChatMessage = {
+          id: nextId('m'),
+          role: 'assistant',
+          text: '',
+          createdAt: now,
+          model: clone(model),
+          status: 'streaming',
+        };
+        // 原地替换失败的那条，前面的 user/历史原样保留
+        conv.messages[conv.messages.length - 1] = assistant;
+        conv.updatedAt = now;
+        startStream(conversationId, assistant, lastUser?.text ?? '');
+        return clone({ assistant });
       },
       abort: async (conversationId: string) => {
         const stream = streams.get(conversationId);
