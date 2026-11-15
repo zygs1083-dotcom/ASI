@@ -1,4 +1,5 @@
-import type { ReactNode } from 'react'
+import { useMemo, type ReactNode } from 'react'
+import { useClock } from './clock'
 import { effectiveStatus } from './health'
 import { formatAge } from './format'
 import type { Fact, FactStatus } from './view-model'
@@ -20,8 +21,9 @@ interface MetaProps {
 
 /** 事实的元信息：新鲜度 + 来源（title 提供 api/host）。刚刚采集的不写文字。 */
 export function FactMeta({ fact, now }: MetaProps) {
-  const status = effectiveStatus(fact, now)
-  const age = formatAge(now, fact.observedAt)
+  const effNow = useClock(now)
+  const status = effectiveStatus(fact, effNow)
+  const age = formatAge(effNow, fact.observedAt)
   if (status !== 'stale' && age === '刚刚') return null
   return (
     <span
@@ -47,27 +49,34 @@ export function FactStatusText<T>({
   now: number
   children: (value: T) => ReactNode
 }) {
-  const status = effectiveStatus(fact, now)
+  const effNow = useClock(now)
+  const status = effectiveStatus(fact, effNow)
+  // children 只随 value/渲染函数变化重算：纯时钟滴答不重复执行子树渲染逻辑
+  const value = fact.value
+  const rendered = useMemo(
+    () => (value === null ? null : children(value)),
+    [children, value],
+  )
   if ((status === 'ok' || status === 'stale') && fact.value !== null) {
     if (status === 'stale') {
       // 过期保留值：标注「上次读数」+ 整体去色 + 明确「已过期」与年龄，不伪装成新鲜数据
       return (
         <span className={css.factStale} data-status="stale">
           <span className={css.factMeta}>上次读数</span>
-          {children(fact.value)}
+          {rendered}
           <span className={css.factMeta}>
-            已过期 · {formatAge(now, fact.observedAt)}
+            已过期 · {formatAge(effNow, fact.observedAt)}
           </span>
         </span>
       )
     }
-    return <>{children(fact.value)}</>
+    return <>{rendered}</>
   }
   if (status === 'denied') {
     return <>无权限{fact.reason ? `（${fact.reason}）` : ''}</>
   }
   if (status === 'stale') {
-    return <>已过期 · {formatAge(now, fact.observedAt)}</>
+    return <>已过期 · {formatAge(effNow, fact.observedAt)}</>
   }
   return (
     <>
@@ -94,7 +103,8 @@ export function FactValue<T>({
   onOpenPermissionSettings,
   children,
 }: FactValueProps<T>) {
-  const status = effectiveStatus(fact, now)
+  const effNow = useClock(now)
+  const status = effectiveStatus(fact, effNow)
   const sourceTitle = `来源 ${fact.source.api} @ ${fact.source.host}`
 
   if (status === 'ok' && fact.value !== null) {
@@ -106,7 +116,7 @@ export function FactValue<T>({
         <span className={css.factMeta}>上次读数</span>
         {children(fact.value)}
         <span className={css.factMeta}>
-          已过期 · {formatAge(now, fact.observedAt)}
+          已过期 · {formatAge(effNow, fact.observedAt)}
         </span>
       </span>
     )
@@ -131,7 +141,7 @@ export function FactValue<T>({
     // value 为 null 也明示过期状态与年龄，不留空白
     return (
       <span className={css.factMuted} title={sourceTitle}>
-        已过期 · {formatAge(now, fact.observedAt)}
+        已过期 · {formatAge(effNow, fact.observedAt)}
       </span>
     )
   }

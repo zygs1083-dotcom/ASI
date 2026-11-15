@@ -1,4 +1,5 @@
 import { attentionLine } from '../attention'
+import { ClockProvider } from '../clock'
 import { evaluateBody, type Severity } from '../health'
 import { formatPercent } from '../format'
 import { DisksTile } from './disk-rows'
@@ -91,7 +92,8 @@ export function BodySection({
   return (
     <>
       <Monitor model={model} sev={evalResult.severity} sentence={sentence} />
-      <div className={css.tiles}>
+      <ClockProvider value={now}>
+        <div className={css.tiles}>
         <CpuTile model={model} rows={rows} ctx={ctx} />
         <MemoryTile model={model} rows={rows} ctx={ctx} />
         <TokenTile model={model} rows={rows} ctx={ctx} />
@@ -100,7 +102,8 @@ export function BodySection({
         <ThermalTile model={model} rows={rows} ctx={ctx} />
         {!rows.battery.hidden && <BatteryTile model={model} rows={rows} ctx={ctx} />}
         <ProcessTile model={model} rows={rows} ctx={ctx} />
-      </div>
+        </div>
+      </ClockProvider>
     </>
   )
 }
