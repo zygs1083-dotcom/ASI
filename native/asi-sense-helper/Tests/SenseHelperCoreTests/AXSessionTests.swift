@@ -58,7 +58,7 @@ final class AXSessionTests: XCTestCase {
     fake = FakeAX(); events = []; scheduled = []; clock = 0; pending = []
     axQ = DispatchQueue(label: "test.ax")
     session = S(backend: fake, isTrusted: { [self] in trusted }, nowMs: { 7 },
-                emit: { [self] e, _ in events.append(Self.dict(e)) },
+                emit: { [self] e in events.append(Self.dict(e)) },
                 queue: axQ, toMain: captureMain ? { [self] in pending.append($0) } : { $0() },
                 uptime: { [self] in clock },
                 scheduler: { [self] d, i in scheduled.append((clock + d, i)) })
@@ -235,8 +235,12 @@ final class AXSessionTests: XCTestCase {
     raceThroughFwRead(
       start: { self.session.notify(S.focusedNotification, observer: self.obs, element: .init(1)) },
       body: { self.session.activate(pid: 8, bundleId: "b.2") })
-    XCTAssertEqual(ofType("window.focused").count, 1,
-                 "the blocked pre-activation refresh must be dropped")
+    let dropped = ofType("window.focused")
+    XCTAssertEqual(dropped.count, 2,
+                 "stale refresh drops; app 8's windowless attach reports focus")
+    XCTAssertEqual(dropped[0]["pid"] as? Int, 7)
+    XCTAssertEqual(dropped[1]["pid"] as? Int, 8)
+    XCTAssertTrue(dropped[1]["window"] is NSNull)
     fake.windows[8] = .init(2); fake.titles[2] = "W2"
     session.notify(S.focusedNotification, observer: obs, element: .init(2)); drain()
     XCTAssertEqual(ofType("window.focused").last?["pid"] as? Int, 8)
@@ -251,8 +255,10 @@ final class AXSessionTests: XCTestCase {
     fake.windows[8] = .init(2)
     session.notify(S.focusedNotification, observer: obs, element: .init(2)); drain()
     let fw = ofType("window.focused")
-    XCTAssertEqual(fw.count, 1)
+    XCTAssertEqual(fw.count, 2, "windowless attach focus + switched-window focus")
     XCTAssertEqual(fw[0]["pid"] as? Int, 8)
+    XCTAssertTrue(fw[0]["window"] is NSNull)
+    XCTAssertEqual(fw[1]["pid"] as? Int, 8)
     XCTAssertTrue(session.isAttached)
   }
   // A/B: termination mid-IPC detaches NOW (read-blocked and add-blocked).
@@ -399,16 +405,6 @@ final class AXSessionTests: XCTestCase {
     XCTAssertFalse(fake.detached.contains { $0 === obs },
                    "stale cleanup must not detach the newer attach")
   }
-  func testPermanentTitleFailureOnFirstFocusEmitsNoFocused() {
-    makeSession(captureMain: true)
-    fake.windows[7] = .init(1)
-    fake.errors["title:1"] = .attributeUnsupported
-    attach(7)
-    pending.forEach { $0() }
-    XCTAssertEqual(ofType("ax.unsupported").count, 1)
-    XCTAssertTrue(ofType("window.focused").isEmpty, "no focused, never pid0/empty bundle")
-    XCTAssertFalse(session.isAttached)
-  }
   // Off->on mid-title-read discards the stale result via privGen.
   func testPrivacyToggleDropsStaleTitleReadNotRetagged() {
     makeSession()
@@ -426,5 +422,167 @@ final class AXSessionTests: XCTestCase {
     advance(1.0)
     XCTAssertEqual(ofType("window.title").compactMap { $0["title"] as? String },
                  ["FRESH"], "stale pre-toggle title must never emit")
+  }
+  // #7: a permanent AXTitle failure degrades the title only, never the app.
+  func testPermanentTitleFailureStillEmitsFocused() {
+    makeSession()
+    fake.windows[7] = .init(1)
+    fake.errors["title:1"] = .attributeUnsupported
+    attach(7)
+    let fw = ofType("window.focused")
+    XCTAssertEqual(fw.count, 1, "focused still emits; only the title degrades")
+    XCTAssertNil(fw.first?["title"])
+    XCTAssertTrue(ofType("ax.unsupported").isEmpty, "optional title failure is not app-unsupported")
+    XCTAssertTrue(session.isAttached)
+  }
+  // #6: an initial windowless attach reports focus once (window:null).
+  func testWindowlessInitialAttachEmitsWindowNullOnce() {
+    makeSession()
+    attach(7) // no window configured: focusedWindow succeeds with nil
+    let fw = ofType("window.focused")
+    XCTAssertEqual(fw.count, 1, "initial windowless attach must report focus")
+    XCTAssertTrue(fw.first?["window"] is NSNull, "windowless reports window:null")
+    session.notify(S.focusedNotification, observer: obs, element: .init(9)); drain()
+    XCTAssertEqual(ofType("window.focused").count, 1, "repeated nil focus is deduped")
+  }
+  // #6: switching to a windowless app reports window:null again.
+  func testWindowlessAfterAppSwitchEmitsAgain() {
+    makeSession()
+    attach(7, win: 1, title: "A")
+    session.activate(pid: 8, bundleId: "b.2"); drain() // app 8 has no window
+    let fw = ofType("window.focused")
+    XCTAssertEqual(fw.count, 2)
+    XCTAssertTrue(fw.count > 1 && fw[1]["window"] is NSNull)
+    XCTAssertEqual(fw.count > 1 ? fw[1]["pid"] as? Int : nil, 8)
+  }
+  // #5: a storm of privacy flips coalesces to at most one queued job.
+  func testPrivacyToggleStormCoalesces() {
+    makeSession()
+    attach(7, win: 1, title: "A")
+    let base = fake.titleCalls
+    let release = hold()
+    for i in 0..<2000 { session.setTitlesEnabled(i % 2 == 1) }
+    session.setTitlesEnabled(true)
+    release(); drain()
+    XCTAssertEqual(fake.titleCalls, base + 1, "coalesced flips run one title read")
+  }
+  // #8: errors produced before an app switch die at main delivery.
+  func testStaleAxErrorsDropAfterAppSwitch() {
+    makeSession(captureMain: true)
+    attach(7, "b.x", win: 1)
+    pending.removeAll()
+    fake.errors["fw:7"] = .attributeUnsupported
+    session.notify(S.focusedNotification, observer: obs, element: .init(1)); drain()
+    session.activate(pid: 8, bundleId: "b.2")
+    pending.forEach { $0() }
+    XCTAssertTrue(ofType("ax.unsupported").isEmpty, "stale error must not deliver")
+  }
+  // #8: app-scoped errors identify the target app.
+  func testAxErrorIdentityCarriesPidAndBundle() {
+    makeSession()
+    fake.errors["add:\(-7):\(S.focusedNotification)"] = .attributeUnsupported
+    attach(7, "b.u")
+    let u = ofType("ax.unsupported")
+    XCTAssertEqual(u.count, 1)
+    XCTAssertEqual(u[0]["pid"] as? Int, 7)
+    // Retryable errors identify the app too - including bundle-less PIDs.
+    makeSession()
+    fake.errors["add:\(-9):\(S.focusedNotification)"] = .cannotComplete
+    attach(9, "")
+    let e = ofType("error").first { $0["code"] as? String == "ax-retryable" }
+    XCTAssertEqual(e?["pid"] as? Int, 9, "retryable names the producing pid")
+    XCTAssertEqual(e?["bundleId"] as? String, "", "bundle-less app reports an empty id")
+  }
+  // #8: a stale retryable held on main also dies after an app switch.
+  func testStaleRetryableErrorDropsAfterAppSwitch() {
+    makeSession(captureMain: true)
+    attach(7, "b.x", win: 1)
+    pending.removeAll()
+    fake.errors["fw:7"] = .cannotComplete
+    session.notify(S.focusedNotification, observer: obs, element: .init(1)); drain()
+    session.activate(pid: 8, bundleId: "b.2")
+    pending.forEach { $0() }
+    XCTAssertTrue(ofType("error").isEmpty, "stale ax-retryable must not deliver")
+  }
+  // #8: a stale unsupported held on main dies after a privacy flip too.
+  func testStaleAxErrorDropsAfterPrivacyFlip() {
+    makeSession(captureMain: true)
+    attach(7, "b.x", win: 1)
+    pending.removeAll()
+    fake.errors["fw:7"] = .attributeUnsupported
+    session.notify(S.focusedNotification, observer: obs, element: .init(1)); drain()
+    session.setTitlesEnabled(false)
+    pending.forEach { $0() }
+    XCTAssertTrue(ofType("ax.unsupported").isEmpty,
+                  "stale-epoch error must not deliver under the new privacy gen")
+  }
+  // #8: an error produced by a blocked read carries the producing stamp - a
+  // privacy flip mid-read means it is never recorded or emitted, and the app
+  // is NOT detached by an epoch it no longer belongs to.
+  func testBlockedErrorKeepsProducingStampNotCurrent() {
+    makeSession()
+    attach(7, "b.x", win: 1)
+    fake.errors["fw:7"] = .attributeUnsupported
+    raceThroughFwRead(
+      start: { self.session.notify(S.focusedNotification, observer: self.obs, element: .init(1)) },
+      body: { self.session.setTitlesEnabled(false) })
+    XCTAssertTrue(ofType("ax.unsupported").isEmpty,
+                  "the stale error must not be relabeled with the new privacy stamp")
+    XCTAssertTrue(session.isAttached,
+                  "stale error must not tear down the current session")
+    makeSession()
+    attach(7, "b.x", win: 1)
+    fake.errors["fw:7"] = .cannotComplete
+    raceThroughFwRead(
+      start: { self.session.notify(S.focusedNotification, observer: self.obs, element: .init(1)) },
+      body: { self.session.setTitlesEnabled(false) })
+    XCTAssertTrue(ofType("error").isEmpty, "stale ax-retryable must not deliver either")
+    XCTAssertTrue(session.isAttached)
+  }
+  // A queued same-window refresh captured before a privacy flip must not even
+  // read AXTitle: only the coalesced privacy apply does.
+  func testStaleRefreshNeverReadsTitleAfterPrivacyFlip() {
+    makeSession()
+    attach(7, win: 1, title: "A")
+    let base = fake.titleCalls
+    let release = hold()
+    session.notify(S.focusedNotification, observer: obs, element: .init(1))
+    session.setTitlesEnabled(false)
+    session.setTitlesEnabled(true)
+    release(); drain()
+    XCTAssertEqual(fake.titleCalls, base + 1,
+                   "only the current privacy apply reads AXTitle, not the stale refresh")
+  }
+  // A title registration blocked mid-apply is recorded on the queue before
+  // the staleness guard, so the coalesced `false` job still removes it.
+  func testBlockedTitleRegistrationRemovedByLaterDisable() {
+    makeSession()
+    attach(7, win: 1, title: "A")
+    session.setTitlesEnabled(false); drain() // unsubscribes: flag is false now
+    fake.removes.removeAll()
+    let titleBase = fake.titleCalls
+    raceThroughAdd(
+      start: { self.session.setTitlesEnabled(true) }, // apply blocks inside add()
+      body: { self.session.setTitlesEnabled(false) }) // supersedes mid-add
+    XCTAssertTrue(
+      fake.removes.contains { $0.1 == S.titleNotification },
+      "the subscription that finished under a stale gen is still removed")
+    XCTAssertEqual(fake.titleCalls, titleBase, "no title read while titles are off")
+  }
+  // #7: optional title failures degrade on snapshot and title notifications
+  // too - the app stays attached and never reports unsupported.
+  func testPermanentTitleFailureOnSnapshotAndNotifyKeepsAttach() {
+    makeSession()
+    attach(7, win: 1, title: "A")
+    fake.errors["title:1"] = .attributeUnsupported
+    var result: (String, String?)?
+    session.snapshot(pid: 7, bundleId: "b.x") { s, t in result = (s, t) }; drain()
+    XCTAssertEqual(result?.0, "ok")
+    XCTAssertNil(result?.1, "optional title failure degrades to no title")
+    XCTAssertTrue(session.isAttached)
+    session.notify(S.titleNotification, observer: obs, element: .init(1)); drain()
+    advance(1.0)
+    XCTAssertTrue(ofType("ax.unsupported").isEmpty)
+    XCTAssertTrue(session.isAttached, "optional title failure never detaches")
   }
 }

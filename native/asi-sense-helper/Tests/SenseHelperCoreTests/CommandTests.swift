@@ -9,6 +9,18 @@ final class CommandTests: XCTestCase {
     XCTAssertEqual(parse(#"{"cmd":"snapshot"}"#), .ok(.snapshot))
     XCTAssertEqual(parse(#"{"cmd":"titles","enabled":true}"#), .ok(.titles(true)))
     XCTAssertEqual(parse(#"{"cmd":"titles","enabled":false}"#), .ok(.titles(false)))
+    XCTAssertEqual(parse(#"{"cmd":"titles","enabled":false,"id":"abc-1"}"#),
+                   .ok(.titles(false, id: .string("abc-1"))))
+    XCTAssertEqual(parse(#"{"cmd":"titles","enabled":true,"id":42}"#),
+                   .ok(.titles(true, id: .int(42))))
+    XCTAssertEqual(parse(#"{"cmd":"titles","enabled":true,"id":0}"#),
+                   .ok(.titles(true, id: .int(0))))
+    XCTAssertEqual(parse(#"{"cmd":"titles","enabled":true,"id":-9007199254740991}"#),
+                   .ok(.titles(true, id: .int(-9007199254740991))))
+    XCTAssertEqual(parse(#"{"cmd":"titles","enabled":true,"id":9223372036854775807}"#),
+                   .ok(.titles(true, id: .int(.max))))
+    XCTAssertEqual(parse(#"{"cmd":"titles","enabled":true,"id":-9223372036854775808}"#),
+                   .ok(.titles(true, id: .int(.min))))
     XCTAssertEqual(parse(#"{"cmd":"recheck-permissions"}"#), .ok(.recheckPermissions))
     XCTAssertEqual(parse(#"{"cmd":"quit"}"#), .ok(.quit))
     XCTAssertEqual(parse(#"{"v":1,"cmd":"quit","at":123,"type":"x"}"#), .ok(.quit))
@@ -31,6 +43,18 @@ final class CommandTests: XCTestCase {
     for s in [#"{"cmd":"titles"}"#, #"{"cmd":"titles","enabled":0}"#, #"{"cmd":"titles","enabled":1}"#,
               #"{"cmd":"titles","enabled":"true"}"#, #"{"cmd":"titles","enabled":null}"#] {
       assertError(s, "bad-enabled")
+    }
+  }
+  func testBadId() {
+    for s in [#"{"cmd":"titles","enabled":true,"id":1.5}"#,
+              #"{"cmd":"titles","enabled":true,"id":true}"#,
+              // Beyond Int64 range: a Double round-trip must never wrap.
+              #"{"cmd":"titles","enabled":true,"id":9223372036854775808}"#,
+              #"{"cmd":"titles","enabled":true,"id":-9223372036854775809}"#,
+              #"{"cmd":"titles","enabled":true,"id":1e30}"#,
+              #"{"cmd":"titles","enabled":true,"id":[1]}"#,
+              #"{"cmd":"titles","enabled":true,"id":{"x":1}}"#] {
+      assertError(s, "bad-id")
     }
   }
   func testBadVersion() {

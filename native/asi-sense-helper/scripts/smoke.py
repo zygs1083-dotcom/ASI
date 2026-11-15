@@ -66,23 +66,42 @@ def main():
     fence_idx = None
     rc = None
     try:
+        # Preflight: real app switching only runs when Accessibility is
+        # already granted (we never change permissions).
+        if not wait_for(lambda: any(e.get("type") == "hello" for e in events), 5):
+            print("FAIL: no hello event")
+            return 1
+        hello = next(e for e in events if e.get("type") == "hello")
+        ax_ok = hello.get("permissions", {}).get("accessibility") == "granted"
+        if not ax_ok:
+            print("accessibility denied: skipping real app switching "
+                  "(protocol-only smoke)")
         start = time.monotonic()
-        # Pre-toggle switches, a titled snapshot, the privacy toggle with a
-        # fence snapshot right after, then real post-fence switches.
-        schedule = [(2 + 4 * i, name, "open") for i, name in enumerate(OPEN_TARGETS)]
+        # Pre-toggle switches, a titled snapshot, the privacy toggle (the
+        # titles.ack is the fence), a post-fence snapshot, then real
+        # post-fence switches.
+        schedule = [(2 + 4 * i, name, "open") for i, name in
+                    enumerate(OPEN_TARGETS if ax_ok else [])]
         schedule += [(14, {"cmd": "snapshot"}, "send"),
-                     (15, {"cmd": "titles", "enabled": False}, "send"),
-                     (16, {"cmd": "snapshot"}, "send"),  # fence
-                     (18, POST_FENCE_TARGETS[0], "open"),
-                     (22, POST_FENCE_TARGETS[1], "open")]
+                     (15, {"cmd": "titles", "enabled": False, "id": "smoke-fence"}, "send"),
+                     (16, {"cmd": "snapshot"}, "send"),
+                     (18, POST_FENCE_TARGETS[0], "open") if ax_ok else (18, None, "noop"),
+                     (22, POST_FENCE_TARGETS[1], "open") if ax_ok else (22, None, "noop")]
         for when, payload, kind in schedule:
             time.sleep(max(0, when - (time.monotonic() - start)))
-            open_app(payload) if kind == "open" else send(payload)
-        # The fence is the second snapshot; all events at/after it must be
+            if kind == "open":
+                open_app(payload)
+            elif kind == "send":
+                send(payload)
+        # The fence is the matching titles.ack; all events at/after it must be
         # title-free.
-        wait_for(lambda: sum(1 for e in events if e.get("type") == "snapshot") >= 2, 5)
-        fence_idx = next((i for i in range(len(events) - 1, -1, -1)
-                          if events[i].get("type") == "snapshot"), None)
+        wait_for(lambda: any(e.get("type") == "titles.ack"
+                             and e.get("id") == "smoke-fence"
+                             and e.get("enabled") is False
+                             for e in events), 5)
+        fence_idx = next((i for i, e in enumerate(events)
+                          if e.get("type") == "titles.ack"
+                          and e.get("id") == "smoke-fence"), None)
         wait_for(lambda: fence_idx is not None and any(
             e.get("type") == "window.focused" for e in events[fence_idx:]), 8)
         time.sleep(1.0)
@@ -116,12 +135,12 @@ def main():
         failures.append("bad envelope or first event is not hello")
     if len(events) < 2 or events[1].get("type") != "thermal":
         failures.append("second event is not thermal")
-    if counts.get("app.activated", 0) < 2:
+    if ax_perm == "granted" and counts.get("app.activated", 0) < 2:
         failures.append(f"expected >=2 app.activated, got {counts.get('app.activated', 0)}")
     if len(snapshots) < 2 or has_title_key(snapshots[-1]):
         failures.append("missing snapshot or title key leaked post-privacy")
     if fence_idx is None:
-        failures.append("fence snapshot never arrived")
+        failures.append("matching titles.ack (the privacy fence) never arrived")
     elif any(has_title_key(e) for e in events[fence_idx:]):
         failures.append("title key leaked in an event at/after the privacy fence")
     post_fence = events[fence_idx:] if fence_idx is not None else []

@@ -1,19 +1,33 @@
 import Foundation
-// Bounded stdin reader (semantics: PROTOCOL.md): <=16KiB chunks, <=256KiB
-// retained (buffer + in-flight), strict one-at-a-time consumption, overflow
-// discard once per episode, normal EOF drain after early onEOFDetected.
+// Bounded stdin reader (semantics: PROTOCOL.md): <=16KiB chunks; physical
+// lines are framed in a separate <=64KiB scratch INDEPENDENTLY of serialized
+// consumption. Each completed line is classified by CommandParser: valid
+// `titles`/`quit` commands are controls kept in dedicated newest-of-class
+// slots (never charged to the pending cap, flushed after every read chunk,
+// delivered ahead of any queued ordinary line even while one is in flight).
+// Ordinary lines queue in a bounded pending list (queued + in-flight
+// <=256KiB, each entry charged max(64, bytes+1) to cover framing overhead so
+// a flood of empty lines cannot queue unbounded records); beyond the cap they
+// are dropped and counted per command type, reported coalesced per readiness
+// batch. Oversize physical lines keep line-too-long and are rejected through
+// their next LF.
 public final class InputReader {
   public static let chunkBytes = 16 * 1024, maxPending = 256 * 1024
   private let fd: Int32
   private let queue: DispatchQueue
   private let source: DispatchSourceRead
-  private var buffer = Data(), discarding = false
+  private var scratch = Data(), rejectingLine = false
+  private var pending: [Data] = [], pendingHead = 0, queuedBytes = 0, inFlight = 0
+  private var consuming = false, pumping = false, eof = false, eofNotified = false
+  private var seq = 0
+  private var titlesSlot: (seq: Int, cmd: Command)?, quitSlot: (seq: Int, cmd: Command)?
+  private var batchDropped = 0, batchTypes: [String: Int] = [:]
   private let lifecycle = Locked((started: false, stopped: false))
-  private var consuming = false, inFlight = 0, pumping = false
-  private var eof = false, overflowNoted = false
   public private(set) var peakPending = 0 // test seam: bounded-pending evidence
-  public var onLine: ((Data, @escaping () -> Void) -> Void)?
-  public var onError: ((String) -> Void)? // "input_overflow" | "line-too-long"
+  public var onLine: ((Data, @escaping () -> Void) -> Void)?     // ordinary, serialized
+  public var onControlLine: ((Command) -> Void)?                 // controls, immediate
+  public var onError: ((String) -> Void)?                        // "line-too-long"
+  public var onOverflow: ((Int, [String: Int]) -> Void)?         // dropped, per-type counts
   public var onEOFDetected: (() -> Void)? // fires at hitEOF, before draining
   public var onEOF: (() -> Void)?         // fires once all input is consumed
 
@@ -36,23 +50,20 @@ public final class InputReader {
     if !wasStarted { source.resume() } // activate a never-started source so cancel is safe
     source.cancel()
   }
+  // Per-entry pending cost: the line plus its LF, with a 64B minimum so
+  // zero-byte records (e.g. blank lines) still spend real budget.
+  private static func charge(_ line: Data) -> Int { max(64, line.count + 1) }
   private var pendingBytes: Int {
-    let n = buffer.count + inFlight
+    let n = queuedBytes + inFlight
     if n > peakPending { peakPending = n }
     return n
   }
   private func readable() {
+    batchDropped = 0; batchTypes = [:]
+    defer { flushOverflow() }
     var avail = max(1, Int(source.data)) // probe even at 0: a 0-length read means EOF
     while avail > 0, !eof, !lifecycle.get().stopped {
-      let room = Self.maxPending - pendingBytes
-      if room <= 0, !discarding {
-        if !overflowNoted { overflowNoted = true; onError?("input_overflow") }
-        // Drop the buffered trailing partial, keep complete lines.
-        if let nl = buffer.lastIndex(of: 0x0A) { buffer.removeSubrange(buffer.index(after: nl)...) }
-        else { buffer.removeAll() }
-        discarding = true
-      }
-      let want = min(avail, Self.chunkBytes, discarding ? Self.chunkBytes : max(1, room))
+      let want = min(avail, Self.chunkBytes)
       var chunk = [UInt8](repeating: 0, count: want)
       let n = read(fd, &chunk, want)
       if n < 0 {
@@ -62,66 +73,111 @@ public final class InputReader {
       }
       if n == 0 { hitEOF(); return }
       avail -= n
-      if discarding {
-        var rest = chunk[0..<n]
-        while discarding { // drop one physical line at a time
-          guard let nl = rest.firstIndex(of: 0x0A) else { break } // still mid-line: drop it all
-          rest = rest[rest.index(after: nl)...]
-          if rest.count <= Self.maxPending - pendingBytes { // suffix fits: resume retaining
-            buffer.append(contentsOf: rest); discarding = false
-          }
-        }
-      } else {
-        buffer.append(contentsOf: chunk[0..<n])
-      }
+      feed(chunk[0..<n])
+      flushControls()
       pump()
     }
   }
-  // Extraction lives here so consumption stays serialized (<=1 in-flight).
+  // Frame complete physical lines out of the chunk; classify each one.
+  private func feed(_ bytes: ArraySlice<UInt8>) {
+    var seg = bytes
+    while let nl = seg.firstIndex(of: 0x0A) {
+      defer { seg = seg[seg.index(after: nl)...] }
+      if rejectingLine { rejectingLine = false; continue } // tail of a rejected line
+      var line = scratch
+      line.append(contentsOf: seg[seg.startIndex..<nl])
+      scratch.removeAll()
+      complete(line)
+    }
+    guard !rejectingLine else { return } // drop the oversize partial too
+    scratch.append(contentsOf: seg)
+    if scratch.count > CommandParser.maxLineBytes {
+      scratch.removeAll()
+      rejectingLine = true
+      onError?("line-too-long")
+    }
+  }
+  private func complete(_ raw: Data) {
+    var line = raw
+    if line.last == 0x0D { line.removeLast() }
+    if line.count > CommandParser.maxLineBytes { onError?("line-too-long"); return }
+    seq += 1
+    let result = CommandParser.parse(line)
+    switch result {
+    case .ok(let cmd) where cmd.isControl:
+      switch cmd {
+      case .titles: titlesSlot = (seq, cmd)
+      case .quit: quitSlot = (seq, cmd)
+      default: break
+      }
+    case .ok, .error:
+      if pendingBytes + Self.charge(line) > Self.maxPending {
+        batchDropped += 1
+        batchTypes[dropKey(result), default: 0] += 1
+      } else {
+        pending.append(line)
+        queuedBytes += Self.charge(line)
+        _ = pendingBytes // refreshes peakPending
+      }
+    }
+  }
+  // Fixed, bounded drop-type keys; arbitrary commands never echo.
+  private func dropKey(_ result: CommandResult) -> String {
+    switch result {
+    case .ok(.snapshot): return "snapshot"
+    case .ok(.recheckPermissions): return "recheck-permissions"
+    case .ok: return "unknown"
+    case .error(let code, _): return code == "unknown-command" ? "unknown" : "malformed"
+    }
+  }
+  // Controls jump the ordinary backlog; newest of each class wins and the two
+  // classes keep arrival order between them.
+  private func flushControls() {
+    while titlesSlot != nil || quitSlot != nil {
+      if let q = quitSlot, titlesSlot == nil || q.seq < titlesSlot!.seq {
+        quitSlot = nil
+        onControlLine?(q.cmd)
+      } else if let t = titlesSlot {
+        titlesSlot = nil
+        onControlLine?(t.cmd)
+      }
+    }
+  }
+  private func flushOverflow() {
+    guard batchDropped > 0 else { return }
+    let n = batchDropped, types = batchTypes
+    batchDropped = 0; batchTypes = [:]
+    onOverflow?(n, types)
+  }
+  // Ordinary consumption stays serialized (<=1 in-flight).
   private func pump() {
     guard !pumping else { return }
     pumping = true
     defer { pumping = false }
-    while true {
-      if consuming { return }
-      if let nl = buffer.firstIndex(of: 0x0A) {
-        var line = buffer.subdata(in: buffer.startIndex..<nl)
-        buffer.removeSubrange(buffer.startIndex...nl)
-        if line.last == 0x0D { line.removeLast() }
-        deliver(line)
-        continue
+    guard !consuming else { return }
+    if pendingHead < pending.count {
+      let line = pending[pendingHead]
+      pendingHead += 1
+      queuedBytes -= Self.charge(line)
+      if pendingHead >= pending.count { pending.removeAll(); pendingHead = 0 }
+      else if pendingHead >= 64 && pendingHead * 2 >= pending.count {
+        pending.removeFirst(pendingHead); pendingHead = 0
       }
-      if !eof {
-        if buffer.count > CommandParser.maxLineBytes {
-          buffer.removeAll()
-          onError?("line-too-long")
-          discarding = true
-          continue
-        }
-        return
-      }
-      // EOF: the trailing partial line is the final command.
-      if !buffer.isEmpty {
-        var line = buffer
-        buffer.removeAll()
-        if line.count > CommandParser.maxLineBytes { onError?("line-too-long"); continue }
-        if line.last == 0x0D { line.removeLast() }
-        if !line.isEmpty { deliver(line); continue }
-      }
-      onEOF?()
+      deliver(line)
       return
     }
+    if eof, !eofNotified { eofNotified = true; onEOF?() }
   }
   private func deliver(_ line: Data) {
     consuming = true
-    inFlight = line.count
+    inFlight = Self.charge(line)
+    _ = pendingBytes
     // Re-serialize the consumer completion on this queue.
     onLine?(line) { [weak self, queue] in
       queue.async { [weak self] in
         guard let self else { return }
         self.inFlight = 0
         self.consuming = false
-        self.overflowNoted = self.pendingBytes >= Self.maxPending
         self.pump()
       }
     }
@@ -131,6 +187,19 @@ public final class InputReader {
     eof = true
     source.cancel()
     onEOFDetected?() // runtime arms its exit deadline here, before the drain
+    // The trailing partial line is the final command (unless it continues a
+    // rejected oversized line).
+    if rejectingLine {
+      rejectingLine = false
+      scratch.removeAll()
+    } else if !scratch.isEmpty {
+      let line = scratch
+      scratch.removeAll()
+      if line.count > CommandParser.maxLineBytes { onError?("line-too-long") }
+      else { complete(line) }
+    }
+    flushControls()
+    flushOverflow()
     pump()
   }
 }

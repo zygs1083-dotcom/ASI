@@ -118,16 +118,120 @@ private final class HelperProcess {
   }
 }
 
+// Drives the synthetic pipe fixture: same CommandChannel+AXSession as the real
+// helper, deterministic fake AX, stderr markers for synchronization.
+private final class FixtureProcess {
+  let process = Process()
+  private let stdinPipe = Pipe(), stdoutPipe = Pipe(), stderrPipe = Pipe()
+  private var outData = Data(), errData = Data()
+  private var partial = Data(), lines: [String] = []
+  private let lock = NSLock()
+
+  init(binary: URL, args: [String] = [], prefillStdout: Bool = false,
+       drainStdout: Bool = true) throws {
+    let wfd = stdoutPipe.fileHandleForWriting.fileDescriptor
+    if prefillStdout { // structural saturation: kernel pipe starts full
+      _ = fcntl(wfd, F_SETFL, fcntl(wfd, F_GETFL) | O_NONBLOCK)
+      var buf = [UInt8](repeating: 0x2e, count: 4096)
+      while write(wfd, &buf, buf.count) > 0 {}
+      var one: UInt8 = 0x2e // top off the last partial slot
+      while write(wfd, &one, 1) > 0 {}
+    }
+    stderrPipe.fileHandleForReading.readabilityHandler = { [weak self] h in
+      self?.appendErr(h.availableData)
+    }
+    if drainStdout { startDraining() }
+    process.executableURL = binary
+    process.arguments = args
+    process.standardInput = stdinPipe
+    process.standardOutput = stdoutPipe
+    process.standardError = stderrPipe
+    try process.run()
+  }
+  deinit { cleanup() }
+  func cleanup() {
+    stdoutPipe.fileHandleForReading.readabilityHandler = nil
+    stderrPipe.fileHandleForReading.readabilityHandler = nil
+    try? stdinPipe.fileHandleForWriting.close()
+    guard process.isRunning else { return }
+    process.terminate()
+    if waitExit(timeout: 3) == nil { kill(process.processIdentifier, SIGKILL); process.waitUntilExit() }
+  }
+  func startDraining() {
+    stdoutPipe.fileHandleForReading.readabilityHandler = { [weak self] h in
+      self?.appendOut(h.availableData)
+    }
+  }
+  // Read exactly n bytes off the undrained pipe (leaves <4096 free).
+  func readStdout(bytes n: Int) {
+    var buf = [UInt8](repeating: 0, count: n)
+    _ = read(stdoutPipe.fileHandleForReading.fileDescriptor, &buf, n)
+  }
+  func stdoutBuffered() -> Int {
+    var n = Int32(0)
+    _ = ioctl(stdoutPipe.fileHandleForReading.fileDescriptor, 0x4004_667f, &n)
+    return Int(n)
+  }
+  private func appendErr(_ d: Data) { lock.lock(); errData.append(d); lock.unlock() }
+  private func appendOut(_ d: Data) {
+    lock.lock(); defer { lock.unlock() }
+    outData.append(d)
+    partial.append(d)
+    while let nl = partial.firstIndex(of: 0x0A) {
+      let line = partial.subdata(in: partial.startIndex..<nl)
+      partial.removeSubrange(partial.startIndex...nl)
+      if let s = String(data: line, encoding: .utf8) { lines.append(s) }
+    }
+  }
+  func send(_ s: String) { stdinPipe.fileHandleForWriting.write(Data(s.utf8)) }
+  func closeStdin() { try? stdinPipe.fileHandleForWriting.close() }
+  func snapshotLines() -> [String] { lock.lock(); defer { lock.unlock() }; return lines }
+  func rawOutput() -> Data { lock.lock(); defer { lock.unlock() }; return outData }
+  func stderrText() -> String { lock.lock(); defer { lock.unlock() }
+    return String(decoding: errData, as: UTF8.self) }
+  private func waitFor(_ timeout: TimeInterval, _ pred: () -> Bool) -> Bool {
+    let deadline = Date().addingTimeInterval(timeout)
+    while Date() < deadline {
+      if pred() { return true }
+      Thread.sleep(forTimeInterval: 0.01)
+    }
+    return false
+  }
+  @discardableResult
+  func waitStderr(_ marker: String, timeout: TimeInterval = 10) -> Bool {
+    waitFor(timeout) { self.stderrText().contains(marker) }
+  }
+  @discardableResult
+  func waitForLine(containing needle: String, timeout: TimeInterval = 10) -> String? {
+    var found: String?
+    _ = waitFor(timeout) {
+      found = self.snapshotLines().first { $0.contains(needle) }
+      return found != nil
+    }
+    return found
+  }
+  @discardableResult
+  func waitExit(timeout: TimeInterval = 10) -> Int32? {
+    waitFor(timeout) { !self.process.isRunning } ? process.terminationStatus : nil
+  }
+}
+
 final class ProcessTests: XCTestCase {
   private static func binary() throws -> URL {
+    try binaryNamed("asi-sense-helper")
+  }
+  private static func fixtureBinary() throws -> URL {
+    try binaryNamed("asi-sense-pipe-fixture")
+  }
+  private static func binaryNamed(_ name: String) throws -> URL {
     var dir = URL(fileURLWithPath: #filePath)
     for _ in 0..<3 { dir.deleteLastPathComponent() } // package root
     for config in ["debug", "release"] {
-      let url = dir.appendingPathComponent(".build/\(config)/asi-sense-helper")
+      let url = dir.appendingPathComponent(".build/\(config)/\(name)")
       if FileManager.default.isExecutableFile(atPath: url.path) { return url }
     }
-    XCTFail("helper binary not found; run `swift build` first")
-    return dir.appendingPathComponent(".build/debug/asi-sense-helper")
+    XCTFail("\(name) binary not found; run `swift build` first")
+    return dir.appendingPathComponent(".build/debug/\(name)")
   }
   private func sendQuitAndExpectCleanExit(_ p: HelperProcess, file: StaticString = #filePath, line: UInt = #line) {
     p.send("{\"cmd\":\"quit\"}\n")
@@ -219,9 +323,10 @@ final class ProcessTests: XCTestCase {
     XCTAssertGreaterThan(p.stdoutBuffered(), 16 * 1024,
                          "kernel pipe must start structurally full", file: file, line: line)
     p.send("{\"cmd\":\"titles\",\"enabled\":false}\n")
+    // Bounded well under the 1024-line critical cap: snapshots are critical
+    // output now, so an unbounded flood would legitimately fail fast.
     let batch = String(repeating: "{\"cmd\":\"snapshot\"}\n", count: 100)
-    let end = Date().addingTimeInterval(3)
-    while Date() < end, p.sendFlood(batch, deadline: 0.5) {}
+    for _ in 0..<3 { XCTAssertTrue(p.sendFlood(batch, deadline: 2)) }
     Thread.sleep(forTimeInterval: 0.3) // let queued snapshots exercise the writer
     XCTAssertGreaterThanOrEqual(p.stdoutBuffered(), 16 * 1024,
                                 "kernel pipe must still be full", file: file, line: line)
@@ -290,5 +395,121 @@ final class ProcessTests: XCTestCase {
       }
     }
     return rc == 0 ? info.ri_resident_size : 0
+  }
+
+  // MARK: - Synthetic fixture scenarios (same CommandChannel + AXSession)
+
+  private func launchFixture(_ args: [String] = [], prefillStdout: Bool = false,
+                             drainStdout: Bool = true) throws -> FixtureProcess {
+    let p = try FixtureProcess(binary: Self.fixtureBinary(), args: args,
+                               prefillStdout: prefillStdout, drainStdout: drainStdout)
+    XCTAssertTrue(p.waitStderr("fixture:ready"), "fixture must start")
+    return p
+  }
+  // A: a titles:false control jumps a >256KiB ordinary backlog AND an
+  // AX-blocked snapshot; the ack lands before the gate releases and quit
+  // bypasses the whole stuck pipeline.
+  func testFixtureAControlBypassesBlockedSnapshotAndOverflow() throws {
+    let p = try launchFixture(["--gate-fw-from=2", "--release-delay-ms=2500"])
+    p.send("{\"cmd\":\"snapshot\"}\n")
+    XCTAssertTrue(p.waitStderr("fixture:gate-hold"), "first snapshot must reach the gated AX read")
+    p.send(String(repeating: "{\"cmd\":\"snapshot\"}\n", count: 15000)) // ~270KiB
+    p.send("{\"cmd\":\"titles\",\"enabled\":false,\"id\":\"A1\"}\n")
+    guard let ack = p.waitForLine(containing: "titles.ack", timeout: 10) else {
+      return XCTFail("ack must arrive while the backlog and AX read are still blocked")
+    }
+    XCTAssertFalse(p.stderrText().contains("fixture:gate-release"),
+                   "ack must precede any AX completion")
+    guard let d = (try? JSONSerialization.jsonObject(with: Data(ack.utf8))) as? [String: Any] else {
+      return XCTFail("ack must be JSON")
+    }
+    XCTAssertEqual(d["id"] as? String, "A1")
+    XCTAssertEqual(d["enabled"] as? Bool, false)
+    XCTAssertNotNil(d["gen"] as? Int)
+    guard let overflow = p.waitForLine(containing: "input_overflow", timeout: 5) else {
+      return XCTFail("dropped snapshots must be reported")
+    }
+    let od = (try? JSONSerialization.jsonObject(with: Data(overflow.utf8))) as? [String: Any]
+    XCTAssertGreaterThan(
+      ((od?["droppedTypes"] as? [String: Any])?["snapshot"] as? Int) ?? 0, 0,
+      "snapshot drops counted by type")
+    p.send("{\"cmd\":\"quit\"}\n")
+    guard let code = p.waitExit(timeout: 3) else {
+      return XCTFail("quit must bypass the blocked AX work and the input backlog")
+    }
+    XCTAssertEqual(code, 0)
+  }
+  // B: titles:false is applied and acked while the snapshot's AX read is still
+  // gated; the gate releases only afterwards (fixture schedules it inside the
+  // titles hook), so the completed snapshot must carry no title.
+  func testFixtureBAckPrecedesGateReleaseSnapshotHasNoTitle() throws {
+    let p = try launchFixture(["--gate-fw-from=2", "--release-delay-ms=750"])
+    p.send("{\"cmd\":\"snapshot\"}\n")
+    XCTAssertTrue(p.waitStderr("fixture:gate-hold"))
+    p.send("{\"cmd\":\"titles\",\"enabled\":false,\"id\":\"B1\"}\n")
+    guard let ack = p.waitForLine(containing: "\"id\":\"B1\"", timeout: 10) else {
+      return XCTFail("ack must arrive while AX is still gated")
+    }
+    XCTAssertFalse(p.stderrText().contains("fixture:gate-release"),
+                   "the AX read must still be blocked when the ack lands")
+    XCTAssertTrue(ack.contains("\"enabled\":false"))
+    guard let snap = p.waitForLine(containing: "\"type\":\"snapshot\"", timeout: 10) else {
+      return XCTFail("snapshot must complete once the delayed gate releases")
+    }
+    XCTAssertFalse(snap.contains("\"title\""), "post-toggle snapshot carries no title")
+    XCTAssertTrue(p.stderrText().contains("fixture:gate-release"))
+    p.send("{\"cmd\":\"quit\"}\n")
+    XCTAssertEqual(p.waitExit(), 0)
+  }
+  // C: title lines are <=PIPE_BUF and write atomically, so a pipe with less
+  // than a whole line free NEVER receives a title byte - the queued entry is
+  // removed wholesale by the privacy purge. Only a line that completed
+  // entirely before the toggle could already sit in the kernel.
+  private func fixturePrivacyPurgeFlow(prefreeBytes: Int) throws {
+    let p = try launchFixture(["--title-len=60000"], prefillStdout: true,
+                              drainStdout: false)
+    XCTAssertGreaterThan(p.stdoutBuffered(), 16 * 1024, "pipe must start full")
+    p.send("{\"cmd\":\"snapshot\"}\n")
+    XCTAssertTrue(p.waitStderr("fixture:snapshot-done"),
+                  "the title-bearing snapshot must be queued in the writer")
+    if prefreeBytes > 0 { p.readStdout(bytes: prefreeBytes) } // < title line
+    XCTAssertFalse(p.stderrText().contains("FIXTLEAK"), "markers never go to stderr")
+    p.send("{\"cmd\":\"titles\",\"enabled\":false,\"id\":\"C1\"}\n")
+    // The marker is emitted only after the full control applied: the purge and
+    // the ack enqueue are already done when stdout starts draining.
+    XCTAssertTrue(p.waitStderr("fixture:titles-applied"),
+                  "privacy applies while stdout is still blocked")
+    p.startDraining()
+    guard let ack = p.waitForLine(containing: "\"id\":\"C1\"", timeout: 10) else {
+      return XCTFail("the ack must still arrive")
+    }
+    XCTAssertTrue(ack.contains("\"enabled\":false"))
+    let raw = String(decoding: p.rawOutput(), as: UTF8.self)
+    XCTAssertFalse(raw.contains("FIXTLEAK-BEGIN"),
+                   "no synthetic title byte may ever reach the wire")
+    XCTAssertFalse(raw.contains("FIXTLEAK-END"),
+                   "no synthetic title suffix may ever reach the wire")
+    XCTAssertFalse(raw.contains("\"title\""), "no title key post-toggle")
+    // Everything after the kernel filler must be whole valid NDJSON records -
+    // a truncated title line can never be glued onto a following event.
+    let segments = raw.split(separator: "\n").map(String.init)
+    let events = segments.filter { $0.hasPrefix("{") }
+    XCTAssertFalse(events.isEmpty, "events must follow the filler")
+    for line in events {
+      XCTAssertNotNil(try? JSONSerialization.jsonObject(with: Data(line.utf8)),
+                      "every emitted line is valid JSON: \(line.prefix(60))")
+    }
+    XCTAssertTrue(events.contains { $0.contains("\"type\":\"snapshot\"") },
+                  "the critical snapshot survives, stripped")
+    p.send("{\"cmd\":\"quit\"}\n")
+    XCTAssertEqual(p.waitExit(), 0)
+  }
+  func testFixtureC1FullPipeQueuedTitleNeverWrittenAfterToggle() throws {
+    try fixturePrivacyPurgeFlow(prefreeBytes: 0)
+  }
+  // C variant: a hole smaller than one atomic title line still admits zero
+  // title bytes - hello/thermal may consume the hole, nothing else fits.
+  func testFixtureC2PartialFreeSpaceTitleNeverWritten() throws {
+    try fixturePrivacyPurgeFlow(prefreeBytes: 64)
   }
 }

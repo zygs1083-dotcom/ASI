@@ -8,6 +8,10 @@ let package = Package(
   targets: [
     .target(name: "SenseHelperCore"),
     .executableTarget(name: "ASISenseHelper", dependencies: ["SenseHelperCore"]),
-    .testTarget(name: "SenseHelperCoreTests", dependencies: ["SenseHelperCore"]),
+    // Test-only synthetic helper: same CommandChannel/AXSession, fake backend.
+    .executableTarget(name: "asi-sense-pipe-fixture",
+                      dependencies: ["SenseHelperCore"], path: "Tests/PipeFixture"),
+    .testTarget(name: "SenseHelperCoreTests",
+                dependencies: ["SenseHelperCore", "asi-sense-pipe-fixture"]),
   ]
 )

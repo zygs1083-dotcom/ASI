@@ -20,13 +20,14 @@ Startup order:
 |---|---|---|
 | `hello` | `version`,`pid`,`permissions` | startup + `recheck-permissions` |
 | `app.activated` / `app.launched` / `app.terminated` | `name`,`bundleId`,`pid` (missing strings -> `""`) | NSWorkspace |
-| `window.focused` | `pid`,`bundleId`,`title?` | AX focused/main window change; `title` absent if unreadable, no focused window, or titles disabled |
+| `window.focused` | `pid`,`bundleId`,`title?`,`window` | AX focused/main window change; `title` absent if unreadable, no focused window, or titles disabled; `window` is explicitly `null` when the focused app currently has no window (windowless focus, deduplicated while focus stays windowless) |
 | `window.title` | `pid`,`bundleId`,`title?` | AX title change, debounced 250ms trailing, latest wins, same-as-emitted suppressed per focused-window context |
-| `ax.unsupported` | `bundleId`,`notification`,`error` (raw AXError code) | a required AX registration failed with a *permanent* unsupported error; at most once per app key per run (see AX semantics) |
+| `titles.ack` | `id?`,`enabled`,`gen` | confirms a `titles` command was applied: `enabled` echoes the new state, `gen` is the privacy generation the switch produced, `id` echoes the command's correlation id when one was supplied (string or integer) |
+| `ax.unsupported` | `bundleId`,`pid`,`notification`,`error` (raw AXError code) | a required AX registration failed with a *permanent* unsupported error; at most once per app key per run (see AX semantics) |
 | `thermal` | `state` | ProcessInfo |
 | `power.sleep`/`power.wake`, `screen.locked`/`screen.unlocked`, `session.active`/`session.inactive` | - | NSWorkspace + DNC |
 | `snapshot` | see below | `{"cmd":"snapshot"}` |
-| `error` | `code`,`message`,`dropped?` | rejected input, flow-control notices or unrecognized OS state; fixed strings, never echoes input |
+| `error` | `code`,`message`,`dropped?`,`droppedTypes?`,`pid?`,`bundleId?` | rejected input, flow-control notices or unrecognized OS state; fixed strings, never echoes input |
 
 If a future unrecognized `ProcessInfo.ThermalState` appears, a fixed `error`
 event (`code:"thermal-state"`) is emitted instead of an invented state.
@@ -55,9 +56,21 @@ One per line, <=64KiB; partial lines and CRLF handled. Optional `v` must equal
 | command | effect |
 |---|---|
 | `{"cmd":"snapshot"}` | one `snapshot` event |
-| `{"cmd":"titles","enabled":true|false}` | privacy switch (see below) |
+| `{"cmd":"titles","enabled":true|false,"id"?}` | privacy switch (see below); optional `id` is a string or exact Int64 correlation tag echoed by `titles.ack` (non-integral or out-of-range values -> `bad-id`) |
 | `{"cmd":"recheck-permissions"}` | fresh `hello`; reconciles AX state: attaches when trusted and not yet observing, detaches the live observer when trust was revoked; never prompts |
 | `{"cmd":"quit"}` | clean shutdown, exit 0 |
+
+**Controls.** `titles` and `quit` are *control* commands: the reader keeps a
+newest-of-each-class slot and delivers them ahead of every queued ordinary
+command - even while a `snapshot` is in flight or the ordinary backlog is
+saturated. When several same-class controls arrive inside one read batch only
+the latest is delivered (superseded controls need not ack); between classes,
+arrival order is preserved. `titles` is applied synchronously when delivered:
+the privacy generation bumps *per delivered command* (even redundant ones),
+the encoder state flips, queued title lines are purged, and a critical
+`titles.ack` is enqueued - every delivered `titles` command gets exactly one
+ack. `quit` disables titles (invalidating in-flight title work), purges queued
+title lines, then performs the bounded clean shutdown.
 
 Errors (`error` event, process keeps running unless noted):
 
@@ -66,21 +79,30 @@ Errors (`error` event, process keeps running unless noted):
 | `malformed` | not a JSON object, or `cmd` not a string |
 | `unknown-command` | unrecognized `cmd` |
 | `bad-enabled` | `titles.enabled` missing or not a JSON boolean (0/1 rejected) |
+| `bad-id` | `titles.id` present but not a string or integer |
 | `bad-version` | `v` present but not numerically `1` |
 | `line-too-long` | command line exceeds 64KiB; the rest of that physical line is discarded |
-| `input_overflow` | aggregate pending input exceeded 256KiB; the current physical line is discarded through its next LF (one event per saturation episode) |
-| `output_overflow` | queued output hit the bounds below and noncritical events were evicted; `dropped:N` reports the total evicted count. Emitted once the queue drains |
-| `ax-retryable` | an AX operation failed with a retryable error (`cannotComplete`, `apiDisabled`, `failure`, `invalidUIElement`, ...); the app is *not* marked unsupported and the next activation/`recheck-permissions` retries |
+| `input_overflow` | ordinary pending input exceeded 256KiB; `dropped`/`droppedTypes` count the dropped commands per bounded type key (`snapshot`,`recheck-permissions`,`unknown`,`malformed`); coalesced per readiness batch |
+| `output_overflow` | queued output hit the bounds below and noncritical events were evicted; `dropped`/`droppedTypes` count evictions per event type. Emitted as the next whole record, not at queue-empty |
+| `ax-retryable` | an AX operation failed with a retryable error (`cannotComplete`, `apiDisabled`, `failure`, `invalidUIElement`, ...); carries `pid`/`bundleId` of the affected app; the app is *not* marked unsupported and the next activation/`recheck-permissions` retries |
 | `thermal-state` | OS reported an unrecognized thermal state |
 
 ## Input bounds
 
 - Reads are nonblocking, <=16KiB chunks, on a serial reader context (the main
   run loop in the shipped helper); each readiness event handles finite bytes.
-- Total pending input (buffered + in-flight command) is capped at 256KiB. On
-  saturation `input_overflow` fires once per episode and physical lines are
-  discarded through their LFs without retaining oversize suffixes; ordinary
-  oversized lines keep `line-too-long`.
+- Physical lines are framed in a dedicated <=64KiB scratch **independently** of
+  serialized command consumption; an oversized line is rejected through its
+  next LF with `line-too-long`.
+- Ordinary pending input (queued + in-flight command) is capped at 256KiB,
+  each entry charged `max(64, bytes+1)` to cover framing overhead so empty
+  lines cannot queue unbounded records; anything beyond the cap is dropped
+  and counted in a coalesced `input_overflow` per readiness batch.
+- Valid `titles`/`quit` commands are controls: they live in dedicated slots
+  (never charged to the cap, newest per class wins), are flushed after every
+  read chunk, and are delivered ahead of the next ordinary command even while
+  one is in flight - so `titles:false` and `quit` cannot be serialized behind
+  a blocked snapshot or a flooded backlog.
 - Commands run strictly one at a time (next delivered only after the previous
   completion, including the async `snapshot` read); a flood cannot queue
   unbounded work.
@@ -94,12 +116,21 @@ Errors (`error` event, process keeps running unless noted):
   at most **1024 queued lines** and **1MiB queued bytes** - drained by a
   `DispatchSourceWrite`. Enqueue never blocks, spins on EAGAIN, or interleaves
   lines; a partially written line resumes at its byte offset when space frees.
-- On saturation the **oldest unstarted noncritical** events are evicted; the
-  count accumulates and one `output_overflow` (`dropped:N`) error is emitted
-  once the queue drains.
-- `hello` and `error` are **critical**: never evicted or purged. If nothing
-  removable remains (or a critical event exceeds the byte bound) the helper
-  fails fast with exit 1 rather than discard critical data or grow memory.
+- On saturation the **oldest unstarted noncritical** events are evicted; one
+  coalesced critical `output_overflow` record (`dropped`, `droppedTypes`)
+  rides as the next whole line right behind any partially-written head.
+- **Critical** - never evicted, never purged-without-transform:
+  `hello`, `error`, `app.terminated`, `ax.unsupported`, `snapshot`,
+  `titles.ack`. If nothing removable remains (or a critical event exceeds
+  the byte bound) the helper fails fast with exit 1 rather than discard
+  critical data or grow memory.
+- Title-bearing lines are capped at **PIPE_BUF bytes** including the LF -
+  `min(4096, PIPE_BUF)` = 512 on Darwin (a platform-safety tightening of the
+  requested <=4096); the encoder truncates or strips title strings to fit
+  the final JSONSerialization encoding. Such a line is written atomically:
+  the whole line crosses in one `write()` or the entry waits at offset 0 -
+  a partial title line never exists, so it can never be resumed, purged
+  mid-wire, or glued onto a following record.
 - Normal shutdown drains only ready output under a strict 200ms deadline;
   it does not guarantee delivery of everything queued. Filled stdout can
   never block EOF or SIGTERM handling.
@@ -117,14 +148,21 @@ Errors (`error` event, process keeps running unless noted):
   app generation before and after every blocking call, and main-bound
   deliveries are dropped on any stamp mismatch.
 - `kAXFocusedWindowChangedNotification` is **required**;
-  `kAXMainWindowChangedNotification` is optional - its failure never marks an
-  app unsupported and focused monitoring continues.
+  `kAXMainWindowChangedNotification` and all `AXTitle` reads/subscriptions are
+  optional - their failures (even permanent unsupported ones) never mark an
+  app unsupported and never detach it; a focused app simply reports no title.
 - Permanent unsupported errors (`notificationUnsupported`,
   `attributeUnsupported`, `parameterizedAttributeUnsupported`,
   `actionUnsupported`, `notImplemented`) emit `ax.unsupported` once per app key
   per run. Every other failure emits `ax-retryable` once per context and is
   retried on the next activation or `recheck-permissions`. `noValue` means
-  windowless/unknown.
+  windowless/unknown: it emits `window.focused` with `window:null` (once per
+  windowless context; repeated windowless notifications are deduplicated, and
+  switching to a windowless app reports it again).
+- App-scoped error events (`ax.unsupported`, `ax-retryable`) capture the
+  producing app+privacy generations and the target's identity before any
+  teardown; at delivery a stale generation drops the event entirely - errors
+  are never relabeled with a newer context.
 - The internal dedup key is the bundle id, or `pid:<n>` when the app has none -
   two bundle-less apps never share unsupported state; on the wire `bundleId`
   serializes as `""` for missing identifiers.
@@ -139,16 +177,57 @@ Errors (`error` event, process keeps running unless noted):
   read per context; a re-run enqueues one successor at the queue tail so
   activation/privacy/termination work is never starved. Notifications from a
   replaced observer are ignored.
+- Privacy changes also coalesce: each `titles` command bumps the generation
+  synchronously and returns it for the ack, but at most one queued AX apply
+  job (plus one successor carrying the latest generation) ever exists - a
+  storm of toggles runs a bounded amount of AX work, and queued notification
+  reads carry the privacy generation they were requested under so stale
+  pre-toggle reads never run.
 
 ## Privacy
 
-- Titles default **on**. `titles:false` cancels pending debounced titles,
-  unregisters the title observer, purges unstarted title-bearing noncritical
-  queued output, and centrally strips every `title` key from all subsequent
-  events in the encoder so a stale payload cannot leak.
-- A line already partially written to stdout cannot be recalled; the purge
-  covers only queued-but-unwritten data. This is the sole residual leak and is
-  at most the unwritten remainder of one line.
+Titles default **on**. The host and the helper share a *privacy barrier*: the
+moment the host decides to hide titles it **sends `titles:false` and
+immediately strips every `title` key recursively** from anything it would
+display or forward - without waiting. The barrier closes when the matching
+`titles.ack` arrives (`id` and `enabled` match; `gen` is monotonically
+increasing so the host can record the latest applied generation): from that
+point on the helper guarantees no title-bearing output until an explicit
+later `titles:true` (the host must still wait for its enable ack before
+rendering titles).
+
+```text
+host:  id = unique(); discardTitles = true        // strip recursively NOW
+       send {"cmd":"titles","enabled":false,"id":id}
+host:  strip title keys from every subsequent event until the matching ack
+host:  on titles.ack where ack.id == id && ack.enabled == false:
+           barrier closed - no title may arrive until an explicit true;
+           record ack.gen (privacy gens are monotonically increasing)
+host:  titles:true takes helper-side effect at once, but the host must not
+       render titles until the matching enabled:true ack is received
+```
+
+On the helper side, a delivered `titles` command:
+
+1. synchronously bumps the privacy generation and flips `titlesEnabled` in the
+   session (so in-flight AX title reads are invalidated),
+2. flips the central encoder: every nested `title` key is removed recursively
+   from all later events,
+3. purges queued output: title entries are atomic, so only whole unstarted
+   records can exist - noncritical title lines are dropped entirely and an
+   unstarted critical title-bearing record such as `snapshot` is re-encoded
+   with every `title` key stripped rather than dropped,
+4. enqueues the critical `titles.ack`.
+
+Every delivered `titles` command gets its own ack (its own `gen`), including
+redundant ones; a same-batch-superseded control may never be delivered and
+therefore need not ack - the latest control is always delivered.
+
+Residual risk, explicitly: a COMPLETE title line already accepted into the
+kernel buffer before the toggle cannot be recalled. That is the only possible
+residual: because title lines write atomically there is never a partial line
+to complete, so no truncated title or title suffix can ever follow the ack.
+
 - `titles:true` resets title dedup and re-reads through the normal 250ms
   debounce. While titles are off the helper does not read `AXTitle`.
 - Only two AX attributes are ever read: `AXFocusedWindow` and `AXTitle`.

@@ -30,13 +30,28 @@ for every field, ordering, error codes, privacy rules and exit statuses.
 All I/O is bounded so a slow or dead peer can never hang or exhaust the
 helper (bounds and semantics: PROTOCOL.md):
 
-- **stdin**: nonblocking reader, 16KiB chunks, <=256KiB pending, serialized
-  commands, `input_overflow` on saturation.
+- **stdin**: nonblocking reader, 16KiB chunks, <=64KiB physical-line framing,
+  <=256KiB ordinary pending, serialized commands. Valid `titles`/`quit`
+  commands are controls that jump the backlog (newest per class) even while a
+  snapshot is in flight; ordinary drops report `input_overflow` with
+  per-type counts.
 - **stdout**: nonblocking bounded writer (1024 lines / 1MiB); oldest
-  noncritical evictions are reported once via `output_overflow`; criticals
+  noncritical evictions report one coalesced `output_overflow`
+  (`dropped`/`droppedTypes`) as the next whole line; criticals
+  (`hello`,`error`,`app.terminated`,`ax.unsupported`,`snapshot`,`titles.ack`)
   never drop - a full critical queue fails fast.
+- **privacy**: `titles` applies synchronously (privacy generation bump),
+  flips the central encoder (recursive `title`-key stripping), purges queued
+  title lines and emits a critical `titles.ack` - the host's privacy fence.
+  Title lines are <=PIPE_BUF (512B on Darwin) and write atomically - either
+  whole or not at all - so a purged title line can never leave a truncated
+  prefix on the wire.
 - **AX**: all IPC on a serial queue with a 0.5s timeout; app/window/privacy
-  generation checks drop stale results.
+  generation checks drop stale results; one coalesced privacy job applies the
+  latest generation regardless of toggle storms.
+- `CommandChannel` owns the stdin/privacy/stdout plumbing shared by the real
+  runtime and the `Tests/PipeFixture` synthetic process used by pipe-level
+  regression tests.
 - **shutdown**: SIGTERM exits directly on a control queue; EOF/`quit` exit
   within ~1s under a full stdout pipe; normal shutdown flushes <=200ms.
 

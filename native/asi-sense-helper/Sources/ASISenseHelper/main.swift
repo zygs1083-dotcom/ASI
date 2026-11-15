@@ -7,61 +7,47 @@ private func nowMs() -> Int64 { Int64(Date().timeIntervalSince1970 * 1000) }
 private func accessibilityTrusted() -> Bool { AXIsProcessTrusted() }
 private func permissionState() -> String { accessibilityTrusted() ? "granted" : "denied" }
 
-// Main owns NSWorkspace subscriptions, NDJSON framing, privacy encoding and
-// lifecycle; AX IPC lives on the session queue, stdin/stdout are bounded.
+// Main owns NSWorkspace subscriptions and lifecycle; CommandChannel owns the
+// bounded stdin/stdout plumbing, privacy switching and acks; AX IPC lives on
+// the session queue.
 final class HelperRuntime {
-  private var encoder = LineEncoder()
-  private let writer = OutputWriter(fd: STDOUT_FILENO)
-  private var reader: InputReader!
+  private let channel = CommandChannel(queue: .main, nowMs: nowMs)
   private var session: AXSession<SystemAXBackend>!
   private var workspaceTokens: [NSObjectProtocol] = []
   private var centerTokens: [(NotificationCenter, NSObjectProtocol)] = []
-  private var stopping = false, titlesEnabled = true
+  private var stopping = false
 
   func start() {
     let backend = SystemAXBackend()
     let session = AXSession(backend: backend, isTrusted: accessibilityTrusted, nowMs: nowMs) {
-      [weak self] event, critical in self?.emit(event, critical: critical)
+      [weak self] event in self?.emit(event)
     }
     self.session = session
     backend.callback = { [weak session] obs, element, name in
       session?.notify(name, observer: obs, element: element)
     }
-    writer.onFatal = { exit(1) }
-    // Fires on the writer queue; encoder/privacy state is main-owned, so hop.
-    writer.onDropsRecovered = { [weak self] n in
-      DispatchQueue.main.async { [weak self] in
-        self?.emit(ErrorEvent(at: nowMs(), code: "output_overflow",
-                              message: "stdout backpressure dropped queued events", dropped: n),
-                   critical: true)
-      }
-    }
-    let reader = InputReader(queue: .main)
-    self.reader = reader
-    reader.onLine = { [weak self] line, done in self?.processLine(line, done: done) }
-    reader.onError = { [weak self] code in
-      self?.emitError(code, code == "input_overflow" ? "stdin backlog exceeds 256KiB"
-                                                   : "command line exceeds 64KiB")
-    }
-    reader.onEOFDetected = { armExitDeadline() }
-    reader.onEOF = { [weak self] in self?.shutdown(exitCode: 0) }
+    channel.onTitles = { [weak self] on in self?.session.setTitlesEnabled(on) ?? -1 }
+    channel.onCommand = { [weak self] cmd, done in self?.execute(cmd, done: done) }
+    channel.onQuit = { [weak self] in self?.shutdown(exitCode: 0) }
+    channel.onEOF = { [weak self] in self?.shutdown(exitCode: 0) }
+    channel.onEOFDetected = { armExitDeadline() }
+    channel.onFatal = { exit(1) }
     emitHello()
     emitThermal()
     registerObservers()
-    reader.start()
+    channel.start()
     if let app = NSWorkspace.shared.frontmostApplication {
       session.activate(pid: app.processIdentifier, bundleId: app.bundleIdentifier ?? "")
     }
   }
 
-  private func emit<E: Encodable>(_ event: E, critical: Bool = false) {
-    guard !stopping, let line = try? encoder.encodeLine(event) else { return }
-    writer.enqueue(line, critical: critical,
-                   hasTitle: encoder.titlesEnabled && line.range(of: Data(#""title""#.utf8)) != nil)
+  private func emit<E: Encodable>(_ event: E) {
+    guard !stopping else { return }
+    channel.send(event)
   }
   private func emitHello() {
     emit(HelloEvent(at: nowMs(), pid: ProcessInfo.processInfo.processIdentifier,
-                    permissions: .init(accessibility: permissionState())), critical: true)
+                    permissions: .init(accessibility: permissionState())))
   }
   private func emitApp(_ type: String, _ a: NSRunningApplication) {
     emit(AppEvent(type: type, at: nowMs(), name: a.localizedName ?? "",
@@ -69,13 +55,10 @@ final class HelperRuntime {
   }
   private func emitThermal() {
     guard let state = Self.thermalString(ProcessInfo.processInfo.thermalState) else {
-      emitError("thermal-state", "unrecognized thermal state")
+      channel.emitError("thermal-state", "unrecognized thermal state")
       return
     }
     emit(ThermalEvent(at: nowMs(), state: state))
-  }
-  private func emitError(_ code: String, _ message: String) {
-    emit(ErrorEvent(at: nowMs(), code: code, message: message), critical: true)
   }
   static func thermalString(_ state: ProcessInfo.ThermalState) -> String? {
     switch state {
@@ -125,32 +108,17 @@ final class HelperRuntime {
     ) { [weak self] _ in self?.emitThermal() }))
   }
 
-  private func processLine(_ line: Data, done: @escaping () -> Void) {
-    if line.count > CommandParser.maxLineBytes {
-      emitError("line-too-long", "command line exceeds 64KiB")
-      done()
-      return
-    }
-    switch CommandParser.parse(line) {
-    case .ok(let command): execute(command, done: done)
-    case .error(let code, let message): emitError(code, message); done()
-    }
-  }
   private func execute(_ command: Command, done: @escaping () -> Void) {
     switch command {
     case .snapshot:
       emitSnapshot(done: done)
-    case .titles(let on):
-      setTitlesEnabled(on)
-      done()
     case .recheckPermissions:
       emitHello()
       let app = NSWorkspace.shared.frontmostApplication
       session.recheck(pid: app?.processIdentifier ?? 0, bundleId: app?.bundleIdentifier ?? "")
       done()
-    case .quit:
+    case .titles, .quit: // controls never reach the ordinary path
       done()
-      shutdown(exitCode: 0)
     }
   }
   private func emitSnapshot(done: @escaping () -> Void) {
@@ -164,7 +132,7 @@ final class HelperRuntime {
         SnapshotEvent.FocusedWindow(pid: $0.pid, bundleId: $0.bundleId, status: status, title: title)
       }
       let thermal = Self.thermalString(ProcessInfo.processInfo.thermalState) ?? "unknown"
-      if thermal == "unknown" { self.emitError("thermal-state", "unrecognized thermal state") }
+      if thermal == "unknown" { self.channel.emitError("thermal-state", "unrecognized thermal state") }
       self.emit(SnapshotEvent(at: nowMs(), frontApp: frontApp, focusedWindow: fw,
                               thermal: thermal, permissions: .init(accessibility: permissionState())))
       done()
@@ -172,22 +140,15 @@ final class HelperRuntime {
     guard frontApp != nil else { finish("unknown", nil); return }
     session.snapshot(pid: pid, bundleId: bid) { status, title in finish(status, title) }
   }
-  private func setTitlesEnabled(_ on: Bool) {
-    guard on != titlesEnabled else { return }
-    titlesEnabled = on
-    encoder.titlesEnabled = on
-    if !on { writer.purgeUnstartedTitles() } // queued pre-toggle title lines cannot leak
-    session.setTitlesEnabled(on)
-  }
   func shutdown(exitCode: Int32) {
     guard !stopping else { return }
     stopping = true
-    reader.stop()
+    channel.stopInput()
     for token in workspaceTokens { NSWorkspace.shared.notificationCenter.removeObserver(token) }
     for (center, token) in centerTokens { center.removeObserver(token) }
-    session.shutdown()          // posts local teardown to the AX queue; never blocks on AX IPC
-    writer.flush(deadline: 0.2) // deliver only what the pipe accepts within the deadline
-    writer.close()
+    session.shutdown()              // posts local teardown to the AX queue; never blocks on AX IPC
+    channel.flushOutput(deadline: 0.2) // deliver only what the pipe accepts within the deadline
+    channel.closeOutput()
     exit(exitCode)
   }
 }

@@ -4,8 +4,9 @@ import Foundation
 // Deterministic AX lifecycle (semantics: PROTOCOL.md): all AX state/IPC on a
 // serial queue. One lock-protected Control record carries the desired target,
 // app/window/privacy generations, titles and the published observer; workers
-// carry an immutable app generation re-validated around every blocking call
-// and deliveries carry all three stamps.
+// carry an immutable app generation re-validated around every blocking call,
+// deliveries carry stamps, and queued notification/privacy work captures the
+// privacy generation it was requested under.
 private struct SessionControl<O> {
   var desiredPid: Int32 = 0, desiredBid = ""
   var appGen = 0, winGen = 0, privGen = 0, titles = true
@@ -20,26 +21,28 @@ public final class AXSession<B: AXBackend> {
 
   private let backend: B, axQueue: DispatchQueue
   private let toMain: (@escaping () -> Void) -> Void
-  private let emit: (_ event: any Encodable, _ critical: Bool) -> Void
+  private let emit: (_ event: any Encodable) -> Void
   private let nowMs: () -> Int64, isTrusted: () -> Bool
   private let uptime: () -> TimeInterval
   private let schedule: (TimeInterval, DispatchWorkItem) -> Void
 
   private var observer: B.Observer?, appEl: B.Element?, windowEl: B.Element? // AX-queue-only state
   private var pid: Int32 = 0, bundleId = "", key = "", attachedGen = -1
-  private var titleSubscribed = false
+  private var titleSubscribed = false, hasReportedFocus = false
   private var debouncer = TitleDebouncer(), titleFire: DispatchWorkItem?
   private var titleFireStamp: Stamp = (0, 0, 0), scheduledDeadline: TimeInterval?
   private var unsupported = Set<String>()
   private var needsRetry = false, retryableNoted = false
+  private var privacyAppliedGen = 0
   // Cross-thread shared state
   private let control = Locked(SessionControl<B.Observer>())
-  private let attachState = Locked<(queued: Bool, args: (Int32, String)?, appGen: Int)>((false, nil, 0))
-  private let refreshState = Locked<(posted: Bool, pending: Bool, gen: Int)>((false, false, 0))
-  private let titleState = Locked<(posted: Bool, element: B.Element?, gen: Int)>((false, nil, 0))
+  private let attachState = Locked<(queued: Bool, args: (Int32, String)?, appGen: Int, privGen: Int)>((false, nil, 0, 0))
+  private let refreshState = Locked<(posted: Bool, pending: Bool, appGen: Int, privGen: Int)>((false, false, 0, 0))
+  private let titleState = Locked<(posted: Bool, element: B.Element?, appGen: Int, privGen: Int)>((false, nil, 0, 0))
+  private let privState = Locked<(posted: Bool, pending: Bool, gen: Int)>((false, false, 0))
 
   public init(backend: B, isTrusted: @escaping () -> Bool, nowMs: @escaping () -> Int64,
-              emit: @escaping (_ event: any Encodable, _ critical: Bool) -> Void,
+              emit: @escaping (_ event: any Encodable) -> Void,
               queue: DispatchQueue = .init(label: "asi-sense-helper.ax"),
               toMain: @escaping (@escaping () -> Void) -> Void = { DispatchQueue.main.async(execute: $0) },
               uptime: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
@@ -52,32 +55,42 @@ public final class AXSession<B: AXBackend> {
   public var titlesEnabled: Bool { control.get().titles }
   private func stampNow() -> Stamp { let c = control.get(); return (c.appGen, c.winGen, c.privGen) }
   // Deliver only if the producing context (all three generations) is current.
-  private func post(_ event: any Encodable, critical: Bool, stamp: Stamp) {
+  private func post(_ event: any Encodable, stamp: Stamp) {
     toMain { [weak self] in
       guard let self else { return }
       let c = self.control.get()
       guard c.appGen == stamp.app, c.winGen == stamp.win, c.privGen == stamp.priv else { return }
-      self.emit(event, critical)
+      self.emit(event)
     }
   }
-  private func postAlways(_ event: any Encodable, critical: Bool) { toMain { self.emit(event, critical) } }
+  // App-scoped records (ax.unsupported, ax-retryable): the producing context's
+  // app and privacy generations must still be current at delivery. The window
+  // generation is intentionally omitted: our own unsupported teardown bumps it.
+  private func postAppScoped(_ event: any Encodable, stamp: Stamp) {
+    toMain { [weak self] in
+      guard let self else { return }
+      let c = self.control.get()
+      guard c.appGen == stamp.app, c.privGen == stamp.priv else { return }
+      self.emit(event)
+    }
+  }
 
   // MARK: - Public API (main thread): mutate Control atomically, then post work
 
-  private func queueAttach(_ p: Int32, _ b: String, _ g: Int) {
+  private func queueAttach(_ p: Int32, _ b: String, _ g: Int, _ pr: Int) {
     if attachState.mutate({ st -> Bool in
-      st.args = (p, b); st.appGen = g
+      st.args = (p, b); st.appGen = g; st.privGen = pr
       defer { st.queued = true }
       return !st.queued
     }) { axQueue.async { self.attachNext() } }
   }
   public func activate(pid p: Int32, bundleId b: String) {
-    let g = control.mutate { c -> Int in
+    let (g, pr) = control.mutate { c -> (Int, Int) in
       if c.desiredPid != p { c.appGen &+= 1; c.pubPid = 0; c.pubObs = nil }
       c.desiredPid = p; c.desiredBid = b
-      return c.appGen
+      return (c.appGen, c.privGen)
     }
-    queueAttach(p, b, g)
+    queueAttach(p, b, g, pr)
   }
   // Logical detach is synchronous; resource teardown stays queued.
   public func appTerminated(pid p: Int32) {
@@ -93,12 +106,12 @@ public final class AXSession<B: AXBackend> {
   // Revocation invalidates now; a changed target behaves like activate().
   public func recheck(pid p: Int32, bundleId b: String) {
     if isTrusted(), p != 0 {
-      let g = control.mutate { c -> Int in
+      let (g, pr) = control.mutate { c -> (Int, Int) in
         if c.desiredPid != p { c.appGen &+= 1; c.pubPid = 0; c.pubObs = nil }
         c.desiredPid = p; c.desiredBid = b
-        return c.appGen
+        return (c.appGen, c.privGen)
       }
-      queueAttach(p, b, g)
+      queueAttach(p, b, g, pr)
     } else {
       let g = control.mutate { c -> Int in
         c.appGen &+= 1; c.desiredPid = 0; c.pubPid = 0; c.pubObs = nil
@@ -109,31 +122,41 @@ public final class AXSession<B: AXBackend> {
     }
   }
   public func shutdown() { axQueue.async { self.detachNow() } }
-  // Ingress captures the published observer AND current app generation.
+  // Ingress captures the published observer AND current app+privacy generations.
   public func notify(_ name: String, observer o: B.Observer, element: B.Element) {
     let c = control.get()
     guard let cur = c.pubObs, backend.equalObserver(cur, o) else { return }
-    let g = c.appGen
+    let g = c.appGen, p = c.privGen
     if name == Self.titleNotification {
       guard c.titles else { return }
       if titleState.mutate({ st -> Bool in
-        st.element = element; st.gen = g
+        st.element = element; st.appGen = g; st.privGen = p
         defer { st.posted = true }; return !st.posted
       }) { axQueue.async { self.titleStep() } }
     } else if refreshState.mutate({ st -> Bool in
-      st.gen = g
+      st.appGen = g; st.privGen = p
       if st.posted { st.pending = true; return false }
       st.posted = true; return true
     }) { axQueue.async { self.refreshStep() } }
   }
-  // Privacy flips NOW so in-flight title reads drop; attach jobs survive
-  // a mid-registration toggle and only skip title work.
-  public func setTitlesEnabled(_ on: Bool) {
-    guard control.mutate({ c -> Bool in
-      guard c.titles != on else { return false }
-      c.titles = on; c.privGen &+= 1; return true
-    }) else { return }
-    axQueue.async { self.applyTitles() }
+  // Privacy flips NOW (privGen bumps synchronously per command, even redundant
+  // ones, so every command gets its own ack generation) and kills any pending
+  // queued title read; at most one coalesced privacy job stays outstanding.
+  // Returns the privacy generation this command produced.
+  @discardableResult
+  public func setTitlesEnabled(_ on: Bool) -> Int {
+    let g = control.mutate { c -> Int in
+      c.titles = on
+      c.privGen &+= 1
+      return c.privGen
+    }
+    titleState.mutate { $0.element = nil }
+    if privState.mutate({ st -> Bool in
+      st.gen = g
+      if st.posted { st.pending = true; return false }
+      st.posted = true; return true
+    }) { axQueue.async { self.privacyStep() } }
+    return g
   }
   // Stamps are captured BEFORE the hop; a privacy change skips the title
   // read and yields no title.
@@ -151,7 +174,8 @@ public final class AXSession<B: AXBackend> {
           let (err, win) = self.backend.focusedWindow(self.backend.application(pid: p))
           let c1 = self.control.get()
           if c1.appGen == snap.app {
-            self.classifyRead(err, Self.focusedNotification, key: k, bundleId: b)
+            self.classifyRead(err, Self.focusedNotification, stamp: snap,
+                              key: k, bundleId: b, pid: p)
             if let win, err == .success {
               status = "ok"
               if c1.titles, c1.privGen == snap.priv {
@@ -159,7 +183,7 @@ public final class AXSession<B: AXBackend> {
                 let c2 = self.control.get()
                 if c2.titles, c2.privGen == snap.priv, c2.appGen == snap.app {
                   if terr == .success { title = t }
-                  else { self.classifyRead(terr, Self.titleNotification, key: k, bundleId: b) }
+                  else { self.classifyOptionalTitle(terr, stamp: snap, pid: p, bundleId: b) }
                 }
               }
             }
@@ -177,17 +201,17 @@ public final class AXSession<B: AXBackend> {
   // MARK: - AX queue internals
 
   private func attachNext() {
-    guard let (p, b, g) = attachState.mutate({ st -> (Int32, String, Int)? in
+    guard let (p, b, g, pr) = attachState.mutate({ st -> (Int32, String, Int, Int)? in
       st.queued = false
       guard let a = st.args else { return nil }
       st.args = nil
-      return (a.0, a.1, st.appGen)
+      return (a.0, a.1, st.appGen, st.privGen)
     }), control.get().appGen == g else { return } // superseded while queued
-    attachNow(pid: p, bundleId: b, appGen: g)
+    attachNow(pid: p, bundleId: b, appGen: g, privGen: pr)
   }
   // `g` is the request's immutable app generation, re-validated after every
   // blocking IPC; the resource publishes atomically or detaches unstarted.
-  private func attachNow(pid p: Int32, bundleId b: String, appGen g: Int) {
+  private func attachNow(pid p: Int32, bundleId b: String, appGen g: Int, privGen pr: Int) {
     if observer != nil, p == pid, attachedGen == g, !needsRetry { return }
     detachNow()
     pid = p; bundleId = b; key = b.isEmpty ? "pid:\(p)" : b; attachedGen = g
@@ -198,7 +222,9 @@ public final class AXSession<B: AXBackend> {
     let obs: B.Observer
     do { obs = try backend.createObserver(pid: p) } catch {
       guard current() else { return } // superseded: don't poison cache/emit
-      classifyRead((error as? AXObserverCreateError)?.axError ?? .failure, Self.focusedNotification)
+      classifyRead((error as? AXObserverCreateError)?.axError ?? .failure,
+                   Self.focusedNotification, stamp: (g, 0, pr),
+                   key: key, bundleId: b, pid: p)
       return
     }
     guard current() else { backend.detach(obs); return }
@@ -207,15 +233,19 @@ public final class AXSession<B: AXBackend> {
     guard current() else { backend.detach(obs); return }
     guard e1 == .success || e1 == .notificationAlreadyRegistered else {
       if isPermanent(e1) {
-        markUnsupported(key, bundleId: bundleId, notification: Self.focusedNotification, error: e1)
-      } else { noteRetryable() }
+        markUnsupported(key, bundleId: bundleId, pid: p,
+                        notification: Self.focusedNotification, error: e1,
+                        stamp: (g, 0, pr))
+      } else { noteRetryable(stamp: (g, 0, pr), pid: p, bundleId: b) }
       backend.detach(obs)
       return
     }
     // Optional subscription: failure never poisons focused monitoring.
     let e2 = backend.add(observer: obs, element: app, notification: Self.mainNotification)
     guard current() else { backend.detach(obs); return }
-    if e2 != .success, e2 != .notificationAlreadyRegistered, !isPermanent(e2) { noteRetryable() }
+    if e2 != .success, e2 != .notificationAlreadyRegistered, !isPermanent(e2) {
+      noteRetryable(stamp: (g, 0, pr), pid: p, bundleId: b)
+    }
     // Atomic publish: wins only if this is still the desired target's gen.
     guard control.mutate({ c -> Bool in
       guard c.appGen == g, c.desiredPid == p else { return false }
@@ -224,7 +254,7 @@ public final class AXSession<B: AXBackend> {
     }) else { backend.detach(obs); return }
     backend.start(obs)
     observer = obs; appEl = app
-    refreshNow(gen: g)
+    refreshNow(gen: g, priv: pr)
   }
   // The published slot is released only if it still holds THIS observer.
   private func detachNow() {
@@ -239,17 +269,30 @@ public final class AXSession<B: AXBackend> {
       }
     }
     observer = nil; appEl = nil; windowEl = nil
-    titleSubscribed = false
+    titleSubscribed = false; hasReportedFocus = false
     pid = 0; bundleId = ""; key = ""; attachedGen = -1
   }
-  // permanent -> unsupported, other failures -> ax-retryable.
+  // permanent -> unsupported, other failures -> ax-retryable. `s` is the
+  // immutable stamp of the request that produced the error: app+privacy gens
+  // are checked before error state mutates AND again at delivery, so a stale
+  // result can never be relabeled as a newer context's failure.
   @discardableResult
-  private func classifyRead(_ e: AXError, _ n: String, key k: String? = nil, bundleId b: String? = nil) -> Bool {
+  private func classifyRead(_ e: AXError, _ n: String, stamp s: Stamp,
+                            key k: String, bundleId b: String, pid p: Int32) -> Bool {
     if isPermanent(e) {
-      markUnsupported(k ?? key, bundleId: b ?? bundleId, notification: n, error: e)
+      markUnsupported(k, bundleId: b, pid: p, notification: n, error: e, stamp: s)
       return false
     }
-    if e != .success && e != .noValue { noteRetryable() }
+    if e != .success && e != .noValue { noteRetryable(stamp: s, pid: p, bundleId: b) }
+    return true
+  }
+  // Optional AXTitle reads/subscriptions degrade to "no title" only and never
+  // poison the app's focus observation; retryable failures keep needsRetry.
+  @discardableResult
+  private func classifyOptionalTitle(_ e: AXError, stamp s: Stamp,
+                                     pid p: Int32, bundleId b: String) -> Bool {
+    if isPermanent(e) { return false }
+    if e != .success && e != .noValue { noteRetryable(stamp: s, pid: p, bundleId: b) }
     return true
   }
   private func isPermanent(_ e: AXError) -> Bool {
@@ -257,49 +300,61 @@ public final class AXSession<B: AXBackend> {
     [.notificationUnsupported, .attributeUnsupported, .parameterizedAttributeUnsupported,
      .actionUnsupported, .notImplemented].contains(e)
   }
-  private func markUnsupported(_ k: String, bundleId b: String, notification: String, error: AXError) {
+  private func markUnsupported(_ k: String, bundleId b: String, pid p: Int32,
+                               notification: String, error: AXError, stamp: Stamp) {
+    // The producing epoch must still be current before error state mutates;
+    // the delivery re-checks the same stamp.
+    guard control.get().appGen == stamp.app, control.get().privGen == stamp.priv else { return }
     if unsupported.insert(k).inserted {
-      postAlways(AxUnsupportedEvent(at: nowMs(), bundleId: b, notification: notification,
-                                  error: error.rawValue), critical: false)
+      postAppScoped(AxUnsupportedEvent(at: nowMs(), bundleId: b, pid: p,
+                                     notification: notification, error: error.rawValue),
+                    stamp: stamp)
     }
     // Only the failing target's own session is torn down.
     if k == key { detachNow() }
   }
   // One ax-retryable per context; recheck()/activation consumes needsRetry.
-  private func noteRetryable() {
+  private func noteRetryable(stamp: Stamp, pid p: Int32, bundleId b: String) {
+    guard control.get().appGen == stamp.app, control.get().privGen == stamp.priv else { return }
     needsRetry = true
     guard !retryableNoted else { return }
     retryableNoted = true
-    postAlways(ErrorEvent(at: nowMs(), code: "ax-retryable",
-                          message: "AX operation failed; will retry on next activation or recheck"),
-               critical: true)
+    postAppScoped(ErrorEvent(at: nowMs(), code: "ax-retryable",
+                             message: "AX operation failed; will retry on next activation or recheck",
+                             pid: p, bundleId: b),
+                  stamp: stamp)
   }
   private func refreshStep() {
-    let g = refreshState.get().gen
-    if control.get().appGen == g { refreshNow(gen: g) }
+    let st = refreshState.get()
+    if control.get().appGen == st.appGen { refreshNow(gen: st.appGen, priv: st.privGen) }
     if refreshState.mutate({ st -> Bool in
       if st.pending { st.pending = false; return true } // stays posted
       st.posted = false; return false
     }) { axQueue.async { self.refreshStep() } }
   }
-  private func refreshNow(gen g: Int) {
+  private func refreshNow(gen g: Int, priv p: Int) {
     guard attachedGen == g, control.get().appGen == g, let obs = observer, let app = appEl else { return }
     func current() -> Bool { control.get().appGen == g }
     let (err, el) = backend.focusedWindow(app)
     guard current() else { return }
-    classifyRead(err, Self.focusedNotification)
+    classifyRead(err, Self.focusedNotification, stamp: (g, 0, p),
+                 key: key, bundleId: bundleId, pid: pid)
     guard err == .success || err == .noValue else { return } // stay attached; retry later
     let newWin = err == .success ? el : nil // noValue/success-nil: windowless
-    let same = newWin == nil ? windowEl == nil
+    let same = newWin == nil ? (windowEl == nil && hasReportedFocus)
                              : windowEl != nil && backend.equal(newWin!, windowEl!)
     if same { // identical focus: no reset/focused; feed the title via debounce
-      guard control.get().titles, let w = windowEl else { return }
-      let stamp = stampNow()
+      guard let w = windowEl else { return }
+      // The captured privacy epoch is validated BEFORE the read too: a stale
+      // queued refresh must never spend an AXTitle call.
+      let c0 = control.get()
+      guard c0.titles, c0.privGen == p, c0.appGen == g else { return }
       let (terr, t) = backend.title(w)
       let c = control.get()
-      guard current(), c.titles, c.privGen == stamp.priv else { return }
-      classifyRead(terr, Self.titleNotification)
-      if let t, terr == .success { submitTitle(t, stamp: stamp) }
+      guard current(), c.titles, c.privGen == p else { return } // stale privacy epoch
+      guard classifyOptionalTitle(terr, stamp: (g, 0, p), pid: pid, bundleId: bundleId)
+      else { return }
+      if let t, terr == .success { submitTitle(t, stamp: (g, c.winGen, c.privGen)) }
       return
     }
     if titleSubscribed, let old = windowEl {
@@ -314,40 +369,47 @@ public final class AXSession<B: AXBackend> {
       return (c.appGen, c.winGen, c.privGen)
     }) else { return }
     windowEl = newWin
+    hasReportedFocus = true
     debouncer.reset()
     cancelTitleFire()
     var title: String? = nil
-    if let w = newWin, control.get().titles, isTrusted() {
+    // Title work belongs to the privacy epoch this refresh was queued under:
+    // a request made before an off->on flip does not run its stale reads.
+    if let w = newWin, control.get().titles, control.get().privGen == p, isTrusted() {
       let e = backend.add(observer: obs, element: w, notification: Self.titleNotification)
       guard current() else { return }
       if e == .success || e == .notificationAlreadyRegistered { titleSubscribed = true }
-      else if isPermanent(e) { markUnsupported(key, bundleId: bundleId, notification: Self.titleNotification, error: e); return }
-      else { noteRetryable() }
+      else if !isPermanent(e) {
+        noteRetryable(stamp: (g, 0, p), pid: pid, bundleId: bundleId) // optional
+      }
       let c2 = control.get()
-      if c2.titles, c2.privGen == stamp.priv {
+      if c2.titles, c2.privGen == p, c2.appGen == g {
         let (terr, t) = backend.title(w)
         let c3 = control.get()
-        if c3.titles, c3.privGen == stamp.priv, c3.appGen == g {
-          guard classifyRead(terr, Self.titleNotification) else { return }
-          if terr == .success { title = t }
+        if c3.titles, c3.privGen == p, c3.appGen == g,
+           classifyOptionalTitle(terr, stamp: (g, 0, p), pid: pid, bundleId: bundleId),
+           terr == .success {
+          title = t
         }
       }
     }
     if let t = title { debouncer.markEmitted(t) }
-    post(WindowEvent(type: "window.focused", at: nowMs(), pid: pid, bundleId: bundleId, title: title),
-         critical: false, stamp: stamp)
+    post(WindowEvent(type: "window.focused", at: nowMs(), pid: pid, bundleId: bundleId,
+                     title: title, windowless: newWin == nil), stamp: stamp)
   }
   private func titleStep() {
-    let (el, g) = titleState.mutate { st -> (B.Element?, Int) in
-      let e = st.element; st.element = nil; return (e, st.gen)
+    let (el, g, p) = titleState.mutate { st -> (B.Element?, Int, Int) in
+      let e = st.element; st.element = nil; return (e, st.appGen, st.privGen)
     }
     let c = control.get()
-    if c.appGen == g, attachedGen == g, c.titles, let w = windowEl, let el, backend.equal(el, w) {
+    if c.appGen == g, c.privGen == p, attachedGen == g, c.titles,
+       let w = windowEl, let el, backend.equal(el, w) {
       let (terr, t) = backend.title(w)
       let c2 = control.get()
-      if c2.appGen == g, c2.titles, c2.privGen == c.privGen {
-        classifyRead(terr, Self.titleNotification)
-        if let t, terr == .success { submitTitle(t, stamp: (g, c.winGen, c.privGen)) }
+      if c2.appGen == g, c2.titles, c2.privGen == p,
+         classifyOptionalTitle(terr, stamp: (g, 0, p), pid: pid, bundleId: bundleId),
+         let t, terr == .success {
+        submitTitle(t, stamp: (g, c2.winGen, c2.privGen))
       }
     }
     if titleState.mutate({ st -> Bool in
@@ -355,27 +417,43 @@ public final class AXSession<B: AXBackend> {
       st.posted = false; return false
     }) { axQueue.async { self.titleStep() } }
   }
-  private func applyTitles() {
-    let g = attachedGen // this job manages THIS worker context only
-    guard control.get().appGen == g else { return }
-    if control.get().titles {
+  // At most one queued privacy job plus one successor; each applies the exact
+  // generation it dequeued and skips work already covered by a newer apply.
+  private func privacyStep() {
+    let st = privState.get()
+    if st.gen != privacyAppliedGen {
+      privacyAppliedGen = st.gen
+      applyTitles(privGen: st.gen)
+    }
+    if privState.mutate({ s -> Bool in
+      if s.pending { s.pending = false; return true } // one successor, latest gen
+      s.posted = false; return false
+    }) { axQueue.async { self.privacyStep() } }
+  }
+  private func applyTitles(privGen g: Int) {
+    let appG = attachedGen // this job manages THIS worker context only
+    var c = control.get()
+    guard c.appGen == appG, c.privGen == g else { return }
+    if c.titles {
       debouncer.reset()
       guard isTrusted() else { detachNow(); return }
       guard let obs = observer, let w = windowEl else { return }
       let e = backend.add(observer: obs, element: w, notification: Self.titleNotification)
-      guard control.get().appGen == g else { return }
+      // Record a successful subscription BEFORE the staleness guard: if a
+      // newer privacy job supersedes us it must still remove this
+      // registration, which only exists on the AX queue's state.
       if e == .success || e == .notificationAlreadyRegistered { titleSubscribed = true }
-      else if isPermanent(e) { markUnsupported(key, bundleId: bundleId, notification: Self.titleNotification, error: e); return }
-      else { noteRetryable() }
-      let c = control.get()
-      if c.titles {
-        let (terr, t) = backend.title(w)
-        let c2 = control.get()
-        if c2.appGen == g, c2.titles, c2.privGen == c.privGen {
-          classifyRead(terr, Self.titleNotification)
-          if let t, terr == .success { submitTitle(t, stamp: (g, c.winGen, c.privGen)) }
-        }
+      c = control.get()
+      guard c.appGen == appG, c.privGen == g else { return }
+      if e != .success, e != .notificationAlreadyRegistered, !isPermanent(e) {
+        noteRetryable(stamp: (appG, 0, g), pid: pid, bundleId: bundleId)
       }
+      let (terr, t) = backend.title(w)
+      let c2 = control.get()
+      guard c2.appGen == appG, c2.titles, c2.privGen == g else { return }
+      guard classifyOptionalTitle(terr, stamp: (appG, 0, g), pid: pid, bundleId: bundleId)
+      else { return }
+      if let t, terr == .success { submitTitle(t, stamp: (appG, c2.winGen, c2.privGen)) }
     } else {
       debouncer.cancelPending()
       cancelTitleFire()
@@ -404,7 +482,7 @@ public final class AXSession<B: AXBackend> {
     guard isTrusted() else { detachNow(); return }
     if let t = debouncer.fire(now: uptime()) {
       post(WindowEvent(type: "window.title", at: nowMs(), pid: pid, bundleId: bundleId, title: t),
-           critical: false, stamp: titleFireStamp)
+           stamp: titleFireStamp)
     } else if let deadline = debouncer.pendingDeadline { // fired early: finish the wait
       arm(deadline, stamp: titleFireStamp)
     }
