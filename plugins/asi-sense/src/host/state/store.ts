@@ -1,43 +1,50 @@
 import type { Fact, FactStatus, JobSummary, SenseState, Signal } from '@asi/sense-types';
 import { FACT_PATHS, factAt, initialState, num, recomputeStatuses, str, ttlOf } from './facts.ts';
+import { FACT_STATUSES, sourceObservation } from './source-health.ts';
 
-const FACT_STATUSES: ReadonlySet<string> = new Set(['ok', 'stale', 'denied', 'unsupported', 'unavailable', 'unknown']);
 const ACTIVITIES: ReadonlySet<string> = new Set(['idle', 'thinking', 'tool', 'waiting-user']);
 type Activity = 'idle' | 'thinking' | 'tool' | 'waiting-user';
 
+/** Per-job event tracking: jobs are independent even inside one aggregate fact. */
+interface JobTrack {
+  /** Latest accepted event time for this job; older/same-time input is ignored. */
+  lastEventAt: number;
+  /** True once `job.exited` landed — an exit tombstone that outlives the value entry. */
+  exited: boolean;
+  /** Store-clock receipt of the latest accepted event (tombstone retention). */
+  receivedAt: number;
+  job?: JobSummary;
+}
+
 /**
- * In-memory fact table (DESIGN §2.2). Pure TypeScript; the host feeds it
- * signals and reads snapshots.
+ * In-memory fact table (DESIGN §2.2); the host feeds it signals and reads
+ * snapshots. `signal.data` contract: `app.activated`/`window.*` →
+ * `env.frontApp`/`env.focusedWindow`, `file.changed` → cumulative
+ * `env.watchedPaths[path]`, `job.*` → `env.activeJobs`, `agent.status` →
+ * `self.activity`, `fact.updated` → trusted write to {@link FACT_PATHS},
+ * `source.*` → `observation.sources`. Every signal also marks source health
+ * via {@link sourceObservation}; ids dedup (last 1024); out-of-order input
+ * is ignored per fact once observed; `data.ttlMs` overrides the TTL.
  *
- * Signal contract (`signal.data`):
- * - `app.activated` `{name, bundleId?}` → `env.frontApp`
- * - `window.focused`/`window.title-changed` `{title}` → `env.focusedWindow`
- * - `file.changed` `data.path` or `subject` → `env.watchedPaths[path]` cumulative
- * - `job.started` `{command?, pid?, startedAt?}` → adds to `env.activeJobs`;
- *   `job.exited` removes it
- * - `agent.status` `{activity}` → `self.activity`
- * - `fact.updated` `{path, value, status?, ttlMs?}` → trusted internal write to
- *   a whitelisted full fact path ({@link FACT_PATHS})
- * - `source.status` `{status, error?}` → `observation.sources[source.id]`
- *   (`'error'` normalizes to `unavailable`, same as `source.error`)
- *
- * Every signal updates `observation.sources[source.id]`. Repeated
- * `signal.id`s are deduplicated (bounded to the last 1024) so broadcast or
- * retry cannot inflate cumulative counts; subscribers are notified only for
- * new, unique input. Signals older than a fact's `observedAt` (or a path's
- * `lastChange`) are ignored for that fact, so out-of-order delivery cannot
- * regress state; the guard applies only once a fact has a real (non-`unknown`)
- * observation, so a delayed first sample is still accepted. `data.ttlMs`
- * (finite, >=0) overrides the default TTL per update.
+ * Jobs track each id's latest event plus a {@link JOB_RETENTION_MS} exit
+ * tombstone so out-of-order events cannot resurrect a job; `env.activeJobs`
+ * rebuilds from tracking per accepted event while keeping the newest
+ * event's source/ttl/observedAt. `apply` deep-clones input, queues
+ * reentrant calls, and emits one fixed snapshot cloned per listener —
+ * listener exceptions are isolated and cannot starve the queue.
  */
 export class StateStore {
   private static readonly DEDUP_MAX = 1024;
+  private static readonly JOB_RETENTION_MS = 600_000;
   private readonly clock: () => number;
   private readonly defaultTtlMs: number;
   private readonly listeners = new Set<(snapshot: SenseState) => void>();
   private readonly state: SenseState;
   private readonly seenIds = new Set<string>();
   private readonly seenOrder: string[] = [];
+  private readonly jobs = new Map<string, JobTrack>();
+  private readonly queue: Signal[] = [];
+  private processing = false;
 
   constructor(clock: () => number = Date.now, defaultTtlMs = 60_000) {
     this.clock = clock;
@@ -48,46 +55,25 @@ export class StateStore {
   /**
    * Feeds one signal into the fact table and notifies subscribers. The
    * signal is deep-cloned on entry, so later caller mutation cannot corrupt
-   * stored facts.
+   * stored facts. A call made inside a subscriber only enqueues; the
+   * outermost call drains the queue in order.
    */
   apply(signal: Signal): void {
-    if (this.isDuplicate(signal.id)) return;
-    const s = structuredClone(signal);
-    this.updateSource(s);
-    const d = s.data;
-    switch (s.kind) {
-      case 'app.activated':
-        this.setFact(this.state.env.frontApp, { name: str(d.name), bundleId: str(d.bundleId) || s.subject }, s);
-        break;
-      case 'window.focused':
-      case 'window.title-changed':
-        this.setFact(this.state.env.focusedWindow, { title: str(d.title) }, s);
-        break;
-      case 'file.changed':
-        this.noteFile(s);
-        break;
-      case 'job.started':
-        this.noteJob(s);
-        break;
-      case 'job.exited':
-        this.setFact(
-          this.state.env.activeJobs,
-          (this.state.env.activeJobs.value ?? []).filter((j) => j.id !== this.jobId(s)),
-          s,
-        );
-        break;
-      case 'agent.status':
-        if (typeof d.activity === 'string' && ACTIVITIES.has(d.activity)) {
-          this.setFact(this.state.self.activity, d.activity as Activity, s);
+    this.queue.push(structuredClone(signal));
+    if (this.processing) return;
+    this.processing = true;
+    try {
+      let next = this.queue.shift();
+      while (next !== undefined) {
+        if (!this.isDuplicate(next.id)) {
+          this.applyOne(next);
+          this.emit();
         }
-        break;
-      case 'fact.updated':
-        this.applyFactUpdate(s);
-        break;
-      default:
-        break;
+        next = this.queue.shift();
+      }
+    } finally {
+      this.processing = false;
     }
-    this.emit();
   }
 
   /** Returns an isolated deep-cloned snapshot with TTL statuses computed at `now`. */
@@ -103,6 +89,39 @@ export class StateStore {
     return () => this.listeners.delete(listener);
   }
 
+  private applyOne(s: Signal): void {
+    this.updateSource(s);
+    const d = s.data;
+    switch (s.kind) {
+      case 'app.activated':
+        this.setFact(this.state.env.frontApp, { name: str(d.name), bundleId: str(d.bundleId) || s.subject }, s);
+        break;
+      case 'window.focused':
+      case 'window.title-changed':
+        this.setFact(this.state.env.focusedWindow, { title: str(d.title) }, s);
+        break;
+      case 'file.changed':
+        this.noteFile(s);
+        break;
+      case 'job.started':
+        this.noteJobStart(s);
+        break;
+      case 'job.exited':
+        this.noteJobExit(s);
+        break;
+      case 'agent.status':
+        if (typeof d.activity === 'string' && ACTIVITIES.has(d.activity)) {
+          this.setFact(this.state.self.activity, d.activity as Activity, s);
+        }
+        break;
+      case 'fact.updated':
+        this.applyFactUpdate(s);
+        break;
+      default:
+        break;
+    }
+  }
+
   private isDuplicate(id: string): boolean {
     if (this.seenIds.has(id)) return true;
     this.seenIds.add(id);
@@ -113,9 +132,23 @@ export class StateStore {
     return false;
   }
 
-  /** Each listener gets its own snapshot so one cannot corrupt another. */
+  /**
+   * One fixed snapshot per applied signal, cloned per listener so nobody can
+   * corrupt another listener or the store. The listener set is iterated as
+   * a copy: unsubscribing mid-emit is honored before invocation, listeners
+   * added mid-emit fire on the next apply only, and a throwing listener is
+   * isolated so it cannot starve the rest of the set or the queue.
+   */
   private emit(): void {
-    for (const listener of this.listeners) listener(this.snapshot());
+    const snap = this.snapshot();
+    for (const listener of [...this.listeners]) {
+      if (!this.listeners.has(listener)) continue;
+      try {
+        listener(structuredClone(snap));
+      } catch {
+        // listener exceptions are isolated by contract
+      }
+    }
   }
 
   private setFact<T>(fact: Fact<T>, value: T, signal: Signal): void {
@@ -153,18 +186,58 @@ export class StateStore {
     fact.ttlMs = ttlOf(signal.data.ttlMs, this.defaultTtlMs);
   }
 
-  private noteJob(signal: Signal): void {
+  /** Drops exit tombstones past the retention window (store clock). */
+  private pruneJobs(): void {
+    const now = this.clock();
+    for (const [id, track] of this.jobs) {
+      if (track.exited && now - track.receivedAt >= StateStore.JOB_RETENTION_MS) this.jobs.delete(id);
+    }
+  }
+
+  /**
+   * Rebuilds `env.activeJobs` from tracking after an accepted job event.
+   * An older (but still accepted) event updates the value yet keeps the
+   * newest event's source/ttl/observedAt metadata.
+   */
+  private commitJobs(signal: Signal): void {
     const fact = this.state.env.activeJobs;
-    if (fact.status !== 'unknown' && signal.at < fact.observedAt) return;
+    const newest = fact.status === 'unknown' || signal.at >= fact.observedAt;
+    fact.value = [...this.jobs.values()].flatMap((track) => (track.exited || !track.job ? [] : [track.job]));
+    fact.status = 'ok';
+    if (newest) {
+      fact.source = signal.source;
+      fact.observedAt = signal.at;
+      fact.ttlMs = ttlOf(signal.data.ttlMs, this.defaultTtlMs);
+    }
+  }
+
+  private noteJobStart(signal: Signal): void {
+    this.pruneJobs();
+    const id = this.jobId(signal);
+    const track = this.jobs.get(id);
+    // Older input is ignored, and at an equal timestamp the exit tombstone
+    // wins — only a genuinely newer start may reuse the id.
+    if (track && signal.at <= track.lastEventAt) return;
     const job: JobSummary = {
-      id: this.jobId(signal),
+      id,
       startedAt: num(signal.data.startedAt) ?? signal.at,
       status: 'running',
     };
     if (typeof signal.data.command === 'string') job.command = signal.data.command;
     const pid = num(signal.data.pid);
     if (pid !== undefined) job.pid = pid;
-    this.setFact(fact, [...(fact.value ?? []).filter((j) => j.id !== job.id), job], signal);
+    this.jobs.set(id, { lastEventAt: signal.at, exited: false, receivedAt: this.clock(), job });
+    this.commitJobs(signal);
+  }
+
+  private noteJobExit(signal: Signal): void {
+    this.pruneJobs();
+    const id = this.jobId(signal);
+    const track = this.jobs.get(id);
+    // Exit wins equal timestamps over start; only an older exit is ignored.
+    if (track && signal.at < track.lastEventAt) return;
+    this.jobs.set(id, { lastEventAt: signal.at, exited: true, receivedAt: this.clock() });
+    this.commitJobs(signal);
   }
 
   private applyFactUpdate(signal: Signal): void {
@@ -180,26 +253,30 @@ export class StateStore {
     fact.source = signal.source;
     fact.observedAt = signal.at;
     fact.ttlMs = ttlOf(signal.data.ttlMs, this.defaultTtlMs);
+    // A replaced job list reseeds tracking — an array seeds its entries, a
+    // non-array (e.g. null) clears it — or the next job event would rebuild
+    // the value from stale tracks and silently resurrect dropped jobs.
+    if (path === 'env.activeJobs') {
+      this.jobs.clear();
+      if (Array.isArray(value)) {
+        for (const j of value as JobSummary[]) {
+          if (!j || typeof j !== 'object' || typeof j.id !== 'string') continue;
+          const running = j.status !== 'exited';
+          this.jobs.set(j.id, {
+            lastEventAt: signal.at,
+            exited: !running,
+            receivedAt: this.clock(),
+            ...(running ? { job: j } : {}),
+          });
+        }
+      }
+    }
   }
 
   private updateSource(signal: Signal): void {
     const sources = this.state.observation.sources;
     const cur = Object.hasOwn(sources, signal.source.id) ? sources[signal.source.id] : undefined;
     if (cur && signal.at < cur.lastSignalAt) return;
-    const next: { status: FactStatus; lastSignalAt: number; error?: string } = {
-      status: 'ok',
-      lastSignalAt: signal.at,
-    };
-    if (signal.kind === 'source.status') {
-      const s = signal.data.status;
-      // 'error' is not a FactStatus; it normalizes to 'unavailable'.
-      next.status =
-        s === 'error' ? 'unavailable' : typeof s === 'string' && FACT_STATUSES.has(s) ? (s as FactStatus) : 'unknown';
-      if (typeof signal.data.error === 'string') next.error = signal.data.error;
-    } else if (signal.kind === 'source.error') {
-      next.status = 'unavailable';
-      if (typeof signal.data.error === 'string') next.error = signal.data.error;
-    }
-    sources[signal.source.id] = next;
+    sources[signal.source.id] = sourceObservation(signal);
   }
 }

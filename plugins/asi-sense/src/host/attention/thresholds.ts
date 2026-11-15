@@ -84,7 +84,9 @@ function read(body: Body, at: number, key: string, t: BodyThresholds): Reading |
   }
   if (metric === 'context') {
     const tok = okFact(body.tokens, at);
-    const used = tok ? (tok.contextProjected ?? tok.contextUsed) : undefined;
+    // Only the actual usage counts: contextProjected is a forecast, never a
+    // reading, and without contextUsed there is nothing to evaluate.
+    const used = tok?.contextUsed;
     // used < 0 is corrupt (retain latch, fabricate nothing); used > window is
     // a real overflow and evaluates to a negative ratio → critical.
     if (!tok || !finite(tok.contextWindow) || tok.contextWindow <= 0 || !finite(used) || used < 0) {

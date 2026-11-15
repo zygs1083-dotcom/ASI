@@ -114,14 +114,20 @@ describe('bodyThresholdSignals', () => {
     expect(missing.state['disk:/']).toBe('warn'); // absent mounts retain latch
   });
 
-  it('evaluates context remaining using contextProjected over contextUsed', () => {
+  it('uses actual context usage and ignores projected usage for thresholds', () => {
+    // projected 97% never drives the metric: actual 50% used → 50% free
     const r = bodyThresholdSignals(sample(tokens(100, 50), 0), sample(tokens(100, 50, 97), 10));
-    expect(r.signals[0]).toMatchObject({
+    expect(r.signals).toHaveLength(0);
+    const warn = bodyThresholdSignals(sample(tokens(100, 50), 0), sample(tokens(100, 90), 10));
+    expect(warn.signals[0]?.data.severity).toBe('warn');
+    const crit = bodyThresholdSignals(sample(tokens(100, 50), 0), sample(tokens(100, 97), 10));
+    expect(crit.signals[0]).toMatchObject({
       subject: 'context',
       data: { severity: 'critical' },
     });
-    const warn = bodyThresholdSignals(sample(tokens(100, 50), 0), sample(tokens(100, 90), 10));
-    expect(warn.signals[0]?.data.severity).toBe('warn');
+    // no actual usage → no context signal even when a projection exists
+    const projectedOnly = bodyThresholdSignals(sample(tokens(100, 50), 0), sample(tokens(100, undefined, 97), 10));
+    expect(projectedOnly.signals).toHaveLength(0);
     const invalid = bodyThresholdSignals(sample(tokens(100, 50), 0), sample(tokens(0), 10));
     expect(invalid.signals).toHaveLength(0);
   });
