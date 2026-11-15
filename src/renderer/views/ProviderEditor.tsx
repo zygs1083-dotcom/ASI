@@ -168,7 +168,7 @@ export function ProviderEditor({ target }: { target: { id: string | null } }) {
       const key = apiKeyDraft.trim();
       if (key === '') errs.apiKey = 'API Key 不能为空字符串';
       else if (key.length < 8) errs.apiKey = 'API Key 长度至少 8 个字符';
-      else if (key.includes('[已隐藏]')) errs.apiKey = 'API Key 不能包含占位符文本';
+      else if (!/^[\x21-\x7E]+$/.test(key)) errs.apiKey = 'API Key 只能包含无空白的可打印 ASCII 字符';
     }
     setErrors(errs);
     return Object.keys(errs).length === 0;

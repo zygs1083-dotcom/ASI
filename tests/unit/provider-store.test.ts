@@ -717,18 +717,36 @@ describe('ProviderStore apiKey validation', () => {
     expect(store.list()).toEqual([]);
   });
 
-  it('rejects keys containing the mask placeholder and never echoes the value', () => {
+  it.each([
+    ['内部空格', 'abcd 1234'],
+    ['内部制表符', 'abcd\t1234'],
+    ['内部换行', 'abcd\n1234'],
+    ['非 ASCII 字符', 'abcdé1234'],
+    ['emoji', 'abcd😀1234'],
+    ['DEL 字符', 'abcd1234\x7F'],
+    ['控制字符', 'ab\x01cd1234'],
+    ['旧掩码占位符', 'sk-abc[已隐藏]xyz'],
+  ])('rejects a key containing %s and never echoes the value', (_label, bad) => {
     const store = new ProviderStore(tempDir(), fakeEncryption());
-    const bad = 'sk-abc[已隐藏]xyz';
     try {
       store.save(input({ apiKey: bad }));
       expect.unreachable();
     } catch (err) {
-      expect((err as Error).message).toMatch(/占位符/);
-      expect((err as Error).message).not.toContain(bad);
+      expect((err as Error).message).toContain('可打印 ASCII');
+      expect((err as Error).message).not.toContain(bad.trim());
     }
     expect(store.list()).toEqual([]);
   });
+
+  it.each(['!!!!!!!!', '~~~~~~~~', '12345678', '  padded-ok9  '])(
+    'accepts the boundary-valid key %j',
+    (ok) => {
+      const store = new ProviderStore(tempDir(), fakeEncryption());
+      const saved = store.save(input({ apiKey: ok }));
+      expect(saved.hasApiKey).toBe(true);
+      expect(store.getApiKey(saved.id)).toBe(ok.trim());
+    },
+  );
 
   it('trims a valid key before persisting and using it', () => {
     const store = new ProviderStore(tempDir(), fakeEncryption());
@@ -769,7 +787,7 @@ describe('ProviderStore legacy invalid keys', () => {
     expect(text).not.toContain('p-bad');
   });
 
-  it('marks invalid plaintext entries unusable in test mode (ASI_DATA_DIR set)', async () => {
+  it('marks invalid plaintext entries unusable in test mode when encryption is unavailable', async () => {
     vi.resetModules();
     vi.stubEnv('ASI_DATA_DIR', '/tmp/asi-test-data');
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
@@ -781,46 +799,104 @@ describe('ProviderStore legacy invalid keys', () => {
       JSON.stringify({ p1: { encrypted: false, value: 'tiny' } }),
       'utf8',
     );
-    const store = new FreshStore(dir, fakeEncryption());
+    const store = new FreshStore(dir, fakeEncryption(false));
     expect(store.get('p1')?.hasApiKey).toBe(false);
     expect(store.getApiKey('p1')).toBeUndefined();
     expect(warn).toHaveBeenCalledTimes(1);
     expect(warn.mock.calls.flat().join(' ')).not.toContain('tiny');
   });
 
-  it('skips invalid plaintext during migration while still migrating valid ones', async () => {
-    vi.resetModules();
-    vi.stubEnv('ASI_DATA_DIR', '');
-    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
-    const { ProviderStore: FreshStore } = await import('../../src/main/stores/provider-store');
-    const dir = tempDir();
-    writeFileSync(
-      join(dir, 'providers.json'),
-      JSON.stringify([providerRecord('bad'), providerRecord('good')]),
-      'utf8',
-    );
-    writeFileSync(
-      join(dir, 'keys.json'),
-      JSON.stringify({
-        bad: { encrypted: false, value: 'tiny' },
-        good: { encrypted: false, value: 'sk-mig-valid' },
-      }),
-      'utf8',
-    );
-    const store = new FreshStore(dir, fakeEncryption());
-    expect(store.getApiKey('bad')).toBeUndefined();
-    expect(store.get('bad')?.hasApiKey).toBe(false);
-    expect(store.getApiKey('good')).toBe('sk-mig-valid');
-    // 有效明文已迁移为密文；无效明文条目仍留在盘上但不可用
-    const raw = JSON.parse(readFileSync(join(dir, 'keys.json'), 'utf8')) as Record<
-      string,
-      { encrypted: boolean; value: string }
-    >;
-    expect(raw.good.encrypted).toBe(true);
-    expect(raw.bad).toEqual({ encrypted: false, value: 'tiny' });
-    const text = warn.mock.calls.flat().join(' ');
-    expect(text).not.toContain('tiny');
-  });
+  // 加密可用时 ASI_DATA_DIR 不再豁免迁移：无效/孤儿明文一律加密，原值字节原样保留
+  it.each(['', '/tmp/asi-test-data'])(
+    'encrypts invalid plaintext during migration while keeping it unavailable (ASI_DATA_DIR=%j)',
+    async (dataDir) => {
+      vi.resetModules();
+      vi.stubEnv('ASI_DATA_DIR', dataDir);
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const { ProviderStore: FreshStore } = await import('../../src/main/stores/provider-store');
+      const dir = tempDir();
+      writeFileSync(
+        join(dir, 'providers.json'),
+        JSON.stringify([providerRecord('bad'), providerRecord('good')]),
+        'utf8',
+      );
+      // padded 无效值：迁移必须原样加密保留原始字节（不 trim/不改写）
+      writeFileSync(
+        join(dir, 'keys.json'),
+        JSON.stringify({
+          bad: { encrypted: false, value: ' tiny ' },
+          good: { encrypted: false, value: 'sk-mig-valid' },
+        }),
+        'utf8',
+      );
+      const store = new FreshStore(dir, fakeEncryption());
+      expect(store.getApiKey('bad')).toBeUndefined();
+      expect(store.get('bad')?.hasApiKey).toBe(false);
+      expect(store.getApiKey('good')).toBe('sk-mig-valid');
+      // 有效与无效明文都迁移为密文：盘上不留明文
+      const raw = JSON.parse(readFileSync(join(dir, 'keys.json'), 'utf8')) as Record<
+        string,
+        { encrypted: boolean; value: string }
+      >;
+      expect(raw.good.encrypted).toBe(true);
+      expect(raw.bad.encrypted).toBe(true);
+      expect(fakeEncryption().decryptString(Buffer.from(raw.bad.value, 'base64'))).toBe(' tiny ');
+      expect(readFileSync(join(dir, 'keys.json'), 'utf8')).not.toContain('tiny');
+      // 重载后无效密文仍然不可用，恢复的原值仍是 padded 字节序列；告警全进程一次且不含 key/id
+      const reloaded = new FreshStore(dir, fakeEncryption());
+      expect(reloaded.getApiKey('bad')).toBeUndefined();
+      expect(reloaded.get('bad')?.hasApiKey).toBe(false);
+      expect(reloaded.getApiKey('good')).toBe('sk-mig-valid');
+      expect(reloaded.getRedactionKeys()).toContain(' tiny ');
+      expect(warn).toHaveBeenCalledTimes(1);
+      const text = warn.mock.calls.flat().join(' ');
+      expect(text).not.toContain('tiny');
+      expect(text).not.toContain('bad');
+    },
+  );
+
+  it.each(['', '/tmp/asi-test-data'])(
+    'writes the migrated file even when every plaintext entry is invalid or orphaned (ASI_DATA_DIR=%j)',
+    async (dataDir) => {
+      vi.resetModules();
+      vi.stubEnv('ASI_DATA_DIR', dataDir);
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const { ProviderStore: FreshStore } = await import('../../src/main/stores/provider-store');
+      const dir = tempDir();
+      writeFileSync(join(dir, 'providers.json'), JSON.stringify([providerRecord('bad')]), 'utf8');
+      writeFileSync(
+        join(dir, 'keys.json'),
+        JSON.stringify({
+          bad: { encrypted: false, value: ' tiny ' },
+          orphan: { encrypted: false, value: 'xx yy' },
+        }),
+        'utf8',
+      );
+      const store = new FreshStore(dir, fakeEncryption());
+      expect(store.getApiKey('bad')).toBeUndefined();
+      expect(store.getApiKey('orphan')).toBeUndefined();
+      // 没有任何合法邻居也照样重写：盘上不留明文
+      const raw = JSON.parse(readFileSync(join(dir, 'keys.json'), 'utf8')) as Record<
+        string,
+        { encrypted: boolean; value: string }
+      >;
+      expect(raw.bad.encrypted).toBe(true);
+      expect(raw.orphan.encrypted).toBe(true);
+      const onDisk = readFileSync(join(dir, 'keys.json'), 'utf8');
+      expect(onDisk).not.toContain('tiny');
+      expect(onDisk).not.toContain('xx yy');
+      expect(fakeEncryption().decryptString(Buffer.from(raw.bad.value, 'base64'))).toBe(' tiny ');
+      // 重载后依旧不可用；无效原值仍可解密枚举
+      const reloaded = new FreshStore(dir, fakeEncryption());
+      expect(reloaded.getApiKey('bad')).toBeUndefined();
+      expect(reloaded.get('bad')?.hasApiKey).toBe(false);
+      expect(reloaded.getRedactionKeys()).toEqual(expect.arrayContaining([' tiny ', 'xx yy']));
+      expect(warn).toHaveBeenCalledTimes(1);
+      const text = warn.mock.calls.flat().join(' ');
+      expect(text).not.toContain('tiny');
+      expect(text).not.toContain('xx yy');
+    },
+  );
 
   it('marks plaintext entries unusable rather than deleting them when encryption is unavailable', async () => {
     vi.resetModules();
@@ -920,6 +996,7 @@ describe('ProviderStore ignored entries survive successful rewrites', () => {
     it(`keeps ignored plaintext and invalid orphan entries after a successful ${op}`, async () => {
       vi.resetModules();
       vi.stubEnv('ASI_DATA_DIR', '');
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
       const { ProviderStore: FreshStore } = await import('../../src/main/stores/provider-store');
       const dir = tempDir();
       writeFileSync(
@@ -928,7 +1005,7 @@ describe('ProviderStore ignored entries survive successful rewrites', () => {
         'utf8',
       );
       const p1Entry = { encrypted: false, value: 'sk-plain-p1' };
-      const orphanEntry = { encrypted: true, value: fakeCipher('tiny') };
+      const orphanEntry = { encrypted: false, value: 'tiny' };
       writeFileSync(
         join(dir, 'keys.json'),
         JSON.stringify({
@@ -971,15 +1048,24 @@ describe('ProviderStore ignored entries survive successful rewrites', () => {
       expect(store.getApiKey('p1')).toBeUndefined();
       expect(store.get('p1')?.hasApiKey).toBe(false);
 
-      // 加密可用后重载：p1 明文迁移为密文并可用，无效 orphan 依旧保留
+      // 加密可用后重载：p1 明文迁移为密文并可用；无效 orphan 明文同样被加密迁移
+      // （原值原样可解密、不可用标记保持、盘上无明文），而不是原样留明文
       const reloaded = new FreshStore(dir, fakeEncryption());
       expect(reloaded.getApiKey('p1')).toBe('sk-plain-p1');
       const migrated = JSON.parse(readFileSync(join(dir, 'keys.json'), 'utf8')) as Record<
         string,
-        { encrypted: boolean }
+        { encrypted: boolean; value: string }
       >;
       expect(migrated.p1.encrypted).toBe(true);
-      expect(migrated.orphan).toEqual(orphanEntry);
+      expect(migrated.orphan.encrypted).toBe(true);
+      expect(fakeEncryption().decryptString(Buffer.from(migrated.orphan.value, 'base64'))).toBe('tiny');
+      expect(readFileSync(join(dir, 'keys.json'), 'utf8')).not.toContain('tiny');
+      expect(reloaded.getApiKey('orphan')).toBeUndefined();
+      expect(reloaded.getRedactionKeys()).toContain('tiny');
+      const warnText = warn.mock.calls.flat().join(' ');
+      expect(warnText).not.toContain('tiny');
+      expect(warnText).not.toContain('orphan');
+      expect(warnText).not.toContain('sk-plain-p1');
     });
   }
 });

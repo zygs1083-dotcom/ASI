@@ -14,6 +14,17 @@ import { FAUX_PROVIDER_ID, type ProviderStore } from '../stores/provider-store';
 import { KeyRedactor, redactKeys } from './key-redactor';
 import type { ModelResolver } from './model-resolver';
 
+/** 提取错误消息：非 Error 值给中文兜底，不回传原始对象/cause/stack */
+function errorMessage(err: unknown): string {
+  if (err instanceof Error) {
+    return err.message === '' ? '未知错误' : err.message;
+  }
+  if (typeof err === 'string' && err !== '') {
+    return err;
+  }
+  return '未知错误';
+}
+
 /** faux 厂商不需要真实 key，传固定哨兵避免 pi-ai 回退到环境变量里的真实凭证 */
 const FAUX_API_KEY = 'asi-faux';
 const TEST_TIMEOUT_MS = 15000;
@@ -55,47 +66,69 @@ export class ChatService {
   ) {}
 
   async send(conversationId: string, text: string): Promise<{ user: ChatMessage; assistant: ChatMessage }> {
-    // 同步校验（首个 await 之前完成）：任何失败都不追加消息
-    const conv = this.requireIdle(conversationId);
-    if (text.trim() === '') {
-      throw new Error('消息内容不能为空');
+    // 请求开始时的脱敏 key 快照：之后厂商被删除/轮换也不影响本次保护范围；
+    // 请求中途新保存的 key 有意不在本请求内（下一次请求生效，见架构 §6）
+    const requestKeys = this.providers.getRedactionKeys();
+    try {
+      // 同步校验（首个 await 之前完成）：任何失败都不追加消息
+      const conv = this.requireIdle(conversationId);
+      if (text.trim() === '') {
+        throw new Error('消息内容不能为空');
+      }
+      const target = this.resolveTarget(conv);
+      // 活动 key 单独进快照：faux 哨兵与遗留读取的 key 不在 keys.json 集合里
+      requestKeys.push(target.apiKey);
+
+      const now = Date.now();
+      const user: ChatMessage = {
+        id: randomUUID(),
+        role: 'user',
+        text,
+        createdAt: now,
+        status: 'done',
+      };
+      const assistant = this.newAssistant(now, target.modelRef);
+
+      const messages: Message[] = conv.messages
+        .filter((m) => m.status === 'done')
+        .map((m) => this.toHistoryMessage(m, target.model));
+      messages.push({ role: 'user', content: text, timestamp: user.createdAt });
+      const context: Context = { messages };
+
+      this.conversations.appendMessages(conversationId, [user, assistant]);
+      this.schedule(conversationId, assistant, target, context, new KeyRedactor(requestKeys));
+      return { user: structuredClone(user), assistant: structuredClone(assistant) };
+    } catch (err) {
+      // 所有校验/写盘/调度失败走同一脱敏出口：静态错误串也不例外
+      throw new Error(redactKeys(errorMessage(err), requestKeys));
     }
-    const target = this.resolveTarget(conv);
-
-    const now = Date.now();
-    const user: ChatMessage = { id: randomUUID(), role: 'user', text, createdAt: now, status: 'done' };
-    const assistant = this.newAssistant(now, target.modelRef);
-
-    const messages: Message[] = conv.messages
-      .filter((m) => m.status === 'done')
-      .map((m) => this.toHistoryMessage(m, target.model));
-    messages.push({ role: 'user', content: text, timestamp: user.createdAt });
-    const context: Context = { messages };
-
-    this.conversations.appendMessages(conversationId, [user, assistant]);
-    this.schedule(conversationId, assistant, target, context);
-    return { user: structuredClone(user), assistant: structuredClone(assistant) };
   }
 
   async retry(conversationId: string): Promise<{ assistant: ChatMessage }> {
-    const conv = this.requireIdle(conversationId);
-    const last = conv.messages[conv.messages.length - 1];
-    if (last?.role !== 'assistant' || (last.status !== 'error' && last.status !== 'aborted')) {
-      throw new Error('只能重试最后一轮失败或已停止的回复');
+    const requestKeys = this.providers.getRedactionKeys();
+    try {
+      const conv = this.requireIdle(conversationId);
+      const last = conv.messages[conv.messages.length - 1];
+      if (last?.role !== 'assistant' || (last.status !== 'error' && last.status !== 'aborted')) {
+        throw new Error('只能重试最后一轮失败或已停止的回复');
+      }
+      // 全部校验（模型/厂商/key）通过后才允许改动会话
+      const target = this.resolveTarget(conv);
+      requestKeys.push(target.apiKey);
+      const assistant = this.newAssistant(Date.now(), target.modelRef);
+      // 上下文 = 被替换 assistant 之前的 done 历史（原 user 消息已在其中，不重复追加）
+      const context: Context = {
+        messages: conv.messages
+          .slice(0, -1)
+          .filter((m) => m.status === 'done')
+          .map((m) => this.toHistoryMessage(m, target.model)),
+      };
+      this.conversations.replaceLastMessage(conversationId, last.id, assistant);
+      this.schedule(conversationId, assistant, target, context, new KeyRedactor(requestKeys));
+      return { assistant: structuredClone(assistant) };
+    } catch (err) {
+      throw new Error(redactKeys(errorMessage(err), requestKeys));
     }
-    // 全部校验（模型/厂商/key）通过后才允许改动会话
-    const target = this.resolveTarget(conv);
-    const assistant = this.newAssistant(Date.now(), target.modelRef);
-    // 上下文 = 被替换 assistant 之前的 done 历史（原 user 消息已在其中，不重复追加）
-    const context: Context = {
-      messages: conv.messages
-        .slice(0, -1)
-        .filter((m) => m.status === 'done')
-        .map((m) => this.toHistoryMessage(m, target.model)),
-    };
-    this.conversations.replaceLastMessage(conversationId, last.id, assistant);
-    this.schedule(conversationId, assistant, target, context);
-    return { assistant: structuredClone(assistant) };
   }
 
   /** 同步校验：会话存在且没有进行中的请求 */
@@ -110,12 +143,7 @@ export class ChatService {
     return conv;
   }
 
-  /** 当前已保存的全部 key：每次调用取最新值，中途新增/轮换的 key 也受保护 */
-  private savedKeys(): string[] {
-    return this.providers.getRedactionKeys();
-  }
-
-  /** 同步解析模型/厂商/key；任何一步失败都不允许调用方改动会话 */
+  /** 同步解析模型/厂商/key；任何一步失败都不允许调用方改动会话（错误由调用方统一脱敏） */
   private resolveTarget(conv: Conversation): StreamTarget {
     const modelRef = conv.model;
     if (!modelRef) {
@@ -128,18 +156,8 @@ export class ChatService {
     if (!provider.enabled) {
       throw new Error('模型所属厂商已停用');
     }
-    let model: Model<Api>;
-    try {
-      model = this.resolver.resolve(provider, modelRef.modelId);
-    } catch (err) {
-      throw new Error(this.mask(err, this.savedKeys()));
-    }
-    let apiKey: string | undefined;
-    try {
-      apiKey = provider.id === FAUX_PROVIDER_ID ? FAUX_API_KEY : this.providers.getApiKey(provider.id);
-    } catch (err) {
-      throw new Error(this.mask(err, this.savedKeys()));
-    }
+    const model = this.resolver.resolve(provider, modelRef.modelId);
+    const apiKey = provider.id === FAUX_PROVIDER_ID ? FAUX_API_KEY : this.providers.getApiKey(provider.id);
     if (!apiKey) {
       throw new Error('厂商未设置 API Key');
     }
@@ -163,6 +181,7 @@ export class ChatService {
     assistant: ChatMessage,
     target: StreamTarget,
     context: Context,
+    redactor: KeyRedactor,
   ): void {
     const controller = new AbortController();
     const entry: ActiveRequest = {
@@ -177,6 +196,7 @@ export class ChatService {
             context,
             target.apiKey,
             target.providerId,
+            redactor,
             controller.signal,
           )
             .catch(() => {})
@@ -202,12 +222,13 @@ export class ChatService {
   }
 
   async test(providerId: string, modelId: string): Promise<TestResult> {
-    // 本次请求的脱敏 key 快照：测试挂起期间被删除的已存 key 仍受保护
-    const requestKeys = this.savedKeys();
-    // 所有失败出口统一过最终脱敏：静态错误与兜底串也不例外
+    // 本次请求的脱敏 key 快照：测试挂起期间被删除/轮换的已存 key 仍受保护；
+    // 活动 apiKey 解析后也并入同一快照（push 生效于之后的 failure 调用）
+    const requestKeys = this.providers.getRedactionKeys();
+    // 所有失败出口统一过同一脱敏原语：静态错误与兜底串也不例外
     const failure = (err: unknown): TestResult => ({
       ok: false,
-      error: this.mask(err, [...requestKeys, ...this.savedKeys()]),
+      error: this.mask(err, requestKeys),
     });
     const provider = this.providers.get(providerId);
     if (!provider) {
@@ -280,17 +301,11 @@ export class ChatService {
     context: Context,
     apiKey: string,
     providerId: string,
+    redactor: KeyRedactor,
     signal: AbortSignal,
   ): Promise<void> {
     let status: MessageStatus;
     let errorText: string | undefined;
-    // 本次请求的 key 快照：运行期间厂商被删除/轮换也不会让活动 key 失去保护
-    const requestKeys = [apiKey, ...this.savedKeys()];
-    // 边界处的最终防线：请求快照 + 此刻全部已存 key（中途新增的 key 也受保护）
-    const guardKeys = (): string[] => [...requestKeys, ...this.savedKeys()];
-    const guard = (text: string): string => redactKeys(text, guardKeys());
-    // 所有流式正文先过脱敏器：发出的事件与写盘的快照永远不含完整 key
-    const redactor = new KeyRedactor(requestKeys);
     // 消费任务的副作用开关：强制终结后置 false，迟到的 delta/终态全部失效
     let accepting = true;
     let abortTimer: ReturnType<typeof setTimeout> | undefined;
@@ -321,13 +336,12 @@ export class ChatService {
               return;
             }
             if (event.type === 'text_delta') {
+              // push 输出已保证安全：直接并入权威正文，不再全文复扫
               const safe = redactor.push(event.delta);
               if (safe === '') {
                 continue;
               }
-              assistant.text += guard(safe);
-              // 累计正文（事件里的权威值）在写盘/发出前再过一次最终脱敏
-              assistant.text = guard(assistant.text);
+              assistant.text += safe;
               try {
                 this.conversations.updateMessage(conversationId, assistant);
               } catch {
@@ -337,7 +351,7 @@ export class ChatService {
                 type: 'delta',
                 conversationId,
                 messageId: assistant.id,
-                delta: guard(safe),
+                delta: safe,
                 text: assistant.text,
               });
             } else if (event.type === 'done') {
@@ -374,7 +388,7 @@ export class ChatService {
           status = 'done';
         } else {
           status = 'error';
-          errorText = providerError ? this.mask(providerError, guardKeys()) : '模型回复失败';
+          errorText = providerError ? redactor.redact(providerError) : '模型回复失败';
         }
       }
     } catch (err) {
@@ -383,7 +397,7 @@ export class ChatService {
         errorText = '已停止';
       } else {
         status = 'error';
-        errorText = this.mask(err, guardKeys());
+        errorText = redactor.redact(errorMessage(err));
       }
     } finally {
       accepting = false;
@@ -394,10 +408,9 @@ export class ChatService {
     }
 
     // 把脱敏器扣留的尾部并入正文；aborted 不补发 delta，尾部直接进终态消息
-    const tail = guard(redactor.flush());
+    const tail = redactor.flush();
     if (tail !== '') {
       assistant.text += tail;
-      assistant.text = guard(assistant.text);
       if (status !== 'aborted') {
         try {
           this.conversations.updateMessage(conversationId, assistant);
@@ -415,16 +428,16 @@ export class ChatService {
     }
 
     assistant.status = status;
-    // 终态前最后一次全量脱敏：权威正文与错误信息都不含完整 key
-    assistant.text = guard(assistant.text);
-    assistant.error = errorText === undefined ? undefined : guard(errorText);
+    // 终态前唯一一次全文复扫：权威正文与错误信息都不含完整 key
+    assistant.text = redactor.redact(assistant.text);
+    assistant.error = errorText === undefined ? undefined : redactor.redact(errorText);
     let emitType: 'done' | 'error' = status === 'done' ? 'done' : 'error';
     try {
       this.conversations.updateMessage(conversationId, assistant);
       this.conversations.flush(conversationId);
     } catch (err) {
       assistant.status = 'error';
-      assistant.error = this.mask(err, guardKeys());
+      assistant.error = redactor.redact(errorMessage(err));
       emitType = 'error';
       try {
         // 尽力把内存里的消息同步到同一错误状态：不再二次 flush、不复活已删会话
@@ -483,10 +496,6 @@ export class ChatService {
   }
 
   private mask(err: unknown, keys: string[]): string {
-    let message = err instanceof Error ? err.message : typeof err === 'string' ? err : '';
-    if (message === '') {
-      message = '未知错误';
-    }
-    return redactKeys(message, keys);
+    return redactKeys(errorMessage(err), keys);
   }
 }

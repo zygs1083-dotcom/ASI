@@ -1110,21 +1110,49 @@ describe('ProviderEditor pending payload scrub (mock hooks)', () => {
     h.unmount();
   });
 
-  it('rejects a draft containing the mask placeholder without calling save', async () => {
+  it.each([
+    'sk-abc[已隐藏]xyz',
+    'abcd 1234',
+    'abcd\t1234',
+    'abcd\n1234',
+    'sk-é1234567',
+    'sk-😀1234567',
+    'sk-abc123\x7F4',
+    'sk-a\x01c12345',
+  ])('rejects a draft with illegal characters (%j) locally without calling save', async (bad) => {
     let saveCalls = 0;
     editorApi(async () => {
       saveCalls += 1;
       return clone(savedProvider);
     });
     const h = await mountEditor({ id: null });
-    (must(h, 'pe-apikey').onChange as (e: unknown) => void)({
-      target: { value: 'sk-abc[已隐藏]xyz' },
-    });
+    (must(h, 'pe-apikey').onChange as (e: unknown) => void)({ target: { value: bad } });
     (must(h, 'pe-save').onClick as () => void)();
     expect(saveCalls).toBe(0);
-    expect(String(h.byTestId('pe-apikey-err')?.children)).toContain('占位符');
+    const text = String(h.byTestId('pe-apikey-err')?.children);
+    expect(text).toContain('可打印 ASCII');
+    expect(text).not.toContain(bad.trim());
     h.unmount();
   });
+
+  it.each(['!!!!!!!!', '~~~~~~~~', '12345678', '  validkey9  '])(
+    'accepts the boundary-valid draft %j and reaches save',
+    async (ok) => {
+      const calls: ProviderInput[] = [];
+      editorApi(async (i) => {
+        calls.push(clone(i));
+        return clone(savedProvider);
+      });
+      const h = await mountEditor({ id: 'p1' });
+      (must(h, 'pe-apikey').onChange as (e: unknown) => void)({ target: { value: ok } });
+      (must(h, 'pe-save').onClick as () => void)();
+      expect(h.byTestId('pe-apikey-err')).toBeUndefined();
+      await flushMicrotasks();
+      expect(calls).toHaveLength(1);
+      expect(calls[0].apiKey).toBe(ok);
+      h.unmount();
+    },
+  );
 
   it('rejects a whitespace-only key draft but treats a truly empty draft as retain', async () => {
     const calls: ProviderInput[] = [];

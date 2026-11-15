@@ -2,7 +2,6 @@ import { randomUUID } from 'node:crypto';
 import { rmSync } from 'node:fs';
 import { join } from 'node:path';
 import type { ProviderConfig, ProviderInput, ProviderKind } from '../../shared/types';
-import { KEY_MASK } from '../chat/key-redactor';
 import { ensureDir, readJsonFile, writeJsonAtomic } from './json-file';
 
 export interface StorageEncryption {
@@ -51,9 +50,12 @@ let warnedInvalidKeys = false;
 
 const MIN_API_KEY_LENGTH = 8;
 
-type ApiKeyProblem = 'empty' | 'short' | 'masked';
+/** 合法 key 字符集：无空白的可打印 ASCII（'!' 0x21 ~ '~' 0x7E），trim 后至少 8 位 */
+const API_KEY_PATTERN = /^[\x21-\x7E]+$/;
 
-/** 与渲染进程一致的 key 校验：trim 后为空 / 过短 / 含脱敏占位符 */
+type ApiKeyProblem = 'empty' | 'short' | 'charset';
+
+/** 与渲染进程一致的 key 校验：trim 后为空 / 过短 / 含空白或非可打印 ASCII */
 function apiKeyProblem(value: string): ApiKeyProblem | null {
   const trimmed = value.trim();
   if (trimmed === '') {
@@ -62,8 +64,8 @@ function apiKeyProblem(value: string): ApiKeyProblem | null {
   if (trimmed.length < MIN_API_KEY_LENGTH) {
     return 'short';
   }
-  if (trimmed.includes(KEY_MASK)) {
-    return 'masked';
+  if (!API_KEY_PATTERN.test(trimmed)) {
+    return 'charset';
   }
   return null;
 }
@@ -71,7 +73,7 @@ function apiKeyProblem(value: string): ApiKeyProblem | null {
 const API_KEY_ERRORS: Record<ApiKeyProblem, string> = {
   empty: 'API Key 不能为空字符串',
   short: `API Key 长度至少 ${MIN_API_KEY_LENGTH} 个字符`,
-  masked: 'API Key 不能包含占位符文本',
+  charset: 'API Key 只能包含无空白的可打印 ASCII 字符',
 };
 
 /** 恢复单个 JSON 文件到调用前状态：有旧快照则原子写回，原本不存在则删除刚创建的文件 */
@@ -173,7 +175,7 @@ export class ProviderStore {
   }
 
   /**
-   * 加载的条目逐个分类：可解密但内容非法的标记为不可用（不再迁移、也不可被 getApiKey 读到）；
+   * 加载的条目逐个分类：可解密但内容非法的标记为不可用（密文原样保留、不可被 getApiKey 读到）；
    * 密文本身不可读的跳过——保留既有行为：构造照常，getApiKey 时才抛统一解密错误。
    */
   private classifyLoadedKeys(): void {
@@ -190,48 +192,50 @@ export class ProviderStore {
           this.warnInvalidKey();
         }
       } else if (process.env.ASI_DATA_DIR) {
-        // 测试模式明文条目可用，但内容仍须通过同一校验
+        // 加密不可用的测试回退里明文条目可用，但内容仍须通过同一校验；
+        // 加密可用时这些明文条目随后由 migratePlaintextKeys 全部迁移
         if (apiKeyProblem(entry.value) !== null) {
           this.unavailableKeys.add(id);
           this.warnInvalidKey();
         }
       }
-      // 非测试模式的明文条目由 migratePlaintextKeys 处置
+      // 其余明文条目由 migratePlaintextKeys 处置
     }
   }
 
   /**
-   * 非测试环境不允许明文 key 投入使用：
-   * - 加密可用：把全部 encrypted:false 且内容合法的条目转成密文，构造返回前原子重写一次；
-   *   非法明文条目不迁移、标记为不可用（条目仍留在内存与盘上）；
-   *   迁移加密/写盘失败直接让构造失败，明文绝不可被 getApiKey 读到。
-   * - 加密不可用：全部明文条目标记为不可用（内存与盘上都不删），进程级告警一次。
-   * ASI_DATA_DIR 测试模式下的明文条目保持可用（合法性已在 classifyLoadedKeys 分类）。
+   * 加密可用时盘上不留明文 key（生产与 ASI_DATA_DIR 测试模式一致迁移）：
+   * - 加密可用：把全部 encrypted:false 条目转成密文（含内容非法的与孤儿条目），
+   *   构造返回前原子重写一次；非法条目原值原样加密保留（不 trim/不改写），
+   *   同时标记为不可用；迁移加密/写盘失败直接让构造失败，
+   *   明文绝不可被 getApiKey 读到。
+   * - 加密不可用：生产环境全部明文条目标记为不可用（内存与盘上都不删），
+   *   进程级告警一次；仅 ASI_DATA_DIR 测试模式允许明文回退投入使用，
+   *   条目保持可用（合法性已在 classifyLoadedKeys 分类）。
    */
   private migratePlaintextKeys(): void {
-    if (process.env.ASI_DATA_DIR) {
-      return;
-    }
     const plaintextIds = Object.keys(this.keys).filter((id) => !this.keys[id].encrypted);
     if (plaintextIds.length === 0) {
       return;
     }
     if (this.encryption.isEncryptionAvailable()) {
       const migrated = { ...this.keys };
-      let changed = false;
       for (const id of plaintextIds) {
         if (apiKeyProblem(this.keys[id].value) === null) {
           migrated[id] = this.encodeKey(this.keys[id].value.trim());
-          changed = true;
         } else {
+          // 非法条目也加密：盘上不留明文；原值原样保留以便重载/脱敏枚举恢复同一字节序列
+          migrated[id] = this.encodeKey(this.keys[id].value);
           this.unavailableKeys.add(id);
           this.warnInvalidKey();
         }
       }
-      if (changed) {
-        writeJsonAtomic(this.keysPath, migrated);
-        this.keys = migrated;
-      }
+      writeJsonAtomic(this.keysPath, migrated);
+      this.keys = migrated;
+      return;
+    }
+    if (process.env.ASI_DATA_DIR) {
+      // 仅加密不可用时允许的测试明文回退：条目保持可用，盘上仍是明文
       return;
     }
     for (const id of plaintextIds) {
@@ -452,7 +456,10 @@ export class ProviderStore {
 
   /**
    * 主进程内部使用：返回全部可解密的非空持久化 key 值（含被标记不可用的/被忽略的遗留条目），
-   * 供流式输出脱敏枚举；单条密文损坏只跳过该条，不影响其余，也不改变 getApiKey 的行为。
+   * 供流式输出脱敏枚举。已接受边界（架构 §6）：不可解密的条目被有意排除——解不出来的值
+   * 应用不会发给本次请求的目标厂商，契约明确将其排除（而非承诺该值不可能出现在模型
+   * 输出里）；请求中途新保存的 key 从下一次请求起生效。
+   * 单条密文损坏只跳过该条，不影响其余，也不改变 getApiKey 的行为。
    */
   getRedactionKeys(): string[] {
     const out: string[] = [];
