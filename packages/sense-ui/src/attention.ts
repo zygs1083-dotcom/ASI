@@ -42,7 +42,8 @@ function validEta(key: MetricKey, eta: Eta | undefined, now: number): Eta | null
   if (
     timeToThresholdMs == null ||
     !Number.isFinite(timeToThresholdMs) ||
-    timeToThresholdMs < 0
+    timeToThresholdMs < 0 ||
+    timeToThresholdMs > MAX_ETA_MS
   ) {
     return null
   }
@@ -55,6 +56,8 @@ function validEta(key: MetricKey, eta: Eta | undefined, now: number): Eta | null
  * 优先警示行：
  * 先按严重度选出当前最差行（不先看事件紧急度，避免 warn 磁盘掩盖 critical 内存），
  * 再从该行各指标的 insight.currentEta 里挑最新且仍有效的宿主投影；
+ * timeToThresholdMs 是 asOf 时刻的估计，显示前先扣除已流逝时间
+ * （remaining = ETA − (now − asOf)，remaining ≤ 0 即视为已到期不显示）；
  * 更新的匹配 body.rate 信号使旧投影失效（信号意味着宿主已重新评估，
  * 包括新的无 ETA / 零速率 / 反向更新，不做历史 ETA 替补）。
  */
@@ -89,8 +92,11 @@ export function attentionLine(
     //（含新的无 ETA / 零速率 / 反向更新，不做历史 ETA 替补）。
     const signalAt = latestRateAt.get(key)
     if (signalAt != null && signalAt > eta.asOf) continue
+    // timeToThresholdMs 是 asOf 时刻的估计：扣除已流逝时间才是剩余倒计时
+    const remainingMs = eta.timeToThresholdMs! - (model.now - eta.asOf)
+    if (remainingMs <= 0) continue
     if (!best || eta.asOf > best.asOf) {
-      best = { key, asOf: eta.asOf, ms: eta.timeToThresholdMs! }
+      best = { key, asOf: eta.asOf, ms: remainingMs }
     }
   }
   if (!best || best.ms > MAX_ETA_MS) return null

@@ -133,7 +133,7 @@ export const BatteryTile = memoTile(
                 label="电池电量"
                 format={formatPercentValue}
                 severity={rows.battery.severity}
-                baseline={model.insights?.battery?.baseline}
+                baseline={fresh ? model.insights?.battery?.baseline : undefined}
                 thresholds={thr.lines}
               />
             </>
