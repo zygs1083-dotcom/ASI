@@ -40,6 +40,7 @@ function AssistantMessage({
               <button
                 type="button"
                 className="pill-btn msg-retry"
+                data-testid="msg-retry"
                 aria-label="重试"
                 disabled={pending}
                 onClick={() => void actions.retry(convId)}
@@ -56,6 +57,7 @@ function AssistantMessage({
               <button
                 type="button"
                 className="pill-btn msg-retry"
+                data-testid="msg-retry"
                 aria-label="重试"
                 disabled={pending}
                 onClick={() => void actions.retry(convId)}

@@ -85,7 +85,7 @@ test('retry replaces a failed reply without adding another user message', async 
     recovered.setResponses([pi.fauxAssistantMessage([pi.fauxText('Recovered.')])]);
   }, resolve('node_modules/@mariozechner/pi-ai/dist/index.js'));
 
-  await page.getByTestId('msg-error').getByRole('button', { name: '重试' }).click();
+  await page.getByTestId('msg-error').getByTestId('msg-retry').click();
   await expect(page.getByTestId('msg-assistant')).toHaveCount(1);
   await expect(page.getByTestId('msg-assistant').last()).toHaveAttribute('data-status', 'done');
   await expect(page.getByTestId('msg-assistant').last()).toContainText('Recovered.');
