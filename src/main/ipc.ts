@@ -1,8 +1,10 @@
-import { BrowserWindow, ipcMain, nativeTheme, safeStorage } from 'electron';
+import type { IpcMainInvokeEvent } from 'electron';
+import { ipcMain, nativeTheme, safeStorage } from 'electron';
 import { IPC_CHANNELS } from '../shared/ipc';
 import type { AppSettings, ChatEvent, ModelRef, ProviderConfig, ProviderInput } from '../shared/types';
 import { ChatService } from './chat/chat-service';
 import { isSupportedBuiltinProvider, ModelResolver } from './chat/model-resolver';
+import { getMainWindow } from './main-window';
 import { dataDir } from './paths';
 import { ConversationStore } from './stores/conversation-store';
 import { ProviderStore } from './stores/provider-store';
@@ -151,7 +153,16 @@ function requireProvider(services: MainServices, providerId: string): ProviderCo
 
 export function registerIpc(services: MainServices = createDefaultServices()): void {
   const handle = (channel: string, fn: (...args: unknown[]) => unknown): void => {
-    ipcMain.handle(channel, async (_event: unknown, ...args: unknown[]) => fn(...args));
+    ipcMain.handle(channel, async (event: IpcMainInvokeEvent, ...args: unknown[]) => {
+      // 任何参数解析/服务调用之前先验证来源：必须来自主窗口主 frame，
+      // 杜绝远程页面、子 frame 或其它窗口借桥调用特权接口
+      const main = getMainWindow();
+      const frame = event.senderFrame;
+      if (!main || event.sender !== main.webContents || !frame || frame !== main.webContents.mainFrame) {
+        throw new Error('IPC 调用来源不可信');
+      }
+      return fn(...args);
+    });
   };
   const C = IPC_CHANNELS;
 
@@ -197,6 +208,7 @@ export function registerIpc(services: MainServices = createDefaultServices()): v
   handle(C.chat.send, (id, text) =>
     services.chat.send(reqString(id, 'conversationId'), reqString(text, 'text')),
   );
+  handle(C.chat.retry, (id) => services.chat.retry(reqString(id, 'conversationId')));
   handle(C.chat.abort, (id) => services.chat.abort(reqString(id, 'conversationId')));
 
   handle(C.settings.get, () => services.settings.get());
@@ -204,14 +216,13 @@ export function registerIpc(services: MainServices = createDefaultServices()): v
 }
 
 export function emitChatEvent(e: ChatEvent): void {
-  for (const win of BrowserWindow.getAllWindows()) {
-    try {
-      if (win.isDestroyed?.() === true || win.webContents?.isDestroyed?.() === true) {
-        continue;
-      }
-      win.webContents.send(IPC_CHANNELS.chat.onEvent, e);
-    } catch {
-      // 某个窗口销毁/异常不影响其它窗口的投递
-    }
+  const win = getMainWindow();
+  if (!win) {
+    return;
+  }
+  try {
+    win.webContents.send(IPC_CHANNELS.chat.onEvent, e);
+  } catch {
+    // 窗口在投递途中关闭不影响主流程
   }
 }

@@ -722,3 +722,679 @@ describe('ChatService.test', () => {
     expect(vi.getTimerCount()).toBe(0);
   });
 });
+
+/** 用自定义分片序列构造一次性 mock 流，尾态可选 done/error */
+function streamDeltas(deltas: string[], tail: 'done' | { error: string } = 'done'): void {
+  streamMock.mockImplementationOnce(
+    () =>
+      ({
+        async *[Symbol.asyncIterator]() {
+          for (const delta of deltas) {
+            yield { type: 'text_delta', contentIndex: 0, delta } as AssistantMessageEvent;
+          }
+          if (tail === 'done') {
+            yield { type: 'done', reason: 'stop', message: {} } as AssistantMessageEvent;
+          } else {
+            yield {
+              type: 'error',
+              reason: 'error',
+              error: { errorMessage: tail.error },
+            } as AssistantMessageEvent;
+          }
+        },
+      }) as unknown as ReturnType<typeof piai.stream>,
+  );
+}
+
+/** 带 key 的 builtin 厂商会话（stream 已被 mock，不会真实联网） */
+function keyedConv(env: Env, apiKey: string): { providerId: string; conv: Conversation } {
+  const provider = env.providers.save({
+    name: 'Anthropic',
+    kind: 'builtin',
+    builtinProvider: 'anthropic',
+    apiKey,
+    enabled: true,
+    customModels: [],
+  });
+  const conv = env.conversations.create({ providerId: provider.id, modelId: 'claude-sonnet-4-5' });
+  return { providerId: provider.id, conv };
+}
+
+function deltaTexts(events: ChatEvent[]): string[] {
+  return events.filter((e) => e.type === 'delta').map((e) => (e as { delta: string }).delta);
+}
+
+function deltaCumulatives(events: ChatEvent[]): string[] {
+  return events.filter((e) => e.type === 'delta').map((e) => (e as { text: string }).text);
+}
+
+function terminalMessage(events: ChatEvent[]): ChatMessage | undefined {
+  const t = events.find((e) => e.type === 'done' || e.type === 'error');
+  return t && 'message' in t ? t.message : undefined;
+}
+
+describe('ChatService.retry', () => {
+  function seed(
+    env: Env,
+    messages: ChatMessage[],
+    model = { providerId: FAUX_PROVIDER_ID, modelId: 'faux-chat' },
+  ): Conversation {
+    const conv = env.conversations.create(model);
+    const snap = env.conversations.get(conv.id);
+    env.conversations.save({ ...(snap as Conversation), messages });
+    return conv;
+  }
+
+  it('retries the last error turn: same user message, new assistant id, done result', async () => {
+    const env = setup();
+    const conv = seed(env, [
+      msg({ id: 'u1', text: '你好', status: 'done' }),
+      msg({ id: 'a1', role: 'assistant', text: '', status: 'error', error: '挂了' }),
+    ]);
+    const { assistant } = await env.service.retry(conv.id);
+    expect(assistant.status).toBe('streaming');
+    expect(assistant.id).not.toBe('a1');
+    expect(env.events).toEqual([]);
+    await waitFor(() => env.events.some((e) => e.type === 'done'));
+    const stored = env.conversations.get(conv.id);
+    expect(stored?.messages.map((m) => m.id)).toEqual(['u1', assistant.id]);
+    expect(stored?.messages[0].text).toBe('你好');
+    expect(stored?.messages[1].status).toBe('done');
+    expect(stored?.messages[1].text).toBe('你好，我是测试模型。');
+    const raw = JSON.parse(readFileSync(join(env.dir, 'conversations', `${conv.id}.json`), 'utf8'));
+    expect(raw.messages).toHaveLength(2);
+    expect(raw.messages[1].status).toBe('done');
+  });
+
+  it('retries the last aborted turn to completion', async () => {
+    const env = setup();
+    const conv = seed(env, [
+      msg({ id: 'u1', text: '你好', status: 'done' }),
+      msg({ id: 'a1', role: 'assistant', text: '半截', status: 'aborted', error: '已停止' }),
+    ]);
+    const { assistant } = await env.service.retry(conv.id);
+    await waitFor(() => env.events.some((e) => e.type === 'done'));
+    const stored = env.conversations.get(conv.id);
+    expect(stored?.messages.map((m) => m.id)).toEqual(['u1', assistant.id]);
+    expect(stored?.messages[1].status).toBe('done');
+  });
+
+  it('sends exactly the prior done history to the provider, skipping older failures', async () => {
+    const env = setup();
+    const conv = seed(env, [
+      msg({ id: 'u1', text: '第一条', status: 'done' }),
+      msg({ id: 'a1', role: 'assistant', text: '回复一', status: 'done' }),
+      msg({ id: 'ax', role: 'assistant', text: '更早的失败', status: 'error', error: 'x' }),
+      msg({ id: 'u2', text: '第二条', status: 'done' }),
+      msg({ id: 'a2', role: 'assistant', text: '', status: 'error', error: '失败' }),
+    ]);
+    let captured: Context | undefined;
+    streamMock.mockImplementationOnce((model, ctx, options) => {
+      captured = ctx;
+      return REAL.stream(model, ctx, options);
+    });
+    await env.service.retry(conv.id);
+    await waitFor(() => env.events.some((e) => e.type === 'done'));
+    const messages = captured?.messages ?? [];
+    // 上下文 = 被删 assistant 之前的 done 历史：更早的 error 不计入，也不追加新的 user 消息
+    expect(messages).toHaveLength(3);
+    expect(messages[0]).toMatchObject({ role: 'user', content: '第一条' });
+    expect(messages[1]).toMatchObject({ role: 'assistant' });
+    expect(messages[2]).toMatchObject({ role: 'user', content: '第二条' });
+    expect(messages.filter((m) => m.role === 'user' && m.content === '第二条')).toHaveLength(1);
+  });
+
+  it('rejects when the last message is not a failed/aborted assistant', async () => {
+    const env = setup();
+    const done = seed(env, [
+      msg({ id: 'u1', status: 'done' }),
+      msg({ id: 'a1', role: 'assistant', text: 'ok', status: 'done' }),
+    ]);
+    const userTail = seed(env, [msg({ id: 'u2', status: 'done' })]);
+    const empty = seed(env, []);
+    const streaming = seed(env, [
+      msg({ id: 'u3', status: 'done' }),
+      msg({ id: 'a3', role: 'assistant', text: 'x', status: 'streaming' }),
+    ]);
+    for (const conv of [done, userTail, empty, streaming]) {
+      await expect(env.service.retry(conv.id)).rejects.toThrow();
+    }
+    await expect(env.service.retry('missing')).rejects.toThrow();
+    // 全部未发生变更
+    expect(env.conversations.get(done.id)?.messages).toHaveLength(2);
+    expect(env.conversations.get(userTail.id)?.messages).toHaveLength(1);
+    expect(env.conversations.get(streaming.id)?.messages[1].status).toBe('streaming');
+    expect(env.events).toEqual([]);
+  });
+
+  it('rejects while a request is active, without mutating the failed message', async () => {
+    vi.useFakeTimers();
+    const env = setup();
+    // 先发一条 send 占住会话锁（底层流挂起），retry 必须立即被拒且不改动
+    streamMock.mockImplementationOnce(
+      () =>
+        ({
+          async *[Symbol.asyncIterator]() {
+            yield { type: 'text_delta', contentIndex: 0, delta: 'x' } as AssistantMessageEvent;
+            await new Promise(() => {});
+          },
+        }) as unknown as ReturnType<typeof piai.stream>,
+    );
+    const conv = seed(env, [msg({ id: 'u1', text: 'hi', status: 'done' })]);
+    await env.service.send(conv.id, 'again');
+    await vi.advanceTimersByTimeAsync(0);
+    await expect(env.service.retry(conv.id)).rejects.toThrow();
+    // 消息未被改动：u1 + send 追加的 user + 进行中的 streaming assistant
+    const stored = env.conversations.get(conv.id);
+    expect(stored?.messages).toHaveLength(3);
+    expect(stored?.messages[2].status).toBe('streaming');
+    // 清理：强制终结释放锁
+    const aborting = env.service.abort(conv.id);
+    await vi.advanceTimersByTimeAsync(2000);
+    await aborting;
+  });
+
+  it('rejects and preserves the failed message when the provider validation fails', async () => {
+    const env = setup();
+    const noKey = env.providers.save({
+      name: 'NoKey',
+      kind: 'builtin',
+      builtinProvider: 'anthropic',
+      enabled: true,
+      customModels: [],
+    });
+    const conv = seed(
+      env,
+      [
+        msg({ id: 'u1', status: 'done' }),
+        msg({ id: 'a1', role: 'assistant', text: '', status: 'error', error: 'x' }),
+      ],
+      { providerId: noKey.id, modelId: 'claude-sonnet-4-5' },
+    );
+    await expect(env.service.retry(conv.id)).rejects.toThrow(/API Key/i);
+    const stored = env.conversations.get(conv.id);
+    expect(stored?.messages.map((m) => m.id)).toEqual(['u1', 'a1']);
+    expect(stored?.messages[1].status).toBe('error');
+    expect(env.events).toEqual([]);
+  });
+});
+
+describe('ChatService key masking (cross-chunk)', () => {
+  const KEY = 'sk-ABCDEFGH';
+
+  it('masks a whole key arriving in a single chunk, in events, snapshot and on disk', async () => {
+    const env = setup();
+    const { conv } = keyedConv(env, KEY);
+    streamDeltas([`正文${KEY}尾巴`]);
+    await env.service.send(conv.id, 'hi');
+    await waitFor(() => env.events.some((e) => e.type === 'done'));
+    const final = terminalMessage(env.events);
+    expect(final?.text).toBe('正文[已隐藏]尾巴');
+    for (const e of env.events) {
+      expect(JSON.stringify(e)).not.toContain(KEY);
+    }
+    const stored = env.conversations.get(conv.id);
+    expect(stored?.messages[1].text).not.toContain(KEY);
+    const raw = readFileSync(join(env.dir, 'conversations', `${conv.id}.json`), 'utf8');
+    expect(raw).not.toContain(KEY);
+  });
+
+  it('masks the key at every two-chunk split boundary', async () => {
+    for (let i = 1; i < KEY.length; i++) {
+      const env = setup();
+      const { conv } = keyedConv(env, KEY);
+      streamDeltas([`pre${KEY.slice(0, i)}`, `${KEY.slice(i)}post`]);
+      await env.service.send(conv.id, 'hi');
+      await waitFor(() => env.events.some((e) => e.type === 'done' || e.type === 'error'));
+      const final = terminalMessage(env.events);
+      expect(final?.text, `split at ${i}`).toBe('pre[已隐藏]post');
+      for (const e of env.events) {
+        expect(JSON.stringify(e), `split at ${i}`).not.toContain(KEY);
+      }
+    }
+  });
+
+  it('masks the key across single-character delta fragments', async () => {
+    const env = setup();
+    const { conv } = keyedConv(env, KEY);
+    streamDeltas([...KEY]);
+    await env.service.send(conv.id, 'hi');
+    await waitFor(() => env.events.some((e) => e.type === 'done'));
+    const final = terminalMessage(env.events);
+    expect(final?.text).toBe('[已隐藏]');
+    for (const e of env.events) {
+      expect(JSON.stringify(e)).not.toContain(KEY);
+    }
+  });
+
+  it('masks repeated and adjacent occurrences of the key', async () => {
+    const env = setup();
+    const { conv } = keyedConv(env, KEY);
+    streamDeltas([`${KEY}${KEY}`, `x${KEY.slice(0, 4)}`, KEY.slice(4)]);
+    await env.service.send(conv.id, 'hi');
+    await waitFor(() => env.events.some((e) => e.type === 'done'));
+    expect(terminalMessage(env.events)?.text).toBe('[已隐藏][已隐藏]x[已隐藏]');
+  });
+
+  it('leaves a key shorter than 8 chars untouched in text and errors', async () => {
+    const env = setup();
+    const SHORT = 'short-7';
+    const { conv } = keyedConv(env, SHORT);
+    streamDeltas([`echo ${SHORT}`], { error: `denied ${SHORT}` });
+    await env.service.send(conv.id, 'hi');
+    await waitFor(() => env.events.some((e) => e.type === 'error'));
+    const final = terminalMessage(env.events);
+    expect(final?.text).toBe(`echo ${SHORT}`);
+    expect(final?.error).toBe(`denied ${SHORT}`);
+  });
+
+  it('emits benign text promptly: only a potential key-prefix tail is withheld', async () => {
+    const env = setup();
+    const { conv } = keyedConv(env, KEY);
+    streamDeltas(['你好世界', `正常文本${KEY.slice(0, 3)}`, '继续']);
+    await env.service.send(conv.id, 'hi');
+    await waitFor(() => env.events.some((e) => e.type === 'done'));
+    const deltas = deltaTexts(env.events);
+    // 第一块完整放出；第二块放出正常文本但扣留 'sk-'；第三块发现不是 key 后放出剩余
+    expect(deltas[0]).toBe('你好世界');
+    expect(deltas[1]).toBe('正常文本');
+    expect(deltas.join('')).toBe(`你好世界正常文本${KEY.slice(0, 3)}继续`);
+    expect(terminalMessage(env.events)?.text).toBe(`你好世界正常文本${KEY.slice(0, 3)}继续`);
+  });
+
+  it('masks a streamed key before an error, and masks the secret inside the error text', async () => {
+    const env = setup();
+    const { conv } = keyedConv(env, KEY);
+    streamDeltas([KEY.slice(0, 5), KEY.slice(5), 'more'], { error: `HTTP 401 ${KEY}` });
+    await env.service.send(conv.id, 'hi');
+    await waitFor(() => env.events.some((e) => e.type === 'error'));
+    const final = terminalMessage(env.events);
+    expect(final?.status).toBe('error');
+    expect(final?.text).not.toContain(KEY);
+    expect(final?.text).toBe('[已隐藏]more');
+    expect(final?.error).not.toContain(KEY);
+    expect(final?.error).toBe('HTTP 401 [已隐藏]');
+    const stored = env.conversations.get(conv.id)?.messages[1];
+    expect(stored?.text).not.toContain(KEY);
+    expect(stored?.error).not.toContain(KEY);
+  });
+
+  it('masks on abort after a split key and flushes a pending key-prefix into the final message', async () => {
+    const env = setup();
+    const { conv } = keyedConv(env, KEY);
+    streamMock.mockImplementationOnce(
+      () =>
+        ({
+          async *[Symbol.asyncIterator]() {
+            yield {
+              type: 'text_delta',
+              contentIndex: 0,
+              delta: `ok${KEY.slice(0, 4)}`,
+            } as AssistantMessageEvent;
+            yield { type: 'text_delta', contentIndex: 0, delta: KEY.slice(4) } as AssistantMessageEvent;
+            yield {
+              type: 'text_delta',
+              contentIndex: 0,
+              delta: `safe${KEY.slice(0, 3)}`,
+            } as AssistantMessageEvent;
+            await new Promise(() => {});
+          },
+        }) as unknown as ReturnType<typeof piai.stream>,
+    );
+    const { assistant } = await env.service.send(conv.id, 'hi');
+    // 等全部三块都消费完（'safe' 已放出、'sk-' 仍被扣留）再中止
+    await waitFor(() => deltaTexts(env.events).join('').includes('safe'));
+    const deltasBeforeAbort = deltaTexts(env.events).length;
+    await env.service.abort(conv.id);
+    const stored = env.conversations.get(conv.id)?.messages.find((m) => m.id === assistant.id);
+    expect(stored?.status).toBe('aborted');
+    // 完整 key 已脱敏；尾部残留的 key 前缀片段原样保留在终态消息中（不是完整 key）
+    expect(stored?.text).not.toContain(KEY);
+    expect(stored?.text).toBe(`ok[已隐藏]safe${KEY.slice(0, 3)}`);
+    // abort 不为尾部补发 delta
+    expect(deltaTexts(env.events)).toHaveLength(deltasBeforeAbort);
+    for (const e of env.events) {
+      expect(JSON.stringify(e)).not.toContain(KEY);
+    }
+  });
+
+  it('masks the key when the iterator throws mid-stream', async () => {
+    const env = setup();
+    const { conv } = keyedConv(env, KEY);
+    streamMock.mockImplementationOnce(
+      () =>
+        ({
+          async *[Symbol.asyncIterator]() {
+            yield { type: 'text_delta', contentIndex: 0, delta: KEY.slice(0, 6) } as AssistantMessageEvent;
+            throw new Error(`boom ${KEY}`);
+          },
+        }) as unknown as ReturnType<typeof piai.stream>,
+    );
+    await env.service.send(conv.id, 'hi');
+    await waitFor(() => env.events.some((e) => e.type === 'error'));
+    const final = terminalMessage(env.events);
+    expect(final?.error).toBe('boom [已隐藏]');
+    expect(final?.text).not.toContain(KEY);
+    // 抛错前扣留的前缀经 flush 后进入正文（key 片段，安全）
+    expect(final?.text).toBe(KEY.slice(0, 6));
+    for (const e of env.events) {
+      expect(JSON.stringify(e)).not.toContain(KEY);
+    }
+  });
+
+  it('masks the key in connectivity-test errors', async () => {
+    const env = setup();
+    const provider = env.providers.save({
+      name: 'Anthropic',
+      kind: 'builtin',
+      builtinProvider: 'anthropic',
+      apiKey: KEY,
+      enabled: true,
+      customModels: [],
+    });
+    completeMock.mockImplementationOnce(async () => {
+      throw new Error(`unauthorized ${KEY}`);
+    });
+    const result = await env.service.test(provider.id, 'claude-sonnet-4-5');
+    expect(result.ok).toBe(false);
+    expect(result.error).toBe('unauthorized [已隐藏]');
+  });
+
+  it('delta.text is the authoritative cumulative text and resumes after a snapshot', async () => {
+    const env = setup();
+    const { conv } = keyedConv(env, KEY);
+    let release: (() => void) | undefined;
+    const gate = new Promise<void>((r) => {
+      release = r;
+    });
+    streamMock.mockImplementationOnce(
+      () =>
+        ({
+          async *[Symbol.asyncIterator]() {
+            yield { type: 'text_delta', contentIndex: 0, delta: 'abc' } as AssistantMessageEvent;
+            yield { type: 'text_delta', contentIndex: 0, delta: KEY.slice(0, 4) } as AssistantMessageEvent;
+            await gate;
+            yield {
+              type: 'text_delta',
+              contentIndex: 0,
+              delta: `${KEY.slice(4)}tail`,
+            } as AssistantMessageEvent;
+            yield { type: 'done', reason: 'stop', message: {} } as AssistantMessageEvent;
+          },
+        }) as unknown as ReturnType<typeof piai.stream>,
+    );
+    const { assistant } = await env.service.send(conv.id, 'hi');
+    // 'abc' 已放出；'sk-A'（key 前缀）被扣留未发
+    await waitFor(() => deltaTexts(env.events).length === 1);
+    // 中途快照：get() 的正文 = 已安全放出的累计文本
+    const snapshot = env.conversations.get(conv.id)?.messages.find((m) => m.id === assistant.id);
+    expect(snapshot?.text).toBe('abc');
+    release?.();
+    await waitFor(() => env.events.some((e) => e.type === 'done'));
+    const deltas = deltaTexts(env.events);
+    const cumulatives = deltaCumulatives(env.events);
+    let expected = '';
+    for (const [i, delta] of deltas.entries()) {
+      expected += delta;
+      // 每个 delta 事件的 text 都是截至此刻的完整累计正文
+      expect(cumulatives[i]).toBe(expected);
+    }
+    const final = terminalMessage(env.events);
+    expect(final?.text).toBe(expected);
+    // 快照前缀 + 后续 delta.text 仍能无缝续上权威文本
+    expect(cumulatives.at(-1)).toBe('abc[已隐藏]tail');
+    const stored = env.conversations.get(conv.id)?.messages.find((m) => m.id === assistant.id);
+    expect(stored?.text).toBe(`abc[已隐藏]tail`);
+  });
+});
+
+describe('ChatService bounded abort', () => {
+  /** 完全不响应 signal 的挂起流：可控推进或永不产出 */
+  function hangingStream(): void {
+    streamMock.mockImplementationOnce(
+      () =>
+        ({
+          async *[Symbol.asyncIterator]() {
+            yield { type: 'text_delta', contentIndex: 0, delta: 'chunk' } as AssistantMessageEvent;
+            await new Promise(() => {});
+          },
+        }) as unknown as ReturnType<typeof piai.stream>,
+    );
+  }
+
+  it('force-terminates a non-cooperative stream at the 2s deadline and releases the lock', async () => {
+    vi.useFakeTimers();
+    const env = setup();
+    const conv = fauxConv(env);
+    hangingStream();
+    await env.service.send(conv.id, 'hi');
+    await vi.advanceTimersByTimeAsync(0);
+    const aborting = env.service.abort(conv.id);
+    let settled = false;
+    void aborting.then(() => {
+      settled = true;
+    });
+    await vi.advanceTimersByTimeAsync(1999);
+    expect(settled).toBe(false);
+    expect(env.conversations.get(conv.id)?.messages[1].status).toBe('streaming');
+    await vi.advanceTimersByTimeAsync(1);
+    await aborting;
+    expect(settled).toBe(true);
+    const stored = env.conversations.get(conv.id)?.messages[1];
+    expect(stored?.status).toBe('aborted');
+    expect(stored?.error).toBe('已停止');
+    // 已落盘为 aborted
+    const raw = JSON.parse(readFileSync(join(env.dir, 'conversations', `${conv.id}.json`), 'utf8'));
+    expect(raw.messages[1].status).toBe('aborted');
+    // 锁已释放：可以立刻再发
+    streamDeltas(['ok']);
+    await env.service.send(conv.id, 'again');
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.runAllTimersAsync();
+    expect(env.conversations.get(conv.id)?.messages[3].status).toBe('done');
+  });
+
+  it('concurrent abort calls are idempotent and do not reset the deadline', async () => {
+    vi.useFakeTimers();
+    const env = setup();
+    const conv = fauxConv(env);
+    hangingStream();
+    await env.service.send(conv.id, 'hi');
+    await vi.advanceTimersByTimeAsync(0);
+    const a = env.service.abort(conv.id);
+    await vi.advanceTimersByTimeAsync(1500);
+    const b = env.service.abort(conv.id);
+    // 若第二次 abort 重置了计时器，这里不会终结
+    await vi.advanceTimersByTimeAsync(500);
+    await Promise.all([a, b]);
+    expect(env.conversations.get(conv.id)?.messages[1].status).toBe('aborted');
+  });
+
+  /** 完全可控的挂起流：next() 一直挂起直到测试显式放出结果，return() 同样挂起 */
+  interface DeferredStream {
+    resolveNext: (result: IteratorResult<AssistantMessageEvent>) => void;
+    rejectNext: (err: unknown) => void;
+  }
+
+  function deferredStream(): DeferredStream {
+    const ctl: DeferredStream = {
+      resolveNext: () => {},
+      rejectNext: () => {},
+    };
+    streamMock.mockImplementationOnce(
+      () =>
+        ({
+          [Symbol.asyncIterator]() {
+            return {
+              next: () =>
+                new Promise<IteratorResult<AssistantMessageEvent>>((res, rej) => {
+                  ctl.resolveNext = res;
+                  ctl.rejectNext = rej;
+                }),
+              return: () => new Promise<IteratorResult<AssistantMessageEvent>>(() => {}),
+            };
+          },
+        }) as unknown as ReturnType<typeof piai.stream>,
+    );
+    return ctl;
+  }
+
+  const lateEvents = {
+    'late delta': {
+      value: { type: 'text_delta', contentIndex: 0, delta: 'late' } as AssistantMessageEvent,
+      done: false,
+    } as IteratorResult<AssistantMessageEvent>,
+    'late done': {
+      value: { type: 'done', reason: 'stop', message: {} } as AssistantMessageEvent,
+      done: false,
+    } as IteratorResult<AssistantMessageEvent>,
+    'late error': {
+      value: {
+        type: 'error',
+        reason: 'error',
+        error: { errorMessage: 'late error' },
+      } as AssistantMessageEvent,
+      done: false,
+    } as IteratorResult<AssistantMessageEvent>,
+    'iterator end': { value: undefined, done: true } as IteratorResult<AssistantMessageEvent>,
+  };
+
+  it.each(Object.keys(lateEvents))(
+    'a %s after a forced abort cannot emit, write, or release the newer lock',
+    async (name) => {
+      vi.useFakeTimers();
+      const env = setup();
+      const conv = fauxConv(env);
+      const oldStream = deferredStream();
+      const { assistant: first } = await env.service.send(conv.id, 'hi');
+      await vi.advanceTimersByTimeAsync(0);
+      const aborting = env.service.abort(conv.id);
+      await vi.advanceTimersByTimeAsync(2000);
+      await aborting;
+      // 旧请求只有一个终态 error 事件，没有任何 delta
+      expect(env.events).toHaveLength(1);
+      expect(env.events[0].type).toBe('error');
+
+      // 锁已释放：同一会话立刻再发新请求（同样不配合）
+      deferredStream();
+      const { assistant: second } = await env.service.send(conv.id, 'again');
+      await vi.advanceTimersByTimeAsync(0);
+      const storedBefore = env.conversations.get(conv.id);
+      expect(storedBefore?.messages).toHaveLength(4);
+      expect(storedBefore?.messages[3].status).toBe('streaming');
+
+      // 现在才放出旧流的迟到事件/结束：对新请求和存储零副作用
+      oldStream.resolveNext(lateEvents[name as keyof typeof lateEvents]);
+      await vi.advanceTimersByTimeAsync(0);
+      await Promise.resolve();
+      expect(env.events).toHaveLength(1);
+      const stored = env.conversations.get(conv.id);
+      expect(stored?.messages[1].status).toBe('aborted');
+      expect(stored?.messages[1].id).toBe(first.id);
+      expect(stored?.messages[1].text).not.toContain('late');
+      expect(stored?.messages[3].id).toBe(second.id);
+      expect(stored?.messages[3].status).toBe('streaming');
+      expect(stored?.messages[3].text).toBe('');
+      // 旧事件不能清掉新请求的锁：并发 send 仍然被拒
+      await expect(env.service.send(conv.id, 'third')).rejects.toThrow(/进行中/);
+      // 新请求走自己的 2s 强终流程正常收尾（不 await 挂起的 return）
+      const secondAbort = env.service.abort(conv.id);
+      await vi.advanceTimersByTimeAsync(2000);
+      await secondAbort;
+      expect(env.events.filter((e) => e.type !== 'delta')).toHaveLength(2);
+      expect(env.conversations.get(conv.id)?.messages[3].status).toBe('aborted');
+    },
+  );
+
+  it('a late iterator rejection after a forced abort has zero side effects', async () => {
+    vi.useFakeTimers();
+    const env = setup();
+    const conv = fauxConv(env);
+    const oldStream = deferredStream();
+    await env.service.send(conv.id, 'hi');
+    await vi.advanceTimersByTimeAsync(0);
+    const aborting = env.service.abort(conv.id);
+    await vi.advanceTimersByTimeAsync(2000);
+    await aborting;
+    expect(env.events).toHaveLength(1);
+    // 迭代器在强终之后抛错：不得产生未处理拒绝之外的任何副作用
+    oldStream.rejectNext(new Error('late iterator failure'));
+    await vi.advanceTimersByTimeAsync(0);
+    await Promise.resolve();
+    expect(env.events).toHaveLength(1);
+    const stored = env.conversations.get(conv.id)?.messages[1];
+    expect(stored?.status).toBe('aborted');
+    expect(stored?.error).toBe('已停止');
+  });
+
+  it('retry immediately after a forced abort works and late old events stay inert', async () => {
+    vi.useFakeTimers();
+    const env = setup();
+    const conv = fauxConv(env);
+    const oldStream = deferredStream();
+    const { user, assistant: first } = await env.service.send(conv.id, 'hi');
+    await vi.advanceTimersByTimeAsync(0);
+    const aborting = env.service.abort(conv.id);
+    await vi.advanceTimersByTimeAsync(2000);
+    await aborting;
+    // 强制终结后立刻 retry：替换被中止的 assistant，不追加 user
+    streamDeltas(['retried']);
+    const { assistant: retried } = await env.service.retry(conv.id);
+    expect(retried.id).not.toBe(first.id);
+    expect(retried.status).toBe('streaming');
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.runAllTimersAsync();
+    const stored = env.conversations.get(conv.id);
+    expect(stored?.messages.map((m) => m.id)).toEqual([user.id, retried.id]);
+    expect(stored?.messages[1].status).toBe('done');
+    expect(stored?.messages[1].text).toBe('retried');
+    // 旧流此时再放东西：不能 emit、不能改存储
+    const eventCount = env.events.length;
+    oldStream.resolveNext(lateEvents['late delta']);
+    await vi.advanceTimersByTimeAsync(0);
+    await Promise.resolve();
+    expect(env.events).toHaveLength(eventCount);
+    expect(env.conversations.get(conv.id)?.messages[1].text).toBe('retried');
+    expect(env.conversations.get(conv.id)?.messages[1].status).toBe('done');
+  });
+
+  it('late events after the conversation was deleted cannot resurrect the file', async () => {
+    vi.useFakeTimers();
+    const env = setup();
+    const conv = fauxConv(env);
+    const oldStream = deferredStream();
+    await env.service.send(conv.id, 'hi');
+    await vi.advanceTimersByTimeAsync(0);
+    const aborting = env.service.abort(conv.id);
+    await vi.advanceTimersByTimeAsync(2000);
+    await aborting;
+    const file = join(env.dir, 'conversations', `${conv.id}.json`);
+    env.conversations.remove(conv.id);
+    expect(env.conversations.get(conv.id)).toBeNull();
+    expect(existsSync(file)).toBe(false);
+    // 强终之后旧流再放 delta/done/错误：文件与内存都不得复活
+    oldStream.resolveNext(lateEvents['late delta']);
+    await vi.advanceTimersByTimeAsync(0);
+    await Promise.resolve();
+    oldStream.rejectNext(new Error('late'));
+    await vi.advanceTimersByTimeAsync(0);
+    await Promise.resolve();
+    expect(env.conversations.get(conv.id)).toBeNull();
+    expect(existsSync(file)).toBe(false);
+  });
+
+  it('aborts before the scheduled run starts: stream is skipped entirely', async () => {
+    vi.useFakeTimers();
+    const env = setup();
+    const conv = fauxConv(env);
+    streamDeltas(['never']);
+    await env.service.send(conv.id, 'hi');
+    const aborting = env.service.abort(conv.id);
+    await vi.advanceTimersByTimeAsync(0);
+    await aborting;
+    expect(streamMock).not.toHaveBeenCalled();
+    const stored = env.conversations.get(conv.id)?.messages[1];
+    expect(stored?.status).toBe('aborted');
+    expect(stored?.text).toBe('');
+  });
+});

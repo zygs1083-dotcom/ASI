@@ -24,6 +24,7 @@ const EXPECTED_CHANNELS = {
   },
   chat: {
     send: 'chat:send',
+    retry: 'chat:retry',
     abort: 'chat:abort',
     onEvent: 'chat:event',
   },
@@ -50,14 +51,15 @@ describe('IPC channel contract', () => {
     }
   });
 
-  it('has 17 unique invoke channels, excluding the chat event channel', () => {
-    expect(IPC_INVOKE_CHANNELS).toHaveLength(17);
-    expect(new Set(IPC_INVOKE_CHANNELS).size).toBe(17);
+  it('has 18 unique invoke channels, excluding the chat event channel', () => {
+    expect(IPC_INVOKE_CHANNELS).toHaveLength(18);
+    expect(new Set(IPC_INVOKE_CHANNELS).size).toBe(18);
     expect(IPC_INVOKE_CHANNELS).not.toContain(IPC_CHANNELS.chat.onEvent);
     const allInvoke = [
       ...Object.values(EXPECTED_CHANNELS.providers),
       ...Object.values(EXPECTED_CHANNELS.conversations),
       EXPECTED_CHANNELS.chat.send,
+      EXPECTED_CHANNELS.chat.retry,
       EXPECTED_CHANNELS.chat.abort,
       ...Object.values(EXPECTED_CHANNELS.settings),
     ];
