@@ -1,4 +1,3 @@
-import { performance } from 'node:perf_hooks';
 import { defaultRun, type RunFn } from './command.js';
 import * as fact from './fact.js';
 import type { Fact, ProcessValue, SourceRef } from './types.js';
@@ -53,7 +52,7 @@ export class SelfProcessSampler {
     try {
       const ru = (this.deps.resourceUsage ?? (() => process.resourceUsage()))();
       const micros = ru.userCPUTime + ru.systemCPUTime;
-      const at = (this.deps.now ?? (() => performance.now()))();
+      const at = (this.deps.now ?? (() => globalThis.performance.now()))();
       const rss = (this.deps.memoryUsage ?? (() => process.memoryUsage()))().rss;
       const uptimeSec = (this.deps.uptime ?? (() => process.uptime()))();
       if (!Number.isFinite(micros) || micros < 0 || !Number.isFinite(at)

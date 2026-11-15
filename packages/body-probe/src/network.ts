@@ -1,5 +1,4 @@
 import os from 'node:os';
-import { performance } from 'node:perf_hooks';
 import { defaultRun, type RunFn } from './command.js';
 import * as fact from './fact.js';
 import type { Fact, NetworkValue, SourceRef } from './types.js';
@@ -140,11 +139,12 @@ export class NetworkSampler {
       return fact.fail('unavailable', this.src, ttlMs);
     }
     const run = this.deps.run ?? defaultRun;
-    const routeMs = periods.routeMs ?? ROUTE_CACHE_MS;
+    // A child can never poll faster than the parent that publishes it.
+    const routeMs = Math.max(periods.routeMs ?? ROUTE_CACHE_MS, ttlMs / 3);
     try {
       const counters = parseNetstatIB(await run('/usr/sbin/netstat', ['-ib'], signal));
       signal?.throwIfAborted();
-      const now = (this.deps.now ?? (() => performance.now()))();
+      const now = (this.deps.now ?? (() => globalThis.performance.now()))();
       const wallNow = (this.deps.wall ?? (() => Date.now()))();
       const online = await this.onlineStatus(now, wallNow, routeMs, run, signal);
       signal?.throwIfAborted();
@@ -178,10 +178,12 @@ export class NetworkSampler {
         return fact.fail('unknown', this.src, ttlMs);
       }
       const meta = fact.oldestMeta([
-        { observedAt: wallNow, periodMs: ttlMs / 3 },
+        { observedAt: wallNow, periodMs: ttlMs / 3, at: now },
         ...online.parts,
       ]);
-      return fact.ok({ online: online.verdict, rxBps, txBps }, this.src, meta.ttlMs, meta.observedAt);
+      const f = fact.ok({ online: online.verdict, rxBps, txBps }, this.src, meta.ttlMs, meta.observedAt);
+      if (meta.expiresAt !== undefined) fact.trackDeadline(f, meta.expiresAt);
+      return f;
     } catch (err) {
       // Abort leaves the baseline untouched so a later generation can still
       // compute deltas; real failures reset it.
@@ -232,7 +234,7 @@ export class NetworkSampler {
   ): Promise<{ verdict: boolean | 'unknown'; meta?: fact.FactMeta }> {
     const cached = this.routes[family];
     if (cached && now - cached.at < routeMs) {
-      return { verdict: cached.value, meta: { observedAt: cached.observedAt, periodMs: routeMs } };
+      return { verdict: cached.value, meta: { observedAt: cached.observedAt, periodMs: routeMs, at: cached.at } };
     }
     let verdict: boolean | 'unknown';
     try {
@@ -246,6 +248,14 @@ export class NetworkSampler {
     // cached at all so the next sample retries the probe.
     if (signal?.aborted || verdict === 'unknown') return { verdict: 'unknown' };
     this.routes[family] = { at: now, observedAt: wallNow, value: verdict };
-    return { verdict, meta: { observedAt: wallNow, periodMs: routeMs } };
+    return { verdict, meta: { observedAt: wallNow, periodMs: routeMs, at: now } };
+  }
+
+  // Drops the route verdicts and the rate baseline so a restart re-probes and
+  // re-baselines; called by BodyProbe on stop and start. Aborted in-flight
+  // reads already check their signal before writing.
+  reset(): void {
+    this.routes = {};
+    this.prev = undefined;
   }
 }

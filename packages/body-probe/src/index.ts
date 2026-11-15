@@ -21,5 +21,5 @@ export {
 } from './tokens.js';
 export {
   BodyProbe,
-  type ProbeCollectors, type SamplePoint, type SamplingCadence, type StartOptions,
+  type ProbeClock, type ProbeCollectors, type SamplePoint, type SamplingCadence, type StartOptions,
 } from './probe.js';

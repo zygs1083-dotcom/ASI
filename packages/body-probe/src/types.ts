@@ -14,12 +14,24 @@ export interface Fact<T> {
   source: SourceRef;       // 来自哪个接口
   observedAt: number;      // 什么时候获取
   ttlMs: number;           // 多久后视为过期（stale 由读取时计算，不靠定时器）
+  unavailableMounts?: string[]; // disks: queried paths with no successful reading yet
+}
+
+// One entry of the disks fact value: total/free are bytes; the optional
+// status/observedAt/ttlMs let a single hung volume degrade alone.
+export interface DiskVolume {
+  mount: string;
+  total: number;
+  free: number;
+  status?: 'ok' | 'stale';
+  observedAt?: number;
+  ttlMs?: number;
 }
 
 export interface Body {
   cpu: Fact<{ usage: number /* 0..1 */; perCore: number[]; load1: number; load5: number; load15: number }>;
   memory: Fact<{ total: number; used: number; cached?: number; pressure: 'normal' | 'warn' | 'critical'; swapUsed: number }>;
-  disks: Fact<Array<{ mount: string; total: number; free: number }>>;   // 至少根卷 + 工作目录所在卷
+  disks: Fact<DiskVolume[]>;   // 至少根卷 + 工作目录所在卷
   battery: Fact<{ percent: number; charging: boolean; minutesLeft?: number } | null>;  // 台式机为 null
   thermal: Fact<'nominal' | 'fair' | 'serious' | 'critical'>;           // ProcessInfo.thermalState，经 helper
   network: Fact<{ online: boolean; rxBps: number; txBps: number }>;

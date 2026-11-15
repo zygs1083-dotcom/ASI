@@ -1,5 +1,4 @@
 import os from 'node:os';
-import { performance } from 'node:perf_hooks';
 import { defaultRun, type RunFn } from './command.js';
 import * as fact from './fact.js';
 import type { Fact, MemoryValue, SourceRef } from './types.js';
@@ -96,10 +95,11 @@ export class MemorySampler {
     }
     const run = this.deps.run ?? defaultRun;
     const totalmem = this.deps.totalmem ?? os.totalmem;
-    const now = this.deps.now ?? (() => performance.now());
+    const now = this.deps.now ?? (() => globalThis.performance.now());
     const wall = this.deps.wall ?? (() => Date.now());
-    const swapMs = periods.swapMs ?? SWAP_CACHE_MS;
-    const pressureMs = periods.pressureMs ?? PRESSURE_CACHE_MS;
+    // A child can never poll faster than the parent that publishes it.
+    const swapMs = Math.max(periods.swapMs ?? SWAP_CACHE_MS, ttlMs / 3);
+    const pressureMs = Math.max(periods.pressureMs ?? PRESSURE_CACHE_MS, ttlMs / 3);
     try {
       const swap = this.swapCache && now() - this.swapCache.at < swapMs ? this.swapCache : undefined;
       const pressure = this.pressureCache && now() - this.pressureCache.at < pressureMs
@@ -116,38 +116,49 @@ export class MemorySampler {
       if (swapR.status === 'rejected') throw swapR.reason;
       if (signal?.aborted) throw signal.reason;
       const wallNow = wall();
-      // The fact keeps the oldest constituent's wall time and 3x its period
-      // (the vm read's period is the caller's ttl/3); ties take the smallest.
-      const parts: fact.FactMeta[] = [{ observedAt: wallNow, periodMs: ttlMs / 3 }];
+      const monoNow = now();
+      // The fact keeps the oldest constituent's wall time and expires at the
+      // earliest absolute constituent deadline (vm's period is ttl/3).
+      const parts: fact.FactMeta[] = [{ observedAt: wallNow, periodMs: ttlMs / 3, at: monoNow }];
       const vm = parseVmStat(vmR.value);
       let swapUsed: number;
       if (swap) {
         swapUsed = swap.value;
-        parts.push({ observedAt: swap.observedAt, periodMs: swapMs });
+        parts.push({ observedAt: swap.observedAt, periodMs: swapMs, at: swap.at });
       } else {
         swapUsed = parseSwapUsage(swapR.value);
-        this.swapCache = { at: now(), observedAt: wallNow, value: swapUsed };
-        parts.push({ observedAt: wallNow, periodMs: swapMs });
+        this.swapCache = { at: monoNow, observedAt: wallNow, value: swapUsed };
+        parts.push({ observedAt: wallNow, periodMs: swapMs, at: monoNow });
       }
       let level: MemoryValue['pressure'];
       if (pressure) {
         level = pressure.value;
-        parts.push({ observedAt: pressure.observedAt, periodMs: pressureMs });
+        parts.push({ observedAt: pressure.observedAt, periodMs: pressureMs, at: pressure.at });
       } else {
         level = parsePressureLevel(pressureR.value);
-        this.pressureCache = { at: now(), observedAt: wallNow, value: level };
-        parts.push({ observedAt: wallNow, periodMs: pressureMs });
+        this.pressureCache = { at: monoNow, observedAt: wallNow, value: level };
+        parts.push({ observedAt: wallNow, periodMs: pressureMs, at: monoNow });
       }
       const meta = fact.oldestMeta(parts);
-      return fact.ok({
+      const f = fact.ok({
         total: totalmem(),
         used: (Math.max(0, vm.anonymous - vm.purgeable) + vm.wired + vm.compressorOccupied) * vm.pageSize,
         cached: (vm.fileBacked + vm.purgeable) * vm.pageSize,
         pressure: level,
         swapUsed,
       }, this.src, meta.ttlMs, meta.observedAt);
+      if (meta.expiresAt !== undefined) fact.trackDeadline(f, meta.expiresAt);
+      return f;
     } catch (err) {
       return fact.fail(fact.errorStatus(err), this.src, ttlMs);
     }
+  }
+
+  // Drops the inner pressure/swap caches so a restart re-reads them; called
+  // by BodyProbe on stop and start. Aborted in-flight reads already check
+  // their signal before writing, so a pending older generation stays safe.
+  reset(): void {
+    this.swapCache = undefined;
+    this.pressureCache = undefined;
   }
 }
