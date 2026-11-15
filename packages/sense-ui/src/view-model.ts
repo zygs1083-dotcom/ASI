@@ -55,12 +55,33 @@ export interface Body {
     /** 内存细分（原始字节）；未提供时 UI 只画 used/free，不虚构比例。 */
     breakdown?: { app: number; wired: number; compressed: number; cached: number }
   }>
-  disks: Fact<Array<{ mount: string; total: number; free: number }>>
+  disks: DisksFact
   battery: Fact<{ percent: number; charging: boolean; minutesLeft?: number } | null>
   thermal: Fact<'nominal' | 'fair' | 'serious' | 'critical'>
   network: Fact<{ online: boolean; rxBps: number; txBps: number }>
   harnessProcess: Fact<{ rss: number; cpu: number; uptimeSec: number }>
   tokens: Fact<TokenVitals>
+}
+
+/**
+ * 磁盘卷读数。可选字段全部为增量契约：
+ * status/observedAt/ttlMs 提供卷级新鲜度覆盖（缺省继承父事实 ok/observedAt/ttlMs）；
+ * 旧的只含 mount/total/free 的 payload 行为完全不变。
+ */
+export interface DiskVolume {
+  mount: string
+  total: number
+  free: number
+  /** 卷级新鲜度覆盖：'stale'/'unknown' 只降级该卷；不能复活父事实的非 ok 状态。 */
+  status?: 'ok' | 'stale' | 'unknown'
+  observedAt?: number
+  ttlMs?: number
+}
+
+/** 磁盘事实：value 为卷列表；unavailableMounts 声明读不出的挂载点（如挂起网络盘）。 */
+export type DisksFact = Fact<DiskVolume[]> & {
+  /** 即使 value 里带该挂载点读数也一律不展示（无数字、无历史、无图）。 */
+  unavailableMounts?: string[]
 }
 
 export interface TokenVitals {

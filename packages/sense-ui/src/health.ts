@@ -2,6 +2,8 @@
 
 import type {
   Body,
+  DiskVolume,
+  DisksFact,
   Fact,
   FactStatus,
   MetricInsight,
@@ -94,6 +96,50 @@ export function diskValid(d: { total: number; free: number }): boolean {
   return Number.isFinite(d.total) && d.total > 0 && Number.isFinite(d.free)
 }
 
+/** unavailableMounts 去重后的挂载点集合。 */
+export function unavailableMountSet(f: DisksFact): Set<string> {
+  return new Set(f.unavailableMounts ?? [])
+}
+
+/**
+ * 卷级事实：父事实为底，叠加卷级 status/observedAt/ttlMs 覆盖。
+ * unavailableMounts 命中即 unavailable 且清空读数；父事实有效状态为上界
+ * （整列 stale/denied/已过期不能被卷级 ok 复活）；stale 保留读数供灰显，
+ * unknown/unavailable 清空。配 effectiveStatus 得含 TTL 的最终状态。
+ */
+export function diskFact(parent: DisksFact, disk: DiskVolume, now: number): Fact<DiskVolume> {
+  const observedAt = disk.observedAt ?? parent.observedAt
+  const ttlMs = disk.ttlMs ?? parent.ttlMs
+  if (unavailableMountSet(parent).has(disk.mount)) {
+    return {
+      value: null,
+      status: 'unavailable',
+      source: parent.source,
+      observedAt,
+      ttlMs,
+    }
+  }
+  // 父事实有效状态为上界：整体已过期/拒绝不能靠卷级元数据复活
+  const parentEff = effectiveStatus(parent, now)
+  const status = parentEff === 'ok' ? (disk.status ?? 'ok') : parentEff
+  return {
+    value:
+      status === 'ok' || status === 'stale'
+        ? { mount: disk.mount, total: disk.total, free: disk.free }
+        : null,
+    status,
+    source: parent.source,
+    observedAt,
+    ttlMs,
+    reason: parent.reason,
+  }
+}
+
+/** 卷是否新鲜可用：父可用、读数有效、不在 unavailableMounts、卷级有效状态 ok。 */
+export function diskUsable(f: DisksFact, d: DiskVolume, now: number): boolean {
+  return isUsable(f, now) && diskValid(d) && effectiveStatus(diskFact(f, d, now), now) === 'ok'
+}
+
 /** 单个磁盘剩余比例 → 严重度（每个盘独立着色用）。 */
 export function diskSeverity(freeRatio: number): Severity {
   return freeRatio <= 0.05 ? 'critical' : freeRatio <= 0.1 ? 'warn' : 'good'
@@ -126,12 +172,27 @@ function evalMemory(body: Body, now: number): RowResult {
 function evalDisks(body: Body, now: number): RowResult {
   const f = body.disks
   if (!isUsable(f, now)) return unusable()
-  const valid = f.value!.filter(diskValid)
-  if (valid.length === 0) return unusable()
+  const values = f.value ?? []
+  const unavail = unavailableMountSet(f)
+  // 只聚合新鲜可用卷：stale/unknown/unavailable/无效读数不告警
+  const fresh = values.filter((d) => diskUsable(f, d, now))
   let severity: Severity = 'good'
-  for (const d of valid) {
+  for (const d of fresh) {
     severity = maxSeverity(severity, diskSeverity(d.free / d.total))
   }
+  // 根卷显式非新鲜（声明 stale/unknown、unavailable——即使 value 无根条目、
+  // 或自身 TTL 过期）时行报 unknown 而非 good；其他卷新鲜告警仍可优先。
+  // 无卷级元数据的旧版 payload 走「无效条目不参与聚合」语义。
+  const root = values.find((d) => d.mount === '/')
+  const rootNonfresh =
+    unavail.has('/') ||
+    (root != null &&
+      !diskUsable(f, root, now) &&
+      (root.status != null || root.observedAt != null || root.ttlMs != null))
+  if (rootNonfresh) {
+    return { severity: severity === 'good' ? 'unknown' : severity, hidden: false }
+  }
+  if (fresh.length === 0) return unusable()
   return { severity, hidden: false }
 }
 
@@ -199,8 +260,8 @@ const ROW_EVALUATORS: Record<BodyRowKey, (body: Body, now: number) => RowResult>
   process: evalProcess,
 }
 
-/** 每个行对应可查询的指标 key（网络/进程各两条，磁盘按挂载点展开）。 */
-export function rowMetricKeys(key: BodyRowKey, body: Body): MetricKey[] {
+/** 每个行对应可查询的指标 key（网络/进程各两条，磁盘只取新鲜可用挂载点）。 */
+export function rowMetricKeys(key: BodyRowKey, body: Body, now: number): MetricKey[] {
   switch (key) {
     case 'cpu':
     case 'memory':
@@ -213,16 +274,17 @@ export function rowMetricKeys(key: BodyRowKey, body: Body): MetricKey[] {
     case 'process':
       return ['processCpu', 'processRss']
     case 'disks':
-      // 无效挂载点（total<=0/NaN）不产生可聚合的 insight key
+      // 只有新鲜可用卷才聚合 insight：stale/unknown/unavailable/无效挂载点
+      // 不产生 key，防止陈旧卷的 insight/ETA 泄漏进告警
       return (body.disks.value ?? [])
-        .filter(diskValid)
+        .filter((d) => diskUsable(body.disks, d, now))
         .map((d) => `disk:${d.mount}` as const)
   }
 }
 
-/** 行事实是否新鲜可用（才可并入 insight 严重度，stale/denied 不假装当前）。 */
-export function rowUsable(key: BodyRowKey, body: Body, now: number): boolean {
-  const f: Fact<unknown> = {
+/** 行键 → 对应身体事实（process 行用 harnessProcess 字段）。 */
+export function rowFact(key: BodyRowKey, body: Body): Fact<unknown> {
+  return {
     cpu: body.cpu,
     memory: body.memory,
     disks: body.disks,
@@ -232,6 +294,11 @@ export function rowUsable(key: BodyRowKey, body: Body, now: number): boolean {
     process: body.harnessProcess,
     tokens: body.tokens,
   }[key]
+}
+
+/** 行事实是否新鲜可用（才可并入 insight 严重度，stale/denied 不假装当前）。 */
+export function rowUsable(key: BodyRowKey, body: Body, now: number): boolean {
+  const f = rowFact(key, body)
   if (!isUsable(f, now)) return false
   if (key === 'tokens') {
     const v = body.tokens.value!
@@ -243,7 +310,7 @@ export function rowUsable(key: BodyRowKey, body: Body, now: number): boolean {
     )
   }
   if (key === 'disks') {
-    return body.disks.value!.some(diskValid)
+    return body.disks.value!.some((d) => diskUsable(body.disks, d, now))
   }
   return true
 }
@@ -257,7 +324,7 @@ export function evaluateBody(
   for (const key of BODY_ROW_PRIORITY) {
     const r = ROW_EVALUATORS[key](body, now)
     if (insights && !r.hidden && rowUsable(key, body, now)) {
-      for (const mk of rowMetricKeys(key, body)) {
+      for (const mk of rowMetricKeys(key, body, now)) {
         const sev = effectiveSeverity(insights[mk])
         if (sev !== 'good') r.severity = maxSeverity(r.severity, sev)
       }

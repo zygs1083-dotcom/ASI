@@ -68,7 +68,7 @@ export function attentionLine(
   if (!rowKey) return null
   const body = model.state.self.body
   if (!rowUsable(rowKey, body, model.now)) return null
-  const keys = rowMetricKeys(rowKey, body)
+  const keys = rowMetricKeys(rowKey, body, model.now)
 
   // 每指标最近一次 body.rate 信号时间（> now 的不算）
   const latestRateAt = new Map<string, number>()

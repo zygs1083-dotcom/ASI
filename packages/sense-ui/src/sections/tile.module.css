@@ -27,6 +27,12 @@
   padding-bottom: 0;
 }
 
+/* 卷级过期读数：整块去色变灰（同 .factStale），明示非当前值。 */
+.metricBlock[data-status='stale'] {
+  color: var(--dsw-alias-label-secondary, #61666b);
+  filter: grayscale(1);
+}
+
 .metricBlock[data-sev='warn'] .metricHead {
   color: var(--sev-warn-ink);
 }

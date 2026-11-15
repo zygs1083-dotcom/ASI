@@ -3,6 +3,8 @@ export type {
   Body,
   BodyHistory,
   DetailUnit,
+  DiskVolume,
+  DisksFact,
   EventDetail,
   EventLevel,
   Fact,

@@ -25,6 +25,7 @@ export const SCENARIOS = [
   'learning',
   'rapid-change',
   'token-fallback',
+  'disk-partial',
 ] as const
 
 export type ScenarioName = (typeof SCENARIOS)[number]
@@ -264,6 +265,36 @@ const BUILDERS: Record<ScenarioName, () => SensePanelModel> = {
   learning,
   'rapid-change': rapidChange,
   'token-fallback': tokenFallback,
+  'disk-partial': diskPartial,
+}
+
+/** 卷级新鲜度混杂：根卷读数过期（保留值灰显）、/data 新鲜、网络盘挂起无法读取。 */
+function diskPartial(): SensePanelModel {
+  const state = makeState()
+  state.self.body.disks = {
+    ...fact(
+      [
+        {
+          mount: '/',
+          total: 460e9,
+          free: 175e9,
+          observedAt: T0 - 90_000,
+          ttlMs: 5_000,
+        },
+        { mount: '/data', total: 200e9, free: 160e9 },
+      ],
+      { api: 'diskstat' },
+    ),
+    unavailableMounts: ['/Volumes/network'],
+  }
+  return model(state, {
+    history: makeHistory({
+      disks: {
+        '/': series(60, 5_000, (i) => 0.62 + 0.005 * Math.sin(i / 20)),
+        '/data': series(60, 5_000, (i) => 0.2 + 0.004 * Math.sin(i / 20)),
+      },
+    }),
+  })
 }
 
 /** 上下文窗口容量来自回退估值：环/余量降饱和为「容量未确认」，无告警。 */
