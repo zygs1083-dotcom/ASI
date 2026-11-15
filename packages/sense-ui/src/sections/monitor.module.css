@@ -1,0 +1,120 @@
+/* 监护概览：严重度词 + ECG 脉冲 + 学习进度。 */
+
+.monitor {
+  display: flex;
+  align-items: center;
+  gap: var(--sense-pad-row, 8px);
+  padding: var(--sense-pad-row, 8px);
+  border: 0.5px solid var(--dsw-alias-border-l2, rgba(0, 0, 0, 0.1));
+  border-left: 2px solid var(--sev-good, #22c55e);
+  border-radius: var(--dsw-radius-sm, 8px);
+}
+
+.monitor[data-sev='warn'] {
+  border-left-color: var(--sev-warn, #f59e0b);
+}
+
+.monitor[data-sev='critical'] {
+  border-left-color: var(--sev-critical, #ec1313);
+}
+
+.monitor[data-sev='unknown'] {
+  border-left-color: var(--sev-unknown, #81858c);
+}
+
+.ecg {
+  width: 60px;
+  height: 24px;
+  flex-shrink: 0;
+}
+
+.ecgBase {
+  fill: none;
+  stroke: var(--dsw-alias-border-l4, rgba(0, 0, 0, 0.16));
+  stroke-width: 1.4;
+}
+
+.ecgPulse {
+  fill: none;
+  stroke: var(--sev-good, #22c55e);
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-dasharray: 16 74;
+  animation: ecgMove var(--ecg-dur, 2.4s) linear infinite;
+}
+
+.monitor[data-sev='warn'] .ecgPulse {
+  stroke: var(--sev-warn, #f59e0b);
+  --ecg-dur: 1.6s;
+}
+
+.monitor[data-sev='critical'] .ecgPulse {
+  stroke: var(--sev-critical, #ec1313);
+  --ecg-dur: 0.9s;
+}
+
+.monitor[data-sev='unknown'] .ecgPulse {
+  stroke: var(--sev-unknown, #81858c);
+  --ecg-dur: 3.6s;
+}
+
+@keyframes ecgMove {
+  to {
+    stroke-dashoffset: -90;
+  }
+}
+
+.monitorText {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.monitorWord {
+  font-size: 16px;
+  font-weight: 600;
+  line-height: 20px;
+}
+
+.monitor[data-sev='good'] .monitorWord {
+  color: var(--sev-good-ink);
+}
+
+.monitor[data-sev='warn'] .monitorWord {
+  color: var(--sev-warn-ink);
+}
+
+.monitor[data-sev='critical'] .monitorWord {
+  color: var(--sev-critical-ink);
+}
+
+.monitor[data-sev='unknown'] .monitorWord {
+  color: var(--dsw-alias-label-secondary, #61666b);
+}
+
+.monitorSub {
+  font-size: var(--sense-fs-s);
+  color: var(--dsw-alias-label-secondary, #61666b);
+}
+
+.learning {
+  display: flex;
+  align-items: center;
+  gap: var(--sense-gap, 6px);
+}
+
+.learnBar {
+  flex: 1;
+  min-width: 40px;
+  height: 4px;
+  accent-color: var(--dsw-alias-state-business-primary, #4176e6);
+}
+
+
+/* 减弱动态时 ECG 显示为整根静态线（全局 animation:none 之外再取消虚线分段）。 */
+@media (prefers-reduced-motion: reduce) {
+  .ecgPulse {
+    animation: none;
+    stroke-dasharray: none;
+  }
+}

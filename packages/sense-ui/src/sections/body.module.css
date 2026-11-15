@@ -1,0 +1,243 @@
+/* 身体区块：监护概览 + 两列指标卡片。 */
+
+/* 指标卡片网格：任何宽度都保持两列，展开卡跨整行 */
+
+.tiles {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--sense-gap, 6px);
+}
+
+.tile {
+  min-width: 0;
+  border: 0.5px solid var(--dsw-alias-border-l2, rgba(0, 0, 0, 0.1));
+  border-radius: var(--dsw-radius-sm, 8px);
+  padding: var(--sense-gap, 6px) var(--sense-pad-row, 8px);
+}
+
+.tile[data-sev='warn'] {
+  border-color: var(--sev-warn, #f59e0b);
+}
+
+.tile[data-sev='critical'] {
+  border-color: var(--sev-critical, #ec1313);
+}
+
+.tile[data-span2],
+.tile[open] {
+  grid-column: 1 / -1;
+}
+
+/*
+ * 末位卡片若单独落在半空行则拉满整行：
+ * 只对最后一个整行卡（span2/open）之后的尾部序列按非整行卡奇偶计数。
+ */
+.tiles
+  > .tile:last-child:nth-child(
+    odd of .tile:not([data-span2]):not([open]):not(:has(~ .tile:is([data-span2], [open])))
+  ) {
+  grid-column: 1 / -1;
+}
+
+.tileSummary {
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  cursor: pointer;
+  user-select: none;
+  min-width: 0;
+}
+
+.tileSummary::-webkit-details-marker {
+  display: none;
+}
+
+.tileHead {
+  display: flex;
+  align-items: center;
+  gap: var(--sense-gap, 6px);
+  color: var(--dsw-alias-label-secondary, #61666b);
+}
+
+.tile[data-sev='warn'] .tileHead {
+  color: var(--sev-warn, #f59e0b);
+}
+
+.tile[data-sev='critical'] .tileHead {
+  color: var(--sev-critical, #ec1313);
+}
+
+.tileLabel {
+  color: var(--dsw-alias-label-secondary, #61666b);
+  font-size: var(--sense-fs-s);
+}
+
+.tileValue {
+  font-size: 20px;
+  line-height: 24px;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+/* 主数字前的小标签（如磁盘的「剩余」），不参与主数字尺寸。 */
+.mainLabel {
+  font-size: var(--sense-fs-s);
+  font-weight: 400;
+  line-height: 1;
+  color: var(--dsw-alias-label-secondary, #61666b);
+  margin-right: 4px;
+}
+
+/* 支撑行里的紧凑速率徽标（如 −2.1 GB/分）。 */
+.rateEm {
+  font-style: normal;
+  margin-left: var(--sense-gap, 6px);
+  padding: 0 4px;
+  border-radius: var(--dsw-radius-xs, 4px);
+  border: 0.5px solid var(--dsw-alias-border-l4, rgba(0, 0, 0, 0.16));
+  color: var(--dsw-alias-label-secondary, #61666b);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+/* 卡片头右侧的折叠箭头，展开时旋转 90°。 */
+.chev {
+  flex-shrink: 0;
+  margin-left: auto;
+  opacity: 0.6;
+  transition: transform 120ms ease;
+}
+
+.sevTag ~ .chev {
+  margin-left: var(--sense-gap, 6px);
+}
+
+.tile[open] > .tileSummary .chev {
+  transform: rotate(90deg);
+}
+
+.tileSub {
+  display: block;
+  font-size: var(--sense-fs-s);
+  color: var(--dsw-alias-label-secondary, #61666b);
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+
+.tileSubStale {
+  composes: tileSub;
+  filter: grayscale(1);
+}
+
+.detailLine {
+  font-size: var(--sense-fs-s);
+  color: var(--dsw-alias-label-secondary, #61666b);
+  font-variant-numeric: tabular-nums;
+}
+
+.detailLine[data-sev='warn'] {
+  color: var(--sev-warn-ink);
+}
+
+.detailLine[data-sev='critical'] {
+  color: var(--sev-critical-ink);
+}
+
+/* 卡片内图形 */
+
+.cores {
+  display: flex;
+  align-items: flex-end;
+  gap: 2px;
+  width: 100%;
+  height: 14px;
+}
+
+.cores > i {
+  flex: 1;
+  min-height: 1px;
+  background: var(--dsw-alias-state-business-primary, #4176e6);
+  border-radius: 1px;
+  opacity: 0.7;
+}
+
+.memStrip {
+  display: flex;
+  width: 100%;
+  height: 5px;
+  border-radius: 3px;
+  background: var(--dsw-alias-border-l1, rgba(0, 0, 0, 0.04));
+  overflow: hidden;
+}
+
+.memStrip > i {
+  display: block;
+  height: 100%;
+}
+
+.memApp {
+  background: var(--dsw-alias-state-business-primary, #4176e6);
+}
+
+.memWired {
+  background: var(--dsw-alias-state-success-primary, #22c55e);
+}
+
+.memCompressed {
+  background: var(--dsw-alias-state-warn-primary, #f59e0b);
+}
+
+.memCached {
+  background: var(--dsw-alias-label-tertiary, #81858c);
+}
+
+.diskUsed {
+  background: var(--dsw-alias-state-business-primary, #4176e6);
+}
+
+.sevTag {
+  font-size: var(--sense-fs-s);
+  font-weight: 500;
+  padding: 0 5px;
+  border-radius: var(--dsw-radius-xs, 4px);
+  border: 0.5px solid currentColor;
+  margin-left: auto;
+}
+
+.sevTag[data-sev='warn'] {
+  color: var(--sev-warn-ink);
+}
+
+.sevTag[data-sev='critical'] {
+  color: var(--sev-critical-ink);
+}
+
+.sevTag[data-sev='unknown'] {
+  color: var(--dsw-alias-label-secondary, #61666b);
+}
+
+.tokenMain {
+  display: flex;
+  align-items: center;
+  gap: var(--sense-pad-row, 8px);
+}
+
+.tokenSide {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+  flex: 1;
+}
+
+.linkButton {
+  border: none;
+  background: none;
+  padding: 0;
+  font: inherit;
+  color: var(--sev-business-ink);
+  cursor: pointer;
+}

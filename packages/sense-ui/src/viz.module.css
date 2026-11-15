@@ -1,0 +1,191 @@
+/* sparkline / token-ring 等 SVG 可视化的样式。
+   正常段保持中性色，越界段与阈值线用状态色。 */
+
+.chartBox,
+.chartBoxExpanded {
+  width: 100%;
+  min-width: 0;
+}
+
+/* 绘图区：svg + y 轴/阈值标注的相对定位容器（标注 % 对齐实际 svg 高度）。
+   x 轴在容器外，不占定位高度。 */
+.chartPlot {
+  position: relative;
+  width: 100%;
+}
+
+.spark {
+  display: block;
+  width: 100%;
+  height: 30px;
+}
+
+.chartExpanded {
+  display: block;
+  width: 100%;
+  height: 110px;
+}
+
+.segNormal {
+  fill: none;
+  stroke: var(--dsw-alias-label-tertiary, #81858c);
+  stroke-width: 1.4;
+}
+
+.segWarn {
+  fill: none;
+  stroke: var(--sev-warn, #f59e0b);
+  stroke-width: 1.6;
+}
+
+.segCritical {
+  fill: none;
+  stroke: var(--sev-critical, #ec1313);
+  stroke-width: 1.6;
+}
+
+.thrWarn,
+.thrCritical {
+  stroke-width: 1;
+  opacity: 1;
+}
+
+/* warn 虚线 / critical 实线：线型区分不依赖颜色；墨色保证浅色底 ≥3:1 对比。 */
+.thrWarn {
+  stroke: var(--sev-warn-ink);
+  stroke-dasharray: 3 3;
+}
+
+.thrCritical {
+  stroke: var(--sev-critical-ink);
+}
+
+/* 末点当前状态标记：行级告警在无可比阈值时仍可见。 */
+.curWarn {
+  fill: var(--sev-warn-ink);
+}
+
+.curCritical {
+  fill: var(--sev-critical-ink);
+}
+
+.sparkBand {
+  fill: color-mix(
+    in srgb,
+    var(--dsw-alias-state-business-primary, #4176e6) 16%,
+    transparent
+  );
+}
+
+.sparkEmpty {
+  display: block;
+  font-size: var(--sense-fs-s);
+  color: var(--dsw-alias-label-secondary, #61666b);
+  padding: 4px 0;
+}
+
+.axisYMax,
+.axisYMin,
+.thrLabel {
+  position: absolute;
+  left: 2px;
+  font-size: 10px;
+  line-height: 12px;
+  font-variant-numeric: tabular-nums;
+  color: var(--dsw-alias-label-secondary, #61666b);
+  background: color-mix(
+    in srgb,
+    var(--dsw-specific-sidebar-fill, #f9fafb) 72%,
+    transparent
+  );
+  border-radius: 2px;
+  padding: 0 2px;
+  pointer-events: none;
+}
+
+.axisYMax {
+  top: 0;
+}
+
+.axisYMin {
+  bottom: 0;
+}
+
+.thrLabel {
+  left: auto;
+  right: 2px;
+  transform: translateY(-50%);
+}
+
+.thrLabel[data-sev='warn'] {
+  color: var(--sev-warn-ink);
+}
+
+.thrLabel[data-sev='critical'] {
+  color: var(--sev-critical-ink);
+}
+
+.axisX {
+  display: flex;
+  justify-content: space-between;
+  font-size: 10px;
+  line-height: 12px;
+  color: var(--dsw-alias-label-secondary, #61666b);
+  margin-top: 2px;
+}
+
+.ring {
+  flex-shrink: 0;
+}
+
+/* 容量未确认（contextWindow 为回退估值）：环与百分比整体降饱和。 */
+.ring[data-unconfirmed] {
+  opacity: 0.45;
+}
+
+.ring[data-unconfirmed] .ringFill {
+  stroke: var(--dsw-alias-label-tertiary, #81858c);
+}
+
+.ring[data-unconfirmed] .ringText {
+  fill: var(--dsw-alias-label-secondary, #61666b);
+}
+
+.ringTrack {
+  stroke: var(--dsw-alias-border-l4, rgba(0, 0, 0, 0.16));
+}
+
+.ringFill {
+  stroke: var(--dsw-alias-state-business-primary, #4176e6);
+  transition: stroke var(--ds-transition-duration, 0.2s)
+    var(--ds-ease-in-out, cubic-bezier(0.4, 0, 0.2, 1));
+}
+
+[data-sev='warn'] .ringFill {
+  stroke: var(--dsw-alias-state-warn-primary, #f59e0b);
+}
+
+[data-sev='critical'] .ringFill {
+  stroke: var(--dsw-alias-state-error-primary, #ec1313);
+}
+
+.ringTick {
+  stroke: var(--dsw-alias-label-secondary, #61666b);
+}
+
+.ringText {
+  fill: var(--dsw-alias-label-primary, #0f1115);
+  font-variant-numeric: tabular-nums;
+}
+
+.srOnly {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
