@@ -1,0 +1,256 @@
+/* 身体区块：健康条 + 指标行。 */
+
+.health {
+  display: flex;
+  align-items: center;
+  gap: var(--sense-gap, 6px);
+  padding: var(--sense-pad-row, 8px);
+  border: 0.5px solid var(--dsw-alias-border-l2, rgba(0, 0, 0, 0.1));
+  border-left: 1px solid var(--sev-good, #22c55e);
+  border-radius: var(--dsw-radius-sm, 8px);
+}
+
+.health[data-sev='warn'] {
+  border-left-color: var(--sev-warn, #f59e0b);
+}
+
+.health[data-sev='critical'] {
+  border-left-color: var(--sev-critical, #ec1313);
+}
+
+.health[data-sev='unknown'] {
+  border-left-color: var(--sev-unknown, #81858c);
+}
+
+.healthIcon {
+  color: var(--sev-good, #22c55e);
+  transition: color var(--ds-transition-duration, 0.2s)
+    var(--ds-ease-in-out, cubic-bezier(0.4, 0, 0.2, 1));
+}
+
+.health[data-sev='warn'] .healthIcon {
+  color: var(--sev-warn, #f59e0b);
+}
+
+.health[data-sev='critical'] .healthIcon {
+  color: var(--sev-critical, #ec1313);
+}
+
+.health[data-sev='unknown'] .healthIcon {
+  color: var(--sev-unknown, #81858c);
+}
+
+.healthText {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.healthText strong {
+  font-weight: 500;
+}
+
+.health[data-sev='good'] .healthText strong {
+  color: var(--sev-good-ink);
+}
+
+.health[data-sev='warn'] .healthText strong {
+  color: var(--sev-warn-ink);
+}
+
+.health[data-sev='critical'] .healthText strong {
+  color: var(--sev-critical-ink);
+}
+
+.healthText span {
+  font-size: var(--sense-fs-s);
+  color: var(--dsw-alias-label-secondary, #61666b);
+}
+
+.row {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 2px 0;
+  border-bottom: 0.5px solid var(--dsw-alias-border-l1, rgba(0, 0, 0, 0.04));
+}
+
+.row:last-child {
+  border-bottom: none;
+}
+
+.rowHead {
+  display: flex;
+  align-items: center;
+  gap: var(--sense-gap, 6px);
+  color: var(--dsw-alias-label-secondary, #61666b);
+}
+
+.row[data-sev='warn'] .rowHead {
+  color: var(--sev-warn, #f59e0b);
+}
+
+.row[data-sev='critical'] .rowHead {
+  color: var(--sev-critical, #ec1313);
+}
+
+.rowLabel {
+  color: var(--dsw-alias-label-secondary, #61666b);
+  font-size: var(--sense-fs-s);
+}
+
+.rowValue {
+  font-variant-numeric: tabular-nums;
+  font-weight: 500;
+  min-width: 0;
+}
+
+.detail {
+  font-size: var(--sense-fs-s);
+  color: var(--dsw-alias-label-secondary, #61666b);
+  font-variant-numeric: tabular-nums;
+}
+
+.bar {
+  height: 3px;
+  border-radius: 2px;
+  background: var(--dsw-alias-border-l1, rgba(0, 0, 0, 0.04));
+  overflow: hidden;
+}
+
+.bar > i {
+  display: block;
+  height: 100%;
+  background: var(--dsw-alias-state-business-primary, #4176e6);
+  border-radius: 2px;
+  transition:
+    width var(--ds-transition-duration, 0.2s)
+      var(--ds-ease-in-out, cubic-bezier(0.4, 0, 0.2, 1)),
+    background-color var(--ds-transition-duration, 0.2s);
+}
+
+.row[data-sev='warn'] .bar > i {
+  background: var(--sev-warn, #f59e0b);
+}
+
+.row[data-sev='critical'] .bar > i {
+  background: var(--sev-critical, #ec1313);
+}
+
+.cores {
+  display: flex;
+  align-items: flex-end;
+  gap: 2px;
+  height: 14px;
+}
+
+.cores > i {
+  width: 4px;
+  min-height: 1px;
+  background: var(--dsw-alias-state-business-primary, #4176e6);
+  border-radius: 1px;
+  opacity: 0.7;
+}
+
+.diskRow {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 2px 0;
+}
+
+.mount {
+  color: var(--dsw-alias-label-secondary, #61666b);
+  font-family: var(--ds-font-family-code, monospace);
+  font-size: var(--sense-fs-s);
+  margin-right: 4px;
+}
+
+.tokenMain {
+  display: flex;
+  align-items: center;
+  gap: var(--sense-pad-row, 8px);
+}
+
+.tokenSide {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+/* §2.2c：行级严重度标签 + 阈值来源/触发标注 + 基线学习进度 */
+
+.healthIcon {
+  stroke-width: 2;
+}
+
+.sevTag {
+  font-size: var(--sense-fs-s);
+  font-weight: 500;
+  padding: 0 5px;
+  border-radius: var(--dsw-radius-xs, 4px);
+  border: 0.5px solid currentColor;
+  margin-left: auto;
+}
+
+.rowHead .factMeta {
+  margin-left: auto;
+}
+
+.sevTag[data-sev='warn'] {
+  color: var(--sev-warn-ink);
+}
+
+.sevTag[data-sev='critical'] {
+  color: var(--sev-critical-ink);
+}
+
+.sevTag[data-sev='unknown'] {
+  color: var(--dsw-alias-label-secondary, #61666b);
+}
+
+.insight {
+  font-size: var(--sense-fs-s);
+  color: var(--dsw-alias-label-secondary, #61666b);
+  font-variant-numeric: tabular-nums;
+}
+
+.learning {
+  display: flex;
+  align-items: center;
+  gap: var(--sense-gap, 6px);
+}
+
+.learnBar {
+  flex: 1;
+  height: 4px;
+  accent-color: var(--dsw-alias-state-business-primary, #4176e6);
+}
+
+.staleDetail {
+  font-size: var(--sense-fs-s);
+  color: var(--dsw-alias-label-secondary, #61666b);
+  font-variant-numeric: tabular-nums;
+}
+
+.linkButton {
+  border: none;
+  background: none;
+  padding: 0;
+  font: inherit;
+  color: var(--sev-business-ink);
+  cursor: pointer;
+}
+
+/* 磁盘行按自身剩余比例着色（不被行级最差值连坐） */
+.diskRow[data-sev='warn'] .bar > i {
+  background: var(--sev-warn, #f59e0b);
+}
+
+.diskRow[data-sev='critical'] .bar > i {
+  background: var(--sev-critical, #ec1313);
+}
+
+.diskRow[data-sev='good'] .bar > i {
+  background: var(--dsw-alias-state-business-primary, #4176e6);
+}

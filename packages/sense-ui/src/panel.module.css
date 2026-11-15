@@ -1,0 +1,185 @@
+/* 消费宿主注入的 DSW 主题令牌（不回填、不自定义明暗选择器）。
+   fallback 取 DSH light 值，仅用于脱离宿主时的兜底。 */
+.panel {
+  /* 布局节奏：沿用侧栏的 4/6/8/12px，本地变量名独立，见 THEME.md */
+  --sense-pad-inline: var(--dsh-sidebar-inline-padding, 12px);
+  --sense-pad-row: var(--dsh-sidebar-row-padding, 8px);
+  --sense-gap: var(--dsh-sidebar-label-gap, 6px);
+  --sev-good: var(--dsw-alias-state-success-primary, #22c55e);
+  --sev-warn: var(--dsw-alias-state-warn-primary, #f59e0b);
+  --sev-critical: var(--dsw-alias-state-error-primary, #ec1313);
+  --sev-unknown: var(--dsw-alias-label-tertiary, #81858c);
+  /* 状态文字用与主墨色调和后的墨色，保证小字对比度（axe 4.5:1） */
+  --sev-good-ink: color-mix(in srgb, var(--sev-good) 35%, var(--dsw-alias-label-primary, #0f1115));
+  --sev-warn-ink: color-mix(in srgb, var(--sev-warn) 35%, var(--dsw-alias-label-primary, #0f1115));
+  --sev-critical-ink: color-mix(in srgb, var(--sev-critical) 75%, var(--dsw-alias-label-primary, #0f1115));
+  --sev-business-ink: color-mix(in srgb, var(--dsw-alias-state-business-primary, #4176e6) 60%, var(--dsw-alias-label-primary, #0f1115));
+  /* DSH 无 13/12px 字号角色令牌（见 THEME.md），尺寸为本地常量。 */
+  --sense-fs: 13px;
+  --sense-fs-s: 12px;
+
+  font-family: var(--dsw-font-family, -apple-system, 'PingFang SC', 'Segoe UI', sans-serif);
+  font-size: var(--sense-fs);
+  line-height: 20px;
+  font-weight: 400;
+  color: var(--dsw-alias-label-primary, #0f1115);
+  background: var(--dsw-specific-sidebar-fill, transparent);
+  padding: 0 var(--sense-pad-inline) var(--sense-pad-inline);
+  min-width: 0;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+}
+
+.header {
+  display: flex;
+  align-items: center;
+  gap: var(--sense-gap);
+  padding: var(--sense-pad-inline) 0 var(--sense-pad-row);
+  border-bottom: 0.5px solid var(--dsw-alias-border-l2, rgba(0, 0, 0, 0.1));
+}
+
+.title {
+  font-size: var(--sense-fs);
+  font-weight: 500;
+  margin: 0;
+  flex: 1;
+  min-width: 0;
+}
+
+.privacy,
+.pausedTag {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: var(--sense-fs-s);
+  color: var(--dsw-alias-label-secondary, #61666b);
+  white-space: nowrap;
+}
+
+.pausedTag {
+  color: var(--sev-warn-ink);
+}
+
+.section {
+  border-bottom: 0.5px solid var(--dsw-alias-border-l2, rgba(0, 0, 0, 0.1));
+}
+
+.section > summary {
+  list-style: none;
+  display: flex;
+  align-items: center;
+  gap: var(--sense-gap);
+  padding: var(--sense-pad-row) 0;
+  font-weight: 500;
+  cursor: pointer;
+  user-select: none;
+}
+
+.section > summary::before {
+  content: '';
+  width: 0;
+  height: 0;
+  border-left: 4px solid var(--dsw-alias-label-secondary, #61666b);
+  border-top: 3.5px solid transparent;
+  border-bottom: 3.5px solid transparent;
+  transition: transform var(--ds-transition-duration-fast, 0.1s)
+    var(--ds-ease-in-out, cubic-bezier(0.4, 0, 0.2, 1));
+}
+
+.section[open] > summary::before {
+  transform: rotate(90deg);
+}
+
+.sectionBody {
+  padding: 0 0 var(--sense-pad-row) 10px;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sense-gap);
+}
+
+/* 事实状态（sections 与 fact.tsx 共用） */
+.factMeta {
+  font-size: var(--sense-fs-s);
+  color: var(--dsw-alias-label-secondary, #61666b);
+  white-space: nowrap;
+}
+
+.factStale {
+  color: var(--dsw-alias-label-secondary, #61666b);
+  /* 过期内容整体去色：子级柱状条/走势图/图标一律变灰。 */
+  filter: grayscale(1);
+}
+
+.factDenied {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sense-gap);
+  color: var(--dsw-alias-label-secondary, #61666b);
+}
+
+.factMuted {
+  color: var(--dsw-alias-label-secondary, #61666b);
+}
+
+.linkButton {
+  border: none;
+  background: none;
+  padding: 0;
+  font: inherit;
+  color: var(--sev-business-ink);
+  cursor: pointer;
+}
+
+.linkButton:focus-visible,
+.section > summary:focus-visible,
+.panel button:focus-visible,
+.panel input:focus-visible {
+  outline: 2px solid var(--dsw-alias-state-business-primary, #4176e6);
+  outline-offset: 1px;
+  border-radius: var(--dsw-radius-xs, 4px);
+}
+
+.panel button {
+  font: inherit;
+  font-size: var(--sense-fs-s);
+  color: var(--dsw-alias-label-primary, #0f1115);
+  background: var(--dsw-alias-bg-layer-1, #fff);
+  border: 1px solid var(--dsw-alias-border-l4, rgba(0, 0, 0, 0.16));
+  border-radius: var(--dsw-radius-sm, 8px);
+  padding: 2px 10px;
+  min-height: 24px;
+  cursor: pointer;
+}
+
+@media (pointer: coarse) {
+  .panel button {
+    min-height: 32px;
+  }
+}
+
+.panel button:disabled {
+  color: var(--dsw-alias-label-secondary, #61666b);
+  cursor: default;
+}
+
+.panel input[type='checkbox'] {
+  accent-color: var(--sev-business-ink);
+  margin: 0;
+}
+
+@media (hover: hover) {
+  .panel button:not(:disabled):hover {
+    border-color: var(--sev-business-ink);
+  }
+  .linkButton:hover {
+    text-decoration: underline;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .panel,
+  .panel * {
+    transition: none !important;
+    animation: none !important;
+  }
+}
