@@ -1,4 +1,12 @@
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { AssistantMessage, AssistantMessageEvent, Context, StreamOptions } from '@mariozechner/pi-ai';
@@ -43,6 +51,31 @@ function fakeEncryption(): StorageEncryption {
   };
 }
 
+/** keys.json 里直接落一条密文条目用的编码（与 fakeEncryption 互逆） */
+function fakeCipher(value: string): string {
+  return Buffer.concat([
+    Buffer.from('ENC|'),
+    Buffer.from(Buffer.from(value, 'utf8').toString('base64')),
+  ]).toString('base64');
+}
+
+/** 统计 decryptString 次数的加密实现：断言流式期间不做逐 delta 解密 */
+function countingEncryption(): { enc: StorageEncryption; counts: { decrypt: number } } {
+  const base = fakeEncryption();
+  const counts = { decrypt: 0 };
+  return {
+    enc: {
+      isEncryptionAvailable: base.isEncryptionAvailable,
+      encryptString: base.encryptString,
+      decryptString: (value: Buffer) => {
+        counts.decrypt += 1;
+        return base.decryptString(value);
+      },
+    },
+    counts,
+  };
+}
+
 interface Env {
   dir: string;
   providers: ProviderStore;
@@ -61,12 +94,12 @@ function tempDir(): string {
   return dir;
 }
 
-function setup(faux = true): Env {
+function setup(faux = true, enc: StorageEncryption = fakeEncryption()): Env {
   const dir = tempDir();
   vi.stubEnv('ASI_FAUX', faux ? '1' : '');
   vi.stubEnv('ASI_FAUX_REPLY', undefined);
   vi.stubEnv('ASI_DATA_DIR', dir);
-  const providers = new ProviderStore(dir, fakeEncryption());
+  const providers = new ProviderStore(dir, enc);
   const conversations = new ConversationStore(dir);
   const resolver = new ModelResolver();
   resolvers.push(resolver);
@@ -1109,24 +1142,25 @@ describe('ChatService key masking (cross-chunk)', () => {
     expect(env.conversations.get(conv.id)?.messages[1].text).not.toContain(OTHER);
   });
 
-  it('keeps protecting the request key after the provider is deleted mid-stream, and masks a newly saved key', async () => {
+  it('keeps protecting the request-start key after mid-stream deletion; a mid-stream saved key is protected only from the next request', async () => {
     const env = setup();
     const ROTATED = 'sk-rotated-9';
     const { providerId, conv } = keyedConv(env, KEY);
+    let replacementId = '';
     streamMock.mockImplementationOnce(
       () =>
         ({
           async *[Symbol.asyncIterator]() {
             // 流式进行中：厂商被删除 → 又被另一个厂商顶替保存了新 key
             env.providers.remove(providerId);
-            env.providers.save({
+            replacementId = env.providers.save({
               name: 'Replacement',
               kind: 'builtin',
               builtinProvider: 'anthropic',
               apiKey: ROTATED,
               enabled: true,
               customModels: [],
-            });
+            }).id;
             yield { type: 'text_delta', contentIndex: 0, delta: `old${KEY}` } as AssistantMessageEvent;
             yield {
               type: 'text_delta',
@@ -1140,13 +1174,29 @@ describe('ChatService key masking (cross-chunk)', () => {
     await env.service.send(conv.id, 'hi');
     await waitFor(() => env.events.some((e) => e.type === 'done' || e.type === 'error'));
     const final = terminalMessage(env.events);
-    expect(final?.text).toBe('old[已隐藏]new[已隐藏]');
+    // 起始快照里的 key 依然受保护；中途新保存的 key 本请求内有意不脱敏（下一次请求生效）
+    expect(final?.text).toBe(`old[已隐藏]new${ROTATED}`);
     for (const e of env.events) {
       expect(JSON.stringify(e)).not.toContain(KEY);
-      expect(JSON.stringify(e)).not.toContain(ROTATED);
     }
     expect(env.conversations.get(conv.id)?.messages[1].text).not.toContain(KEY);
-    expect(env.conversations.get(conv.id)?.messages[1].text).not.toContain(ROTATED);
+
+    // 下一次请求的快照覆盖新 key：即使被分片切开也脱敏
+    env.conversations.setModel(conv.id, {
+      providerId: replacementId,
+      modelId: 'claude-sonnet-4-5',
+    });
+    const eventCount = env.events.length;
+    streamDeltas([ROTATED.slice(0, 5), ROTATED.slice(5), ' tail']);
+    await env.service.send(conv.id, 'again');
+    await waitFor(() => env.events.filter((e) => e.type === 'done').length >= 2);
+    const later = env.events.slice(eventCount);
+    const final2 = terminalMessage(later);
+    expect(final2?.text).toBe('[已隐藏] tail');
+    for (const e of later) {
+      expect(JSON.stringify(e)).not.toContain(ROTATED);
+    }
+    expect(env.conversations.get(conv.id)?.messages[3].text).toBe('[已隐藏] tail');
   });
 
   it('masks a secret-bearing error from a failed persistence flush', async () => {
@@ -1323,6 +1373,219 @@ describe('ChatService key masking (cross-chunk)', () => {
     expect(cumulatives.at(-1)).toBe('abc[已隐藏]tail');
     const stored = env.conversations.get(conv.id)?.messages.find((m) => m.id === assistant.id);
     expect(stored?.text).toBe(`abc[已隐藏]tail`);
+  });
+
+  it('masks fragments of two different keys interleaved across chunks', async () => {
+    const env = setup();
+    const A = 'abcd1234';
+    const B = '1234wxyz';
+    const { conv } = keyedConv(env, A);
+    env.providers.save({
+      name: 'Other',
+      kind: 'builtin',
+      builtinProvider: 'anthropic',
+      apiKey: B,
+      enabled: true,
+      customModels: [],
+    });
+    streamDeltas(['abc', 'd1234', ' 12', '34wx', 'yz end']);
+    await env.service.send(conv.id, 'hi');
+    await waitFor(() => env.events.some((e) => e.type === 'done'));
+    const final = terminalMessage(env.events);
+    expect(final?.text).toBe('[已隐藏] [已隐藏] end');
+    for (const e of env.events) {
+      const s = JSON.stringify(e);
+      expect(s).not.toContain(A);
+      expect(s).not.toContain(B);
+    }
+    const stored = env.conversations.get(conv.id)?.messages[1];
+    expect(stored?.text).toBe('[已隐藏] [已隐藏] end');
+  });
+
+  it('withholds emissions ending in a competing proper key prefix until resolved', async () => {
+    const env = setup();
+    const A = 'abcdefgh';
+    const B = 'XYZabcde';
+    const { conv } = keyedConv(env, A);
+    env.providers.save({
+      name: 'Other',
+      kind: 'builtin',
+      builtinProvider: 'anthropic',
+      apiKey: B,
+      enabled: true,
+      customModels: [],
+    });
+    // 'abc' 是 A 的前缀、'XYZ' 是 B 的前缀：放出 'abc' 会留下受保护前缀结尾
+    streamDeltas(['abcXYZ', 'defgh', ' tail']);
+    await env.service.send(conv.id, 'hi');
+    await waitFor(() => env.events.some((e) => e.type === 'done'));
+    const deltas = deltaTexts(env.events);
+    expect(deltas[0]).toBe('abcXYZdefgh');
+    expect(deltas.join('')).toBe('abcXYZdefgh tail');
+    expect(terminalMessage(env.events)?.text).toBe('abcXYZdefgh tail');
+  });
+
+  it('flushes a withheld key-prefix tail into the final text on done', async () => {
+    const env = setup();
+    const { conv } = keyedConv(env, KEY);
+    streamDeltas(['body', KEY.slice(0, 4)]);
+    await env.service.send(conv.id, 'hi');
+    await waitFor(() => env.events.some((e) => e.type === 'done'));
+    const final = terminalMessage(env.events);
+    expect(final?.status).toBe('done');
+    // 尾部只是 key 前缀残片（不是完整 key）：终端 flush 原样并入正文
+    expect(final?.text).toBe(`body${KEY.slice(0, 4)}`);
+    for (const e of env.events) {
+      expect(JSON.stringify(e)).not.toContain(KEY);
+    }
+    expect(env.conversations.get(conv.id)?.messages[1].text).toBe(`body${KEY.slice(0, 4)}`);
+  });
+
+  it('flushes the withheld tail and masks the key inside a provider error', async () => {
+    const env = setup();
+    const { conv } = keyedConv(env, KEY);
+    streamDeltas(['body', KEY.slice(0, 4)], { error: `denied ${KEY}` });
+    await env.service.send(conv.id, 'hi');
+    await waitFor(() => env.events.some((e) => e.type === 'error'));
+    const final = terminalMessage(env.events);
+    expect(final?.text).toBe(`body${KEY.slice(0, 4)}`);
+    expect(final?.error).toBe('denied [已隐藏]');
+    for (const e of env.events) {
+      expect(JSON.stringify(e)).not.toContain(KEY);
+    }
+    const stored = env.conversations.get(conv.id)?.messages[1];
+    expect(stored?.text).toBe(`body${KEY.slice(0, 4)}`);
+    expect(stored?.error).not.toContain(KEY);
+  });
+
+  it('snapshots redaction keys exactly once per send and never re-decrypts mid-stream', async () => {
+    const counting = countingEncryption();
+    const env = setup(true, counting.enc);
+    const { conv } = keyedConv(env, KEY);
+    const keySpy = vi.spyOn(env.providers, 'getRedactionKeys');
+    streamDeltas(['chunk-one', 'chunk-two', 'chunk-three']);
+    await env.service.send(conv.id, 'hi');
+    // 请求开始时取一次快照；流式期间不得再枚举集合或逐 delta 解密
+    expect(keySpy).toHaveBeenCalledTimes(1);
+    const decryptsAtReturn = counting.counts.decrypt;
+    await waitFor(() => env.events.some((e) => e.type === 'delta'));
+    await waitFor(() => env.events.some((e) => e.type === 'done'));
+    expect(counting.counts.decrypt).toBe(decryptsAtReturn);
+    expect(keySpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('snapshots redaction keys exactly once per retry and per test call', async () => {
+    const env = setup();
+    const conv = fauxConv(env);
+    const snapshot = env.conversations.get(conv.id);
+    env.conversations.save({
+      ...(snapshot as Conversation),
+      messages: [
+        msg({ id: 'u1', text: 'hi', status: 'done' }),
+        msg({ id: 'a1', role: 'assistant', text: '', status: 'error', error: 'x' }),
+      ],
+    });
+    streamDeltas(['ok']);
+    const keySpy = vi.spyOn(env.providers, 'getRedactionKeys');
+    await env.service.retry(conv.id);
+    expect(keySpy).toHaveBeenCalledTimes(1);
+    await waitFor(() => env.events.some((e) => e.type === 'done'));
+    expect(keySpy).toHaveBeenCalledTimes(1);
+    keySpy.mockClear();
+    const result = await env.service.test(FAUX_PROVIDER_ID, 'faux-chat');
+    expect(result.ok).toBe(true);
+    expect(keySpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('masks a stored legacy key colliding with static error text in send/retry/test failures', async () => {
+    const env = setup();
+    // 遗留 keys.json 里存着与静态错误串相同的非法短 key：
+    // 新校验已不可能保存它，但加载后它仍在脱敏集合里
+    writeFileSync(
+      join(env.dir, 'providers.json'),
+      JSON.stringify([
+        {
+          id: 'p-legacy',
+          name: 'Legacy',
+          kind: 'builtin',
+          builtinProvider: 'anthropic',
+          enabled: true,
+          customModels: [],
+          createdAt: 1,
+        },
+      ]),
+      'utf8',
+    );
+    writeFileSync(
+      join(env.dir, 'keys.json'),
+      JSON.stringify({ 'p-legacy': { encrypted: true, value: fakeCipher('API Key') } }),
+      'utf8',
+    );
+    const providers = new ProviderStore(env.dir, fakeEncryption());
+    // 非法遗留 key 被标记不可用：所有 "厂商未设置 API Key" 出口都会撞上它
+    const service = new ChatService(providers, env.conversations, env.resolver, (e) => env.events.push(e));
+    const conv = env.conversations.create({ providerId: 'p-legacy', modelId: 'claude-sonnet-4-5' });
+    const sendErr = (await service.send(conv.id, 'hi').catch((e) => e)) as Error;
+    expect(sendErr.message).toBe('厂商未设置 [已隐藏]');
+    expect(sendErr.message).not.toContain('API Key');
+
+    const snapshot = env.conversations.get(conv.id);
+    env.conversations.save({
+      ...(snapshot as Conversation),
+      messages: [
+        msg({ id: 'u1', text: 'hi', status: 'done' }),
+        msg({ id: 'a1', role: 'assistant', text: '', status: 'error', error: 'x' }),
+      ],
+    });
+    const retryErr = (await service.retry(conv.id).catch((e) => e)) as Error;
+    expect(retryErr.message).toBe('厂商未设置 [已隐藏]');
+    expect(retryErr.message).not.toContain('API Key');
+
+    const result = await service.test('p-legacy', 'claude-sonnet-4-5');
+    expect(result.ok).toBe(false);
+    expect(result.error).toBe('厂商未设置 [已隐藏]');
+    expect(result.error).not.toContain('API Key');
+  });
+
+  it('redacts a 100000-char stream in 5000 fragments within 1s and snapshots keys once', async () => {
+    const env = setup();
+    const A = 'abcd1234';
+    const B = '1234wxyz';
+    const { conv } = keyedConv(env, A);
+    env.providers.save({
+      name: 'Other',
+      kind: 'builtin',
+      builtinProvider: 'anthropic',
+      apiKey: B,
+      enabled: true,
+      customModels: [],
+    });
+    const block = `${'safe text '.repeat(8)}abcd1234 1234wxyz en`;
+    expect(block.length).toBe(100);
+    const full = block.repeat(1000);
+    expect(full.length).toBe(100000);
+    const fragments: string[] = [];
+    for (let i = 0; i < full.length; i += 20) {
+      fragments.push(full.slice(i, i + 20));
+    }
+    expect(fragments).toHaveLength(5000);
+    streamDeltas(fragments);
+    const keySpy = vi.spyOn(env.providers, 'getRedactionKeys');
+    const t0 = performance.now();
+    await env.service.send(conv.id, 'perf');
+    await waitFor(() => env.events.some((e) => e.type === 'done'), 30000);
+    const elapsed = performance.now() - t0;
+    console.log(`[perf] 100000 chars / 5000 fragments redacted stream: ${elapsed.toFixed(1)}ms`);
+    expect(elapsed).toBeLessThan(1000);
+    expect(keySpy).toHaveBeenCalledTimes(1);
+    const expected = `${'safe text '.repeat(8)}[已隐藏] [已隐藏] en`.repeat(1000);
+    const final = terminalMessage(env.events);
+    expect(final?.text).toBe(expected);
+    const stored = env.conversations.get(conv.id)?.messages[1];
+    expect(stored?.text).toBe(expected);
+    const raw = readFileSync(join(env.dir, 'conversations', `${conv.id}.json`), 'utf8');
+    expect(raw).not.toContain(A);
+    expect(raw).not.toContain(B);
   });
 });
 

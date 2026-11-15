@@ -221,3 +221,166 @@ describe('KeyRedactor streaming', () => {
     expect(out).toBe(`${KEY_MASK}x${KEY_MASK}`);
   });
 });
+
+describe('KeyRedactor boundary safety (legal keys)', () => {
+  const LEGAL_A = 'abcd1234';
+  const LEGAL_B = '1234wxyz';
+
+  /**
+   * 逐 push 断言不变量：累计已放出文本不含任何完整 key，
+   * 也不以任何 key 的真前缀结尾（否则下一段放出文本可能在边界上拼出 key）。
+   * flush 是终端例外，只要求最终文本不含完整 key。
+   */
+  function drainSafe(keys: string[], chunks: string[]): string {
+    const r = new KeyRedactor(keys);
+    let emitted = '';
+    for (const c of chunks) {
+      emitted += r.push(c);
+      for (const k of keys) {
+        expect(emitted).not.toContain(k);
+        for (let p = 1; p < k.length; p++) {
+          expect(
+            emitted.endsWith(k.slice(0, p)),
+            `emitted ${JSON.stringify(emitted)} must not end with a proper prefix of ${k}`,
+          ).toBe(false);
+        }
+      }
+    }
+    emitted += r.flush();
+    for (const k of keys) {
+      expect(emitted).not.toContain(k);
+    }
+    return emitted;
+  }
+
+  it.each([LEGAL_A, LEGAL_B])(
+    'masks %s at every two- and three-chunk split and across single chars',
+    (key) => {
+      const text = `pre${key}post`;
+      const expected = `pre${KEY_MASK}post`;
+      for (let i = 1; i < text.length; i++) {
+        expect(drainSafe([key], [text.slice(0, i), text.slice(i)]), `two-split ${i}`).toBe(expected);
+      }
+      for (let i = 1; i < text.length - 1; i++) {
+        for (let j = i + 1; j < text.length; j++) {
+          expect(
+            drainSafe([key], [text.slice(0, i), text.slice(i, j), text.slice(j)]),
+            `three-split ${i},${j}`,
+          ).toBe(expected);
+        }
+      }
+      expect(drainSafe([key], [...text])).toBe(expected);
+    },
+  );
+
+  it('withholds text ending in a competing proper prefix instead of releasing it', () => {
+    // 'abc' 是 'abcdefgh' 的前缀、'XYZ' 是 'XYZabcde' 的前缀：
+    // 在 'XYZ' 前切开会让已放出的 'abc' 以受保护前缀结尾，必须整段扣留
+    const r = new KeyRedactor(['abcdefgh', 'XYZabcde']);
+    expect(r.push('abcXYZ')).toBe('');
+    // 后续片段让 pending 不再以任何受保护前缀结尾：整段放出（'abcXYZ' 本身不是 key）
+    expect(r.push('defgh tail')).toBe('abcXYZdefgh tail');
+    expect(r.flush()).toBe('');
+  });
+
+  it('stays safe for competing proper prefixes at every split and per char', () => {
+    const keys = ['abcdefgh', 'XYZabcde'];
+    for (const text of ['abcXYZabcdefgh', 'abcXYZdefgh', 'abcdefghXYZabcde', 'xabcdefghabcXYZ']) {
+      for (let i = 1; i < text.length; i++) {
+        drainSafe(keys, [text.slice(0, i), text.slice(i)]);
+      }
+      drainSafe(keys, [...text]);
+    }
+  });
+
+  it('keeps protecting a legacy key that contains the mask across chunk splits', () => {
+    // 遗留 key 可能含掩码子串（新保存已不可能）：分片拼出时仍不得泄漏
+    const legacy = `a${KEY_MASK}b`;
+    const emitted = drainSafe([legacy], [`x${legacy.slice(0, 4)}`, legacy.slice(4), 'y']);
+    expect(emitted).not.toContain(legacy);
+  });
+
+  it('masks both legal keys through overlapping, interleaved and repeated text at every split', () => {
+    const keys = [LEGAL_A, LEGAL_B];
+    for (const text of [
+      // 'abcd1234wxyz'：A 与 B 经共享的 '1234' 交叠；两把 key 各自重复出现
+      'x abcd1234wxyz 1234wxyz abcd1234 end',
+      'abcd1234 abcd1234 1234wxyz 1234wxyz',
+      'pre abcd1234 mid 1234wxyz tail',
+    ]) {
+      const expected = redactKeys(text, keys);
+      for (let i = 1; i < text.length; i++) {
+        expect(drainSafe(keys, [text.slice(0, i), text.slice(i)]), `two-split ${i}`).toBe(expected);
+      }
+      for (let i = 1; i < text.length - 1; i++) {
+        for (let j = i + 1; j < text.length; j++) {
+          expect(
+            drainSafe(keys, [text.slice(0, i), text.slice(i, j), text.slice(j)]),
+            `three-split ${i},${j}`,
+          ).toBe(expected);
+        }
+      }
+      expect(drainSafe(keys, [...text])).toBe(expected);
+    }
+  });
+
+  it('loses nothing when a long held proper-prefix chain completes a key then goes safe', () => {
+    const keys = [LEGAL_A, LEGAL_B];
+    // 5000 个 'a' 全是 'abcd1234' 的真前缀后缀：整段扣留；
+    // 'bcd1234' 在链尾拼出完整 key，扣留前缀一个字符都不能丢
+    const text = `${'a'.repeat(5000)}bcd1234 tail`;
+    const chunks: string[] = [];
+    for (let i = 0; i < text.length; i += 20) {
+      chunks.push(text.slice(i, i + 20));
+    }
+    const emitted = drainSafe(keys, chunks);
+    expect(emitted).toBe(`${'a'.repeat(4999)}${KEY_MASK} tail`);
+    expect(emitted).not.toContain(LEGAL_A);
+    expect(emitted).not.toContain(LEGAL_B);
+  });
+
+  it('processes a 100000-char all-proper-prefix stream in linear time', () => {
+    // 对抗性回压：每个 'a' 都让文本以 'abcd1234' 的真前缀结尾，永远无法放出；
+    // 持久匹配器只处理新增字符，不允许退化为逐片重扫扣留串
+    const keys = [LEGAL_A, LEGAL_B];
+    const full = 'a'.repeat(100000);
+    const fragments: string[] = [];
+    for (let i = 0; i < full.length; i += 20) {
+      fragments.push(full.slice(i, i + 20));
+    }
+    expect(fragments).toHaveLength(5000);
+    const r = new KeyRedactor(keys);
+    const t0 = performance.now();
+    for (const f of fragments) {
+      expect(r.push(f)).toBe('');
+    }
+    const tail = r.flush();
+    const elapsed = performance.now() - t0;
+    console.log(`[perf] 100000 prefix-holding chars / 5000 fragments: ${elapsed.toFixed(1)}ms`);
+    expect(elapsed).toBeLessThan(1000);
+    expect(tail).toBe(full);
+  });
+
+  it('never reconstructs a legacy invalid stored key across event boundaries', () => {
+    // 遗留非法 key 'abcd[已隐藏' 含掩码前缀（新保存已不可能入库）：
+    // 'abcd1234' + '5678' 跨片拼出 '12345678'，掩码插入又恰好拼出遗留 key，
+    // 兜底清理必须连它一起清掉；任意切分点上同样不得泄漏任何受保护值
+    const legacy = `abcd${KEY_MASK.slice(0, -1)}`; // 'abcd[已隐藏'
+    const keys = [legacy, '12345678'];
+    const emitted = drainSafe(keys, ['abcd1234', '5678']);
+    expect(emitted).toBe(redactKeys('abcd12345678', keys));
+    expect(emitted).not.toContain('12345678');
+    expect(emitted).not.toContain(legacy);
+    const text = 'abcd12345678';
+    for (let i = 1; i < text.length; i++) {
+      drainSafe(keys, [text.slice(0, i), text.slice(i)]);
+    }
+    drainSafe(keys, [...text]);
+  });
+
+  it('redact() applies the cached key snapshot to arbitrary text', () => {
+    const r = new KeyRedactor([KEY]);
+    expect(r.redact(`pre${KEY}post`)).toBe(`pre${KEY_MASK}post`);
+    expect(r.redact('clean')).toBe('clean');
+  });
+});

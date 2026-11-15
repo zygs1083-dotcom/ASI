@@ -601,6 +601,87 @@ describe('IPC handlers: conversations, chat and settings', () => {
   });
 });
 
+describe('IPC error redaction', () => {
+  it('masks a saved key colliding with argument-validation error text', async () => {
+    const env = makeServices();
+    registerIpc(env);
+    env.providers.save({
+      name: 'P',
+      kind: 'builtin',
+      builtinProvider: 'anthropic',
+      apiKey: 'providerId',
+      enabled: true,
+      customModels: [],
+    });
+    // 'providerId' 是合法保存的 key（10 位可打印 ASCII）：静态错误文本里的同名片段不得出桥
+    const err = (await env.invoke(IPC_CHANNELS.providers.remove, 42).catch((e) => e)) as Error;
+    expect(err).toBeInstanceOf(Error);
+    expect(err.message).toBe('参数无效：[已隐藏] 必须是非空字符串');
+    expect(err.message).not.toContain('providerId');
+  });
+
+  it('masks a saved key colliding with the kind-validation error text', async () => {
+    const env = makeServices();
+    registerIpc(env);
+    env.providers.save({
+      name: 'P',
+      kind: 'builtin',
+      builtinProvider: 'anthropic',
+      apiKey: 'openai-compatible',
+      enabled: true,
+      customModels: [],
+    });
+    const err = (await env
+      .invoke(IPC_CHANNELS.providers.save, {
+        name: 'C',
+        kind: 'nope',
+        enabled: true,
+        customModels: [],
+      })
+      .catch((e) => e)) as Error;
+    expect(err.message).toBe('参数无效：kind 必须是 builtin 或 [已隐藏]');
+    expect(err.message).not.toContain('openai-compatible');
+  });
+
+  it('masks saved keys in sync throws and async rejections, with a sanitized fallback', async () => {
+    const env = makeServices();
+    registerIpc(env);
+    env.providers.save({
+      name: 'P',
+      kind: 'builtin',
+      builtinProvider: 'anthropic',
+      apiKey: 'providerId',
+      enabled: true,
+      customModels: [],
+    });
+    // handler 内同步抛错
+    const removeSpy = vi.spyOn(env.providers, 'remove').mockImplementation(() => {
+      throw new Error('sync leak providerId end');
+    });
+    const syncErr = (await env.invoke(IPC_CHANNELS.providers.remove, 'p1').catch((e) => e)) as Error;
+    expect(syncErr.message).toBe('sync leak [已隐藏] end');
+    expect(syncErr.message).not.toContain('providerId');
+    removeSpy.mockRestore();
+
+    // handler 返回的 promise 拒绝
+    const sendSpy = vi.spyOn(env.chat, 'send').mockRejectedValue(new Error('async leak providerId end'));
+    const asyncErr = (await env.invoke(IPC_CHANNELS.chat.send, 'c1', 'hi').catch((e) => e)) as Error;
+    expect(asyncErr.message).toBe('async leak [已隐藏] end');
+    expect(asyncErr.message).not.toContain('providerId');
+    sendSpy.mockRestore();
+
+    // 非 Error 拒绝原样转 message；完全无消息走统一中文兜底
+    const abortSpy = vi.spyOn(env.chat, 'abort').mockRejectedValue('raw string');
+    const strErr = (await env.invoke(IPC_CHANNELS.chat.abort, 'c1').catch((e) => e)) as Error;
+    expect(strErr).toBeInstanceOf(Error);
+    expect(strErr.message).toBe('raw string');
+    abortSpy.mockRejectedValue(undefined);
+    const emptyErr = (await env.invoke(IPC_CHANNELS.chat.abort, 'c1').catch((e) => e)) as Error;
+    expect(emptyErr.message).toBe('未知错误');
+    abortSpy.mockRestore();
+  });
+});
+
 describe('emitChatEvent', () => {
   it('sends the event only to the main window webContents', () => {
     const send = vi.fn();

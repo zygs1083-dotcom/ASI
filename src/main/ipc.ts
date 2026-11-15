@@ -3,6 +3,7 @@ import { ipcMain, nativeTheme, safeStorage } from 'electron';
 import { IPC_CHANNELS } from '../shared/ipc';
 import type { AppSettings, ChatEvent, ModelRef, ProviderConfig, ProviderInput } from '../shared/types';
 import { ChatService } from './chat/chat-service';
+import { redactKeys } from './chat/key-redactor';
 import { isSupportedBuiltinProvider, ModelResolver } from './chat/model-resolver';
 import { getMainWindow } from './main-window';
 import { dataDir } from './paths';
@@ -154,14 +155,28 @@ function requireProvider(services: MainServices, providerId: string): ProviderCo
 export function registerIpc(services: MainServices = createDefaultServices()): void {
   const handle = (channel: string, fn: (...args: unknown[]) => unknown): void => {
     ipcMain.handle(channel, async (event: IpcMainInvokeEvent, ...args: unknown[]) => {
-      // 任何参数解析/服务调用之前先验证来源：必须来自主窗口主 frame，
-      // 杜绝远程页面、子 frame 或其它窗口借桥调用特权接口
-      const main = getMainWindow();
-      const frame = event.senderFrame;
-      if (!main || event.sender !== main.webContents || !frame || frame !== main.webContents.mainFrame) {
-        throw new Error('IPC 调用来源不可信');
+      // 纵深防线的脱敏出口：只在失败时取一次已存 key 快照，成功路径不做额外收集；
+      // 原始 error/cause/stack 一律不序列化出桥
+      const sanitize = (err: unknown): Error => {
+        let message = err instanceof Error ? err.message : typeof err === 'string' ? err : '';
+        if (message === '') {
+          message = '未知错误';
+        }
+        return new Error(redactKeys(message, services.providers.getRedactionKeys()));
+      };
+      try {
+        // 任何参数解析/服务调用之前先验证来源：必须来自主窗口主 frame，
+        // 杜绝远程页面、子 frame 或其它窗口借桥调用特权接口
+        const main = getMainWindow();
+        const frame = event.senderFrame;
+        if (!main || event.sender !== main.webContents || !frame || frame !== main.webContents.mainFrame) {
+          throw new Error('IPC 调用来源不可信');
+        }
+        // await 让同步 throw 与异步 reject 都进同一个脱敏 catch
+        return await fn(...args);
+      } catch (err) {
+        throw sanitize(err);
       }
-      return fn(...args);
     });
   };
   const C = IPC_CHANNELS;
