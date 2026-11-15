@@ -1,6 +1,6 @@
 import { readdir, readFile } from 'node:fs/promises';
 import { basename, join } from 'node:path';
-import { addCompatibleProvider, providerRow, TEST_KEY } from './actions';
+import { addCompatibleProvider, newFauxChat, providerRow, send, TEST_KEY } from './actions';
 import { expect, test } from './fixtures';
 
 async function filesUnder(dir: string): Promise<string[]> {
@@ -38,4 +38,32 @@ test('saved API keys are not stored in plaintext', async ({ dataDir, launchApp }
   for (const file of files) {
     expect((await readFile(file)).includes(TEST_KEY), `plaintext key in ${file}`).toBe(false);
   }
+});
+
+test('assistant links open externally without navigating or creating an app window', async ({
+  launchApp,
+}) => {
+  const { app, page } = await launchApp({ fauxReply: '[x](https://example.com)' });
+  await app.evaluate(({ shell }) => {
+    const state = globalThis as typeof globalThis & { externalUrls: string[] };
+    state.externalUrls = [];
+    shell.openExternal = async (url: string) => {
+      state.externalUrls.push(url);
+    };
+  });
+  await newFauxChat(page);
+  await send(page, 'link');
+  const assistant = page.getByTestId('msg-assistant');
+  await expect(assistant).toHaveAttribute('data-status', 'done');
+  const originalUrl = page.url();
+  await assistant.getByRole('link', { name: 'x' }).click();
+
+  await expect
+    .poll(() =>
+      app.evaluate(() => (globalThis as typeof globalThis & { externalUrls: string[] }).externalUrls),
+    )
+    .toEqual(['https://example.com/']);
+  expect(page.url()).toBe(originalUrl);
+  expect(await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows().length)).toBe(1);
+  expect(app.windows()).toHaveLength(1);
 });

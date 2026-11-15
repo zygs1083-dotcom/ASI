@@ -14,7 +14,7 @@
     "build": "electron-vite build",
     "typecheck": "tsc --noEmit -p tsconfig.node.json && tsc --noEmit -p tsconfig.web.json",
     "lint": "biome check .",
-    "test": "vitest run",
+    "test": "vitest run && vitest run --config src/renderer/dev/vitest.config.ts",
     "check": "npm run typecheck && npm run lint && npm test",
     "e2e": "npm run build && playwright test",
     "dist:mac": "npm run build && electron-builder --mac dmg --arm64"

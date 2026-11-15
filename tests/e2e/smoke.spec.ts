@@ -15,6 +15,7 @@ const EXPECTED_METHODS = [
   'conversations.remove',
   'conversations.setModel',
   'chat.send',
+  'chat.retry',
   'chat.abort',
   'chat.onEvent',
   'settings.get',

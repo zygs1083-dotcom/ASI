@@ -1,3 +1,4 @@
+import { resolve } from 'node:path';
 import { newFauxChat, send } from './actions';
 import { expect, FAUX_REPLY, test } from './fixtures';
 
@@ -65,4 +66,29 @@ test('a provider error appears in the conversation', async ({ launchApp }) => {
   await send(page, '/error');
   await expect(page.getByTestId('msg-assistant')).toHaveAttribute('data-status', 'error');
   await expect(page.getByTestId('msg-error')).toBeVisible();
+});
+
+test('retry replaces a failed reply without adding another user message', async ({ launchApp }) => {
+  const { app, page } = await launchApp();
+  await newFauxChat(page);
+  await send(page, '/error');
+  await expect(page.getByTestId('msg-assistant')).toHaveAttribute('data-status', 'error');
+  await expect(page.getByTestId('msg-error')).toBeVisible();
+
+  // /error always fails in the built-in faux fixture; simulate upstream recovery for the retry.
+  await app.evaluate((_, modulePath) => {
+    const { createRequire } = process.getBuiltinModule('node:module') as typeof import('node:module');
+    const pi = createRequire(modulePath)(modulePath) as typeof import('@mariozechner/pi-ai');
+    const original = pi.getApiProviders().find((provider) => provider.api.startsWith('faux:'));
+    if (!original) throw new Error('Faux provider not registered');
+    const recovered = pi.registerFauxProvider({ api: original.api });
+    recovered.setResponses([pi.fauxAssistantMessage([pi.fauxText('Recovered.')])]);
+  }, resolve('node_modules/@mariozechner/pi-ai/dist/index.js'));
+
+  await page.getByTestId('msg-error').getByRole('button', { name: '重试' }).click();
+  await expect(page.getByTestId('msg-assistant')).toHaveCount(1);
+  await expect(page.getByTestId('msg-assistant').last()).toHaveAttribute('data-status', 'done');
+  await expect(page.getByTestId('msg-assistant').last()).toContainText('Recovered.');
+  await expect(page.getByTestId('msg-user')).toHaveCount(1);
+  await expect(page.getByTestId('msg-user')).toHaveText('/error');
 });
