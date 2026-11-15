@@ -4,8 +4,12 @@
 
 ## 0. 兼容版本
 
-- DSH：`deepseek-ai/deepseek-harness` `master@39163dd3`（2026-11-13）调研所得。P0 确认 MacPro 实际安装版本后写入本节，并写进各包 `engines.dsh`。
-- macOS：MacPro 实机版本（P0 记录）。
+- DSH：`0.2.2-rc.3`，commit `39163dd30f703a79079e2d2446545cff3c453738`（P0 在 MacPro 源码安装验证，见 `docs/spikes/P0.md`）。各包 `engines.dsh` 写 `0.2.2-rc.3`。
+- macOS 15.7.7（24G720），Node 26.13.0，Swift 6.2.4（arm64）。
+- P0 带来的约束：
+  - `contextWindow` 可能是 DSH 的 1,000,000 回退值而非真实容量（magpie 广告 256000）。Token 读数必须带来源标记 `configured | catalog | fallback`，回退值在侧栏标"未确认容量"，不参与阈值告警。
+  - Remote API 的 Typert 生成器在 DSH 源码外需要 shim；M2 固定生成器版本并完善外部类型映射。
+  - 同 kind 的 inject 不唤醒、followup 新开一轮，已实测；source.kind 用 `environment`。
 
 ## 1. 总体
 
