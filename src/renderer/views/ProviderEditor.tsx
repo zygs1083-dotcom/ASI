@@ -35,14 +35,29 @@ export function ProviderEditor({ target }: { target: { id: string | null } }) {
   const [tests, setTests] = useState<TestState>({});
   const deleteRef = useRef<HTMLButtonElement>(null);
   const keyInputRef = useRef<HTMLInputElement | null>(null);
+  // 已提交、尚在等待后端结果的保存 payload：取消/返回/卸载/输入框 detach 都要就地删掉明文
+  const pendingPayloadRef = useRef<ProviderInput | null>(null);
+
+  // 丢弃进行中的保存 payload：删掉其中的明文 key 并解除引用
+  const discardPendingPayload = useCallback(() => {
+    const payload = pendingPayloadRef.current;
+    if (payload) {
+      delete payload.apiKey;
+      pendingPayloadRef.current = null;
+    }
+  }, []);
 
   // 回调 ref：React detach（传 null）或换节点时同步清掉旧 DOM 上的明文——
   // 卸载 effect 看到 ref 已是 null，清不到脱离文档的旧节点，所以必须在 ref 层清
-  const keyInputCb = useCallback((node: HTMLInputElement | null) => {
-    const prev = keyInputRef.current;
-    if (prev && prev !== node) prev.value = '';
-    keyInputRef.current = node;
-  }, []);
+  const keyInputCb = useCallback(
+    (node: HTMLInputElement | null) => {
+      const prev = keyInputRef.current;
+      if (prev && prev !== node) prev.value = '';
+      keyInputRef.current = node;
+      if (node === null) discardPendingPayload();
+    },
+    [discardPendingPayload],
+  );
 
   // 唯一的 Key 草稿清理入口：React state 与当前 DOM 值一起清
   const clearKeyDraft = useCallback(() => {
@@ -50,8 +65,14 @@ export function ProviderEditor({ target }: { target: { id: string | null } }) {
     if (keyInputRef.current) keyInputRef.current.value = '';
   }, []);
 
-  // 卸载兜底再清一次（此时 DOM 值已由回调 ref 清掉，这里只保证 state 不残留）
-  useEffect(() => () => clearKeyDraft(), [clearKeyDraft]);
+  // 卸载兜底再清一次（此时 DOM 值已由回调 ref 清掉，这里只保证 state 与 payload 不残留）
+  useEffect(
+    () => () => {
+      clearKeyDraft();
+      discardPendingPayload();
+    },
+    [clearKeyDraft, discardPendingPayload],
+  );
 
   useEffect(() => {
     if (existing) void actions.ensureProviderModels(existing.id);
@@ -99,6 +120,7 @@ export function ProviderEditor({ target }: { target: { id: string | null } }) {
               aria-label="返回厂商列表"
               onClick={() => {
                 clearKeyDraft();
+                discardPendingPayload();
                 actions.closeEditor();
               }}
             >
@@ -141,6 +163,13 @@ export function ProviderEditor({ target }: { target: { id: string | null } }) {
     const url = baseUrl.trim();
     if (kind === 'openai-compatible' && !url) errs.baseUrl = '请输入 Base URL';
     else if (url && !validHttpUrl(url)) errs.baseUrl = 'Base URL 需为合法的 http:// 或 https:// 地址';
+    // 与主进程一致的校验：仅当真的输入过内容时校验；空草稿 = 保留/不设 key
+    if (apiKeyDraft !== '') {
+      const key = apiKeyDraft.trim();
+      if (key === '') errs.apiKey = 'API Key 不能为空字符串';
+      else if (key.length < 8) errs.apiKey = 'API Key 长度至少 8 个字符';
+      else if (key.includes('[已隐藏]')) errs.apiKey = 'API Key 不能包含占位符文本';
+    }
     setErrors(errs);
     return Object.keys(errs).length === 0;
   };
@@ -165,17 +194,26 @@ export function ProviderEditor({ target }: { target: { id: string | null } }) {
       enabled,
       customModels: kind === 'openai-compatible' ? customModels : [],
     };
-    // 明文 key 一旦进了 payload 立刻清掉草稿，不等保存结果
+    // 明文 key 一旦进了 payload 立刻清掉草稿，不等保存结果；
+    // payload 挂上 pending ref：取消/返回/卸载/detach 都能就地删掉明文
     clearKeyDraft();
+    pendingPayloadRef.current = input;
     try {
       await actions.saveProvider(input);
+      // 已取消/卸载的提交不得关闭或报错到可能已重新打开的编辑器
+      if (pendingPayloadRef.current !== input) return;
       actions.closeEditor();
     } catch (e) {
-      setErrors({ form: e instanceof Error && e.message ? e.message : '保存失败，请重试' });
+      if (pendingPayloadRef.current === input) {
+        setErrors({ form: e instanceof Error && e.message ? e.message : '保存失败，请重试' });
+      }
     } finally {
-      // 后端已消费 payload，删掉本地持有的明文引用
+      // 无论如何都删掉本地持有的明文引用
       delete input.apiKey;
-      setSaving(false);
+      if (pendingPayloadRef.current === input) {
+        pendingPayloadRef.current = null;
+        setSaving(false);
+      }
     }
   };
 
@@ -209,6 +247,7 @@ export function ProviderEditor({ target }: { target: { id: string | null } }) {
             aria-label="返回厂商列表"
             onClick={() => {
               clearKeyDraft();
+              discardPendingPayload();
               actions.closeEditor();
             }}
           >
@@ -306,6 +345,8 @@ export function ProviderEditor({ target }: { target: { id: string | null } }) {
                 disabled={saving}
                 value={apiKeyDraft}
                 placeholder={keyPlaceholder}
+                aria-invalid={errors.apiKey ? true : undefined}
+                aria-describedby={errors.apiKey ? 'pe-apikey-err' : undefined}
                 onChange={(e) => setApiKeyDraft(e.target.value)}
               />
               {existing?.hasApiKey && !keyCleared && (
@@ -323,6 +364,11 @@ export function ProviderEditor({ target }: { target: { id: string | null } }) {
                 </button>
               )}
             </div>
+            {errors.apiKey && (
+              <div className="pe-err" id="pe-apikey-err">
+                {errors.apiKey}
+              </div>
+            )}
             {keyCleared && (
               <div className="pe-hint">保存后将清除已保存的 Key{apiKeyDraft ? '，并写入新 Key' : ''}</div>
             )}
@@ -384,25 +430,27 @@ export function ProviderEditor({ target }: { target: { id: string | null } }) {
                   data-model-id={r.modelId}
                 >
                   <span className="pe-model-name">{r.name}</span>
-                  <button
-                    type="button"
-                    className="pill-btn"
-                    data-testid="pe-model-test"
-                    aria-label={`测试 ${r.name}`}
-                    disabled={!canTest || t === 'loading'}
-                    onClick={() => void runTest(r.modelId)}
-                  >
-                    测试
-                  </button>
-                  <span className="pe-model-test-result" data-testid="pe-model-test-result">
-                    {t === 'loading'
-                      ? '测试中…'
-                      : t
-                        ? t.ok
-                          ? `✓ ${t.latencyMs ?? 0}ms`
-                          : `✗ ${t.error ?? '失败'}`
-                        : ''}
-                  </span>
+                  <div className="pe-model-actions">
+                    <button
+                      type="button"
+                      className="pill-btn"
+                      data-testid="pe-model-test"
+                      aria-label={`测试 ${r.name}`}
+                      disabled={!canTest || t === 'loading'}
+                      onClick={() => void runTest(r.modelId)}
+                    >
+                      测试
+                    </button>
+                    {t && (
+                      <span className="pe-model-test-result" data-testid="pe-model-test-result">
+                        {t === 'loading'
+                          ? '测试中…'
+                          : t.ok
+                            ? `✓ ${t.latencyMs ?? 0}ms`
+                            : `✗ ${t.error ?? '失败'}`}
+                      </span>
+                    )}
+                  </div>
                 </div>
               );
             })}
@@ -464,6 +512,7 @@ export function ProviderEditor({ target }: { target: { id: string | null } }) {
                 aria-label="取消编辑"
                 onClick={() => {
                   clearKeyDraft();
+                  discardPendingPayload();
                   actions.closeEditor();
                 }}
               >

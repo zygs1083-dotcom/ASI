@@ -10,6 +10,7 @@ import type {
   Conversation,
   ModelRef,
   ProviderConfig,
+  ProviderInput,
 } from '../../shared/types';
 import { devCspPlugin, relaxCspForDev } from './csp';
 import { createMockApi } from './mockApi';
@@ -756,5 +757,392 @@ describe('dev CSP plugin', () => {
         "connect-src 'self'",
       );
     expect(reStrict).toBe(strict);
+  });
+});
+
+// ---------- ProviderEditor：key 草稿与 payload 脱敏 ----------
+// node 环境没有 DOM/test-renderer：用最小 mock-hooks 装置直接调用 ProviderEditor，
+// 记录 hook 槽位并重渲染元素树；断言行为而非源码文本。
+
+const editorModulePath = '../views/ProviderEditor';
+const reactModulePath = 'react';
+const storeModulePath = '../store';
+
+type ElProps = Record<string, unknown> & { children?: unknown };
+
+function findProps(node: unknown, key: string): ElProps | undefined {
+  if (node === null || node === undefined || typeof node !== 'object') return undefined;
+  if (Array.isArray(node)) {
+    for (const child of node) {
+      const found = findProps(child, key);
+      if (found) return found;
+    }
+    return undefined;
+  }
+  const el = node as { props?: ElProps };
+  if (el.props?.['data-testid'] === key || el.props?.id === key) return el.props;
+  return findProps(el.props?.children, key);
+}
+
+function sameDeps(a: unknown[] | undefined, b: unknown[] | undefined): boolean {
+  if (a === undefined || b === undefined) return a === b;
+  return a.length === b.length && a.every((d, i) => Object.is(d, b[i]));
+}
+
+interface EditorHarness {
+  store: Store;
+  byTestId: (key: string) => ElProps | undefined;
+  unmount: () => void;
+}
+
+function must(h: EditorHarness, key: string): ElProps {
+  const props = h.byTestId(key);
+  if (!props) throw new Error(`missing element ${key}`);
+  return props;
+}
+
+/** 挂载 ProviderEditor：doMock react 的四个 hooks 走自记账槽位，useAppState 直连 store */
+async function mountEditor(target: { id: string | null }): Promise<EditorHarness> {
+  interface Slot {
+    v?: unknown;
+    current?: unknown;
+    fn?: unknown;
+    deps?: unknown[];
+    cleanup?: unknown;
+    effect?: () => unknown;
+  }
+  const slots: Slot[] = [];
+  const slotOf = (i: number): Slot => {
+    let slot = slots[i];
+    if (!slot) {
+      slot = {};
+      slots[i] = slot;
+    }
+    return slot;
+  };
+  const pendingEffects: number[] = [];
+  let cursor = 0;
+  let mounted = true;
+  let rendering = false;
+  let flushing = false;
+  let dirty = false;
+  let tree: unknown;
+  let editorFn: (props: { target: { id: string | null } }) => unknown = () => null;
+
+  const rerender = () => {
+    if (!mounted) return;
+    render();
+    while (dirty && mounted) {
+      dirty = false;
+      render();
+    }
+  };
+  const render = () => {
+    rendering = true;
+    cursor = 0;
+    pendingEffects.length = 0;
+    tree = editorFn({ target });
+    rendering = false;
+    flushing = true;
+    while (pendingEffects.length > 0) {
+      const i = pendingEffects.shift() as number;
+      const slot = slots[i];
+      if (typeof slot.cleanup === 'function') (slot.cleanup as () => void)();
+      slot.cleanup = slot.effect?.();
+    }
+    flushing = false;
+  };
+
+  vi.doMock(reactModulePath, async (importOriginal) => {
+    const actual = await importOriginal<typeof import('react')>();
+    return {
+      ...actual,
+      useState: (init: unknown) => {
+        const i = cursor++;
+        const slot = slotOf(i);
+        if (!('v' in slot)) slot.v = typeof init === 'function' ? (init as () => unknown)() : init;
+        const set = (v: unknown) => {
+          slot.v = typeof v === 'function' ? (v as (p: unknown) => unknown)(slot.v) : v;
+          if (!mounted) return;
+          if (rendering || flushing) dirty = true;
+          else rerender();
+        };
+        return [slot.v, set];
+      },
+      useRef: (init: unknown) => {
+        const i = cursor++;
+        const slot = slotOf(i);
+        if (!('current' in slot)) slot.current = init;
+        return slot;
+      },
+      useCallback: (fn: unknown, deps: unknown[]) => {
+        const i = cursor++;
+        const slot = slotOf(i);
+        if (!sameDeps(slot.deps, deps)) {
+          slot.fn = fn;
+          slot.deps = deps;
+        }
+        return slot.fn;
+      },
+      useEffect: (fn: () => unknown, deps?: unknown[]) => {
+        const i = cursor++;
+        const slot = slotOf(i);
+        if (!sameDeps(slot.deps, deps)) {
+          slot.effect = fn;
+          pendingEffects.push(i);
+        }
+        slot.deps = deps;
+      },
+    };
+  });
+  vi.doMock(storeModulePath, async (importOriginal) => {
+    const actual = await importOriginal<typeof import('../store')>();
+    return { ...actual, useAppState: () => actual.getState() };
+  });
+  vi.resetModules();
+  const store = (await import(storeModulePath)) as Store;
+  const mod = (await import(editorModulePath)) as {
+    ProviderEditor: (props: { target: { id: string | null } }) => unknown;
+  };
+  editorFn = mod.ProviderEditor;
+  // 先 init 再首渲染：useState 初值只在首次渲染时求值，catalog/providers 必须先就位
+  await store.actions.init();
+  render();
+  return {
+    store,
+    byTestId: (key) => findProps(tree, key),
+    unmount: () => {
+      if (!mounted) return;
+      mounted = false;
+      for (const slot of slots) {
+        if (slot && typeof slot.cleanup === 'function') (slot.cleanup as () => void)();
+      }
+    },
+  };
+}
+
+const savedProvider: ProviderConfig = {
+  id: 'p1',
+  name: 'Provider One',
+  kind: 'openai-compatible',
+  baseUrl: 'http://localhost:9/v1',
+  hasApiKey: true,
+  enabled: true,
+  customModels: ['m1', 'm2'],
+  createdAt: 0,
+};
+
+const flushMicrotasks = async () => {
+  for (let i = 0; i < 10; i++) await Promise.resolve();
+};
+
+describe('actions.saveProvider apiKey scrub', () => {
+  it('deletes input.apiKey as soon as providers.save resolves, without waiting for refresh', async () => {
+    const { api } = makeApi();
+    const input: ProviderInput = {
+      name: 'P',
+      kind: 'builtin',
+      builtinProvider: 'anthropic',
+      apiKey: 'sk-live-1234',
+      enabled: true,
+      customModels: [],
+    };
+    let captured: ProviderInput | undefined;
+    api.providers.save = async (i) => {
+      captured = i;
+      return clone(savedProvider);
+    };
+    // providers.list 永远挂起：刷新不应阻塞 payload 脱敏
+    api.providers.list = () => new Promise(() => {});
+    const store = await boot(api);
+    const pending = store.actions.saveProvider(input);
+    void pending.catch(() => {});
+    await flushMicrotasks();
+    expect(captured).toBe(input);
+    expect('apiKey' in input).toBe(false);
+    expect(input.apiKey).toBeUndefined();
+  });
+
+  it('deletes input.apiKey when providers.save rejects', async () => {
+    const { api } = makeApi();
+    const input: ProviderInput = {
+      name: 'P',
+      kind: 'builtin',
+      builtinProvider: 'anthropic',
+      apiKey: 'sk-live-1234',
+      enabled: true,
+      customModels: [],
+    };
+    api.providers.save = async () => {
+      throw new Error('后端炸了');
+    };
+    const store = await boot(api);
+    await expect(store.actions.saveProvider(input)).rejects.toThrow('后端炸了');
+    expect('apiKey' in input).toBe(false);
+  });
+});
+
+describe('ProviderEditor pending payload scrub (mock hooks)', () => {
+  afterEach(() => {
+    vi.doUnmock(reactModulePath);
+    vi.doUnmock(storeModulePath);
+    vi.resetModules();
+  });
+
+  function editorApi(saveImpl: (i: ProviderInput) => Promise<ProviderConfig>) {
+    const { api } = makeApi();
+    api.providers.catalog = async () => [{ id: 'b1', name: 'B1', modelCount: 1 }];
+    api.providers.save = saveImpl;
+    vi.stubGlobal('window', { asi: api });
+    vi.stubGlobal('document', {
+      documentElement: { dataset: {} },
+      addEventListener: () => {},
+      removeEventListener: () => {},
+    });
+    return api;
+  }
+
+  it('clears the draft immediately, keeps the payload key only until IPC resolves', async () => {
+    let captured: ProviderInput | undefined;
+    let resolveSave: (c: ProviderConfig) => void = () => {};
+    const gate = new Promise<ProviderConfig>((res) => {
+      resolveSave = res;
+    });
+    editorApi(async (i) => {
+      captured = i;
+      return gate;
+    });
+    const h = await mountEditor({ id: null });
+    const node = { value: '' };
+    (must(h, 'pe-apikey').ref as (n: unknown) => void)(node);
+    (must(h, 'pe-apikey').onChange as (e: unknown) => void)({
+      target: { value: 'sk-draft-99' },
+    });
+    (must(h, 'pe-save').onClick as () => void)();
+    // 草稿立即清空；payload 在 IPC 解决前仍持有 key
+    expect(node.value).toBe('');
+    expect(captured?.apiKey).toBe('sk-draft-99');
+    resolveSave(clone(savedProvider));
+    await flushMicrotasks();
+    expect('apiKey' in (captured as ProviderInput)).toBe(false);
+    // 保存成功后关闭编辑器
+    expect(h.store.getState().editor).toBeNull();
+    h.unmount();
+  });
+
+  it('cancel while IPC is in flight scrubs the payload; late resolve does not close a reopened editor', async () => {
+    let captured: ProviderInput | undefined;
+    let resolveSave: (c: ProviderConfig) => void = () => {};
+    const gate = new Promise<ProviderConfig>((res) => {
+      resolveSave = res;
+    });
+    editorApi(async (i) => {
+      captured = i;
+      return gate;
+    });
+    const h = await mountEditor({ id: null });
+    (must(h, 'pe-apikey').ref as (n: unknown) => void)({ value: '' });
+    (must(h, 'pe-apikey').onChange as (e: unknown) => void)({
+      target: { value: 'sk-draft-99' },
+    });
+    (must(h, 'pe-save').onClick as () => void)();
+    expect(captured?.apiKey).toBe('sk-draft-99');
+    (must(h, 'pe-cancel').onClick as () => void)();
+    // 取消当下 payload 里的明文就被删掉
+    expect('apiKey' in (captured as ProviderInput)).toBe(false);
+    // 用户在 IPC 未决期间打开了另一个厂商的编辑器
+    h.store.actions.openEditor('p1');
+    resolveSave(clone(savedProvider));
+    await flushMicrotasks();
+    expect(h.store.getState().editor).toEqual({ id: 'p1' });
+    h.unmount();
+  });
+
+  it('unmount while IPC is in flight scrubs the payload via effect cleanup', async () => {
+    let captured: ProviderInput | undefined;
+    const gate = new Promise<ProviderConfig>(() => {});
+    editorApi(async (i) => {
+      captured = i;
+      return gate;
+    });
+    const h = await mountEditor({ id: null });
+    (must(h, 'pe-apikey').onChange as (e: unknown) => void)({
+      target: { value: 'sk-draft-99' },
+    });
+    (must(h, 'pe-save').onClick as () => void)();
+    expect(captured?.apiKey).toBe('sk-draft-99');
+    h.unmount();
+    expect('apiKey' in (captured as ProviderInput)).toBe(false);
+  });
+
+  it('detaching the key input while IPC is in flight scrubs the payload', async () => {
+    let captured: ProviderInput | undefined;
+    const gate = new Promise<ProviderConfig>(() => {});
+    editorApi(async (i) => {
+      captured = i;
+      return gate;
+    });
+    const h = await mountEditor({ id: null });
+    (must(h, 'pe-apikey').ref as (n: unknown) => void)({ value: 'x' });
+    (must(h, 'pe-apikey').onChange as (e: unknown) => void)({
+      target: { value: 'sk-draft-99' },
+    });
+    (must(h, 'pe-save').onClick as () => void)();
+    expect(captured?.apiKey).toBe('sk-draft-99');
+    (must(h, 'pe-apikey').ref as (n: unknown) => void)(null);
+    expect('apiKey' in (captured as ProviderInput)).toBe(false);
+    h.unmount();
+  });
+
+  it('rejects a short typed key locally and shows the key error without calling save', async () => {
+    let saveCalls = 0;
+    editorApi(async () => {
+      saveCalls += 1;
+      return clone(savedProvider);
+    });
+    const h = await mountEditor({ id: null });
+    (must(h, 'pe-apikey').onChange as (e: unknown) => void)({ target: { value: 'sk-1' } });
+    (must(h, 'pe-save').onClick as () => void)();
+    expect(saveCalls).toBe(0);
+    expect(h.byTestId('pe-apikey')?.['aria-invalid']).toBe(true);
+    expect(h.byTestId('pe-apikey')?.['aria-describedby']).toBe('pe-apikey-err');
+    expect(String(h.byTestId('pe-apikey-err')?.children)).toContain('至少 8');
+    h.unmount();
+  });
+
+  it('rejects a draft containing the mask placeholder without calling save', async () => {
+    let saveCalls = 0;
+    editorApi(async () => {
+      saveCalls += 1;
+      return clone(savedProvider);
+    });
+    const h = await mountEditor({ id: null });
+    (must(h, 'pe-apikey').onChange as (e: unknown) => void)({
+      target: { value: 'sk-abc[已隐藏]xyz' },
+    });
+    (must(h, 'pe-save').onClick as () => void)();
+    expect(saveCalls).toBe(0);
+    expect(String(h.byTestId('pe-apikey-err')?.children)).toContain('占位符');
+    h.unmount();
+  });
+
+  it('rejects a whitespace-only key draft but treats a truly empty draft as retain', async () => {
+    const calls: ProviderInput[] = [];
+    editorApi(async (i) => {
+      calls.push(i);
+      return clone(savedProvider);
+    });
+    const h = await mountEditor({ id: null });
+    (must(h, 'pe-apikey').onChange as (e: unknown) => void)({ target: { value: '   ' } });
+    (must(h, 'pe-save').onClick as () => void)();
+    expect(calls).toHaveLength(0);
+    expect(String(h.byTestId('pe-apikey-err')?.children)).toContain('不能为空字符串');
+    // 清空草稿后再保存：apiKey 为 undefined（新建厂商表示不设置 key）
+    (must(h, 'pe-apikey').onChange as (e: unknown) => void)({ target: { value: '' } });
+    (must(h, 'pe-save').onClick as () => void)();
+    await flushMicrotasks();
+    expect(calls).toHaveLength(1);
+    expect(calls[0].apiKey).toBeUndefined();
+    h.unmount();
   });
 });
