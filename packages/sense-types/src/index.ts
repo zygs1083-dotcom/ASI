@@ -170,6 +170,8 @@ export interface EnvUpdate {
   at: number;
   changes: EnvChange[];
   suppressed: number;
+  /** Signals already injected this session from a split mixed bucket (sum of `count`s). */
+  alreadyInjected?: number;
 }
 
 /**

@@ -190,4 +190,13 @@ describe('formatEnvUpdate', () => {
     // visible variant still shows the generic fact.updated line
     expect(formatEnvUpdate(u)).toContain('env.focusedWindow');
   });
+
+  it('renders the already-injected summary only for a positive count', () => {
+    const u = update([change({ signal: sig({ id: 'j', kind: 'job.exited', at: T0, data: { exitCode: 1 } }) })], {
+      alreadyInjected: 3,
+    });
+    expect(formatEnvUpdate(u)).toContain('另有 3 条已在上一步注入');
+    expect(formatEnvUpdate(update([], { alreadyInjected: 0 }))).not.toContain('已在上一步注入');
+    expect(formatEnvUpdate(update([]))).not.toContain('已在上一步注入');
+  });
 });

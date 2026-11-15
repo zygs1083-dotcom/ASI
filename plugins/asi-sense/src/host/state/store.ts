@@ -1,3 +1,4 @@
+import { performance } from 'node:perf_hooks';
 import type { Fact, FactStatus, JobSummary, SenseState, Signal } from '@asi/sense-types';
 import { FACT_PATHS, factAt, initialState, num, recomputeStatuses, str, ttlOf } from './facts.ts';
 import { FACT_STATUSES, sourceObservation } from './source-health.ts';
@@ -36,48 +37,70 @@ interface JobTrack {
 export class StateStore {
   private static readonly DEDUP_MAX = 1024;
   private static readonly JOB_RETENTION_MS = 600_000;
-  private readonly clock: () => number;
+  private readonly wallClock: () => number;
+  private readonly monotonic: () => number;
   private readonly defaultTtlMs: number;
   private readonly listeners = new Set<(snapshot: SenseState) => void>();
   private readonly state: SenseState;
   private readonly seenIds = new Set<string>();
   private readonly seenOrder: string[] = [];
   private readonly jobs = new Map<string, JobTrack>();
-  private readonly queue: Signal[] = [];
+  private readonly queue: { signal: Signal; afterApply?: () => void }[] = [];
+  /** `signal.at` of the last accepted `env.activeJobs` replacement. */
+  private jobSnapshotAt = Number.NEGATIVE_INFINITY;
   private processing = false;
 
-  constructor(clock: () => number = Date.now, defaultTtlMs = 60_000) {
-    this.clock = clock;
+  /**
+   * `monotonicClock` (never `Date.now`) drives job-tombstone retention.
+   */
+  constructor(
+    wallClock: () => number = Date.now,
+    defaultTtlMs = 60_000,
+    monotonicClock: () => number = () => performance.now(),
+  ) {
+    this.wallClock = wallClock;
+    this.monotonic = monotonicClock;
     this.defaultTtlMs = defaultTtlMs;
-    this.state = initialState(this.clock(), defaultTtlMs);
+    this.state = initialState(this.wallClock(), defaultTtlMs);
   }
 
   /**
    * Feeds one signal into the fact table and notifies subscribers. The
    * signal is deep-cloned on entry, so later caller mutation cannot corrupt
    * stored facts. A call made inside a subscriber only enqueues; the
-   * outermost call drains the queue in order.
+   * outermost call drains the queue in order — each entry applies, emits
+   * fixed snapshots, then runs `afterApply` (even on a duplicate); its
+   * errors are collected and the first rethrown after the queue drains.
    */
-  apply(signal: Signal): void {
-    this.queue.push(structuredClone(signal));
+  apply(signal: Signal, afterApply?: () => void): void {
+    this.queue.push({ signal: structuredClone(signal), afterApply });
     if (this.processing) return;
     this.processing = true;
+    const errors: unknown[] = [];
     try {
       let next = this.queue.shift();
       while (next !== undefined) {
-        if (!this.isDuplicate(next.id)) {
-          this.applyOne(next);
+        if (!this.isDuplicate(next.signal.id)) {
+          this.applyOne(next.signal);
           this.emit();
+        }
+        if (next.afterApply !== undefined) {
+          try {
+            next.afterApply();
+          } catch (e) {
+            errors.push(e);
+          }
         }
         next = this.queue.shift();
       }
     } finally {
       this.processing = false;
     }
+    if (errors.length > 0) throw errors[0];
   }
 
   /** Returns an isolated deep-cloned snapshot with TTL statuses computed at `now`. */
-  snapshot(now: number = this.clock()): SenseState {
+  snapshot(now: number = this.wallClock()): SenseState {
     const clone = structuredClone(this.state);
     recomputeStatuses(clone, now);
     return clone;
@@ -186,9 +209,9 @@ export class StateStore {
     fact.ttlMs = ttlOf(signal.data.ttlMs, this.defaultTtlMs);
   }
 
-  /** Drops exit tombstones past the retention window (store clock). */
+  /** Drops exit tombstones past the retention window (monotonic clock). */
   private pruneJobs(): void {
-    const now = this.clock();
+    const now = this.monotonic();
     for (const [id, track] of this.jobs) {
       if (track.exited && now - track.receivedAt >= StateStore.JOB_RETENTION_MS) this.jobs.delete(id);
     }
@@ -218,6 +241,8 @@ export class StateStore {
     // Older input is ignored, and at an equal timestamp the exit tombstone
     // wins — only a genuinely newer start may reuse the id.
     if (track && signal.at <= track.lastEventAt) return;
+    // pre-snapshot starts are ignored — the replacement answered for that time
+    if (signal.at < this.jobSnapshotAt) return;
     const job: JobSummary = {
       id,
       startedAt: num(signal.data.startedAt) ?? signal.at,
@@ -226,7 +251,7 @@ export class StateStore {
     if (typeof signal.data.command === 'string') job.command = signal.data.command;
     const pid = num(signal.data.pid);
     if (pid !== undefined) job.pid = pid;
-    this.jobs.set(id, { lastEventAt: signal.at, exited: false, receivedAt: this.clock(), job });
+    this.jobs.set(id, { lastEventAt: signal.at, exited: false, receivedAt: this.monotonic(), job });
     this.commitJobs(signal);
   }
 
@@ -236,7 +261,7 @@ export class StateStore {
     const track = this.jobs.get(id);
     // Exit wins equal timestamps over start; only an older exit is ignored.
     if (track && signal.at < track.lastEventAt) return;
-    this.jobs.set(id, { lastEventAt: signal.at, exited: true, receivedAt: this.clock() });
+    this.jobs.set(id, { lastEventAt: signal.at, exited: true, receivedAt: this.monotonic() });
     this.commitJobs(signal);
   }
 
@@ -254,10 +279,16 @@ export class StateStore {
     fact.observedAt = signal.at;
     fact.ttlMs = ttlOf(signal.data.ttlMs, this.defaultTtlMs);
     // A replaced job list reseeds tracking — an array seeds its entries, a
-    // non-array (e.g. null) clears it — or the next job event would rebuild
-    // the value from stale tracks and silently resurrect dropped jobs.
+    // non-array (e.g. null) clears running jobs — or the next job event
+    // would rebuild the value from stale tracks and resurrect dropped jobs.
+    // The watermark ignores pre-snapshot starts for replaced/unknown ids
+    // while unexpired exit tombstones survive the replacement.
     if (path === 'env.activeJobs') {
-      this.jobs.clear();
+      this.jobSnapshotAt = signal.at;
+      this.pruneJobs();
+      for (const [id, track] of this.jobs) {
+        if (!track.exited) this.jobs.delete(id);
+      }
       if (Array.isArray(value)) {
         for (const j of value as JobSummary[]) {
           if (!j || typeof j !== 'object' || typeof j.id !== 'string') continue;
@@ -265,7 +296,7 @@ export class StateStore {
           this.jobs.set(j.id, {
             lastEventAt: signal.at,
             exited: !running,
-            receivedAt: this.clock(),
+            receivedAt: this.monotonic(),
             ...(running ? { job: j } : {}),
           });
         }

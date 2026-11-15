@@ -122,7 +122,7 @@ describe('job tracking', () => {
 
   it('tracks interleaved jobs independently and retains exit tombstones', () => {
     const c = new FakeClock();
-    const st = new StateStore(c.time, 1000);
+    const st = new StateStore(c.time, 1000, c.time);
     st.apply(started('A', 1));
     st.apply(started('B', 10, { source: SRC2 }));
     st.apply(exited('A', 5)); // late exit removes only A
@@ -252,5 +252,21 @@ describe('store subscriber reentrancy', () => {
     st3.apply(sig({ id: '1', kind: 'app.activated', at: 1, data: { name: 'A' } }));
     st3.apply(sig({ id: '2', kind: 'app.activated', at: 2, data: { name: 'B' } }));
     expect(seen3).toEqual(['l1', 'l3:A', 'l1', 'l3:B']);
+
+    // a throwing afterApply callback propagates the raw error (even a
+    // thrown `undefined`) after the queue drains; the signal stays applied
+    const boom = new Error('cb');
+    const st4 = new StateStore(new FakeClock().time);
+    expect(() =>
+      st4.apply(sig({ id: '1', kind: 'app.activated', at: 1, data: { name: 'C' } }), () => {
+        throw boom;
+      }),
+    ).toThrow(boom);
+    expect(() =>
+      st4.apply(sig({ id: '2', kind: 'app.activated', at: 2, data: { name: 'D' } }), () => {
+        throw undefined;
+      }),
+    ).toThrow();
+    expect(st4.snapshot().env.frontApp.value?.name).toBe('D');
   });
 });

@@ -1,5 +1,14 @@
+import { createHash } from 'node:crypto';
 import type { EnvUpdate, Signal, WatchRule } from '@asi/sense-types';
-import { type Bucket, bucketChanges, bucketLevel, bucketSince, byChangeAtId, upsertBucket } from './buckets.ts';
+import {
+  type Bucket,
+  type BucketDetail,
+  bucketChanges,
+  bucketLevel,
+  bucketSince,
+  byChangeAtId,
+  upsertBucket,
+} from './buckets.ts';
 import type { DeliveryIntent, SessionState } from './pipeline.ts';
 
 const WAKE_WINDOW_MS = 600_000;
@@ -16,27 +25,39 @@ export interface DrainHooks {
   wallClock: () => number;
 }
 
-function collectError(errors: unknown[], e: unknown): void {
-  if (e instanceof AggregateError) errors.push(...e.errors);
-  else errors.push(e);
+/** A frozen inject delivery: the built intent retries verbatim on failure. */
+interface InjectBatch {
+  buckets: Bucket[];
+  intent: DeliveryIntent;
 }
 
 function throwCollected(errors: unknown[], label: string): void {
+  // raw rejections propagate unchanged — even an empty AggregateError
   if (errors.length === 1) throw errors[0];
   if (errors.length > 1) throw new AggregateError(errors, label);
 }
 
+/** Idempotency key: session + SORTED original signal ids — same payload ⇒ same id on retry. */
+function deliveryId(sessionId: string, buckets: Bucket[]): string {
+  const ids = buckets.flatMap((b) => [...b.details.values()].flatMap((d) => d.ids)).sort();
+  return createHash('sha256')
+    .update(JSON.stringify([sessionId, ids]))
+    .digest('hex');
+}
+
 /**
  * Merge buckets (pending) plus the ready context queue, delivered through
- * the host's deliverer. Attempts are independent: a bucket is removed only
- * after its delivery resolves, a rejection retains it uncharged, and one
- * failure never stops the remaining buckets — of any session — from being
- * tried. Intents are deep-cloned so a rejecting adapter that mutates them
- * cannot corrupt the retained retry.
+ * the host's deliverer. Attempts are independent and isolated: a bucket is
+ * detached and sealed BEFORE its awaited delivery, so a rejection retains
+ * it for a same-payload retry while fresh same-subject input opens a new
+ * bucket, and one failure never stops the remaining buckets — of any
+ * session — from being tried. Intents are deep-cloned so a rejecting
+ * adapter that mutates them cannot corrupt the retained retry.
  */
 export class BucketDrain {
   private readonly pending = new Map<number, Bucket>();
   private readonly ready = new Map<string, Bucket[]>();
+  private readonly batches = new Map<string, InjectBatch[]>();
   private readonly deliverer: DrainHooks['deliverer'];
   private readonly sessions: DrainHooks['sessions'];
   private readonly clock: () => number;
@@ -76,54 +97,77 @@ export class BucketDrain {
    */
   async due(now: number): Promise<void> {
     const errors: unknown[] = [];
-    for (const b of [...this.pending.values()]) {
-      if (now < b.deadline) continue;
-      try {
-        await this.complete(b);
-        this.pending.delete(b.id);
-      } catch (e) {
-        collectError(errors, e);
-      }
-    }
+    await this.attemptDue(now, errors);
     throwCollected(errors, 'delivery failed');
   }
 
   /**
-   * Pre-step drain (DESIGN §2.3): the session's pending context-level groups
-   * close early — wake groups keep waiting for their deadline — due buckets
-   * for every session drain next, and the session's ready context injects
-   * last. Each step runs even when an earlier one failed.
+   * Pre-step drain (DESIGN §2.3): the session's context ships FIRST — pure
+   * context groups close early and context details split out of still-open
+   * mixed buckets — then ready context injects, due buckets for every
+   * session drain, and anything the due pass made ready injects too.
    */
   async preStep(sessionId: string, now: number): Promise<void> {
     for (const b of [...this.pending.values()]) {
-      if (b.sessionId === sessionId && bucketLevel(b) === 'context') {
-        this.readyList(b.sessionId).push(b);
+      if (b.sessionId !== sessionId || b.sealed) continue;
+      if (bucketLevel(b) === 'context') {
         this.pending.delete(b.id);
+        this.list(this.ready, sessionId).push(b);
+        continue;
       }
+      // Mixed bucket: split context details into ready context; the wake
+      // remainder keeps the ORIGINAL deadline pending.
+      const ctx = new Map<string, BucketDetail>();
+      for (const [kind, d] of b.details) {
+        if (d.level === 'context') ctx.set(kind, d);
+      }
+      if (ctx.size === 0) continue;
+      for (const kind of ctx.keys()) b.details.delete(kind);
+      this.seq += 1;
+      this.list(this.ready, sessionId).push({
+        id: this.seq,
+        sessionId: b.sessionId,
+        subject: b.subject,
+        startedAt: b.startedAt,
+        deadline: b.deadline,
+        details: ctx,
+        splitFrom: b,
+      });
     }
     const errors: unknown[] = [];
-    try {
-      await this.due(now);
-    } catch (e) {
-      collectError(errors, e);
-    }
-    try {
-      await this.inject(sessionId);
-    } catch (e) {
-      collectError(errors, e);
-    }
+    const attempted = new Set<InjectBatch>();
+    await this.attemptInject(sessionId, errors, attempted);
+    await this.attemptDue(now, errors);
+    // due-pass downgrades also inject THIS step; failed batches wait for the next
+    await this.attemptInject(sessionId, errors, attempted);
     throwCollected(errors, 'pre-step delivery failed');
+  }
+
+  /** Due buckets attempted independently; failures restore the sealed bucket for a same-payload retry. */
+  private async attemptDue(now: number, errors: unknown[]): Promise<void> {
+    for (const b of [...this.pending.values()]) {
+      if (now < b.deadline) continue;
+      this.pending.delete(b.id);
+      b.sealed = true;
+      try {
+        await this.complete(b);
+      } catch (e) {
+        errors.push(e);
+        this.pending.set(b.id, b); // sealed: retry only, never a merge target
+      }
+    }
   }
 
   /**
    * Completes one due bucket: context groups go to the ready queue; wake
    * groups check the per-session budget on a fresh monotonic sample — the
    * drain may have been queued long ago — and charge it once, on a second
-   * fresh sample taken AFTER the delivery resolves.
+   * fresh sample taken AFTER the delivery resolves. `at`/`deliveryId`
+   * freeze at the FIRST attempt and survive retries.
    */
   private async complete(b: Bucket): Promise<void> {
     if (bucketLevel(b) !== 'wake') {
-      this.readyList(b.sessionId).push(b);
+      this.list(this.ready, b.sessionId).push(b);
       return;
     }
     const s = this.sessions.get(b.sessionId);
@@ -139,58 +183,86 @@ export class BucketDrain {
         }
       }
       this.suppressedGroups++;
-      this.readyList(b.sessionId).push(b);
+      if (b.frozenAt === undefined) {
+        this.list(this.ready, b.sessionId).push(b); // never attempted: aggregates
+      } else {
+        // previously attempted wake: inject separately, keeping its
+        // original display time and identity — never join a fresh batch
+        this.list(this.batches, b.sessionId).push(this.buildInjectBatch(b.sessionId, [b], b.frozenAt));
+      }
       return;
     }
+    if (b.frozenAt === undefined) b.frozenAt = this.wallClock();
     const changes = bucketChanges(b);
+    const update: EnvUpdate = { since: bucketSince(b), at: b.frozenAt, changes, suppressed: 0 };
+    if ((b.alreadyInjected ?? 0) > 0) update.alreadyInjected = b.alreadyInjected;
     let intent: DeliveryIntent;
     if (s?.context.busy) {
       const reason = s.context.userInitiated ? 'user-active' : 'agent-busy';
       for (const ch of changes) if (ch.level === 'wake') ch.reason = reason;
-      const update: EnvUpdate = { since: bucketSince(b), at: this.wallClock(), changes, suppressed: 0 };
       intent = { kind: 'send', sessionId: b.sessionId, target: 'next-step', wakeup: true, update };
     } else {
-      const update: EnvUpdate = { since: bucketSince(b), at: this.wallClock(), changes, suppressed: 0 };
       intent = { kind: 'followup', sessionId: b.sessionId, update };
     }
+    intent.deliveryId = deliveryId(b.sessionId, [b]);
     await this.deliverer.deliver(structuredClone(intent));
     s?.wakeTimes.push(this.clock());
   }
 
   /**
-   * Injects the session's ready buckets in one update. On success exactly
-   * the delivered batch is removed — anything appended during the awaited
-   * delivery is retained — and on rejection nothing is dropped, so the next
-   * step retries the same batch exactly once.
+   * Freezes loose ready buckets into a fresh batch, then attempts every
+   * frozen batch in order, skipping batches already tried this step.
+   * Success marks split parents `alreadyInjected`; a rejection retains the
+   * batch unchanged.
    */
-  private async inject(sessionId: string): Promise<void> {
-    const ready = this.ready.get(sessionId);
-    if (!ready || ready.length === 0) return;
-    const batch = [...ready];
-    const changes = batch.flatMap((b) => bucketChanges(b)).sort(byChangeAtId);
-    const intent: DeliveryIntent = {
-      kind: 'inject',
-      sessionId,
-      update: {
-        since: Math.min(...batch.map(bucketSince)),
-        at: this.wallClock(),
-        changes,
-        // suppressed counts GROUPS, not the wake-budget details inside them
-        suppressed: batch.filter((b) => [...b.details.values()].some((d) => d.reason === 'wake-budget')).length,
-      },
-    };
-    await this.deliverer.deliver(structuredClone(intent));
-    const delivered = new Set(batch);
-    const remaining = (this.ready.get(sessionId) ?? []).filter((b) => !delivered.has(b));
-    if (remaining.length === 0) this.ready.delete(sessionId);
-    else this.ready.set(sessionId, remaining);
+  private async attemptInject(sessionId: string, errors: unknown[], attempted: Set<InjectBatch>): Promise<void> {
+    const loose = this.ready.get(sessionId);
+    if (loose !== undefined && loose.length > 0) {
+      this.ready.delete(sessionId);
+      this.list(this.batches, sessionId).push(this.buildInjectBatch(sessionId, loose));
+    }
+    const batches = this.batches.get(sessionId);
+    if (batches === undefined) return;
+    for (const batch of [...batches]) {
+      if (attempted.has(batch)) continue;
+      attempted.add(batch);
+      try {
+        await this.deliverer.deliver(structuredClone(batch.intent));
+      } catch (e) {
+        errors.push(e);
+        continue;
+      }
+      for (const b of batch.buckets) {
+        if (b.splitFrom !== undefined) {
+          const n = [...b.details.values()].reduce((sum, d) => sum + d.count, 0);
+          b.splitFrom.alreadyInjected = (b.splitFrom.alreadyInjected ?? 0) + n;
+        }
+      }
+      batches.splice(batches.indexOf(batch), 1);
+    }
+    if (batches.length === 0) this.batches.delete(sessionId);
   }
 
-  private readyList(sessionId: string): Bucket[] {
-    let list = this.ready.get(sessionId);
+  /** Builds the immutable inject intent: sorted changes, earliest `since`,
+   * suppressed-group count, summed `alreadyInjected`, stable `deliveryId`. */
+  private buildInjectBatch(sessionId: string, buckets: Bucket[], at?: number): InjectBatch {
+    const alreadyInjected = buckets.reduce((n, b) => n + (b.alreadyInjected ?? 0), 0);
+    const update: EnvUpdate = {
+      since: Math.min(...buckets.map(bucketSince)),
+      at: at ?? this.wallClock(),
+      changes: buckets.flatMap((b) => bucketChanges(b)).sort(byChangeAtId),
+      // suppressed counts GROUPS, not the wake-budget details inside them
+      suppressed: buckets.filter((b) => [...b.details.values()].some((d) => d.reason === 'wake-budget')).length,
+    };
+    if (alreadyInjected > 0) update.alreadyInjected = alreadyInjected;
+    return { buckets, intent: { kind: 'inject', sessionId, update, deliveryId: deliveryId(sessionId, buckets) } };
+  }
+
+  private list<T>(map: Map<string, T[]>, sessionId: string): T[] {
+    let list = map.get(sessionId);
     if (!list) {
       list = [];
-      this.ready.set(sessionId, list);
+      map.set(sessionId, list);
     }
     return list;
   }

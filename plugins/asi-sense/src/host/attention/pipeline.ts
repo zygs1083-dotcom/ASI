@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { performance } from 'node:perf_hooks';
 import type { DeliveryLevel, EnvChange, EnvUpdate, Signal, SourceObservation, WatchRule } from '@asi/sense-types';
 import { sourceObservation } from '../state/source-health.ts';
@@ -19,17 +20,28 @@ export interface SessionContext {
 /**
  * A delivery instruction for the host adapter (M3 implements the transports).
  * `sessionId` routes the intent back to the session that produced it.
+ * `deliveryId` is the stable SHA-256 idempotency key the host dedups
+ * at-least-once deliveries by (README).
  */
 export type DeliveryIntent =
-  | { kind: 'inject'; sessionId: string; update: EnvUpdate }
-  | { kind: 'followup'; sessionId: string; update: EnvUpdate }
+  | { kind: 'inject'; sessionId: string; update: EnvUpdate; deliveryId?: string }
+  | { kind: 'followup'; sessionId: string; update: EnvUpdate; deliveryId?: string }
   | {
       kind: 'send';
       sessionId: string;
       target: 'next-step';
       wakeup: true;
       update: EnvUpdate;
+      deliveryId?: string;
     };
+
+/** Thrown for pipeline APIs awaited inside `Deliverer.deliver` (deadlock). */
+export class ReentrantDeliveryError extends Error {
+  constructor() {
+    super('adapter.deliver must not await pipeline APIs (accept/flush/preStep): return or reject instead');
+    this.name = 'ReentrantDeliveryError';
+  }
+}
 
 /**
  * Sink for delivery intents. The returned promise is awaited before any
@@ -88,6 +100,8 @@ export class AttentionPipeline {
   private readonly mergeWindowMs: number;
   private readonly fileMergeWindowMs: number;
   private readonly sessions = new Map<string, SessionState>();
+  /** Set only while `Deliverer.deliver` (and its async continuations) runs. */
+  private readonly deliveryContext = new AsyncLocalStorage<true>();
   private tail: Promise<void> = Promise.resolve();
 
   constructor(options: AttentionPipelineOptions) {
@@ -104,7 +118,9 @@ export class AttentionPipeline {
     this.mergeWindowMs = options.mergeWindowMs ?? 2_000;
     this.fileMergeWindowMs = options.fileMergeWindowMs ?? 5_000;
     this.drain = new BucketDrain({
-      deliverer: options.deliverer,
+      deliverer: {
+        deliver: (intent) => this.deliveryContext.run(true, () => options.deliverer.deliver(intent)),
+      },
       sessions: this.sessions,
       clock: this.clock,
       wallClock: this.wallClock,
@@ -146,16 +162,34 @@ export class AttentionPipeline {
   /**
    * Feeds one signal and resolves to its normalized {@link EnvChange}
    * (`count: 1`, effective level, rule info, reason). All intake — session
-   * refresh, clone/classify, store apply, dedup/match/enqueue — completes
-   * before the first await, so a rejected drain keeps the signal.
+   * refresh, clone/classify, store apply, dedup/match/enqueue — runs inside
+   * the store's apply callback before the first await, so a rejected drain
+   * keeps the signal. A reentrant `accept` queues behind the outer intake;
+   * inside `deliver` this rejects with {@link ReentrantDeliveryError}.
    */
   async accept(signal: Signal, session: SessionContext): Promise<EnvChange> {
-    const s = this.session(session.id);
-    s.context = session;
+    if (this.deliveryContext.getStore()) {
+      throw new ReentrantDeliveryError();
+    }
     const ev = structuredClone(signal);
     ev.cause = classifyCause(ev, session.toolWindows ?? []);
-    this.store.apply(ev);
-    const now = this.clock();
+    return await new Promise<EnvChange>((resolve, reject) => {
+      this.store.apply(ev, () => {
+        try {
+          const now = this.clock();
+          const result = this.intake(ev, session, now);
+          this.enqueueDrain(() => this.drain.due(now)).then(() => resolve(result), reject);
+        } catch (e) {
+          reject(e);
+        }
+      });
+    });
+  }
+
+  /** All mutable accept intake — runs inside the store's apply callback (FIFO). */
+  private intake(ev: Signal, session: SessionContext, now: number): EnvChange {
+    const s = this.session(session.id);
+    s.context = session;
     const change: EnvChange = { signal: ev, count: 1, level: 'record' };
     if (this.isDuplicate(s, ev.id)) {
       change.reason = 'duplicate';
@@ -186,22 +220,37 @@ export class AttentionPipeline {
         }
       }
     }
-    const result = structuredClone(change);
-    await this.enqueueDrain(() => this.drain.due(now));
-    return result;
-  }
-
-  /** Completes every bucket whose monotonic deadline passed (awaited). */
-  flush(now: number = this.clock()): Promise<void> {
-    return this.enqueueDrain(() => this.drain.due(now));
+    return structuredClone(change);
   }
 
   /**
-   * Drains due buckets, then injects the session's ready context — including
-   * its pending context-level groups closed early for this step.
+   * Completes every bucket whose monotonic deadline passed (awaited). `now`
+   * must be a timestamp of the injected MONOTONIC clock (never `Date.now` or
+   * a future value — a later cutoff is clamped to the current clock, and a
+   * non-finite one is a `TypeError`); omit it for the normal case.
+   */
+  flush(now: number = this.clock()): Promise<void> {
+    if (this.deliveryContext.getStore()) return Promise.reject(new ReentrantDeliveryError());
+    const cutoff = this.cutoff(now);
+    return this.enqueueDrain(() => this.drain.due(cutoff));
+  }
+
+  /**
+   * Injects the session's ready context — including its pending
+   * context-level groups closed early for this step — then drains due
+   * buckets. `now` follows the same monotonic-clock contract as
+   * {@link flush}.
    */
   preStep(sessionId: string, now: number = this.clock()): Promise<void> {
-    return this.enqueueDrain(() => this.drain.preStep(sessionId, now));
+    if (this.deliveryContext.getStore()) return Promise.reject(new ReentrantDeliveryError());
+    const cutoff = this.cutoff(now);
+    return this.enqueueDrain(() => this.drain.preStep(sessionId, cutoff));
+  }
+
+  /** Validates/clamps a caller-supplied due cutoff to the injected clock. */
+  private cutoff(now: number): number {
+    if (!Number.isFinite(now)) throw new TypeError('drain cutoff must be a finite monotonic timestamp');
+    return Math.min(now, this.clock());
   }
 
   /** Serializes drains on a promise tail; a rejected run cannot stall the next one. */

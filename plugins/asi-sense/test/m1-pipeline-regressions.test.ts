@@ -66,26 +66,35 @@ describe('async intake and delivery', () => {
 
   it('awaits rejected context delivery and retries only the retained batch', async () => {
     const c = new FakeClock();
-    const intents: DeliveryIntent[] = [];
+    const calls: DeliveryIntent[] = [];
     let failNext = true;
     const pipeline = pipelineWith(c, async (i) => {
+      calls.push(structuredClone(i));
       if (failNext) {
         failNext = false;
         throw new Error('retry');
       }
-      intents.push(i);
     });
     await pipeline.accept(jobExit('done', 0, 0), sess()); // context bucket
     c.advance(2001);
     await expect(pipeline.preStep('s1')).rejects.toThrow('retry');
-    // a new context signal joins the retained batch for the next step
+    await pipeline.flush(); // flush never retries a failed inject
+    expect(calls).toHaveLength(1);
+    // a new context signal becomes a SEPARATE fresh batch — the frozen
+    // failed batch retries unchanged and is never re-merged
     await pipeline.accept(file('f', 2, '/w/b.ts'), sess());
     await pipeline.preStep('s1');
     await pipeline.preStep('s1');
-    expect(intents).toHaveLength(1); // one inject, never redelivered
-    const inj = intents[0];
-    if (inj?.kind !== 'inject') throw new Error('expected inject');
-    expect(inj.update.changes.map((ch) => ch.signal.id).sort()).toEqual(['done', 'f']);
+    expect(calls).toHaveLength(3); // failed attempt + 'done' retry + 'f'
+    const retry = calls[1];
+    if (retry?.kind !== 'inject') throw new Error('expected inject');
+    expect(retry.update.changes.map((ch) => ch.signal.id)).toEqual(['done']);
+    expect(retry.deliveryId).toBe(calls[0]?.deliveryId); // stable frozen identity
+    expect(retry.update.at).toBe(calls[0]?.update.at);
+    const fresh = calls[2];
+    if (fresh?.kind !== 'inject') throw new Error('expected inject');
+    expect(fresh.update.changes.map((ch) => ch.signal.id)).toEqual(['f']);
+    expect(fresh.deliveryId).not.toBe(retry.deliveryId);
   });
 
   it('serializes concurrent flush and preStep drains without duplicate or lost delivery', async () => {

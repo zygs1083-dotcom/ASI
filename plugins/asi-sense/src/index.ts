@@ -3,6 +3,7 @@ export {
   type AttentionPipelineOptions,
   type Deliverer,
   type DeliveryIntent,
+  ReentrantDeliveryError,
   type SessionContext,
 } from './host/attention/pipeline.ts';
 export {

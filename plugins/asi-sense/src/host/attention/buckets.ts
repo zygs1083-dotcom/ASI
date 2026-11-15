@@ -13,6 +13,8 @@ export interface BucketDetail {
   /** Earliest `signal.at` seen for this kind. */
   since: number;
   latest: Signal;
+  /** Every merged signal id — the retry identity of the delivery. */
+  ids: string[];
   ruleId?: string;
   note?: string;
   reason?: string;
@@ -34,6 +36,14 @@ export interface Bucket {
   /** Monotonic completion deadline, `startedAt + window of first kind`. */
   deadline: number;
   details: Map<string, BucketDetail>;
+  /** Set at the first delivery attempt — no further merges or splits. */
+  sealed?: boolean;
+  /** Wall-clock `EnvUpdate.at` frozen at the first delivery attempt. */
+  frozenAt?: number;
+  /** The mixed bucket this context-only split came from. */
+  splitFrom?: Bucket;
+  /** Signals already injected from this bucket via split context. */
+  alreadyInjected?: number;
 }
 
 /** A bucket is a wake group iff any of its kind details is wake-level. */
@@ -74,7 +84,12 @@ export function upsertBucket(
 ): void {
   let b: Bucket | undefined;
   for (const candidate of pending.values()) {
-    if (candidate.sessionId === sessionId && candidate.subject === signal.subject && candidate.deadline > now) {
+    if (
+      !candidate.sealed &&
+      candidate.sessionId === sessionId &&
+      candidate.subject === signal.subject &&
+      candidate.deadline > now
+    ) {
       b = candidate;
       break;
     }
@@ -92,7 +107,14 @@ export function upsertBucket(
   }
   const d = b.details.get(signal.kind);
   if (!d) {
-    const detail: BucketDetail = { kind: signal.kind, level, count: 1, since: signal.at, latest: signal };
+    const detail: BucketDetail = {
+      kind: signal.kind,
+      level,
+      count: 1,
+      since: signal.at,
+      latest: signal,
+      ids: [signal.id],
+    };
     if (rule?.id !== undefined) detail.ruleId = rule.id;
     if (rule?.note !== undefined) detail.note = rule.note;
     if (reason !== undefined) detail.reason = reason;
@@ -100,6 +122,7 @@ export function upsertBucket(
     return;
   }
   d.count++;
+  d.ids.push(signal.id);
   d.since = Math.min(d.since, signal.at);
   const better =
     LEVEL_RANK[level] > LEVEL_RANK[d.level] ||

@@ -100,6 +100,7 @@ export function formatEnvUpdate(update: EnvUpdate, options: FormatOptions = {}):
   const lines = [`<env-update since="${esc(hhmmss(update.since))}" source="asi-sense">`];
   for (const ch of changes) lines.push(...changeLines(ch, includeTitles));
   if (update.suppressed > 0) lines.push(`suppressed: ${update.suppressed}`);
+  if ((update.alreadyInjected ?? 0) > 0) lines.push(`另有 ${update.alreadyInjected} 条已在上一步注入`);
   lines.push('</env-update>');
   return lines.join('\n');
 }
