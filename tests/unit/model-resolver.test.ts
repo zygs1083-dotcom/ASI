@@ -1,6 +1,6 @@
 import type { Context } from '@mariozechner/pi-ai';
 import { complete } from '@mariozechner/pi-ai';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   builtinProviderName,
   isSupportedBuiltinProvider,
@@ -50,6 +50,11 @@ function resolver(): ModelResolver {
 function ctx(): Context {
   return { messages: [{ role: 'user', content: 'ping', timestamp: Date.now() }] };
 }
+
+beforeEach(() => {
+  vi.stubEnv('ASI_FAUX', '');
+  vi.stubEnv('ASI_DATA_DIR', '');
+});
 
 afterEach(() => {
   for (const r of resolvers.splice(0)) {
