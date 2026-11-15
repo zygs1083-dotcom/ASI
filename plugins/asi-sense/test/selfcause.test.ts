@@ -1,0 +1,167 @@
+import { describe, expect, it } from 'vitest';
+import { classifyCause, type ToolWindow } from '../src/host/attention/selfcause.ts';
+import { sig } from './helpers.ts';
+
+const W: ToolWindow = { startedAt: 100, endedAt: 200, cwd: '/repo', pid: 42 };
+
+describe('classifyCause', () => {
+  it('marks file.changed under an active tool cwd as agent', () => {
+    const s = sig({
+      id: '1',
+      kind: 'file.changed',
+      at: 150,
+      subject: '/repo/src/a.ts',
+    });
+    expect(classifyCause(s, [W])).toBe('agent');
+    expect(classifyCause(s, [])).toBe('unknown');
+  });
+
+  it('uses data.path over subject for file changes', () => {
+    const s = sig({
+      id: '1',
+      kind: 'file.changed',
+      at: 150,
+      subject: '/else/x',
+      data: { path: '/repo/b' },
+    });
+    expect(classifyCause(s, [W])).toBe('agent');
+  });
+
+  it('respects inclusive time bounds and closed windows', () => {
+    const inW = sig({
+      id: '1',
+      kind: 'file.changed',
+      at: 200,
+      subject: '/repo/a',
+    });
+    const late = sig({
+      id: '2',
+      kind: 'file.changed',
+      at: 201,
+      subject: '/repo/a',
+    });
+    const early = sig({
+      id: '3',
+      kind: 'file.changed',
+      at: 99,
+      subject: '/repo/a',
+    });
+    expect(classifyCause(inW, [W])).toBe('agent');
+    expect(classifyCause(late, [W])).toBe('unknown');
+    expect(classifyCause(early, [W])).toBe('unknown');
+    const open: ToolWindow = { startedAt: 100, cwd: '/repo' };
+    expect(classifyCause(late, [open])).toBe('agent');
+  });
+
+  it('does not match prefix-only cwd (/repo vs /repository)', () => {
+    const s = sig({
+      id: '1',
+      kind: 'file.changed',
+      at: 150,
+      subject: '/repository/a',
+    });
+    expect(classifyCause(s, [W])).toBe('unknown');
+    const exact = sig({
+      id: '2',
+      kind: 'file.changed',
+      at: 150,
+      subject: '/repo',
+    });
+    expect(classifyCause(exact, [W])).toBe('agent');
+  });
+
+  it('matches job/process signals by pid and cwd', () => {
+    const byPid = sig({
+      id: '1',
+      kind: 'job.exited',
+      at: 150,
+      data: { pid: 42 },
+    });
+    const wrongPid = sig({
+      id: '2',
+      kind: 'job.exited',
+      at: 150,
+      data: { pid: 43 },
+    });
+    const startByCwd = sig({
+      id: '3',
+      kind: 'process.started',
+      at: 150,
+      data: { path: '/repo/bin/x' },
+    });
+    const procExit = sig({
+      id: '4',
+      kind: 'process.exited',
+      at: 150,
+      data: { pid: 42 },
+    });
+    expect(classifyCause(byPid, [W])).toBe('agent');
+    expect(classifyCause(wrongPid, [W])).toBe('unknown');
+    expect(classifyCause(startByCwd, [W])).toBe('agent');
+    expect(classifyCause(procExit, [W])).toBe('agent');
+  });
+
+  it('preserves explicit agent cause and upgrades user/unknown only on match', () => {
+    const unrelated = sig({
+      id: '1',
+      kind: 'app.activated',
+      at: 150,
+      cause: 'agent',
+    });
+    expect(classifyCause(unrelated, [])).toBe('agent');
+    const userFile = sig({
+      id: '2',
+      kind: 'file.changed',
+      at: 150,
+      subject: '/repo/a',
+      cause: 'user',
+    });
+    expect(classifyCause(userFile, [W])).toBe('agent');
+    const userOutside = sig({
+      id: '3',
+      kind: 'file.changed',
+      at: 500,
+      subject: '/repo/a',
+      cause: 'user',
+    });
+    expect(classifyCause(userOutside, [W])).toBe('user');
+    const app = sig({ id: '4', kind: 'app.activated', at: 150, cause: 'user' });
+    expect(classifyCause(app, [W])).toBe('user');
+  });
+
+  it("matches '..'-prefixed names inside cwd but never real parent traversal", () => {
+    const inside = sig({
+      id: '1',
+      kind: 'file.changed',
+      at: 150,
+      subject: '/repo/..notes/a.ts',
+    });
+    expect(classifyCause(inside, [W])).toBe('agent');
+    const traversal = sig({
+      id: '2',
+      kind: 'file.changed',
+      at: 150,
+      subject: '/repo/../outside.ts',
+    });
+    expect(classifyCause(traversal, [W])).toBe('unknown');
+    const sibling = sig({
+      id: '3',
+      kind: 'file.changed',
+      at: 150,
+      subject: '/repository/a.ts',
+    });
+    expect(classifyCause(sibling, [W])).toBe('unknown');
+  });
+
+  it('rejects relative signal paths instead of resolving against process cwd', () => {
+    const rel = sig({
+      id: '1',
+      kind: 'file.changed',
+      at: 150,
+      subject: 'src/a.ts',
+    });
+    expect(classifyCause(rel, [W])).toBe('unknown');
+    const relWin: ToolWindow = { startedAt: 0, cwd: 'repo/sub' };
+    expect(classifyCause(rel, [relWin])).toBe('unknown');
+  });
+});
