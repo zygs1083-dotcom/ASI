@@ -165,6 +165,8 @@ beforeEach(() => {
   streamMock.mockImplementation(REAL_PIAI.stream);
   mocks.handlers.clear();
   mocks.nativeTheme.themeSource = 'system';
+  vi.stubEnv('ASI_FAUX', '');
+  vi.stubEnv('ASI_DATA_DIR', '');
 });
 
 afterEach(() => {

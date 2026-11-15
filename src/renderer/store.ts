@@ -690,7 +690,13 @@ export const actions = {
 
   /** 保存只认后端返回；成功后先落本地再刷新，刷新失败不回滚也不吞掉结果 */
   async saveProvider(input: ProviderInput): Promise<ProviderConfig> {
-    const saved = await api().providers.save(input);
+    let saved: ProviderConfig;
+    try {
+      saved = await api().providers.save(input);
+    } finally {
+      // IPC 一旦返回（无论成败），渲染进程不再持有明文 key 引用
+      delete input.apiKey;
+    }
     const providers = [...state.providers.filter((p) => p.id !== saved.id), saved].sort(
       (a, b) => a.createdAt - b.createdAt,
     );

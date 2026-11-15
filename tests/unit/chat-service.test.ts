@@ -65,6 +65,7 @@ function setup(faux = true): Env {
   const dir = tempDir();
   vi.stubEnv('ASI_FAUX', faux ? '1' : '');
   vi.stubEnv('ASI_FAUX_REPLY', undefined);
+  vi.stubEnv('ASI_DATA_DIR', dir);
   const providers = new ProviderStore(dir, fakeEncryption());
   const conversations = new ConversationStore(dir);
   const resolver = new ModelResolver();
@@ -134,7 +135,7 @@ describe('ChatService.send validation', () => {
       name: 'Off',
       kind: 'builtin',
       builtinProvider: 'anthropic',
-      apiKey: 'sk-x',
+      apiKey: 'sk-x-aaaa',
       enabled: false,
       customModels: [],
     });
@@ -155,7 +156,7 @@ describe('ChatService.send validation', () => {
       name: 'Key',
       kind: 'builtin',
       builtinProvider: 'anthropic',
-      apiKey: 'sk-k',
+      apiKey: 'sk-k-aaaa',
       enabled: true,
       customModels: [],
     });
@@ -548,7 +549,7 @@ describe('ChatService.send streaming', () => {
       name: 'Anthropic',
       kind: 'builtin',
       builtinProvider: 'anthropic',
-      apiKey: 'sk-x',
+      apiKey: 'sk-x-aaaa',
       enabled: true,
       customModels: [],
     });
@@ -642,6 +643,94 @@ describe('ChatService.test', () => {
     expect(result.error).not.toContain('sk-resolved-7');
   });
 
+  it('masks snapshot keys in static errors like missing provider', async () => {
+    const env = setup();
+    // 遗留已存 key 恰好与静态错误文本相同：静态出口也必须过最终脱敏
+    vi.spyOn(env.providers, 'getRedactionKeys').mockReturnValue(['厂商不存在']);
+    const result = await env.service.test('missing', 'x');
+    expect(result.ok).toBe(false);
+    expect(result.error).toBe('[已隐藏]');
+    expect(result.error).not.toContain('厂商不存在');
+  });
+
+  it('masks the 测试失败 fallback when stopReason is error with an empty message', async () => {
+    const env = setup();
+    const provider = env.providers.save({
+      name: 'Anthropic',
+      kind: 'builtin',
+      builtinProvider: 'anthropic',
+      apiKey: 'sk-fallback-9',
+      enabled: true,
+      customModels: [],
+    });
+    vi.spyOn(env.providers, 'getRedactionKeys').mockReturnValue(['测试失败']);
+    completeMock.mockImplementationOnce(
+      async () => ({ stopReason: 'error', errorMessage: '' }) as AssistantMessage,
+    );
+    const result = await env.service.test(provider.id, 'claude-sonnet-4-5');
+    expect(result.ok).toBe(false);
+    // 兜底串本身命中已存 key：整串被脱敏
+    expect(result.error).toBe('[已隐藏]');
+  });
+
+  it('masks active and snapshotted saved keys in thrown errors even if a provider is deleted mid-test', async () => {
+    const env = setup();
+    const other = env.providers.save({
+      name: 'Other',
+      kind: 'builtin',
+      builtinProvider: 'anthropic',
+      apiKey: 'sk-other-88',
+      enabled: true,
+      customModels: [],
+    });
+    const target = env.providers.save({
+      name: 'Target',
+      kind: 'builtin',
+      builtinProvider: 'anthropic',
+      apiKey: 'sk-active-8',
+      enabled: true,
+      customModels: [],
+    });
+    completeMock.mockImplementationOnce(async () => {
+      // 测试挂起期间删除另一个厂商：其 key 仍受请求快照保护
+      env.providers.remove(other.id);
+      throw new Error('leak sk-active-8 and sk-other-88');
+    });
+    const result = await env.service.test(target.id, 'claude-sonnet-4-5');
+    expect(result.ok).toBe(false);
+    expect(result.error).toBe('leak [已隐藏] and [已隐藏]');
+  });
+
+  it('masks active and snapshotted saved keys in stopReason errors even if a provider is deleted mid-test', async () => {
+    const env = setup();
+    const other = env.providers.save({
+      name: 'Other',
+      kind: 'builtin',
+      builtinProvider: 'anthropic',
+      apiKey: 'sk-other-88',
+      enabled: true,
+      customModels: [],
+    });
+    const target = env.providers.save({
+      name: 'Target',
+      kind: 'builtin',
+      builtinProvider: 'anthropic',
+      apiKey: 'sk-active-8',
+      enabled: true,
+      customModels: [],
+    });
+    completeMock.mockImplementationOnce(async () => {
+      env.providers.remove(other.id);
+      return {
+        stopReason: 'error',
+        errorMessage: 'deny sk-active-8 / sk-other-88',
+      } as AssistantMessage;
+    });
+    const result = await env.service.test(target.id, 'claude-sonnet-4-5');
+    expect(result.ok).toBe(false);
+    expect(result.error).toBe('deny [已隐藏] / [已隐藏]');
+  });
+
   it('supports concurrent faux test() calls without stealing response queues', async () => {
     const env = setup();
     const [r1, r2] = await Promise.all([
@@ -673,7 +762,7 @@ describe('ChatService.test', () => {
       name: 'Off',
       kind: 'builtin',
       builtinProvider: 'anthropic',
-      apiKey: 'sk-x',
+      apiKey: 'sk-x-aaaa',
       enabled: false,
       customModels: [],
     });
@@ -694,7 +783,7 @@ describe('ChatService.test', () => {
       name: 'Key',
       kind: 'builtin',
       builtinProvider: 'anthropic',
-      apiKey: 'sk-k',
+      apiKey: 'sk-k-aaaa',
       enabled: true,
       customModels: [],
     });
@@ -709,7 +798,7 @@ describe('ChatService.test', () => {
       name: 'Anthropic',
       kind: 'builtin',
       builtinProvider: 'anthropic',
-      apiKey: 'sk-k',
+      apiKey: 'sk-k-aaaa',
       enabled: true,
       customModels: [],
     });
@@ -976,16 +1065,105 @@ describe('ChatService key masking (cross-chunk)', () => {
     expect(terminalMessage(env.events)?.text).toBe('[已隐藏][已隐藏]x[已隐藏]');
   });
 
-  it('leaves a key shorter than 8 chars untouched in text and errors', async () => {
+  it('masks even a short legacy key in text and errors (defense in depth)', async () => {
+    // 遗留数据里可能存在短 key：save 已拒收，这里只 mock getApiKey 模拟遗留读取
     const env = setup();
     const SHORT = 'short-7';
-    const { conv } = keyedConv(env, SHORT);
+    const { conv } = keyedConv(env, 'sk-legacy-9');
+    vi.spyOn(env.providers, 'getApiKey').mockReturnValue(SHORT);
     streamDeltas([`echo ${SHORT}`], { error: `denied ${SHORT}` });
     await env.service.send(conv.id, 'hi');
     await waitFor(() => env.events.some((e) => e.type === 'error'));
     const final = terminalMessage(env.events);
-    expect(final?.text).toBe(`echo ${SHORT}`);
-    expect(final?.error).toBe(`denied ${SHORT}`);
+    expect(final?.text).toBe(`echo ${'[已隐藏]'}`);
+    expect(final?.error).toBe(`denied ${'[已隐藏]'}`);
+    for (const e of env.events) {
+      expect(JSON.stringify(e)).not.toContain(SHORT);
+    }
+    const stored = env.conversations.get(conv.id)?.messages[1];
+    expect(stored?.text).not.toContain(SHORT);
+    expect(stored?.error).not.toContain(SHORT);
+  });
+
+  it('masks another provider saved key echoed by the active provider', async () => {
+    const env = setup();
+    const OTHER = 'sk-other-secret';
+    env.providers.save({
+      name: 'Other Provider',
+      kind: 'builtin',
+      builtinProvider: 'anthropic',
+      apiKey: OTHER,
+      enabled: true,
+      customModels: [],
+    });
+    const { conv } = keyedConv(env, KEY);
+    streamDeltas([`leak ${OTHER} here`], { error: `denied ${OTHER}` });
+    await env.service.send(conv.id, 'hi');
+    await waitFor(() => env.events.some((e) => e.type === 'error'));
+    const final = terminalMessage(env.events);
+    expect(final?.text).toBe('leak [已隐藏] here');
+    expect(final?.error).toBe('denied [已隐藏]');
+    for (const e of env.events) {
+      expect(JSON.stringify(e)).not.toContain(OTHER);
+    }
+    expect(env.conversations.get(conv.id)?.messages[1].text).not.toContain(OTHER);
+  });
+
+  it('keeps protecting the request key after the provider is deleted mid-stream, and masks a newly saved key', async () => {
+    const env = setup();
+    const ROTATED = 'sk-rotated-9';
+    const { providerId, conv } = keyedConv(env, KEY);
+    streamMock.mockImplementationOnce(
+      () =>
+        ({
+          async *[Symbol.asyncIterator]() {
+            // 流式进行中：厂商被删除 → 又被另一个厂商顶替保存了新 key
+            env.providers.remove(providerId);
+            env.providers.save({
+              name: 'Replacement',
+              kind: 'builtin',
+              builtinProvider: 'anthropic',
+              apiKey: ROTATED,
+              enabled: true,
+              customModels: [],
+            });
+            yield { type: 'text_delta', contentIndex: 0, delta: `old${KEY}` } as AssistantMessageEvent;
+            yield {
+              type: 'text_delta',
+              contentIndex: 0,
+              delta: `new${ROTATED}`,
+            } as AssistantMessageEvent;
+            yield { type: 'done', reason: 'stop', message: {} } as AssistantMessageEvent;
+          },
+        }) as unknown as ReturnType<typeof piai.stream>,
+    );
+    await env.service.send(conv.id, 'hi');
+    await waitFor(() => env.events.some((e) => e.type === 'done' || e.type === 'error'));
+    const final = terminalMessage(env.events);
+    expect(final?.text).toBe('old[已隐藏]new[已隐藏]');
+    for (const e of env.events) {
+      expect(JSON.stringify(e)).not.toContain(KEY);
+      expect(JSON.stringify(e)).not.toContain(ROTATED);
+    }
+    expect(env.conversations.get(conv.id)?.messages[1].text).not.toContain(KEY);
+    expect(env.conversations.get(conv.id)?.messages[1].text).not.toContain(ROTATED);
+  });
+
+  it('masks a secret-bearing error from a failed persistence flush', async () => {
+    const env = setup();
+    const { conv } = keyedConv(env, KEY);
+    streamDeltas(['ok']);
+    vi.spyOn(env.conversations, 'flush').mockImplementation(() => {
+      throw new Error(`disk io near ${KEY}`);
+    });
+    await env.service.send(conv.id, 'hi');
+    await waitFor(() => env.events.some((e) => e.type === 'error'));
+    const final = terminalMessage(env.events);
+    expect(final?.status).toBe('error');
+    expect(final?.error).toBe('disk io near [已隐藏]');
+    for (const e of env.events) {
+      expect(JSON.stringify(e)).not.toContain(KEY);
+    }
   });
 
   it('emits benign text promptly: only a potential key-prefix tail is withheld', async () => {

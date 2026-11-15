@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { rmSync } from 'node:fs';
 import { join } from 'node:path';
 import type { ProviderConfig, ProviderInput, ProviderKind } from '../../shared/types';
+import { KEY_MASK } from '../chat/key-redactor';
 import { ensureDir, readJsonFile, writeJsonAtomic } from './json-file';
 
 export interface StorageEncryption {
@@ -45,6 +46,34 @@ let warnedPlaintextKeys = false;
 // 非测试环境加载到明文 key 且无法加密迁移时的告警，整个进程只报一次
 let warnedPlaintextDropped = false;
 
+// 历史遗留的非法 key 条目被标记为不可用时的告警，整个进程只报一次（不含 key 内容与条目 id）
+let warnedInvalidKeys = false;
+
+const MIN_API_KEY_LENGTH = 8;
+
+type ApiKeyProblem = 'empty' | 'short' | 'masked';
+
+/** 与渲染进程一致的 key 校验：trim 后为空 / 过短 / 含脱敏占位符 */
+function apiKeyProblem(value: string): ApiKeyProblem | null {
+  const trimmed = value.trim();
+  if (trimmed === '') {
+    return 'empty';
+  }
+  if (trimmed.length < MIN_API_KEY_LENGTH) {
+    return 'short';
+  }
+  if (trimmed.includes(KEY_MASK)) {
+    return 'masked';
+  }
+  return null;
+}
+
+const API_KEY_ERRORS: Record<ApiKeyProblem, string> = {
+  empty: 'API Key 不能为空字符串',
+  short: `API Key 长度至少 ${MIN_API_KEY_LENGTH} 个字符`,
+  masked: 'API Key 不能包含占位符文本',
+};
+
 /** 恢复单个 JSON 文件到调用前状态：有旧快照则原子写回，原本不存在则删除刚创建的文件 */
 function restoreFileSnapshot(path: string, snapshot: unknown): void {
   if (snapshot === undefined) {
@@ -82,7 +111,10 @@ export class ProviderStore {
   private readonly providersPath: string;
   private readonly keysPath: string;
   private providers: ProviderRecord[] = [];
+  /** 保留盘上全部条目（含被判定不可用的），保证 save/remove 写回时不丢无关条目 */
   private keys: Record<string, KeyEntry> = {};
+  /** 加载时被判定不可用的 key 条目（非法内容、或生产环境无法加密的明文）：hasApiKey=false、getApiKey=undefined */
+  private readonly unavailableKeys = new Set<string>();
 
   constructor(
     dataDirectory: string,
@@ -129,15 +161,52 @@ export class ProviderStore {
       }
       this.keys = rawKeys as Record<string, KeyEntry>;
     }
+    this.classifyLoadedKeys();
     this.migratePlaintextKeys();
+  }
+
+  private warnInvalidKey(): void {
+    if (!warnedInvalidKeys) {
+      warnedInvalidKeys = true;
+      console.warn('[ASI] keys.json 中存在不符合校验规则的 API Key 条目，已标记为不可用');
+    }
+  }
+
+  /**
+   * 加载的条目逐个分类：可解密但内容非法的标记为不可用（不再迁移、也不可被 getApiKey 读到）；
+   * 密文本身不可读的跳过——保留既有行为：构造照常，getApiKey 时才抛统一解密错误。
+   */
+  private classifyLoadedKeys(): void {
+    for (const [id, entry] of Object.entries(this.keys)) {
+      if (entry.encrypted) {
+        let value: string;
+        try {
+          value = this.encryption.decryptString(Buffer.from(entry.value, 'base64'));
+        } catch {
+          continue;
+        }
+        if (apiKeyProblem(value) !== null) {
+          this.unavailableKeys.add(id);
+          this.warnInvalidKey();
+        }
+      } else if (process.env.ASI_DATA_DIR) {
+        // 测试模式明文条目可用，但内容仍须通过同一校验
+        if (apiKeyProblem(entry.value) !== null) {
+          this.unavailableKeys.add(id);
+          this.warnInvalidKey();
+        }
+      }
+      // 非测试模式的明文条目由 migratePlaintextKeys 处置
+    }
   }
 
   /**
    * 非测试环境不允许明文 key 投入使用：
-   * - 加密可用：用 encodeKey 把全部 encrypted:false 条目转成密文，构造返回前原子重写一次；
+   * - 加密可用：把全部 encrypted:false 且内容合法的条目转成密文，构造返回前原子重写一次；
+   *   非法明文条目不迁移、标记为不可用（条目仍留在内存与盘上）；
    *   迁移加密/写盘失败直接让构造失败，明文绝不可被 getApiKey 读到。
-   * - 加密不可用：只从内存丢弃明文条目（盘上文件不动），保留加密条目，进程级告警一次。
-   * ASI_DATA_DIR 测试模式下的明文条目保持可用。
+   * - 加密不可用：全部明文条目标记为不可用（内存与盘上都不删），进程级告警一次。
+   * ASI_DATA_DIR 测试模式下的明文条目保持可用（合法性已在 classifyLoadedKeys 分类）。
    */
   private migratePlaintextKeys(): void {
     if (process.env.ASI_DATA_DIR) {
@@ -149,15 +218,27 @@ export class ProviderStore {
     }
     if (this.encryption.isEncryptionAvailable()) {
       const migrated = { ...this.keys };
+      let changed = false;
       for (const id of plaintextIds) {
-        migrated[id] = this.encodeKey(this.keys[id].value);
+        if (apiKeyProblem(this.keys[id].value) === null) {
+          migrated[id] = this.encodeKey(this.keys[id].value.trim());
+          changed = true;
+        } else {
+          this.unavailableKeys.add(id);
+          this.warnInvalidKey();
+        }
       }
-      writeJsonAtomic(this.keysPath, migrated);
-      this.keys = migrated;
+      if (changed) {
+        writeJsonAtomic(this.keysPath, migrated);
+        this.keys = migrated;
+      }
       return;
     }
     for (const id of plaintextIds) {
-      delete this.keys[id];
+      this.unavailableKeys.add(id);
+      if (apiKeyProblem(this.keys[id].value) !== null) {
+        this.warnInvalidKey();
+      }
     }
     if (!warnedPlaintextDropped) {
       warnedPlaintextDropped = true;
@@ -174,7 +255,7 @@ export class ProviderStore {
       id: record.id,
       name: record.name,
       kind: record.kind,
-      hasApiKey: this.keys[record.id] !== undefined,
+      hasApiKey: this.keys[record.id] !== undefined && !this.unavailableKeys.has(record.id),
       enabled: record.enabled,
       customModels: [...record.customModels],
       createdAt: record.createdAt,
@@ -229,8 +310,12 @@ export class ProviderStore {
     if (input.id === FAUX_PROVIDER_ID) {
       throw new Error('内置测试厂商不可修改');
     }
-    if (typeof input.apiKey === 'string' && input.apiKey.trim() === '') {
-      throw new Error('API Key 不能为空字符串');
+    if (typeof input.apiKey === 'string') {
+      const problem = apiKeyProblem(input.apiKey);
+      if (problem !== null) {
+        // 校验错误信息不得回显 key 内容
+        throw new Error(API_KEY_ERRORS[problem]);
+      }
     }
 
     let record: ProviderRecord;
@@ -279,7 +364,7 @@ export class ProviderStore {
       nextKeys = { ...this.keys };
       delete nextKeys[record.id];
     } else if (typeof input.apiKey === 'string') {
-      nextKeys = { ...this.keys, [record.id]: this.encodeKey(input.apiKey) };
+      nextKeys = { ...this.keys, [record.id]: this.encodeKey(input.apiKey.trim()) };
     }
 
     if (nextKeys) {
@@ -305,6 +390,8 @@ export class ProviderStore {
     this.providers = nextProviders;
     if (nextKeys) {
       this.keys = nextKeys;
+      // 显式设置/清除成功后才解除该条目的不可用标记（写盘失败时保持原状）
+      this.unavailableKeys.delete(record.id);
     }
     return this.toConfig(record);
   }
@@ -341,9 +428,13 @@ export class ProviderStore {
     }
     this.providers = nextProviders;
     this.keys = nextKeys;
+    this.unavailableKeys.delete(id);
   }
 
   getApiKey(id: string): string | undefined {
+    if (this.unavailableKeys.has(id)) {
+      return undefined;
+    }
     const entry = this.keys[id];
     if (!entry) {
       return undefined;
@@ -357,5 +448,28 @@ export class ProviderStore {
       // 底层错误信息可能携带 key/密文内容，不向外透传
       throw new Error('无法解密已保存的 API Key');
     }
+  }
+
+  /**
+   * 主进程内部使用：返回全部可解密的非空持久化 key 值（含被标记不可用的/被忽略的遗留条目），
+   * 供流式输出脱敏枚举；单条密文损坏只跳过该条，不影响其余，也不改变 getApiKey 的行为。
+   */
+  getRedactionKeys(): string[] {
+    const out: string[] = [];
+    for (const entry of Object.values(this.keys)) {
+      if (entry.encrypted) {
+        try {
+          const value = this.encryption.decryptString(Buffer.from(entry.value, 'base64'));
+          if (value !== '') {
+            out.push(value);
+          }
+        } catch {
+          // 单条损坏只跳过：枚举绝不因一条坏数据泄漏或中断
+        }
+      } else if (entry.value !== '') {
+        out.push(entry.value);
+      }
+    }
+    return out;
   }
 }

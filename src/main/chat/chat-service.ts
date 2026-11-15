@@ -11,6 +11,7 @@ import type {
 } from '../../shared/types';
 import type { ConversationStore } from '../stores/conversation-store';
 import { FAUX_PROVIDER_ID, type ProviderStore } from '../stores/provider-store';
+import { KeyRedactor, redactKeys } from './key-redactor';
 import type { ModelResolver } from './model-resolver';
 
 /** faux 厂商不需要真实 key，传固定哨兵避免 pi-ai 回退到环境变量里的真实凭证 */
@@ -18,9 +19,6 @@ const FAUX_API_KEY = 'asi-faux';
 const TEST_TIMEOUT_MS = 15000;
 /** abort 后等待底层流结束的最长时间，超过则强制终结 */
 const ABORT_LIMIT_MS = 2000;
-const KEY_MASK = '[已隐藏]';
-/** 低于该长度的 key 不脱敏：误伤正常文本的风险大于泄漏风险 */
-const MIN_MASK_KEY_LENGTH = 8;
 
 interface ActiveRequest {
   controller: AbortController;
@@ -33,49 +31,6 @@ interface StreamTarget {
   apiKey: string;
   providerId: string;
   modelRef: ModelRef;
-}
-
-/**
- * 跨分片流式脱敏器：key 可能被切成任意多片到达。
- * 每追加一段原始文本，先替换全部完整 key，再扣留尾部最长的"key 前缀"，
- * 只放出绝不可能参与构成 key 的部分；流结束时剩余内容过一遍完整匹配后全部放出。
- * 这样保证任何已发出/已存储的文本里都不存在完整 key。
- */
-class KeyRedactor {
-  private pending = '';
-  private readonly key: string | undefined;
-
-  constructor(apiKey: string | undefined) {
-    this.key = apiKey !== undefined && apiKey.length >= MIN_MASK_KEY_LENGTH ? apiKey : undefined;
-  }
-
-  push(raw: string): string {
-    this.pending += raw;
-    if (this.key === undefined) {
-      const out = this.pending;
-      this.pending = '';
-      return out;
-    }
-    this.pending = this.pending.split(this.key).join(KEY_MASK);
-    let hold = 0;
-    const max = Math.min(this.pending.length, this.key.length - 1);
-    for (let len = max; len > 0; len--) {
-      if (this.key.startsWith(this.pending.slice(this.pending.length - len))) {
-        hold = len;
-        break;
-      }
-    }
-    const out = this.pending.slice(0, this.pending.length - hold);
-    this.pending = this.pending.slice(this.pending.length - hold);
-    return out;
-  }
-
-  /** 剩余 pending 不可能是完整 key（顶多是 key 前缀片段），过完整匹配后放出 */
-  flush(): string {
-    const out = this.key === undefined ? this.pending : this.pending.split(this.key).join(KEY_MASK);
-    this.pending = '';
-    return out;
-  }
 }
 
 function zeroUsage(): Usage {
@@ -155,6 +110,11 @@ export class ChatService {
     return conv;
   }
 
+  /** 当前已保存的全部 key：每次调用取最新值，中途新增/轮换的 key 也受保护 */
+  private savedKeys(): string[] {
+    return this.providers.getRedactionKeys();
+  }
+
   /** 同步解析模型/厂商/key；任何一步失败都不允许调用方改动会话 */
   private resolveTarget(conv: Conversation): StreamTarget {
     const modelRef = conv.model;
@@ -168,12 +128,17 @@ export class ChatService {
     if (!provider.enabled) {
       throw new Error('模型所属厂商已停用');
     }
-    const model = this.resolver.resolve(provider, modelRef.modelId);
+    let model: Model<Api>;
+    try {
+      model = this.resolver.resolve(provider, modelRef.modelId);
+    } catch (err) {
+      throw new Error(this.mask(err, this.savedKeys()));
+    }
     let apiKey: string | undefined;
     try {
       apiKey = provider.id === FAUX_PROVIDER_ID ? FAUX_API_KEY : this.providers.getApiKey(provider.id);
     } catch (err) {
-      throw new Error(this.mask(err, undefined));
+      throw new Error(this.mask(err, this.savedKeys()));
     }
     if (!apiKey) {
       throw new Error('厂商未设置 API Key');
@@ -237,28 +202,36 @@ export class ChatService {
   }
 
   async test(providerId: string, modelId: string): Promise<TestResult> {
+    // 本次请求的脱敏 key 快照：测试挂起期间被删除的已存 key 仍受保护
+    const requestKeys = this.savedKeys();
+    // 所有失败出口统一过最终脱敏：静态错误与兜底串也不例外
+    const failure = (err: unknown): TestResult => ({
+      ok: false,
+      error: this.mask(err, [...requestKeys, ...this.savedKeys()]),
+    });
     const provider = this.providers.get(providerId);
     if (!provider) {
-      return { ok: false, error: '厂商不存在' };
+      return failure('厂商不存在');
     }
     if (!provider.enabled) {
-      return { ok: false, error: '厂商已停用' };
+      return failure('厂商已停用');
     }
     let model: Model<Api>;
     try {
       model = this.resolver.resolve(provider, modelId);
     } catch (err) {
-      return { ok: false, error: this.mask(err, undefined) };
+      return failure(err);
     }
     let apiKey: string | undefined;
     try {
       apiKey = provider.id === FAUX_PROVIDER_ID ? FAUX_API_KEY : this.providers.getApiKey(provider.id);
     } catch (err) {
-      return { ok: false, error: this.mask(err, undefined) };
+      return failure(err);
     }
     if (!apiKey) {
-      return { ok: false, error: '厂商未设置 API Key' };
+      return failure('厂商未设置 API Key');
     }
+    requestKeys.push(apiKey);
 
     const controller = new AbortController();
     const started = Date.now();
@@ -287,14 +260,14 @@ export class ChatService {
         timeout,
       ]);
       if (reply.stopReason === 'error' || reply.stopReason === 'aborted') {
-        return { ok: false, error: this.mask(reply.errorMessage ?? '', apiKey) || '测试失败' };
+        return failure(reply.errorMessage || '测试失败');
       }
       return { ok: true, latencyMs: Math.max(0, Date.now() - started) };
     } catch (err) {
       if (timedOut) {
-        return { ok: false, error: '测试连接超时（15 秒）' };
+        return failure('测试连接超时（15 秒）');
       }
-      return { ok: false, error: this.mask(err, apiKey) };
+      return failure(err);
     } finally {
       clearTimeout(timer);
     }
@@ -311,8 +284,13 @@ export class ChatService {
   ): Promise<void> {
     let status: MessageStatus;
     let errorText: string | undefined;
+    // 本次请求的 key 快照：运行期间厂商被删除/轮换也不会让活动 key 失去保护
+    const requestKeys = [apiKey, ...this.savedKeys()];
+    // 边界处的最终防线：请求快照 + 此刻全部已存 key（中途新增的 key 也受保护）
+    const guardKeys = (): string[] => [...requestKeys, ...this.savedKeys()];
+    const guard = (text: string): string => redactKeys(text, guardKeys());
     // 所有流式正文先过脱敏器：发出的事件与写盘的快照永远不含完整 key
-    const redactor = new KeyRedactor(apiKey);
+    const redactor = new KeyRedactor(requestKeys);
     // 消费任务的副作用开关：强制终结后置 false，迟到的 delta/终态全部失效
     let accepting = true;
     let abortTimer: ReturnType<typeof setTimeout> | undefined;
@@ -347,7 +325,9 @@ export class ChatService {
               if (safe === '') {
                 continue;
               }
-              assistant.text += safe;
+              assistant.text += guard(safe);
+              // 累计正文（事件里的权威值）在写盘/发出前再过一次最终脱敏
+              assistant.text = guard(assistant.text);
               try {
                 this.conversations.updateMessage(conversationId, assistant);
               } catch {
@@ -357,7 +337,7 @@ export class ChatService {
                 type: 'delta',
                 conversationId,
                 messageId: assistant.id,
-                delta: safe,
+                delta: guard(safe),
                 text: assistant.text,
               });
             } else if (event.type === 'done') {
@@ -394,7 +374,7 @@ export class ChatService {
           status = 'done';
         } else {
           status = 'error';
-          errorText = providerError ? this.mask(providerError, apiKey) : '模型回复失败';
+          errorText = providerError ? this.mask(providerError, guardKeys()) : '模型回复失败';
         }
       }
     } catch (err) {
@@ -403,7 +383,7 @@ export class ChatService {
         errorText = '已停止';
       } else {
         status = 'error';
-        errorText = this.mask(err, apiKey);
+        errorText = this.mask(err, guardKeys());
       }
     } finally {
       accepting = false;
@@ -414,9 +394,10 @@ export class ChatService {
     }
 
     // 把脱敏器扣留的尾部并入正文；aborted 不补发 delta，尾部直接进终态消息
-    const tail = redactor.flush();
+    const tail = guard(redactor.flush());
     if (tail !== '') {
       assistant.text += tail;
+      assistant.text = guard(assistant.text);
       if (status !== 'aborted') {
         try {
           this.conversations.updateMessage(conversationId, assistant);
@@ -434,14 +415,16 @@ export class ChatService {
     }
 
     assistant.status = status;
-    assistant.error = errorText;
+    // 终态前最后一次全量脱敏：权威正文与错误信息都不含完整 key
+    assistant.text = guard(assistant.text);
+    assistant.error = errorText === undefined ? undefined : guard(errorText);
     let emitType: 'done' | 'error' = status === 'done' ? 'done' : 'error';
     try {
       this.conversations.updateMessage(conversationId, assistant);
       this.conversations.flush(conversationId);
     } catch (err) {
       assistant.status = 'error';
-      assistant.error = this.mask(err, apiKey);
+      assistant.error = this.mask(err, guardKeys());
       emitType = 'error';
       try {
         // 尽力把内存里的消息同步到同一错误状态：不再二次 flush、不复活已删会话
@@ -499,14 +482,11 @@ export class ChatService {
     }
   }
 
-  private mask(err: unknown, apiKey: string | undefined): string {
+  private mask(err: unknown, keys: string[]): string {
     let message = err instanceof Error ? err.message : typeof err === 'string' ? err : '';
     if (message === '') {
       message = '未知错误';
     }
-    if (apiKey !== undefined && apiKey.length >= MIN_MASK_KEY_LENGTH) {
-      message = message.split(apiKey).join(KEY_MASK);
-    }
-    return message;
+    return redactKeys(message, keys);
   }
 }
