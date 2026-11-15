@@ -2,6 +2,7 @@ import { readFileSync } from 'node:fs';
 import { describe, expect, it, vi } from 'vitest';
 import type { NetworkInterfaceInfo } from 'node:os';
 import { NetworkSampler, isOnline, parseNetstatIB } from '../src/network.js';
+import * as fact from '../src/fact.js';
 import type { RunFn } from '../src/command.js';
 
 const fx = (name: string) => readFileSync(new URL(`./fixtures/${name}`, import.meta.url), 'utf8');
@@ -271,7 +272,7 @@ describe('NetworkSampler', () => {
     expect(routes).toBe(2); // the fresh verdict is now cached
   });
 
-  it('composes observedAt/ttlMs from the oldest constituent (rate vs route)', async () => {
+  it('composes observedAt/ttlMs from the earliest absolute expiry (rate vs route)', async () => {
     let mono = 0;
     let wall = 1_000;
     let i = 0;
@@ -291,8 +292,13 @@ describe('NetworkSampler', () => {
     const f = await s.sample(6000);
     expect(f.status).toBe('ok');
     expect(f.observedAt).toBe(1000); // the cached route observation is oldest
-    expect(f.ttlMs).toBe(90_000);    // 3 * 30s route period beats the rate sample's ttl
+    expect(f.ttlMs).toBe(10_000);    // expires at 11000: the rate sample's own 6s ttl
     expect(routeCalls).toBe(1);
+    // tracked monotonic deadline: rate part mono 4000 + 6s — boundary is not stale
+    expect(fact.stale(f, 10_000, 5_000).status).toBe('ok');
+    expect(fact.stale(f, 10_001, 5_000).status).toBe('stale');
+    // a rolled-back wall cannot revive it either
+    expect(fact.stale(f, 10_001, 1).status).toBe('stale');
   });
 
   it('a late-resolving aborted sample cannot overwrite the newer baseline or route cache', async () => {

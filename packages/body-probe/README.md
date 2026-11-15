@@ -6,7 +6,7 @@ by `asi-sense` to fill `self.body`.
 ```ts
 import { BodyProbe } from '@asi/body-probe';
 
-const probe = new BodyProbe();
+const probe = new BodyProbe();          // optional: (collectors, { now, wall, platform })
 const off = probe.onSample((body) => { /* render gauges */ });
 probe.start({ intervalMs: 2000 });          // immediate tick, then every 2s
 // probe.start({ intervalMs: 2000, cadence: { memoryMs: 10_000 } }); // cadence override
@@ -19,22 +19,29 @@ off();
 ## Facts
 
 Every field is a `Fact<T>` (`value`, `status`, `source`, `observedAt`,
-`ttlMs`). `status` is `ok`, `unknown` (first delta sample / rebase / a
-reading that cannot be determined), `unavailable` (command, parser or
-platform failure), `denied` (EACCES/EPERM) or `stale` (computed by `latest()`
-once `age > ttlMs`; stored history is never re-marked). `cpu`/`harnessProcess`/
-`thermal` get `ttlMs = 3 * intervalMs`; `tokens` keeps the injected fact's
-own ttl; the slower collectors get `ttlMs = 3 * effective period` (below).
+`ttlMs`, optional `unavailableMounts`). `status` is `ok`, `unknown` (first
+delta sample / rebase / a reading that cannot be determined), `unavailable`
+(command, parser or platform failure), `denied` (EACCES/EPERM) or `stale`
+(computed by `latest()`/cached republish from a monotonic deadline fixed at
+ingestion — wall-clock moves cannot freeze or revive a fact; stored history
+is never re-marked). `cpu`/`harnessProcess`/`thermal` get
+`ttlMs = 3 * intervalMs`; `tokens` keeps the injected fact's own ttl; the
+slower collectors get `ttlMs = 3 * effective period` (below).
 
 Units: ratios are 0..1 fractions (process CPU is unclamped, may exceed 1),
 sizes are bytes, network rates are B/s, `minutesLeft`/`uptimeSec` are minutes
 and seconds. `disks.mount` is the queried path (`/` or resolved cwd; statfs
-reports no mountpoint name). `thermal` is a placeholder `unavailable` — real
+reports no mountpoint name). Each disk volume also carries optional
+`status: 'ok' | 'stale'`, `observedAt` and `ttlMs`; volumes that never
+succeeded are omitted from `value` (no fabricated numbers) and listed in the
+fact's `unavailableMounts`. `thermal` is a placeholder `unavailable` — real
 data is owned by the asi-sense helper. `tokens` is `unavailable` without an
 injected `TokenSource`.
 
 Formulas: `memory.used = (max(0, anonymous - purgeable) + wired + compressor-occupied) * pageSize`,
 `memory.cached = (file-backed + purgeable) * pageSize` (vm_stat fields).
+Simultaneously-due pressure and swap reads share one `sysctl -n <keys>` process,
+each keeping its own cache period.
 
 Cadence: `start({ cadence })` accepts a `Partial<SamplingCadence>`
 (`memoryMs`, `networkMs`, `disksMs`, `batteryMs`, `pressureMs`, `swapMs`,
@@ -42,15 +49,21 @@ Cadence: `start({ cadence })` accepts a `Partial<SamplingCadence>`
 `max(intervalMs, configured)`; each slow collector runs on the first tick
 at/after it (5s first fires on the ~6s tick at the default 2s interval) and
 between runs the cached fact is republished as-is — scheduled on when the
-collector returned, never on `observedAt`, stale-marked past its ttl. Outer
-caches reset on `start()` and cadence does not carry over. The swap/pressure
-and route caches inside the samplers use the same periods
-(`sample(ttl, signal, periods)` overrides standalone use).
+collector returned, never on `observedAt`, stale-marked past its ttl. A child
+can never poll faster than the parent that publishes it — the effective child
+period is `max(configured child, effective parent, intervalMs)` for
+pressure/swap (parent memoryMs) and route (parent networkMs). Outer caches
+reset on `start()`/`stop()` (the inner swap/pressure/route and disk
+generation state resets too) and cadence does not carry over. The
+swap/pressure and route caches inside the samplers use the same periods,
+clamped to at least `ttlMs / 3` under standalone use
+(`sample(ttl, signal, periods)` overrides).
 
 `memory` and `network` facts are composite: a fresh `ok` fact takes the
-oldest constituent's `observedAt` and `ttlMs = 3 *` its period (vm read vs
-cached pressure/swap; rate sample vs needed families' route observations;
-ties take the smallest period).
+oldest constituent's `observedAt` and expires at the earliest absolute
+constituent deadline — `ttlMs = min(observedAt + 3*periodMs) - observedAt`
+(vm read vs cached pressure/swap; rate sample vs needed families' route
+observations).
 
 `network.online` runs `/sbin/route -n get -inet default` / `-inet6 default`
 only for families with a usable address (non-internal IPv4 or global IPv6 in
@@ -63,11 +76,26 @@ is `false` without a route probe. Deltas key on name + `<Link#N>`; a
 same-name replacement, counter drop, or rate >10 Gbit/s rebases to
 `unknown`. No external probes are ever made.
 
-`disks` allows at most one in-flight scan per `DiskSampler` (released only
-when it settles, never by abort): while busy, samples return a stale
-aggregate fact republishing the last success — `value: null` if none.
-`collectDisks` checks its `AbortSignal` before every `stat`/`statfs`, and an
-aborted generation's result never becomes the last success.
+`disks` never blocks a tick: `DiskSampler.sample()` starts an independent
+background job per queried path (`/` and the resolved cwd, deduplicated) and
+returns the currently available per-volume state immediately. Each job has
+its own ~3s `AbortController` timeout and an I/O lock that releases only
+when the filesystem call really settles — never on timeout, abort or
+`stop()` — so a wedged volume cannot pile up operations or stall the probe.
+The caller's signal is forwarded into each job: timeout, abort, `stop()` or
+rejected I/O all mark the volume failed, discard its late result (a late
+`stat` never starts a `statfs`), and its last successful numbers show
+`status: 'stale'` immediately — long before its own deadline — until the
+next success clears the flag. Each reading keeps the `ttlMs`/deadline in
+force when it was taken (a wider caller cadence never revives it); volumes
+that never succeeded land in `unavailableMounts`. Jobs relaunch when their
+per-volume period (`ttlMs/3`) elapses; equal `stat.dev` volumes dedup with
+`/` winning. `DiskSampler.stop()` cancels timers/controllers without
+releasing locks, and the BodyProbe default calls the sampler every tick
+while it enforces `disksMs` internally (an injected `collectors.disks`
+keeps the whole-group outer cache instead).
+`collectDisks` remains the standalone sequential helper: it checks its
+`AbortSignal` before every `stat`/`statfs`.
 
 Cancellation: each tick runs under an `AbortSignal` forwarded to collectors
 and commands (commands bounded 1s, SIGKILL, 4 MB, LC_ALL=C, no shell; identical

@@ -39,8 +39,17 @@ export interface StartOptions {
 }
 
 export interface SamplePoint {
-  at: number;
+  at: number;   // wall clock of the sample
   body: Body;
+}
+
+// Optional clocks: `now` is monotonic (cadence, staleness, history window);
+// `wall` stamps observations. Both default to the process clocks.
+// `platform` overrides the OS gate of the built-in macOS samplers.
+export interface ProbeClock {
+  now?: () => number;
+  wall?: () => number;
+  platform?: NodeJS.Platform;
 }
 
 const HISTORY_WINDOW_MS = 300_000;
@@ -62,10 +71,19 @@ interface CacheMap {
   battery: BatteryValue | null;
 }
 
+interface RingPoint extends SamplePoint {
+  mono: number; // private monotonic stamp; stripped from outward results
+}
+
 export class BodyProbe {
   private readonly collectors: ProbeCollectors;
   private readonly listeners = new Set<(body: Body) => void>();
-  private readonly ring: SamplePoint[] = [];
+  private readonly ring: RingPoint[] = [];
+  private readonly clockNow: () => number;
+  private readonly clockWall: () => number;
+  private readonly customDisks: boolean;
+  private readonly resetInner: () => void;
+  private readonly stopInner: () => void;
   private timer: NodeJS.Timeout | undefined;
   private tickAbort: AbortController | undefined;
   private stopping: Promise<void> = Promise.resolve();
@@ -79,27 +97,43 @@ export class BodyProbe {
   private pid = process.pid;
   private tokenSource: TokenSource | undefined;
 
-  constructor(collectors: Partial<ProbeCollectors> = {}) {
+  constructor(collectors: Partial<ProbeCollectors> = {}, clock: ProbeClock = {}) {
+    this.clockNow = clock.now ?? (() => globalThis.performance.now());
+    this.clockWall = clock.wall ?? (() => Date.now());
+    const platform = clock.platform ?? process.platform;
     const cpu = new CpuSampler();
-    const memory = new MemorySampler();
-    const disks = new DiskSampler();
-    const battery = new BatterySampler();
-    const network = new NetworkSampler();
-    const self = new SelfProcessSampler();
+    const memory = new MemorySampler({ now: this.clockNow, wall: this.clockWall, platform });
+    const disks = new DiskSampler({ now: this.clockNow, wall: this.clockWall });
+    const battery = new BatterySampler({ platform });
+    const network = new NetworkSampler({ now: this.clockNow, wall: this.clockWall, platform });
+    const self = new SelfProcessSampler({ now: this.clockNow });
     const defaults: ProbeCollectors = {
       cpu: (ttl) => Promise.resolve(cpu.sample(ttl)),
       memory: (ttl, signal) => memory.sample(ttl, signal, {
         pressureMs: this.cadence.pressureMs,
         swapMs: this.cadence.swapMs,
       }),
-      disks: (cwd, ttl, signal) => disks.sample(cwd, ttl, signal),
+      // The default disk collector runs every tick and resolves immediately:
+      // DiskSampler enforces disksMs per volume internally and its background
+      // jobs must outlive (never be bound to) the tick's abort signal.
+      disks: (cwd, ttl) => disks.sample(cwd, ttl),
       battery: (ttl, signal) => battery.sample(ttl, signal),
       network: (ttl, signal) => network.sample(ttl, signal, { routeMs: this.cadence.routeMs }),
       process: (pid, ttl, signal) => (pid === process.pid
         ? Promise.resolve(self.sample(ttl))
-        : new ExternalProcessSampler(pid).sample(ttl, signal)),
+        : new ExternalProcessSampler(pid, { now: this.clockNow }).sample(ttl, signal)),
     };
     this.collectors = { ...defaults, ...collectors };
+    this.customDisks = collectors.disks !== undefined;
+    this.resetInner = () => {
+      memory.reset();
+      network.reset();
+    };
+    this.stopInner = () => {
+      memory.reset();
+      network.reset();
+      disks.stop();
+    };
   }
 
   start(options: StartOptions = {}): void {
@@ -116,9 +150,14 @@ export class BodyProbe {
       // A slower tick can never poll faster than itself; effective period.
       cadence[key] = Math.max(intervalMs, value);
     }
+    // Children can never poll faster than the parent that publishes them.
+    cadence.pressureMs = Math.max(cadence.pressureMs, cadence.memoryMs);
+    cadence.swapMs = Math.max(cadence.swapMs, cadence.memoryMs);
+    cadence.routeMs = Math.max(cadence.routeMs, cadence.networkMs);
     if (this.running) return; // repeated start is a no-op; stop() before reconfiguring
     this.running = true;
     this.caches = {}; // a new run samples everything fresh
+    this.resetInner();
     this.cadence = cadence;
     this.intervalMs = intervalMs;
     this.capacity = Math.ceil(HISTORY_WINDOW_MS / intervalMs) + 1;
@@ -138,6 +177,10 @@ export class BodyProbe {
     const controller = this.tickAbort;
     this.tickAbort = undefined;
     controller?.abort();
+    // Outer + inner caches reset and disk generation jobs abort (I/O locks
+    // stay held until the filesystem actually settles).
+    this.caches = {};
+    this.stopInner();
     // Drain only this generation's commands; chain after any earlier stop()
     // so repeated calls still serialize. Hung collectors never block stop().
     this.stopping = Promise.all([
@@ -160,22 +203,24 @@ export class BodyProbe {
   latest(): Body | null {
     const point = this.ring[this.ring.length - 1];
     if (!point) return null;
-    const body = structuredClone(point.body);
-    const now = Date.now();
-    for (const key of Object.keys(body) as (keyof Body)[]) {
-      const f: Fact<unknown> = body[key];
-      body[key] = fact.stale(f, now) as never;
+    const now = this.clockNow();
+    const wall = this.clockWall();
+    // Stale-mark the stored originals (fact.stale never mutates) so tracked
+    // deadlines keyed by object identity survive; clone only afterwards.
+    const body = {} as Record<keyof Body, Fact<unknown>>;
+    for (const key of Object.keys(point.body) as (keyof Body)[]) {
+      body[key] = structuredClone(fact.stale(point.body[key], now, wall));
     }
-    return body;
+    return body as Body;
   }
 
   history(seconds = 300): SamplePoint[] {
     if (!Number.isFinite(seconds) || seconds <= 0) {
       throw new RangeError(`seconds must be a finite number > 0, got ${seconds}`);
     }
-    const cutoff = Date.now() - Math.min(seconds * 1000, HISTORY_WINDOW_MS);
+    const cutoff = this.clockNow() - Math.min(seconds * 1000, HISTORY_WINDOW_MS);
     return this.ring
-      .filter((p) => p.at >= cutoff)
+      .filter((p) => p.mono >= cutoff)
       .map((p) => ({ at: p.at, body: structuredClone(p.body) }));
   }
 
@@ -204,7 +249,7 @@ export class BodyProbe {
       Promise.all([
         this.call(() => c.cpu(ttl, signal), 'cpu', ttl, signal),
         this.cached('memory', () => c.memory(this.cadence.memoryMs * 3, signal), signal),
-        this.cached('disks', () => c.disks(this.cwd, this.cadence.disksMs * 3, signal), signal),
+        this.disksFact(signal),
         this.cached('battery', () => c.battery(this.cadence.batteryMs * 3, signal), signal),
         this.cached('network', () => c.network(this.cadence.networkMs * 3, signal), signal),
         this.call(() => c.process(this.pid, ttl, signal), 'harnessProcess', ttl, signal),
@@ -219,7 +264,12 @@ export class BodyProbe {
       thermal: fact.fail<ThermalValue>('unavailable', fact.source('thermal', 'ProcessInfo.thermalState'), ttl),
       network, harnessProcess, tokens,
     };
-    this.push({ at: Date.now(), body });
+    const mono = this.clockNow();
+    const wall = this.clockWall();
+    for (const key of Object.keys(body) as (keyof Body)[]) {
+      fact.ingest(body[key], mono, wall); // fix monotonic deadlines once
+    }
+    this.push({ at: wall, mono, body });
     for (const listener of this.listeners) {
       // A listener may stop/restart mid-dispatch, making this sample stale.
       if (!this.running || generation !== this.generation) return;
@@ -233,7 +283,7 @@ export class BodyProbe {
 
   // Slow collectors run at most once per effective cadence; between runs the
   // fact is republished as-is (stale-marked past its ttl). Scheduling uses the
-  // entry's sampling-at, never the fact's composite observedAt.
+  // entry's monotonic sampling-at, never the fact's composite observedAt.
   private cached<K extends keyof CacheMap>(
     key: K,
     invoke: () => Promise<Fact<CacheMap[K]>>,
@@ -241,17 +291,31 @@ export class BodyProbe {
   ): Promise<Fact<CacheMap[K]>> {
     const periodMs = this.cadence[`${key}Ms` as keyof SamplingCadence];
     const entry = this.caches[key];
-    const now = Date.now();
+    const now = this.clockNow();
     if (entry && now - entry.at < periodMs) {
-      return Promise.resolve(fact.stale(entry.fact, now));
+      return Promise.resolve(fact.stale(entry.fact, now, this.clockWall()));
     }
     return this.call(invoke, key, periodMs * 3, signal).then((f) => {
       if (!signal.aborted) {
+        const at = this.clockNow();
+        fact.ingest(f, at, this.clockWall());
         (this.caches as Record<keyof CacheMap, { at: number; fact: Fact<unknown> } | undefined>)[key] =
-          { at: Date.now(), fact: f };
+          { at, fact: f };
       }
       return f;
     });
+  }
+
+  // The default DiskSampler is nonblocking and enforces disksMs per volume,
+  // so it is queried every tick; its background jobs never see the tick
+  // signal (it dies with the next tick — stopInner aborts generations). An
+  // injected disks collector keeps the whole-group cached cadence instead.
+  private disksFact(signal: AbortSignal): Promise<Fact<DisksValue>> {
+    const ttl = this.cadence.disksMs * 3;
+    if (this.customDisks) {
+      return this.cached('disks', () => this.collectors.disks(this.cwd, ttl, signal), signal);
+    }
+    return this.call(() => this.collectors.disks(this.cwd, ttl), 'disks', ttl, signal);
   }
 
   private async call<T>(
@@ -296,9 +360,9 @@ export class BodyProbe {
     }
   }
 
-  private push(point: SamplePoint): void {
-    const cutoff = point.at - HISTORY_WINDOW_MS;
-    while (this.ring.length > 0 && this.ring[0]!.at < cutoff) this.ring.shift();
+  private push(point: RingPoint): void {
+    const cutoff = point.mono - HISTORY_WINDOW_MS;
+    while (this.ring.length > 0 && this.ring[0]!.mono < cutoff) this.ring.shift();
     this.ring.push(point);
     while (this.ring.length > this.capacity) this.ring.shift();
   }
