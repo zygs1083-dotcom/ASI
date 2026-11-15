@@ -90,3 +90,16 @@ describe('design tokens', () => {
     expect(css).toContain(':root[data-theme="dark"]');
   });
 });
+
+describe('dependency override', () => {
+  it('pins basic-ftp to exactly 6.2.6 in package.json and the lockfile', () => {
+    const pkg = JSON.parse(readFileSync(resolve('package.json'), 'utf8')) as {
+      overrides?: Record<string, string>;
+    };
+    expect(pkg.overrides?.['basic-ftp']).toBe('6.2.6');
+    const lock = JSON.parse(readFileSync(resolve('package-lock.json'), 'utf8')) as {
+      packages?: Record<string, { version?: string }>;
+    };
+    expect(lock.packages?.['node_modules/basic-ftp']?.version).toBe('6.2.6');
+  });
+});
