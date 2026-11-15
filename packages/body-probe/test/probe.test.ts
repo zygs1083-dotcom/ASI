@@ -3,8 +3,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { BodyProbe, type ProbeCollectors } from '../src/probe.js';
+import * as command from '../src/command.js';
 import { runCommand, type ExecFn, type RunFn } from '../src/command.js';
-import { DiskSampler } from '../src/disks.js';
 import { MemorySampler } from '../src/memory.js';
 import { NetworkSampler } from '../src/network.js';
 import * as fact from '../src/fact.js';
@@ -34,9 +34,16 @@ function deferred<T>() {
 
 const flush = () => vi.advanceTimersByTimeAsync(0);
 
+const fakeEn0 = () => vi.spyOn(os, 'networkInterfaces').mockReturnValue({
+  en0: [{ address: '10.0.0.1', netmask: '255.0.0.0', family: 'IPv4', mac: 'aa', internal: false, cidr: null }],
+});
+
 describe('BodyProbe', () => {
   beforeEach(() => vi.useFakeTimers());
-  afterEach(() => vi.useRealTimers());
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.useRealTimers();
+  });
 
   it('emits an immediate sample then follows the cadence', async () => {
     const probe = new BodyProbe(baseCollectors());
@@ -451,31 +458,221 @@ describe('BodyProbe', () => {
   });
 
   it.each(['stat', 'statfs'] as const)(
-    'a never-settling disk %s survives 8 stop/starts; new generations publish stale', async (op) => {
-      let started = 0;
-      const disks = new DiskSampler({
-        stat: async () => (op === 'stat' ? (started += 1, await new Promise<never>(() => {})) : { dev: 1 }),
-        statfs: async () => (op === 'statfs'
-          ? (started += 1, await new Promise<never>(() => {}))
-          : { bsize: 4096, blocks: 10, bavail: 5 }),
-        resolve: (p) => p,
+    'a never-settling disk %s keeps one hung op per path across 8 stop/starts', async (op) => {
+      let statCalls = 0;
+      let statfsCalls = 0;
+      vi.spyOn(fs.promises, 'stat').mockImplementation(async (p) => {
+        statCalls += 1;
+        if (op === 'stat') await new Promise<never>(() => {});
+        return { dev: String(p) === '/' ? 1 : 2 } as fs.Stats;
+      });
+      vi.spyOn(fs.promises, 'statfs').mockImplementation(async () => {
+        statfsCalls += 1;
+        if (op === 'statfs') await new Promise<never>(() => {});
+        return { bsize: 4096, blocks: 10, bavail: 5 } as fs.StatsFs;
       });
       const collectors = baseCollectors();
-      collectors.disks = (cwd, ttl, signal) => disks.sample(cwd, ttl, signal);
+      delete (collectors as Partial<ProbeCollectors>).disks; // default sampler path
       const probe = new BodyProbe(collectors);
       const seen: Body[] = [];
       probe.onSample((b) => seen.push(b));
       for (let i = 0; i < 8; i += 1) {
-        probe.start({ intervalMs: 2000 });
+        probe.start({ intervalMs: 2000, cwd: '/fake-cwd' });
         await flush();
         await probe.stop();
       }
-      expect(started).toBe(1); // the wedged op keeps the lock across generations
-      expect(seen).toHaveLength(7); // the first generation's tick never completes
-      expect(seen.every((b) => b.disks.status === 'stale')).toBe(true);
-      expect(vi.getTimerCount()).toBe(0);
+      expect(statCalls).toBe(2); // one wedged job per queried path, never duplicated
+      expect(statfsCalls).toBe(op === 'stat' ? 0 : 2);
+      expect(seen).toHaveLength(8); // wedged volumes no longer gate the tick
+      expect(seen.every((b) => b.disks.status === 'unknown' && b.disks.value === null)).toBe(true);
+      expect(seen.every((b) => (b.disks.unavailableMounts ?? []).length === 2)).toBe(true);
+      expect(vi.getTimerCount()).toBe(0); // stop() cancels the per-volume timeouts
     },
   );
+
+  it.each(['stat', 'statfs'] as const)(
+    'publishes every tick while a resolved-cwd disk %s hangs; root keeps refreshing', async (op) => {
+      let free = 10;
+      vi.spyOn(fs.promises, 'stat').mockImplementation(async (p) => {
+        if (op === 'stat' && String(p) === '/wedge') return new Promise<never>(() => {});
+        return { dev: 1 } as fs.Stats;
+      });
+      vi.spyOn(fs.promises, 'statfs').mockImplementation(async (p) => {
+        if (op === 'statfs' && String(p) === '/wedge') return new Promise<never>(() => {});
+        free += 1;
+        return { bsize: 1, blocks: free, bavail: free } as fs.StatsFs;
+      });
+      const collectors = baseCollectors();
+      delete (collectors as Partial<ProbeCollectors>).disks; // default sampler path
+      const probe = new BodyProbe(collectors);
+      const seen: Body[] = [];
+      probe.onSample((b) => seen.push(b));
+      probe.start({ intervalMs: 2000, cwd: '/wedge', cadence: { disksMs: 2000 } });
+      await flush();
+      expect(seen).toHaveLength(1);
+      expect(seen[0]?.disks.status).toBe('unknown'); // first turn may be unknown
+      expect(seen[0]?.disks.unavailableMounts).toEqual(['/', '/wedge']);
+      expect(seen[0]?.cpu.status).toBe('ok');
+      await vi.advanceTimersByTimeAsync(2000); // root lands under the 3s timeout
+      expect(seen).toHaveLength(2);
+      expect(seen[1]?.disks.unavailableMounts).toEqual(['/wedge']);
+      const root1 = seen[1]?.disks.value?.find((v) => v.mount === '/');
+      await vi.advanceTimersByTimeAsync(4000); // two more ticks past the timeout
+      const last = seen.at(-1)!;
+      const root2 = last.disks.value?.find((v) => v.mount === '/');
+      expect(seen).toHaveLength(4);            // ticks never wait on the wedge
+      expect(root2?.free).toBeGreaterThan(root1?.free ?? -1); // root refreshed
+      expect(root2?.observedAt).toBeGreaterThan(root1?.observedAt ?? 0);
+      expect(last.disks.unavailableMounts).toEqual(['/wedge']);
+      expect(last.cpu.status).toBe('ok');
+      await probe.stop();
+    },
+  );
+
+  it('restarting clears inner network caches: route re-probes, new offline lands after baseline', async () => {
+    let routeCalls = 0;
+    let online = true;
+    let i = 0;
+    const texts = [fx('netstat_1.txt'), fx('netstat_2.txt'), fx('netstat_2.txt'), fx('netstat_2.txt')];
+    vi.spyOn(command, 'defaultRun').mockImplementation(async (file, args = []) => {
+      if (file.endsWith('netstat')) return texts[Math.min(i++, texts.length - 1)]!;
+      if (file.endsWith('route')) {
+        routeCalls += 1;
+        if (!online) {
+          throw Object.assign(new Error('route: writing to routing socket: not in table'), { code: 1 });
+        }
+        return '';
+      }
+      if (file.endsWith('vm_stat')) return fx('vm_stat.txt');
+      if (args.includes('vm.swapusage')) return fx('swapusage.txt');
+      return '1\n';
+    });
+    fakeEn0();
+    const probe = new BodyProbe();
+    probe.start({ intervalMs: 1000, cadence: { networkMs: 2000, routeMs: 5000 } });
+    await vi.advanceTimersByTimeAsync(3000); // baseline t0, online rate fact at t2
+    expect(probe.latest()?.network.value?.online).toBe(true);
+    expect(routeCalls).toBe(1);
+    online = false;
+    await probe.stop();
+    probe.start({ intervalMs: 1000, cadence: { networkMs: 2000, routeMs: 30_000 } });
+    await flush(); // reset must force a route probe despite the longer routeMs
+    expect(routeCalls).toBe(2);
+    await vi.advanceTimersByTimeAsync(2000); // rate baseline completes -> offline lands
+    expect(probe.latest()?.network.status).toBe('ok');
+    expect(probe.latest()?.network.value?.online).toBe(false);
+    await probe.stop();
+  });
+
+  it('restarting clears inner memory caches: pressure/swap re-run and report new values', async () => {
+    let pressureCalls = 0;
+    let swapCalls = 0;
+    let pressureOut = '1\n';
+    let swapOut = fx('swapusage.txt');
+    vi.spyOn(command, 'defaultRun').mockImplementation(async (file, args = []) => {
+      if (file.endsWith('vm_stat')) return fx('vm_stat.txt');
+      if (args.includes('kern.memorystatus_vm_pressure_level')) { pressureCalls += 1; return pressureOut; }
+      if (args.includes('vm.swapusage')) { swapCalls += 1; return swapOut; }
+      if (file.endsWith('netstat')) return fx('netstat_1.txt');
+      return '';
+    });
+    const probe = new BodyProbe();
+    probe.start({ intervalMs: 1000 });
+    await flush();
+    expect(pressureCalls).toBe(1);
+    expect(swapCalls).toBe(1);
+    expect(probe.latest()?.memory.value?.pressure).toBe('normal');
+    await vi.advanceTimersByTimeAsync(4000); // still inside the 5s/30s cache windows
+    expect(pressureCalls).toBe(1);
+    expect(swapCalls).toBe(1);
+    pressureOut = '2\n';
+    swapOut = 'total = 1T used = 5G free = 0B';
+    await probe.stop();
+    probe.start({ intervalMs: 1000 });
+    await flush();
+    expect(pressureCalls).toBe(2); // inner caches were cleared, not only the outer ones
+    expect(swapCalls).toBe(2);
+    expect(probe.latest()?.memory.value?.pressure).toBe('warn');
+    expect(probe.latest()?.memory.value?.swapUsed).toBe(5 * 1024 ** 3);
+    await probe.stop();
+  });
+
+  it('clamps child cadences up to the parent so composites stay ok between polls', async () => {
+    let pressureCalls = 0;
+    let swapCalls = 0;
+    let routeCalls = 0;
+    vi.spyOn(command, 'defaultRun').mockImplementation(async (file, args = []) => {
+      if (file.endsWith('vm_stat')) return fx('vm_stat.txt');
+      if (args.includes('kern.memorystatus_vm_pressure_level')) { pressureCalls += 1; return '1\n'; }
+      if (args.includes('vm.swapusage')) { swapCalls += 1; return fx('swapusage.txt'); }
+      if (file.endsWith('netstat')) return fx('netstat_1.txt');
+      if (file.endsWith('route')) { routeCalls += 1; return ''; }
+      return '1\n';
+    });
+    fakeEn0();
+    const probe = new BodyProbe();
+    probe.start({
+      intervalMs: 2000,
+      cadence: { memoryMs: 30_000, networkMs: 30_000, pressureMs: 5000, swapMs: 5000, routeMs: 5000 },
+    });
+    await flush();
+    expect([pressureCalls, swapCalls, routeCalls]).toEqual([1, 1, 1]);
+    await vi.advanceTimersByTimeAsync(28_000); // children must not poll faster than the parent
+    expect([pressureCalls, swapCalls, routeCalls]).toEqual([1, 1, 1]);
+    const mem = probe.latest()!.memory;
+    const net = probe.latest()!.network;
+    expect(mem.status).toBe('ok'); // no spurious stale before the parent poll
+    expect(mem.ttlMs).toBe(90_000); // 3 * effective 30s child period
+    expect(net.ttlMs).toBe(90_000);
+    await vi.advanceTimersByTimeAsync(2000); // t=30s: the parent polls again
+    expect([pressureCalls, swapCalls, routeCalls]).toEqual([2, 2, 2]);
+    expect(probe.latest()?.network.status).toBe('ok');
+    await probe.stop();
+  });
+
+  it('uses the injected monotonic clock for cadence, staleness and history when wall moves back', async () => {
+    const counts = { memory: 0, network: 0, battery: 0, disks: 0 };
+    const collectors = baseCollectors();
+    collectors.memory = async (ttl) => {
+      counts.memory += 1;
+      return fact.ok({ total: 1, used: 1, pressure: 'normal', swapUsed: 0 }, src('mem'), ttl);
+    };
+    collectors.network = async (ttl) => {
+      counts.network += 1;
+      return fact.ok({ online: true, rxBps: 1, txBps: 1 }, src('net'), ttl);
+    };
+    collectors.battery = async (ttl) => {
+      counts.battery += 1;
+      return fact.ok(null, src('batt'), ttl);
+    };
+    collectors.disks = async (_cwd, ttl) => {
+      counts.disks += 1;
+      return fact.ok([{ mount: '/', total: 10, free: 5 }], src('disks'), ttl);
+    };
+    // The injected mono clock wraps the faked global performance.now(), so
+    // advancing timers progresses it while setSystemTime moves only the wall.
+    const probe = new BodyProbe(collectors, {
+      now: () => globalThis.performance.now(),
+      wall: () => Date.now(),
+    });
+    probe.start({ intervalMs: 2000 });
+    await flush();
+    expect(counts).toEqual({ memory: 1, network: 1, battery: 1, disks: 1 });
+    vi.setSystemTime(Date.now() - 3_600_000); // wall rolls back one hour
+    await vi.advanceTimersByTimeAsync(2000); // inside every cadence
+    expect(counts).toEqual({ memory: 1, network: 1, battery: 1, disks: 1 });
+    await vi.advanceTimersByTimeAsync(4000); // 6s mono: 5s cadences refetch
+    expect(counts).toEqual({ memory: 2, network: 2, battery: 1, disks: 1 });
+    expect(probe.latest()?.memory.status).toBe('ok'); // fresh facts usable after rollback
+    await vi.advanceTimersByTimeAsync(26_000); // 32s mono: battery 30s, disks 10s refetch
+    expect(counts.battery).toBe(2);
+    expect(counts.disks).toBeGreaterThanOrEqual(3);
+    await probe.stop();
+    await vi.advanceTimersByTimeAsync(16_000); // tracked deadline is monotonic, not wall
+    expect(probe.latest()?.memory.status).toBe('stale');
+    await vi.advanceTimersByTimeAsync(300_000); // the history window is monotonic too
+    expect(probe.history()).toHaveLength(0);
+  });
 
   it('marks real composite facts stale after stop; stored history stays ok', async () => {
     const run: RunFn = async (file, args = []) => {
@@ -484,12 +681,11 @@ describe('BodyProbe', () => {
       if (args.includes('vm.swapusage')) return fx('swapusage.txt');
       return '1\n'; // pressure level; route success output is unused
     };
-    const now = () => Date.now(); // fake timers drive the samplers' cache clocks
-    const memory = new MemorySampler({ platform: 'darwin', run, now, totalmem: () => 1 });
+    // Samplers default to the same (faked) monotonic clock as the probe.
+    const memory = new MemorySampler({ platform: 'darwin', run, totalmem: () => 1 });
     const network = new NetworkSampler({
       platform: 'darwin',
       run,
-      now,
       interfaces: () => ({
         en0: [{ address: '10.0.0.1', netmask: '255.0.0.0', family: 'IPv4', mac: 'aa', internal: false, cidr: null }],
       }),
@@ -508,13 +704,16 @@ describe('BodyProbe', () => {
     expect(mem.status).toBe('ok');
     expect(net.status).toBe('ok');
     expect(mem.observedAt).toBeLessThan(Date.now()); // built on a t=0 swap read
-    expect(mem.ttlMs).toBe(90_000); // 3*swapMs: swap is the oldest constituent
-    expect(net.ttlMs).toBe(90_000); // 3*routeMs
+    expect(mem.ttlMs).toBe(21_000); // earliest expiry: fresh vm/pressure reads at t6 (+15s)
+    expect(net.ttlMs).toBe(21_000); // the t6 rate sample's own ttl, not the route's
     const until = (f: Fact<unknown>) => f.observedAt + f.ttlMs;
-    await vi.advanceTimersByTimeAsync(Math.min(until(mem), until(net)) - Date.now() - 1);
+    const toBoundary = Math.min(until(mem), until(net)) - Date.now() - 1;
+    const pastBoundary = Math.max(until(mem), until(net)) - Date.now() + 1;
+    await vi.advanceTimersByTimeAsync(toBoundary);
     expect(probe.latest()?.memory.status).toBe('ok');
     expect(probe.latest()?.network.status).toBe('ok');
-    await vi.advanceTimersByTimeAsync(Math.max(until(mem), until(net)) - Date.now() + 1);
+    vi.setSystemTime(Date.now() - 3_600_000); // rollback cannot revive tracked deadlines
+    await vi.advanceTimersByTimeAsync(pastBoundary - toBoundary);
     expect(probe.latest()?.memory.status).toBe('stale');
     expect(probe.latest()?.network.status).toBe('stale');
     expect(probe.latest()?.memory.observedAt).toBe(mem.observedAt); // never refreshed

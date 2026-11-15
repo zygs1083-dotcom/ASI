@@ -1,6 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { describe, expect, it, vi } from 'vitest';
 import { MemorySampler, parsePressureLevel, parseSwapUsage, parseVmStat } from '../src/memory.js';
+import * as fact from '../src/fact.js';
 import type { RunFn } from '../src/command.js';
 
 const fx = (name: string) => readFileSync(new URL(`./fixtures/${name}`, import.meta.url), 'utf8');
@@ -153,7 +154,7 @@ describe('MemorySampler', () => {
     expect(calls).toBe(3);   // boundary expiry re-runs
   });
 
-  it('composes observedAt/ttlMs from the oldest constituent, ties take the smallest period', async () => {
+  it('composes observedAt/ttlMs from the earliest absolute expiry, not the oldest field', async () => {
     let mono = 0;
     let wall = 1_000;
     const s = new MemorySampler({
@@ -165,17 +166,22 @@ describe('MemorySampler', () => {
     });
     const first = await s.sample(6000); // all constituents fresh at wall 1000
     expect(first.observedAt).toBe(1000);
-    expect(first.ttlMs).toBe(6000);     // three-way tie -> smallest period (vm, ttl/3 = 2000)
+    expect(first.ttlMs).toBe(6000);     // earliest expiry: vm read at 1000 + 3*2000
 
     wall = 9_000; mono = 4_000;         // pressure & swap caches still valid
     const second = await s.sample(6000);
     expect(second.observedAt).toBe(1000); // cached constituents are the oldest
-    expect(second.ttlMs).toBe(15_000);    // pressure's 5000 wins the tie against swap's 30000
+    expect(second.ttlMs).toBe(14_000);    // expires at 15000: the fresh vm read's ttl
 
     wall = 40_000; mono = 25_000;       // pressure expired (>5s), swap still cached
     const third = await s.sample(6000);
     expect(third.observedAt).toBe(1000); // swap's original observation is oldest
-    expect(third.ttlMs).toBe(90_000);    // 3 * swap period
+    expect(third.ttlMs).toBe(45_000);    // expires at 46000: the fresh vm read's ttl
+    // the tracked monotonic deadline matches: vm part observed at mono 25000 + 6s
+    expect(fact.stale(third, 30_999, 40_000).status).toBe('ok');
+    expect(fact.stale(third, 31_001, 40_000).status).toBe('stale');
+    // a rolled-back wall cannot revive it: the deadline is monotonic
+    expect(fact.stale(third, 31_001, 1).status).toBe('stale');
   });
 
   it('honors caller-supplied pressure/swap cache periods', async () => {
