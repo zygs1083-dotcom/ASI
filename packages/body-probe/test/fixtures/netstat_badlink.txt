@@ -1,0 +1,2 @@
+Name  Mtu   Network       Address            Ipkts Ierrs     Ibytes    Opkts Oerrs     Obytes    Coll
+en0   1500  <Link#4>    aa:bb:cc:dd:ee:ff     100     0       6000      200     0          0
