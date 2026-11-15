@@ -60,7 +60,7 @@ test('Electron window boots with the secure API boundary', async ({ launchApp })
 
 test('fixture can restart Electron with the same isolated data directory', async ({ dataDir, launchApp }) => {
   const first = await launchApp();
-  expect(await first.app.evaluate(({ app }) => app.getPath('userData'))).toBe(dataDir);
+  expect(await first.app.evaluate(() => process.env.ASI_DATA_DIR)).toBe(dataDir);
   expect(await first.app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].getSize())).toEqual(
     [1100, 720],
   );
@@ -68,6 +68,6 @@ test('fixture can restart Electron with the same isolated data directory', async
   await first.app.close();
 
   const second = await launchApp({ dataDir });
-  expect(await second.app.evaluate(({ app }) => app.getPath('userData'))).toBe(dataDir);
+  expect(await second.app.evaluate(() => process.env.ASI_DATA_DIR)).toBe(dataDir);
   await expect.poll(() => second.page.evaluate('document.readyState')).toBe('complete');
 });

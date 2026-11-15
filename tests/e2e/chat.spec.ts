@@ -42,16 +42,18 @@ test('stopping a slow reply preserves its partial text', async ({ launchApp }) =
   await expect(fullReply).toHaveAttribute('data-status', 'done', { timeout: 20_000 });
   const fullText = (await fullReply.textContent())?.trim() ?? '';
   expect(fullText.length).toBeGreaterThan(0);
+  const prefix = Array.from(fullText).slice(0, 8).join('');
 
   await newFauxChat(page);
   await send(page, '/slow');
   const assistant = page.getByTestId('msg-assistant');
   await expect(assistant).toHaveAttribute('data-status', 'streaming');
-  await expect.poll(async () => (await assistant.textContent())?.trim().length ?? 0).toBeGreaterThan(0);
+  await expect(assistant).toContainText(prefix);
   const partialText = (await assistant.textContent())?.trim() ?? '';
   expect(partialText.length).toBeLessThan(fullText.length);
   await page.getByTestId('composer-stop').click();
   await expect(assistant).toHaveAttribute('data-status', 'aborted');
+  await expect(assistant).toContainText(prefix);
   const stoppedText = (await assistant.textContent())?.trim() ?? '';
   expect(stoppedText.length).toBeGreaterThan(0);
   expect(stoppedText.length).toBeLessThan(fullText.length);
