@@ -42,7 +42,7 @@ export function Sidebar({ open, onNavigate }: { open: boolean; onNavigate: () =>
     ? def.available
       ? def.label
       : `${def.label}（不可用）`
-    : '未配置模型';
+    : '未设置默认模型';
   const statusClass = !s.settings?.defaultModel ? 'off' : def.available ? 'on' : 'err';
 
   const finishRename = (id: string) => (title: string | null) => {

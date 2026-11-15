@@ -15,27 +15,56 @@ function UserMessage({ m }: { m: ChatMessage }) {
   );
 }
 
-function AssistantMessage({ m, convId }: { m: ChatMessage; convId: string }) {
+function AssistantMessage({
+  m,
+  convId,
+  isLast,
+  pending,
+}: {
+  m: ChatMessage;
+  convId: string;
+  isLast: boolean;
+  pending: boolean;
+}) {
   const streaming = m.status === 'streaming';
+  // 只有真正的最后一条失败/中止消息才可重试（契约：chat.retry 只针对最后一轮）
+  const showRetry = isLast && (m.status === 'error' || m.status === 'aborted');
   return (
     <div className="msg-row assistant">
       <div className="msg-assistant" data-testid="msg-assistant" data-status={m.status ?? 'done'}>
-        {m.text ? <Markdown text={m.text} /> : null}
-        {streaming && <span className="stream-cursor" aria-hidden="true" />}
+        <Markdown text={m.text} streaming={streaming} />
         {m.status === 'error' && (
           <div className="msg-error" data-testid="msg-error">
             <span className="msg-error-text">{m.error || '出错了，请重试'}</span>
-            <button
-              type="button"
-              className="pill-btn msg-retry"
-              aria-label="重试"
-              onClick={() => actions.retry(convId, m.id)}
-            >
-              重试
-            </button>
+            {showRetry && (
+              <button
+                type="button"
+                className="pill-btn msg-retry"
+                aria-label="重试"
+                disabled={pending}
+                onClick={() => void actions.retry(convId)}
+              >
+                重试
+              </button>
+            )}
           </div>
         )}
-        {m.status === 'aborted' && <div className="msg-aborted">已停止</div>}
+        {m.status === 'aborted' && (
+          <div className="msg-aborted">
+            <span>已停止</span>
+            {showRetry && (
+              <button
+                type="button"
+                className="pill-btn msg-retry"
+                aria-label="重试"
+                disabled={pending}
+                onClick={() => void actions.retry(convId)}
+              >
+                重试
+              </button>
+            )}
+          </div>
+        )}
       </div>
     </div>
   );
@@ -188,11 +217,17 @@ export function ChatView() {
               )}
             </div>
           ) : (
-            conv.messages.map((m) =>
+            conv.messages.map((m, i) =>
               m.role === 'user' ? (
                 <UserMessage key={m.id} m={m} />
               ) : (
-                <AssistantMessage key={m.id} m={m} convId={convId} />
+                <AssistantMessage
+                  key={m.id}
+                  m={m}
+                  convId={convId}
+                  isLast={i === conv.messages.length - 1}
+                  pending={!!s.pendingSend[convId]}
+                />
               ),
             )
           )}

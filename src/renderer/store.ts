@@ -133,10 +133,13 @@ export function applyTheme(theme: AppSettings['theme']): void {
 
 // ---------- 流式事件与合并 ----------
 
-// 每个会话里流式消息 id → 已收到的全部 delta 文本（权威来源：订阅早于任何 send/get）。
-const liveDeltas = new Map<string, Map<string, string>>();
+// 每个会话里流式消息 id → 最近一次 delta 事件携带的完整正文（权威值，不是拼接结果；
+// 订阅早于任何 send/get，窗口重建/重载后旧快照也盖不掉它）。
+const liveTexts = new Map<string, Map<string, string>>();
 // 消息尚未出现在缓存里时先到的事件（send 返回前 / 会话未加载）
 const pendingEvents = new Map<string, ChatEvent[]>();
+// 重试已移除的失败消息 id：迟到的旧 get 快照不得把它复活；会话删除时清空
+const supersededMessages = new Map<string, Set<string>>();
 // 会话删除纪元：get/send 的过期响应不允许复活已删会话
 const convEpoch = new Map<string, number>();
 // 本地字段（title/model）版本：改名/改模型后，过期的 get 快照不得覆盖本地新值
@@ -151,6 +154,7 @@ const bumpRev = (m: Map<string, number>, k: string): void => {
 let selectionGen = 0;
 let offEvents: (() => void) | null = null;
 let initStarted = false;
+let pendingNewConversation: Promise<void> | null = null;
 
 function queueEvent(convId: string, e: ChatEvent): void {
   const list = pendingEvents.get(convId) ?? [];
@@ -178,8 +182,8 @@ function renewSubscription(): void {
 /**
  * 合并规则（消息历史只增不减）：
  * - 同一 messageId：任一侧为终态（done/error/aborted）则终态获胜——终态绝不回流式；
- *   两侧同态取快照；同为 streaming 时文本以 liveDeltas 累积为准，否则取更长的一侧，
- *   保证晚到的旧快照不会把终端消息改回流式、也不会截断已收到的文本。
+ *   两侧同态取快照；同为 streaming 时文本以 liveTexts 里最新事件的完整正文为准，
+ *   否则取更长的一侧，保证晚到的旧快照不会把终端消息改回流式、也不会截断已收到的文本。
  * - 缓存里存在而快照里没有的消息（send 刚写入的 pair 等）按原顺序保留在尾部。
  */
 function mergeMessage(c: ChatMessage | undefined, s: ChatMessage, acc: string | undefined): ChatMessage {
@@ -196,7 +200,7 @@ function mergeMessage(c: ChatMessage | undefined, s: ChatMessage, acc: string | 
 }
 
 function mergeMessages(convId: string, snap: ChatMessage[], cached: ChatMessage[]): ChatMessage[] {
-  const deltas = liveDeltas.get(convId);
+  const deltas = liveTexts.get(convId);
   const remaining = new Map(cached.map((m) => [m.id, m]));
   const merged = snap.map((s) => {
     const c = remaining.get(s.id);
@@ -215,7 +219,6 @@ function mergeMessages(convId: string, snap: ChatMessage[], cached: ChatMessage[
  */
 function applyEventToConv(cd: ConvState, convId: string, e: ChatEvent, queueMissing: boolean): ConvState {
   if (e.type === 'delta') {
-    const acc = liveDeltas.get(convId)?.get(e.messageId) ?? '';
     const idx = cd.messages.findIndex((m) => m.id === e.messageId);
     if (idx < 0) {
       if (queueMissing) {
@@ -225,7 +228,7 @@ function applyEventToConv(cd: ConvState, convId: string, e: ChatEvent, queueMiss
       const placeholder: ChatMessage = {
         id: e.messageId,
         role: 'assistant',
-        text: acc,
+        text: e.text,
         createdAt: Date.now(),
         status: 'streaming',
       };
@@ -233,9 +236,9 @@ function applyEventToConv(cd: ConvState, convId: string, e: ChatEvent, queueMiss
     }
     // 终态消息忽略迟到的 delta（如过期排队事件重放），终态不得回流式
     if (isTerminal(cd.messages[idx])) return cd;
-    if (cd.messages[idx].text === acc && cd.messages[idx].status === 'streaming') return cd;
+    if (cd.messages[idx].text === e.text && cd.messages[idx].status === 'streaming') return cd;
     const messages = [...cd.messages];
-    messages[idx] = { ...messages[idx], text: acc, status: 'streaming' };
+    messages[idx] = { ...messages[idx], text: e.text, status: 'streaming' };
     return { ...cd, messages };
   }
   const idx = cd.messages.findIndex((m) => m.id === e.message.id);
@@ -263,14 +266,14 @@ function flushPending(convId: string, cd: ConvState): ConvState {
 function handleEvent(e: ChatEvent): void {
   const convId = e.conversationId;
   if (e.type === 'delta') {
-    let m = liveDeltas.get(convId);
+    let m = liveTexts.get(convId);
     if (!m) {
       m = new Map();
-      liveDeltas.set(convId, m);
+      liveTexts.set(convId, m);
     }
-    m.set(e.messageId, (m.get(e.messageId) ?? '') + e.delta);
+    m.set(e.messageId, e.text);
   } else {
-    liveDeltas.get(convId)?.delete(e.message.id);
+    liveTexts.get(convId)?.delete(e.message.id);
   }
   const cd = state.conversations[convId];
   if (!cd?.loaded) {
@@ -282,17 +285,20 @@ function handleEvent(e: ChatEvent): void {
   if (e.type !== 'delta') void refreshSummaries();
 }
 
-/** get 快照与当前缓存按消息 id 合并，再 flush 排队事件 */
+/** get 快照与当前缓存按消息 id 合并，再 flush 排队事件；快照里的消息是完整正文，直接用 */
 function mergeIntoCache(convId: string, conv: Conversation): ConvState {
   const cached = state.conversations[convId];
-  const deltas = liveDeltas.get(convId);
+  const deltas = liveTexts.get(convId);
+  const superseded = supersededMessages.get(convId);
+  // 已被重试替换掉的失败消息：旧快照里的残影直接丢弃，不得复活
+  const snap = superseded ? conv.messages.filter((m) => !superseded.has(m.id)) : conv.messages;
   const cd: ConvState = {
     loaded: true,
     title: conv.title,
     model: conv.model,
     messages: cached
-      ? mergeMessages(convId, conv.messages, cached.messages)
-      : conv.messages.map((m) => {
+      ? mergeMessages(convId, snap, cached.messages)
+      : snap.map((m) => {
           const acc = deltas?.get(m.id);
           return acc != null && m.status === 'streaming' ? { ...m, text: acc } : m;
         }),
@@ -302,7 +308,7 @@ function mergeIntoCache(convId: string, conv: Conversation): ConvState {
 
 /** send 返回的 user/assistant：按 id upsert——已存在时按合并规则（终态不被流式占位覆盖） */
 function upsertMessages(convId: string, messages: ChatMessage[], incoming: ChatMessage[]): ChatMessage[] {
-  const deltas = liveDeltas.get(convId);
+  const deltas = liveTexts.get(convId);
   const byId = new Map(incoming.map((m) => [m.id, m]));
   const out = messages.map((m) => {
     const inc = byId.get(m.id);
@@ -417,22 +423,65 @@ export const actions = {
   },
 
   async newConversation(): Promise<void> {
-    const gen = ++selectionGen;
-    try {
-      const conv = await api().conversations.create();
-      const conversations = {
-        ...state.conversations,
-        [conv.id]: { loaded: true, title: conv.title, model: conv.model, messages: conv.messages },
-      };
-      if (gen === selectionGen) {
-        setState({ conversations, currentId: conv.id, view: 'chat', editor: null, convLoading: false });
-      } else {
-        setState({ conversations });
+    // 快速连续点击共用同一次进行中的发现/创建，不产生重复会话
+    pendingNewConversation ??= (async () => {
+      const gen = ++selectionGen;
+      try {
+        // 复用真空会话（messages 为 0，改过名的也算）：当前 → 缓存 → get 核实未加载的
+        const current = state.currentId ? state.conversations[state.currentId] : undefined;
+        if (current?.loaded && current.messages.length === 0) {
+          if (gen === selectionGen) setState({ view: 'chat', editor: null, convLoading: false });
+          return;
+        }
+        for (const summary of state.summaries) {
+          const cached = state.conversations[summary.id];
+          if (cached?.loaded) {
+            if (cached.messages.length !== 0) continue;
+            renewSubscription();
+            if (gen === selectionGen) {
+              setState({ currentId: summary.id, view: 'chat', editor: null, convLoading: false });
+            }
+            return;
+          }
+          const epoch = convEpoch.get(summary.id) ?? 0;
+          const conv = await api().conversations.get(summary.id);
+          // 等待期间发生了无关导航或会话被删：放弃本次发现/创建
+          if (gen !== selectionGen || (convEpoch.get(summary.id) ?? 0) !== epoch) return;
+          if (conv?.messages.length !== 0) continue;
+          renewSubscription();
+          const merged = mergeIntoCache(summary.id, conv);
+          const conversations = { ...state.conversations, [summary.id]: merged };
+          if (gen === selectionGen) {
+            setState({
+              conversations,
+              currentId: summary.id,
+              view: 'chat',
+              editor: null,
+              convLoading: false,
+            });
+          } else {
+            setState({ conversations });
+          }
+          return;
+        }
+        const conv = await api().conversations.create();
+        const conversations = {
+          ...state.conversations,
+          [conv.id]: { loaded: true, title: conv.title, model: conv.model, messages: conv.messages },
+        };
+        if (gen === selectionGen) {
+          setState({ conversations, currentId: conv.id, view: 'chat', editor: null, convLoading: false });
+        } else {
+          setState({ conversations });
+        }
+        void refreshSummaries();
+      } catch (e) {
+        setState({ notice: errText(e) });
       }
-      void refreshSummaries();
-    } catch (e) {
-      setState({ notice: errText(e) });
-    }
+    })().finally(() => {
+      pendingNewConversation = null;
+    });
+    return pendingNewConversation;
   },
 
   async deleteConversation(id: string): Promise<void> {
@@ -444,8 +493,9 @@ export const actions = {
     }
     bumpRev(convEpoch, id);
     bumpRev(convLocalRev, id);
-    liveDeltas.delete(id);
+    liveTexts.delete(id);
     pendingEvents.delete(id);
+    supersededMessages.delete(id);
     const conversations = { ...state.conversations };
     delete conversations[id];
     const drafts = { ...state.drafts };
@@ -520,17 +570,48 @@ export const actions = {
     }
   },
 
-  retry(convId: string, assistantMessageId: string): void {
+  /**
+   * 重试最后一轮：仅当最后一条是终态 error/aborted 的 assistant 时调用 chat.retry，
+   * 返回的新 streaming 占位只替换那条失败消息，不重复追加 user。
+   */
+  async retry(convId: string): Promise<void> {
     const cd = state.conversations[convId];
-    if (!cd || convStreaming(cd) || state.pendingSend[convId]) return;
-    const idx = cd.messages.findIndex((m) => m.id === assistantMessageId);
-    const end = idx < 0 ? cd.messages.length : idx;
-    for (let i = end - 1; i >= 0; i--) {
-      const m = cd.messages[i];
-      if (m.role === 'user') {
-        void actions.send(convId, m.text);
-        return;
+    if (!cd?.loaded || convStreaming(cd) || state.pendingSend[convId]) return;
+    const last = cd.messages[cd.messages.length - 1];
+    if (last?.role !== 'assistant' || (last.status !== 'error' && last.status !== 'aborted')) {
+      return;
+    }
+    const epoch = convEpoch.get(convId) ?? 0;
+    setState({ pendingSend: { ...state.pendingSend, [convId]: true }, notice: null });
+    try {
+      const { assistant } = await api().chat.retry(convId);
+      if ((convEpoch.get(convId) ?? 0) !== epoch) return; // 会话在重试期间被删除
+      // 旧失败消息已在后端被替换：记入 superseded，迟到的 get 快照不得复活它
+      let superseded = supersededMessages.get(convId);
+      if (!superseded) {
+        superseded = new Set();
+        supersededMessages.set(convId, superseded);
       }
+      superseded.add(last.id);
+      liveTexts.get(convId)?.delete(last.id);
+      const base = state.conversations[convId] ?? cd;
+      const next = flushPending(convId, {
+        ...base,
+        messages: upsertMessages(
+          convId,
+          base.messages.filter((m) => m.id !== last.id),
+          [assistant],
+        ),
+      });
+      setConv(convId, next);
+      void refreshSummaries();
+    } catch (e) {
+      // 重试失败保留原失败消息，可再次重试
+      setState({ notice: errText(e) });
+    } finally {
+      const pendingSend = { ...state.pendingSend };
+      delete pendingSend[convId];
+      setState({ pendingSend });
     }
   },
 
@@ -543,6 +624,16 @@ export const actions = {
       const now = state.conversations[convId];
       if (now) setConv(convId, { ...now, model: ref });
       void refreshSummaries();
+      // 还没有默认模型时，把刚选的这个顺手设为默认；已有默认值绝不覆盖
+      if (state.settings !== null && state.settings.defaultModel === null) {
+        try {
+          const settings = await api().settings.set({ defaultModel: ref });
+          setState({ settings });
+        } catch (e) {
+          // 会话模型已生效，只提示默认模型写入失败
+          setState({ notice: `会话模型已更新，但默认模型保存失败：${errText(e)}` });
+        }
+      }
     } catch (e) {
       setState({ notice: errText(e) });
     }

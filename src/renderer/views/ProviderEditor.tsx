@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import type { ProviderInput, ProviderKind, TestResult } from '../../shared/types';
 import { Segmented, Switch } from '../components/controls';
 import { actions, useAppState } from '../store';
@@ -34,6 +34,24 @@ export function ProviderEditor({ target }: { target: { id: string | null } }) {
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [tests, setTests] = useState<TestState>({});
   const deleteRef = useRef<HTMLButtonElement>(null);
+  const keyInputRef = useRef<HTMLInputElement | null>(null);
+
+  // 回调 ref：React detach（传 null）或换节点时同步清掉旧 DOM 上的明文——
+  // 卸载 effect 看到 ref 已是 null，清不到脱离文档的旧节点，所以必须在 ref 层清
+  const keyInputCb = useCallback((node: HTMLInputElement | null) => {
+    const prev = keyInputRef.current;
+    if (prev && prev !== node) prev.value = '';
+    keyInputRef.current = node;
+  }, []);
+
+  // 唯一的 Key 草稿清理入口：React state 与当前 DOM 值一起清
+  const clearKeyDraft = useCallback(() => {
+    setApiKeyDraft('');
+    if (keyInputRef.current) keyInputRef.current.value = '';
+  }, []);
+
+  // 卸载兜底再清一次（此时 DOM 值已由回调 ref 清掉，这里只保证 state 不残留）
+  useEffect(() => () => clearKeyDraft(), [clearKeyDraft]);
 
   useEffect(() => {
     if (existing) void actions.ensureProviderModels(existing.id);
@@ -79,7 +97,10 @@ export function ProviderEditor({ target }: { target: { id: string | null } }) {
               type="button"
               className="pill-btn"
               aria-label="返回厂商列表"
-              onClick={() => actions.closeEditor()}
+              onClick={() => {
+                clearKeyDraft();
+                actions.closeEditor();
+              }}
             >
               ‹ 返回
             </button>
@@ -134,24 +155,26 @@ export function ProviderEditor({ target }: { target: { id: string | null } }) {
   const save = async () => {
     if (!validate() || saving) return;
     setSaving(true);
-    const apiKey = keyCleared ? apiKeyDraft || null : apiKeyDraft || undefined;
     const input: ProviderInput = {
       id: existing?.id,
       name: name.trim(),
       kind,
       builtinProvider: kind === 'builtin' ? builtinProvider : undefined,
       baseUrl: baseUrl.trim() || undefined,
-      apiKey,
+      apiKey: keyCleared ? apiKeyDraft || null : apiKeyDraft || undefined,
       enabled,
       customModels: kind === 'openai-compatible' ? customModels : [],
     };
+    // 明文 key 一旦进了 payload 立刻清掉草稿，不等保存结果
+    clearKeyDraft();
     try {
       await actions.saveProvider(input);
-      setApiKeyDraft('');
       actions.closeEditor();
     } catch (e) {
       setErrors({ form: e instanceof Error && e.message ? e.message : '保存失败，请重试' });
     } finally {
+      // 后端已消费 payload，删掉本地持有的明文引用
+      delete input.apiKey;
       setSaving(false);
     }
   };
@@ -165,6 +188,7 @@ export function ProviderEditor({ target }: { target: { id: string | null } }) {
 
   const pickBuiltin = (id: string) => {
     setBuiltinProvider(id);
+    clearKeyDraft();
     if (!nameTouched) setName(s.catalog.find((c) => c.id === id)?.name ?? '');
   };
 
@@ -183,7 +207,10 @@ export function ProviderEditor({ target }: { target: { id: string | null } }) {
             type="button"
             className="pill-btn"
             aria-label="返回厂商列表"
-            onClick={() => actions.closeEditor()}
+            onClick={() => {
+              clearKeyDraft();
+              actions.closeEditor();
+            }}
           >
             ‹ 返回
           </button>
@@ -197,6 +224,7 @@ export function ProviderEditor({ target }: { target: { id: string | null } }) {
               value={kind}
               onChange={(k) => {
                 setKind(k);
+                clearKeyDraft();
                 if (!nameTouched && k === 'builtin' && catalogEntry) setName(catalogEntry.name);
               }}
               options={[
@@ -257,7 +285,7 @@ export function ProviderEditor({ target }: { target: { id: string | null } }) {
               data-testid="pe-baseurl"
               type="text"
               value={baseUrl}
-              placeholder="http://localhost:11434/v1"
+              placeholder={kind === 'builtin' ? '使用厂商默认地址' : 'http://localhost:11434/v1'}
               onChange={(e) => setBaseUrl(e.target.value)}
             />
             {errors.baseUrl && <div className="pe-err">{errors.baseUrl}</div>}
@@ -269,11 +297,13 @@ export function ProviderEditor({ target }: { target: { id: string | null } }) {
             </label>
             <div className="pe-key-row">
               <input
+                ref={keyInputCb}
                 id="pe-apikey"
                 className="pe-input"
                 data-testid="pe-apikey"
                 type="password"
                 autoComplete="new-password"
+                disabled={saving}
                 value={apiKeyDraft}
                 placeholder={keyPlaceholder}
                 onChange={(e) => setApiKeyDraft(e.target.value)}
@@ -286,7 +316,7 @@ export function ProviderEditor({ target }: { target: { id: string | null } }) {
                   aria-label="清除已保存的 API Key"
                   onClick={() => {
                     setKeyCleared(true);
-                    setApiKeyDraft('');
+                    clearKeyDraft();
                   }}
                 >
                   清除
@@ -432,7 +462,10 @@ export function ProviderEditor({ target }: { target: { id: string | null } }) {
                 className="pill-btn"
                 data-testid="pe-cancel"
                 aria-label="取消编辑"
-                onClick={() => actions.closeEditor()}
+                onClick={() => {
+                  clearKeyDraft();
+                  actions.closeEditor();
+                }}
               >
                 取消
               </button>

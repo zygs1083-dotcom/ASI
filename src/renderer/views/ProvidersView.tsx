@@ -55,7 +55,8 @@ export function ProvidersView() {
     for (const p of s.providers) void actions.ensureProviderModels(p.id);
   }, [s.providers]);
 
-  if (s.editor) return <ProviderEditor target={s.editor} />;
+  // key 按编辑目标变化：切厂商时整体重挂载，表单/key 草稿等本地状态互不串扰
+  if (s.editor) return <ProviderEditor key={s.editor.id ?? 'new'} target={s.editor} />;
 
   const q = query.trim().toLowerCase();
   const filtered = s.providers.filter(
