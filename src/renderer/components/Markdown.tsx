@@ -1,6 +1,7 @@
 import { Check, Copy } from 'lucide-react';
 import { type ReactNode, useRef, useState } from 'react';
 import ReactMarkdown from 'react-markdown';
+import remarkBreaks from 'remark-breaks';
 import remarkGfm from 'remark-gfm';
 import type { Plugin } from 'unified';
 
@@ -108,7 +109,7 @@ export function Markdown({ text, streaming }: { text: string; streaming?: boolea
   return (
     <div className={`md${streaming ? ' streaming' : ''}`}>
       <ReactMarkdown
-        remarkPlugins={[remarkGfm]}
+        remarkPlugins={[remarkGfm, remarkBreaks]}
         rehypePlugins={streaming ? [rehypeStreamTail] : []}
         components={{
           pre: CodeBlock,

@@ -276,7 +276,7 @@ export class ChatService {
         complete(
           model,
           { messages: [{ role: 'user', content: 'ping', timestamp: started }] },
-          { apiKey, signal: controller.signal, maxTokens: 16 },
+          { apiKey, signal: controller.signal, maxTokens: 64 },
         ),
         timeout,
       ]);

@@ -722,6 +722,29 @@ describe('Markdown stream-tail marker', () => {
   });
 });
 
+// ---------- F5：行内单换行渲染为 <br>，代码块内原样保留 ----------
+
+const brCount = (html: string) => (html.match(/<br\b/g) ?? []).length;
+
+describe('Markdown single-newline breaks', () => {
+  it.each([false, true])('renders soft newlines as <br> within one paragraph (streaming=%s)', (streaming) => {
+    const html = renderMd('1\n2\n3', streaming);
+    expect(brCount(html)).toBe(2);
+    const para = html.match(/<p[^>]*>([\s\S]*?)<\/p>/);
+    expect(para?.[1]).toMatch(/^1<br[^>]*>[\s\S]*2<br[^>]*>[\s\S]*3$/);
+  });
+
+  it.each([false, true])(
+    'keeps newlines literal inside fenced code without <br> (streaming=%s)',
+    (streaming) => {
+      const html = renderMd('```\n1\n2\n3\n```', streaming);
+      const code = html.match(/<code[^>]*>([\s\S]*?)<\/code>/);
+      expect(code?.[1]).toContain('1\n2\n3\n');
+      expect(brCount(html)).toBe(0);
+    },
+  );
+});
+
 // ---------- dev CSP 插件 ----------
 
 const PROD_CSP =

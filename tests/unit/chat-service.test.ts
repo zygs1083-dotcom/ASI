@@ -628,9 +628,20 @@ describe('ChatService.test', () => {
     const [_model, ctx, options] = completeMock.mock.calls[0];
     expect(ctx.messages).toHaveLength(1);
     expect(ctx.messages[0]).toMatchObject({ role: 'user', content: 'ping' });
-    expect(options?.maxTokens).toBe(16);
+    expect(options?.maxTokens).toBe(64);
     expect(options?.apiKey).toBe('asi-faux');
     // 测试连通不创建/修改会话
+    expect(env.conversations.list()).toEqual([]);
+  });
+
+  it('accepts an empty-content reply truncated by the token cap as ok', async () => {
+    const env = setup();
+    // maxTokens 顶满时厂商可能返回 stopReason:'length' 且零内容的回复：连通本身已验证
+    completeMock.mockResolvedValueOnce(piai.fauxAssistantMessage([], { stopReason: 'length' }));
+    const result = await env.service.test(FAUX_PROVIDER_ID, 'faux-chat');
+    expect(result.ok).toBe(true);
+    expect(result.latencyMs).toBeGreaterThanOrEqual(0);
+    expect(result.error).toBeUndefined();
     expect(env.conversations.list()).toEqual([]);
   });
 
