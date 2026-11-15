@@ -2,46 +2,67 @@ import type { DeliveryLevel, EnvChange, Signal, WatchRule } from '@asi/sense-typ
 import { LEVEL_RANK } from './rules.ts';
 
 /**
- * One merge bucket: a group of signals sharing session+kind+subject, closed
- * at a fixed deadline anchored on first receipt. `latest` is the
- * representative signal — the highest effective level in the group, and
- * among equal levels the newest `signal.at` (`id` is the deterministic tie).
+ * One kind's contribution inside a merge bucket: merged `count`, earliest
+ * `signal.at`, and the representative — highest effective level, then newest
+ * `at` (`id` breaks ties); rule/note/reason follow the representative.
  */
-export interface Bucket {
-  sessionId: string;
+export interface BucketDetail {
   kind: string;
-  subject: string;
   level: DeliveryLevel;
-  /** Earliest `signal.at` seen in the group. */
-  since: number;
-  deadline: number;
-  latest: Signal;
   count: number;
+  /** Earliest `signal.at` seen for this kind. */
+  since: number;
+  latest: Signal;
   ruleId?: string;
   note?: string;
   reason?: string;
 }
 
-/** Last source-health transition observed for one source id. */
-export interface SourceMark {
-  status: string;
-  at: number;
+/**
+ * One merge bucket: every accepted signal sharing session+subject received
+ * in the half-open window `[startedAt, deadline)` fixed by the first
+ * signal's kind — a signal received at or after it opens a new generation,
+ * so a retained failed delivery can never swallow fresh input. `details`
+ * keeps each kind's own merge so one delivery carries every kind's change.
+ */
+export interface Bucket {
+  id: number;
+  sessionId: string;
+  subject: string;
+  /** Monotonic receipt time of the first signal in this generation. */
+  startedAt: number;
+  /** Monotonic completion deadline, `startedAt + window of first kind`. */
+  deadline: number;
+  details: Map<string, BucketDetail>;
 }
 
-/** Collision-safe bucket key (subjects may contain newlines). */
-export function bucketKey(sessionId: string, kind: string, subject: string): string {
-  return JSON.stringify([sessionId, kind, subject]);
+/** A bucket is a wake group iff any of its kind details is wake-level. */
+export function bucketLevel(b: Bucket): DeliveryLevel {
+  let level: DeliveryLevel = 'record';
+  for (const d of b.details.values()) {
+    if (LEVEL_RANK[d.level] > LEVEL_RANK[level]) level = d.level;
+  }
+  return level;
 }
+
+/** Earliest event time across all kind details. */
+export function bucketSince(b: Bucket): number {
+  let since = Number.POSITIVE_INFINITY;
+  for (const d of b.details.values()) since = Math.min(since, d.since);
+  return since;
+}
+
+/** Deterministic change ordering: representative `signal.at`, then `id`. */
+export const byChangeAtId = (a: EnvChange, b: EnvChange): number =>
+  a.signal.at - b.signal.at || (a.signal.id < b.signal.id ? -1 : 1);
 
 /**
- * Inserts or merges one accepted signal into `pending`. A new bucket starts
- * a fixed window at `now + windowMs`; merging bumps `count`, keeps the
- * earliest `since`, and re-elects the representative — rule/note/reason
- * always follow the current representative (a stale `reason` is cleared when
- * the new representative carries none).
+ * Inserts or merges one accepted signal into the open generation — the same
+ * session+subject bucket whose `deadline` is still ahead of `now` — or
+ * starts a fresh bucket with a fixed window via `nextId`.
  */
 export function upsertBucket(
-  pending: Map<string, Bucket>,
+  pending: Map<number, Bucket>,
   signal: Signal,
   sessionId: string,
   level: DeliveryLevel,
@@ -49,45 +70,58 @@ export function upsertBucket(
   reason: string | undefined,
   now: number,
   windowMs: number,
+  nextId: () => number,
 ): void {
-  const key = bucketKey(sessionId, signal.kind, signal.subject);
-  const b = pending.get(key);
+  let b: Bucket | undefined;
+  for (const candidate of pending.values()) {
+    if (candidate.sessionId === sessionId && candidate.subject === signal.subject && candidate.deadline > now) {
+      b = candidate;
+      break;
+    }
+  }
   if (!b) {
-    const fresh: Bucket = {
+    b = {
+      id: nextId(),
       sessionId,
-      kind: signal.kind,
       subject: signal.subject,
-      level,
-      since: signal.at,
+      startedAt: now,
       deadline: now + windowMs,
-      latest: signal,
-      count: 1,
+      details: new Map(),
     };
-    if (rule?.id !== undefined) fresh.ruleId = rule.id;
-    if (rule?.note !== undefined) fresh.note = rule.note;
-    if (reason !== undefined) fresh.reason = reason;
-    pending.set(key, fresh);
+    pending.set(b.id, b);
+  }
+  const d = b.details.get(signal.kind);
+  if (!d) {
+    const detail: BucketDetail = { kind: signal.kind, level, count: 1, since: signal.at, latest: signal };
+    if (rule?.id !== undefined) detail.ruleId = rule.id;
+    if (rule?.note !== undefined) detail.note = rule.note;
+    if (reason !== undefined) detail.reason = reason;
+    b.details.set(signal.kind, detail);
     return;
   }
-  b.count++;
-  b.since = Math.min(b.since, signal.at);
+  d.count++;
+  d.since = Math.min(d.since, signal.at);
   const better =
-    LEVEL_RANK[level] > LEVEL_RANK[b.level] ||
-    (level === b.level && (signal.at > b.latest.at || (signal.at === b.latest.at && signal.id > b.latest.id)));
+    LEVEL_RANK[level] > LEVEL_RANK[d.level] ||
+    (level === d.level && (signal.at > d.latest.at || (signal.at === d.latest.at && signal.id > d.latest.id)));
   if (better) {
-    b.level = level;
-    b.latest = signal;
-    b.ruleId = rule?.id;
-    b.note = rule?.note;
-    b.reason = reason;
+    d.level = level;
+    d.latest = signal;
+    d.ruleId = rule?.id;
+    d.note = rule?.note;
+    d.reason = reason;
   }
 }
 
-/** Converts a completed bucket into a deliverable {@link EnvChange}. */
-export function bucketChange(b: Bucket): EnvChange {
-  const c: EnvChange = { signal: b.latest, count: b.count, level: b.level };
-  if (b.ruleId !== undefined) c.ruleId = b.ruleId;
-  if (b.note !== undefined) c.note = b.note;
-  if (b.reason !== undefined) c.reason = b.reason;
-  return c;
+/** Converts a completed bucket into one sorted {@link EnvChange} per kind. */
+export function bucketChanges(b: Bucket): EnvChange[] {
+  const changes: EnvChange[] = [];
+  for (const d of b.details.values()) {
+    const c: EnvChange = { signal: d.latest, count: d.count, level: d.level };
+    if (d.ruleId !== undefined) c.ruleId = d.ruleId;
+    if (d.note !== undefined) c.note = d.note;
+    if (d.reason !== undefined) c.reason = d.reason;
+    changes.push(c);
+  }
+  return changes.sort(byChangeAtId);
 }

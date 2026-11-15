@@ -11,6 +11,7 @@ export {
   isRuleApproved,
   matchesRule,
   selectRule,
+  validateRule,
 } from './host/attention/rules.ts';
 export { classifyCause, type ToolWindow } from './host/attention/selfcause.ts';
 export {

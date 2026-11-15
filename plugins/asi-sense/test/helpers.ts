@@ -25,15 +25,15 @@ export function jobExit(id: string, at: number, exitCode: number, subject = 'j1'
 }
 
 /** Feeds a failing job.exited signal, then advances past the merge window and flushes. */
-export function wake(
+export async function wake(
   pipeline: AttentionPipeline,
   clock: FakeClock,
   id: string,
   session: SessionContext = sess(),
-): void {
-  pipeline.accept(jobExit(id, clock.now, 1, id), session);
+): Promise<void> {
+  await pipeline.accept(jobExit(id, clock.now, 1, id), session);
   clock.advance(2001);
-  pipeline.flush();
+  await pipeline.flush();
 }
 
 export function pipe(clock: FakeClock, rules?: WatchRule[]) {
@@ -41,17 +41,34 @@ export function pipe(clock: FakeClock, rules?: WatchRule[]) {
   const intents: DeliveryIntent[] = [];
   const pipeline = new AttentionPipeline({
     store,
-    deliverer: { deliver: (i) => intents.push(i) },
+    deliverer: {
+      deliver: (i) => {
+        intents.push(i);
+        return Promise.resolve();
+      },
+    },
     clock: clock.time,
+    wallClock: clock.wallTime,
     rules,
   });
   return { store, intents, pipeline };
 }
 
+/**
+ * Two independent clocks: `now` is monotonic (deadlines, budgets) and `wall`
+ * is the wall clock (rule expiry, update display). `advance` moves both so
+ * existing tests stay deterministic; `jumpWall` moves only the wall clock.
+ */
 export class FakeClock {
   now = 0;
+  wall = 0;
   advance(ms: number): void {
     this.now += ms;
+    this.wall += ms;
+  }
+  jumpWall(ms: number): void {
+    this.wall += ms;
   }
   time = (): number => this.now;
+  wallTime = (): number => this.wall;
 }

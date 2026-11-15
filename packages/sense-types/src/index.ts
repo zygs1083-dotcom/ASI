@@ -43,7 +43,17 @@ export interface Signal {
   at: number;
   source: SourceRef;
   subject: string;
-  data: Record<string, unknown>;
+  /**
+   * Kind-specific payload. Sources that can attribute a process may add:
+   * `pid` (the process itself), `ppid` (its parent) and `ancestors` (its
+   * ancestor pid chain) — used by self-cause classification to link shell
+   * children and grandchildren back to the tool window that spawned them.
+   */
+  data: Record<string, unknown> & {
+    pid?: number;
+    ppid?: number;
+    ancestors?: number[];
+  };
   cause?: SignalCause;
 }
 

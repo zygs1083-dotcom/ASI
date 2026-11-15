@@ -81,16 +81,93 @@ function matchWhere(actual: unknown, expected: unknown): boolean {
   return validPrim(actual) && validPrim(expected) && actual === expected;
 }
 
-/** True when `rule` matches `signal` at `now` (expired rules never match). */
+/** Plain object = `Object.prototype` or null prototype (JSON-compatible). */
+function isPlainObject(v: unknown): v is Record<string, unknown> {
+  if (v === null || typeof v !== 'object' || Array.isArray(v)) return false;
+  const p = Object.getPrototypeOf(v);
+  return p === Object.prototype || p === null;
+}
+
+/** Ordered comparisons only take finite-number operands, like the matcher. */
+const ORDERED_OPS: ReadonlySet<string> = new Set(['>', '>=', '<', '<=']);
+
+function validateWhere(where: Record<string, unknown>, path: string, errors: string[]): void {
+  for (const [key, expected] of Object.entries(where)) {
+    const at = `${path}.${key}`;
+    if (validPrim(expected)) continue; // literal equality
+    if (!isPlainObject(expected)) {
+      errors.push(`${at}: expected a primitive or {op: operand} comparator`);
+      continue;
+    }
+    const entries = Object.entries(expected);
+    if (entries.length === 0) {
+      errors.push(`${at}: empty comparator object`);
+      continue;
+    }
+    for (const [op, operand] of entries) {
+      if (!OPERATORS.has(op)) {
+        errors.push(`${at}: unknown operator ${JSON.stringify(op)}`);
+      } else if (!validPrim(operand) || (ORDERED_OPS.has(op) && typeof operand !== 'number')) {
+        errors.push(`${at}: invalid operand for ${op}`);
+      }
+    }
+  }
+}
+
+/**
+ * Runtime validation of a {@link WatchRule}, e.g. one arriving via JSON.
+ * Returns the list of violations (empty = valid). `where` must be absent or
+ * a plain object — an *empty* object stays a legal unconditional rule —
+ * and every condition must be expressible by the fail-closed matcher, so an
+ * invalid rule can never widen into a catch-all at match time.
+ */
+export function validateRule(input: unknown): string[] {
+  const errors: string[] = [];
+  if (!isPlainObject(input)) return ['rule must be a plain object'];
+  const r = input;
+  if (typeof r.id !== 'string' || r.id.length === 0) errors.push('id must be a non-empty string');
+  if (!isPlainObject(r.match)) {
+    errors.push('match must be a plain object');
+  } else {
+    const m = r.match;
+    if (typeof m.kind !== 'string' || m.kind.length === 0) errors.push('match.kind must be a non-empty string');
+    if (m.subject !== undefined && typeof m.subject !== 'string') errors.push('match.subject must be a string');
+    if (Object.hasOwn(m, 'where')) {
+      if (!isPlainObject(m.where)) errors.push('match.where must be a plain object when present');
+      else validateWhere(m.where, 'match.where', errors);
+    }
+  }
+  if (r.level !== 'record' && r.level !== 'context' && r.level !== 'wake') {
+    errors.push('level must be record | context | wake');
+  }
+  if (r.note !== undefined && typeof r.note !== 'string') errors.push('note must be a string');
+  if (r.createdBy !== 'user' && r.createdBy !== 'agent') errors.push('createdBy must be user | agent');
+  if (typeof r.approved !== 'boolean') errors.push('approved must be a boolean');
+  if (r.expiresAt !== undefined && (typeof r.expiresAt !== 'number' || !Number.isFinite(r.expiresAt))) {
+    errors.push('expiresAt must be a finite number');
+  }
+  return errors;
+}
+
+/**
+ * True when `rule` matches `signal` at `now` (expired rules never match).
+ * Fully fail closed: a rule that is invalid at runtime — including a
+ * `where` that is not a plain object — simply never matches, and no
+ * malformed input can make it throw.
+ */
 export function matchesRule(rule: WatchRule, signal: Signal, now: number): boolean {
+  if (validateRule(rule).length > 0 || !isPlainObject(signal)) return false;
   if (rule.expiresAt !== undefined && now >= rule.expiresAt) return false;
   if (rule.match.kind !== signal.kind) return false;
-  if (rule.match.subject !== undefined && !globToRegExp(rule.match.subject).test(signal.subject)) {
-    return false;
+  if (rule.match.subject !== undefined) {
+    if (typeof signal.subject !== 'string' || !globToRegExp(rule.match.subject).test(signal.subject)) {
+      return false;
+    }
   }
-  if (rule.match.where) {
+  if (rule.match.where !== undefined) {
+    const data = isPlainObject(signal.data) ? signal.data : {};
     for (const [key, expected] of Object.entries(rule.match.where)) {
-      if (!Object.hasOwn(signal.data, key) || !matchWhere(signal.data[key], expected)) {
+      if (!Object.hasOwn(data, key) || !matchWhere(data[key], expected)) {
         return false;
       }
     }

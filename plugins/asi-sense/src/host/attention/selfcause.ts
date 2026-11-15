@@ -35,13 +35,26 @@ function underDir(cwd: string, p: string): boolean {
 }
 
 /**
+ * `ToolWindow.pid` is the shell pid: a signal is related when its own pid,
+ * its parent pid or any pid in its `ancestors` chain equals it — so shell
+ * children and grandchildren are covered, not just the shell itself.
+ */
+function relatedToShell(signal: Signal, shellPid: number): boolean {
+  const d = signal.data;
+  if (d.pid === shellPid || d.ppid === shellPid) return true;
+  return Array.isArray(d.ancestors) && d.ancestors.includes(shellPid);
+}
+
+/**
  * Self-cause classification (DESIGN §2.3 step 2). Only file/job/process
  * signals can be agent-caused; they match a tool window when `signal.at` is
- * within the inclusive `[startedAt, endedAt]` bounds and either the signal's
- * `data.pid` equals `window.pid` or its path (`data.path`, else subject for
- * `file.changed`) lies under `window.cwd` (path-boundary safe: `/repo` does
- * not match `/repository`). An explicit `cause: 'agent'` is always preserved;
- * `user`/`unknown` are upgraded to `agent` on match, never downgraded.
+ * within the inclusive `[startedAt, endedAt]` bounds and either the signal
+ * is related to the window's shell pid (pid/ppid/ancestors) or its path
+ * (`data.path`, else subject for `file.changed`) lies under `window.cwd`
+ * (path-boundary safe: `/repo` does not match `/repository`). Concurrent or
+ * nested windows are handled by checking every window. An explicit
+ * `cause: 'agent'` is always preserved; `user`/`unknown` are upgraded to
+ * `agent` on match, never downgraded.
  */
 export function classifyCause(signal: Signal, toolWindows: readonly ToolWindow[] = []): SignalCause {
   if (signal.cause === 'agent') return 'agent';
@@ -49,7 +62,7 @@ export function classifyCause(signal: Signal, toolWindows: readonly ToolWindow[]
   if (!CAUSAL_KINDS.has(signal.kind)) return base;
   for (const w of toolWindows) {
     if (signal.at < w.startedAt || (w.endedAt !== undefined && signal.at > w.endedAt)) continue;
-    if (w.pid !== undefined && signal.data.pid === w.pid) return 'agent';
+    if (w.pid !== undefined && relatedToShell(signal, w.pid)) return 'agent';
     const p = signalPath(signal);
     if (w.cwd !== undefined && p !== undefined && underDir(w.cwd, p)) return 'agent';
   }
