@@ -12,9 +12,32 @@ import type {
   TestResult,
 } from '../../shared/types';
 
-const REPLY = '你好，我是本地模拟模型。ASI 骨架已就绪，这条回复用于无后端时的界面预览。';
+const REPLY = [
+  '收到！我是本地模拟模型，这里是一段 **Markdown** 示例：',
+  '',
+  '- 支持列表、**加粗** 和 `行内代码`',
+  '- 输入 `/slow` 可以观察长时间流式输出并随时中止',
+  '- 输入 `/error` 可以触发一次固定错误',
+  '',
+  '```ts',
+  'const greeting: string = "你好，ASI";',
+  'console.log(greeting);',
+  '```',
+].join('\n');
+
+const SLOW_REPLY = Array.from({ length: 8 }, (_, i) =>
+  [
+    `第 ${i + 1} 段：这是一条刻意放慢的回复，用来验证流式渲染、切换会话与中止。`,
+    '',
+    `- 要点 ${i + 1}.1：界面应该持续追加文本，而不是一次性出现`,
+    `- 要点 ${i + 1}.2：切走再切回来后，已生成的内容应当完整保留`,
+  ].join('\n'),
+).join('\n\n');
+
+const ERROR_PARTIAL = '正在生成回复，但';
 
 const DELTA_MS = 25;
+const SLOW_DELTA_MS = 60;
 
 let seq = 0;
 const nextId = (prefix: string) => `${prefix}-${(++seq).toString(36)}-${Date.now().toString(36)}`;
@@ -240,6 +263,16 @@ export function createMockApi(): AsiApi {
         if (!conv.model) {
           throw new Error('请先为会话选择模型');
         }
+        const provider = providers.find((p) => p.id === conv.model?.providerId);
+        if (!provider) {
+          throw new Error('该会话绑定的厂商已不存在，请重新选择模型');
+        }
+        if (!provider.enabled) {
+          throw new Error('该会话绑定的厂商已停用，请重新选择模型');
+        }
+        if (!modelsFor(provider).some((m) => m.modelId === conv.model?.modelId)) {
+          throw new Error('该会话绑定的模型已不存在，请重新选择模型');
+        }
         const now = Date.now();
         const user: ChatMessage = { id: nextId('m'), role: 'user', text, createdAt: now, status: 'done' };
         const assistant: ChatMessage = {
@@ -252,8 +285,15 @@ export function createMockApi(): AsiApi {
         };
         conv.messages.push(user, assistant);
         conv.updatedAt = now;
+        // 模拟真实后端的标题策略：空会话（默认标题）的首条消息自动生成标题
+        if (conv.title === '新对话' && conv.messages.filter((m) => m.role === 'user').length === 1) {
+          conv.title = [...text.trim()].slice(0, 30).join('') || '新对话';
+        }
 
-        const chars = [...REPLY];
+        const trimmed = text.trim();
+        const mode = trimmed.startsWith('/slow') ? 'slow' : trimmed.startsWith('/error') ? 'error' : 'normal';
+        const chars = [...(mode === 'slow' ? SLOW_REPLY : mode === 'error' ? ERROR_PARTIAL : REPLY)];
+        const deltaMs = mode === 'slow' ? SLOW_DELTA_MS : DELTA_MS;
         const stream: Stream = { timer: null, messageId: assistant.id };
         streams.set(conversationId, stream);
         let i = 0;
@@ -263,14 +303,20 @@ export function createMockApi(): AsiApi {
             const delta = chars[i++];
             assistant.text += delta;
             emit({ type: 'delta', conversationId, messageId: assistant.id, delta });
-            stream.timer = setTimeout(tick, DELTA_MS);
+            stream.timer = setTimeout(tick, deltaMs);
+          } else if (mode === 'error') {
+            assistant.status = 'error';
+            assistant.text += '，模拟厂商返回错误。';
+            assistant.error = '模拟厂商返回错误：上游服务不可用（mock 固定错误）';
+            streams.delete(conversationId);
+            emit({ type: 'error', conversationId, message: clone(assistant) });
           } else {
             assistant.status = 'done';
             streams.delete(conversationId);
             emit({ type: 'done', conversationId, message: clone(assistant) });
           }
         };
-        stream.timer = setTimeout(tick, DELTA_MS);
+        stream.timer = setTimeout(tick, deltaMs);
 
         return clone({ user, assistant });
       },
