@@ -157,3 +157,31 @@ export interface AsiApi {
 - **builtin 覆盖 baseUrl**：`{ ...getModel(p, id), baseUrl }`。
 - **key 传递**：`stream(model, ctx, { apiKey, signal })`。
 - **写盘**：原子写（写临时文件再 rename）。keys.json 只存 `safeStorage.encryptString` 的 base64；`safeStorage.isEncryptionAvailable()` 为 false 时（测试环境）退化为明文并在日志警告一次——仅在 `ASI_DATA_DIR` 被设置时允许退化。
+
+## 5. 界面测试锚点（`data-testid`，UI 与 e2e 共同遵守）
+
+| testid | 元素 |
+|---|---|
+| `nav-new-chat` | 侧栏「新对话」 |
+| `conv-item` | 侧栏会话项（`data-id` = 会话 id，`aria-current="page"` 表示选中） |
+| `conv-delete` | 会话项上的删除按钮 |
+| `nav-settings` | 侧栏「设置」 |
+| `sidebar-default-model` | 侧栏底部默认模型文字 |
+| `chat-empty` | 空会话占位 |
+| `go-settings` | 空会话里"先去配置模型厂商"按钮 |
+| `msg-user` / `msg-assistant` | 消息（`data-status` = streaming/done/error/aborted） |
+| `msg-error` | 助手错误条 |
+| `composer-input` | 输入框 textarea |
+| `composer-send` / `composer-stop` | 发送 / 停止按钮 |
+| `model-picker` | 模型药丸按钮；弹层内选项 `model-option`（`data-provider-id`、`data-model-id`），搜索框 `model-search` |
+| `provider-add` | 「添加厂商」 |
+| `provider-search` | 查找厂商输入框 |
+| `provider-row` | 厂商行（`data-id`），行内开关 `provider-toggle`，状态 `provider-key-status` |
+| `pe-kind-builtin` / `pe-kind-compatible` | 编辑面板类型分段 |
+| `pe-builtin-select` | 内置厂商下拉（`<select>`） |
+| `pe-name` / `pe-baseurl` / `pe-apikey` / `pe-apikey-clear` | 表单字段 |
+| `pe-model-input` | OpenAI 兼容模型 id 输入（回车添加），标签 `pe-model-tag` |
+| `pe-model-row` | 模型预览行（`data-model-id`），测试按钮 `pe-model-test`，结果 `pe-model-test-result` |
+| `pe-save` / `pe-cancel` / `pe-delete` | 面板按钮（删除需二次确认：再点一次 `pe-delete-confirm`） |
+| `settings-default-model` | 通用卡片里的默认模型选择器（同 `model-picker` 弹层） |
+| `theme-system` / `theme-light` / `theme-dark` | 外观分段 |
