@@ -6,7 +6,7 @@ by `asi-sense` to fill `self.body`.
 ```ts
 import { BodyProbe } from '@asi/body-probe';
 
-const probe = new BodyProbe();          // optional: (collectors, { now, wall })
+const probe = new BodyProbe();          // optional: (collectors, { now, wall, platform })
 const off = probe.onSample((body) => { /* render gauges */ });
 probe.start({ intervalMs: 2000 });          // immediate tick, then every 2s
 // probe.start({ intervalMs: 2000, cadence: { memoryMs: 10_000 } }); // cadence override

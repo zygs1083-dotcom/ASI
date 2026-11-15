@@ -45,9 +45,11 @@ export interface SamplePoint {
 
 // Optional clocks: `now` is monotonic (cadence, staleness, history window);
 // `wall` stamps observations. Both default to the process clocks.
+// `platform` overrides the OS gate of the built-in macOS samplers.
 export interface ProbeClock {
   now?: () => number;
   wall?: () => number;
+  platform?: NodeJS.Platform;
 }
 
 const HISTORY_WINDOW_MS = 300_000;
@@ -98,11 +100,12 @@ export class BodyProbe {
   constructor(collectors: Partial<ProbeCollectors> = {}, clock: ProbeClock = {}) {
     this.clockNow = clock.now ?? (() => globalThis.performance.now());
     this.clockWall = clock.wall ?? (() => Date.now());
+    const platform = clock.platform ?? process.platform;
     const cpu = new CpuSampler();
-    const memory = new MemorySampler({ now: this.clockNow, wall: this.clockWall });
+    const memory = new MemorySampler({ now: this.clockNow, wall: this.clockWall, platform });
     const disks = new DiskSampler({ now: this.clockNow, wall: this.clockWall });
-    const battery = new BatterySampler();
-    const network = new NetworkSampler({ now: this.clockNow, wall: this.clockWall });
+    const battery = new BatterySampler({ platform });
+    const network = new NetworkSampler({ now: this.clockNow, wall: this.clockWall, platform });
     const self = new SelfProcessSampler({ now: this.clockNow });
     const defaults: ProbeCollectors = {
       cpu: (ttl) => Promise.resolve(cpu.sample(ttl)),

@@ -548,7 +548,7 @@ describe('BodyProbe', () => {
       return '1\n';
     });
     fakeEn0();
-    const probe = new BodyProbe();
+    const probe = new BodyProbe({}, { platform: 'darwin' });
     probe.start({ intervalMs: 1000, cadence: { networkMs: 2000, routeMs: 5000 } });
     await vi.advanceTimersByTimeAsync(3000); // baseline t0, online rate fact at t2
     expect(probe.latest()?.network.value?.online).toBe(true);
@@ -576,7 +576,7 @@ describe('BodyProbe', () => {
       if (file.endsWith('netstat')) return fx('netstat_1.txt');
       return '';
     });
-    const probe = new BodyProbe();
+    const probe = new BodyProbe({}, { platform: 'darwin' });
     probe.start({ intervalMs: 1000 });
     await flush();
     expect(pressureCalls).toBe(1);
@@ -610,7 +610,7 @@ describe('BodyProbe', () => {
       return '1\n';
     });
     fakeEn0();
-    const probe = new BodyProbe();
+    const probe = new BodyProbe({}, { platform: 'darwin' });
     probe.start({
       intervalMs: 2000,
       cadence: { memoryMs: 30_000, networkMs: 30_000, pressureMs: 5000, swapMs: 5000, routeMs: 5000 },
@@ -721,5 +721,22 @@ describe('BodyProbe', () => {
     const last = probe.history().at(-1)!;
     expect(last.body.memory.status).toBe('ok'); // stored points are never re-marked
     expect(last.body.network.status).toBe('ok');
+  });
+
+  it('marks macOS facts unavailable off-darwin and never spawns their commands', async () => {
+    const collectors: Partial<ProbeCollectors> = baseCollectors();
+    delete collectors.memory;
+    delete collectors.network;
+    delete collectors.battery;
+    const run = vi.spyOn(command, 'defaultRun').mockResolvedValue('');
+    const probe = new BodyProbe(collectors, { platform: 'linux' });
+    probe.start({ intervalMs: 1000 });
+    await flush();
+    const body = probe.latest()!;
+    expect(body.memory.status).toBe('unavailable');
+    expect(body.network.status).toBe('unavailable');
+    expect(body.battery.status).toBe('unavailable');
+    expect(run).not.toHaveBeenCalled();
+    await probe.stop();
   });
 });
