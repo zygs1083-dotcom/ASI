@@ -77,6 +77,15 @@ export class BucketDrain {
     return this.suppressedGroups;
   }
 
+  /** Earliest pending merge deadline — retained failures included; `undefined` when none. */
+  nextDeadline(): number | undefined {
+    let min: number | undefined;
+    for (const b of this.pending.values()) {
+      if (min === undefined || b.deadline < min) min = b.deadline;
+    }
+    return min;
+  }
+
   /** Enqueues one classified signal into its session+subject merge window. */
   enqueue(
     signal: Signal,

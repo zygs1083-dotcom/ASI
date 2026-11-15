@@ -35,12 +35,10 @@ export type DeliveryIntent =
       deliveryId?: string;
     };
 
-/** Thrown for accept/flush/preStep calls in an active delivery's async context. */
+/** Thrown for flush/preStep calls in an active delivery's async context. */
 export class ReentrantDeliveryError extends Error {
   constructor() {
-    super(
-      'accept/flush/preStep all reject during an active adapter.deliver (awaited or not): return or reject instead',
-    );
+    super('flush/preStep reject during an active adapter.deliver (awaited or not): return or reject instead');
     this.name = 'ReentrantDeliveryError';
   }
 }
@@ -49,7 +47,7 @@ export class ReentrantDeliveryError extends Error {
  * Sink for delivery intents. The returned promise is awaited before any
  * bucket is dropped or the wake budget charged; a rejection retains the
  * queued input and propagates to the caller. While a delivery is in flight
- * every pipeline API call inside its async context rejects with
+ * every `flush`/`preStep` call inside its async context rejects with
  * {@link ReentrantDeliveryError}; work it schedules for later runs free.
  */
 export interface Deliverer {
@@ -87,8 +85,9 @@ export interface SessionState {
 const DEDUP_MAX = 1024;
 
 /**
- * Host-driven pipeline (DESIGN §2.3): no internal timers — the host calls
- * {@link flush} at merge deadlines and {@link preStep} before agent steps.
+ * Host-driven pipeline (DESIGN §2.3): no internal timers — `accept` is
+ * intake only; the host calls {@link flush} at {@link nextDeadline} and
+ * {@link preStep} before agent steps.
  * `accept`/`flush`/`preStep` are async; intake is durable before the first
  * await, so a rejected drain keeps the signal — retry `flush`/`preStep`,
  * not `accept`. Drains serialize on a recovered promise tail and attempt
@@ -182,23 +181,17 @@ export class AttentionPipeline {
    * Feeds one signal and resolves to its normalized {@link EnvChange}
    * (`count: 1`, effective level, rule info, reason). All intake — session
    * refresh, clone/classify, store apply, dedup/match/enqueue — runs inside
-   * the store's apply callback before the first await, so a rejected drain
-   * keeps the signal. A reentrant `accept` queues behind the outer intake;
-   * during an in-flight `deliver` it rejects with
-   * {@link ReentrantDeliveryError}.
+   * the store's apply callback (shared synchronous FIFO), so the signal is
+   * durable before the promise resolves; no delivery is attempted or
+   * awaited — inside an in-flight `deliver` it still completes.
    */
   async accept(signal: Signal, session: SessionContext): Promise<EnvChange> {
-    if (this.deliveryContext.getStore()?.active) {
-      throw new ReentrantDeliveryError();
-    }
     const ev = structuredClone(signal);
     ev.cause = classifyCause(ev, session.toolWindows ?? []);
     return await new Promise<EnvChange>((resolve, reject) => {
       this.store.apply(ev, () => {
         try {
-          const now = this.clock();
-          const result = this.intake(ev, session, now);
-          this.enqueueDrain(() => this.drain.due(now)).then(() => resolve(result), reject);
+          resolve(this.intake(ev, session, this.clock()));
         } catch (e) {
           reject(e);
         }
@@ -241,6 +234,11 @@ export class AttentionPipeline {
       }
     }
     return structuredClone(change);
+  }
+
+  /** Earliest pending merge deadline (monotonic) or `undefined` — the host's flush-timer hint. */
+  nextDeadline(): number | undefined {
+    return this.drain.nextDeadline();
   }
 
   /**

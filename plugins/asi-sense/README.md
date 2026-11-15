@@ -15,31 +15,38 @@ and deterministic environment-update formatting.
 ## Host contract
 
 - **Async API**: `accept(signal, session)`, `flush(now?)` and
-  `preStep(sessionId, now?)` return promises — always await them.
+  `preStep(sessionId, now?)` return promises — always await them. `accept`
+  is pure intake — it never drains or awaits delivery.
   `Deliverer.deliver(intent)` also returns a promise that is awaited before
   any bucket is dropped; the wake budget is charged on a fresh monotonic
   sample taken at delivery completion, not at drain start. While a `deliver`
-  is **in flight**, every `accept`/`flush`/`preStep` call inside its async
+  is **in flight**, every `flush`/`preStep` call inside its async
   context rejects immediately with `ReentrantDeliveryError` — awaited or
   not — so return or reject from `deliver` instead. The token is
   per-delivery: work scheduled inside `deliver` (a `setImmediate` callback,
   a detached promise) inherits the context but calls pipeline APIs freely
-  once that delivery settles. Concurrent callers _outside_ `deliver` queue
-  normally.
+  after its wrapper continuation: between promise settlement and that
+  continuation, microtask `flush`/`preStep` MAY still reject. Use
+  `setImmediate`, not `queueMicrotask`, or avoid drains inside `deliver`.
+  Concurrent callers _outside_ `deliver` queue normally.
+- **Scheduling**: no core timers — the host MUST schedule its flush timer
+  from monotonic `nextDeadline()` (earliest pending merge deadline,
+  retained failures included) and refresh it after `accept`/drains;
+  `undefined` means none — ready context/failed inject need `preStep`, a
+  past deadline is host-owned retry/backoff.
 - **Durable intake**: `accept` runs all mutable intake (session refresh,
-  source marks, dedup/match/enqueue, drain scheduling) inside the store's
+  source marks, dedup/match/enqueue) inside the store's
   apply callback — shared synchronous FIFO, so the signal is durable before
-  the first await even when the promise rejects on delivery. Exception: an
+  the promise resolves. Exception: an
   `accept` issued **reentrantly** from a subscriber or apply callback is
-  queued until the outer intake finishes, its drain scheduled after the
-  outer one. To retry a failed delivery call `flush`/`preStep` again —
-  never re-`accept` the same signal.
+  queued until the outer intake finishes. To retry a failed delivery call
+  `flush`/`preStep` again — never re-`accept` the same signal.
 - **Retry entries**:
 
-  | failed delivery                                      | retry via                                                             |
-  | ---------------------------------------------------- | --------------------------------------------------------------------- |
-  | wake (`send`/`followup`, incl. `accept`'s own drain) | `flush()` or any `preStep`                                            |
-  | context `inject`                                     | `preStep` of the **same session** only — `flush` never retries inject |
+  | failed delivery          | retry via                                                             |
+  | ------------------------ | --------------------------------------------------------------------- |
+  | wake (`send`/`followup`) | `flush()` or any `preStep`                                            |
+  | context `inject`         | `preStep` of the **same session** only — `flush` never retries inject |
 
 - **At-least-once + `deliveryId`**: a rejection may already have committed
   externally, so the host dedups deliveries by `deliveryId` — a stable
@@ -58,7 +65,7 @@ and deterministic environment-update formatting.
   all attempts — a single one (even an empty `AggregateError`) rethrown by
   identity, several combined as `AggregateError` without flattening.
   Delivery intents are deep-cloned before reaching the adapter.
-- **Serialization**: drain work inside `accept`/`flush`/`preStep` runs on a
+- **Serialization**: drain work inside `flush`/`preStep` runs on a
   promise tail, so concurrent calls can never duplicate or lose a delivery.
 - **Clocks**: `clock` is injected _monotonic_ time (default
   `performance.now`) used for merge deadlines, the wake sliding window and
@@ -82,17 +89,16 @@ and deterministic environment-update formatting.
 - **Job tracking**: `StateStore(wallClock?, defaultTtlMs?, monotonicClock?)` — exit
   tombstones use the injected _monotonic_ clock over the half-open
   `[receivedAt, receivedAt+600s)` window while fact TTL keeps the wall clock.
-  An `env.activeJobs` `fact.updated` replacement keeps unexpired tombstones
-  and advances a snapshot watermark: `job.started` with `at` before the
-  replacement is ignored; independent post-snapshot jobs are unaffected,
-  even when older than the newest other job event. Two independent
-  watermarks order snapshots: the replacement `at` and the newest accepted
-  job observation (`jobObservedAt`, job events included). A snapshot older
-  than either is rejected before touching fact, tracking or tombstones —
-  an outdated running-jobs list cannot resurrect exited jobs. An `unknown`
-  snapshot reports **only** the status: value, provenance, freshness,
-  jobs, tombstones and both watermarks are preserved, so it can neither
-  roll a newer snapshot back nor mask a later stale one. A start arriving
+  `env.activeJobs` reports order on a single `jobsFactAt` watermark — EVERY
+  accepted `fact.updated` for the path advances it, `unknown` included —
+  and a report older than it is dropped before touching fact, tracking or
+  tombstones. Job events are no watermark: a report older than individual
+  job events still merges per job id — a newer tombstone or running event
+  wins, the value rebuilds from merged tracking, and `null` clears only
+  when no newer running job survives. A non-unknown report also advances
+  `jobSnapshotAt`, below which `job.started` is ignored. An `unknown`
+  report marks **only** the status — value, provenance, freshness, jobs
+  and tombstones preserved — yet still moves `jobsFactAt`. A start arriving
   after its tombstone prunes is an ordinary new event — still subject to
   the watermark and signal-id dedup.
 - **Self-cause**: a causal-kind signal inside a tool window's inclusive
@@ -158,7 +164,7 @@ In `m1-rereview-regressions.test.ts` unless noted:
 4. Mixed-bucket context split + `alreadyInjected` — `injects split context at preStep while the wake keeps its deadline and count`
 5. Monotonic tombstones, half-open `[receivedAt, +600s)` — `ignores wall-clock jumps and prunes exit tombstones at exactly 600s monotonic`
 6. Sealed in-flight buckets; monotonic cutoff clamp — `clamps future cutoffs, rejects non-finite ones and keeps same-subject arrivals in a fresh bucket`
-7. `ReentrantDeliveryError` inside `deliver` — `rejects pipeline APIs awaited inside adapter.deliver without deadlock`
+7. `ReentrantDeliveryError` inside `deliver` — `rejects drains awaited inside adapter.deliver while accept stays durable`
 8. Stable `deliveryId`/frozen `at`; frozen inject batches; once-per-step, non-FIFO downgrade retries; mutation isolation — `retries a failed wake with the same deliveryId and frozen display time` / `downgrades a failed wake retry to a separate frozen inject once the budget moved` / `injects a same-step budget downgrade once and propagates inject failure` / `isolates adapter mutations of a delivered intent from the retained retry` / `awaits rejected context delivery and retries only the retained batch` (m1-pipeline, updated)
 9. Retry entries, at-least-once dedup, downgrade/no-FIFO, adapter reentrancy — **Host contract** above; exercised by the fix-8 tests (the updated pipeline test proves `flush` never retries inject; the downgrade tests prove once-per-step attempts and `followup(new)`-then-`inject(old)` ordering)
 
@@ -166,9 +172,14 @@ In `m1-rereview-regressions.test.ts` unless noted:
 
 In `m1-fix3-regressions.test.ts`:
 
-1. `env.activeJobs` snapshot watermarks independent of `fact.status`; `unknown` snapshots change status only — `keeps job tombstones when unknown is followed by an older snapshot` / `keeps the newest watermark across three out-of-order snapshots` / `accepts a first real job snapshot before constructor and unknown timestamps`
+1. `env.activeJobs` snapshot ordering independent of `fact.status`; `unknown` reports change status only — `keeps job tombstones when unknown is followed by an older snapshot` / `keeps the newest watermark across three out-of-order snapshots` / `accepts constructor-delayed snapshots but rejects reports older than explicit unknown` (semantics refined by M1 fix-4 below)
 2. Bucket details keyed by (kind, effective level) — `injects same-kind context before the wake deadline (success first)` / `injects same-kind context before the wake deadline (failure first)` / `keeps same-kind outcome counts separate without a preStep split`
-3. Per-delivery active token for `ReentrantDeliveryError` — `allows inherited setImmediate intake after delivery resolved` / `allows inherited setImmediate intake after delivery rejected`
+3. Per-delivery active token for `ReentrantDeliveryError` — `allows inherited setImmediate intake after delivery resolved` / `allows inherited setImmediate intake after delivery rejected` (also queueMicrotask intake)
+
+## M1 fix-4 regressions → tests
+
+1. Blocker: `started@1 → exited@30 → unknown@40 → snapshot@35`, and `snapshot@30 → unknown@40 → snapshot@35` — `keeps job tombstones when unknown is followed by an older snapshot` / `keeps the newest watermark across three out-of-order snapshots` (m1-fix3); `jobsFactAt` orders all explicit statuses while snapshots merge newer per-job events.
+2. Blocker: `queueMicrotask(() => accept())` before a resolved/rejected adapter promise's continuation — `allows inherited setImmediate intake after delivery %s` (m1-fix3, also asserts microtask intake for both outcomes); `rejects drains awaited inside adapter.deliver while accept stays durable` (m1-rereview) guards the remaining drain rejection.
 
 ## M3 待定契约
 

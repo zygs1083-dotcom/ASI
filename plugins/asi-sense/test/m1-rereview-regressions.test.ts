@@ -234,15 +234,21 @@ describe('delivery isolation and reentrancy', () => {
     const inj = calls.find((i) => i.kind === 'inject');
     expect(changeIds(inj)).toEqual(['b']); // B delivered separately, never dropped
   });
-  it('rejects pipeline APIs awaited inside adapter.deliver without deadlock', async () => {
+  it('rejects drains awaited inside adapter.deliver while accept stays durable', async () => {
     const c = new FakeClock();
     const reentryErrors: string[] = [];
+    let accepted: Awaited<ReturnType<AttentionPipeline['accept']>> | undefined;
     const pipeline = pipelineWith(c, async () => {
       await Promise.resolve(); // still inside the delivery context after an await
       for (const call of [
         () => pipeline.flush(),
         () => pipeline.preStep('s1'),
-        () => pipeline.accept(sig({ id: 're', kind: 'app.activated', at: 0, data: { name: 'X' } }), sess()),
+        async () => {
+          accepted = await pipeline.accept(
+            sig({ id: 're', kind: 'app.activated', at: 0, data: { name: 'X' } }),
+            sess(),
+          );
+        },
       ]) {
         try {
           await call();
@@ -255,11 +261,8 @@ describe('delivery isolation and reentrancy', () => {
     await pipeline.accept(jobExit('w', 0, 1, 'w'), sess());
     c.advance(2001);
     await pipeline.flush(); // must not deadlock on the adapter's own drain
-    expect(reentryErrors).toEqual([
-      ReentrantDeliveryError.name,
-      ReentrantDeliveryError.name,
-      ReentrantDeliveryError.name,
-    ]);
+    expect(reentryErrors).toEqual([ReentrantDeliveryError.name, ReentrantDeliveryError.name, 'resolved']);
+    expect(accepted).toMatchObject({ level: 'record', signal: { id: 're' } });
   });
   it('retries a failed wake with the same deliveryId and frozen display time', async () => {
     const c = new FakeClock();
@@ -276,8 +279,10 @@ describe('delivery isolation and reentrancy', () => {
     await pipeline.accept(jobExit('a1', 1, 1, 'w'), sess());
     c.advance(2001);
     await expect(pipeline.flush()).rejects.toThrow('down');
+    expect(pipeline.nextDeadline()).toBe(2000); // the retained bucket keeps its deadline
     c.jumpWall(100_000); // wall moves — the retry keeps the frozen display time
     await pipeline.flush();
+    expect(pipeline.nextDeadline()).toBeUndefined();
     expect(calls).toHaveLength(2);
     expect(calls[1]?.deliveryId).toBe(calls[0]?.deliveryId);
     expect(calls[1]?.update.at).toBe(calls[0]?.update.at);

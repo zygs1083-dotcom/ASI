@@ -46,13 +46,16 @@ export class StateStore {
   private readonly seenOrder: string[] = [];
   private readonly jobs = new Map<string, JobTrack>();
   private readonly queue: { signal: Signal; afterApply?: () => void }[] = [];
-  /** `signal.at` of the last accepted `env.activeJobs` replacement. */
+  /** `signal.at` of the last accepted non-unknown `env.activeJobs` replacement. */
   private jobSnapshotAt = Number.NEGATIVE_INFINITY;
   /**
-   * Newest `signal.at` of an accepted job-aggregate observation — a job
-   * event or a non-unknown `env.activeJobs` snapshot. Kept independent of
-   * `fact.status`/`jobSnapshotAt` so an unknown report can neither reset
-   * freshness nor move the snapshot watermark.
+   * `signal.at` of the last accepted `env.activeJobs` report — EVERY accepted
+   * one advances it, `unknown` included; orders reports only, never job events.
+   */
+  private jobsFactAt = Number.NEGATIVE_INFINITY;
+  /**
+   * Newest `signal.at` of an accepted job event or non-unknown report —
+   * metadata ordering for {@link commitJobs} only; it never rejects input.
    */
   private jobObservedAt = Number.NEGATIVE_INFINITY;
   private processing = false;
@@ -282,12 +285,12 @@ export class StateStore {
     if (status !== undefined && (typeof status !== 'string' || !FACT_STATUSES.has(status))) return;
     const fact = factAt(this.state, path);
     if (path === 'env.activeJobs') {
-      // Snapshot staleness is decided before ANY mutation: a report older
-      // than the snapshot watermark or the newest accepted job observation
-      // leaves the fact, tracking, tombstones and both watermarks untouched.
-      if (signal.at < this.jobSnapshotAt || signal.at < this.jobObservedAt) return;
+      // A report older than the newest accepted one is dropped before ANY
+      // mutation — fact, tracking, tombstones and the watermark untouched.
+      if (signal.at < this.jobsFactAt) return;
+      this.jobsFactAt = signal.at;
       // An unknown report marks ONLY the status — value, provenance,
-      // freshness, jobs, tombstones and watermarks are all preserved.
+      // freshness, jobs and tombstones are all preserved.
       if (status === 'unknown') {
         fact.status = 'unknown';
         return;
@@ -298,21 +301,21 @@ export class StateStore {
     fact.source = signal.source;
     fact.observedAt = signal.at;
     fact.ttlMs = ttlOf(signal.data.ttlMs, this.defaultTtlMs);
-    // A replaced job list reseeds tracking — an array seeds its entries, a
-    // non-array (e.g. null) clears running jobs — or the next job event
-    // would rebuild the value from stale tracks and resurrect dropped jobs.
-    // The watermark ignores pre-snapshot starts for replaced/unknown ids
-    // while unexpired exit tombstones survive the replacement.
     if (path === 'env.activeJobs') {
-      this.jobSnapshotAt = Math.max(this.jobSnapshotAt, signal.at);
+      this.jobSnapshotAt = signal.at;
       this.jobObservedAt = Math.max(this.jobObservedAt, signal.at);
+      // Merge per job id, newer event wins: a report clears running tracks
+      // only at or below `at`, seeds listed jobs, rebuilds the value from
+      // tracking; `null` survives only if no newer running job does.
       this.pruneJobs();
       for (const [id, track] of this.jobs) {
-        if (!track.exited) this.jobs.delete(id);
+        if (!track.exited && track.lastEventAt <= signal.at) this.jobs.delete(id);
       }
       if (Array.isArray(value)) {
         for (const j of value as JobSummary[]) {
           if (!j || typeof j !== 'object' || typeof j.id !== 'string') continue;
+          const track = this.jobs.get(j.id);
+          if (track && track.lastEventAt > signal.at) continue; // a newer event wins
           const running = j.status !== 'exited';
           this.jobs.set(j.id, {
             lastEventAt: signal.at,
@@ -322,6 +325,10 @@ export class StateStore {
           });
         }
       }
+      const running = [...this.jobs.values()].flatMap((t) => (t.exited || !t.job ? [] : [t.job]));
+      // the merged tracking is authoritative except a bare non-array report
+      // (null) whose surviving newer running tracks keep it an array
+      if (Array.isArray(value) || running.length > 0) fact.value = running;
     }
   }
 

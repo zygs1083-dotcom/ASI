@@ -118,6 +118,7 @@ describe('busy sessions', () => {
       sig({ id: 'r', kind: 'app.activated', at: c.now }),
       sess({ busy: true, userInitiated: false }),
     );
+    await pipeline.flush();
     const send = intents[0];
     if (send?.kind !== 'send') throw new Error('expected send');
     expect(send.update.changes[0]?.reason).toBe('agent-busy');
@@ -170,7 +171,7 @@ describe('busy sessions', () => {
     expect(pipeline.suppressed).toBe(0);
   });
 
-  it('applies new input to the store before a failing drain can abort', async () => {
+  it('stores new input durably; only an explicit drain propagates failure', async () => {
     const c = new FakeClock();
     const store = new StateStore(c.time);
     const pipeline = new AttentionPipeline({
@@ -182,11 +183,10 @@ describe('busy sessions', () => {
     });
     await pipeline.accept(jobExit('w', 0, 1), sess());
     c.advance(2001);
-    // next accept: store.apply runs before the drain that rejects
-    await expect(
-      pipeline.accept(sig({ id: 'a', kind: 'app.activated', at: 1, data: { name: 'Safari' } }), sess()),
-    ).rejects.toThrow('nope');
+    // accept never drains: the due wake failure cannot reject it
+    await pipeline.accept(sig({ id: 'a', kind: 'app.activated', at: 1, data: { name: 'Safari' } }), sess());
     expect(store.snapshot().env.frontApp.value?.name).toBe('Safari');
+    await expect(pipeline.flush()).rejects.toThrow('nope');
   });
 
   it('retains a context batch when inject fails and delivers it only once on retry', async () => {

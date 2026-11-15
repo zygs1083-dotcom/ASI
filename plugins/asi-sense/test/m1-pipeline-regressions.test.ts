@@ -27,10 +27,11 @@ describe('async intake and delivery', () => {
     });
     await pipeline.accept(jobExit('w2', 0, 1, 'w2'), sess({ id: 's2' }));
     await pipeline.accept(jobExit('w3', 0, 1, 'w3'), sess({ id: 's3' }));
-    c.advance(2001); // both sessions' wake buckets are due
-    // s1 intake is durable before rejection; s2's failure stops neither
-    // s3's delivery nor the later preStep inject of the retained s1 batch
-    await expect(pipeline.accept(file('f', 1), sess({ id: 's1' }))).rejects.toThrow('s2-down');
+    c.advance(2001); // both sessions' wake buckets are due — nothing drains yet
+    // intake-only accept is durable; the pending s2 failure cannot reject it
+    await pipeline.accept(file('f', 1), sess({ id: 's1' }));
+    expect(intents).toHaveLength(0); // no intent ships without a drain
+    await expect(pipeline.flush()).rejects.toThrow('s2-down'); // s3 still ships
     expect(keys(intents)).toEqual(['followup:s3']);
     await expect(pipeline.preStep('s1')).rejects.toThrow('s2-down');
     expect(keys(intents)).toEqual(['followup:s3', 'inject:s1']);
