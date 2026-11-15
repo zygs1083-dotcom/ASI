@@ -1,11 +1,14 @@
 import os from 'node:os';
-import { runCommand, type RunFn } from './command.js';
+import { performance } from 'node:perf_hooks';
+import { defaultRun, type RunFn } from './command.js';
 import * as fact from './fact.js';
 import type { Fact, MemoryValue, SourceRef } from './types.js';
 
 export interface VmStat {
   pageSize: number;
-  active: number;
+  anonymous: number;
+  purgeable: number;
+  fileBacked: number;
   wired: number;
   compressorOccupied: number;
 }
@@ -25,7 +28,9 @@ export function parseVmStat(text: string): VmStat {
   if (!Number.isFinite(pageSize) || pageSize <= 0) throw new Error('vm_stat: bad page size');
   return {
     pageSize,
-    active: requiredField(text, 'Pages active'),
+    anonymous: requiredField(text, 'Anonymous pages'),
+    purgeable: requiredField(text, 'Pages purgeable'),
+    fileBacked: requiredField(text, 'File-backed pages'),
     wired: requiredField(text, 'Pages wired down'),
     compressorOccupied: requiredField(text, 'Pages occupied by compressor'),
   };
@@ -49,38 +54,69 @@ export function parsePressureLevel(text: string): MemoryValue['pressure'] {
   throw new Error(`memorystatus_vm_pressure_level: unknown code ${text.trim()}`);
 }
 
+const SWAP_CACHE_MS = 30_000;
+const PRESSURE_CACHE_MS = 5_000;
+
 export interface MemoryDeps {
   run?: RunFn;
   platform?: NodeJS.Platform;
   totalmem?: () => number;
+  now?: () => number;
   src?: SourceRef;
 }
 
 export class MemorySampler {
+  private swapCache: { at: number; value: number } | undefined;
+  private pressureCache: { at: number; value: MemoryValue['pressure'] } | undefined;
   private readonly src: SourceRef;
 
   constructor(private readonly deps: MemoryDeps = {}) {
     this.src = deps.src ?? fact.source('memory', '/usr/bin/vm_stat + /usr/sbin/sysctl');
   }
 
-  sample(ttlMs: number = fact.DEFAULT_TTL_MS): Promise<Fact<MemoryValue>> {
+  sample(ttlMs: number = fact.DEFAULT_TTL_MS, signal?: AbortSignal): Promise<Fact<MemoryValue>> {
     if ((this.deps.platform ?? process.platform) !== 'darwin') {
       return Promise.resolve(fact.fail('unavailable', this.src, ttlMs));
     }
-    const run = this.deps.run ?? runCommand;
+    const run = this.deps.run ?? defaultRun;
     const totalmem = this.deps.totalmem ?? os.totalmem;
+    const now = this.deps.now ?? (() => performance.now());
     return fact.collect(this.src, async () => {
-      const [vmText, pressureText, swapText] = await Promise.all([
-        run('/usr/bin/vm_stat'),
-        run('/usr/sbin/sysctl', ['-n', 'kern.memorystatus_vm_pressure_level']),
-        run('/usr/sbin/sysctl', ['-n', 'vm.swapusage']),
+      const swap = this.swapCache && now() - this.swapCache.at < SWAP_CACHE_MS ? this.swapCache : undefined;
+      const pressure = this.pressureCache && now() - this.pressureCache.at < PRESSURE_CACHE_MS
+        ? this.pressureCache : undefined;
+      const [vmR, pressureR, swapR] = await Promise.allSettled([
+        run('/usr/bin/vm_stat', [], signal),
+        pressure ? Promise.resolve('') : run('/usr/sbin/sysctl', ['-n', 'kern.memorystatus_vm_pressure_level'], signal),
+        swap ? Promise.resolve('') : run('/usr/sbin/sysctl', ['-n', 'vm.swapusage'], signal),
       ]);
-      const vm = parseVmStat(vmText);
+      // A fast failure still waits for the slower siblings: processes may be
+      // lingering until here, so only map the error after all have settled.
+      if (vmR.status === 'rejected') throw vmR.reason;
+      if (pressureR.status === 'rejected') throw pressureR.reason;
+      if (swapR.status === 'rejected') throw swapR.reason;
+      if (signal?.aborted) throw signal.reason;
+      const vm = parseVmStat(vmR.value);
+      let swapUsed: number;
+      if (swap) {
+        swapUsed = swap.value;
+      } else {
+        swapUsed = parseSwapUsage(swapR.value);
+        this.swapCache = { at: now(), value: swapUsed };
+      }
+      let level: MemoryValue['pressure'];
+      if (pressure) {
+        level = pressure.value;
+      } else {
+        level = parsePressureLevel(pressureR.value);
+        this.pressureCache = { at: now(), value: level };
+      }
       return {
         total: totalmem(),
-        used: (vm.active + vm.wired + vm.compressorOccupied) * vm.pageSize,
-        pressure: parsePressureLevel(pressureText),
-        swapUsed: parseSwapUsage(swapText),
+        used: (Math.max(0, vm.anonymous - vm.purgeable) + vm.wired + vm.compressorOccupied) * vm.pageSize,
+        cached: (vm.fileBacked + vm.purgeable) * vm.pageSize,
+        pressure: level,
+        swapUsed,
       };
     }, ttlMs);
   }

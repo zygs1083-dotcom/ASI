@@ -1,5 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { BodyProbe, type ProbeCollectors } from '../src/probe.js';
+import { runCommand, type ExecFn } from '../src/command.js';
 import * as fact from '../src/fact.js';
 import type { Body, Fact, TokensValue } from '../src/types.js';
 
@@ -17,6 +21,12 @@ const baseCollectors = (): ProbeCollectors => ({
 
 const tokenFact = (ttl = 12345): Fact<TokensValue> =>
   fact.ok({ sessionUsage: { input: 1, output: 2, cacheRead: 3, cacheWrite: 4 } }, src('tokenSource'), ttl);
+
+function deferred<T>() {
+  let resolve!: (v: T) => void;
+  const promise = new Promise<T>((res) => { resolve = res; });
+  return { promise, resolve };
+}
 
 const flush = () => vi.advanceTimersByTimeAsync(0);
 
@@ -190,33 +200,146 @@ describe('BodyProbe', () => {
     await probe.stop();
   });
 
-  it('serializes a restart behind a still-pending previous sample', async () => {
+  it('restarts immediately without waiting for a still-pending previous sample', async () => {
     let calls = 0;
     let resolveFirst!: (f: Fact<never>) => void;
     const collectors = baseCollectors();
     collectors.cpu = (ttl) => {
       calls += 1;
-      if (calls === 1) return new Promise<Fact<never>>((res) => { resolveFirst = res; });
-      return Promise.resolve(fact.ok(
-        { usage: 0.9, perCore: [], load1: 0, load5: 0, load15: 0 }, src('cpu'), ttl) as never);
+      return calls === 1
+        ? new Promise<Fact<never>>((res) => { resolveFirst = res; })
+        : Promise.resolve(fact.ok(
+          { usage: 0.9, perCore: [], load1: 0, load5: 0, load15: 0 }, src('cpu'), ttl) as never);
     };
     const probe = new BodyProbe(collectors);
-    const seen: Body[] = [];
-    probe.onSample((b) => seen.push(b));
+    const seen: number[] = [];
+    probe.onSample((b) => seen.push(b.cpu.value!.usage));
     probe.start({ intervalMs: 1000 });
     await vi.advanceTimersByTimeAsync(0);
-    expect(calls).toBe(1);
     const stopped = probe.stop();
     probe.start({ intervalMs: 1000 });
-    await vi.advanceTimersByTimeAsync(10_000);
-    expect(calls).toBe(1); // new generation must wait for the pending tick
-    resolveFirst(fact.ok({ usage: 0.1, perCore: [], load1: 0, load5: 0, load15: 0 }, src('cpu')) as never);
-    await stopped;
     await vi.advanceTimersByTimeAsync(0);
-    expect(calls).toBe(2);
-    expect(seen).toHaveLength(1); // the obsolete generation never published
-    expect(seen[0]!.cpu.value?.usage).toBe(0.9);
+    expect(calls).toBe(2); // fresh tick runs right away, not behind the old one
+    await stopped;
+    resolveFirst(fact.ok({ usage: 0.1, perCore: [], load1: 0, load5: 0, load15: 0 }, src('cpu')) as never);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(seen).toEqual([0.9]); // obsolete generation never publishes
     await probe.stop();
+  });
+
+  it('stop() resolves despite a hung collector and tokenSource, leaving no timers', async () => {
+    const collectors = baseCollectors();
+    collectors.memory = () => new Promise<Fact<never>>(() => {});
+    const probe = new BodyProbe(collectors);
+    probe.start({
+      intervalMs: 1000,
+      tokenSource: { read: () => new Promise<Fact<TokensValue>>(() => {}) },
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    await probe.stop();
+    expect(vi.getTimerCount()).toBe(0);
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(probe.latest()).toBeNull();
+  });
+
+  it.each([
+    ['stop', ['first']],
+    ['restart', ['first', 'first', 'second']],
+  ] as const)('cuts off stale dispatch when a listener %ss mid-tick', async (mode, expected) => {
+    const probe = new BodyProbe(baseCollectors());
+    const seen: string[] = [];
+    let once = false;
+    probe.onSample(() => {
+      seen.push('first');
+      if (once) return;
+      once = true;
+      void probe.stop();
+      if (mode === 'restart') probe.start({ intervalMs: 1000 });
+    });
+    probe.onSample(() => seen.push('second'));
+    probe.start({ intervalMs: 1000 });
+    await flush();
+    expect(seen).toEqual(expected);
+    await probe.stop();
+  });
+
+  it('samples battery at most every 30s (ttl >=90s), republishing observedAt', async () => {
+    const collectors = baseCollectors();
+    let batteryCalls = 0;
+    collectors.battery = async (ttl) => {
+      batteryCalls += 1;
+      return fact.ok({ percent: 50, charging: false }, src('batt'), ttl);
+    };
+    const probe = new BodyProbe(collectors);
+    probe.start({ intervalMs: 2000 });
+    await flush();
+    const firstAt = probe.latest()!.battery.observedAt;
+    expect(probe.latest()?.battery.ttlMs).toBe(90_000);
+    await vi.advanceTimersByTimeAsync(28_000);
+    expect(batteryCalls).toBe(1); // 14 ticks served from cache
+    expect(probe.latest()?.battery.observedAt).toBe(firstAt);
+    await vi.advanceTimersByTimeAsync(4_000);
+    expect(batteryCalls).toBe(2);
+    await probe.stop();
+  });
+
+  it('stop() waits only for its own generation\'s commands, not unrelated signals', async () => {
+    const foreign = new AbortController();
+    const d = deferred<{ stdout: string }>();
+    const pending = runCommand('/bin/f', [], vi.fn<ExecFn>(() => d.promise), foreign.signal);
+    pending.catch(() => {});
+    try {
+      const probe = new BodyProbe(baseCollectors());
+      probe.start({ intervalMs: 1000 });
+      await flush();
+      await probe.stop(); // resolves while the foreign command is still pending
+    } finally {
+      d.resolve({ stdout: 'x' }); // settle + deregister the foreign command
+      foreign.abort();
+      await pending.catch(() => {});
+    }
+  });
+
+  it('leaves no timers when a collector synchronously stops the probe mid-tick', async () => {
+    const collectors = baseCollectors();
+    let probe!: BodyProbe;
+    collectors.memory = () => { // reentrant stop: aborts the tick mid-setup
+      void probe.stop();
+      return new Promise<Fact<never>>(() => {});
+    };
+    probe = new BodyProbe(collectors);
+    probe.start({
+      intervalMs: 1000,
+      tokenSource: { read: () => new Promise<Fact<TokensValue>>(() => {}) },
+    });
+    await flush();
+    expect(vi.getTimerCount()).toBe(0);
+    await probe.stop();
+  });
+
+  it('stop() aborts a real child command and returns only after it exits', async () => {
+    vi.useRealTimers(); // the spawned child lives in real time
+    const pidFile = path.join(os.tmpdir(), `body-probe-probe-${process.pid}.pid`);
+    const collectors = baseCollectors();
+    collectors.memory = async (ttl, signal) => {
+      await runCommand(process.execPath, [
+        '-e',
+        `require('node:fs').writeFileSync(${JSON.stringify(pidFile)}, String(process.pid)); setInterval(() => {}, 6e4);`,
+      ], undefined, signal);
+      return fact.ok({ total: 1, used: 1, pressure: 'normal', swapUsed: 0 }, src('mem'), ttl);
+    };
+    const probe = new BodyProbe(collectors);
+    let pid = 0;
+    try {
+      probe.start({ intervalMs: 60_000 });
+      await vi.waitFor(() => { pid = Number(fs.readFileSync(pidFile, 'utf8')); }, { timeout: 5000, interval: 20 });
+      await probe.stop(); // drains the aborted command through child close
+      expect(() => process.kill(pid, 0)).toThrowError(/ESRCH/);
+    } finally {
+      await probe.stop();
+      try { if (pid) process.kill(pid, 'SIGKILL'); } catch { /* already gone */ }
+      fs.rmSync(pidFile, { force: true });
+    }
   });
 
   it('start/stop are safe to repeat and stop leaves no timers behind', async () => {

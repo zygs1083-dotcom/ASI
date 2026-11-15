@@ -1,4 +1,4 @@
-import { runCommand, type RunFn } from './command.js';
+import { defaultRun, type RunFn } from './command.js';
 import * as fact from './fact.js';
 import type { BatteryValue, Fact, SourceRef } from './types.js';
 
@@ -31,11 +31,12 @@ export class BatterySampler {
     this.src = deps.src ?? fact.source('battery', '/usr/bin/pmset -g batt');
   }
 
-  sample(ttlMs: number = fact.DEFAULT_TTL_MS): Promise<Fact<BatteryValue | null>> {
+  sample(ttlMs: number = fact.DEFAULT_TTL_MS, signal?: AbortSignal): Promise<Fact<BatteryValue | null>> {
     if ((this.deps.platform ?? process.platform) !== 'darwin') {
       return Promise.resolve(fact.fail('unavailable', this.src, ttlMs));
     }
-    const run = this.deps.run ?? runCommand;
-    return fact.collect(this.src, async () => parsePmsetBatt(await run('/usr/bin/pmset', ['-g', 'batt'])), ttlMs);
+    const run = this.deps.run ?? defaultRun;
+    return fact.collect(this.src, async () =>
+      parsePmsetBatt(await run('/usr/bin/pmset', ['-g', 'batt'], signal)), ttlMs);
   }
 }

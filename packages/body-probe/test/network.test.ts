@@ -9,11 +9,23 @@ const fx = (name: string) => readFileSync(new URL(`./fixtures/${name}`, import.m
 const iface = (over: Partial<NetworkInterfaceInfo>): NetworkInterfaceInfo =>
   ({ address: 'a', netmask: 'n', family: 'IPv4', mac: 'm', internal: false, cidr: null, ...over }) as NetworkInterfaceInfo;
 
+const HEADER =
+  'Name  Mtu   Network       Address            Ipkts Ierrs     Ibytes    Opkts Oerrs     Obytes    Coll';
+const linkRow = (name: string, link: string, rx: number, tx: number) =>
+  `${name}   1500  ${link}    aa:bb:cc:dd:ee:ff     100     0       ${rx}     200     0       ${tx}      0`;
+const netstat = (...rows: string[]) => [HEADER, ...rows].join('\n');
+
+function deferred<T>() {
+  let resolve!: (v: T) => void;
+  const promise = new Promise<T>((res) => { resolve = res; });
+  return { promise, resolve };
+}
+
 describe('parseNetstatIB', () => {
   it('counts only Network=<Link#..> rows, dedups by name, excludes lo0', () => {
     const m = parseNetstatIB(fx('netstat_1.txt'));
     expect([...m.keys()]).toEqual(['en0']);
-    expect(m.get('en0')).toEqual({ rx: 1000, tx: 2000 });
+    expect(m.get('en0')).toEqual({ rx: 1000, tx: 2000, link: '<Link#4>' });
   });
   it('accepts a valid but empty table', () => {
     expect(parseNetstatIB(fx('netstat_empty.txt')).size).toBe(0);
@@ -25,7 +37,7 @@ describe('parseNetstatIB', () => {
   it('re-aligns link rows that omit the Address column and excludes lo0*', () => {
     const m = parseNetstatIB(fx('netstat_utun_2.txt'));
     expect([...m.keys()]).toEqual(['utun9']);
-    expect(m.get('utun9')).toEqual({ rx: 6000, tx: 9000 });
+    expect(m.get('utun9')).toEqual({ rx: 6000, tx: 9000, link: '<Link#20>' });
   });
 
   it('throws on a link row matching neither field-count variant', () => {
@@ -34,25 +46,42 @@ describe('parseNetstatIB', () => {
 });
 
 describe('isOnline', () => {
-  it('is true when a non-internal IPv4 address exists', () => {
-    expect(isOnline({ en0: [iface({})] })).toBe(true);
-    expect(isOnline({ en0: [iface({ family: 4 as unknown as 'IPv4' })] })).toBe(true);
-  });
-  it('is false for internal-only or IPv6-only', () => {
-    expect(isOnline({ lo0: [iface({ internal: true })] })).toBe(false);
-    expect(isOnline({ en0: [iface({ family: 'IPv6' })] })).toBe(false);
-    expect(isOnline({})).toBe(false);
+  const cases: [NodeJS.Dict<NetworkInterfaceInfo[]>, boolean][] = [
+    [{ en0: [iface({})] }, true],
+    [{ en0: [iface({ family: 4 as unknown as 'IPv4' })] }, true],
+    [{ en0: [iface({ family: 'IPv6', address: '2001:db8::5' })] }, true],
+    [{ en0: [iface({ family: 6 as unknown as 'IPv6', address: '2606:4700::1' })] }, true],
+    [{ en0: [iface({ family: 'IPv6', address: 'fe80::1' })] }, false],
+    [{ en0: [iface({ family: 'IPv6', address: 'fd00::9' })] }, false],
+    [{ en0: [iface({ family: 'IPv6', address: 'ff02::1' })] }, false],
+    [{ en0: [iface({ family: 'IPv6', address: '2::1' })] }, false],
+    [{ en0: [iface({ family: 'IPv6', address: '3::1' })] }, false],
+    [{ en0: [iface({ family: 'IPv6', address: '::1' })] }, false],
+    [{ lo0: [iface({ internal: false })] }, false],
+    [{ en0: [iface({ internal: true })] }, false],
+    [{}, false],
+  ];
+  it.each(cases)('address predicate %#', (interfaces, expected) => {
+    expect(isOnline(interfaces)).toBe(expected);
   });
 
-  it('skips loopback interfaces by name even when marked non-internal', () => {
-    expect(isOnline({ lo0: [iface({ internal: false })] })).toBe(false);
+  it('requires the default route', () => {
+    expect(isOnline({ en0: [iface({})] }, false)).toBe(false);
+    expect(isOnline({ en0: [iface({ family: 'IPv6', address: '2001:db8::5' })] }, false)).toBe(false);
   });
 });
 
 describe('NetworkSampler', () => {
-  const sampler = (texts: string[], now: () => number, interfaces = () => ({ en0: [iface({})] })) => {
+  const sampler = (
+    texts: string[],
+    now: () => number,
+    interfaces = () => ({ en0: [iface({})] }),
+    route?: RunFn,
+  ) => {
     let i = 0;
-    const run: RunFn = async () => texts[Math.min(i++, texts.length - 1)]!;
+    const run: RunFn = async (file, args = []) =>
+      file.endsWith('netstat') ? texts[Math.min(i++, texts.length - 1)]!
+        : route ? route(file, args) : ''; // /sbin/route exit 0
     return new NetworkSampler({ platform: 'darwin', run, now, interfaces });
   };
 
@@ -66,18 +95,99 @@ describe('NetworkSampler', () => {
     expect(second.value).toEqual({ online: true, rxBps: 1000, txBps: 1500 });
   });
 
-  it('gives newly appearing interfaces their own baseline and zeroes resets', async () => {
+  it('gives newly appearing interfaces their own baseline and reports unknown on resets', async () => {
     let t = 0;
-    const s = sampler([fx('netstat_hotplug_1.txt'), fx('netstat_hotplug_2.txt'), fx('netstat_reset_2.txt')],
-      () => (t += 1000) - 1000);
+    const s = sampler(
+      [fx('netstat_hotplug_1.txt'), fx('netstat_hotplug_2.txt'), fx('netstat_reset_2.txt'),
+        netstat(linkRow('en0', '<Link#4>', 1500, 1700), linkRow('en7', '<Link#9>', 71000, 91000))],
+      () => (t += 1000) - 1000,
+    );
     await s.sample(0);
     const second = await s.sample(1000);
     // en0 delta over 1s; en7 appeared -> contributes nothing this interval
     expect(second.value?.rxBps).toBe(2000);
-    const third = await s.sample(1000);
-    // en0 counters reset -> contributes 0; en7 now has a baseline but prev had it at 70000/90000
-    expect(third.value?.rxBps).toBe(0);
-    expect(third.value?.txBps).toBe(0);
+    // en0 counters dropped below baseline -> rebase, reported unknown not 0 B/s
+    expect((await s.sample(1000)).status).toBe('unknown');
+    const fourth = await s.sample(1000);
+    expect(fourth.status).toBe('ok');
+    expect(fourth.value?.rxBps).toBe(2000); // 1000/s en0 + 1000/s en7
+  });
+
+  it.each([
+    ['<Link#5>', 1_000_000_000], // same name, new link identity, counters already higher
+    ['<Link#4>', 2_000_000_100], // same identity, implausible burst
+  ])('reports unknown on a corrupt delta (link %s, rx %i) and recovers', async (link, rx) => {
+    let t = 0;
+    const s = sampler(
+      [netstat(linkRow('en0', '<Link#4>', 100, 200)),
+        netstat(linkRow('en0', link, rx, 200)),
+        netstat(linkRow('en0', link, rx + 2000, 400))],
+      () => (t += 1000) - 1000,
+    );
+    await s.sample(0);
+    expect((await s.sample(1000)).status).toBe('unknown'); // not a fake spike
+    const next = await s.sample(1000);
+    expect(next.status).toBe('ok');
+    expect(next.value).toEqual({ online: true, rxBps: 2000, txBps: 200 });
+  });
+
+  const routeCases: [RunFn, boolean | undefined, string][] = [
+    [async () => '', true, 'ok'],
+    [async () => { throw Object.assign(new Error('exit 1'), { code: 1 }); }, false, 'ok'],
+    [async () => { throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' }); }, undefined, 'unknown'],
+  ];
+  it.each(routeCases)('maps the route probe to online/status %#', async (route, online, status) => {
+    let t = 0;
+    const s = sampler([fx('netstat_1.txt'), fx('netstat_2.txt')], () => (t += 1000) - 1000, undefined, route);
+    await s.sample(0);
+    const f = await s.sample(1000);
+    expect(f.status).toBe(status);
+    if (online !== undefined) expect(f.value?.online).toBe(online);
+  });
+
+  it.each([[true], [false]])('caches the route verdict 30s (command fails=%s)', async (fail) => {
+    let t = 0;
+    let routeCalls = 0;
+    let i = 0;
+    const texts = [fx('netstat_1.txt'), fx('netstat_2.txt'), fx('netstat_2.txt'), fx('netstat_2.txt')];
+    const run: RunFn = async (file) => {
+      if (file.endsWith('netstat')) return texts[Math.min(i++, texts.length - 1)]!;
+      routeCalls += 1;
+      if (fail) throw Object.assign(new Error('gone'), { code: 'ENOENT' });
+      return '';
+    };
+    const s = new NetworkSampler({ platform: 'darwin', run, now: () => t, interfaces: () => ({ en0: [iface({})] }) });
+    await s.sample(0);
+    t = 1_000;
+    expect((await s.sample(0)).status).toBe(fail ? 'unknown' : 'ok');
+    t = 29_000;
+    await s.sample(0);
+    expect(routeCalls).toBe(1);
+    t = 30_001;
+    await s.sample(0);
+    expect(routeCalls).toBe(2);
+  });
+
+  it('a late-resolving aborted sample cannot overwrite the newer baseline or route cache', async () => {
+    let t = 0, calls = 0, routes = 0;
+    const d = deferred<string>();
+    const controller = new AbortController();
+    const run: RunFn = async (file) => {
+      if (!file.endsWith('netstat')) return ++routes === 1 ? d.promise : '';
+      calls += 1;
+      // sample k reads (1000k, 2000k) except the baseline (100, 200)
+      return netstat(linkRow('en0', '<Link#4>', calls === 1 ? 100 : 1000 * calls, calls === 1 ? 200 : 2000 * calls));
+    };
+    const s = new NetworkSampler({ platform: 'darwin', run, now: () => t, interfaces: () => ({ en0: [iface({})] }) });
+    const stale = s.sample(0, controller.signal); // netstat resolves, route deferred
+    await s.sample(0);                            // newer sample completes fully (baseline B2, route true)
+    controller.abort();
+    d.resolve(''); // late route success for the aborted sample
+    expect((await stale).status).not.toBe('ok');
+    t = 1_000;
+    const f = await s.sample(0);
+    expect(f.value).toEqual({ online: true, rxBps: 1000, txBps: 2000 }); // deltas vs newer baseline (2000,4000)
+    expect(routes).toBe(2); // stale sample never wrote its route outcome
   });
 
   it('reports unavailable on malformed output then rebases safely', async () => {
@@ -93,12 +203,12 @@ describe('NetworkSampler', () => {
     expect(ok.value?.rxBps).toBe(0);
   });
 
-  it('reports unavailable when the command fails', async () => {
+  it('reports unavailable when the netstat command fails', async () => {
     const s = new NetworkSampler({ platform: 'darwin', run: async () => { throw new Error('offline'); }, now: () => 0 });
     expect((await s.sample(0)).status).toBe('unavailable');
   });
 
-  it('reports unavailable and rebases when interfaces() throws', async () => {
+  it('reports unknown and rebases when interfaces() throws', async () => {
     let t = 0;
     let i = 0;
     const texts = [fx('netstat_1.txt'), fx('netstat_2.txt'), fx('netstat_2.txt')];
@@ -107,13 +217,13 @@ describe('NetworkSampler', () => {
     });
     const s = new NetworkSampler({
       platform: 'darwin',
-      run: async () => texts[Math.min(i++, texts.length - 1)]!,
+      run: async (file) => (file.endsWith('netstat') ? texts[Math.min(i++, texts.length - 1)]! : ''),
       now: () => (t += 1000) - 1000,
       interfaces: ifaces,
     });
-    expect((await s.sample(0)).status).toBe('unavailable');
+    expect((await s.sample(0)).status).toBe('unknown'); // online undecidable
     ifaces.mockImplementation(() => ({ en0: [iface({})] }));
-    expect((await s.sample(0)).status).toBe('unknown'); // prev cleared -> baseline again
+    expect((await s.sample(0)).status).toBe('unknown'); // baseline again
     expect((await s.sample(0)).status).toBe('ok');
   });
 

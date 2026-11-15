@@ -18,7 +18,7 @@ export interface Fact<T> {
 
 export interface Body {
   cpu: Fact<{ usage: number /* 0..1 */; perCore: number[]; load1: number; load5: number; load15: number }>;
-  memory: Fact<{ total: number; used: number; pressure: 'normal' | 'warn' | 'critical'; swapUsed: number }>;
+  memory: Fact<{ total: number; used: number; cached?: number; pressure: 'normal' | 'warn' | 'critical'; swapUsed: number }>;
   disks: Fact<Array<{ mount: string; total: number; free: number }>>;   // 至少根卷 + 工作目录所在卷
   battery: Fact<{ percent: number; charging: boolean; minutesLeft?: number } | null>;  // 台式机为 null
   thermal: Fact<'nominal' | 'fair' | 'serious' | 'critical'>;           // ProcessInfo.thermalState，经 helper

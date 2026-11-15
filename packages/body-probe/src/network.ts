@@ -1,12 +1,13 @@
 import os from 'node:os';
 import { performance } from 'node:perf_hooks';
-import { runCommand, type RunFn } from './command.js';
+import { defaultRun, type RunFn } from './command.js';
 import * as fact from './fact.js';
 import type { Fact, NetworkValue, SourceRef } from './types.js';
 
 export interface IfaceCounters {
   rx: number;
   tx: number;
+  link?: string; // the '<Link#N>' identity of the interface row
 }
 
 // Real `netstat -ib` Link rows for interfaces without a MAC (utun*, awdl
@@ -27,7 +28,8 @@ export function parseNetstatIB(text: string): Map<string, IfaceCounters> {
   const counters = new Map<string, IfaceCounters>();
   for (const line of lines.slice(1)) {
     const cols = line.split(/\s+/);
-    if (!/^<Link#\d+>$/.test(cols[iNet] ?? '')) continue;
+    const link = cols[iNet];
+    if (!link || !/^<Link#\d+>$/.test(link)) continue;
     let fields = cols;
     if (cols.length === header.length - 1) {
       // The one-field-short row is only a legit omitted Address when the slot
@@ -45,18 +47,25 @@ export function parseNetstatIB(text: string): Map<string, IfaceCounters> {
     if (!Number.isInteger(rx) || rx < 0 || !Number.isInteger(tx) || tx < 0) {
       throw new Error('netstat -ib: bad counters');
     }
-    counters.set(name, { rx, tx });
+    counters.set(name, { rx, tx, link });
   }
   return counters;
 }
 
 type IfaceMap = NodeJS.Dict<os.NetworkInterfaceInfo[]>;
 
-export function isOnline(interfaces: IfaceMap): boolean {
+// "online" = at least one globally usable address (any non-internal IPv4, or
+// a global-unicast IPv6 in 2000::/3) AND a default route. Loopback, ULA,
+// link-local and multicast IPv6 never count — all live outside 2000::/3.
+export function isOnline(interfaces: IfaceMap, hasDefaultRoute = true): boolean {
+  if (!hasDefaultRoute) return false;
   for (const [name, list] of Object.entries(interfaces)) {
     if (/^lo\d*$/.test(name)) continue;
     for (const i of list ?? []) {
-      if (!i.internal && (i.family === 'IPv4' || (i.family as unknown) === 4)) return true;
+      if (i.internal) continue;
+      const family = i.family as unknown;
+      if (family === 'IPv4' || family === 4) return true;
+      if ((family === 'IPv6' || family === 6) && /^[23][0-9a-f]{3}:/i.test(i.address)) return true;
     }
   }
   return false;
@@ -75,23 +84,35 @@ interface Snapshot {
   counters: Map<string, IfaceCounters>;
 }
 
+const ROUTE_CACHE_MS = 30_000;
+// Rates above 10 Gbit/s in a single sample interval are counter artefacts
+// (rebase aftermath), not real traffic.
+const MAX_BPS = 10_000_000_000 / 8;
+
 export class NetworkSampler {
   private prev: Snapshot | undefined;
+  private route: { at: number; value: boolean | 'unknown' } | undefined;
   private readonly src: SourceRef;
 
   constructor(private readonly deps: NetworkDeps = {}) {
     this.src = deps.src ?? fact.source('network', '/usr/sbin/netstat -ib');
   }
 
-  async sample(ttlMs: number = fact.DEFAULT_TTL_MS): Promise<Fact<NetworkValue>> {
+  async sample(ttlMs: number = fact.DEFAULT_TTL_MS, signal?: AbortSignal): Promise<Fact<NetworkValue>> {
     if ((this.deps.platform ?? process.platform) !== 'darwin') {
       return fact.fail('unavailable', this.src, ttlMs);
     }
-    const run = this.deps.run ?? runCommand;
+    const run = this.deps.run ?? defaultRun;
     try {
-      const counters = parseNetstatIB(await run('/usr/sbin/netstat', ['-ib']));
+      const counters = parseNetstatIB(await run('/usr/sbin/netstat', ['-ib'], signal));
+      signal?.throwIfAborted();
       const now = (this.deps.now ?? (() => performance.now()))();
-      const online = isOnline((this.deps.interfaces ?? os.networkInterfaces)());
+      const online = await this.onlineStatus(now, run, signal);
+      signal?.throwIfAborted();
+      if (online === 'unknown') {
+        this.prev = undefined; // reset baseline safely; next sample re-baselines
+        return fact.fail('unknown', this.src, ttlMs);
+      }
       const prev = this.prev;
       this.prev = { at: now, counters };
       if (!prev) return fact.fail('unknown', this.src, ttlMs);
@@ -104,14 +125,51 @@ export class NetworkSampler {
         if (!before) continue; // newly appeared interface: baseline only
         const dRx = cur.rx - before.rx;
         const dTx = cur.tx - before.tx;
-        if (dRx < 0 || dTx < 0) continue; // reset counter contributes 0
+        // Same-name replacement (different link) or a counter reset can fake
+        // huge spikes; the baseline is already current, so report unknown.
+        if (before.link !== cur.link || dRx < 0 || dTx < 0) {
+          return fact.fail('unknown', this.src, ttlMs);
+        }
         rx += dRx;
         tx += dTx;
       }
-      return fact.ok({ online, rxBps: rx / elapsedSec, txBps: tx / elapsedSec }, this.src, ttlMs);
+      const rxBps = rx / elapsedSec;
+      const txBps = tx / elapsedSec;
+      if (rxBps > MAX_BPS || txBps > MAX_BPS || rxBps + txBps > MAX_BPS) {
+        return fact.fail('unknown', this.src, ttlMs);
+      }
+      return fact.ok({ online, rxBps, txBps }, this.src, ttlMs);
     } catch (err) {
-      this.prev = undefined;
+      // Abort leaves the baseline untouched so a later generation can still
+      // compute deltas; real failures reset it.
+      if (!signal?.aborted) this.prev = undefined;
       return fact.fail(fact.errorStatus(err), this.src, ttlMs);
     }
+  }
+
+  // 'unknown' when the interfaces list is unreadable or the default-route
+  // probe fails non-numerically: online cannot be determined.
+  private async onlineStatus(now: number, run: RunFn, signal?: AbortSignal): Promise<boolean | 'unknown'> {
+    let interfaces: IfaceMap;
+    try {
+      interfaces = (this.deps.interfaces ?? os.networkInterfaces)();
+    } catch {
+      return 'unknown';
+    }
+    if (this.route && now - this.route.at < ROUTE_CACHE_MS) {
+      return this.route.value === 'unknown' ? 'unknown' : isOnline(interfaces, this.route.value);
+    }
+    let value: boolean | 'unknown';
+    try {
+      await run('/sbin/route', ['-n', 'get', 'default'], signal);
+      value = true;
+    } catch (err) {
+      if (signal?.aborted) return 'unknown'; // abort outcomes are never cached
+      const code = (err as NodeJS.ErrnoException | undefined)?.code;
+      value = typeof code === 'number' && code > 0 ? false : 'unknown';
+    }
+    signal?.throwIfAborted();
+    this.route = { at: now, value };
+    return value === 'unknown' ? 'unknown' : isOnline(interfaces, value);
   }
 }

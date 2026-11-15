@@ -15,9 +15,14 @@ const run =
   };
 
 describe('parseVmStat', () => {
-  it('reads the page size from the header and the three used fields', () => {
+  it('reads the page size from the header and the product-formula fields', () => {
     expect(parseVmStat(fx('vm_stat.txt'))).toEqual({
-      pageSize: 16384, active: 100, wired: 20, compressorOccupied: 30,
+      pageSize: 16384,
+      anonymous: 2500000,
+      purgeable: 10,
+      fileBacked: 4000000,
+      wired: 20,
+      compressorOccupied: 30,
     });
   });
   it('rejects output missing a required field', () => {
@@ -55,20 +60,97 @@ describe('parsePressureLevel', () => {
 });
 
 describe('MemorySampler', () => {
-  it('computes used from active+wired+compressor-occupied pages (ignores stored/inactive)', async () => {
+  it.each([4096, 16384])('computes used/cached from vm_stat at page size %i', async (pageSize) => {
     const s = new MemorySampler({
       platform: 'darwin',
-      run: run(fx('vm_stat.txt'), '1\n', fx('swapusage.txt')),
-      totalmem: () => 16 * 1024 ** 3,
+      run: run(fx('vm_stat.txt').replace('16384', String(pageSize)), '1\n', fx('swapusage.txt')),
+      totalmem: () => 128 * 1024 ** 3,
     });
     const f = await s.sample();
     expect(f.status).toBe('ok');
     expect(f.value).toEqual({
-      total: 16 * 1024 ** 3,
-      used: 150 * 16384,
+      total: 128 * 1024 ** 3,
+      used: (2500000 - 10 + 20 + 30) * pageSize,
+      cached: (4000000 + 10) * pageSize,
       pressure: 'normal',
       swapUsed: 12.5 * 1024 ** 2,
     });
+  });
+
+  it('clamps anonymous-purgeable at zero when purgeable exceeds anonymous', async () => {
+    const s = new MemorySampler({
+      platform: 'darwin',
+      run: run(fx('vm_stat.txt').replace('2500000.', '5.'), '1\n', fx('swapusage.txt')),
+      totalmem: () => 128 * 1024 ** 3,
+    });
+    const f = await s.sample();
+    expect(f.value?.used).toBe(50 * 16384);
+    expect(f.value?.cached).toBe((4000000 + 10) * 16384);
+  });
+
+  it('waits for slow siblings before mapping a fast failure', async () => {
+    let resolveSwap!: (s: string) => void;
+    const runFn: RunFn = async (file, args = []) => {
+      if (file.endsWith('vm_stat')) throw Object.assign(new Error('nope'), { code: 'EACCES' });
+      if (args.includes('vm.swapusage')) return new Promise<string>((res) => { resolveSwap = res; });
+      return '1\n';
+    };
+    let settled = false;
+    const p = new MemorySampler({ platform: 'darwin', run: runFn }).sample()
+      .then((f) => { settled = true; return f; });
+    await new Promise((r) => setImmediate(r));
+    expect(settled).toBe(false); // still pending on the slow swap command
+    resolveSwap(fx('swapusage.txt'));
+    expect((await p).status).toBe('denied'); // EACCES classification preserved
+  });
+
+  it('caches a successful swap reading for 30s but never a rejected one', async () => {
+    let t = 0;
+    let calls = 0;
+    let fail = true;
+    const runFn: RunFn = async (file, args = []) => {
+      if (file.endsWith('vm_stat')) return fx('vm_stat.txt');
+      if (args.includes('vm.swapusage')) {
+        calls += 1;
+        if (fail) throw new Error('swap down');
+        return fx('swapusage.txt');
+      }
+      return '1\n';
+    };
+    const s = new MemorySampler({ platform: 'darwin', run: runFn, now: () => t });
+    expect((await s.sample()).status).toBe('unavailable');
+    fail = false;
+    expect((await s.sample()).status).toBe('ok'); // rejected runs are retried
+    t = 29_999;
+    await s.sample();
+    expect(calls).toBe(2);                       // success is cached
+    t = 30_000;
+    await s.sample();
+    expect(calls).toBe(3);                       // and expires at 30s
+  });
+
+  it('caches the pressure reading for 5s, never a rejected one', async () => {
+    let t = 0, calls = 0, fail = true;
+    const runFn: RunFn = async (file, args = []) => {
+      if (file.endsWith('vm_stat')) return fx('vm_stat.txt');
+      if (args.includes('kern.memorystatus_vm_pressure_level')) {
+        calls += 1;
+        if (fail) throw new Error('pressure down');
+        return '1\n';
+      }
+      return fx('swapusage.txt');
+    };
+    const s = new MemorySampler({ platform: 'darwin', run: runFn, now: () => t });
+    expect((await s.sample()).status).toBe('unavailable'); // rejected: not cached
+    fail = false;
+    await s.sample();
+    expect(calls).toBe(2);   // success caches at t=0
+    t = 4_999;
+    await s.sample();
+    expect(calls).toBe(2);   // inside the 5s window
+    t = 5_000;
+    await s.sample();
+    expect(calls).toBe(3);   // boundary expiry re-runs
   });
 
   it('returns unavailable when any command output is malformed', async () => {

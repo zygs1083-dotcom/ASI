@@ -1,5 +1,8 @@
 import { describe, expect, it, vi } from 'vitest';
-import { runCommand, type ExecFn } from '../src/command.js';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { drainCommands, runCommand, type ExecFn } from '../src/command.js';
 
 function deferred<T>() {
   let resolve!: (v: T) => void;
@@ -63,5 +66,78 @@ describe('runCommand', () => {
   it('rejects when exec rejects (collectors convert to facts)', async () => {
     const exec = vi.fn<ExecFn>(async () => { throw Object.assign(new Error('killed'), { code: 'SIGKILL' }); });
     await expect(runCommand('/bin/fake', [], exec)).rejects.toThrow('killed');
+  });
+});
+
+describe('runCommand cancellation', () => {
+  it('serializes an identical command across different signals, retrying after settle', async () => {
+    const execs: ReturnType<typeof deferred<{ stdout: string }>>[] = [];
+    const exec = vi.fn<ExecFn>(() => { const d = deferred<{ stdout: string }>(); execs.push(d); return d.promise; });
+    const p1 = runCommand('/bin/f', ['a'], exec, new AbortController().signal);
+    const p2 = runCommand('/bin/f', ['a'], exec, new AbortController().signal);
+    expect(exec).toHaveBeenCalledTimes(1);
+    execs[0]!.resolve({ stdout: 'one' });
+    expect(await p1).toBe('one');
+    await vi.waitFor(() => expect(exec).toHaveBeenCalledTimes(2), { timeout: 1000, interval: 5 });
+    execs[1]!.resolve({ stdout: 'two' });
+    expect(await p2).toBe('two');
+  });
+
+  it('never executes pre-aborted or wait-cancelled requests', async () => {
+    const d = deferred<{ stdout: string }>();
+    const exec = vi.fn<ExecFn>(() => d.promise);
+    const pre = new AbortController();
+    pre.abort();
+    await expect(runCommand('/bin/f', ['a'], exec, pre.signal)).rejects.toThrow(/abort/i);
+    const queued = new AbortController();
+    const p1 = runCommand('/bin/f', ['a'], exec);
+    const p2 = runCommand('/bin/f', ['a'], exec, queued.signal);
+    p2.catch(() => {}); // silence until asserted below
+    try {
+      queued.abort();
+      // our waiter settles on our own abort, without waiting for p1's command
+      await expect(p2).rejects.toThrow(/abort/i);
+      expect(exec).toHaveBeenCalledTimes(1); // only p1 ever ran
+    } finally {
+      d.resolve({ stdout: 'x' });
+      await p1;
+    }
+    expect(exec).toHaveBeenCalledTimes(1); // aborted waiter never retried
+  });
+
+  it('drainCommands waits only for commands under the drained signal', async () => {
+    const d = deferred<{ stdout: string }>();
+    const c = new AbortController();
+    const pending = runCommand('/bin/f', [], vi.fn<ExecFn>(() => d.promise), c.signal);
+    pending.catch(() => {});
+    let drained = false;
+    const draining = drainCommands(c.signal).then(() => { drained = true; });
+    await Promise.resolve();
+    expect(drained).toBe(false);
+    d.resolve({ stdout: 'ok' });
+    await draining;
+    expect(drained).toBe(true);
+    expect(await pending).toBe('ok');
+  });
+
+  it('rejects an aborted real command only after the child exits', async () => {
+    const pidFile = path.join(os.tmpdir(), `body-probe-${process.pid}.pid`);
+    const controller = new AbortController();
+    const pending = runCommand(process.execPath, [
+      '-e',
+      `require('node:fs').writeFileSync(${JSON.stringify(pidFile)}, String(process.pid)); setInterval(() => {}, 6e4);`,
+    ], undefined, controller.signal);
+    pending.catch(() => {});
+    let pid = 0;
+    try {
+      await vi.waitFor(() => { pid = Number(fs.readFileSync(pidFile, 'utf8')); }, { timeout: 5000, interval: 20 });
+      controller.abort();
+      await expect(pending).rejects.toThrow();
+      expect(() => process.kill(pid, 0)).toThrowError(/ESRCH/);
+    } finally {
+      controller.abort();
+      try { if (pid) process.kill(pid, 'SIGKILL'); } catch { /* already gone */ }
+      fs.rmSync(pidFile, { force: true });
+    }
   });
 });

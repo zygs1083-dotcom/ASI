@@ -1,5 +1,5 @@
 import { performance } from 'node:perf_hooks';
-import { runCommand, type RunFn } from './command.js';
+import { defaultRun, type RunFn } from './command.js';
 import * as fact from './fact.js';
 import type { Fact, ProcessValue, SourceRef } from './types.js';
 
@@ -82,12 +82,12 @@ export class ExternalProcessSampler {
     this.src = deps.src ?? fact.source('harnessProcess', '/bin/ps');
   }
 
-  sample(ttlMs: number = fact.DEFAULT_TTL_MS): Promise<Fact<ProcessValue>> {
+  sample(ttlMs: number = fact.DEFAULT_TTL_MS, signal?: AbortSignal): Promise<Fact<ProcessValue>> {
     if (!Number.isInteger(this.pid) || this.pid <= 0) {
       return Promise.resolve(fact.fail('unavailable', this.src, ttlMs));
     }
-    const run = this.deps.run ?? runCommand;
+    const run = this.deps.run ?? defaultRun;
     return fact.collect(this.src, async () =>
-      parsePsRow(await run('/bin/ps', ['-o', 'rss=,%cpu=,etime=', '-p', String(this.pid)])), ttlMs);
+      parsePsRow(await run('/bin/ps', ['-o', 'rss=,%cpu=,etime=', '-p', String(this.pid)], signal)), ttlMs);
   }
 }

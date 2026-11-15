@@ -101,7 +101,7 @@ describe('ExternalProcessSampler', () => {
     const runSpy = vi.fn<RunFn>(async () => '  1  0.0  00:01');
     const s = new ExternalProcessSampler(4242, { run: runSpy });
     await s.sample();
-    expect(runSpy).toHaveBeenCalledWith('/bin/ps', ['-o', 'rss=,%cpu=,etime=', '-p', '4242']);
+    expect(runSpy).toHaveBeenCalledWith('/bin/ps', ['-o', 'rss=,%cpu=,etime=', '-p', '4242'], undefined);
   });
 
   it.each([0, -3, 1.5, NaN])('rejects invalid pid %s without running commands', async (pid) => {
