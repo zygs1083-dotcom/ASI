@@ -174,6 +174,7 @@ export interface AsiApi {
 | `go-settings` | 空会话里"先去配置模型厂商"按钮 |
 | `msg-user` / `msg-assistant` | 消息（`data-status` = streaming/done/error/aborted） |
 | `msg-error` | 助手错误条 |
+| `msg-retry` | 错误/中止后的「重试」按钮（仅最后一轮显示） |
 | `composer-input` | 输入框 textarea |
 | `composer-send` / `composer-stop` | 发送 / 停止按钮 |
 | `model-picker` | 模型药丸按钮；弹层内选项 `model-option`（`data-provider-id`、`data-model-id`），搜索框 `model-search` |
