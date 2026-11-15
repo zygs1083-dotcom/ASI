@@ -227,9 +227,9 @@ describe('KeyRedactor boundary safety (legal keys)', () => {
   const LEGAL_B = '1234wxyz';
 
   /**
-   * 逐 push 断言不变量：累计已放出文本不含任何完整 key，
-   * 也不以任何 key 的真前缀结尾（否则下一段放出文本可能在边界上拼出 key）。
-   * flush 是终端例外，只要求最终文本不含完整 key。
+   * 逐 push 断言不变量：累计已放出文本（含插入的掩码字符）不含任何完整 key。
+   * 已放出文本允许以某个 key 的真前缀结尾——跨边界拼出的完整匹配会被
+   * 基线状态捕获并压制；flush 只要求最终文本不含完整 key。
    */
   function drainSafe(keys: string[], chunks: string[]): string {
     const r = new KeyRedactor(keys);
@@ -238,12 +238,6 @@ describe('KeyRedactor boundary safety (legal keys)', () => {
       emitted += r.push(c);
       for (const k of keys) {
         expect(emitted).not.toContain(k);
-        for (let p = 1; p < k.length; p++) {
-          expect(
-            emitted.endsWith(k.slice(0, p)),
-            `emitted ${JSON.stringify(emitted)} must not end with a proper prefix of ${k}`,
-          ).toBe(false);
-        }
       }
     }
     emitted += r.flush();
@@ -273,13 +267,14 @@ describe('KeyRedactor boundary safety (legal keys)', () => {
     },
   );
 
-  it('withholds text ending in a competing proper prefix instead of releasing it', () => {
+  it('releases the safe prefix and retains only the longest proper-prefix suffix', () => {
     // 'abc' 是 'abcdefgh' 的前缀、'XYZ' 是 'XYZabcde' 的前缀：
-    // 在 'XYZ' 前切开会让已放出的 'abc' 以受保护前缀结尾，必须整段扣留
+    // pending 'abcXYZ' 的最长受保护前缀后缀是 'XYZ'，'abc' 立即放出
+    // （放出文本可以以另一把 key 的真前缀结尾，跨边界完整匹配仍会被压制）
     const r = new KeyRedactor(['abcdefgh', 'XYZabcde']);
-    expect(r.push('abcXYZ')).toBe('');
-    // 后续片段让 pending 不再以任何受保护前缀结尾：整段放出（'abcXYZ' 本身不是 key）
-    expect(r.push('defgh tail')).toBe('abcXYZdefgh tail');
+    expect(r.push('abcXYZ')).toBe('abc');
+    // 'XYZ' 拼不出 'XYZabcde' 后继续前进，整段放出，拼接回完整输入
+    expect(r.push('defgh tail')).toBe('XYZdefgh tail');
     expect(r.flush()).toBe('');
   });
 
@@ -324,10 +319,10 @@ describe('KeyRedactor boundary safety (legal keys)', () => {
     }
   });
 
-  it('loses nothing when a long held proper-prefix chain completes a key then goes safe', () => {
+  it('loses nothing when a long proper-prefix stream completes a key then goes safe', () => {
     const keys = [LEGAL_A, LEGAL_B];
-    // 5000 个 'a' 全是 'abcd1234' 的真前缀后缀：整段扣留；
-    // 'bcd1234' 在链尾拼出完整 key，扣留前缀一个字符都不能丢
+    // 5000 个 'a' 全是 'abcd1234' 的真前缀后缀：前 4999 个增量放出，
+    // 每次只扣留最后一个 'a'；'bcd1234' 在链尾拼出完整 key，已放出前缀一个字符都不能丢
     const text = `${'a'.repeat(5000)}bcd1234 tail`;
     const chunks: string[] = [];
     for (let i = 0; i < text.length; i += 20) {
@@ -339,9 +334,9 @@ describe('KeyRedactor boundary safety (legal keys)', () => {
     expect(emitted).not.toContain(LEGAL_B);
   });
 
-  it('processes a 100000-char all-proper-prefix stream in linear time', () => {
-    // 对抗性回压：每个 'a' 都让文本以 'abcd1234' 的真前缀结尾，永远无法放出；
-    // 持久匹配器只处理新增字符，不允许退化为逐片重扫扣留串
+  it('releases a 100000-char all-proper-prefix stream incrementally, retaining only one char', () => {
+    // 对抗性回压：每个 'a' 都是 'abcd1234' 的真前缀，但 'aa' 不是——
+    // 每次 push 最多扣留 1 个字符，其余立即放出，缓冲不随输入无限增长
     const keys = [LEGAL_A, LEGAL_B];
     const full = 'a'.repeat(100000);
     const fragments: string[] = [];
@@ -350,28 +345,79 @@ describe('KeyRedactor boundary safety (legal keys)', () => {
     }
     expect(fragments).toHaveLength(5000);
     const r = new KeyRedactor(keys);
+    const emitted: string[] = [];
+    let consumed = 0;
+    let released = 0;
     const t0 = performance.now();
     for (const f of fragments) {
-      expect(r.push(f)).toBe('');
+      const out = r.push(f);
+      consumed += f.length;
+      released += out.length;
+      emitted.push(out);
+      // 每次 push 后扣留量 = 已消费 - 已放出，不超过最长受保护前缀后缀（这里 = 1）
+      expect(consumed - released).toBeLessThanOrEqual(1);
+      for (const k of keys) {
+        expect(out).not.toContain(k);
+      }
     }
     const tail = r.flush();
     const elapsed = performance.now() - t0;
     console.log(`[perf] 100000 prefix-holding chars / 5000 fragments: ${elapsed.toFixed(1)}ms`);
     expect(elapsed).toBeLessThan(1000);
-    expect(tail).toBe(full);
+    // 增量放出的拼接 = 完整输入减去最后扣留的 'a'；flush 放出最后一个 'a'
+    expect(emitted.join('')).toBe(full.slice(0, -1));
+    expect(tail).toBe('a');
+  });
+
+  it('releases single-character prefix chunks incrementally too', () => {
+    // 单字符流：每次 push 只到 1 个 'a'，仍受最长真前缀后缀规则约束
+    const r = new KeyRedactor([LEGAL_A]);
+    const emitted: string[] = [];
+    let consumed = 0;
+    let released = 0;
+    for (let i = 0; i < 2000; i++) {
+      const out = r.push('a');
+      consumed += 1;
+      released += out.length;
+      emitted.push(out);
+      expect(consumed - released).toBeLessThanOrEqual(1);
+    }
+    expect(emitted.join('')).toBe('a'.repeat(1999));
+    expect(r.flush()).toBe('a');
   });
 
   it('never reconstructs a legacy invalid stored key across event boundaries', () => {
     // 遗留非法 key 'abcd[已隐藏' 含掩码前缀（新保存已不可能入库）：
     // 'abcd1234' + '5678' 跨片拼出 '12345678'，掩码插入又恰好拼出遗留 key，
-    // 兜底清理必须连它一起清掉；任意切分点上同样不得泄漏任何受保护值
+    // 插入期间重组出的匹配必须连它一起清掉；任意切分点上同样不得泄漏任何受保护值。
+    // 注意：'abcd' 在 '1234' 被扣留时即可放出（它不是完整 key），
+    // 因此累计输出只要求不含完整受保护值，不要求与离线脱敏逐字一致。
     const legacy = `abcd${KEY_MASK.slice(0, -1)}`; // 'abcd[已隐藏'
     const keys = [legacy, '12345678'];
     const emitted = drainSafe(keys, ['abcd1234', '5678']);
-    expect(emitted).toBe(redactKeys('abcd12345678', keys));
     expect(emitted).not.toContain('12345678');
     expect(emitted).not.toContain(legacy);
     const text = 'abcd12345678';
+    for (let i = 1; i < text.length; i++) {
+      drainSafe(keys, [text.slice(0, i), text.slice(i)]);
+    }
+    drainSafe(keys, [...text]);
+  });
+
+  it('suppresses a mask char that completes a legal key across the release boundary', () => {
+    // key1 'abcdefg[' 与 key2 '12345678'，输入 'abcdefg12345678'：
+    // 'abcdefg' 放出时已以 key1 的 7 位真前缀结尾；'12345678' 匹配后插入的掩码
+    // 首字符 '[' 恰好在已放出边界上拼出完整 key1，必须被基线状态压制。
+    const keys = ['abcdefg[', '12345678'];
+    const r = new KeyRedactor(keys);
+    expect(r.push('abcdefg1234')).toBe('abcdefg');
+    let emitted = 'abcdefg';
+    emitted += r.push('5678');
+    emitted += r.flush();
+    expect(emitted).not.toContain('abcdefg[');
+    expect(emitted).not.toContain('12345678');
+    // 任意切分点与逐字符推进：累计输出永远不含任一把完整 key
+    const text = 'abcdefg12345678';
     for (let i = 1; i < text.length; i++) {
       drainSafe(keys, [text.slice(0, i), text.slice(i)]);
     }

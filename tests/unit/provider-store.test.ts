@@ -437,6 +437,27 @@ function fakeCipher(value: string): string {
   ]).toString('base64');
 }
 
+/** 统计每个密文 decryptString 次数：断言快照对每条密文恰好解密一次 */
+function countingEncryption(available = true): {
+  enc: StorageEncryption;
+  perCipher: Map<string, number>;
+} {
+  const base = fakeEncryption(available);
+  const perCipher = new Map<string, number>();
+  return {
+    enc: {
+      isEncryptionAvailable: base.isEncryptionAvailable,
+      encryptString: base.encryptString,
+      decryptString: (value: Buffer) => {
+        const cipher = value.toString('base64');
+        perCipher.set(cipher, (perCipher.get(cipher) ?? 0) + 1);
+        return base.decryptString(value);
+      },
+    },
+    perCipher,
+  };
+}
+
 function providerRecord(id: string): Record<string, unknown> {
   return {
     id,
@@ -988,6 +1009,124 @@ describe('ProviderStore legacy invalid keys', () => {
     expect(keys).toHaveLength(3);
     // 密文损坏的条目只在枚举时被跳过，getApiKey 仍抛统一解密错误
     expect(() => store.getApiKey('p-bad')).toThrow(/无法解密/);
+  });
+});
+
+describe('ProviderStore getKeySnapshot', () => {
+  it('decrypts each ciphertext exactly once per snapshot, including corrupt entries', () => {
+    vi.stubEnv('ASI_DATA_DIR', '/tmp/asi-test-data');
+    const dir = tempDir();
+    writeFileSync(join(dir, 'providers.json'), JSON.stringify([providerRecord('p-ok')]), 'utf8');
+    writeFileSync(
+      join(dir, 'keys.json'),
+      JSON.stringify({
+        'p-ok': { encrypted: true, value: fakeCipher('sk-valid-zz') },
+        'p-corrupt': { encrypted: true, value: Buffer.from('GARBAGE').toString('base64') },
+        'p-plain': { encrypted: false, value: 'sk-plain-zz' },
+      }),
+      'utf8',
+    );
+    // 加密不可用的测试回退：明文条目保持明文，快照枚举时不经过解密
+    const counting = countingEncryption(false);
+    const store = new ProviderStore(dir, counting.enc);
+    // 构造期的分类解密与本次断言无关：清零后只看快照枚举
+    counting.perCipher.clear();
+    const snapshot = store.getKeySnapshot();
+    // 两条密文（含损坏的）各恰好解密一次；明文条目不经过解密
+    expect(counting.perCipher.size).toBe(2);
+    for (const n of counting.perCipher.values()) {
+      expect(n).toBe(1);
+    }
+    expect(snapshot.redactionKeys).toEqual(expect.arrayContaining(['sk-valid-zz', 'sk-plain-zz']));
+    expect(snapshot.redactionKeys).toHaveLength(2);
+  });
+
+  it('collects every decryptable raw value for redaction while unavailable entries stay unusable', () => {
+    // 加密不可用的测试回退：明文条目保留为明文，非法条目标记不可用但仍可枚举
+    vi.stubEnv('ASI_DATA_DIR', '/tmp/asi-test-data');
+    const dir = tempDir();
+    writeFileSync(
+      join(dir, 'providers.json'),
+      JSON.stringify([
+        providerRecord('p-ok'),
+        providerRecord('p-bad'),
+        providerRecord('p-plain'),
+        providerRecord('p-corrupt'),
+      ]),
+      'utf8',
+    );
+    writeFileSync(
+      join(dir, 'keys.json'),
+      JSON.stringify({
+        'p-ok': { encrypted: true, value: fakeCipher('sk-valid-zz') },
+        'p-bad': { encrypted: true, value: fakeCipher('tiny') },
+        'p-plain': { encrypted: false, value: 'sk-plain-zz' },
+        'p-orphan': { encrypted: false, value: ' tiny ' },
+        'p-corrupt': { encrypted: true, value: Buffer.from('GARBAGE').toString('base64') },
+      }),
+      'utf8',
+    );
+    const store = new ProviderStore(dir, fakeEncryption(false));
+    const snapshot = store.getKeySnapshot();
+    // 全部可解密的非空原值都进脱敏集合：含非法值、被忽略的孤儿与明文遗留
+    expect(snapshot.redactionKeys).toEqual(
+      expect.arrayContaining(['sk-valid-zz', 'tiny', 'sk-plain-zz', ' tiny ']),
+    );
+    expect(snapshot.redactionKeys).toHaveLength(4);
+    expect(snapshot.getApiKey('p-ok')).toBe('sk-valid-zz');
+    expect(snapshot.getApiKey('p-plain')).toBe('sk-plain-zz');
+    // 不可用（非法内容/被忽略）条目不可被取用
+    expect(snapshot.getApiKey('p-bad')).toBeUndefined();
+    expect(snapshot.getApiKey('p-orphan')).toBeUndefined();
+    // 缺失条目返回 undefined
+    expect(snapshot.getApiKey('missing')).toBeUndefined();
+    // 损坏密文抛与独立 getApiKey 相同的脱敏错误
+    expect(() => snapshot.getApiKey('p-corrupt')).toThrow('无法解密已保存的 API Key');
+    try {
+      snapshot.getApiKey('p-corrupt');
+      expect.unreachable();
+    } catch (err) {
+      expect((err as Error).message).not.toContain('GARBAGE');
+      expect((err as Error).message).not.toContain('bad cipher');
+    }
+  });
+
+  it('keeps captured values and eligibility frozen across later store changes, without re-decrypting', () => {
+    vi.stubEnv('ASI_DATA_DIR', '/tmp/asi-test-data');
+    const dir = tempDir();
+    writeFileSync(
+      join(dir, 'providers.json'),
+      JSON.stringify([providerRecord('p1'), providerRecord('p2'), providerRecord('p3')]),
+      'utf8',
+    );
+    writeFileSync(
+      join(dir, 'keys.json'),
+      JSON.stringify({
+        p1: { encrypted: true, value: fakeCipher('sk-first-88') },
+        p2: { encrypted: true, value: fakeCipher('sk-second-9') },
+        p3: { encrypted: true, value: fakeCipher('tiny') },
+      }),
+      'utf8',
+    );
+    const counting = countingEncryption();
+    const store = new ProviderStore(dir, counting.enc);
+    counting.perCipher.clear();
+    const snapshot = store.getKeySnapshot();
+    const baseline = new Map(counting.perCipher);
+    // 快照之后：轮换 p1 的 key、删除 p2、给不可用的 p3 换上合法 key
+    store.save(input({ id: 'p1', apiKey: 'sk-rotated-7' }));
+    store.remove('p2');
+    store.save(input({ id: 'p3', apiKey: 'sk-fixed-999' }));
+    // 快照冻结：值与可用性都停留在捕获时刻，且不触发任何新的解密
+    expect(snapshot.getApiKey('p1')).toBe('sk-first-88');
+    expect(snapshot.getApiKey('p2')).toBe('sk-second-9');
+    expect(snapshot.getApiKey('p3')).toBeUndefined();
+    expect(snapshot.redactionKeys).toEqual(expect.arrayContaining(['sk-first-88', 'sk-second-9', 'tiny']));
+    expect(counting.perCipher).toEqual(baseline);
+    // store 的独立视图已按变更后状态工作
+    expect(store.getApiKey('p1')).toBe('sk-rotated-7');
+    expect(store.getApiKey('p2')).toBeUndefined();
+    expect(store.getApiKey('p3')).toBe('sk-fixed-999');
   });
 });
 
