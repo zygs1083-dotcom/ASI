@@ -1,0 +1,57 @@
+import path from 'node:path';
+import type { Signal, SignalCause } from '@asi/sense-types';
+
+/**
+ * A window in which the agent was executing a tool call. Signals inside it
+ * that relate to the tool (same pid, or a path under `cwd`) are self-caused.
+ */
+export interface ToolWindow {
+  startedAt: number;
+  endedAt?: number;
+  cwd?: string;
+  pid?: number;
+}
+
+const CAUSAL_KINDS: ReadonlySet<string> = new Set([
+  'file.changed',
+  'job.started',
+  'job.exited',
+  'process.started',
+  'process.exited',
+]);
+
+function signalPath(signal: Signal): string | undefined {
+  if (typeof signal.data.path === 'string' && signal.data.path.length > 0) return signal.data.path;
+  if (signal.kind === 'file.changed' && signal.subject.length > 0) return signal.subject;
+  return undefined;
+}
+
+function underDir(cwd: string, p: string): boolean {
+  // Both paths must be absolute: a relative signal path is never resolved
+  // against the process cwd (that is not part of the source contract).
+  if (!path.isAbsolute(cwd) || !path.isAbsolute(p)) return false;
+  const rel = path.relative(path.resolve(cwd), path.resolve(p));
+  return rel === '' || (rel !== '..' && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel));
+}
+
+/**
+ * Self-cause classification (DESIGN §2.3 step 2). Only file/job/process
+ * signals can be agent-caused; they match a tool window when `signal.at` is
+ * within the inclusive `[startedAt, endedAt]` bounds and either the signal's
+ * `data.pid` equals `window.pid` or its path (`data.path`, else subject for
+ * `file.changed`) lies under `window.cwd` (path-boundary safe: `/repo` does
+ * not match `/repository`). An explicit `cause: 'agent'` is always preserved;
+ * `user`/`unknown` are upgraded to `agent` on match, never downgraded.
+ */
+export function classifyCause(signal: Signal, toolWindows: readonly ToolWindow[] = []): SignalCause {
+  if (signal.cause === 'agent') return 'agent';
+  const base = signal.cause ?? 'unknown';
+  if (!CAUSAL_KINDS.has(signal.kind)) return base;
+  for (const w of toolWindows) {
+    if (signal.at < w.startedAt || (w.endedAt !== undefined && signal.at > w.endedAt)) continue;
+    if (w.pid !== undefined && signal.data.pid === w.pid) return 'agent';
+    const p = signalPath(signal);
+    if (w.cwd !== undefined && p !== undefined && underDir(w.cwd, p)) return 'agent';
+  }
+  return base;
+}
