@@ -55,8 +55,9 @@ public struct ErrorEvent: Encodable {
   public var v = 1; public var type = "error"; public var at: Int64
   public var code: String
   public var message: String
-  public init(at: Int64, code: String, message: String) {
-    self.at = at; self.code = code; self.message = message }
+  public var dropped: Int? // output_overflow only: number of evicted events
+  public init(at: Int64, code: String, message: String, dropped: Int? = nil) {
+    self.at = at; self.code = code; self.message = message; self.dropped = dropped }
 }
 
 public struct SnapshotEvent: Encodable {
