@@ -31,34 +31,34 @@ persistence or running service are involved.
 
 ## Captured Results
 
-| Injection | Detected | Delay (s) |
-| --- | --- | ---: |
-| disk drop | yes | 0 |
-| RSS leak | yes | 180 |
-| excess deletion | yes | 25 |
-| CPU anomaly | yes | 120 |
-| context drain | yes | 60 |
+| Injection       | Detected | Delay (s) |
+| --------------- | -------- | --------: |
+| disk drop       | yes      |         0 |
+| RSS leak        | yes      |       180 |
+| excess deletion | yes      |        25 |
+| CPU anomaly     | yes      |       120 |
+| context drain   | yes      |        60 |
 
 | Day | Stable exposure (days) | False alerts | False alerts / stable day |
-| ---: | ---: | ---: | ---: |
-| 1 | 0.9993 | 0 | 0.0000 |
-| 2 | 0.9889 | 0 | 0.0000 |
-| 3 | 0.9889 | 0 | 0.0000 |
-| 4 | 0.9951 | 0 | 0.0000 |
-| 5 | 0.9889 | 0 | 0.0000 |
-| 6 | 0.9889 | 0 | 0.0000 |
-| 7 | 1.0000 | 0 | 0.0000 |
+| --: | ---------------------: | -----------: | ------------------------: |
+|   1 |                 0.9993 |            0 |                    0.0000 |
+|   2 |                 0.9889 |            0 |                    0.0000 |
+|   3 |                 0.9889 |            0 |                    0.0000 |
+|   4 |                 0.9951 |            0 |                    0.0000 |
+|   5 |                 0.9889 |            0 |                    0.0000 |
+|   6 |                 0.9889 |            0 |                    0.0000 |
+|   7 |                 1.0000 |            0 |                    0.0000 |
 
 | Installed hours | Learning progress (%) |
-| ---: | ---: |
-| 0 | 0.0 |
-| 6 | 25.0 |
-| 7.2 | 30.0 |
-| 12 | 50.0 |
-| 18 | 75.0 |
-| 24 | 100.0 |
-| 48 | 100.0 |
-| 168 | 100.0 |
+| --------------: | --------------------: |
+|               0 |                   0.0 |
+|               6 |                  25.0 |
+|             7.2 |                  30.0 |
+|              12 |                  50.0 |
+|              18 |                  75.0 |
+|              24 |                 100.0 |
+|              48 |                 100.0 |
+|             168 |                 100.0 |
 
 ## Repeated Noise Feedback
 
@@ -66,14 +66,14 @@ Nine distinct alert registrations for the same CPU rule receive synthetic
 `noise` feedback. Every three consecutive labels request 20% less
 sensitivity, implemented as an upper sigma threshold divided by `0.8`.
 
-| Operation | Parameter | From | To | Status | Reason |
-| --- | --- | ---: | ---: | --- | --- |
-| propose | cpu.sigma | 3 | 3.75 | applied | three consecutive noise labels |
-| propose | cpu.sigma | 3.75 | 4.6875 | applied | three consecutive noise labels |
-| propose | cpu.sigma | 4.6875 | 5.859375 | rejected | hourly change limit |
-| propose | floor.disk | 0.05 | 0.04 | rejected | safety: cannot loosen |
-| lock | cpu.sigma | 4.6875 | 4.6875 | applied | locked |
-| propose | cpu.sigma | 4.6875 | 5 | rejected | param locked |
+| Operation | Parameter  |   From |       To | Status   | Reason                         |
+| --------- | ---------- | -----: | -------: | -------- | ------------------------------ |
+| propose   | cpu.sigma  |      3 |     3.75 | applied  | three consecutive noise labels |
+| propose   | cpu.sigma  |   3.75 |   4.6875 | applied  | three consecutive noise labels |
+| propose   | cpu.sigma  | 4.6875 | 5.859375 | rejected | hourly change limit            |
+| propose   | floor.disk |   0.05 |     0.04 | rejected | safety: cannot loosen          |
+| lock      | cpu.sigma  | 4.6875 |   4.6875 | applied  | locked                         |
+| propose   | cpu.sigma  | 4.6875 |        5 | rejected | param locked                   |
 
 Each applied step is +25% (within the 50% guard), only two changes apply in
 the rolling hour, and the safety floor remains unchanged.
