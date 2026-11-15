@@ -1,0 +1,2 @@
+%% not pmset output at all
+random words here

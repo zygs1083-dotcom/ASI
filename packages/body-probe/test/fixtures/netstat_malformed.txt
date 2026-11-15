@@ -1,0 +1,2 @@
+Name  Mtu   Network       Address            Ipkts Ierrs    Opkts Oerrs    Coll
+lo0   16384 <Link#1>                         10000     0    10000     0      0
