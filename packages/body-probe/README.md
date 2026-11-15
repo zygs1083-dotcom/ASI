@@ -6,7 +6,7 @@ by `asi-sense` to fill `self.body`.
 ```ts
 import { BodyProbe } from '@asi/body-probe';
 
-const probe = new BodyProbe();          // optional: (collectors, { now, wall })
+const probe = new BodyProbe();          // optional: (collectors, { now, wall, platform })
 const off = probe.onSample((body) => { /* render gauges */ });
 probe.start({ intervalMs: 2000 });          // immediate tick, then every 2s
 // probe.start({ intervalMs: 2000, cadence: { memoryMs: 10_000 } }); // cadence override
@@ -40,6 +40,8 @@ injected `TokenSource`.
 
 Formulas: `memory.used = (max(0, anonymous - purgeable) + wired + compressor-occupied) * pageSize`,
 `memory.cached = (file-backed + purgeable) * pageSize` (vm_stat fields).
+Simultaneously-due pressure and swap reads share one `sysctl -n <keys>` process,
+each keeping its own cache period.
 
 Cadence: `start({ cadence })` accepts a `Partial<SamplingCadence>`
 (`memoryMs`, `networkMs`, `disksMs`, `batteryMs`, `pressureMs`, `swapMs`,

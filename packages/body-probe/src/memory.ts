@@ -104,17 +104,24 @@ export class MemorySampler {
       const swap = this.swapCache && now() - this.swapCache.at < swapMs ? this.swapCache : undefined;
       const pressure = this.pressureCache && now() - this.pressureCache.at < pressureMs
         ? this.pressureCache : undefined;
-      const [vmR, pressureR, swapR] = await Promise.allSettled([
+      // Simultaneously-due sysctl OIDs share one invocation; output lines
+      // come back in argument order.
+      const sysctlKeys = [
+        ...(pressure ? [] : ['kern.memorystatus_vm_pressure_level']),
+        ...(swap ? [] : ['vm.swapusage']),
+      ];
+      const [vmR, sysctlR] = await Promise.allSettled([
         run('/usr/bin/vm_stat', [], signal),
-        pressure ? Promise.resolve('') : run('/usr/sbin/sysctl', ['-n', 'kern.memorystatus_vm_pressure_level'], signal),
-        swap ? Promise.resolve('') : run('/usr/sbin/sysctl', ['-n', 'vm.swapusage'], signal),
+        sysctlKeys.length ? run('/usr/sbin/sysctl', ['-n', ...sysctlKeys], signal) : Promise.resolve(''),
       ]);
-      // A fast failure still waits for the slower siblings: processes may be
+      // A fast failure still waits for the slower sibling: the process may be
       // lingering until here, so only map the error after all have settled.
       if (vmR.status === 'rejected') throw vmR.reason;
-      if (pressureR.status === 'rejected') throw pressureR.reason;
-      if (swapR.status === 'rejected') throw swapR.reason;
+      if (sysctlR.status === 'rejected') throw sysctlR.reason;
       if (signal?.aborted) throw signal.reason;
+      const sysctlLines = sysctlR.value.trim().split('\n');
+      const pressureText = pressure ? '' : sysctlLines.shift() ?? '';
+      const swapText = swap ? '' : sysctlLines.shift() ?? '';
       const wallNow = wall();
       const monoNow = now();
       // The fact keeps the oldest constituent's wall time and expires at the
@@ -126,7 +133,7 @@ export class MemorySampler {
         swapUsed = swap.value;
         parts.push({ observedAt: swap.observedAt, periodMs: swapMs, at: swap.at });
       } else {
-        swapUsed = parseSwapUsage(swapR.value);
+        swapUsed = parseSwapUsage(swapText);
         this.swapCache = { at: monoNow, observedAt: wallNow, value: swapUsed };
         parts.push({ observedAt: wallNow, periodMs: swapMs, at: monoNow });
       }
@@ -135,7 +142,7 @@ export class MemorySampler {
         level = pressure.value;
         parts.push({ observedAt: pressure.observedAt, periodMs: pressureMs, at: pressure.at });
       } else {
-        level = parsePressureLevel(pressureR.value);
+        level = parsePressureLevel(pressureText);
         this.pressureCache = { at: monoNow, observedAt: wallNow, value: level };
         parts.push({ observedAt: wallNow, periodMs: pressureMs, at: monoNow });
       }

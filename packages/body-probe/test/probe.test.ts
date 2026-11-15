@@ -544,11 +544,15 @@ describe('BodyProbe', () => {
         return '';
       }
       if (file.endsWith('vm_stat')) return fx('vm_stat.txt');
-      if (args.includes('vm.swapusage')) return fx('swapusage.txt');
+      if (file.endsWith('sysctl')) {
+        return args.slice(1).map((key) =>
+          key === 'vm.swapusage' ? fx('swapusage.txt').trimEnd() : '1',
+        ).join('\n');
+      }
       return '1\n';
     });
     fakeEn0();
-    const probe = new BodyProbe();
+    const probe = new BodyProbe({}, { platform: 'darwin' });
     probe.start({ intervalMs: 1000, cadence: { networkMs: 2000, routeMs: 5000 } });
     await vi.advanceTimersByTimeAsync(3000); // baseline t0, online rate fact at t2
     expect(probe.latest()?.network.value?.online).toBe(true);
@@ -571,12 +575,17 @@ describe('BodyProbe', () => {
     let swapOut = fx('swapusage.txt');
     vi.spyOn(command, 'defaultRun').mockImplementation(async (file, args = []) => {
       if (file.endsWith('vm_stat')) return fx('vm_stat.txt');
-      if (args.includes('kern.memorystatus_vm_pressure_level')) { pressureCalls += 1; return pressureOut; }
-      if (args.includes('vm.swapusage')) { swapCalls += 1; return swapOut; }
+      if (file.endsWith('sysctl')) {
+        if (args.includes('kern.memorystatus_vm_pressure_level')) pressureCalls += 1;
+        if (args.includes('vm.swapusage')) swapCalls += 1;
+        return args.slice(1).map((key) =>
+          key === 'vm.swapusage' ? swapOut.trimEnd() : pressureOut.trimEnd(),
+        ).join('\n');
+      }
       if (file.endsWith('netstat')) return fx('netstat_1.txt');
       return '';
     });
-    const probe = new BodyProbe();
+    const probe = new BodyProbe({}, { platform: 'darwin' });
     probe.start({ intervalMs: 1000 });
     await flush();
     expect(pressureCalls).toBe(1);
@@ -603,14 +612,19 @@ describe('BodyProbe', () => {
     let routeCalls = 0;
     vi.spyOn(command, 'defaultRun').mockImplementation(async (file, args = []) => {
       if (file.endsWith('vm_stat')) return fx('vm_stat.txt');
-      if (args.includes('kern.memorystatus_vm_pressure_level')) { pressureCalls += 1; return '1\n'; }
-      if (args.includes('vm.swapusage')) { swapCalls += 1; return fx('swapusage.txt'); }
+      if (file.endsWith('sysctl')) {
+        if (args.includes('kern.memorystatus_vm_pressure_level')) pressureCalls += 1;
+        if (args.includes('vm.swapusage')) swapCalls += 1;
+        return args.slice(1).map((key) =>
+          key === 'vm.swapusage' ? fx('swapusage.txt').trimEnd() : '1',
+        ).join('\n');
+      }
       if (file.endsWith('netstat')) return fx('netstat_1.txt');
       if (file.endsWith('route')) { routeCalls += 1; return ''; }
       return '1\n';
     });
     fakeEn0();
-    const probe = new BodyProbe();
+    const probe = new BodyProbe({}, { platform: 'darwin' });
     probe.start({
       intervalMs: 2000,
       cadence: { memoryMs: 30_000, networkMs: 30_000, pressureMs: 5000, swapMs: 5000, routeMs: 5000 },
@@ -678,8 +692,12 @@ describe('BodyProbe', () => {
     const run: RunFn = async (file, args = []) => {
       if (file.endsWith('vm_stat')) return fx('vm_stat.txt');
       if (file.endsWith('netstat')) return fx('netstat_1.txt');
-      if (args.includes('vm.swapusage')) return fx('swapusage.txt');
-      return '1\n'; // pressure level; route success output is unused
+      if (file.endsWith('sysctl')) {
+        return args.slice(1).map((key) =>
+          key === 'vm.swapusage' ? fx('swapusage.txt').trimEnd() : '1',
+        ).join('\n');
+      }
+      return '1\n'; // route success output is unused
     };
     // Samplers default to the same (faked) monotonic clock as the probe.
     const memory = new MemorySampler({ platform: 'darwin', run, totalmem: () => 1 });
@@ -721,5 +739,22 @@ describe('BodyProbe', () => {
     const last = probe.history().at(-1)!;
     expect(last.body.memory.status).toBe('ok'); // stored points are never re-marked
     expect(last.body.network.status).toBe('ok');
+  });
+
+  it('marks macOS facts unavailable off-darwin and never spawns their commands', async () => {
+    const collectors: Partial<ProbeCollectors> = baseCollectors();
+    delete collectors.memory;
+    delete collectors.network;
+    delete collectors.battery;
+    const run = vi.spyOn(command, 'defaultRun').mockResolvedValue('');
+    const probe = new BodyProbe(collectors, { platform: 'linux' });
+    probe.start({ intervalMs: 1000 });
+    await flush();
+    const body = probe.latest()!;
+    expect(body.memory.status).toBe('unavailable');
+    expect(body.network.status).toBe('unavailable');
+    expect(body.battery.status).toBe('unavailable');
+    expect(run).not.toHaveBeenCalled();
+    await probe.stop();
   });
 });
