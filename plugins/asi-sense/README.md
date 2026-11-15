@@ -18,11 +18,14 @@ and deterministic environment-update formatting.
   `preStep(sessionId, now?)` return promises — always await them.
   `Deliverer.deliver(intent)` also returns a promise that is awaited before
   any bucket is dropped; the wake budget is charged on a fresh monotonic
-  sample taken at delivery completion, not at drain start. An adapter must
-  **never await `accept`/`flush`/`preStep` inside `deliver`** — they would
-  queue behind its own drain and deadlock, so such calls reject immediately
-  with `ReentrantDeliveryError`; return or reject from `deliver` instead.
-  Concurrent callers _outside_ `deliver` queue normally.
+  sample taken at delivery completion, not at drain start. While a `deliver`
+  is **in flight**, every `accept`/`flush`/`preStep` call inside its async
+  context rejects immediately with `ReentrantDeliveryError` — awaited or
+  not — so return or reject from `deliver` instead. The token is
+  per-delivery: work scheduled inside `deliver` (a `setImmediate` callback,
+  a detached promise) inherits the context but calls pipeline APIs freely
+  once that delivery settles. Concurrent callers _outside_ `deliver` queue
+  normally.
 - **Durable intake**: `accept` runs all mutable intake (session refresh,
   source marks, dedup/match/enqueue, drain scheduling) inside the store's
   apply callback — shared synchronous FIFO, so the signal is durable before
@@ -67,8 +70,10 @@ and deterministic environment-update formatting.
   `TypeError`); omit it normally.
 - **Merge windows**: buckets group by session+subject, hold a half-open
   `[start, start+window)` receipt interval fixed by the _first_ signal's kind
-  (5s for `file.changed`, else 2s), and keep one merged detail per kind — one
-  delivery carries every kind's change. At `preStep` the session's context
+  (5s for `file.changed`, else 2s), and keep one merged detail per
+  **(kind, effective level)** pair — one delivery carries every pair's
+  change, so a context and a wake `job.exited` on the same subject never
+  collapse into a single count. At `preStep` the session's context
   ships first: pure context groups close early and inject, context details
   _split out_ of still-open mixed buckets inject too, and the wake remainder
   keeps its deadline — its later update reports `alreadyInjected`
@@ -78,8 +83,16 @@ and deterministic environment-update formatting.
   tombstones use the injected _monotonic_ clock over the half-open
   `[receivedAt, receivedAt+600s)` window while fact TTL keeps the wall clock.
   An `env.activeJobs` `fact.updated` replacement keeps unexpired tombstones
-  and sets a watermark: `job.started` with `at` before the replacement is
-  ignored; independent post-snapshot jobs are unaffected. A start arriving
+  and advances a snapshot watermark: `job.started` with `at` before the
+  replacement is ignored; independent post-snapshot jobs are unaffected,
+  even when older than the newest other job event. Two independent
+  watermarks order snapshots: the replacement `at` and the newest accepted
+  job observation (`jobObservedAt`, job events included). A snapshot older
+  than either is rejected before touching fact, tracking or tombstones —
+  an outdated running-jobs list cannot resurrect exited jobs. An `unknown`
+  snapshot reports **only** the status: value, provenance, freshness,
+  jobs, tombstones and both watermarks are preserved, so it can neither
+  roll a newer snapshot back nor mask a later stale one. A start arriving
   after its tombstone prunes is an ordinary new event — still subject to
   the watermark and signal-id dedup.
 - **Self-cause**: a causal-kind signal inside a tool window's inclusive
@@ -148,3 +161,17 @@ In `m1-rereview-regressions.test.ts` unless noted:
 7. `ReentrantDeliveryError` inside `deliver` — `rejects pipeline APIs awaited inside adapter.deliver without deadlock`
 8. Stable `deliveryId`/frozen `at`; frozen inject batches; once-per-step, non-FIFO downgrade retries; mutation isolation — `retries a failed wake with the same deliveryId and frozen display time` / `downgrades a failed wake retry to a separate frozen inject once the budget moved` / `injects a same-step budget downgrade once and propagates inject failure` / `isolates adapter mutations of a delivered intent from the retained retry` / `awaits rejected context delivery and retries only the retained batch` (m1-pipeline, updated)
 9. Retry entries, at-least-once dedup, downgrade/no-FIFO, adapter reentrancy — **Host contract** above; exercised by the fix-8 tests (the updated pipeline test proves `flush` never retries inject; the downgrade tests prove once-per-step attempts and `followup(new)`-then-`inject(old)` ordering)
+
+## M1 fix-3 regressions → tests
+
+In `m1-fix3-regressions.test.ts`:
+
+1. `env.activeJobs` snapshot watermarks independent of `fact.status`; `unknown` snapshots change status only — `keeps job tombstones when unknown is followed by an older snapshot` / `keeps the newest watermark across three out-of-order snapshots` / `accepts a first real job snapshot before constructor and unknown timestamps`
+2. Bucket details keyed by (kind, effective level) — `injects same-kind context before the wake deadline (success first)` / `injects same-kind context before the wake deadline (failure first)` / `keeps same-kind outcome counts separate without a preStep split`
+3. Per-delivery active token for `ReentrantDeliveryError` — `allows inherited setImmediate intake after delivery resolved` / `allows inherited setImmediate intake after delivery rejected`
+
+## M3 待定契约
+
+1. 去重范围：`send` / `followup` / `inject` 是否共享同一 `deliveryId` 去重记录，跨 session 的边界是什么？
+2. 未知提交时的保留期：DSH 可能已提交但确认丢失时，未确认的 `deliveryId` 和待重试消息应保留多久，何时重试或释放？
+3. DSH 是否支持原子提交的幂等键？仅靠本地 ID 集合无法同时消除提交前记账导致的丢失和提交后记账导致的重复；当前只能承诺 at-least-once，不能保证 exactly-once。

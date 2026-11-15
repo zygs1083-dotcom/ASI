@@ -2,15 +2,15 @@ import type { DeliveryLevel, EnvChange, Signal, WatchRule } from '@asi/sense-typ
 import { LEVEL_RANK } from './rules.ts';
 
 /**
- * One kind's contribution inside a merge bucket: merged `count`, earliest
- * `signal.at`, and the representative — highest effective level, then newest
+ * One (kind, effective-level) pair's contribution inside a merge bucket:
+ * merged `count`, earliest `signal.at`, and the representative — newest
  * `at` (`id` breaks ties); rule/note/reason follow the representative.
  */
 export interface BucketDetail {
   kind: string;
   level: DeliveryLevel;
   count: number;
-  /** Earliest `signal.at` seen for this kind. */
+  /** Earliest `signal.at` seen for this (kind, level) pair. */
   since: number;
   latest: Signal;
   /** Every merged signal id — the retry identity of the delivery. */
@@ -25,7 +25,8 @@ export interface BucketDetail {
  * in the half-open window `[startedAt, deadline)` fixed by the first
  * signal's kind — a signal received at or after it opens a new generation,
  * so a retained failed delivery can never swallow fresh input. `details`
- * keeps each kind's own merge so one delivery carries every kind's change.
+ * keeps each (kind, level) pair's own merge so one delivery carries every
+ * pair's change.
  */
 export interface Bucket {
   id: number;
@@ -105,7 +106,11 @@ export function upsertBucket(
     };
     pending.set(b.id, b);
   }
-  const d = b.details.get(signal.kind);
+  // Detail key: the unambiguous (kind, effective-level) tuple, so the same
+  // kind at different levels (e.g. a context vs a wake `job.exited`) merges
+  // into separate details instead of one rank-promoted blob.
+  const key = JSON.stringify([signal.kind, level]);
+  const d = b.details.get(key);
   if (!d) {
     const detail: BucketDetail = {
       kind: signal.kind,
@@ -118,17 +123,15 @@ export function upsertBucket(
     if (rule?.id !== undefined) detail.ruleId = rule.id;
     if (rule?.note !== undefined) detail.note = rule.note;
     if (reason !== undefined) detail.reason = reason;
-    b.details.set(signal.kind, detail);
+    b.details.set(key, detail);
     return;
   }
   d.count++;
   d.ids.push(signal.id);
   d.since = Math.min(d.since, signal.at);
-  const better =
-    LEVEL_RANK[level] > LEVEL_RANK[d.level] ||
-    (level === d.level && (signal.at > d.latest.at || (signal.at === d.latest.at && signal.id > d.latest.id)));
-  if (better) {
-    d.level = level;
+  // Same kind AND level inside a detail: the representative is simply the
+  // newest signal (`id` breaks ties) — there is no rank to promote.
+  if (signal.at > d.latest.at || (signal.at === d.latest.at && signal.id > d.latest.id)) {
     d.latest = signal;
     d.ruleId = rule?.id;
     d.note = rule?.note;
@@ -136,7 +139,7 @@ export function upsertBucket(
   }
 }
 
-/** Converts a completed bucket into one sorted {@link EnvChange} per kind. */
+/** Converts a completed bucket into one sorted {@link EnvChange} per (kind, level) detail. */
 export function bucketChanges(b: Bucket): EnvChange[] {
   const changes: EnvChange[] = [];
   for (const d of b.details.values()) {

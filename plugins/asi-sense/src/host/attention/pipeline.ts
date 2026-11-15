@@ -35,10 +35,12 @@ export type DeliveryIntent =
       deliveryId?: string;
     };
 
-/** Thrown for pipeline APIs awaited inside `Deliverer.deliver` (deadlock). */
+/** Thrown for accept/flush/preStep calls in an active delivery's async context. */
 export class ReentrantDeliveryError extends Error {
   constructor() {
-    super('adapter.deliver must not await pipeline APIs (accept/flush/preStep): return or reject instead');
+    super(
+      'accept/flush/preStep all reject during an active adapter.deliver (awaited or not): return or reject instead',
+    );
     this.name = 'ReentrantDeliveryError';
   }
 }
@@ -46,7 +48,9 @@ export class ReentrantDeliveryError extends Error {
 /**
  * Sink for delivery intents. The returned promise is awaited before any
  * bucket is dropped or the wake budget charged; a rejection retains the
- * queued input and propagates to the caller.
+ * queued input and propagates to the caller. While a delivery is in flight
+ * every pipeline API call inside its async context rejects with
+ * {@link ReentrantDeliveryError}; work it schedules for later runs free.
  */
 export interface Deliverer {
   deliver(intent: DeliveryIntent): Promise<void>;
@@ -100,8 +104,14 @@ export class AttentionPipeline {
   private readonly mergeWindowMs: number;
   private readonly fileMergeWindowMs: number;
   private readonly sessions = new Map<string, SessionState>();
-  /** Set only while `Deliverer.deliver` (and its async continuations) runs. */
-  private readonly deliveryContext = new AsyncLocalStorage<true>();
+  /**
+   * Per-delivery token: `active` is true only while THAT delivery is in
+   * flight, so work scheduled inside it (a `setImmediate` callback, a
+   * detached promise) inherits the context yet may call pipeline APIs once
+   * the delivery settles — while any call made during an in-flight
+   * delivery still rejects.
+   */
+  private readonly deliveryContext = new AsyncLocalStorage<{ active: boolean }>();
   private tail: Promise<void> = Promise.resolve();
 
   constructor(options: AttentionPipelineOptions) {
@@ -119,7 +129,16 @@ export class AttentionPipeline {
     this.fileMergeWindowMs = options.fileMergeWindowMs ?? 5_000;
     this.drain = new BucketDrain({
       deliverer: {
-        deliver: (intent) => this.deliveryContext.run(true, () => options.deliverer.deliver(intent)),
+        deliver: (intent) => {
+          const token = { active: true };
+          return this.deliveryContext.run(token, async () => {
+            try {
+              await options.deliverer.deliver(intent);
+            } finally {
+              token.active = false;
+            }
+          });
+        },
       },
       sessions: this.sessions,
       clock: this.clock,
@@ -165,10 +184,11 @@ export class AttentionPipeline {
    * refresh, clone/classify, store apply, dedup/match/enqueue — runs inside
    * the store's apply callback before the first await, so a rejected drain
    * keeps the signal. A reentrant `accept` queues behind the outer intake;
-   * inside `deliver` this rejects with {@link ReentrantDeliveryError}.
+   * during an in-flight `deliver` it rejects with
+   * {@link ReentrantDeliveryError}.
    */
   async accept(signal: Signal, session: SessionContext): Promise<EnvChange> {
-    if (this.deliveryContext.getStore()) {
+    if (this.deliveryContext.getStore()?.active) {
       throw new ReentrantDeliveryError();
     }
     const ev = structuredClone(signal);
@@ -230,7 +250,7 @@ export class AttentionPipeline {
    * non-finite one is a `TypeError`); omit it for the normal case.
    */
   flush(now: number = this.clock()): Promise<void> {
-    if (this.deliveryContext.getStore()) return Promise.reject(new ReentrantDeliveryError());
+    if (this.deliveryContext.getStore()?.active) return Promise.reject(new ReentrantDeliveryError());
     const cutoff = this.cutoff(now);
     return this.enqueueDrain(() => this.drain.due(cutoff));
   }
@@ -242,7 +262,7 @@ export class AttentionPipeline {
    * {@link flush}.
    */
   preStep(sessionId: string, now: number = this.clock()): Promise<void> {
-    if (this.deliveryContext.getStore()) return Promise.reject(new ReentrantDeliveryError());
+    if (this.deliveryContext.getStore()?.active) return Promise.reject(new ReentrantDeliveryError());
     const cutoff = this.cutoff(now);
     return this.enqueueDrain(() => this.drain.preStep(sessionId, cutoff));
   }

@@ -134,7 +134,7 @@ describe('AttentionPipeline merging', () => {
     expect(inj.update.changes[0]?.count).toBe(2);
   });
 
-  it('keeps the highest-level signal as representative on merge', async () => {
+  it('keeps same-kind different-level signals as separate details on merge', async () => {
     const c = new FakeClock();
     const { intents, pipeline } = pipe(c);
     await pipeline.accept(jobExit('fail', 1, 1, 'j'), sess()); // wake
@@ -143,13 +143,17 @@ describe('AttentionPipeline merging', () => {
     await pipeline.flush();
     const w = intents[0];
     if (w?.kind !== 'followup') throw new Error('expected followup');
+    // (kind, level) details: the wake exit keeps its own representative and
+    // count; the context exit is a separate change, never rank-merged
     expect(w.update.changes[0]).toMatchObject({
-      count: 2,
+      count: 1,
       level: 'wake',
       ruleId: 'job-failed',
     });
     expect(w.update.changes[0]?.signal.id).toBe('fail');
     expect(w.update.changes[0]?.signal.data.exitCode).toBe(1);
+    expect(w.update.changes[1]).toMatchObject({ count: 1, level: 'context' });
+    expect(w.update.changes[1]?.signal.id).toBe('ok');
   });
 
   it('queued signals are immune to later caller mutation', async () => {

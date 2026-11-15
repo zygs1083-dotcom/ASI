@@ -48,6 +48,13 @@ export class StateStore {
   private readonly queue: { signal: Signal; afterApply?: () => void }[] = [];
   /** `signal.at` of the last accepted `env.activeJobs` replacement. */
   private jobSnapshotAt = Number.NEGATIVE_INFINITY;
+  /**
+   * Newest `signal.at` of an accepted job-aggregate observation — a job
+   * event or a non-unknown `env.activeJobs` snapshot. Kept independent of
+   * `fact.status`/`jobSnapshotAt` so an unknown report can neither reset
+   * freshness nor move the snapshot watermark.
+   */
+  private jobObservedAt = Number.NEGATIVE_INFINITY;
   private processing = false;
 
   /**
@@ -220,17 +227,19 @@ export class StateStore {
   /**
    * Rebuilds `env.activeJobs` from tracking after an accepted job event.
    * An older (but still accepted) event updates the value yet keeps the
-   * newest event's source/ttl/observedAt metadata.
+   * newest observation's source/ttl/observedAt metadata — freshness is
+   * judged against {@link jobObservedAt}, never reset by fact status.
    */
   private commitJobs(signal: Signal): void {
     const fact = this.state.env.activeJobs;
-    const newest = fact.status === 'unknown' || signal.at >= fact.observedAt;
+    const newest = signal.at >= this.jobObservedAt;
     fact.value = [...this.jobs.values()].flatMap((track) => (track.exited || !track.job ? [] : [track.job]));
     fact.status = 'ok';
     if (newest) {
       fact.source = signal.source;
       fact.observedAt = signal.at;
       fact.ttlMs = ttlOf(signal.data.ttlMs, this.defaultTtlMs);
+      this.jobObservedAt = signal.at;
     }
   }
 
@@ -272,7 +281,18 @@ export class StateStore {
     if (!Object.hasOwn(signal.data, 'value')) return;
     if (status !== undefined && (typeof status !== 'string' || !FACT_STATUSES.has(status))) return;
     const fact = factAt(this.state, path);
-    if (fact.status !== 'unknown' && signal.at < fact.observedAt) return;
+    if (path === 'env.activeJobs') {
+      // Snapshot staleness is decided before ANY mutation: a report older
+      // than the snapshot watermark or the newest accepted job observation
+      // leaves the fact, tracking, tombstones and both watermarks untouched.
+      if (signal.at < this.jobSnapshotAt || signal.at < this.jobObservedAt) return;
+      // An unknown report marks ONLY the status — value, provenance,
+      // freshness, jobs, tombstones and watermarks are all preserved.
+      if (status === 'unknown') {
+        fact.status = 'unknown';
+        return;
+      }
+    } else if (fact.status !== 'unknown' && signal.at < fact.observedAt) return;
     fact.value = value;
     fact.status = (status as FactStatus | undefined) ?? 'ok';
     fact.source = signal.source;
@@ -284,7 +304,8 @@ export class StateStore {
     // The watermark ignores pre-snapshot starts for replaced/unknown ids
     // while unexpired exit tombstones survive the replacement.
     if (path === 'env.activeJobs') {
-      this.jobSnapshotAt = signal.at;
+      this.jobSnapshotAt = Math.max(this.jobSnapshotAt, signal.at);
+      this.jobObservedAt = Math.max(this.jobObservedAt, signal.at);
       this.pruneJobs();
       for (const [id, track] of this.jobs) {
         if (!track.exited) this.jobs.delete(id);
