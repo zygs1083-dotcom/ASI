@@ -1,0 +1,53 @@
+{
+  "capturedAt": "2026-11-15T19:32:34.931Z",
+  "sessionId": "session-ebe08918-cf4b-4137-8f1a-6ad9af4cec8d",
+  "modelRequests": 1,
+  "turnStarts": [
+    {
+      "seq": 4,
+      "time": 1794770649826,
+      "turn": 1
+    }
+  ],
+  "turnEnds": [
+    {
+      "seq": 17,
+      "time": 1794770653324,
+      "reason": {
+        "kind": "completed"
+      }
+    }
+  ],
+  "contexts": [
+    {
+      "seq": 13,
+      "provider": "magpie",
+      "model": "auto/gpt-6.1-sol",
+      "contextWindow": 1000000
+    }
+  ],
+  "environmentInbox": [
+    {
+      "seq": 19,
+      "time": 1794771115415,
+      "target": "next-step",
+      "source": {
+        "kind": "environment"
+      },
+      "text": "P0 synthetic environment marker: SPIKE_INJECT_731. Do not run tools."
+    }
+  ],
+  "environmentMessages": [],
+  "replies": [
+    {
+      "seq": 15,
+      "text": "P0_GATEWAY_OK",
+      "usage": {
+        "inputTokens": 27291,
+        "outputTokens": 9,
+        "totalTokens": 27300
+      },
+      "toolCalls": 0
+    }
+  ]
+}

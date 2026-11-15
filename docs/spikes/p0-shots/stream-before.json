@@ -1,0 +1,18 @@
+{
+  "asi-sense-panel": "ASI sense spikeSelected sessionsession-ebe08918-cf4b-4137-8f1a-6ad9af4cec8dSelect in HostInject markerSend followupStream statusliveSample#5087 2026-11-15T19:23:57.291ZCPU31.2%Memory63.6 GiB / 64.0 GiBDisk free177.7 GiBHost-reported agentsession-ebe08918-cf4b-4137-8f1a-6ad9af4cec8d (idle)Context— / — / —Token usagein 0 out 0 cr 0 cw 0Helper events#10 window {\"change\":\"focus\"}#11 window {\"change\":\"title\",\"length\":2,\"title\":\"[REDACTED]\"}#12 app {\"bundleId\":\"com.apple.TextEdit\",\"name\":\"文本编辑\"}#13 window {\"change\":\"focus\"}#14 window {\"change\":\"title\",\"length\":2,\"title\":\"[REDACTED]\"}#15 app {\"bundleId\":\"com.apple.finder\",\"name\":\"访达\"}#16 window {\"change\":\"focus\"}#17 window {\"title\":\"[REDACTED]\",\"length\":2,\"change\":\"title\"}Last action—Action status—",
+  "asi-sense-selected": "Selected sessionsession-ebe08918-cf4b-4137-8f1a-6ad9af4cec8dSelect in Host",
+  "asi-sense-select": "Select in Host",
+  "asi-sense-inject": "Inject marker",
+  "asi-sense-followup": "Send followup",
+  "asi-sense-stream-status": "live",
+  "asi-sense-sample": "#5087 2026-11-15T19:23:57.291Z",
+  "asi-sense-cpu": "31.2%",
+  "asi-sense-memory": "63.6 GiB / 64.0 GiB",
+  "asi-sense-disk": "177.7 GiB",
+  "asi-sense-agent": "session-ebe08918-cf4b-4137-8f1a-6ad9af4cec8d (idle)",
+  "asi-sense-context": "— / — / —",
+  "asi-sense-tokens": "in 0 out 0 cr 0 cw 0",
+  "asi-sense-helper": "Helper events#10 window {\"change\":\"focus\"}#11 window {\"change\":\"title\",\"length\":2,\"title\":\"[REDACTED]\"}#12 app {\"bundleId\":\"com.apple.TextEdit\",\"name\":\"文本编辑\"}#13 window {\"change\":\"focus\"}#14 window {\"change\":\"title\",\"length\":2,\"title\":\"[REDACTED]\"}#15 app {\"bundleId\":\"com.apple.finder\",\"name\":\"访达\"}#16 window {\"change\":\"focus\"}#17 window {\"title\":\"[REDACTED]\",\"length\":2,\"change\":\"title\"}",
+  "asi-sense-last-action": "—",
+  "asi-sense-action-status": "—"
+}

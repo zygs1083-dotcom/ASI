@@ -1,0 +1,49 @@
+# asi-dev profile layer for the P0 spike: local-only magpie route with no
+# retries, no auxiliary model calls, no telemetry/feedback egress. The shipped
+# web profile already disables every tool row. The ASI_MAGPIE_PLACEHOLDER env
+# var carries the string "magpie" — the local gateway needs no real key.
+
+- id: asi-sense-spike
+  config:
+    helperPath: /Users/wangying/orca/workspaces/ASI/p0-spike/spikes/p0/.build/asi-sense-helper
+
+- id: llm-pi-ai
+  config:
+    providers:
+      magpie:
+        displayName: Magpie local
+        apiKeyEnv: ASI_MAGPIE_PLACEHOLDER
+        api: openai-completions
+        baseURL: http://127.0.0.1:3425/v1
+        retryPolicy:
+          mode: normal
+          maxRetries: 0
+        models:
+          - id: auto/gpt-6.1-sol
+            name: Magpie auto (gpt-6.1-sol)
+
+- id: agent-default-model
+  config:
+    provider: magpie
+    model: auto/gpt-6.1-sol
+
+- id: session-title-llm
+  disabled: true
+
+- id: session-telemetry-otel
+  disabled: true
+
+- id: desktop-product-telemetry
+  disabled: true
+
+- id: product-analytics
+  disabled: true
+
+- id: message-feedback
+  disabled: true
+
+- id: ui-message-feedback
+  disabled: true
+
+- id: command-feedback
+  disabled: true

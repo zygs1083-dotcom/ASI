@@ -1,0 +1,142 @@
+[p1 "P0 connectivity check. Reply with — DSH 本地构建" | space "ASI P0 spike verification"(20): 1 managed, 0 untracked — p1* "P0 connectivity check. Reply with — DSH 本地构建"]
+root
+  container
+    container
+      container
+        button "新建会话" [ref=16]
+          svg_root
+          container
+            text "DSH 本地构建"
+            text "0.2.2-rc.3-39163dd"
+        button "收起侧边栏" [ref=17, loc=css:button[aria-label="收起侧边栏"]]
+          svg_root
+      button "新建会话" [ref=18]
+        container
+          svg_root
+          text "新会话"
+        text "⌥"
+        text "⌘"
+        text "N"
+      container
+        container "全局面板"
+          button "插件" [ref=19, loc=css:button[aria-label="插件"]]
+            svg_root
+            text "插件"
+          container
+            button "自动化任务" [ref=20, loc=css:button[aria-label="自动化任务"]]
+              svg_root
+              text "自动化任务"
+            button "从侧边栏取消固定自动化任务" [ref=21, loc=css:button[aria-label="从侧边栏取消固定自动化任务"]]
+              svg_root
+          container
+            button "ASI sense" [ref=22, loc=css:button[aria-label="ASI sense"]]
+              svg_root
+              text "ASI sense"
+            button "从侧边栏取消固定ASI sense" [ref=23, loc=css:button[aria-label="从侧边栏取消固定ASI sense"]]
+              svg_root
+          button "更多" [ref=24, loc=css:button[aria-label="更多"]]
+            svg_root
+            text "更多"
+        container
+          container
+            text "工作区"
+            button "搜索会话" [ref=25, loc=css:button[aria-label="搜索会话"]]
+              svg_root
+            container
+              button "视图选项" [ref=26, loc=css:button[aria-label="视图选项"]]
+                svg_root
+              button "添加工作区" [ref=27, loc=css:button[aria-label="添加工作区"]]
+                svg_root
+          tree "会话"
+            treeitem [ref=28]
+              svg_root
+              text "默认工作区"
+            treeitem [ref=29]
+              text "P0 connectivity check. Reply with"
+              text "刚刚"
+      button "账号菜单" [ref=30, loc=css:button[aria-label="账号菜单"]]
+        svg_root
+        text "更多"
+    container
+      container
+        container
+          container
+            container "会话层级"
+              container [ref=43]
+                text "P0 connectivity check. Reply with"
+            container
+              svg_root
+              text "标准模式"
+          button "更多操作" [ref=44, loc=css:button[aria-label="更多操作"]]
+            svg_root
+          button "打开右侧边栏" [ref=34, loc=css:button[aria-label="打开右侧边栏"]]
+            svg_root
+        container
+          tablist
+            tab [ref=45]
+              text "对话"
+            tab [ref=46]
+              text "轨迹"
+          button "更多会话视图" [ref=47, loc=css:button[aria-label="更多会话视图"]]
+            svg_root
+      container
+        container
+          container
+            text "P0 connectivity check. Reply with exactly P0_GATEWAY_OK. Do not run tools."
+            container
+              text "03:24"
+              button "复制" [ref=48]
+                svg_root
+          button [ref=49]
+            container
+              text "已完成，用时"
+              text "3"
+              text "秒"
+            svg_root
+          paragraph
+            text "P0_GATEWAY_OK"
+          container
+            button "复制" [ref=50]
+              svg_root
+            button "在新对话中分支" [ref=51, loc=css:button[aria-label="在新对话中分支"]]
+              svg_root
+            container
+              button [ref=52]
+                svg_root
+                text "用量 27.3K tok"
+              text "03:24"
+        container
+          container [ref=37]
+            container
+              textfield "发消息或创建任务, / 调用指令, @ 文件或对话" [ref=38]
+              text "发消息或创建任务, / 调用指令, @ 文件或对话"
+            container
+              container
+                button "添加文件或调用指令" [ref=39, loc=css:button[aria-label="添加文件或调用指令"]]
+                  svg_root
+                button "访问模式，当前：工作区内修改" [ref=40, loc=css:button[aria-label="访问模式，当前：工作区内修改"]]
+                  svg_root
+                  text "工作区内修改"
+                  svg_root
+              container
+                button "选择模型，当前 Magpie auto (gpt-6.1-sol)" [ref=41, loc=css:button[aria-label="选择模型，当前 Magpie auto (gpt-6.1-sol)"]]
+                  text "Magpie auto (gpt-6.1-sol)"
+                  svg_root
+                button "发送消息" [ref=42, loc=css:button[aria-label="发送消息"]]
+                  svg_root
+          container
+            button "1 轮 1 步 · 65 tok/s" [ref=53, loc=css:button[aria-label="1 轮 1 步 · 65 tok/s"]]
+              svg_root
+              container
+                text "1 轮 1 步"
+                text "·"
+                text "65 tok/s"
+            button "27.3K tok · 缓存命中 0%" [ref=54, loc=css:button[aria-label="27.3K tok · 缓存命中 0%"]]
+              svg_root
+              container
+                text "27.3K tok"
+                text "·"
+                text "缓存命中 0%"
+            button "上下文已用 3%" [ref=55, loc=css:button[aria-label="上下文已用 3%"]]
+              svg_root
+              text "3%"

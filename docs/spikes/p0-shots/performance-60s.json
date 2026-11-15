@@ -1,0 +1,548 @@
+{
+  "capturedAt": "2026-11-15T19:33:45.131Z",
+  "elapsedSec": 60.027920417000004,
+  "method": "31 ps samples at 2s; average CPU = 100 * delta cumulative CPU seconds / elapsed wall seconds; RSS in KiB",
+  "processes": [
+    {
+      "pid": 63024,
+      "cpuPercent": 0.7329922425155206,
+      "rssMinKiB": 262720,
+      "rssMaxKiB": 269136
+    },
+    {
+      "pid": 63025,
+      "cpuPercent": 0,
+      "rssMinKiB": 5184,
+      "rssMaxKiB": 5184
+    }
+  ],
+  "samples": [
+    {
+      "elapsedSec": 0.12400058300000001,
+      "processes": [
+        {
+          "pid": 63024,
+          "cpuSeconds": 4.67,
+          "rssKiB": 269136,
+          "psCpu": 0.6
+        },
+        {
+          "pid": 63025,
+          "cpuSeconds": 0.01,
+          "rssKiB": 5184,
+          "psCpu": 0
+        }
+      ]
+    },
+    {
+      "elapsedSec": 2.145688625,
+      "processes": [
+        {
+          "pid": 63024,
+          "cpuSeconds": 4.68,
+          "rssKiB": 269136,
+          "psCpu": 0.5
+        },
+        {
+          "pid": 63025,
+          "cpuSeconds": 0.01,
+          "rssKiB": 5184,
+          "psCpu": 0
+        }
+      ]
+    },
+    {
+      "elapsedSec": 4.121391792000001,
+      "processes": [
+        {
+          "pid": 63024,
+          "cpuSeconds": 4.8,
+          "rssKiB": 262720,
+          "psCpu": 0.4
+        },
+        {
+          "pid": 63025,
+          "cpuSeconds": 0.01,
+          "rssKiB": 5184,
+          "psCpu": 0
+        }
+      ]
+    },
+    {
+      "elapsedSec": 6.146840667,
+      "processes": [
+        {
+          "pid": 63024,
+          "cpuSeconds": 4.81,
+          "rssKiB": 262720,
+          "psCpu": 1
+        },
+        {
+          "pid": 63025,
+          "cpuSeconds": 0.01,
+          "rssKiB": 5184,
+          "psCpu": 0
+        }
+      ]
+    },
+    {
+      "elapsedSec": 8.147032667000001,
+      "processes": [
+        {
+          "pid": 63024,
+          "cpuSeconds": 4.83,
+          "rssKiB": 263072,
+          "psCpu": 1.1
+        },
+        {
+          "pid": 63025,
+          "cpuSeconds": 0.01,
+          "rssKiB": 5184,
+          "psCpu": 0
+        }
+      ]
+    },
+    {
+      "elapsedSec": 10.1693875,
+      "processes": [
+        {
+          "pid": 63024,
+          "cpuSeconds": 4.83,
+          "rssKiB": 263456,
+          "psCpu": 0.4
+        },
+        {
+          "pid": 63025,
+          "cpuSeconds": 0.01,
+          "rssKiB": 5184,
+          "psCpu": 0
+        }
+      ]
+    },
+    {
+      "elapsedSec": 12.139786749999999,
+      "processes": [
+        {
+          "pid": 63024,
+          "cpuSeconds": 4.84,
+          "rssKiB": 263536,
+          "psCpu": 0.9
+        },
+        {
+          "pid": 63025,
+          "cpuSeconds": 0.01,
+          "rssKiB": 5184,
+          "psCpu": 0
+        }
+      ]
+    },
+    {
+      "elapsedSec": 14.160003249999999,
+      "processes": [
+        {
+          "pid": 63024,
+          "cpuSeconds": 4.86,
+          "rssKiB": 263536,
+          "psCpu": 0.9
+        },
+        {
+          "pid": 63025,
+          "cpuSeconds": 0.01,
+          "rssKiB": 5184,
+          "psCpu": 0
+        }
+      ]
+    },
+    {
+      "elapsedSec": 16.1460245,
+      "processes": [
+        {
+          "pid": 63024,
+          "cpuSeconds": 4.86,
+          "rssKiB": 263536,
+          "psCpu": 0.5
+        },
+        {
+          "pid": 63025,
+          "cpuSeconds": 0.01,
+          "rssKiB": 5184,
+          "psCpu": 0
+        }
+      ]
+    },
+    {
+      "elapsedSec": 18.131089457999998,
+      "processes": [
+        {
+          "pid": 63024,
+          "cpuSeconds": 4.87,
+          "rssKiB": 263536,
+          "psCpu": 0.4
+        },
+        {
+          "pid": 63025,
+          "cpuSeconds": 0.01,
+          "rssKiB": 5184,
+          "psCpu": 0
+        }
+      ]
+    },
+    {
+      "elapsedSec": 20.163689749999996,
+      "processes": [
+        {
+          "pid": 63024,
+          "cpuSeconds": 4.89,
+          "rssKiB": 262976,
+          "psCpu": 0.7
+        },
+        {
+          "pid": 63025,
+          "cpuSeconds": 0.01,
+          "rssKiB": 5184,
+          "psCpu": 0
+        }
+      ]
+    },
+    {
+      "elapsedSec": 22.144338292,
+      "processes": [
+        {
+          "pid": 63024,
+          "cpuSeconds": 4.9,
+          "rssKiB": 262976,
+          "psCpu": 0.6
+        },
+        {
+          "pid": 63025,
+          "cpuSeconds": 0.01,
+          "rssKiB": 5184,
+          "psCpu": 0
+        }
+      ]
+    },
+    {
+      "elapsedSec": 24.141793417000002,
+      "processes": [
+        {
+          "pid": 63024,
+          "cpuSeconds": 4.91,
+          "rssKiB": 262976,
+          "psCpu": 0.7
+        },
+        {
+          "pid": 63025,
+          "cpuSeconds": 0.01,
+          "rssKiB": 5184,
+          "psCpu": 0
+        }
+      ]
+    },
+    {
+      "elapsedSec": 26.15036,
+      "processes": [
+        {
+          "pid": 63024,
+          "cpuSeconds": 4.92,
+          "rssKiB": 262976,
+          "psCpu": 1.2
+        },
+        {
+          "pid": 63025,
+          "cpuSeconds": 0.01,
+          "rssKiB": 5184,
+          "psCpu": 0
+        }
+      ]
+    },
+    {
+      "elapsedSec": 28.126995917,
+      "processes": [
+        {
+          "pid": 63024,
+          "cpuSeconds": 4.93,
+          "rssKiB": 262976,
+          "psCpu": 0.4
+        },
+        {
+          "pid": 63025,
+          "cpuSeconds": 0.01,
+          "rssKiB": 5184,
+          "psCpu": 0
+        }
+      ]
+    },
+    {
+      "elapsedSec": 30.12052675,
+      "processes": [
+        {
+          "pid": 63024,
+          "cpuSeconds": 4.94,
+          "rssKiB": 262976,
+          "psCpu": 0.4
+        },
+        {
+          "pid": 63025,
+          "cpuSeconds": 0.01,
+          "rssKiB": 5184,
+          "psCpu": 0
+        }
+      ]
+    },
+    {
+      "elapsedSec": 32.130018708,
+      "processes": [
+        {
+          "pid": 63024,
+          "cpuSeconds": 4.95,
+          "rssKiB": 262976,
+          "psCpu": 0.3
+        },
+        {
+          "pid": 63025,
+          "cpuSeconds": 0.01,
+          "rssKiB": 5184,
+          "psCpu": 0
+        }
+      ]
+    },
+    {
+      "elapsedSec": 34.171789833000005,
+      "processes": [
+        {
+          "pid": 63024,
+          "cpuSeconds": 4.96,
+          "rssKiB": 262976,
+          "psCpu": 0.7
+        },
+        {
+          "pid": 63025,
+          "cpuSeconds": 0.01,
+          "rssKiB": 5184,
+          "psCpu": 0
+        }
+      ]
+    },
+    {
+      "elapsedSec": 36.154555167,
+      "processes": [
+        {
+          "pid": 63024,
+          "cpuSeconds": 4.97,
+          "rssKiB": 262976,
+          "psCpu": 0.3
+        },
+        {
+          "pid": 63025,
+          "cpuSeconds": 0.01,
+          "rssKiB": 5184,
+          "psCpu": 0
+        }
+      ]
+    },
+    {
+      "elapsedSec": 38.166313417,
+      "processes": [
+        {
+          "pid": 63024,
+          "cpuSeconds": 4.98,
+          "rssKiB": 262976,
+          "psCpu": 0.5
+        },
+        {
+          "pid": 63025,
+          "cpuSeconds": 0.01,
+          "rssKiB": 5184,
+          "psCpu": 0
+        }
+      ]
+    },
+    {
+      "elapsedSec": 40.167459042000004,
+      "processes": [
+        {
+          "pid": 63024,
+          "cpuSeconds": 4.99,
+          "rssKiB": 262976,
+          "psCpu": 0.4
+        },
+        {
+          "pid": 63025,
+          "cpuSeconds": 0.01,
+          "rssKiB": 5184,
+          "psCpu": 0
+        }
+      ]
+    },
+    {
+      "elapsedSec": 42.157807375,
+      "processes": [
+        {
+          "pid": 63024,
+          "cpuSeconds": 5,
+          "rssKiB": 262976,
+          "psCpu": 0.6
+        },
+        {
+          "pid": 63025,
+          "cpuSeconds": 0.01,
+          "rssKiB": 5184,
+          "psCpu": 0
+        }
+      ]
+    },
+    {
+      "elapsedSec": 44.162075625,
+      "processes": [
+        {
+          "pid": 63024,
+          "cpuSeconds": 5.01,
+          "rssKiB": 262976,
+          "psCpu": 1.1
+        },
+        {
+          "pid": 63025,
+          "cpuSeconds": 0.01,
+          "rssKiB": 5184,
+          "psCpu": 0
+        }
+      ]
+    },
+    {
+      "elapsedSec": 46.180398833,
+      "processes": [
+        {
+          "pid": 63024,
+          "cpuSeconds": 5.03,
+          "rssKiB": 262976,
+          "psCpu": 0.6
+        },
+        {
+          "pid": 63025,
+          "cpuSeconds": 0.01,
+          "rssKiB": 5184,
+          "psCpu": 0
+        }
+      ]
+    },
+    {
+      "elapsedSec": 48.15420829199999,
+      "processes": [
+        {
+          "pid": 63024,
+          "cpuSeconds": 5.04,
+          "rssKiB": 262976,
+          "psCpu": 0.7
+        },
+        {
+          "pid": 63025,
+          "cpuSeconds": 0.01,
+          "rssKiB": 5184,
+          "psCpu": 0
+        }
+      ]
+    },
+    {
+      "elapsedSec": 50.174629667,
+      "processes": [
+        {
+          "pid": 63024,
+          "cpuSeconds": 5.05,
+          "rssKiB": 262976,
+          "psCpu": 1
+        },
+        {
+          "pid": 63025,
+          "cpuSeconds": 0.01,
+          "rssKiB": 5184,
+          "psCpu": 0
+        }
+      ]
+    },
+    {
+      "elapsedSec": 52.145701374999994,
+      "processes": [
+        {
+          "pid": 63024,
+          "cpuSeconds": 5.06,
+          "rssKiB": 262976,
+          "psCpu": 1
+        },
+        {
+          "pid": 63025,
+          "cpuSeconds": 0.01,
+          "rssKiB": 5184,
+          "psCpu": 0
+        }
+      ]
+    },
+    {
+      "elapsedSec": 54.148352625,
+      "processes": [
+        {
+          "pid": 63024,
+          "cpuSeconds": 5.08,
+          "rssKiB": 262976,
+          "psCpu": 0.9
+        },
+        {
+          "pid": 63025,
+          "cpuSeconds": 0.01,
+          "rssKiB": 5184,
+          "psCpu": 0
+        }
+      ]
+    },
+    {
+      "elapsedSec": 56.137395917,
+      "processes": [
+        {
+          "pid": 63024,
+          "cpuSeconds": 5.09,
+          "rssKiB": 262976,
+          "psCpu": 1.2
+        },
+        {
+          "pid": 63025,
+          "cpuSeconds": 0.01,
+          "rssKiB": 5184,
+          "psCpu": 0
+        }
+      ]
+    },
+    {
+      "elapsedSec": 58.138216957999994,
+      "processes": [
+        {
+          "pid": 63024,
+          "cpuSeconds": 5.11,
+          "rssKiB": 262976,
+          "psCpu": 1.5
+        },
+        {
+          "pid": 63025,
+          "cpuSeconds": 0.01,
+          "rssKiB": 5184,
+          "psCpu": 0
+        }
+      ]
+    },
+    {
+      "elapsedSec": 60.151921,
+      "processes": [
+        {
+          "pid": 63024,
+          "cpuSeconds": 5.11,
+          "rssKiB": 262976,
+          "psCpu": 0.5
+        },
+        {
+          "pid": 63025,
+          "cpuSeconds": 0.01,
+          "rssKiB": 5184,
+          "psCpu": 0
+        }
+      ]
+    }
+  ]
+}

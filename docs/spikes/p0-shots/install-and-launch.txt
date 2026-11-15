@@ -1,0 +1,28 @@
+asi-sense-spike install + launch evidence (sanitized: no bearer tokens)
+======================================================================
+
+# Install — idempotent re-add of the local bundle into profile asi-dev
+$ DSH_HOME=<spikes/p0>/tmp/dsh-home ASI_MAGPIE_PLACEHOLDER=magpie \
+    pnpm --dir /Users/wangying/orca/dsh dsh plugin --profile asi-dev add <spikes/p0>/bundle
+✓ Lockfile passes supply-chain policies (verified 3h ago)
+Already up to date
+[WARN] linked package declares peerDependencies @deepseek-ai/cordis@*, @deepseek-ai/dsh-typert-protocol@*
+Done in 303ms using pnpm v11.28.5          (exit 0; full log: spikes/p0/logs/plugin-add.log)
+
+Installed version: asi-sense-spike 0.0.1
+Profile dependency: "asi-sense-spike": "link:<spikes/p0>/bundle"
+  (tmp/dsh-home/profiles/asi-dev/package.json — link: so rebuilds reach the app)
+
+# Launch path A — detached launcher (supported `dsh --profile` launcher)
+$ <spikes/p0>/scripts/run-asi-dev.sh
+#   internally: cd /Users/wangying/orca/dsh && nohup pnpm dsh --profile asi-dev \
+#     --no-open --host 127.0.0.1 --port 3186 >> logs/asi-dev-web.log
+dsh web: http://127.0.0.1:3186/?token=<REDACTED>
+
+# Launch path B — overlay via --patch (equivalent of `dsh web --patch`)
+$ DSH_HOME=<spikes/p0>/tmp/dsh-home ASI_MAGPIE_PLACEHOLDER=magpie \
+    pnpm --dir /Users/wangying/orca/dsh dsh --profile asi-dev \
+    --patch <spikes/p0>/overlay/asi-dev.patch.yml \
+    --no-open --host 127.0.0.1 --port 3186
+dsh web: http://127.0.0.1:3186/?token=<REDACTED>
+  (verified live in browser — see patch-loaded.png; log: spikes/p0/logs/asi-dev-patch-web.log)

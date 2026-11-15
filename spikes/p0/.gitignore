@@ -1,0 +1,6 @@
+.build/
+lib/
+logs/
+node_modules/
+tmp/
+packages/asi-sense-spike/lib/

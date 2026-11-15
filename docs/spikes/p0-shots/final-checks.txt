@@ -1,0 +1,45 @@
+final-checks — 2026-11-15T19:36:10Z
+== scope ==
+command -v dsh: (absent)
+dsh --version: 0.2.2-rc.3
+dsh commit: 39163dd30f703a79079e2d2446545cff3c453738
+dsh describe: dsh-v0.2.2-rc.3-608-g39163dd30f
+== toolchain ==
+node: v26.13.0
+pnpm (global): 11.13.0
+pnpm (in dsh): 11.28.5
+macOS: 15.7.7
+  build: 24G720
+swift: Apple Swift version 6.2.4 (swiftlang-6.2.4.1.4 clang-1700.6.4.2)
+== final gate ==
+pnpm check exit: 0
+$ node /Users/wangying/orca/dsh/node_modules/typescript/bin/tsc -p packages/asi-sense-spike/tsconfig.host.json --noEmit && node /Users/wangying/orca/dsh/node_modules/typescript/bin/tsc -p packages/asi-sense-spike/tsconfig.client.json --noEmit && node scripts/selfcheck.mjs
+selfcheck: 5 helper events valid (permission axTrusted=true, thermal=0)
+== repo state ==
+dsh git status --short lines: 0
+asi worktree status: ?? docs/spikes/ ?? spikes/
+== runtime after shutdown ==
+lsof 3186: 0
+asi-sense-helper procs: 0
+== evidence files ==
+total 1600
+drwxr-xr-x@ 20 wangying  staff    640 Nov 16 03:36 .
+drwxr-xr-x@  3 wangying  staff     96 Nov 16 03:21 ..
+-rw-r--r--@  1 wangying  staff  92222 Nov 16 03:22 asi-sense-panel-live.png
+-rw-r--r--@  1 wangying  staff  87819 Nov 16 03:30 asi-sense-select-ok.png
+-rw-r--r--@  1 wangying  staff    947 Nov 16 03:36 final-checks.txt
+-rw-r--r--@  1 wangying  staff  73556 Nov 16 03:32 followup-reply.png
+-rw-r--r--@  1 wangying  staff   2174 Nov 16 03:32 followup.json
+-rw-r--r--@  1 wangying  staff  66551 Nov 16 03:24 gateway-conversation.png
+-rw-r--r--@  1 wangying  staff   5674 Nov 16 03:24 gateway-conversation.txt
+-rw-r--r--@  1 wangying  staff   1005 Nov 16 03:32 inject-idle.json
+-rw-r--r--@  1 wangying  staff  84159 Nov 16 03:31 inject-idle.png
+-rw-r--r--@  1 wangying  staff   1606 Nov 16 03:34 install-and-launch.txt
+-rw-r--r--@  1 wangying  staff  80924 Nov 16 03:35 patch-loaded.png
+-rw-r--r--@  1 wangying  staff  10538 Nov 16 03:33 performance-60s.json
+-rw-r--r--@  1 wangying  staff   1023 Nov 16 03:33 remote-snapshot.json
+-rw-r--r--@  1 wangying  staff   1998 Nov 16 03:23 stream-after.json
+-rw-r--r--@  1 wangying  staff  92315 Nov 16 03:23 stream-after.png
+-rw-r--r--@  1 wangying  staff   1998 Nov 16 03:23 stream-before.json
+-rw-r--r--@  1 wangying  staff  92315 Nov 16 03:23 stream-before.png
+-rw-r--r--@  1 wangying  staff  84884 Nov 16 03:32 tokens-after-followup.png

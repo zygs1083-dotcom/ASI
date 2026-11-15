@@ -1,0 +1,36 @@
+{
+  "name": "asi-p0-spike",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "pnpm run build:host && pnpm run gen && pnpm run build:client",
+    "build:host": "node /Users/wangying/orca/dsh/node_modules/typescript/bin/tsc -p packages/asi-sense-spike/tsconfig.host.json",
+    "gen": "/Users/wangying/orca/dsh/node_modules/.bin/tsx scripts/gen-typert.ts",
+    "build:client": "node scripts/build-client.mjs",
+    "helper": "mkdir -p .build && swiftc -O -o .build/asi-sense-helper helper/main.swift",
+    "check": "node /Users/wangying/orca/dsh/node_modules/typescript/bin/tsc -p packages/asi-sense-spike/tsconfig.host.json --noEmit && node /Users/wangying/orca/dsh/node_modules/typescript/bin/tsc -p packages/asi-sense-spike/tsconfig.client.json --noEmit && node scripts/selfcheck.mjs"
+  },
+  "dependencies": {
+    "@deepseek-ai/cordis": "link:/Users/wangying/orca/dsh/vendor/cordis",
+    "@deepseek-ai/dsh-agent": "link:/Users/wangying/orca/dsh/packages/core/agent",
+    "@deepseek-ai/dsh-api-remote-access": "link:/Users/wangying/orca/dsh/packages/api/remote-access",
+    "@deepseek-ai/dsh-api-remotes": "link:/Users/wangying/orca/dsh/packages/api/remotes",
+    "@deepseek-ai/dsh-client-locale": "link:/Users/wangying/orca/dsh/packages/client/locale",
+    "@deepseek-ai/dsh-client-ui-layout": "link:/Users/wangying/orca/dsh/packages/client/ui-layout",
+    "@deepseek-ai/dsh-client-ui-renderer": "link:/Users/wangying/orca/dsh/packages/client/ui-renderer",
+    "@deepseek-ai/dsh-client-ui-session": "link:/Users/wangying/orca/dsh/packages/client/ui-session",
+    "@deepseek-ai/dsh-client-ui-sidebar": "link:/Users/wangying/orca/dsh/packages/client/ui-sidebar",
+    "@deepseek-ai/dsh-client-ui-slots": "link:/Users/wangying/orca/dsh/packages/client/ui-slots",
+    "@deepseek-ai/dsh-llm": "link:/Users/wangying/orca/dsh/packages/llm/llm",
+    "@deepseek-ai/dsh-session": "link:/Users/wangying/orca/dsh/packages/core/session",
+    "@deepseek-ai/dsh-session-projection": "link:/Users/wangying/orca/dsh/packages/session/session-projection",
+    "@deepseek-ai/dsh-token-meter": "link:/Users/wangying/orca/dsh/packages/llm/token-meter",
+    "@deepseek-ai/dsh-typert-protocol": "link:/Users/wangying/orca/dsh/packages/typert/protocol",
+    "@deepseek-ai/schemastery": "link:/Users/wangying/orca/dsh/vendor/schemastery",
+    "@types/node": "link:/Users/wangying/orca/dsh/node_modules/@types/node",
+    "@types/react": "link:/Users/wangying/orca/dsh/node_modules/@types/react",
+    "react": "link:/Users/wangying/orca/dsh/node_modules/react",
+    "zod": "link:/Users/wangying/orca/dsh/node_modules/zod"
+  }
+}
