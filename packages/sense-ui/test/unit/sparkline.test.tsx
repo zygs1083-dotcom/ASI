@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import { cleanup, render, screen } from '@testing-library/react'
 import { afterEach } from 'vitest'
 import { Sparkline, sampleHistory } from '../../src/sparkline'
+import type { SparkThreshold } from '../../src/thresholds'
 import { formatCount, formatPercent } from '../../src/format'
 import { T0 } from '../../src/mock/fixtures'
 
@@ -288,6 +289,65 @@ describe('sampleHistory 降采样', () => {
     expect(sampleHistory(pts, T0).map((p) => p.value)).toEqual([1, 3, 5])
   })
 
+  // 越界 excursion 的进入/离开边界点（含恰等点）都必须保留
+  const expectExcursionKept = (
+    out: { at: number; value: number }[],
+    peak: number,
+  ) => {
+    const i = out.findIndex((p) => p.value === peak)
+    expect(i, `峰值 ${peak} 保留`).toBeGreaterThan(0)
+    expect(out[i - 1]!.value).toBe(0.5)
+    expect(out[i + 1]!.value).toBe(0.5)
+  }
+
+  it('同桶多次越界 + 恰等迁移：峰值与边界点都保留（软上限）', () => {
+    const thr = [{ value: 0.9, sev: 'warn' as const, direction: 'above' as const }]
+    // 300 点同刻 → 全落一桶；两次高于 0.9 的峰值 0.99/0.96 中间有低谷
+    const same = Array.from({ length: 300 }, (_, i) => ({
+      at: T0 - 1_000,
+      value: i === 100 ? 0.99 : i === 200 ? 0.96 : 0.5,
+    }))
+    const out1 = sampleHistory(same, T0, thr)
+    // 两个峰值都保留（旧实现只留桶内全局 max 0.99）
+    expectExcursionKept(out1, 0.99)
+    expectExcursionKept(out1, 0.96)
+    // 跨多桶：0.5 → 0.9（恰等）→ 0.95 → 0.5，恰等点两侧同样保留
+    const across = Array.from({ length: 300 }, (_, i) => ({
+      at: T0 - 300_000 + i * 1_000,
+      value: i === 150 ? 0.9 : i === 200 ? 0.95 : 0.5,
+    }))
+    const out2 = sampleHistory(across, T0, thr)
+    expectExcursionKept(out2, 0.9)
+    expectExcursionKept(out2, 0.95)
+  })
+
+  it('同时间戳保序：300 点同刻、极值 0.1/1.0、末点 0.8 → 摘要当前 80%', () => {
+    const pts = Array.from({ length: 300 }, (_, i) => ({
+      at: T0 - 1_000,
+      value: i === 50 ? 0.1 : i === 60 ? 1.0 : i === 299 ? 0.8 : 0.5,
+    }))
+    const out = sampleHistory(pts, T0)
+    expect(out.length).toBeLessThanOrEqual(4)
+    expect(out[out.length - 1]!.value).toBe(0.8)
+    // 摘要「当前」必须取真正的末点而不是桶内 max
+    const { unmount } = render(
+      <Sparkline points={pts} now={T0} label="测试" format={formatPercent} />,
+    )
+    expect(screen.getByText(/最近 5 分钟趋势/).textContent).toContain('当前 80%')
+    unmount()
+  })
+
+  it('输入乱序时稳定排序且同刻末点仍胜出', () => {
+    const pts = [
+      { at: T0 - 2_000, value: 0.3 },
+      { at: T0 - 1_000, value: 0.9 },
+      { at: T0 - 2_000, value: 0.4 }, // 乱序
+      { at: T0 - 1_000, value: 0.6 }, // 同刻后写入者 → 该时刻最终值
+    ]
+    const out = sampleHistory(pts, T0)
+    expect(out.map((p) => p.value)).toEqual([0.3, 0.4, 0.9, 0.6])
+  })
+
   it('200,000 点整图渲染 <50ms（夹具分配不计时）', () => {
     const pts = big()
     const t0 = performance.now()
@@ -298,6 +358,66 @@ describe('sampleHistory 降采样', () => {
     expect(performance.now() - t0).toBeLessThan(50)
     const d = container.querySelector('path')!.getAttribute('d')!
     expect(d.split('L').length).toBeLessThanOrEqual(240)
+  })
+})
+
+describe('曲线告警服从有效严重度与触发层', () => {
+  const flat = (v: number) => [
+    { at: T0 - 60_000, value: v },
+    { at: T0, value: v },
+  ]
+  const spark = (p: {
+    v: number
+    severity?: 'good' | 'warn' | 'critical' | 'unknown'
+    thresholds: SparkThreshold[]
+  }) =>
+    render(
+      <Sparkline
+        points={flat(p.v)}
+        now={T0}
+        label="测试"
+        format={formatPercent}
+        severity={p.severity}
+        thresholds={p.thresholds}
+      />,
+    ).container
+
+  // severity 缺省保持旧行为；good/unknown 全中性；warn 封顶上色
+  it.each([
+    { v: 0.5, severity: 'good' as const, want: [] },
+    { v: 0.5, severity: 'unknown' as const, want: [] },
+    { v: 0.5, severity: undefined, want: ['warn'] },
+    { v: 0.95, severity: 'warn' as const, want: ['warn'] },
+  ])(
+    'v=$v severity=$severity → 染色段 $want',
+    ({ v, severity, want }) => {
+      const el = spark({
+        v,
+        severity,
+        thresholds: [
+          { value: 0.4, sev: 'warn', direction: 'above' },
+          { value: 0.9, sev: 'critical', direction: 'above' },
+        ],
+      })
+      const got = [...el.querySelectorAll('path[data-out-of-range]')].map((p) =>
+        p.getAttribute('data-out-of-range'),
+      )
+      expect(got).toEqual(want)
+    },
+  )
+
+  it('未触发层画线但不分类告警：inactive 阈值越过不染', () => {
+    const el = spark({
+      v: 0.5,
+      severity: 'critical',
+      thresholds: [
+        { value: 0.4, sev: 'warn', direction: 'above', active: false },
+        { value: 0.9, sev: 'critical', direction: 'above' },
+      ],
+    })
+    expect(el.querySelectorAll('path[data-out-of-range]')).toHaveLength(0)
+    // 两条线仍作为信息参考画出
+    expect(el.querySelectorAll('line[data-threshold]')).toHaveLength(2)
   })
 })
 

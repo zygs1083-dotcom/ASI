@@ -2,9 +2,14 @@ import { describe, expect, it, vi } from 'vitest'
 import { cleanup, fireEvent, render, screen, within } from '@testing-library/react'
 import { afterEach } from 'vitest'
 import { SensePanel } from '../../src/SensePanel'
-import type { SensePanelProps, SensePanelModel } from '../../src/view-model'
+import type {
+  MetricInsight,
+  MetricPoint,
+  SensePanelProps,
+  SensePanelModel,
+} from '../../src/view-model'
 import { makeScenario } from '../../src/mock/scenarios'
-import { emptyFact, fact, makeEvent, makeState, T0 } from '../../src/mock/fixtures'
+import { emptyFact, fact, makeBody, makeEvent, makeState, T0 } from '../../src/mock/fixtures'
 import { formatClock } from '../../src/format'
 
 afterEach(cleanup)
@@ -334,6 +339,35 @@ describe('宿主触发缺省严重度（缺 severity 不显示为良好）', () 
   )
 })
 
+describe('曲线告警服从触发状态', () => {
+  const cpuPanel = (usage: number, insight: MetricInsight, history?: MetricPoint[]) => {
+    const m = makeScenario('healthy')
+    m.state.self.body.cpu = fact({ usage, perCore: [usage], load1: 1, load5: 1, load15: 1 })
+    if (history) m.history = { ...m.history, cpu: history }
+    renderPanel({ ...m, insights: { cpu: insight } })
+    return document.querySelector('details[data-tile="cpu"] summary')!
+  }
+
+  it('未触发宿主层不把曲线染成告警：cpu 0.5、baseline 线 0.4、triggered 空 → good 且中性', () => {
+    const summary = cpuPanel(0.5, {
+      sources: ['baseline'],
+      triggered: [],
+      thresholds: { baseline: { value: 0.4, source: 'host-baseline' } },
+    })
+    expect(document.querySelector('details[data-tile="cpu"]')!.getAttribute('data-sev')).toBe('good')
+    expect(screen.getByText('状态良好')).toBeTruthy()
+    // history 部分点 >0.4 越过该线：inactive 线只画不染
+    expect(summary.querySelectorAll('path[data-out-of-range]')).toHaveLength(0)
+    // 宿主 baseline 线 + 两条既有显示底线仍画出
+    const labels = [...summary.querySelectorAll('line[data-threshold]')].map((l) =>
+      l.getAttribute('data-threshold'),
+    )
+    expect(labels).toHaveLength(3)
+    expect(labels.filter((s) => s === 'warn')).toHaveLength(2)
+    expect(labels.filter((s) => s === 'critical')).toHaveLength(1)
+  })
+})
+
 describe('contextWindow 回退估值', () => {
   const tokenState = (source: 'configured' | 'catalog' | 'fallback') => {
     const s = makeState()
@@ -398,6 +432,75 @@ describe('过期事实禁用当前推算', () => {
     expect(details.textContent).toContain('上次读数 30%')
     expect(details.textContent).not.toContain('当前 30%')
     expect(details.textContent).toContain('未触发')
+  })
+
+  it('stale token/battery 清除全部当前投影：预计下次/压缩/ETA/基线带/阈值线', () => {
+    const state = makeState()
+    state.self.body.tokens = fact(
+      {
+        ...makeBody().tokens.value!,
+        contextWindowSource: 'configured',
+        contextUsed: 100_000,
+        // contextProjected 超过压缩阈值：fresh 时会显示「下次请求预计触发压缩」
+        contextProjected: 130_000,
+        compressionThreshold: 115_200,
+        contextGrowthPerMinute: 720,
+      },
+      { status: 'ok', ageMs: 120_000, ttlMs: 5_000 },
+    )
+    state.self.body.battery = fact(
+      { percent: 12, charging: false, minutesLeft: 45 },
+      { status: 'ok', ageMs: 120_000, ttlMs: 5_000 },
+    )
+    renderPanel({
+      ...makeScenario('healthy'),
+      state,
+      insights: {
+        tokens: {
+          baseline: { low: 30_000, high: 60_000 },
+          sources: ['floor', 'baseline'],
+          triggered: [],
+          thresholds: { floor: { value: 110_000, source: 'h' } },
+          currentEta: {
+            asOf: T0 - 1_000,
+            sampleIntervalMs: 5_000,
+            timeToThresholdMs: 8 * 60_000,
+            ratePerMinute: 700,
+          },
+        },
+        battery: {
+          baseline: { low: 60, high: 95 },
+          sources: ['floor'],
+          triggered: [],
+        },
+      },
+    })
+    const tokens = document.querySelector('details[data-tile="tokens"]')!
+    for (const w of ['预计下次', '下次请求', '按当前速度', '压缩']) {
+      expect(tokens.textContent, `摘要不应出现「${w}」`).not.toContain(w)
+    }
+    // TokenRing 阈值刻度不画
+    expect(tokens.querySelector('[class*="ringTick"]')).toBeNull()
+    // 保留值与历史仍在
+    expect(tokens.textContent).toContain('上次读数')
+    expect(tokens.textContent).toContain('已过期')
+    expect(tokens.textContent).toContain('本会话')
+
+    // 明细展开后同样无投影/insight，且不再生成默认底线/基线带
+    const detail = openTile('tokens')
+    for (const w of ['预计下次', '下次请求', '按当前速度', '压缩', '显示底线']) {
+      expect(detail.textContent, `明细不应出现「${w}」`).not.toContain(w)
+    }
+    expect(detail.querySelectorAll('line[data-threshold]')).toHaveLength(0)
+    expect(detail.querySelector('rect[data-baseline]')).toBeNull()
+    expect(detail.textContent).toContain('上次读数')
+
+    // stale 电池摘要图不画宿主 baseline 带，也不显示剩余分钟投影
+    const battery = document.querySelector('details[data-tile="battery"]')!
+    expect(battery.querySelector('summary rect[data-baseline]')).toBeNull()
+    expect(battery.textContent).not.toContain('约剩')
+    // 监护句不得引用 stale token 的 currentEta
+    expect(document.body.textContent).not.toContain('分钟后')
   })
 
   it.each(['denied', 'unavailable'] as const)(
@@ -471,5 +574,249 @@ describe('磁贴渲染隔离', () => {
       />,
     )
     expect(spy3.mock.calls.length).toBeGreaterThan(0)
+  })
+
+  it('时钟/事件拷贝/无关事件不重渲；相关事件与 TTL 过期重渲；年龄独立前进', () => {
+    const m = makeScenario('healthy')
+    const spy = vi.spyOn(m.state.self.body.cpu.value!.perCore, 'map')
+    // 内存渲染计数器：breakdown 只有 MemoryTile 渲染路径读取
+    const memValue = m.state.self.body.memory.value!
+    const bd = memValue.breakdown
+    let memReads = 0
+    Object.defineProperty(memValue, 'breakdown', {
+      configurable: true,
+      get: () => (memReads++, bd),
+    })
+    const { view, props } = renderPanel(m)
+    const rr = (patch: Partial<SensePanelModel>) =>
+      view.rerender(<SensePanel {...props} model={{ ...m, ...patch }} />)
+    const base = spy.mock.calls.length
+    const memBase = memReads
+    expect(base).toBeGreaterThan(0)
+
+    // now +1s：无状态翻转 → 两张卡都不重渲
+    rr({ now: m.now + 1_000 })
+    expect(spy.mock.calls.length).toBe(base)
+    expect(memReads).toBe(memBase)
+    // 事件数组拷贝 + 无关事件（file.burst）→ 仍不重渲
+    const burst = makeEvent(8, {
+      signal: { kind: 'file.burst', subject: '/demo/tmp' },
+      detail: {
+        kind: 'file.burst',
+        directory: '/demo/tmp',
+        windowMs: 60_000,
+        created: 1,
+        modified: 0,
+        deleted: 9,
+        excessiveDeletion: false,
+      },
+    })
+    rr({ now: m.now + 2_000, events: [...m.events, burst] })
+    expect(spy.mock.calls.length).toBe(base)
+    expect(memReads).toBe(memBase)
+    // 相关 cpu body.rate 事件 → CPU 重渲，内存仍不重渲
+    const rateCpu = makeEvent(9, {
+      signal: { kind: 'body.rate', subject: 'CPU' },
+      detail: {
+        kind: 'body.rate',
+        metric: 'cpu',
+        windowMs: 60_000,
+        delta: 0.18,
+        unit: 'ratio',
+      },
+    })
+    rr({ now: m.now + 3_000, events: [...m.events, burst, rateCpu] })
+    expect(spy.mock.calls.length).toBeGreaterThan(base)
+    expect(memReads).toBe(memBase)
+  })
+
+  it('CPU TTL 过期强制重渲并显示过期；过期年龄随时钟独立前进', () => {
+    const m = makeScenario('healthy')
+    // age 4s / ttl 5s：T0 时 ok，T0+2s 时过期
+    m.state.self.body.cpu = fact(
+      { usage: 0.3, perCore: [0.3, 0.4], load1: 1, load5: 1, load15: 1 },
+      { ageMs: 4_000, ttlMs: 5_000 },
+    )
+    const spy = vi.spyOn(m.state.self.body.cpu.value!.perCore, 'map')
+    const { view, props } = renderPanel(m)
+    const rr = (patch: Partial<SensePanelModel>) =>
+      view.rerender(<SensePanel {...props} model={{ ...m, ...patch }} />)
+    const base = spy.mock.calls.length
+    rr({ now: m.now + 2_000 })
+    expect(spy.mock.calls.length).toBeGreaterThan(base)
+    const tile = document.querySelector('details[data-tile="cpu"]')!
+    expect(tile.querySelector('summary')!.textContent).toContain('已过期')
+    // 过期保留值：年龄随时钟前进，但不重渲整张卡（map 不再增长）
+    const staleBase = spy.mock.calls.length
+    expect(tile.querySelector('summary')!.textContent).toContain('6 秒前')
+    rr({ now: m.now + 3_000 })
+    expect(tile.querySelector('summary')!.textContent).toContain('7 秒前')
+    expect(spy.mock.calls.length).toBe(staleBase)
+  })
+
+  it('>5min 历史匹配事件与未来事件到点：相关集合仍更新明细「最近触发」', () => {
+    const m = makeScenario('healthy')
+    m.state.self.body.cpu = fact(
+      { usage: 0.3, perCore: [0.3], load1: 1, load5: 1, load15: 1 },
+      { ttlMs: 600_000 },
+    )
+    const spy = vi.spyOn(m.state.self.body.cpu.value!.perCore, 'map')
+    const { view, props } = renderPanel(m)
+    const rr = (patch: Partial<SensePanelModel>) =>
+      view.rerender(<SensePanel {...props} model={{ ...m, ...patch }} />)
+    const cpuEvent = (id: number, at: number) =>
+      makeEvent(id, {
+        signal: { kind: 'body.anomaly', subject: 'CPU', at },
+        detail: {
+          kind: 'body.anomaly',
+          metric: 'cpu',
+          current: 0.95,
+          baseline: 0.4,
+          deviation: 2.5,
+          unit: 'ratio',
+        },
+      })
+    const detail = openTile('cpu')
+    const block = () => detail.querySelector('[data-metric="cpu"]')!
+    expect(block().textContent).toContain('最近触发：无')
+
+    // 拷贝 + 无关事件仍不重渲
+    const base = spy.mock.calls.length
+    const burst = makeEvent(8, {
+      signal: { kind: 'file.burst', subject: '/demo/tmp' },
+      detail: {
+        kind: 'file.burst',
+        directory: '/demo/tmp',
+        windowMs: 60_000,
+        created: 1,
+        modified: 0,
+        deleted: 9,
+        excessiveDeletion: false,
+      },
+    })
+    rr({ events: [...m.events, burst] })
+    expect(spy.mock.calls.length).toBe(base)
+    // >5min 历史匹配事件：明细「最近触发」要显示它 → 重渲
+    const evs = [...m.events, cpuEvent(20, T0 - 6 * 60_000), cpuEvent(21, T0 + 60_000)]
+    rr({ events: evs })
+    expect(spy.mock.calls.length).toBeGreaterThan(base)
+    expect(block().textContent).toContain(formatClock(T0 - 6 * 60_000))
+    // 未来事件到点（同一事件数组，仅 now 越过 at）→ 入选并重渲
+    const base2 = spy.mock.calls.length
+    rr({ now: T0 + 61_000, events: evs })
+    expect(spy.mock.calls.length).toBeGreaterThan(base2)
+    expect(block().textContent).toContain(formatClock(T0 + 60_000))
+  })
+
+  it('磁盘 rate 徽标跨 5 分钟窗消失；陈旧卷历史事件仍更新明细；CPU 不动', () => {
+    const m = makeScenario('healthy')
+    m.state.self.body.cpu = fact(
+      { usage: 0.3, perCore: [0.3], load1: 1, load5: 1, load15: 1 },
+      { ttlMs: 600_000 },
+    )
+    m.state.self.body.disks = fact(
+      [
+        { mount: '/', total: 460e9, free: 175e9 },
+        { mount: '/data', total: 200e9, free: 160e9, status: 'stale' as const },
+      ],
+      { ttlMs: 600_000 },
+    )
+    const cpuSpy = vi.spyOn(m.state.self.body.cpu.value!.perCore, 'map')
+    const rate = makeEvent(30, {
+      signal: { kind: 'body.rate', subject: '磁盘 /', at: T0 - 4 * 60_000 },
+      detail: {
+        kind: 'body.rate',
+        metric: 'disk:/',
+        windowMs: 60_000,
+        delta: -2.1 * 1024 ** 3,
+        unit: 'bytes',
+      },
+    })
+    const anom = makeEvent(31, {
+      signal: { kind: 'body.anomaly', subject: '磁盘 /data', at: T0 - 6 * 60_000 },
+      detail: {
+        kind: 'body.anomaly',
+        metric: 'disk:/data',
+        current: 0.99,
+        baseline: 0.4,
+        deviation: 3,
+        unit: 'ratio',
+      },
+    })
+    const m1 = { ...m, events: [rate] }
+    const { view, props } = renderPanel(m1)
+    const cpuBase = cpuSpy.mock.calls.length
+    const rr = (patch: Partial<SensePanelModel>) =>
+      view.rerender(<SensePanel {...props} model={{ ...m1, ...patch }} />)
+    const tile = document.querySelector('details[data-tile="disks"]')!
+    const summary = tile.querySelector('summary')!
+    expect(summary.textContent).toContain('/分') // rate 4min 前 → 徽标在
+    const dataBlock = () => openTile('disks').querySelector('[data-metric="disk:/data"]')!
+    expect(dataBlock().textContent).toContain('最近触发：无')
+
+    // 陈旧卷的历史 anom（>5min）仍属相关 key → 重渲并更新「最近触发」
+    rr({ events: [rate, anom] })
+    expect(dataBlock().textContent).toContain(formatClock(T0 - 6 * 60_000))
+    expect(cpuSpy.mock.calls.length).toBe(cpuBase)
+    // now 越过 5 分钟窗：同一事件集但徽标过期 → 重渲消失，CPU 仍不动
+    rr({ now: T0 + 121_000, events: [rate, anom] })
+    expect(summary.textContent).not.toContain('/分')
+    expect(cpuSpy.mock.calls.length).toBe(cpuBase)
+  })
+})
+
+describe('磁盘卷级新鲜度', () => {
+  const partialDisks = () => ({
+    ...fact(
+      [
+        { mount: '/', total: 460e9, free: 175e9, status: 'ok' as const, observedAt: T0 - 90_000, ttlMs: 5_000 },
+        { mount: '/data', total: 200e9, free: 160e9 },
+      ],
+    ),
+    unavailableMounts: ['/Volumes/network'],
+  })
+
+  it('根卷 stale 灰显 + 已过期年龄 + 保留值；/data 新鲜；unavailable 挂载「无法读取」无数字无图', () => {
+    const state = makeState()
+    state.self.body.disks = partialDisks()
+    renderPanel({ ...makeScenario('healthy'), state })
+    // 磁贴 unknown、总览数据待补全（根卷非新鲜不能报 good）
+    const tile = document.querySelector('details[data-tile="disks"]')!
+    expect(tile.getAttribute('data-sev')).toBe('unknown')
+    expect(screen.getByText('数据待补全')).toBeTruthy()
+    // 主摘要选根卷：stale 标记 + 保留值 163.0 GB
+    const summary = tile.querySelector('summary')!
+    expect(summary.textContent).toContain('已过期 · 90 秒前')
+    expect(summary.textContent).toContain('163.0 GB')
+    expect(summary.querySelector('[data-status="stale"]')).toBeTruthy()
+
+    const detail = openTile('disks')
+    // 根卷行 stale 表头（保留值），/data 行当前读数
+    const rootBlock = detail.querySelector('[data-metric="disk:/"]')!
+    expect(rootBlock.textContent).toContain('上次读数')
+    expect(rootBlock.textContent).toContain('163.0 GB')
+    const dataBlock = detail.querySelector('[data-metric="disk:/data"]')!
+    expect(dataBlock.textContent).toContain('当前')
+    expect(dataBlock.textContent).toContain('149.0 GB')
+    // 挂载点列表：根卷行 stale 标注 + /Volumes/network「无法读取」无比例条
+    const rows = [...detail.querySelectorAll('[class*="detailLine"]')]
+    const netRow = rows.find((r) => r.textContent!.includes('/Volumes/network'))!
+    expect(netRow.textContent).toContain('无法读取')
+    expect(netRow.querySelector('[data-strip]')).toBeNull()
+    // unavailable 挂载不产生图表块
+    expect(detail.querySelector('[data-metric="disk:/Volumes/network"]')).toBeNull()
+  })
+
+  it('父整体 stale：主摘要只标一次「已过期」，保留值仍在', () => {
+    const state = makeState()
+    state.self.body.disks = fact(
+      [{ mount: '/', total: 460e9, free: 175e9 }],
+      { ageMs: 90_000, ttlMs: 5_000 },
+    )
+    renderPanel({ ...makeScenario('healthy'), state })
+    const summary = document.querySelector('details[data-tile="disks"] summary')!
+    expect(summary.textContent).toContain('163.0 GB')
+    expect(summary.querySelectorAll('[data-status="stale"]')).toHaveLength(1)
+    expect(summary.textContent!.match(/已过期/g)).toHaveLength(1)
   })
 })

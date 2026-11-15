@@ -472,6 +472,44 @@ test.describe('容量未确认（fallback 上下文窗口）', () => {
   }
 })
 
+test.describe('磁盘卷级状态（disk-partial，420px × 明暗）', () => {
+  for (const theme of THEMES) {
+    test(`disk-partial 420 ${theme}：根卷过期灰显 / 网络盘无法读取 / 卡片未知`, async ({
+      page,
+    }) => {
+      const errors = watchErrors(page)
+      await page.setViewportSize({ width: 420, height: 900 })
+      await open(page, 'disk-partial', theme)
+      const t = tile(page, 'disks')
+      // 根卷非新鲜 → 卡片未知，主摘要为根卷过期保留值（灰显 + 年龄）
+      await expect(t).toHaveAttribute('data-sev', 'unknown')
+      const summary = t.locator('summary')
+      await expect(summary.locator('[data-status="stale"]').first()).toBeVisible()
+      await expect(summary).toContainText('已过期 · 90 秒前')
+      await expect(summary).toContainText('163.0 GB')
+      // 展开：根卷 stale 块、/data 当前读数、网络盘无法读取无数字无图
+      await openTile(page, 'disks')
+      const rootBlock = t.locator('[data-metric="disk:/"]')
+      await expect(rootBlock).toContainText('上次读数')
+      await expect(rootBlock).toContainText('已过期')
+      await expect(t.locator('[data-metric="disk:/data"]')).toContainText('149.0 GB')
+      const netRow = t.locator('[class*="detailLine"]', { hasText: '/Volumes/network' })
+      await expect(netRow).toContainText('无法读取')
+      await expect(netRow).not.toContainText('GB')
+      await expect(
+        t.locator('[data-metric="disk:/Volumes/network"]'),
+      ).toHaveCount(0)
+      await expectNoOverflow(page)
+      await axeCheck(page)
+      fs.mkdirSync(SHOT_DIR, { recursive: true })
+      const file = path.join(SHOT_DIR, `disk-partial-420-${theme}.png`)
+      await page.screenshot({ path: file, fullPage: true, animations: 'disabled' })
+      expect(fs.statSync(file).size).toBeLessThan(300 * 1024)
+      expect(errors).toEqual([])
+    })
+  }
+})
+
 test.describe('修复验收：网格末位与阈值图', () => {
   // 每个卡片矩形：key/top/width；grid 宽用于跨行判断
   const tilesRect = (page: Page) =>
