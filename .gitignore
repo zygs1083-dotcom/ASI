@@ -1,11 +1,15 @@
 node_modules/
-out/
 dist/
-release/
-artifacts/
-test-results/
-playwright-report/
-.playwright-mcp/
+lib/
+*.tsbuildinfo
+coverage/
+.vitest/
+# Swift helper build output
+.build/
+*.app/
+# DSH local profiles / test data
+.dsh/
+tmp/
 logs/
 *.log
 .DS_Store
