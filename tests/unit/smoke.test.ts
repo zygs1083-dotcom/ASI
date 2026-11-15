@@ -24,6 +24,7 @@ const EXPECTED_CHANNELS = {
   },
   chat: {
     send: 'chat:send',
+    retry: 'chat:retry',
     abort: 'chat:abort',
     onEvent: 'chat:event',
   },
@@ -50,14 +51,15 @@ describe('IPC channel contract', () => {
     }
   });
 
-  it('has 17 unique invoke channels, excluding the chat event channel', () => {
-    expect(IPC_INVOKE_CHANNELS).toHaveLength(17);
-    expect(new Set(IPC_INVOKE_CHANNELS).size).toBe(17);
+  it('has 18 unique invoke channels, excluding the chat event channel', () => {
+    expect(IPC_INVOKE_CHANNELS).toHaveLength(18);
+    expect(new Set(IPC_INVOKE_CHANNELS).size).toBe(18);
     expect(IPC_INVOKE_CHANNELS).not.toContain(IPC_CHANNELS.chat.onEvent);
     const allInvoke = [
       ...Object.values(EXPECTED_CHANNELS.providers),
       ...Object.values(EXPECTED_CHANNELS.conversations),
       EXPECTED_CHANNELS.chat.send,
+      EXPECTED_CHANNELS.chat.retry,
       EXPECTED_CHANNELS.chat.abort,
       ...Object.values(EXPECTED_CHANNELS.settings),
     ];
@@ -86,5 +88,18 @@ describe('design tokens', () => {
     expect(css.startsWith(':root {')).toBe(true);
     expect(css).toContain('--bg:#f4f4f6');
     expect(css).toContain(':root[data-theme="dark"]');
+  });
+});
+
+describe('dependency override', () => {
+  it('pins basic-ftp to exactly 6.2.6 in package.json and the lockfile', () => {
+    const pkg = JSON.parse(readFileSync(resolve('package.json'), 'utf8')) as {
+      overrides?: Record<string, string>;
+    };
+    expect(pkg.overrides?.['basic-ftp']).toBe('6.2.6');
+    const lock = JSON.parse(readFileSync(resolve('package-lock.json'), 'utf8')) as {
+      packages?: Record<string, { version?: string }>;
+    };
+    expect(lock.packages?.['node_modules/basic-ftp']?.version).toBe('6.2.6');
   });
 });

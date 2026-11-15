@@ -23,6 +23,7 @@ const api: AsiApi = {
   },
   chat: {
     send: (conversationId, text) => ipcRenderer.invoke(IPC_CHANNELS.chat.send, conversationId, text),
+    retry: (conversationId) => ipcRenderer.invoke(IPC_CHANNELS.chat.retry, conversationId),
     abort: (conversationId) => ipcRenderer.invoke(IPC_CHANNELS.chat.abort, conversationId),
     onEvent: (cb) => {
       const listener = (_event: IpcRendererEvent, e: ChatEvent) => cb(e);

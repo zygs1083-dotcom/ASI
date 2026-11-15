@@ -24,6 +24,7 @@ export const IPC_CHANNELS = {
   },
   chat: {
     send: 'chat:send',
+    retry: 'chat:retry',
     abort: 'chat:abort',
     onEvent: 'chat:event',
   },
@@ -37,6 +38,7 @@ export const IPC_INVOKE_CHANNELS: readonly string[] = [
   ...Object.values(IPC_CHANNELS.providers),
   ...Object.values(IPC_CHANNELS.conversations),
   IPC_CHANNELS.chat.send,
+  IPC_CHANNELS.chat.retry,
   IPC_CHANNELS.chat.abort,
   ...Object.values(IPC_CHANNELS.settings),
 ];

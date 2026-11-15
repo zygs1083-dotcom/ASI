@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { rmSync } from 'node:fs';
 import { join } from 'node:path';
 import type { ProviderConfig, ProviderInput, ProviderKind } from '../../shared/types';
 import { ensureDir, readJsonFile, writeJsonAtomic } from './json-file';
@@ -40,6 +41,18 @@ interface KeyEntry {
 
 // safeStorage 不可用时明文回退的告警，整个进程只报一次（告警不含任何 key 内容）
 let warnedPlaintextKeys = false;
+
+// 非测试环境加载到明文 key 且无法加密迁移时的告警，整个进程只报一次
+let warnedPlaintextDropped = false;
+
+/** 恢复单个 JSON 文件到调用前状态：有旧快照则原子写回，原本不存在则删除刚创建的文件 */
+function restoreFileSnapshot(path: string, snapshot: unknown): void {
+  if (snapshot === undefined) {
+    rmSync(path, { force: true });
+  } else {
+    writeJsonAtomic(path, snapshot);
+  }
+}
 
 function isProviderRecord(value: unknown): value is ProviderRecord {
   const r = value as ProviderRecord;
@@ -115,6 +128,40 @@ export class ProviderStore {
         throw new Error(`数据文件损坏，密钥记录格式无效：${this.keysPath}`);
       }
       this.keys = rawKeys as Record<string, KeyEntry>;
+    }
+    this.migratePlaintextKeys();
+  }
+
+  /**
+   * 非测试环境不允许明文 key 投入使用：
+   * - 加密可用：用 encodeKey 把全部 encrypted:false 条目转成密文，构造返回前原子重写一次；
+   *   迁移加密/写盘失败直接让构造失败，明文绝不可被 getApiKey 读到。
+   * - 加密不可用：只从内存丢弃明文条目（盘上文件不动），保留加密条目，进程级告警一次。
+   * ASI_DATA_DIR 测试模式下的明文条目保持可用。
+   */
+  private migratePlaintextKeys(): void {
+    if (process.env.ASI_DATA_DIR) {
+      return;
+    }
+    const plaintextIds = Object.keys(this.keys).filter((id) => !this.keys[id].encrypted);
+    if (plaintextIds.length === 0) {
+      return;
+    }
+    if (this.encryption.isEncryptionAvailable()) {
+      const migrated = { ...this.keys };
+      for (const id of plaintextIds) {
+        migrated[id] = this.encodeKey(this.keys[id].value);
+      }
+      writeJsonAtomic(this.keysPath, migrated);
+      this.keys = migrated;
+      return;
+    }
+    for (const id of plaintextIds) {
+      delete this.keys[id];
+    }
+    if (!warnedPlaintextDropped) {
+      warnedPlaintextDropped = true;
+      console.warn('[ASI] 系统加密不可用，已忽略 keys.json 中的明文 API Key 条目');
     }
   }
 
@@ -236,9 +283,25 @@ export class ProviderStore {
     }
 
     if (nextKeys) {
+      // 回滚快照必须是盘上实际内容：构造时被丢弃的明文条目仍留在盘上，
+      // 用 this.keys 重建会把它们从回滚结果里抹掉
+      const keysSnapshot = readJsonFile<unknown>(this.keysPath);
       writeJsonAtomic(this.keysPath, nextKeys);
+      try {
+        writeJsonAtomic(this.providersPath, nextProviders);
+      } catch (err) {
+        // 第二份文件写失败：把已写出的 keys.json 回滚到调用前状态，
+        // 否则重启后 key 会被静默更新/清除
+        try {
+          restoreFileSnapshot(this.keysPath, keysSnapshot);
+        } catch {
+          throw new Error('厂商保存失败，且密钥数据回滚失败');
+        }
+        throw err;
+      }
+    } else {
+      writeJsonAtomic(this.providersPath, nextProviders);
     }
-    writeJsonAtomic(this.providersPath, nextProviders);
     this.providers = nextProviders;
     if (nextKeys) {
       this.keys = nextKeys;
@@ -259,9 +322,22 @@ export class ProviderStore {
     delete nextKeys[id];
     // 先写 providers 再写 keys：中途失败时盘上最多留下孤儿 key 条目，
     // 而不会是"key 被删掉但厂商还在"的不可用状态
+    // 回滚快照取盘上实际内容，保证恢复原文件而非内存重建版本
+    const providersSnapshot = readJsonFile<unknown>(this.providersPath);
     writeJsonAtomic(this.providersPath, nextProviders);
     if (this.keys[id] !== undefined) {
-      writeJsonAtomic(this.keysPath, nextKeys);
+      try {
+        writeJsonAtomic(this.keysPath, nextKeys);
+      } catch (err) {
+        // 第二份文件写失败：回滚 providers.json 到调用前快照，
+        // 否则重启后厂商已消失但 key 留孤儿
+        try {
+          restoreFileSnapshot(this.providersPath, providersSnapshot);
+        } catch {
+          throw new Error('厂商删除失败，且厂商记录回滚失败');
+        }
+        throw err;
+      }
     }
     this.providers = nextProviders;
     this.keys = nextKeys;
