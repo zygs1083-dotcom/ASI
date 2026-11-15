@@ -277,3 +277,140 @@ describe('ConversationStore', () => {
     expect(store.list()).toEqual([]);
   });
 });
+
+describe('ConversationStore persistence normalize', () => {
+  function seedStreaming(dir: string): { store: ConversationStore; convId: string } {
+    const store = new ConversationStore(dir);
+    const conv = store.create();
+    store.appendMessages(conv.id, [
+      msg({ id: 'u1', text: 'hi', status: 'done' }),
+      msg({ id: 'a1', role: 'assistant', text: '半截', status: 'streaming' }),
+    ]);
+    return { store, convId: conv.id };
+  }
+
+  it('flush writes streaming messages as aborted while live memory stays streaming', () => {
+    const dir = tempDir();
+    const { store, convId } = seedStreaming(dir);
+    store.flush(convId);
+    const raw = JSON.parse(readFileSync(join(dir, 'conversations', `${convId}.json`), 'utf8'));
+    expect(raw.messages[1].status).toBe('aborted');
+    expect(raw.messages[1].error).toBe('已停止');
+    expect(raw.messages[1].text).toBe('半截');
+    // 内存里的实时状态不受影响
+    const live = store.get(convId);
+    expect(live?.messages[1].status).toBe('streaming');
+    expect(live?.messages[1].error).toBeUndefined();
+  });
+
+  it('rename/setModel/save during streaming never persist the streaming status', () => {
+    const dir = tempDir();
+    const { store, convId } = seedStreaming(dir);
+    const file = join(dir, 'conversations', `${convId}.json`);
+    const diskStatuses = () =>
+      (JSON.parse(readFileSync(file, 'utf8')) as { messages: Array<{ status?: string }> }).messages.map(
+        (m) => m.status,
+      );
+
+    store.rename(convId, '流式中改名');
+    expect(diskStatuses()).toEqual(['done', 'aborted']);
+    expect(store.get(convId)?.messages[1].status).toBe('streaming');
+
+    store.setModel(convId, { providerId: 'p2', modelId: 'm2' });
+    expect(diskStatuses()).toEqual(['done', 'aborted']);
+    expect(store.get(convId)?.messages[1].status).toBe('streaming');
+
+    const snap = store.get(convId);
+    if (snap === null) {
+      throw new Error('会话应存在');
+    }
+    store.save(snap);
+    expect(diskStatuses()).toEqual(['done', 'aborted']);
+    expect(store.get(convId)?.messages[1].status).toBe('streaming');
+  });
+
+  it('reload sees the aborted message and can continue to terminal states', () => {
+    const dir = tempDir();
+    const { store, convId } = seedStreaming(dir);
+    store.flush(convId);
+    const reloaded = new ConversationStore(dir);
+    const conv = reloaded.get(convId);
+    expect(conv?.messages[1].status).toBe('aborted');
+    expect(conv?.messages[1].error).toBe('已停止');
+    // 重新加载后消息可正常推进到终态
+    reloaded.updateMessage(convId, {
+      ...(conv?.messages[1] as ChatMessage),
+      text: '完成',
+      status: 'done',
+    });
+    reloaded.flush(convId);
+    const raw = JSON.parse(readFileSync(join(dir, 'conversations', `${convId}.json`), 'utf8'));
+    expect(raw.messages[1].status).toBe('done');
+  });
+
+  it('recovers a legacy on-disk streaming message at construction and rewrites the file', () => {
+    const dir = tempDir();
+    const convDir = join(dir, 'conversations');
+    mkdirSync(convDir, { recursive: true });
+    const legacy = {
+      id: 'legacy1',
+      title: '旧会话',
+      createdAt: 1,
+      updatedAt: 2,
+      model: { providerId: 'p', modelId: 'm' },
+      messages: [
+        { id: 'u1', role: 'user', text: 'hi', createdAt: 1, status: 'done' },
+        { id: 'a1', role: 'assistant', text: '半截', createdAt: 2, status: 'streaming' },
+      ],
+    };
+    const file = join(convDir, 'legacy1.json');
+    writeFileSync(file, JSON.stringify(legacy), 'utf8');
+    const store = new ConversationStore(dir);
+    const conv = store.get('legacy1');
+    expect(conv?.messages[1].status).toBe('aborted');
+    expect(conv?.messages[1].error).toBe('已停止');
+    expect(conv?.messages[1].text).toBe('半截');
+    // 构造时已经原子写回修复后的文件
+    const raw = JSON.parse(readFileSync(file, 'utf8'));
+    expect(raw.messages[1].status).toBe('aborted');
+    expect(raw.messages[1].error).toBe('已停止');
+  });
+
+  it('does not rewrite files that have no streaming leftovers', () => {
+    const dir = tempDir();
+    const store = new ConversationStore(dir);
+    const conv = store.create();
+    store.appendMessages(conv.id, [
+      msg({ id: 'u1', status: 'done' }),
+      msg({ id: 'a1', role: 'assistant', text: 'ok', status: 'done' }),
+    ]);
+    store.flush(conv.id);
+    const file = join(dir, 'conversations', `${conv.id}.json`);
+    const before = readFileSync(file, 'utf8');
+    new ConversationStore(dir);
+    expect(readFileSync(file, 'utf8')).toBe(before);
+  });
+
+  it('replaceLastMessage swaps the last message only when expectedId matches, memory-only', () => {
+    const dir = tempDir();
+    const store = new ConversationStore(dir);
+    const conv = store.create();
+    store.appendMessages(conv.id, [
+      msg({ id: 'u1' }),
+      msg({ id: 'a1', role: 'assistant', text: '', status: 'error', error: 'x' }),
+    ]);
+    store.replaceLastMessage(conv.id, 'a1', msg({ id: 'a2', role: 'assistant', status: 'streaming' }));
+    expect(store.get(conv.id)?.messages.map((m) => m.id)).toEqual(['u1', 'a2']);
+    expect(store.get(conv.id)?.messages[1].status).toBe('streaming');
+    // 只改内存
+    const raw = JSON.parse(readFileSync(join(dir, 'conversations', `${conv.id}.json`), 'utf8'));
+    expect(raw.messages).toHaveLength(0);
+    // expectedId 不匹配 / 会话不存在 / 无消息时拒绝
+    expect(() => store.replaceLastMessage(conv.id, 'a1', msg({ id: 'a3', role: 'assistant' }))).toThrow();
+    expect(() => store.replaceLastMessage(conv.id, 'ghost', msg({ id: 'a3' }))).toThrow();
+    expect(() => store.replaceLastMessage('missing', 'a2', msg({ id: 'a3' }))).toThrow();
+    const empty = store.create();
+    expect(() => store.replaceLastMessage(empty.id, 'x', msg({ id: 'a3' }))).toThrow();
+    expect(store.get(conv.id)?.messages.map((m) => m.id)).toEqual(['u1', 'a2']);
+  });
+});
