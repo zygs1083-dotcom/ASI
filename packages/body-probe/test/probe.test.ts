@@ -3,12 +3,16 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { BodyProbe, type ProbeCollectors } from '../src/probe.js';
-import { runCommand, type ExecFn } from '../src/command.js';
+import { runCommand, type ExecFn, type RunFn } from '../src/command.js';
+import { DiskSampler } from '../src/disks.js';
+import { MemorySampler } from '../src/memory.js';
+import { NetworkSampler } from '../src/network.js';
 import * as fact from '../src/fact.js';
 import type { Body, Fact, TokensValue } from '../src/types.js';
 
 const src = (api: string) => fact.source('test', api);
 const ok = <T>(v: T, api = 'fake'): Fact<T> => fact.ok(v, src(api));
+const fx = (name: string) => fs.readFileSync(new URL(`./fixtures/${name}`, import.meta.url), 'utf8');
 
 const baseCollectors = (): ProbeCollectors => ({
   cpu: async (ttl) => fact.ok({ usage: 0.5, perCore: [0.5], load1: 1, load5: 1, load15: 1 }, src('cpu'), ttl),
@@ -352,5 +356,171 @@ describe('BodyProbe', () => {
     expect(vi.getTimerCount()).toBe(0);
     await vi.advanceTimersByTimeAsync(10_000);
     expect(probe.latest()).not.toBeNull(); // latest remains readable
+  });
+
+  it('validates cadence fields like intervalMs', async () => {
+    const probe = new BodyProbe(baseCollectors());
+    for (const bad of [0, -1, Number.NaN, Number.POSITIVE_INFINITY, 2147483648]) {
+      for (const key of ['memoryMs', 'routeMs', 'disksMs'] as const) {
+        expect(() => probe.start({ cadence: { [key]: bad } })).toThrow(RangeError);
+      }
+    }
+    expect(() => probe.start({ cadence: { memoryMs: 5000, batteryMs: 1 } })).not.toThrow();
+    await probe.stop();
+  });
+
+  it.each([
+    ['memory', 5000],
+    ['network', 5000],
+    ['disks', 10_000],
+    ['battery', 30_000],
+  ] as const)('samples %s on the first tick at/after its %ims period', async (key, periodMs) => {
+    const collectors = baseCollectors();
+    const spy = vi.spyOn(collectors, key);
+    const probe = new BodyProbe(collectors);
+    probe.start({ intervalMs: 2000 });
+    await flush();
+    expect(spy).toHaveBeenCalledTimes(1); // always sampled on the first tick
+    await vi.advanceTimersByTimeAsync(periodMs - 2000);
+    expect(spy).toHaveBeenCalledTimes(1); // earlier ticks republish the cache
+    await vi.advanceTimersByTimeAsync(4000); // first 2s tick at/after the period
+    expect(spy).toHaveBeenCalledTimes(2);
+    await probe.stop();
+  });
+
+  it('honors a custom cadence and does not carry it into the next start', async () => {
+    const collectors = baseCollectors();
+    let calls = 0;
+    collectors.memory = async (ttl) => {
+      calls += 1;
+      return fact.ok({ total: 1, used: 1, pressure: 'normal', swapUsed: 0 }, src('mem'), ttl);
+    };
+    const probe = new BodyProbe(collectors);
+    probe.start({ intervalMs: 2000, cadence: { memoryMs: 3000 } });
+    await flush();
+    expect(calls).toBe(1);
+    await vi.advanceTimersByTimeAsync(4000); // t=4 >= 3s period
+    expect(calls).toBe(2);
+    await probe.stop();
+    probe.start({ intervalMs: 2000 }); // defaults apply again
+    await flush();
+    expect(calls).toBe(3);             // the outer cache resets on start
+    await vi.advanceTimersByTimeAsync(4000); // t=4 < default 5s: cached
+    expect(calls).toBe(3);
+    await probe.stop();
+  });
+
+  it('does not invoke later collectors once an earlier one stops the tick', async () => {
+    const collectors = baseCollectors();
+    const spies = [
+      vi.spyOn(collectors, 'disks'),
+      vi.spyOn(collectors, 'battery'),
+      vi.spyOn(collectors, 'network'),
+      vi.spyOn(collectors, 'process'),
+    ];
+    let probe!: BodyProbe;
+    collectors.memory = () => { // reentrant stop: aborts the tick mid-setup
+      void probe.stop();
+      return new Promise<Fact<never>>(() => {});
+    };
+    probe = new BodyProbe(collectors);
+    probe.start({ intervalMs: 1000 });
+    await flush();
+    for (const spy of spies) expect(spy).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(0);
+    await probe.stop();
+  });
+
+  it('republishes cached facts as-is and marks them stale once their ttl lapses', async () => {
+    const collectors = baseCollectors();
+    collectors.memory = async (ttl) =>
+      fact.ok({ total: 1, used: 1, pressure: 'normal', swapUsed: 0 }, src('mem'), Math.min(ttl, 2500));
+    const probe = new BodyProbe(collectors);
+    const seen: Body[] = [];
+    probe.onSample((b) => seen.push(b));
+    probe.start({ intervalMs: 2000 });
+    await flush();
+    expect(seen[0]?.memory.status).toBe('ok');
+    await vi.advanceTimersByTimeAsync(2000); // cached republish, age < ttl
+    expect(seen[1]?.memory.status).toBe('ok');
+    expect(seen[1]?.memory.observedAt).toBe(seen[0]?.memory.observedAt); // never refreshed
+    await vi.advanceTimersByTimeAsync(2000); // still cached, but now older than its ttl
+    expect(seen[2]?.memory.status).toBe('stale');
+    expect(seen[2]?.memory.observedAt).toBe(seen[0]?.memory.observedAt);
+    await probe.stop();
+  });
+
+  it.each(['stat', 'statfs'] as const)(
+    'a never-settling disk %s survives 8 stop/starts; new generations publish stale', async (op) => {
+      let started = 0;
+      const disks = new DiskSampler({
+        stat: async () => (op === 'stat' ? (started += 1, await new Promise<never>(() => {})) : { dev: 1 }),
+        statfs: async () => (op === 'statfs'
+          ? (started += 1, await new Promise<never>(() => {}))
+          : { bsize: 4096, blocks: 10, bavail: 5 }),
+        resolve: (p) => p,
+      });
+      const collectors = baseCollectors();
+      collectors.disks = (cwd, ttl, signal) => disks.sample(cwd, ttl, signal);
+      const probe = new BodyProbe(collectors);
+      const seen: Body[] = [];
+      probe.onSample((b) => seen.push(b));
+      for (let i = 0; i < 8; i += 1) {
+        probe.start({ intervalMs: 2000 });
+        await flush();
+        await probe.stop();
+      }
+      expect(started).toBe(1); // the wedged op keeps the lock across generations
+      expect(seen).toHaveLength(7); // the first generation's tick never completes
+      expect(seen.every((b) => b.disks.status === 'stale')).toBe(true);
+      expect(vi.getTimerCount()).toBe(0);
+    },
+  );
+
+  it('marks real composite facts stale after stop; stored history stays ok', async () => {
+    const run: RunFn = async (file, args = []) => {
+      if (file.endsWith('vm_stat')) return fx('vm_stat.txt');
+      if (file.endsWith('netstat')) return fx('netstat_1.txt');
+      if (args.includes('vm.swapusage')) return fx('swapusage.txt');
+      return '1\n'; // pressure level; route success output is unused
+    };
+    const now = () => Date.now(); // fake timers drive the samplers' cache clocks
+    const memory = new MemorySampler({ platform: 'darwin', run, now, totalmem: () => 1 });
+    const network = new NetworkSampler({
+      platform: 'darwin',
+      run,
+      now,
+      interfaces: () => ({
+        en0: [{ address: '10.0.0.1', netmask: '255.0.0.0', family: 'IPv4', mac: 'aa', internal: false, cidr: null }],
+      }),
+    });
+    const collectors = baseCollectors();
+    collectors.memory = (ttl, signal) => memory.sample(ttl, signal);
+    collectors.network = (ttl, signal) => network.sample(ttl, signal);
+    const probe = new BodyProbe(collectors);
+    probe.start({ intervalMs: 2000 });
+    // t=0 baseline + cached republish + fresh composite at t=6: pressure
+    // (5s) re-reads, swap/route (30s) stay cached and are the oldest parts.
+    await vi.advanceTimersByTimeAsync(6000);
+    await probe.stop();
+    const mem = probe.latest()!.memory;
+    const net = probe.latest()!.network;
+    expect(mem.status).toBe('ok');
+    expect(net.status).toBe('ok');
+    expect(mem.observedAt).toBeLessThan(Date.now()); // built on a t=0 swap read
+    expect(mem.ttlMs).toBe(90_000); // 3*swapMs: swap is the oldest constituent
+    expect(net.ttlMs).toBe(90_000); // 3*routeMs
+    const until = (f: Fact<unknown>) => f.observedAt + f.ttlMs;
+    await vi.advanceTimersByTimeAsync(Math.min(until(mem), until(net)) - Date.now() - 1);
+    expect(probe.latest()?.memory.status).toBe('ok');
+    expect(probe.latest()?.network.status).toBe('ok');
+    await vi.advanceTimersByTimeAsync(Math.max(until(mem), until(net)) - Date.now() + 1);
+    expect(probe.latest()?.memory.status).toBe('stale');
+    expect(probe.latest()?.network.status).toBe('stale');
+    expect(probe.latest()?.memory.observedAt).toBe(mem.observedAt); // never refreshed
+    expect(probe.latest()?.network.observedAt).toBe(net.observedAt);
+    const last = probe.history().at(-1)!;
+    expect(last.body.memory.status).toBe('ok'); // stored points are never re-marked
+    expect(last.body.network.status).toBe('ok');
   });
 });

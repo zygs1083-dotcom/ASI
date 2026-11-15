@@ -61,29 +61,48 @@ export interface MemoryDeps {
   run?: RunFn;
   platform?: NodeJS.Platform;
   totalmem?: () => number;
-  now?: () => number;
+  now?: () => number;   // monotonic clock for cache eligibility
+  wall?: () => number;  // wall clock stamped on cache entries and facts
   src?: SourceRef;
 }
 
+export interface MemoryPeriods {
+  pressureMs?: number;
+  swapMs?: number;
+}
+
+interface Cached<T> {
+  at: number;          // monotonic stamp used for expiry
+  observedAt: number;  // wall stamp carried into the composite fact
+  value: T;
+}
+
 export class MemorySampler {
-  private swapCache: { at: number; value: number } | undefined;
-  private pressureCache: { at: number; value: MemoryValue['pressure'] } | undefined;
+  private swapCache: Cached<number> | undefined;
+  private pressureCache: Cached<MemoryValue['pressure']> | undefined;
   private readonly src: SourceRef;
 
   constructor(private readonly deps: MemoryDeps = {}) {
     this.src = deps.src ?? fact.source('memory', '/usr/bin/vm_stat + /usr/sbin/sysctl');
   }
 
-  sample(ttlMs: number = fact.DEFAULT_TTL_MS, signal?: AbortSignal): Promise<Fact<MemoryValue>> {
+  async sample(
+    ttlMs: number = fact.DEFAULT_TTL_MS,
+    signal?: AbortSignal,
+    periods: MemoryPeriods = {},
+  ): Promise<Fact<MemoryValue>> {
     if ((this.deps.platform ?? process.platform) !== 'darwin') {
-      return Promise.resolve(fact.fail('unavailable', this.src, ttlMs));
+      return fact.fail('unavailable', this.src, ttlMs);
     }
     const run = this.deps.run ?? defaultRun;
     const totalmem = this.deps.totalmem ?? os.totalmem;
     const now = this.deps.now ?? (() => performance.now());
-    return fact.collect(this.src, async () => {
-      const swap = this.swapCache && now() - this.swapCache.at < SWAP_CACHE_MS ? this.swapCache : undefined;
-      const pressure = this.pressureCache && now() - this.pressureCache.at < PRESSURE_CACHE_MS
+    const wall = this.deps.wall ?? (() => Date.now());
+    const swapMs = periods.swapMs ?? SWAP_CACHE_MS;
+    const pressureMs = periods.pressureMs ?? PRESSURE_CACHE_MS;
+    try {
+      const swap = this.swapCache && now() - this.swapCache.at < swapMs ? this.swapCache : undefined;
+      const pressure = this.pressureCache && now() - this.pressureCache.at < pressureMs
         ? this.pressureCache : undefined;
       const [vmR, pressureR, swapR] = await Promise.allSettled([
         run('/usr/bin/vm_stat', [], signal),
@@ -96,28 +115,39 @@ export class MemorySampler {
       if (pressureR.status === 'rejected') throw pressureR.reason;
       if (swapR.status === 'rejected') throw swapR.reason;
       if (signal?.aborted) throw signal.reason;
+      const wallNow = wall();
+      // The fact keeps the oldest constituent's wall time and 3x its period
+      // (the vm read's period is the caller's ttl/3); ties take the smallest.
+      const parts: fact.FactMeta[] = [{ observedAt: wallNow, periodMs: ttlMs / 3 }];
       const vm = parseVmStat(vmR.value);
       let swapUsed: number;
       if (swap) {
         swapUsed = swap.value;
+        parts.push({ observedAt: swap.observedAt, periodMs: swapMs });
       } else {
         swapUsed = parseSwapUsage(swapR.value);
-        this.swapCache = { at: now(), value: swapUsed };
+        this.swapCache = { at: now(), observedAt: wallNow, value: swapUsed };
+        parts.push({ observedAt: wallNow, periodMs: swapMs });
       }
       let level: MemoryValue['pressure'];
       if (pressure) {
         level = pressure.value;
+        parts.push({ observedAt: pressure.observedAt, periodMs: pressureMs });
       } else {
         level = parsePressureLevel(pressureR.value);
-        this.pressureCache = { at: now(), value: level };
+        this.pressureCache = { at: now(), observedAt: wallNow, value: level };
+        parts.push({ observedAt: wallNow, periodMs: pressureMs });
       }
-      return {
+      const meta = fact.oldestMeta(parts);
+      return fact.ok({
         total: totalmem(),
         used: (Math.max(0, vm.anonymous - vm.purgeable) + vm.wired + vm.compressorOccupied) * vm.pageSize,
         cached: (vm.fileBacked + vm.purgeable) * vm.pageSize,
         pressure: level,
         swapUsed,
-      };
-    }, ttlMs);
+      }, this.src, meta.ttlMs, meta.observedAt);
+    } catch (err) {
+      return fact.fail(fact.errorStatus(err), this.src, ttlMs);
+    }
   }
 }

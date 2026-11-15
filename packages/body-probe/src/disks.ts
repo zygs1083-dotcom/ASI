@@ -18,16 +18,24 @@ export interface DisksDeps {
 
 // mount is the queried path ('/' or the resolved absolute cwd): statfs does
 // not report a mountpoint name, so the path we asked about is what we publish.
-export async function collectDisks(cwd: string, deps: DisksDeps = {}): Promise<DisksValue> {
+// The signal is checked before every stat and statfs so an aborted in-flight
+// stat can never start statfs or a later queried path.
+export async function collectDisks(
+  cwd: string,
+  deps: DisksDeps = {},
+  signal?: AbortSignal,
+): Promise<DisksValue> {
   const stat = deps.stat ?? ((p: string) => fs.promises.stat(p));
   const statfs = deps.statfs ?? ((p: string) => fs.promises.statfs(p));
   const resolve = deps.resolve ?? ((p: string) => path.resolve(p));
   const seen = new Set<number>();
   const volumes: DisksValue = [];
   for (const queried of ['/', resolve(cwd)]) {
+    signal?.throwIfAborted();
     const dev = (await stat(queried)).dev;
     if (seen.has(dev)) continue;
     seen.add(dev);
+    signal?.throwIfAborted();
     const s = await statfs(queried);
     volumes.push({ mount: queried, total: s.blocks * s.bsize, free: s.bavail * s.bsize });
   }
@@ -35,13 +43,41 @@ export async function collectDisks(cwd: string, deps: DisksDeps = {}): Promise<D
 }
 
 export class DiskSampler {
+  private inflight: Promise<Fact<DisksValue>> | undefined;
+  private last: Fact<DisksValue> | undefined;
   private readonly src: SourceRef;
 
   constructor(private readonly deps: DisksDeps = {}) {
     this.src = deps.src ?? fact.source('disks', 'fs.statfs');
   }
 
-  sample(cwd: string, ttlMs: number = fact.DEFAULT_TTL_MS): Promise<Fact<DisksValue>> {
-    return fact.collect(this.src, () => collectDisks(cwd, this.deps), ttlMs);
+  // At most one scan is ever in flight, even across stop/start: the lock is
+  // held until the pending scan actually settles (abort does not release it),
+  // so a wedged stat/statfs degrades later samples to a stale aggregate fact
+  // instead of piling up filesystem operations. Body carries disks only as an
+  // aggregate, so busy samples are stale as a whole, republishing the last
+  // successful scan when there is one.
+  sample(
+    cwd: string,
+    ttlMs: number = fact.DEFAULT_TTL_MS,
+    signal?: AbortSignal,
+  ): Promise<Fact<DisksValue>> {
+    const last = this.last;
+    if (this.inflight) {
+      return Promise.resolve(last
+        ? { ...last, status: 'stale' }
+        : { value: null, status: 'stale', source: this.src, observedAt: Date.now(), ttlMs });
+    }
+    const scan = fact.collect(this.src, () => collectDisks(cwd, this.deps, signal), ttlMs)
+      .then((f) => {
+        // An aborted generation must not become the last success.
+        if (!signal?.aborted && f.status === 'ok') this.last = f;
+        return f;
+      });
+    this.inflight = scan;
+    scan.finally(() => {
+      if (this.inflight === scan) this.inflight = undefined;
+    }).catch(() => {});
+    return scan;
   }
 }

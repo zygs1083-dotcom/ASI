@@ -153,6 +153,50 @@ describe('MemorySampler', () => {
     expect(calls).toBe(3);   // boundary expiry re-runs
   });
 
+  it('composes observedAt/ttlMs from the oldest constituent, ties take the smallest period', async () => {
+    let mono = 0;
+    let wall = 1_000;
+    const s = new MemorySampler({
+      platform: 'darwin',
+      run: run(fx('vm_stat.txt'), '1\n', fx('swapusage.txt')),
+      totalmem: () => 128 * 1024 ** 3,
+      now: () => mono,
+      wall: () => wall,
+    });
+    const first = await s.sample(6000); // all constituents fresh at wall 1000
+    expect(first.observedAt).toBe(1000);
+    expect(first.ttlMs).toBe(6000);     // three-way tie -> smallest period (vm, ttl/3 = 2000)
+
+    wall = 9_000; mono = 4_000;         // pressure & swap caches still valid
+    const second = await s.sample(6000);
+    expect(second.observedAt).toBe(1000); // cached constituents are the oldest
+    expect(second.ttlMs).toBe(15_000);    // pressure's 5000 wins the tie against swap's 30000
+
+    wall = 40_000; mono = 25_000;       // pressure expired (>5s), swap still cached
+    const third = await s.sample(6000);
+    expect(third.observedAt).toBe(1000); // swap's original observation is oldest
+    expect(third.ttlMs).toBe(90_000);    // 3 * swap period
+  });
+
+  it('honors caller-supplied pressure/swap cache periods', async () => {
+    let mono = 0;
+    let pressureCalls = 0;
+    const runFn: RunFn = async (file, args = []) => {
+      if (file.endsWith('vm_stat')) return fx('vm_stat.txt');
+      if (args.includes('kern.memorystatus_vm_pressure_level')) {
+        pressureCalls += 1;
+        return '1\n';
+      }
+      return fx('swapusage.txt');
+    };
+    const s = new MemorySampler({ platform: 'darwin', run: runFn, now: () => mono });
+    const periods = { pressureMs: 60_000, swapMs: 60_000 };
+    await s.sample(6000, undefined, periods);
+    mono = 10_000;
+    await s.sample(6000, undefined, periods);
+    expect(pressureCalls).toBe(1); // still cached at 10s under a 60s period
+  });
+
   it('returns unavailable when any command output is malformed', async () => {
     const s = new MemorySampler({ platform: 'darwin', run: run('garbage', '1\n', fx('swapusage.txt')) });
     const f = await s.sample();

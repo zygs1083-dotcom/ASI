@@ -20,8 +20,19 @@ export interface ProbeCollectors {
   process(pid: number, ttlMs: number, signal?: AbortSignal): Promise<Fact<ProcessValue>>;
 }
 
+export interface SamplingCadence {
+  memoryMs: number;   // MemorySampler invocation period
+  networkMs: number;  // NetworkSampler invocation period
+  pressureMs: number; // sysctl kern.memorystatus_vm_pressure_level period
+  swapMs: number;     // sysctl vm.swapusage period
+  routeMs: number;    // /sbin/route probe period per address family
+  batteryMs: number;  // BatterySampler (pmset) invocation period
+  disksMs: number;    // DiskSampler invocation period
+}
+
 export interface StartOptions {
   intervalMs?: number;
+  cadence?: Partial<SamplingCadence>;
   cwd?: string;
   pid?: number;
   tokenSource?: TokenSource;
@@ -34,8 +45,22 @@ export interface SamplePoint {
 
 const HISTORY_WINDOW_MS = 300_000;
 const TOKEN_READ_TIMEOUT_MS = 1000;
-const BATTERY_SAMPLE_MS = 30_000;
-const BATTERY_TTL_MS = 90_000;
+const DEFAULT_CADENCE: SamplingCadence = {
+  memoryMs: 5000,
+  networkMs: 5000,
+  pressureMs: 5000,
+  swapMs: 30_000,
+  routeMs: 30_000,
+  batteryMs: 30_000,
+  disksMs: 10_000,
+};
+
+interface CacheMap {
+  memory: MemoryValue;
+  network: NetworkValue;
+  disks: DisksValue;
+  battery: BatteryValue | null;
+}
 
 export class BodyProbe {
   private readonly collectors: ProbeCollectors;
@@ -44,10 +69,11 @@ export class BodyProbe {
   private timer: NodeJS.Timeout | undefined;
   private tickAbort: AbortController | undefined;
   private stopping: Promise<void> = Promise.resolve();
-  private batteryCache: { at: number; fact: Fact<BatteryValue | null> } | undefined;
+  private caches: { [K in keyof CacheMap]?: { at: number; fact: Fact<CacheMap[K]> } } = {};
   private running = false;
   private generation = 0;
   private intervalMs = 2000;
+  private cadence: SamplingCadence = { ...DEFAULT_CADENCE };
   private capacity = Math.ceil(HISTORY_WINDOW_MS / 2000) + 1;
   private cwd = process.cwd();
   private pid = process.pid;
@@ -62,10 +88,13 @@ export class BodyProbe {
     const self = new SelfProcessSampler();
     const defaults: ProbeCollectors = {
       cpu: (ttl) => Promise.resolve(cpu.sample(ttl)),
-      memory: (ttl, signal) => memory.sample(ttl, signal),
-      disks: (cwd, ttl) => disks.sample(cwd, ttl),
+      memory: (ttl, signal) => memory.sample(ttl, signal, {
+        pressureMs: this.cadence.pressureMs,
+        swapMs: this.cadence.swapMs,
+      }),
+      disks: (cwd, ttl, signal) => disks.sample(cwd, ttl, signal),
       battery: (ttl, signal) => battery.sample(ttl, signal),
-      network: (ttl, signal) => network.sample(ttl, signal),
+      network: (ttl, signal) => network.sample(ttl, signal, { routeMs: this.cadence.routeMs }),
       process: (pid, ttl, signal) => (pid === process.pid
         ? Promise.resolve(self.sample(ttl))
         : new ExternalProcessSampler(pid).sample(ttl, signal)),
@@ -78,9 +107,19 @@ export class BodyProbe {
     if (!Number.isFinite(intervalMs) || intervalMs < 1 || intervalMs > 2147483647) {
       throw new RangeError(`intervalMs must be finite in [1, 2147483647], got ${intervalMs}`);
     }
+    const cadence = { ...DEFAULT_CADENCE, ...(options.cadence ?? {}) };
+    for (const key of Object.keys(cadence) as (keyof SamplingCadence)[]) {
+      const value = cadence[key];
+      if (!Number.isFinite(value) || value < 1 || value > 2147483647) {
+        throw new RangeError(`cadence.${key} must be finite in [1, 2147483647], got ${value}`);
+      }
+      // A slower tick can never poll faster than itself; effective period.
+      cadence[key] = Math.max(intervalMs, value);
+    }
     if (this.running) return; // repeated start is a no-op; stop() before reconfiguring
     this.running = true;
-    this.batteryCache = undefined; // a new run samples battery fresh
+    this.caches = {}; // a new run samples everything fresh
+    this.cadence = cadence;
     this.intervalMs = intervalMs;
     this.capacity = Math.ceil(HISTORY_WINDOW_MS / intervalMs) + 1;
     this.cwd = options.cwd ?? process.cwd();
@@ -125,7 +164,7 @@ export class BodyProbe {
     const now = Date.now();
     for (const key of Object.keys(body) as (keyof Body)[]) {
       const f: Fact<unknown> = body[key];
-      if (f.status === 'ok' && now - f.observedAt > f.ttlMs) f.status = 'stale';
+      body[key] = fact.stale(f, now) as never;
     }
     return body;
   }
@@ -163,12 +202,12 @@ export class BodyProbe {
     });
     const facts = await Promise.race([
       Promise.all([
-        this.call(() => c.cpu(ttl, signal), 'cpu'),
-        this.call(() => c.memory(ttl, signal), 'memory'),
-        this.call(() => c.disks(this.cwd, ttl, signal), 'disks'),
-        this.battery(ttl, signal),
-        this.call(() => c.network(ttl, signal), 'network'),
-        this.call(() => c.process(this.pid, ttl, signal), 'harnessProcess'),
+        this.call(() => c.cpu(ttl, signal), 'cpu', ttl, signal),
+        this.cached('memory', () => c.memory(this.cadence.memoryMs * 3, signal), signal),
+        this.cached('disks', () => c.disks(this.cwd, this.cadence.disksMs * 3, signal), signal),
+        this.cached('battery', () => c.battery(this.cadence.batteryMs * 3, signal), signal),
+        this.cached('network', () => c.network(this.cadence.networkMs * 3, signal), signal),
+        this.call(() => c.process(this.pid, ttl, signal), 'harnessProcess', ttl, signal),
         this.readTokens(ttl, signal),
       ]),
       aborted,
@@ -192,22 +231,42 @@ export class BodyProbe {
     }
   }
 
-  // Battery: at most one real sample per 30s, ttl >=90s, original observedAt.
-  private battery(ttl: number, signal: AbortSignal): Promise<Fact<BatteryValue | null>> {
-    const cached = this.batteryCache;
-    if (cached && Date.now() - cached.at < BATTERY_SAMPLE_MS) return Promise.resolve(cached.fact);
-    return this.call(() => this.collectors.battery(Math.max(BATTERY_TTL_MS, ttl), signal), 'battery')
-      .then((f) => {
-        if (!signal.aborted) this.batteryCache = { at: Date.now(), fact: f };
-        return f;
-      });
+  // Slow collectors run at most once per effective cadence; between runs the
+  // fact is republished as-is (stale-marked past its ttl). Scheduling uses the
+  // entry's sampling-at, never the fact's composite observedAt.
+  private cached<K extends keyof CacheMap>(
+    key: K,
+    invoke: () => Promise<Fact<CacheMap[K]>>,
+    signal: AbortSignal,
+  ): Promise<Fact<CacheMap[K]>> {
+    const periodMs = this.cadence[`${key}Ms` as keyof SamplingCadence];
+    const entry = this.caches[key];
+    const now = Date.now();
+    if (entry && now - entry.at < periodMs) {
+      return Promise.resolve(fact.stale(entry.fact, now));
+    }
+    return this.call(invoke, key, periodMs * 3, signal).then((f) => {
+      if (!signal.aborted) {
+        (this.caches as Record<keyof CacheMap, { at: number; fact: Fact<unknown> } | undefined>)[key] =
+          { at: Date.now(), fact: f };
+      }
+      return f;
+    });
   }
 
-  private async call<T>(fn: () => Promise<Fact<T>>, id: string): Promise<Fact<T>> {
+  private async call<T>(
+    fn: () => Promise<Fact<T>>,
+    id: string,
+    ttlMs: number,
+    signal: AbortSignal,
+  ): Promise<Fact<T>> {
+    // An earlier collector may synchronously stop the probe mid-tick; once
+    // the tick's signal is aborted no later collector may start.
+    if (signal.aborted) return fact.fail('unavailable', fact.source(id, 'collector'), ttlMs);
     try {
       return await fn();
     } catch {
-      return fact.fail('unavailable', fact.source(id, 'collector'), this.intervalMs * 3);
+      return fact.fail('unavailable', fact.source(id, 'collector'), ttlMs);
     }
   }
 

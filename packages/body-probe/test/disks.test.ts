@@ -1,7 +1,13 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { DiskSampler, collectDisks, type StatFsResult } from '../src/disks.js';
 
 const statfs = (r: StatFsResult) => async () => r;
+
+function deferred<T>() {
+  let resolve!: (v: T) => void;
+  const promise = new Promise<T>((res) => { resolve = res; });
+  return { promise, resolve };
+}
 
 describe('collectDisks', () => {
   it('dedups volumes by stat.dev and reports queried paths as mount', async () => {
@@ -31,6 +37,58 @@ describe('collectDisks', () => {
       statfs: async () => { throw new Error('statfs failed'); },
       resolve: (p) => p,
     })).rejects.toThrow('statfs failed');
+  });
+});
+
+describe('DiskSampler in-flight bound', () => {
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => vi.useRealTimers());
+
+  it('republishes the last successful scan as stale while a scan is in flight', async () => {
+    let wedge = false;
+    const s = new DiskSampler({
+      stat: async (p) => (wedge ? new Promise<{ dev: number }>(() => {}) : { dev: p === '/' ? 1 : 2 }),
+      statfs: async () => ({ bsize: 4096, blocks: 10, bavail: 5 }),
+      resolve: (p) => p,
+    });
+    const first = await s.sample('/work', 6000);
+    expect(first.status).toBe('ok');
+    wedge = true;
+    void s.sample('/work', 6000); // wedged second scan
+    const busy = await s.sample('/work', 6000);
+    expect(busy.status).toBe('stale');
+    expect(busy.value).toEqual(first.value); // whole-aggregate stale
+    expect(busy.observedAt).toBe(first.observedAt);
+  });
+
+  it('an aborted late-resolving scan updates nothing and releases after settle', async () => {
+    const d = deferred<{ dev: number }>();
+    let statCalls = 0;
+    let statfsCalls = 0;
+    let wedgeNext = false;
+    const s = new DiskSampler({
+      stat: async (p) => {
+        statCalls += 1;
+        if (statCalls === 1) return d.promise;
+        if (wedgeNext) return new Promise<{ dev: number }>(() => {});
+        return { dev: p === '/' ? 1 : 2 };
+      },
+      statfs: async () => { statfsCalls += 1; return { bsize: 4096, blocks: 10, bavail: 5 }; },
+      resolve: (p) => p,
+    });
+    const controller = new AbortController();
+    const pending = s.sample('/work', 6000, controller.signal);
+    controller.abort();
+    d.resolve({ dev: 1 }); // late stat: must not reach statfs or the next path
+    expect((await pending).status).not.toBe('ok');
+    expect(statfsCalls).toBe(0);
+
+    wedgeNext = true;          // the next scan wedges; busy republish proves
+    void s.sample('/work', 6000); // the aborted scan never became "last success"
+    const busy = await s.sample('/work', 6000);
+    expect(busy.status).toBe('stale');
+    expect(busy.value).toBeNull();
+    expect(vi.getTimerCount()).toBe(0);
   });
 });
 

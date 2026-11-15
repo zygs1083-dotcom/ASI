@@ -1,13 +1,15 @@
 // 60s real-machine smoke: samples body vitals at the default 2s cadence and
 // prints a compact numeric summary every 10s. Prints no host/cwd/pid/network
 // addresses or other personal data. /usr/bin/time includes the sampled Node
-// process, its loader/startup, and all waited-for child commands in the 1% gate.
+// process, its loader/startup, and all waited-for child commands in the 0.6% gate.
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { BodyProbe } from '../src/index.js';
 import type { Body, Fact } from '../src/index.js';
+import { cpuWithinBudget, REQUIRED_OK, smokeProgressOk } from './smoke-check.js';
 
 const DURATION_MS = 60_000;
+const INTERVAL_MS = 2000;
 const PRINT_EVERY_MS = 10_000;
 
 if (!process.argv.includes('--sample-worker')) {
@@ -33,7 +35,7 @@ if (!process.argv.includes('--sample-worker')) {
   }
   const totalCpuPct = (user + sys) / wall * 100;
   console.log(`[smoke] timed elapsed=${wall.toFixed(2)}s user=${user.toFixed(2)}s sys=${sys.toFixed(2)}s totalCpuPct=${totalCpuPct.toFixed(3)} includesChildCpu=true`);
-  process.exit(totalCpuPct >= 1 ? 1 : 0);
+  process.exit(cpuWithinBudget(user, sys, wall) ? 0 : 1);
 }
 
 const show = <T>(f: Fact<T>, render: (v: NonNullable<T>) => string): string =>
@@ -42,6 +44,7 @@ const show = <T>(f: Fact<T>, render: (v: NonNullable<T>) => string): string =>
 const probe = new BodyProbe();
 let latest: Body | null = null;
 let samples = 0;
+const seenOk = new Set<string>();
 let wallBase = 0;
 let printer: NodeJS.Timeout | undefined;
 let finished = false;
@@ -72,15 +75,22 @@ const shutdown = async (code: number) => {
   await probe.stop();
   const wallMs = performance.now() - wallBase;
   report();
-  console.log(`[smoke] done samples=${samples} elapsed=${(wallMs / 1000).toFixed(1)}s`);
-  process.exit(code);
+  const expected = Math.ceil(DURATION_MS / INTERVAL_MS);
+  const progressOk = smokeProgressOk(samples, seenOk, expected);
+  console.log(`[smoke] done samples=${samples} expected=${expected} ok=${REQUIRED_OK.filter((key) => seenOk.has(key)).join(',')} elapsed=${(wallMs / 1000).toFixed(1)}s progressOk=${progressOk}`);
+  if (!progressOk) console.error('[smoke] failed: insufficient samples or missing required ok facts');
+  process.exit(code || (progressOk ? 0 : 1));
 };
 
 process.on('SIGINT', () => { void shutdown(130); });
 
 wallBase = performance.now();
-probe.start();
-probe.onSample((b) => { samples += 1; latest = b; });
+probe.onSample((b) => {
+  samples += 1;
+  latest = b;
+  for (const key of REQUIRED_OK) if (b[key].status === 'ok') seenOk.add(key);
+});
+probe.start({ intervalMs: INTERVAL_MS });
 printer = setInterval(report, PRINT_EVERY_MS);
 try {
   await new Promise<void>((res) => setTimeout(res, DURATION_MS));

@@ -69,13 +69,24 @@ describe('isOnline', () => {
     expect(isOnline({ en0: [iface({})] }, false)).toBe(false);
     expect(isOnline({ en0: [iface({ family: 'IPv6', address: '2001:db8::5' })] }, false)).toBe(false);
   });
+
+  it('pairs a route only with usable addresses of its own family', () => {
+    const v4 = { en0: [iface({})] };
+    const v6 = { en0: [iface({ family: 'IPv6', address: '2001:db8::5' })] };
+    expect(isOnline(v4, { inet: true, inet6: false })).toBe(true);
+    expect(isOnline(v4, { inet: false, inet6: true })).toBe(false); // a v6 route cannot carry v4
+    expect(isOnline(v6, { inet: false, inet6: true })).toBe(true);
+    expect(isOnline(v6, { inet: true, inet6: false })).toBe(false); // a v4 route cannot carry v6
+    expect(isOnline(v4, false)).toBe(false); // legacy boolean callers unchanged
+    expect(isOnline(v6, true)).toBe(true);
+  });
 });
 
 describe('NetworkSampler', () => {
   const sampler = (
     texts: string[],
     now: () => number,
-    interfaces = () => ({ en0: [iface({})] }),
+    interfaces: () => NodeJS.Dict<NetworkInterfaceInfo[]> = () => ({ en0: [iface({})] }),
     route?: RunFn,
   ) => {
     let i = 0;
@@ -133,7 +144,10 @@ describe('NetworkSampler', () => {
 
   const routeCases: [RunFn, boolean | undefined, string][] = [
     [async () => '', true, 'ok'],
-    [async () => { throw Object.assign(new Error('exit 1'), { code: 1 }); }, false, 'ok'],
+    // a recognizable "no default route" diagnostic means genuinely offline
+    [async () => { throw Object.assign(new Error('route: writing to routing socket: not in table'), { code: 1 }); }, false, 'ok'],
+    // a bare nonzero exit is undiagnosed: unknown, not offline
+    [async () => { throw Object.assign(new Error('exit 1'), { code: 1 }); }, undefined, 'unknown'],
     [async () => { throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' }); }, undefined, 'unknown'],
   ];
   it.each(routeCases)('maps the route probe to online/status %#', async (route, online, status) => {
@@ -145,27 +159,140 @@ describe('NetworkSampler', () => {
     if (online !== undefined) expect(f.value?.online).toBe(online);
   });
 
-  it.each([[true], [false]])('caches the route verdict 30s (command fails=%s)', async (fail) => {
+  it.each([
+    ['online', 'ok'],
+    ['offline', 'ok'],
+    ['unknown', 'unknown'],
+  ] as const)('caches a %s route verdict 30s but never unknown', async (mode, status) => {
     let t = 0;
     let routeCalls = 0;
     let i = 0;
-    const texts = [fx('netstat_1.txt'), fx('netstat_2.txt'), fx('netstat_2.txt'), fx('netstat_2.txt')];
+    const texts = [fx('netstat_1.txt'), fx('netstat_2.txt'), fx('netstat_2.txt'), fx('netstat_2.txt'), fx('netstat_2.txt')];
     const run: RunFn = async (file) => {
       if (file.endsWith('netstat')) return texts[Math.min(i++, texts.length - 1)]!;
       routeCalls += 1;
-      if (fail) throw Object.assign(new Error('gone'), { code: 'ENOENT' });
+      if (mode === 'offline') {
+        throw Object.assign(new Error('route: writing to routing socket: not in table'), { code: 1 });
+      }
+      if (mode === 'unknown') throw Object.assign(new Error('gone'), { code: 'ENOENT' });
       return '';
     };
     const s = new NetworkSampler({ platform: 'darwin', run, now: () => t, interfaces: () => ({ en0: [iface({})] }) });
     await s.sample(0);
     t = 1_000;
-    expect((await s.sample(0)).status).toBe(fail ? 'unknown' : 'ok');
+    expect((await s.sample(0)).status).toBe(status);
     t = 29_000;
     await s.sample(0);
-    expect(routeCalls).toBe(1);
+    expect(routeCalls).toBe(mode === 'unknown' ? 3 : 1); // unknown retries every sample
     t = 30_001;
     await s.sample(0);
-    expect(routeCalls).toBe(2);
+    expect(routeCalls).toBe(mode === 'unknown' ? 4 : 2); // success/offline expire at 30s
+  });
+
+  it('queries only the -inet6 route for IPv6-only interfaces', async () => {
+    let t = 0;
+    const routeArgs: string[][] = [];
+    const s = sampler(
+      [fx('netstat_1.txt'), fx('netstat_2.txt')],
+      () => (t += 1000) - 1000,
+      () => ({ en0: [iface({ family: 'IPv6', address: '2001:db8::5' })] }),
+      async (_file, args = []) => { routeArgs.push([...args]); return ''; },
+    );
+    await s.sample(0);
+    const f = await s.sample(1000);
+    expect(f.value?.online).toBe(true);
+    expect(routeArgs).toEqual([['-n', 'get', '-inet6', 'default']]);
+  });
+
+  it.each<{
+    interfaces: () => NodeJS.Dict<NetworkInterfaceInfo[]>;
+    routes: Record<string, 'ok' | 'offline' | 'unknown'>;
+    online: boolean;
+    queried: string[][];
+  }>([
+    // IPv4 address, but only an IPv6 default route exists: offline.
+    { interfaces: () => ({ en0: [iface({})] }),
+      routes: { '-inet': 'offline', '-inet6': 'ok' },
+      online: false, queried: [['-n', 'get', '-inet', 'default']] },
+    // IPv6 address, but only an IPv4 default route exists: offline.
+    { interfaces: () => ({ en0: [iface({ family: 'IPv6', address: '2001:db8::5' })] }),
+      routes: { '-inet': 'ok', '-inet6': 'offline' },
+      online: false, queried: [['-n', 'get', '-inet6', 'default']] },
+    // Dual stack: one family's unknown does not invalidate the other's
+    // online; the unknown family is not cached and retried next sample.
+    { interfaces: () => ({ en0: [iface({}), iface({ family: 'IPv6', address: '2001:db8::5' })] }),
+      routes: { '-inet': 'unknown', '-inet6': 'ok' },
+      online: true, queried: [
+        ['-n', 'get', '-inet', 'default'], ['-n', 'get', '-inet6', 'default'],
+        ['-n', 'get', '-inet', 'default'],
+      ] },
+  ])('pairs route verdicts with their own family %#', async ({ interfaces, routes, online, queried }) => {
+    let t = 0;
+    const routeArgs: string[][] = [];
+    const s = sampler(
+      [fx('netstat_1.txt'), fx('netstat_2.txt')],
+      () => (t += 1000) - 1000,
+      interfaces,
+      async (_file, args = []) => {
+        routeArgs.push([...args]);
+        const mode = routes[args[2]!];
+        if (mode === 'offline') {
+          throw Object.assign(new Error('route: writing to routing socket: not in table'), { code: 1 });
+        }
+        if (mode === 'unknown') throw Object.assign(new Error('gone'), { code: 'ENOENT' });
+        return '';
+      },
+    );
+    await s.sample(0);
+    const f = await s.sample(1000);
+    expect(f.status).toBe('ok');
+    expect(f.value?.online).toBe(online);
+    expect(routeArgs).toEqual(queried);
+  });
+
+  it('an aborted generation never writes the route cache', async () => {
+    let routes = 0;
+    const d = deferred<string>();
+    const controller = new AbortController();
+    const run: RunFn = async (file) => {
+      if (file.endsWith('netstat')) return netstat(linkRow('en0', '<Link#4>', 100, 200));
+      routes += 1;
+      return routes === 1 ? d.promise : '';
+    };
+    const s = new NetworkSampler({ platform: 'darwin', run, now: () => 0, interfaces: () => ({ en0: [iface({})] }) });
+    const stale = s.sample(0, controller.signal); // netstat done, route deferred
+    await vi.waitFor(() => expect(routes).toBe(1));
+    controller.abort();
+    d.resolve(''); // late success for the aborted probe must not be cached
+    await stale;
+    await s.sample(0);
+    expect(routes).toBe(2); // no cache entry: the next sample re-runs the probe
+    await s.sample(0);
+    expect(routes).toBe(2); // the fresh verdict is now cached
+  });
+
+  it('composes observedAt/ttlMs from the oldest constituent (rate vs route)', async () => {
+    let mono = 0;
+    let wall = 1_000;
+    let i = 0;
+    let routeCalls = 0;
+    const texts = [fx('netstat_1.txt'), fx('netstat_2.txt'), fx('netstat_2.txt'), fx('netstat_2.txt')];
+    const s = new NetworkSampler({
+      platform: 'darwin',
+      run: async (file) => (file.endsWith('netstat')
+        ? texts[Math.min(i++, texts.length - 1)]!
+        : (routeCalls += 1, '')),
+      now: () => mono,
+      wall: () => wall,
+      interfaces: () => ({ en0: [iface({})] }),
+    });
+    await s.sample(6000); // baseline sample; route observed at wall 1000
+    wall = 5_000; mono = 4_000;
+    const f = await s.sample(6000);
+    expect(f.status).toBe('ok');
+    expect(f.observedAt).toBe(1000); // the cached route observation is oldest
+    expect(f.ttlMs).toBe(90_000);    // 3 * 30s route period beats the rate sample's ttl
+    expect(routeCalls).toBe(1);
   });
 
   it('a late-resolving aborted sample cannot overwrite the newer baseline or route cache', async () => {

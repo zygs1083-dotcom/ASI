@@ -17,21 +17,26 @@ export type ExecFn = (file: string, args: readonly string[], options: ExecOption
 export type RunFn = (file: string, args?: readonly string[], signal?: AbortSignal) => Promise<string>;
 
 const defaultExec: ExecFn = (file, args, options) => new Promise((resolve, reject) => {
-  let result: { error: ExecFileException | null; stdout: string } | undefined;
+  let result: { error: ExecFileException | null; stdout: string; stderr: string } | undefined;
   const child = execFile(file, [...args], {
     timeout: options.timeout,
     killSignal: options.killSignal as NodeJS.Signals,
     maxBuffer: options.maxBuffer,
     env: options.env,
     ...(options.signal ? { signal: options.signal } : {}),
-  }, (error, stdout) => {
-    result = { error, stdout: String(stdout ?? '') };
+  }, (error, stdout, stderr) => {
+    result = { error, stdout: String(stdout ?? ''), stderr: String(stderr ?? '') };
   });
   // On abort the execFile callback can fire before the child has actually
   // exited; settle only at 'close', when the process is gone for sure.
   child.once('close', () => {
     if (!result) return reject(new Error(`${file}: closed without an exit status`));
-    if (result.error) return reject(result.error);
+    if (result.error) {
+      // Keep captured output on the error so callers can match diagnostics
+      // like route's "not in table".
+      Object.assign(result.error, { stdout: result.stdout, stderr: result.stderr });
+      return reject(result.error);
+    }
     resolve({ stdout: result.stdout });
   });
 });

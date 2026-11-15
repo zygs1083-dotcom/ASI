@@ -9,6 +9,7 @@ import { BodyProbe } from '@asi/body-probe';
 const probe = new BodyProbe();
 const off = probe.onSample((body) => { /* render gauges */ });
 probe.start({ intervalMs: 2000 });          // immediate tick, then every 2s
+// probe.start({ intervalMs: 2000, cadence: { memoryMs: 10_000 } }); // cadence override
 probe.latest();                             // freshest Body | null (stale-marked)
 probe.history(120);                         // chronological { at, body }[], <= 300s
 await probe.stop();                         // cancels cadence, bounded wait
@@ -21,8 +22,9 @@ Every field is a `Fact<T>` (`value`, `status`, `source`, `observedAt`,
 `ttlMs`). `status` is `ok`, `unknown` (first delta sample / rebase / a
 reading that cannot be determined), `unavailable` (command, parser or
 platform failure), `denied` (EACCES/EPERM) or `stale` (computed by `latest()`
-once `age > ttlMs`; stored history is never re-marked). Sampled facts get
-`ttlMs = 3 * intervalMs` unless noted below.
+once `age > ttlMs`; stored history is never re-marked). `cpu`/`harnessProcess`/
+`thermal` get `ttlMs = 3 * intervalMs`; `tokens` keeps the injected fact's
+own ttl; the slower collectors get `ttlMs = 3 * effective period` (below).
 
 Units: ratios are 0..1 fractions (process CPU is unclamped, may exceed 1),
 sizes are bytes, network rates are B/s, `minutesLeft`/`uptimeSec` are minutes
@@ -34,21 +36,46 @@ injected `TokenSource`.
 Formulas: `memory.used = (max(0, anonymous - purgeable) + wired + compressor-occupied) * pageSize`,
 `memory.cached = (file-backed + purgeable) * pageSize` (vm_stat fields).
 
-Cadence: `memory.swapUsed` re-runs `sysctl vm.swapusage` at most every 30s and
-`pressure` at most every 5s, so those values may lag; `used`/`cached` refresh
-every tick. `battery` samples `pmset` at most
-every 30s with `ttlMs = max(90s, 3*intervalMs)` and republishes the cached
-fact's original `observedAt` (cache resets on `start()`); `network.online`
-caches its `/sbin/route -n get default` verdict — including `unknown` — for
-30s. Network deltas key on interface name + `<Link#N>` identity; a same-name
-replacement, counter drop, or rate >10 Gbit/s rebases to `unknown`. No
-external probes are ever made.
+Cadence: `start({ cadence })` accepts a `Partial<SamplingCadence>`
+(`memoryMs`, `networkMs`, `disksMs`, `batteryMs`, `pressureMs`, `swapMs`,
+`routeMs` — defaults 5s/5s/10s/30s/5s/30s/30s). The effective period is
+`max(intervalMs, configured)`; each slow collector runs on the first tick
+at/after it (5s first fires on the ~6s tick at the default 2s interval) and
+between runs the cached fact is republished as-is — scheduled on when the
+collector returned, never on `observedAt`, stale-marked past its ttl. Outer
+caches reset on `start()` and cadence does not carry over. The swap/pressure
+and route caches inside the samplers use the same periods
+(`sample(ttl, signal, periods)` overrides standalone use).
+
+`memory` and `network` facts are composite: a fresh `ok` fact takes the
+oldest constituent's `observedAt` and `ttlMs = 3 *` its period (vm read vs
+cached pressure/swap; rate sample vs needed families' route observations;
+ties take the smallest period).
+
+`network.online` runs `/sbin/route -n get -inet default` / `-inet6 default`
+only for families with a usable address (non-internal IPv4 or global IPv6 in
+2000::/3), and a route pairs only with its own family — v4 route + unrelated
+v6 address is offline. A `not in table` diagnostic means known-offline;
+success/offline verdicts cache for the route period; anything else is
+`unknown` — never cached, retried next sample, and only makes the verdict
+`unknown` when no family is proven online. With no usable addresses `online`
+is `false` without a route probe. Deltas key on name + `<Link#N>`; a
+same-name replacement, counter drop, or rate >10 Gbit/s rebases to
+`unknown`. No external probes are ever made.
+
+`disks` allows at most one in-flight scan per `DiskSampler` (released only
+when it settles, never by abort): while busy, samples return a stale
+aggregate fact republishing the last success — `value: null` if none.
+`collectDisks` checks its `AbortSignal` before every `stat`/`statfs`, and an
+aborted generation's result never becomes the last success.
 
 Cancellation: each tick runs under an `AbortSignal` forwarded to collectors
 and commands (commands bounded 1s, SIGKILL, 4 MB, LC_ALL=C, no shell; identical
-commands coalesce only within one signal). `stop()` aborts the tick and awaits
-only that tick's commands, so a hung collector cannot delay it; aborted ticks
-never publish or touch baselines, and `start()` ticks immediately.
+commands coalesce only within one signal), and checked before invoking each
+collector — a synchronous earlier collector stopping the probe can never
+start a later one. `stop()` aborts the tick and awaits only that tick's
+commands, so a hung collector cannot delay it; aborted ticks never publish
+or touch baselines, and `start()` ticks immediately.
 
 Platforms: cpu/disks/harnessProcess are Node-based and may report `ok` on any
 platform; memory/network/battery are macOS-only; external pids use `/bin/ps`
@@ -63,12 +90,14 @@ credentials), bounded at 1s, TTL 10min, first `balance_infos` entry.
 ```sh
 pnpm install --ignore-workspace
 pnpm typecheck && pnpm test && pnpm check
-pnpm smoke   # 60s run; exits nonzero if total CPU (including children) >= 1%
+pnpm smoke   # 60s; total CPU including children must be <= 0.6%
 ```
 
 The smoke wraps its sampler worker in `/usr/bin/time -l node --import tsx ...`
 and reports `totalCpuPct = 100 * (user + sys) / real`, including waited-for
 child commands and worker startup/shutdown, not just parent Node CPU.
+It also requires >=27 of the expected 30 samples (90%) and at least one `ok`
+fact each for cpu/memory/disks/network; missing progress exits 1 even at low CPU.
 Memory output uses GiB (2^30 bytes); Activity Monitor labels these units GB.
 
 ## Packaging (transitional)

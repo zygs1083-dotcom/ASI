@@ -53,30 +53,47 @@ export function parseNetstatIB(text: string): Map<string, IfaceCounters> {
 }
 
 type IfaceMap = NodeJS.Dict<os.NetworkInterfaceInfo[]>;
+type RouteFamily = 'inet' | 'inet6';
 
-// "online" = at least one globally usable address (any non-internal IPv4, or
-// a global-unicast IPv6 in 2000::/3) AND a default route. Loopback, ULA,
-// link-local and multicast IPv6 never count — all live outside 2000::/3.
-export function isOnline(interfaces: IfaceMap, hasDefaultRoute = true): boolean {
-  if (!hasDefaultRoute) return false;
+// A family is usable only with a globally routable address: any non-internal
+// IPv4, or a global-unicast IPv6 in 2000::/3. Loopback, ULA, link-local and
+// multicast IPv6 never count — all live outside 2000::/3.
+function usableFamilies(interfaces: IfaceMap): Record<RouteFamily, boolean> {
+  const usable: Record<RouteFamily, boolean> = { inet: false, inet6: false };
   for (const [name, list] of Object.entries(interfaces)) {
     if (/^lo\d*$/.test(name)) continue;
     for (const i of list ?? []) {
       if (i.internal) continue;
       const family = i.family as unknown;
-      if (family === 'IPv4' || family === 4) return true;
-      if ((family === 'IPv6' || family === 6) && /^[23][0-9a-f]{3}:/i.test(i.address)) return true;
+      if (family === 'IPv4' || family === 4) usable.inet = true;
+      if ((family === 'IPv6' || family === 6) && /^[23][0-9a-f]{3}:/i.test(i.address)) usable.inet6 = true;
     }
   }
-  return false;
+  return usable;
+}
+
+export type RouteVerdicts = Partial<Record<RouteFamily, boolean>>;
+
+// "online" = some address family is usable AND a default route exists for
+// that same family; routes never pair across families. `routes` may be a
+// legacy boolean (same verdict for both families) or per-family verdicts.
+export function isOnline(interfaces: IfaceMap, routes: boolean | RouteVerdicts = true): boolean {
+  const usable = usableFamilies(interfaces);
+  const routed = (f: RouteFamily) => (typeof routes === 'boolean' ? routes : routes[f] === true);
+  return (usable.inet && routed('inet')) || (usable.inet6 && routed('inet6'));
 }
 
 export interface NetworkDeps {
   run?: RunFn;
   platform?: NodeJS.Platform;
   interfaces?: () => IfaceMap;
-  now?: () => number;
+  now?: () => number;   // monotonic clock for cache eligibility
+  wall?: () => number;  // wall clock stamped on cache entries and facts
   src?: SourceRef;
+}
+
+export interface NetworkPeriods {
+  routeMs?: number;
 }
 
 interface Snapshot {
@@ -89,27 +106,49 @@ const ROUTE_CACHE_MS = 30_000;
 // (rebase aftermath), not real traffic.
 const MAX_BPS = 10_000_000_000 / 8;
 
+interface RouteEntry {
+  at: number;          // monotonic stamp used for expiry
+  observedAt: number;  // wall stamp carried into the composite fact
+  value: boolean;      // success (true) or known-offline (false); unknown is never cached
+}
+
+// The only recognized no-route diagnostic: `route -n get` prints
+// "route: writing to routing socket: not in table" and exits 1. Any other
+// nonzero exit or execution failure is undiagnosed -> unknown.
+const NO_ROUTE_RE = /not in table/i;
+
+function routeDiagnostics(err: unknown): string {
+  const e = err as { message?: unknown; stdout?: unknown; stderr?: unknown } | undefined;
+  return [e?.stdout, e?.stderr, e?.message ?? err].map((s) => String(s ?? '')).join('\n');
+}
+
 export class NetworkSampler {
   private prev: Snapshot | undefined;
-  private route: { at: number; value: boolean | 'unknown' } | undefined;
+  private routes: Partial<Record<RouteFamily, RouteEntry>> = {};
   private readonly src: SourceRef;
 
   constructor(private readonly deps: NetworkDeps = {}) {
     this.src = deps.src ?? fact.source('network', '/usr/sbin/netstat -ib');
   }
 
-  async sample(ttlMs: number = fact.DEFAULT_TTL_MS, signal?: AbortSignal): Promise<Fact<NetworkValue>> {
+  async sample(
+    ttlMs: number = fact.DEFAULT_TTL_MS,
+    signal?: AbortSignal,
+    periods: NetworkPeriods = {},
+  ): Promise<Fact<NetworkValue>> {
     if ((this.deps.platform ?? process.platform) !== 'darwin') {
       return fact.fail('unavailable', this.src, ttlMs);
     }
     const run = this.deps.run ?? defaultRun;
+    const routeMs = periods.routeMs ?? ROUTE_CACHE_MS;
     try {
       const counters = parseNetstatIB(await run('/usr/sbin/netstat', ['-ib'], signal));
       signal?.throwIfAborted();
       const now = (this.deps.now ?? (() => performance.now()))();
-      const online = await this.onlineStatus(now, run, signal);
+      const wallNow = (this.deps.wall ?? (() => Date.now()))();
+      const online = await this.onlineStatus(now, wallNow, routeMs, run, signal);
       signal?.throwIfAborted();
-      if (online === 'unknown') {
+      if (online.verdict === 'unknown') {
         this.prev = undefined; // reset baseline safely; next sample re-baselines
         return fact.fail('unknown', this.src, ttlMs);
       }
@@ -138,7 +177,11 @@ export class NetworkSampler {
       if (rxBps > MAX_BPS || txBps > MAX_BPS || rxBps + txBps > MAX_BPS) {
         return fact.fail('unknown', this.src, ttlMs);
       }
-      return fact.ok({ online, rxBps, txBps }, this.src, ttlMs);
+      const meta = fact.oldestMeta([
+        { observedAt: wallNow, periodMs: ttlMs / 3 },
+        ...online.parts,
+      ]);
+      return fact.ok({ online: online.verdict, rxBps, txBps }, this.src, meta.ttlMs, meta.observedAt);
     } catch (err) {
       // Abort leaves the baseline untouched so a later generation can still
       // compute deltas; real failures reset it.
@@ -147,29 +190,62 @@ export class NetworkSampler {
     }
   }
 
-  // 'unknown' when the interfaces list is unreadable or the default-route
-  // probe fails non-numerically: online cannot be determined.
-  private async onlineStatus(now: number, run: RunFn, signal?: AbortSignal): Promise<boolean | 'unknown'> {
+  // 'unknown' when the interfaces list is unreadable or a needed route probe
+  // fails without a recognized diagnostic. Only families with usable
+  // addresses are probed, and a verdict only ever pairs with its own family.
+  private async onlineStatus(
+    now: number,
+    wallNow: number,
+    routeMs: number,
+    run: RunFn,
+    signal?: AbortSignal,
+  ): Promise<{ verdict: boolean | 'unknown'; parts: fact.FactMeta[] }> {
     let interfaces: IfaceMap;
     try {
       interfaces = (this.deps.interfaces ?? os.networkInterfaces)();
     } catch {
-      return 'unknown';
+      return { verdict: 'unknown', parts: [] };
     }
-    if (this.route && now - this.route.at < ROUTE_CACHE_MS) {
-      return this.route.value === 'unknown' ? 'unknown' : isOnline(interfaces, this.route.value);
+    const usable = usableFamilies(interfaces);
+    const parts: fact.FactMeta[] = [];
+    const verdicts: (boolean | 'unknown')[] = [];
+    for (const family of ['inet', 'inet6'] as const) {
+      if (!usable[family]) continue;
+      const r = await this.routeVerdict(family, now, wallNow, routeMs, run, signal);
+      if (signal?.aborted) return { verdict: 'unknown', parts: [] };
+      verdicts.push(r.verdict);
+      if (r.meta) parts.push(r.meta);
     }
-    let value: boolean | 'unknown';
+    if (verdicts.includes(true)) return { verdict: true, parts };
+    if (verdicts.includes('unknown')) return { verdict: 'unknown', parts: [] };
+    // No usable addresses, or every needed family is known offline.
+    return { verdict: false, parts };
+  }
+
+  private async routeVerdict(
+    family: RouteFamily,
+    now: number,
+    wallNow: number,
+    routeMs: number,
+    run: RunFn,
+    signal?: AbortSignal,
+  ): Promise<{ verdict: boolean | 'unknown'; meta?: fact.FactMeta }> {
+    const cached = this.routes[family];
+    if (cached && now - cached.at < routeMs) {
+      return { verdict: cached.value, meta: { observedAt: cached.observedAt, periodMs: routeMs } };
+    }
+    let verdict: boolean | 'unknown';
     try {
-      await run('/sbin/route', ['-n', 'get', 'default'], signal);
-      value = true;
+      await run('/sbin/route', ['-n', 'get', `-${family}`, 'default'], signal);
+      verdict = true;
     } catch (err) {
-      if (signal?.aborted) return 'unknown'; // abort outcomes are never cached
-      const code = (err as NodeJS.ErrnoException | undefined)?.code;
-      value = typeof code === 'number' && code > 0 ? false : 'unknown';
+      if (signal?.aborted) return { verdict: 'unknown' };
+      verdict = NO_ROUTE_RE.test(routeDiagnostics(err)) ? false : 'unknown';
     }
-    signal?.throwIfAborted();
-    this.route = { at: now, value };
-    return value === 'unknown' ? 'unknown' : isOnline(interfaces, value);
+    // An aborted generation never writes the cache, and unknown is never
+    // cached at all so the next sample retries the probe.
+    if (signal?.aborted || verdict === 'unknown') return { verdict: 'unknown' };
+    this.routes[family] = { at: now, observedAt: wallNow, value: verdict };
+    return { verdict, meta: { observedAt: wallNow, periodMs: routeMs } };
   }
 }
