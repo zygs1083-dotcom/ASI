@@ -544,7 +544,11 @@ describe('BodyProbe', () => {
         return '';
       }
       if (file.endsWith('vm_stat')) return fx('vm_stat.txt');
-      if (args.includes('vm.swapusage')) return fx('swapusage.txt');
+      if (file.endsWith('sysctl')) {
+        return args.slice(1).map((key) =>
+          key === 'vm.swapusage' ? fx('swapusage.txt').trimEnd() : '1',
+        ).join('\n');
+      }
       return '1\n';
     });
     fakeEn0();
@@ -571,8 +575,13 @@ describe('BodyProbe', () => {
     let swapOut = fx('swapusage.txt');
     vi.spyOn(command, 'defaultRun').mockImplementation(async (file, args = []) => {
       if (file.endsWith('vm_stat')) return fx('vm_stat.txt');
-      if (args.includes('kern.memorystatus_vm_pressure_level')) { pressureCalls += 1; return pressureOut; }
-      if (args.includes('vm.swapusage')) { swapCalls += 1; return swapOut; }
+      if (file.endsWith('sysctl')) {
+        if (args.includes('kern.memorystatus_vm_pressure_level')) pressureCalls += 1;
+        if (args.includes('vm.swapusage')) swapCalls += 1;
+        return args.slice(1).map((key) =>
+          key === 'vm.swapusage' ? swapOut.trimEnd() : pressureOut.trimEnd(),
+        ).join('\n');
+      }
       if (file.endsWith('netstat')) return fx('netstat_1.txt');
       return '';
     });
@@ -603,8 +612,13 @@ describe('BodyProbe', () => {
     let routeCalls = 0;
     vi.spyOn(command, 'defaultRun').mockImplementation(async (file, args = []) => {
       if (file.endsWith('vm_stat')) return fx('vm_stat.txt');
-      if (args.includes('kern.memorystatus_vm_pressure_level')) { pressureCalls += 1; return '1\n'; }
-      if (args.includes('vm.swapusage')) { swapCalls += 1; return fx('swapusage.txt'); }
+      if (file.endsWith('sysctl')) {
+        if (args.includes('kern.memorystatus_vm_pressure_level')) pressureCalls += 1;
+        if (args.includes('vm.swapusage')) swapCalls += 1;
+        return args.slice(1).map((key) =>
+          key === 'vm.swapusage' ? fx('swapusage.txt').trimEnd() : '1',
+        ).join('\n');
+      }
       if (file.endsWith('netstat')) return fx('netstat_1.txt');
       if (file.endsWith('route')) { routeCalls += 1; return ''; }
       return '1\n';
@@ -678,8 +692,12 @@ describe('BodyProbe', () => {
     const run: RunFn = async (file, args = []) => {
       if (file.endsWith('vm_stat')) return fx('vm_stat.txt');
       if (file.endsWith('netstat')) return fx('netstat_1.txt');
-      if (args.includes('vm.swapusage')) return fx('swapusage.txt');
-      return '1\n'; // pressure level; route success output is unused
+      if (file.endsWith('sysctl')) {
+        return args.slice(1).map((key) =>
+          key === 'vm.swapusage' ? fx('swapusage.txt').trimEnd() : '1',
+        ).join('\n');
+      }
+      return '1\n'; // route success output is unused
     };
     // Samplers default to the same (faked) monotonic clock as the probe.
     const memory = new MemorySampler({ platform: 'darwin', run, totalmem: () => 1 });

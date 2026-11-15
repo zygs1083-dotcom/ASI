@@ -40,6 +40,8 @@ injected `TokenSource`.
 
 Formulas: `memory.used = (max(0, anonymous - purgeable) + wired + compressor-occupied) * pageSize`,
 `memory.cached = (file-backed + purgeable) * pageSize` (vm_stat fields).
+Simultaneously-due pressure and swap reads share one `sysctl -n <keys>` process,
+each keeping its own cache period.
 
 Cadence: `start({ cadence })` accepts a `Partial<SamplingCadence>`
 (`memoryMs`, `networkMs`, `disksMs`, `batteryMs`, `pressureMs`, `swapMs`,
