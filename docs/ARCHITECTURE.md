@@ -22,6 +22,7 @@
 - pi-ai 只在主进程使用（它依赖 Node、且可避免 CORS、key 不出主进程）。
 - 数据目录：`ASI_DATA_DIR` 环境变量优先，否则 `app.getPath('userData')`。
 - `ASI_FAUX=1` 时注册 pi-ai faux 厂商（`registerFauxProvider`），并自动在 ProviderStore 中出现一个名为 `Faux (测试)` 的厂商，回复内容由 `ASI_FAUX_REPLY`（默认 `"你好，我是测试模型。"`）决定、`tokensPerSecond: 40`。仅用于测试，正常启动不出现。
+  - faux 厂商固定 id `faux`、模型 id `faux-chat`；普通消息回复 `ASI_FAUX_REPLY`；用户消息以 `/error` 开头 → `stopReason:'error'`；以 `/slow` 开头 → 约 400 字固定长文（用于测中止，测试只断言 aborted 且文本非空、短于全文）。
 
 ## 2. 目录
 
