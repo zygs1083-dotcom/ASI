@@ -60,24 +60,14 @@ export function nowReadings(
   let jobs: JobSummary[] | undefined;
   let selectedJobs: number | undefined;
   try {
-    const perSession = new Map(agents.map((item) => [item.id, ctx.jobs.list(item.id)]));
-    const visible = [ctx.jobs.list(), ...perSession.values()].flat();
-    jobs = [
-      ...new Map(
-        visible
-          .filter((job) => job.status === 'running' || job.status === 'stopping')
-          .map((job) => [
-            job.id,
-            { id: job.id, startedAt: job.startedAt, command: job.label, status: 'running' as const },
-          ]),
-      ).values(),
-    ];
+    const owned = agent
+      ? ctx.jobs
+          .list(agent.id)
+          .filter((job) => job.owner === agent.id && (job.status === 'running' || job.status === 'stopping'))
+      : [];
+    jobs = owned.map((job) => ({ id: job.id, startedAt: job.startedAt, command: job.label, status: 'running' }));
     result['env.activeJobs'] = { value: jobs };
-    if (agent) {
-      selectedJobs = perSession
-        .get(agent.id)
-        ?.filter((job) => job.owner === agent.id && (job.status === 'running' || job.status === 'stopping')).length;
-    }
+    if (agent) selectedJobs = owned.length;
   } catch {
     result['env.activeJobs'] = { value: null, status: 'unavailable', reason: 'DSH 任务列表不可用' };
   }

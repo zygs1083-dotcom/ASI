@@ -1,3 +1,4 @@
+import type { SenseState } from '@asi/sense-types';
 import { Context } from '@deepseek-ai/cordis';
 import type { Agent } from '@deepseek-ai/dsh-agent';
 import { ToolCallId } from '@deepseek-ai/dsh-llm';
@@ -9,22 +10,40 @@ import ToolsService from '@deepseek-ai/dsh-tools';
 import { describe, expect, it, onTestFinished, vi } from 'vitest';
 import { registerSenseTools } from '../../src/host/dsh/tools.ts';
 import { createSenseRuntime } from '../../src/host/runtime/index.ts';
-import type { SensePorts } from '../../src/host/runtime/ports.ts';
+import type { AgentEvent, JobEvent, SensePorts, ToolEvent } from '../../src/host/runtime/ports.ts';
 import { StateStore } from '../../src/host/state/store.ts';
 
-async function fixture(liveState = false) {
+async function fixture(liveState = false, isolated = false) {
   const ctx = new Context();
   await ctx.plugin(SystemPrompt);
   await ctx.plugin(ToolsService);
   ctx.tools.setExecutor(new NativeToolExecutor(ctx));
+  let agentEvent: (event: AgentEvent) => Promise<void> = async () => {};
+  let toolEvent: (event: ToolEvent) => Promise<void> = async () => {};
+  let jobEvent: (event: JobEvent) => Promise<void> = async () => {};
   const ports: SensePorts = {
     clock: { wall: () => 1_000, mono: () => 1_000 },
     dsh: {
-      onAgentEvent: () => () => {},
-      onTool: () => () => {},
-      onJob: () => () => {},
+      onAgentEvent: (callback) => {
+        agentEvent = callback;
+        return () => {};
+      },
+      onTool: (callback) => {
+        toolEvent = callback;
+        return () => {};
+      },
+      onJob: (callback) => {
+        jobEvent = callback;
+        return () => {};
+      },
       deliver: async () => {},
-      tokenSnapshot: async () => undefined,
+      tokenSnapshot: async (session) =>
+        isolated
+          ? {
+              contextUsed: session === 'session-a' ? 11 : 22,
+              sessionUsage: { input: session === 'session-a' ? 11 : 22, output: 0, cacheRead: 0, cacheWrite: 0 },
+            }
+          : undefined,
     },
     storage: { load: async () => undefined, save: async () => {} },
     helper: { spawn: () => undefined },
@@ -37,7 +56,18 @@ async function fixture(liveState = false) {
     { id: 'orphan', owner: undefined, command: 'private-orphan-command', status: 'running' as const, startedAt: 3 },
   ];
   Object.assign(ports.dsh, {
-    nowReadings: () => ({ 'env.activeJobs': { value: jobs } }),
+    nowReadings: (session?: string) =>
+      isolated
+        ? {
+            'env.activeJobs': { value: jobs.filter((job) => job.owner === session) },
+            'self.activity': { value: session === 'session-a' ? 'tool' : 'thinking' },
+            'self.pending': { value: { inbox: session === 'session-a' ? 1 : 2, jobs: 1 } },
+            'self.tools': { value: [session === 'session-a' ? 'a-tool' : 'b-tool'] },
+            'env.where.model': {
+              value: { provider: session === 'session-a' ? 'provider-a' : 'provider-b', endpoint: '', local: true },
+            },
+          }
+        : { 'env.activeJobs': { value: jobs.filter((job) => job.owner === session) } },
     modelJobs: (session: string) =>
       jobs.filter((job) => job.owner === session).map(({ id, status, startedAt }) => ({ id, status, startedAt })),
   });
@@ -117,7 +147,17 @@ async function fixture(liveState = false) {
         ? {}
         : { agent: options.session ? { ...agent, id: SessionId(options.session) } : agent }),
     });
-  return { ctx, live, state, call, off, setTitles: (value: boolean) => (titles = value) };
+  return {
+    ctx,
+    live,
+    state,
+    call,
+    off,
+    agentEvent: (event: AgentEvent) => agentEvent(event),
+    toolEvent: (event: ToolEvent) => toolEvent(event),
+    jobEvent: (event: JobEvent) => jobEvent(event),
+    setTitles: (value: boolean) => (titles = value),
+  };
 }
 
 describe('model-facing tools', () => {
@@ -145,7 +185,7 @@ describe('model-facing tools', () => {
       isError: false,
       value: {
         current: true,
-        app: { value: { name: 'Fixture App', bundleId: 'org.fixture.app' } },
+        app: { value: { name: 'Fixture App' } },
         window: { value: { title: 'Synthetic title' } },
         pid: { value: null, status: 'unknown' },
         windowCount: { value: null, status: 'unknown' },
@@ -194,9 +234,52 @@ describe('model-facing tools', () => {
     expect(JSON.stringify((await h.call('env_detail', {})).value)).not.toContain('fixture-host.invalid');
   });
 
-  it('isolates actual model state by caller while retaining all jobs in the local panel state', async () => {
+  it('preserves consented titles but excludes arbitrary notes and colliding private paths', async () => {
+    const h = await fixture();
+    const title = 'open </private/fixture/report> "backup.example.invalid"';
+    h.state.env.focusedWindow.value = { title };
+    if (!h.state.env.frontApp.value) throw new Error('fixture missing');
+    h.state.env.frontApp.value.bundleId = 'backup.example.invalid';
+    h.state.env.watchedPaths.value = {
+      '/private/a/project': { changes: 1, lastChange: 1 },
+      '/private/b/project': { changes: 2, lastChange: 2 },
+      '/': { changes: 3, lastChange: 3 },
+      '/private/a/__proto__': { changes: 4, lastChange: 4 },
+    };
+    const state = await h.call('env_state', { section: 'env' });
+    expect(state.value).toMatchObject({
+      focusedWindow: { value: { title } },
+      watchedPaths: { value: { project: { changes: 1 }, 'project (2)': { changes: 2 }, '[path]': { changes: 3 } } },
+    });
+    expect(Object.hasOwn((state.value as unknown as SenseState['env']).watchedPaths.value ?? {}, '__proto__')).toBe(
+      true,
+    );
+    expect(JSON.stringify((state.value as unknown as SenseState['env']).frontApp)).not.toContain(
+      'backup.example.invalid',
+    );
+    expect((await h.call('env_detail', {})).value).toMatchObject({ window: { value: { title } } });
+    const result = await h.call('env_watch', {
+      action: 'add',
+      rule: {
+        id: 'fixture-rule',
+        match: { kind: 'app.activated' },
+        level: 'record',
+        note: 'open </private/fixture/report> backup.example.invalid',
+      },
+    });
+    expect(JSON.stringify(result.value)).not.toContain('/private/fixture');
+    expect(JSON.stringify(result.value)).not.toContain('backup.example.invalid');
+    h.setTitles(false);
+    expect(JSON.stringify((await h.call('env_state', {})).value)).not.toContain(title);
+  });
+
+  it('isolates actual model state by caller and selects the local panel session', async () => {
     const h = await fixture(true);
-    expect(JSON.stringify(h.live.state().env.activeJobs)).toContain('private-orphan-command');
+    await h.agentEvent({ type: 'created', sessionId: 'session-a' });
+    await h.agentEvent({ type: 'created', sessionId: 'session-b' });
+    await h.agentEvent({ type: 'pre-step', sessionId: 'session-b' });
+    expect(JSON.stringify(h.live.state().env.activeJobs)).toContain('private-b-command');
+    expect(JSON.stringify(h.live.state().env.activeJobs)).not.toContain('private-orphan-command');
     for (const [session, own, foreign] of [
       ['session-a', 'a-job', 'b-job'],
       ['session-b', 'b-job', 'a-job'],
@@ -208,6 +291,62 @@ describe('model-facing tools', () => {
       expect(text).not.toContain('orphan');
       expect(text).not.toContain('private-');
       expect(JSON.stringify((await h.call('env_detail', {}, { session })).value)).not.toContain('private-');
+    }
+  });
+
+  it('isolates interleaved session activity, pending, tools, jobs and tokens through the DSH tool boundary', async () => {
+    const h = await fixture(true, true);
+    const seen: { session?: string; used?: number; jobs: string[] }[] = [];
+    const off = h.live.subscribe((state) => {
+      seen.push({
+        session: h.live.currentSessionId(),
+        used: state.self.body.tokens.value?.contextUsed,
+        jobs: state.env.activeJobs.value?.map((job) => job.id) ?? [],
+      });
+    });
+    for (const sessionId of ['session-a', 'session-b']) {
+      await h.agentEvent({ type: 'created', sessionId });
+      await h.agentEvent({ type: 'pre-step', sessionId });
+      await h.toolEvent({ type: 'pre-execute', sessionId, toolCallId: `${sessionId}-call` });
+      await h.jobEvent({ type: 'started', id: `${sessionId}-job`, sessionId, command: `${sessionId}-private-command` });
+    }
+    await h.agentEvent({ type: 'pre-step', sessionId: 'session-a' });
+    await h.agentEvent({ type: 'post-step', sessionId: 'session-b' });
+    await h.jobEvent({ type: 'exited', id: 'orphan', command: 'orphan-private-command', exitCode: 1 });
+    expect(h.live.state().self.body.tokens.value?.contextUsed).toBe(11);
+    expect(h.live.state().env.activeJobs.value?.map((job) => job.id)).toEqual(['a-job']);
+    for (const item of seen) {
+      if (!item.session) continue;
+      const own = item.session === 'session-a' ? 'a' : 'b';
+      expect(item.used === undefined || item.used === (own === 'a' ? 11 : 22)).toBe(true);
+      expect(item.jobs.every((job) => job === `${own}-job`)).toBe(true);
+    }
+    off();
+    for (const [session, own, other, used, activity] of [
+      ['session-a', 'a', 'b', 11, 'tool'],
+      ['session-b', 'b', 'a', 22, 'thinking'],
+    ] as const) {
+      const result = await h.call('env_state', {}, { session });
+      expect(result).toMatchObject({
+        isError: false,
+        value: {
+          self: {
+            activity: { value: activity },
+            pending: { value: { inbox: own === 'a' ? 1 : 2, jobs: 1 } },
+            tools: { value: [`${own}-tool`] },
+            body: { tokens: { value: { contextUsed: used } } },
+          },
+          env: {
+            activeJobs: { value: [{ id: `${own}-job` }] },
+            where: { model: { value: { provider: `provider-${own}` } } },
+          },
+        },
+      });
+      const text = JSON.stringify(result.value);
+      expect(text).not.toContain(`${other}-job`);
+      expect(text).not.toContain(`provider-${other}`);
+      expect(text).not.toContain('private-command');
+      expect(JSON.stringify((await h.call('env_detail', {}, { session })).value)).not.toContain('private-command');
     }
   });
 
@@ -239,7 +378,10 @@ describe('model-facing tools', () => {
     if (!param || typeof param.value !== 'number') throw new Error('numeric tuning parameter missing');
     await h.live.actions.lockParam(param.key, true);
     const result = await h.call('body_tune', { param: param.key, to: param.value * 1.1, reason: 'fixture' });
-    expect(result).toMatchObject({ isError: false, value: { applied: false, change: { by: 'agent' } } });
+    expect(result).toMatchObject({
+      isError: false,
+      value: { applied: false, reason: 'param locked', change: { by: 'agent', param: param.key } },
+    });
     expect(h.live.body.tuner.get(param.key)).toBe(param.value);
     expect(h.live.body.tuner.logs.at(-1)).toMatchObject({ by: 'agent', status: 'rejected' });
   });

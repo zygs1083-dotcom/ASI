@@ -156,7 +156,7 @@ describe('DSH now facts', () => {
     });
     const facts = nowReadings(f.ctx, f.agent.id, new Map(), new Set());
     expect(facts['self.pending']).toEqual({ value: { inbox: 3, jobs: 1 } });
-    expect(facts['env.activeJobs'].value).toHaveLength(2);
+    expect(facts['env.activeJobs'].value).toHaveLength(1);
   });
 
   it('reads only owned job summaries for each model session', () => {
@@ -328,6 +328,30 @@ describe('DSH now facts', () => {
       answer();
       await request;
       expect(port.nowReadings(f.agent.id)['self.activity']).toMatchObject({ status: 'unknown' });
+    } finally {
+      off();
+      offAnswerer();
+      await bus.fiber.dispose();
+    }
+  });
+
+  it('passes unscoped user questions through the real waterfall', async () => {
+    const f = fixture();
+    const bus = new Context();
+    const events = bus as unknown as {
+      on(name: string, listener: (...args: never[]) => unknown): () => void;
+      waterfall(name: string, request: unknown, next: () => Promise<unknown>): Promise<unknown>;
+    };
+    const offAnswerer = events.on('user-questions/request', () => 'answered');
+    const ctx = f.ctx as unknown as Record<string, unknown>;
+    ctx.on = bus.on.bind(bus);
+    ctx.jobs = { ...(ctx.jobs as object), events: { subscribe: () => () => {} } };
+    ctx.sessionProjections = { register: async () => ({}) };
+    const off = createDshPort(f.ctx, () => false).onNowChanged(() => {});
+    try {
+      await expect(events.waterfall('user-questions/request', { questions: [] }, async () => 'fallback')).resolves.toBe(
+        'answered',
+      );
     } finally {
       off();
       offAnswerer();

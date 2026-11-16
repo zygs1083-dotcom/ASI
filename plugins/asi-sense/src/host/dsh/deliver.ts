@@ -1,15 +1,72 @@
 import { randomUUID } from 'node:crypto';
+import type { EnvUpdate } from '@asi/sense-types';
 import type { Agent } from '@deepseek-ai/dsh-agent';
 import { freezeMessage, MessageId, type UserMessage } from '@deepseek-ai/dsh-llm';
 import { DeliveryFailure } from '../attention/drain.ts';
 import type { DeliveryIntent } from '../attention/pipeline.ts';
 import { formatEnvUpdate } from '../delivery/format.ts';
-import { modelText } from './tool-output.ts';
+import { modelLabel, modelPath } from './tool-output.ts';
 
 declare module '@deepseek-ai/dsh-llm' {
   interface MessageSourceMap {
     environment: { kind: 'environment' };
   }
+}
+
+function modelUpdate(update: EnvUpdate): EnvUpdate {
+  return {
+    since: update.since,
+    at: update.at,
+    suppressed: update.suppressed,
+    alreadyInjected: update.alreadyInjected,
+    changes: update.changes.map(({ signal, count, level }) => {
+      const data: typeof signal.data = {};
+      let subject = 'observation';
+      if (signal.kind === 'app.activated') {
+        if (typeof signal.data.name === 'string') data.name = modelLabel(signal.data.name);
+        if (typeof signal.data.previousName === 'string') data.previousName = modelLabel(signal.data.previousName);
+      } else if (signal.kind === 'window.focused' || signal.kind === 'window.title-changed') {
+        if (typeof signal.data.title === 'string') data.title = signal.data.title;
+      } else if (signal.kind === 'file.changed') {
+        data.path = modelPath(typeof signal.data.path === 'string' ? signal.data.path : signal.subject);
+      } else if (signal.kind === 'job.exited' || signal.kind === 'process.exited') {
+        if (typeof signal.data.id === 'string') data.id = modelLabel(signal.data.id);
+        if (typeof signal.data.exitCode === 'number') data.exitCode = signal.data.exitCode;
+        if (typeof signal.data.durationMs === 'number') data.durationMs = signal.data.durationMs;
+        if (typeof signal.data.startedAt === 'number') data.startedAt = signal.data.startedAt;
+      } else if (signal.kind === 'body.threshold') {
+        const metrics = ['cpu', 'memory', 'disk', 'battery', 'context', 'network', 'thermal'];
+        subject = metrics.includes(signal.subject) ? signal.subject : 'body';
+        if (['normal', 'warn', 'critical'].includes(String(signal.data.severity))) data.severity = signal.data.severity;
+        if (typeof signal.data.value === 'number') data.value = signal.data.value;
+      }
+      const kinds = [
+        'app.activated',
+        'window.focused',
+        'window.title-changed',
+        'file.changed',
+        'job.exited',
+        'job.failed',
+        'process.exited',
+        'body.threshold',
+        'body.rate',
+        'body.anomaly',
+        'file.burst',
+      ];
+      return {
+        count,
+        level,
+        signal: {
+          id: signal.id,
+          kind: kinds.includes(signal.kind) ? signal.kind : 'observation',
+          at: signal.at,
+          source: { id: 'asi-sense', api: 'delivery', host: 'local' },
+          subject,
+          data,
+        },
+      };
+    }),
+  };
 }
 
 export function createDelivery(
@@ -28,9 +85,10 @@ export function createDelivery(
       content: [
         {
           type: 'text',
-          text: modelText(
-            formatEnvUpdate(intent.update, { includeWindowTitles: sendTitles(), includeJobCommands: false }),
-          ),
+          text: formatEnvUpdate(modelUpdate(intent.update), {
+            includeWindowTitles: sendTitles(),
+            includeJobCommands: false,
+          }),
         },
       ],
     });

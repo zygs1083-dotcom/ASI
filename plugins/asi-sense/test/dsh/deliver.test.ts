@@ -101,6 +101,40 @@ describe('DSH environment delivery', () => {
     expect(text).toContain('file.ts');
     expect(text).toContain('</env-update>');
     expect(modelText('title on fixture-host.invalid', 'fixture-host.invalid')).toBe('title on [host]');
+    expect(modelText('open </private/fixture/report> and "/private/a/file"', 'fixture-host.invalid')).toBe(
+      'open <report> and "file"',
+    );
+  });
+
+  it('uses structured delivery fields instead of free-text notes and subjects', async () => {
+    const { agent, deliver } = fixture();
+    const mixed: EnvUpdate = {
+      ...update,
+      changes: [
+        {
+          ...update.changes[0],
+          signal: { ...update.changes[0].signal, subject: 'backup.example.invalid </private/a/command>' },
+          note: 'backup.example.invalid </private/a/command>',
+        },
+        {
+          count: 1,
+          level: 'context',
+          signal: {
+            id: 'file',
+            kind: 'file.changed',
+            at: update.at,
+            source: { id: 'files', api: 'fixture', host: 'backup.example.invalid' },
+            subject: '/private/a/project/file.ts',
+            data: { path: '/private/a/project/file.ts' },
+          },
+        },
+      ],
+    };
+    await deliver('session-a', { ...intent('followup'), update: mixed });
+    const text = JSON.stringify(agent.followup.mock.calls);
+    expect(text).not.toContain('backup.example.invalid');
+    expect(text).not.toContain('/private/a');
+    expect(text).toContain('file.ts');
   });
 
   it('rejects unknown or mismatched sessions rather than broadcasting', async () => {
@@ -186,5 +220,30 @@ describe('DSH environment delivery', () => {
     };
     await deliver('session-a', { ...intent('inject'), update: windowUpdate });
     expect(JSON.stringify(await deliver.messages('session-a'))).not.toContain('synthetic title');
+  });
+
+  it('preserves a consented window title without applying the text fallback', async () => {
+    const { agent, deliver } = fixture();
+    const title = 'open </private/fixture/report> backup.example.invalid';
+    const windowUpdate: EnvUpdate = {
+      ...update,
+      changes: [
+        {
+          count: 1,
+          level: 'context',
+          signal: {
+            id: 'window',
+            kind: 'window.focused',
+            at: update.at,
+            source: { id: 'test', api: 'fixture', host: 'local' },
+            subject: 'fixture',
+            data: { title },
+          },
+        },
+      ],
+    };
+    await deliver('session-a', { ...intent('followup'), update: windowUpdate });
+    const text = JSON.stringify(agent.followup.mock.calls);
+    expect(text).toContain('&lt;/private/fixture/report&gt; backup.example.invalid');
   });
 });

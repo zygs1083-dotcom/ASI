@@ -54,12 +54,12 @@ export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}
     expiry,
   );
   const listeners = createStateListeners();
-  const offStore = attention.store.subscribe((state) => {
-    listeners.notify(state);
-    schedule();
-  });
   const body = new BodySource(ports.probe, ports.dsh, ports.storage, clock, attention, expiry, isPaused, changed);
   const dsh = new DshSource(deliveryPort, clock, attention, body, isPaused, options.selfCauseGraceMs);
+  const offStore = attention.store.subscribe((state) => {
+    listeners.notify(dsh.stateFor(attention.currentSessionId(), state));
+    schedule();
+  });
   const files = new FileSource(
     ports.files,
     clock,
@@ -111,7 +111,7 @@ export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}
     if (clock.mono() >= nextToken) {
       nextToken = clock.mono() + 5_000;
       const session = attention.current();
-      if (session && !paused) void body.tokens(session);
+      if (session && !paused) void body.tokens(session, () => attention.currentSessionId() === session);
     }
     helper.tick();
     attention.pipeline.pruneSessions();
@@ -234,6 +234,7 @@ export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}
     () => allowTitles,
     changed,
     deliveryPort,
+    dsh,
   );
   function stop(): Promise<void> {
     if (stopping) return stopping;
@@ -290,7 +291,7 @@ export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}
     },
     stop,
     currentSessionId: () => attention.currentSessionId(),
-    state: () => attention.state(),
+    state: () => dsh.stateFor(attention.currentSessionId(), attention.state()),
     factMeta: (path: string) => expiry.factMeta(path),
     subscribe: listeners.subscribe,
     onChange,

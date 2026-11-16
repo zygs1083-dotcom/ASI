@@ -585,10 +585,8 @@ describe('presenter', () => {
       });
     await h.sample(body(0.1, 'normal'));
     const seen: unknown[] = [];
-    const jobs: boolean[] = [];
     let queuedJob: Promise<void> | undefined;
     const off = h.runtime.subscribe((state) => {
-      jobs.push(!!state.env.activeJobs.value?.some((job) => job.id === 'synthetic-job'));
       queuedJob ??= h.job({ type: 'started', id: 'synthetic-job' });
       seen.push({
         cpu: state.self.body.cpu.value?.usage,
@@ -603,8 +601,9 @@ describe('presenter', () => {
     await h.sample(body(0.9, 'critical'));
     await queuedJob;
     expect(seen.length).toBeGreaterThan(1);
-    expect(jobs.at(-1)).toBe(true);
-    expect(jobs.slice(0, -1).every((value) => !value)).toBe(true);
+    expect(h.runtime.events().some((event) => event.kind === 'job.started' && event.subject === 'synthetic-job')).toBe(
+      true,
+    );
     for (const entry of seen) {
       expect(entry).toEqual({
         cpu: 0.9,
@@ -1343,19 +1342,20 @@ describe('presenter', () => {
 
   it('uses remaining tokens and the event window for context ETA even when capacity changes', async () => {
     const h = await harness();
+    await h.agent({ type: 'created', sessionId: 's' });
     for (const [window, used] of [
       [1000, 0],
       [1000, 200],
       [1200, 500],
     ] as const) {
       if (used) await h.advance(70_000);
-      const tokens = f({
+      h.tokens({
         contextWindow: window,
         contextUsed: used,
         sessionUsage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
       });
-      tokens.observedAt = Date.now();
-      await h.sample(mkBody({ tokens }));
+      await h.agent({ type: used ? 'post-step' : 'pre-step', sessionId: 's' });
+      await h.sample(mkBody());
     }
     const event = h.runtime
       .events()
@@ -1372,6 +1372,7 @@ describe('presenter', () => {
 
   it('does not use unconfirmed context capacity as historical evidence', async () => {
     const h = await harness();
+    await h.agent({ type: 'created', sessionId: 's' });
     for (const [used, source] of [
       [0, 'fallback'],
       [100, 'fallback'],
@@ -1380,14 +1381,14 @@ describe('presenter', () => {
       [400, 'configured'],
     ] as const) {
       if (used) await h.advance(10_000);
-      const tokens = f({
+      h.tokens({
         contextWindow: 1000,
         contextUsed: used,
         contextWindowSource: source,
         sessionUsage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
       });
-      tokens.observedAt = Date.now();
-      await h.sample(mkBody({ tokens }));
+      await h.agent({ type: used ? 'post-step' : 'pre-step', sessionId: 's' });
+      await h.sample(mkBody());
       if (used === 300) expect(h.presenter.snapshot().insights?.tokens?.currentEta).toBeUndefined();
     }
     expect(h.presenter.snapshot().insights?.tokens?.currentEta?.ratePerMinute).toBeCloseTo(600);

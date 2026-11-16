@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import type { Body } from '@asi/sense-types';
+import type { Body, SenseState } from '@asi/sense-types';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { DeliveryFailure } from '../../src/host/attention/drain.ts';
 import { DEFAULT_RULES } from '../../src/host/attention/rules.ts';
@@ -18,11 +18,17 @@ import type {
 import { Settings } from '../../src/host/runtime/settings.ts';
 import { pauseAction } from '../../src/host/runtime/tools.ts';
 import type { NowReadings } from '../../src/host/sources/dsh.ts';
+import { TokenFacts } from '../../src/host/sources/token-facts.ts';
 import { f, mkBody } from '../body/helpers.ts';
 
 afterEach(() => vi.useRealTimers());
 
-function harness(savedSettings?: string, options: SenseOptions = {}, nowReadings?: (session?: string) => NowReadings) {
+function harness(
+  savedSettings?: string,
+  options: SenseOptions = {},
+  nowReadings?: (session?: string) => NowReadings,
+  modelJobs?: DshPort['modelJobs'],
+) {
   vi.useFakeTimers();
   vi.setSystemTime(1_700_000_000_000);
   let mono = 0;
@@ -40,6 +46,7 @@ function harness(savedSettings?: string, options: SenseOptions = {}, nowReadings
     clock: { wall: () => Date.now(), mono: () => mono },
     dsh: {
       ...(nowReadings ? { nowReadings } : {}),
+      ...(modelJobs ? { modelJobs } : {}),
       onAgentEvent: (cb) => {
         agent = cb;
         return () => {};
@@ -137,6 +144,118 @@ function harness(savedSettings?: string, options: SenseOptions = {}, nowReadings
 }
 
 describe('host runtime', () => {
+  it('isolates concurrent session facts and restores the selected token on disposal', async () => {
+    const values = {
+      a: { activity: 'tool', pending: { inbox: 1, jobs: 1 }, tools: ['a-tool'], provider: 'provider-a', used: 11 },
+      b: { activity: 'thinking', pending: { inbox: 2, jobs: 2 }, tools: ['b-tool'], provider: 'provider-b', used: 22 },
+    } as const;
+    const h = harness(
+      undefined,
+      { rules: [] },
+      (session): NowReadings => {
+        const value = values[session as 'a' | 'b'];
+        return value
+          ? {
+              'self.activity': { value: value.activity },
+              'self.pending': { value: value.pending },
+              'self.tools': { value: value.tools },
+              'env.where.model': { value: { provider: value.provider, endpoint: 'local', local: true } },
+            }
+          : {};
+      },
+      (session) => [{ id: `${session}-job`, status: 'running', startedAt: 1 }],
+    );
+    h.ports.dsh.tokenSnapshot = async (session) => ({
+      contextUsed: values[session as 'a' | 'b'].used,
+      sessionUsage: { input: values[session as 'a' | 'b'].used, output: 0, cacheRead: 0, cacheWrite: 0 },
+    });
+    await h.runtime.start();
+    for (const sessionId of ['a', 'b']) {
+      await h.agent({ type: 'created', sessionId });
+      await h.agent({ type: 'pre-step', sessionId });
+    }
+    await h.agent({ type: 'pre-step', sessionId: 'a' });
+    await h.agent({ type: 'post-step', sessionId: 'b' });
+    for (const session of ['a', 'b'] as const) {
+      const state = h.runtime.tools.envState(undefined, session) as SenseState;
+      expect(state.self.activity.value).toBe(values[session].activity);
+      expect(state.self.pending.value).toEqual(values[session].pending);
+      expect(state.self.tools.value).toEqual(values[session].tools);
+      expect(state.self.body.tokens.value?.contextUsed).toBe(values[session].used);
+      expect(state.env.where.model.value?.provider).toBe(values[session].provider);
+      expect(state.env.activeJobs.value?.map((job) => job.id)).toEqual([`${session}-job`]);
+    }
+    expect(h.runtime.state().self.body.tokens.value?.contextUsed).toBe(11);
+    await h.agent({ type: 'disposed', sessionId: 'a' });
+    expect(h.runtime.state().self.body.tokens.value?.contextUsed).toBe(22);
+    const disposed = h.runtime.tools.envState(undefined, 'a') as SenseState;
+    expect(disposed.self.body.tokens.value).toBeNull();
+    expect(disposed.env.activeJobs.value).toBeNull();
+    expect(disposed.self.tools.value).toBeNull();
+    await h.agent({ type: 'disposed', sessionId: 'b' });
+    expect(h.runtime.state().self.body.tokens.value).toBeNull();
+    await h.runtime.stop();
+  });
+
+  it('rejects a delayed token read from a disposed session generation', async () => {
+    const h = harness(undefined, { rules: [] });
+    let used = 1;
+    let release!: (value: TokenSnapshot) => void;
+    let delayed = false;
+    const snapshot = (value: number): TokenSnapshot => ({
+      contextUsed: value,
+      sessionUsage: { input: value, output: 0, cacheRead: 0, cacheWrite: 0 },
+    });
+    h.ports.dsh.tokenSnapshot = () =>
+      delayed
+        ? new Promise((resolve) => {
+            release = resolve;
+          })
+        : Promise.resolve(snapshot(used));
+    await h.runtime.start();
+    await h.agent({ type: 'created', sessionId: 'a' });
+    await h.agent({ type: 'pre-step', sessionId: 'a' });
+    delayed = true;
+    const old = h.agent({ type: 'post-step', sessionId: 'a' });
+    await Promise.resolve();
+    await h.agent({ type: 'disposed', sessionId: 'a' });
+    await h.agent({ type: 'created', sessionId: 'a' });
+    delayed = false;
+    used = 2;
+    await h.agent({ type: 'pre-step', sessionId: 'a' });
+    release(snapshot(1));
+    await old;
+    expect(h.runtime.state().self.body.tokens.value?.contextUsed).toBe(2);
+    expect((h.runtime.tools.envState(undefined, 'a') as SenseState).self.body.tokens.value?.contextUsed).toBe(2);
+    await h.runtime.stop();
+  });
+
+  it('keeps a cached token deadline when switching back to its session', async () => {
+    const h = harness(undefined, { rules: [] });
+    let mono = 0;
+    const written: Body['tokens'][] = [];
+    const facts = new TokenFacts(
+      h.ports.dsh,
+      { wall: () => mono, mono: () => mono },
+      () => written.at(-1) ?? mkBody().tokens,
+      (fact) => written.push(fact),
+      () => {},
+    );
+    h.ports.dsh.tokenSnapshot = async () => ({
+      contextUsed: 1,
+      sessionUsage: { input: 1, output: 0, cacheRead: 0, cacheWrite: 0 },
+    });
+    facts.sessionsChanged(true);
+    await facts.tokens('a');
+    facts.select('a');
+    facts.select('b');
+    mono = 14_000;
+    facts.select('a');
+    expect(written.at(-1)?.ttlMs).toBe(1_000);
+    mono = 15_000;
+    expect(facts.fact('a').status).toBe('stale');
+    await facts.stop();
+  });
   it('publishes local location and configured paths while explaining absent session facts', async () => {
     const h = harness(undefined, { rules: [] });
     await h.runtime.start();
@@ -175,6 +294,8 @@ describe('host runtime', () => {
     let activity = 'idle';
     const h = harness(undefined, {}, () => ({ 'self.activity': { value: activity } }));
     await h.runtime.start();
+    await h.agent({ type: 'created', sessionId: 'a' });
+    await h.agent({ type: 'pre-step', sessionId: 'a' });
     expect(h.runtime.state().self.activity.value).toBe('idle');
     activity = 'thinking';
     await h.advance(5_000);
@@ -201,7 +322,7 @@ describe('host runtime', () => {
     await h.agent({ type: 'disposed', sessionId: 'b' });
     await h.agent({ type: 'disposed', sessionId: 'a' });
     await vi.advanceTimersByTimeAsync(0);
-    expect(h.runtime.state().self.tools.value).toEqual([]);
+    expect(h.runtime.state().self.tools.value).toBeNull();
     await h.runtime.stop();
   });
 

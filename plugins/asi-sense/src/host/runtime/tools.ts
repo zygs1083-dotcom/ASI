@@ -1,6 +1,7 @@
 import type { WatchRule } from '@asi/sense-types';
 import { createWatchRule, validateRule } from '../attention/rules.ts';
 import type { BodySource } from '../sources/body.ts';
+import type { DshSource } from '../sources/dsh.ts';
 import type { FileSource } from '../sources/files.ts';
 import type { RuntimeAttention } from './attention.ts';
 import type { DshPort, SenseActions, TuneRequest } from './ports.ts';
@@ -55,13 +56,15 @@ export function runtimeTools(
   titlesAllowed: () => boolean,
   changed: () => void,
   dsh: DshPort,
+  dshSource: DshSource,
 ) {
   return {
     envState: (section?: 'self' | 'env' | 'observation', sessionId?: string) => {
-      const state = attention.state();
+      const state = sessionId === undefined ? attention.state() : dshSource.stateFor(sessionId, attention.state());
       if (!titlesAllowed()) state.env.focusedWindow.value = null;
       if (sessionId !== undefined) {
         try {
+          if (!dshSource.hasSession(sessionId)) throw new Error('session unavailable');
           if (!dsh.modelJobs) throw new Error('job source unavailable');
           state.env.activeJobs.value = dsh.modelJobs(sessionId);
         } catch {

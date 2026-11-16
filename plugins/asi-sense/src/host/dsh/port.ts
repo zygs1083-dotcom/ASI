@@ -136,7 +136,8 @@ export function createDshPort(
         } else return;
         notify();
       });
-      const interaction = async (request: { agent: Agent }, next: () => Promise<unknown>) => {
+      const interaction = async (request: { agent?: Agent }, next: () => Promise<unknown>) => {
+        if (!request.agent) return next();
         const existing = waiting.get(request.agent.id);
         const requests =
           existing?.agent === request.agent ? existing : { agent: request.agent, tokens: new Set<symbol>() };

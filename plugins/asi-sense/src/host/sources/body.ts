@@ -70,7 +70,13 @@ export class BodySource {
       dsh,
       clock,
       () => attention.state().self.body.tokens,
-      (fact) => this.write('tokens', fact),
+      (fact, mono) => {
+        if (mono === undefined) this.write('tokens', fact);
+        else
+          this.expiry.withObservationTimes({ context: { wall: fact.observedAt, mono } }, () =>
+            this.write('tokens', fact),
+          );
+      },
       changed,
     );
     this.tuner = new Tuner(specs, {
@@ -122,6 +128,15 @@ export class BodySource {
   }
   tokens(session: string, valid: () => boolean = () => true): Promise<void> {
     return this.tokenFacts.tokens(session, valid);
+  }
+  sessionToken(session: string): Body['tokens'] {
+    return this.tokenFacts.fact(session);
+  }
+  selectSession(session?: string): void {
+    this.tokenFacts.select(session);
+  }
+  disposeSession(session: string): void {
+    this.tokenFacts.dispose(session);
   }
   setThermal(fact: Body['thermal'], recovering = false): void {
     if (this.stopped) return;

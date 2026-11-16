@@ -1,8 +1,9 @@
 import os from 'node:os';
-import type { Signal } from '@asi/sense-types';
+import type { SenseState, Signal } from '@asi/sense-types';
 import { classifyCause, type ToolWindow } from '../attention/selfcause.ts';
 import type { RuntimeAttention } from '../runtime/attention.ts';
 import type { AgentEvent, Clock, DshPort, JobEvent, ToolEvent, Unsubscribe } from '../runtime/ports.ts';
+import { StateStore } from '../state/store.ts';
 
 export type NowReadings = Record<
   string,
@@ -21,6 +22,7 @@ export class DshSource {
   private active = false;
   private readonly inflight = new Set<Promise<void>>();
   private readonly instances = new Map<string, object>();
+  private readonly sessions = new Map<string, StateStore>();
   private selection = 0;
   private timer?: ReturnType<typeof setInterval>;
   private refreshQueued = false;
@@ -31,6 +33,9 @@ export class DshSource {
     private readonly body: {
       tokens(session: string, valid?: () => boolean): Promise<void>;
       sessionsChanged(present: boolean): void;
+      selectSession(session?: string): void;
+      disposeSession(session: string): void;
+      sessionToken(session: string): SenseState['self']['body']['tokens'];
     },
     private readonly paused: () => boolean,
     private readonly selfCauseGraceMs = 2_000,
@@ -65,6 +70,7 @@ export class DshSource {
     for (const off of this.off.splice(0)) off();
     this.windows.clear();
     this.instances.clear();
+    this.sessions.clear();
     return Promise.allSettled([...this.inflight]).then(() => {});
   }
   private publish(readings: NowReadings, source = { id: 'dsh', api: 'registry', host: os.hostname() }): void {
@@ -85,8 +91,8 @@ export class DshSource {
       () => this.attention.changed(),
     );
   }
-  private refresh(): void {
-    if (!this.active || this.paused()) return;
+  private refresh(force = false): void {
+    if (!this.active || (this.paused() && !force)) return;
     const extended = this.port as DshPort & { nowReadings?: (sessionId?: string) => NowReadings };
     const reason = this.instances.size ? 'DSH 未提供事实来源' : '没有活动会话';
     let readings: NowReadings;
@@ -120,6 +126,68 @@ export class DshSource {
       this.refresh();
     });
   }
+  hasSession(session: string): boolean {
+    return this.sessions.has(session);
+  }
+  stateFor(session: string | undefined, state: SenseState): SenseState {
+    const store = session === undefined ? undefined : this.sessions.get(session);
+    const extended = this.port as DshPort & { nowReadings?: (sessionId?: string) => NowReadings };
+    const paths = [
+      'self.activity',
+      'self.pending',
+      'self.tools',
+      'env.where.model',
+      'env.where.toolExec',
+      'env.activeJobs',
+    ];
+    if (store) {
+      let readings: NowReadings = {};
+      try {
+        readings = extended.nowReadings?.(session) ?? {};
+      } catch {
+        readings = Object.fromEntries(paths.map((path) => [path, { value: null, status: 'unavailable' }]));
+      }
+      for (const path of paths) {
+        const reading = readings[path];
+        if (!reading) continue;
+        store.apply({
+          id: this.attention.id(),
+          kind: 'fact.updated',
+          at: this.clock.wall(),
+          source,
+          subject: path,
+          data: { path, ...reading, ttlMs: 30_000 },
+        });
+      }
+    }
+    const own = store?.snapshot() ?? new StateStore(() => this.clock.wall()).snapshot();
+    if (!store) {
+      const reason = session === undefined ? '没有活动会话' : '会话不可用';
+      for (const fact of [
+        own.self.activity,
+        own.self.pending,
+        own.self.tools,
+        own.self.body.tokens,
+        own.env.where.model,
+        own.env.where.toolExec,
+        own.env.activeJobs,
+      ])
+        fact.reason = reason;
+    }
+    state.self.activity = own.self.activity;
+    state.self.pending = own.self.pending;
+    state.self.tools = own.self.tools;
+    state.self.body.tokens =
+      store && session !== undefined
+        ? this.body.sessionToken(session)
+        : session === undefined && state.self.body.tokens.value === null
+          ? state.self.body.tokens
+          : own.self.body.tokens;
+    state.env.where.model = own.env.where.model;
+    state.env.where.toolExec = own.env.where.toolExec;
+    state.env.activeJobs = own.env.activeJobs;
+    return state;
+  }
   private track(work: () => Promise<void>): Promise<void> {
     if (!this.active) return Promise.resolve();
     const result = work();
@@ -138,14 +206,36 @@ export class DshSource {
   }
   private async agent(event: AgentEvent): Promise<void> {
     if (event.type === 'created') {
+      if (this.instances.has(event.sessionId)) {
+        this.body.disposeSession(event.sessionId);
+        if (this.attention.currentSessionId() === event.sessionId) this.body.selectSession(undefined);
+      }
       this.instances.set(event.sessionId, {});
+      this.sessions.set(
+        event.sessionId,
+        new StateStore(
+          () => this.clock.wall(),
+          60_000,
+          () => this.clock.mono(),
+        ),
+      );
       this.attention.create(event.sessionId);
       this.body.sessionsChanged(true);
+      if (this.attention.currentSessionId() === event.sessionId) this.body.selectSession(event.sessionId);
     }
     if (event.type === 'disposed') {
-      this.instances.delete(event.sessionId);
-      this.attention.dispose(event.sessionId);
-      this.body.sessionsChanged(this.instances.size > 0);
+      this.attention.store.batch(
+        () => {
+          this.instances.delete(event.sessionId);
+          this.sessions.delete(event.sessionId);
+          this.body.disposeSession(event.sessionId);
+          this.attention.dispose(event.sessionId);
+          this.body.sessionsChanged(this.instances.size > 0);
+          this.body.selectSession(this.attention.currentSessionId());
+          this.refresh(true);
+        },
+        () => this.attention.changed(),
+      );
     }
     this.requestRefresh();
     if (event.type === 'pre-step') {
@@ -156,14 +246,28 @@ export class DshSource {
       if (!instance) return;
       try {
         if (!this.paused()) await this.body.tokens(event.sessionId, valid);
-        if (valid()) await this.attention.preStep(event.sessionId, event.userInitiated, !this.paused());
+        if (valid()) {
+          let step: Promise<void> | undefined;
+          this.attention.store.batch(
+            () => {
+              step = this.attention.preStep(event.sessionId, event.userInitiated, !this.paused());
+              this.body.selectSession(this.attention.currentSessionId());
+              this.refresh(true);
+            },
+            () => this.attention.changed(),
+          );
+          await step;
+        }
       } finally {
         this.requestRefresh();
       }
     }
     if (event.type === 'post-step') {
       this.attention.postStep(event.sessionId);
-      if (!this.paused()) await this.body.tokens(event.sessionId);
+      const instance = this.instances.get(event.sessionId);
+      if (instance && !this.paused()) {
+        await this.body.tokens(event.sessionId, () => this.active && this.instances.get(event.sessionId) === instance);
+      }
     }
   }
   private async tool(event: ToolEvent): Promise<void> {

@@ -6,7 +6,12 @@ type TokenFact = Fact<NonNullable<Body['tokens']['value']>>;
 export class TokenFacts {
   private token?: TokenFact;
   private tokenSource?: TokenSnapshot['contextWindowSource'];
-  private tokenGeneration = 0;
+  private readonly readings = new Map<
+    string,
+    { fact: TokenFact; source: TokenSnapshot['contextWindowSource']; mono: number }
+  >();
+  private readonly generations = new Map<string, object>();
+  private selected?: string;
   private readonly tokenWork = new Set<Promise<void>>();
   private stopped = false;
   private hasSession = false;
@@ -16,7 +21,7 @@ export class TokenFacts {
     private readonly dsh: DshPort,
     private readonly clock: Clock,
     private readonly current: () => TokenFact,
-    private readonly write: (fact: TokenFact) => void,
+    private readonly write: (fact: TokenFact, observedMono?: number) => void,
     private readonly changed: () => void,
   ) {}
 
@@ -54,6 +59,41 @@ export class TokenFacts {
     return fact;
   }
 
+  fact(session: string): TokenFact {
+    const reading = this.readings.get(session);
+    if (!reading) return this.empty();
+    const fact = structuredClone(reading.fact);
+    if (fact.status === 'ok' && this.clock.mono() - reading.mono >= fact.ttlMs) fact.status = 'stale';
+    return fact;
+  }
+
+  private empty(): TokenFact {
+    return {
+      value: null,
+      status: 'unknown',
+      source: { id: 'tokens', api: 'dsh', host: 'local' },
+      observedAt: this.clock.wall(),
+      ttlMs: 15_000,
+      reason: this.reason(),
+    };
+  }
+
+  select(session?: string): void {
+    if (this.stopped || this.selected === session) return;
+    this.selected = session;
+    const reading = session ? this.readings.get(session) : undefined;
+    this.token = reading ? this.fact(session as string) : this.empty();
+    this.tokenSource = reading?.source;
+    const ttlMs = reading ? Math.max(0, this.token.ttlMs - (this.clock.mono() - reading.mono)) : this.token.ttlMs;
+    this.write({ ...this.token, ttlMs }, reading?.mono);
+    this.changed();
+  }
+
+  dispose(session: string): void {
+    this.readings.delete(session);
+    this.generations.delete(session);
+  }
+
   tokens(session: string, valid: () => boolean = () => true): Promise<void> {
     if (this.stopped) return Promise.resolve();
     const work = this.readTokens(session, valid);
@@ -66,7 +106,8 @@ export class TokenFacts {
   }
 
   private async readTokens(session: string, valid: () => boolean): Promise<void> {
-    const generation = ++this.tokenGeneration;
+    const generation = {};
+    this.generations.set(session, generation);
     let failed = false;
     const snapshot = await Promise.resolve()
       .then(() => this.dsh.tokenSnapshot(session))
@@ -74,9 +115,8 @@ export class TokenFacts {
         failed = true;
         return undefined;
       });
-    if (this.stopped || generation !== this.tokenGeneration || !valid()) return;
-    this.tokenSource = snapshot?.contextWindowSource;
-    this.token = {
+    if (this.stopped || this.generations.get(session) !== generation || !valid()) return;
+    const fact: TokenFact = {
       value: snapshot ?? null,
       status: snapshot ? 'ok' : 'unavailable',
       source: { id: 'tokens', api: 'dsh', host: 'local' },
@@ -84,12 +124,17 @@ export class TokenFacts {
       ttlMs: 15_000,
       ...(!snapshot ? { reason: failed && this.hasSession ? '用量读取失败' : this.reason() } : {}),
     };
-    this.write(this.token);
-    this.changed();
+    this.readings.set(session, { fact, source: snapshot?.contextWindowSource, mono: this.clock.mono() });
+    if (this.selected === session) {
+      this.token = fact;
+      this.tokenSource = snapshot?.contextWindowSource;
+      this.write(fact, this.clock.mono());
+      this.changed();
+    }
   }
 
   pause(): void {
-    this.tokenGeneration++;
+    this.generations.clear();
   }
 
   stop(): Promise<void> {

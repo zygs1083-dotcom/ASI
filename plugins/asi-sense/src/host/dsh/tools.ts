@@ -1,9 +1,10 @@
+import type { SenseState } from '@asi/sense-types';
 import type { Context } from '@deepseek-ai/cordis';
 import { HarnessError } from '@deepseek-ai/dsh-llm';
 import type {} from '@deepseek-ai/dsh-system-prompt';
 import { defineTool, ToolArgsError, ToolContextUnavailableError, type ToolRunContext } from '@deepseek-ai/dsh-tools';
 import type { createSenseRuntime } from '../runtime/index.ts';
-import { environmentDetail, modelOutput } from './tool-output.ts';
+import { environmentDetail, modelRules, modelState, modelTune } from './tool-output.ts';
 
 type Runtime = Pick<ReturnType<typeof createSenseRuntime>, 'tools' | 'events' | 'rules'>;
 
@@ -30,7 +31,7 @@ export function createSenseTools(runtime: Runtime, now: () => number) {
     output,
     async execute({ section }, exec) {
       requireAgent(exec);
-      return modelOutput(runtime.tools.envState(section, exec.agent?.id), now());
+      return modelState(runtime.tools.envState(undefined, exec.agent?.id) as SenseState, now(), section);
     },
   });
   const envWatch = defineTool({
@@ -68,7 +69,7 @@ export function createSenseTools(runtime: Runtime, now: () => number) {
       if (args.action === 'add' && !args.rule) throw new ToolArgsError(['rule is required for add']);
       if (args.action === 'remove' && !args.id) throw new ToolArgsError(['id is required for remove']);
       try {
-        return modelOutput(await runtime.tools.envWatch(args));
+        return modelRules(await runtime.tools.envWatch(args));
       } catch (cause) {
         throw new HarnessError(
           'Could not confirm the rule update. Read current rules before retrying.',
@@ -119,7 +120,7 @@ export function createSenseTools(runtime: Runtime, now: () => number) {
             : undefined;
       if (!request) throw new ToolArgsError(['provide param and to, or action=feedback with alertId and verdict']);
       try {
-        return modelOutput(await runtime.tools.bodyTune(request));
+        return modelTune(await runtime.tools.bodyTune(request));
       } catch (cause) {
         throw new HarnessError(
           'Could not confirm the tuning operation. Inspect current settings before retrying.',
