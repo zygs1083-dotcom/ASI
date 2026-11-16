@@ -9,7 +9,7 @@ import type { InjectFace, PropsLocale, PropsRuntime } from '@deepseek-ai/dsh-cli
 import remote from 'asi-sense/remote';
 import { createElement as h } from 'react';
 import { createActions } from './actions.ts';
-import { createFrameState } from './frame-state.ts';
+import { createFrameState, stalePanelModel } from './frame-state.ts';
 import { panelModel } from './panel-model.ts';
 
 declare const ASI_SENSE_CSS: string;
@@ -19,6 +19,7 @@ const PANEL_ID = 'asi-sense' as MainPanelId;
 const en = {
   panel: 'Environment sense',
   connecting: 'Connecting to environment sense…',
+  reconnecting: 'Connection lost. Displayed environment data is out of date; reconnecting…',
   ended: 'Environment updates stopped.',
   failed: 'Environment updates failed.',
   actionFailed: 'The action failed. Check the current state and try again.',
@@ -27,6 +28,7 @@ const en = {
 const zh: typeof en = {
   panel: '环境感知',
   connecting: '正在连接环境感知…',
+  reconnecting: '连接已断开，当前环境数据已过时，正在重新连接…',
   ended: '环境更新已停止。',
   failed: '环境更新失败。',
   actionFailed: '操作失败，请检查当前状态后重试。',
@@ -66,7 +68,9 @@ function Panel(props: PanelProps) {
           h('button', { type: 'button', onClick: props.clearError }, props.t('dismiss')),
         )
       : null,
-    model ? h(SensePanel, { model, ...props.actions }) : null,
+    model
+      ? h(SensePanel, { model: snapshot.status === 'live' ? model : stalePanelModel(model), ...props.actions })
+      : null,
   );
 }
 
@@ -95,12 +99,19 @@ export function apply(ctx: Context): void {
     const unmount = await ctx.remote.$mount(remote);
     yield () => unmount();
     const fiber = ctx.inject(['remote.asiSense', 'slots', 'locale'], (scope) => {
-      const source = scope.remote.asiSense.frames();
-      const frames = createFrameState({
-        async *[Symbol.asyncIterator]() {
-          for await (const frame of source) yield panelModel(frame);
-        },
-        dispose: () => source.dispose(),
+      const frames = createFrameState<SensePanelModel>((disconnected) => {
+        const source = scope.remote.$stream({
+          name: 'environment sense',
+          open: (signal: AbortSignal) => scope.remote.asiSense.frames(signal),
+          carrierFailed: disconnected,
+          ended: () => Object.assign(new Error('Environment stream ended'), { code: 'gateway/carrier-lost' }),
+        });
+        return {
+          async *[Symbol.asyncIterator]() {
+            for await (const frame of source) yield { ...frame, value: panelModel(frame.value) };
+          },
+          dispose: () => source.dispose(),
+        };
       });
       const actions = createActions(scope.remote.asiSense);
       scope.effect(
