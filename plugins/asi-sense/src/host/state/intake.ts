@@ -9,6 +9,7 @@ export class SignalIntake {
 
   constructor(
     private readonly applyOne: (signal: Signal) => ApplyResult,
+    private readonly commit: (signals: Signal[]) => void,
     private readonly emit: (signal: Signal) => void,
   ) {}
 
@@ -25,9 +26,10 @@ export class SignalIntake {
     } finally {
       const signals = this.deferred;
       this.deferred = undefined;
-      publish();
       this.processing = true;
       try {
+        this.commit(signals);
+        publish();
         for (const signal of signals) this.emit(signal);
       } finally {
         this.processing = false;
@@ -46,7 +48,10 @@ export class SignalIntake {
         const result = this.applyOne(next.signal);
         if (result === 'applied') {
           if (this.deferred) this.deferred.push(next.signal);
-          else this.emit(next.signal);
+          else {
+            this.commit([next.signal]);
+            this.emit(next.signal);
+          }
         }
         try {
           next.afterApply?.(result);

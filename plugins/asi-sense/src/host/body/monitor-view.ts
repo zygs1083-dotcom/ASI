@@ -42,10 +42,26 @@ export function autoEvaluator(
   evaluate: (prev: BodyThresholdSample, next: BodyThresholdSample, state: BodyThresholdState) => BodyEvaluation,
   capture: () => View,
 ) {
-  return (prev: BodyThresholdSample, next: BodyThresholdSample, state: BodyThresholdState, commit?: Commit) => {
+  return (
+    prev: BodyThresholdSample,
+    next: BodyThresholdSample,
+    state: BodyThresholdState,
+    commit?: Commit,
+    clock?: { mono(): number; wall(): number },
+  ) => {
     const current = rebaser();
     if (!current) return Promise.reject(new Error('monitor: rebaseline suggestions require persistent tuner'));
     validateSamples(prev, next);
-    return view.run(current, next, state, () => evaluate(prev, next, state), capture, commit);
+    return view.run(
+      current,
+      next,
+      state,
+      () => {
+        const sample = clock ? { ...next, evaluatedAt: { mono: clock.mono(), wall: clock.wall() } } : next;
+        return evaluate(prev, sample, state);
+      },
+      capture,
+      commit,
+    );
   };
 }

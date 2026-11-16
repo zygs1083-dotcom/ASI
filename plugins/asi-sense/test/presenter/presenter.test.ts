@@ -2,6 +2,8 @@ import { createRequire } from 'node:module';
 import type { Body } from '@asi/sense-types';
 import type { SensePanelProps } from '@asi/sense-ui/model';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { attentionLine } from '../../../../packages/sense-ui/src/attention.ts';
+import { evaluateBody } from '../../../../packages/sense-ui/src/health.ts';
 import { createPresenter } from '../../src/host/presenter/index.ts';
 import { createSenseRuntime } from '../../src/host/runtime/index.ts';
 import type { AgentEvent, JobEvent, TokenSnapshot } from '../../src/host/runtime/ports.ts';
@@ -82,6 +84,10 @@ async function harness() {
       mono += ms;
       await vi.advanceTimersByTimeAsync(ms);
     },
+    elapse: (ms: number) => {
+      mono += ms;
+      vi.setSystemTime(Date.now() + ms);
+    },
     sample: async (body: Body) => {
       sample(body);
       await vi.advanceTimersByTimeAsync(0);
@@ -92,6 +98,278 @@ async function harness() {
 }
 
 describe('presenter', () => {
+  it.each([false, true])(
+    'commits every fact deadline before batched notifications with session=%s',
+    async (session) => {
+      const h = await harness();
+      if (session) {
+        await h.agent({ type: 'created', sessionId: 's' });
+        await h.agent({ type: 'pre-step', sessionId: 's' });
+      }
+      const memory = {
+        ...f({ total: 100, used: 30, pressure: 'normal' as const, swapUsed: 0 }),
+        observedAt: Date.now(),
+        ttlMs: 5_000,
+      };
+      const cpu = (usage: number) => ({
+        ...f({ usage, perCore: [usage], load1: 0, load5: 0, load15: 0 }),
+        observedAt: Date.now(),
+        ttlMs: 5_000,
+      });
+      await h.sample(mkBody({ cpu: cpu(0.1), memory }));
+      await h.advance(4_000);
+      const seen: { deadline: number | undefined; remaining: number | undefined; cpu: number | undefined }[] = [];
+      const off = h.runtime.subscribe(() => {
+        seen.push({
+          deadline: h.runtime.factMeta('/self/body/memory')?.deadlineMono,
+          remaining: h.presenter.snapshot().state.self.body.memory.staleInMs,
+          cpu: h.runtime.state().self.body.cpu.value?.usage,
+        });
+      });
+      await h.sample(mkBody({ cpu: cpu(0.9), memory }));
+      expect(seen.length).toBeGreaterThan(1);
+      expect(seen.every((entry) => entry.deadline === 9_000 && entry.remaining === 5_000 && entry.cpu === 0.9)).toBe(
+        true,
+      );
+      off();
+      h.presenter.close();
+      await h.runtime.stop();
+    },
+  );
+
+  it('keeps reentrant reads on the old or fully committed fact deadlines', async () => {
+    const h = await harness();
+    const memory = {
+      ...f({ total: 100, used: 30, pressure: 'normal' as const, swapUsed: 0 }),
+      observedAt: Date.now(),
+      ttlMs: 5_000,
+    };
+    const cpu = (usage: number) => ({
+      ...f({ usage, perCore: [usage], load1: 0, load5: 0, load15: 0 }),
+      observedAt: Date.now(),
+      ttlMs: 5_000,
+    });
+    await h.sample(mkBody({ cpu: cpu(0.1), memory }));
+    await h.advance(4_000);
+    const seen: [number | undefined, number | undefined, number | undefined][] = [];
+    h.observeClock(() =>
+      seen.push([
+        h.runtime.state().self.body.cpu.value?.usage,
+        h.runtime.factMeta('/self/body/cpu')?.deadlineMono,
+        h.runtime.factMeta('/self/body/memory')?.deadlineMono,
+      ]),
+    );
+    await h.sample(mkBody({ cpu: cpu(0.9), memory }));
+    h.observeClock();
+    expect(seen).toContainEqual([0.1, 5_000, 5_000]);
+    expect(seen).toContainEqual([0.9, 9_000, 9_000]);
+    expect(
+      seen.filter((item) => JSON.stringify(item) !== '[0.1,5000,5000]' && JSON.stringify(item) !== '[0.9,9000,9000]'),
+    ).toEqual([]);
+    h.presenter.close();
+    await h.runtime.stop();
+  });
+
+  it('anchors delayed disk rate events to their evidence without hiding the current ETA', async () => {
+    const h = await harness();
+    const start = Date.now();
+    const gib = 1024 ** 3;
+    for (const [delay, observed, free] of [
+      [0, 0, 80],
+      [10_000, 10_000, 79],
+      [10_000, 15_000, 75],
+    ]) {
+      await h.advance(delay);
+      const disks = diskFact([{ mount: '/', total: 100 * gib, free: free * gib, observedAt: start + observed }]);
+      disks.observedAt = start + observed;
+      await h.sample(mkBody({ disks }));
+    }
+    const event = h.runtime.events().find((entry) => entry.kind === 'body.rate');
+    const model = h.presenter.snapshot();
+    const projected = model.events.find((entry) => entry.signal.id === event?.id);
+    expect(event).toMatchObject({ at: start + 20_000, detail: { evidenceAt: start + 15_000 } });
+    expect(model.insights?.['disk:/']?.currentEta?.asOf).toBe(start + 15_000);
+    expect(projected?.signal.at).toBe(start + 15_000);
+    expect(projected?.signal.data.evidenceAt).toBe(start + 15_000);
+    expect(attentionLine(model, evaluateBody(model.state.self.body, model.now, model.insights))).toBe(
+      '磁盘 4 分钟后见底',
+    );
+    h.presenter.close();
+    await h.runtime.stop();
+  });
+
+  it('uses elapsed monotonic time for delayed context ETA alerts and event details', async () => {
+    const h = await harness();
+    const start = Date.now();
+    for (const [delay, observed, remaining] of [
+      [0, 0, 615],
+      [20_000, 10_000, 605],
+    ]) {
+      await h.advance(delay);
+      const tokens = {
+        ...f({
+          contextWindow: 10_000,
+          contextUsed: 10_000 - remaining,
+          sessionUsage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        }),
+        observedAt: start + observed,
+      };
+      await h.sample(mkBody({ tokens }));
+    }
+    expect(h.runtime.body.monitor.restoredState?.['rate:context-eta']).toBe('warn');
+    const event = h.runtime.events().find((entry) => entry.kind === 'body.rate' && entry.detail?.metric === 'context');
+    expect(event).toMatchObject({
+      at: start + 20_000,
+      detail: { evidenceAt: start + 10_000, timeToFloorMs: 595_000, severity: 'warn' },
+    });
+    expect(h.presenter.snapshot().events.find((entry) => entry.signal.id === event?.id)).toMatchObject({
+      signal: { at: start + 10_000, data: { evidenceAt: start + 10_000 } },
+      detail: { timeToFloorMs: 595_000 },
+    });
+    h.presenter.close();
+    await h.runtime.stop();
+  });
+
+  it('evaluates ETA when a received sample waits before publication', async () => {
+    const h = await harness();
+    const start = Date.now();
+    const tokens = (remaining: number, observedAt: number) => ({
+      ...f({
+        contextWindow: 10_000,
+        contextUsed: 10_000 - remaining,
+        sessionUsage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      }),
+      observedAt,
+    });
+    await h.sample(mkBody({ tokens: tokens(615, start) }));
+    await h.advance(20_000);
+    h.sampleRaw(mkBody({ tokens: tokens(605, start + 10_000) }));
+    h.elapse(10_000);
+    await h.settle();
+    const event = h.runtime.events().find((entry) => entry.kind === 'body.rate' && entry.detail?.metric === 'context');
+    expect(event).toMatchObject({
+      at: start + 30_000,
+      detail: { evidenceAt: start + 10_000, timeToFloorMs: 585_000 },
+    });
+    h.presenter.close();
+    await h.runtime.stop();
+  });
+
+  it.each([-61_000, 61_000])('keeps delayed rate event evidence aligned across a %i ms wall jump', async (jump) => {
+    const h = await harness();
+    const start = Date.now();
+    const gib = 1024 ** 3;
+    for (const [delay, observed, free] of [
+      [0, 0, 80],
+      [10_000, 10_000, 79],
+      [10_000, 15_000, 75],
+    ]) {
+      await h.advance(delay);
+      const disks = diskFact([{ mount: '/', total: 100 * gib, free: free * gib, observedAt: start + observed }]);
+      disks.observedAt = start + observed;
+      h.sampleRaw(mkBody({ disks }));
+      if (free === 75) vi.setSystemTime(Date.now() + jump);
+      await h.settle();
+    }
+    const model = h.presenter.snapshot();
+    expect(model.insights?.['disk:/']?.currentEta?.asOf).toBe(start + 15_000);
+    expect(model.events.find((entry) => entry.detail?.kind === 'body.rate')?.signal.at).toBe(start + 15_000);
+    expect(attentionLine(model, evaluateBody(model.state.self.body, model.now, model.insights))).toBe(
+      '磁盘 4 分钟后见底',
+    );
+    h.presenter.close();
+    await h.runtime.stop();
+  });
+
+  it('aggregates disk parent from final volume deadlines after cached republishes', async () => {
+    const h = await harness();
+    const now = Date.now();
+    const disks = diskFact([
+      { mount: '/a', total: 100, free: 80, observedAt: now, ttlMs: 5_000, status: 'ok' },
+      { mount: '/b', total: 100, free: 80, observedAt: now, ttlMs: 7_000, status: 'ok' },
+    ]);
+    disks.observedAt = now;
+    disks.ttlMs = 5_000;
+    await h.sample(mkBody({ disks }));
+    await h.advance(4_000);
+    await h.sample(mkBody({ disks }));
+    expect(h.presenter.snapshot().state.self.body.disks.staleInMs).toBe(3_000);
+    await h.advance(1_000);
+    let result = h.presenter.snapshot().state.self.body.disks;
+    expect(result.status).toBe('ok');
+    expect(result.value?.map((volume) => volume.status)).toEqual(['stale', 'ok']);
+    expect(result.staleInMs).toBe(2_000);
+    expect(h.runtime.factMeta('/self/body/disks')?.deadlineMono).toBe(7_000);
+    await h.sample(mkBody({ disks }));
+    result = h.presenter.snapshot().state.self.body.disks;
+    expect(result.value?.map((volume) => volume.status)).toEqual(['stale', 'ok']);
+    expect(result.staleInMs).toBe(2_000);
+    await h.advance(2_000);
+    result = h.presenter.snapshot().state.self.body.disks;
+    expect(h.runtime.state().self.body.disks.status).toBe('stale');
+    expect(result.status).toBe('stale');
+    expect(result.value?.map((volume) => volume.status)).toEqual(['stale', 'stale']);
+    expect(result.staleInMs).toBeUndefined();
+    h.presenter.close();
+    await h.runtime.stop();
+  });
+
+  it('never revives an expired cached disk when its TTL metadata changes', async () => {
+    const h = await harness();
+    const now = Date.now();
+    const disks = diskFact([{ mount: '/', total: 100, free: 80, observedAt: now, ttlMs: 5_000, status: 'ok' }]);
+    disks.observedAt = now;
+    disks.ttlMs = 5_000;
+    await h.sample(mkBody({ disks }));
+    await h.advance(4_000);
+    await h.sample(mkBody({ disks }));
+    if (!disks.value) throw new Error('missing disk');
+    disks.value[0].ttlMs = 10_000;
+    disks.ttlMs = 10_000;
+    await h.sample(mkBody({ disks }));
+    expect(h.presenter.snapshot().state.self.body.disks.staleInMs).toBe(1_000);
+    await h.advance(1_000);
+    expect(h.presenter.snapshot().state.self.body.disks.status).toBe('stale');
+    disks.value[0].status = 'unavailable';
+    await h.sample(mkBody({ disks }));
+    disks.value[0].status = 'ok';
+    await h.sample(mkBody({ disks }));
+    expect(h.runtime.state().self.body.disks.value?.[0].status).toBe('stale');
+    expect(h.presenter.snapshot().state.self.body.disks).toMatchObject({ status: 'stale' });
+    expect(h.presenter.snapshot().state.self.body.disks.staleInMs).toBeUndefined();
+    await h.advance(1_000);
+    disks.observedAt = Date.now();
+    disks.value[0].observedAt = Date.now();
+    await h.sample(mkBody({ disks }));
+    expect(h.presenter.snapshot().state.self.body.disks.status).toBe('ok');
+    h.presenter.close();
+    await h.runtime.stop();
+  });
+
+  it.each(['denied', 'unsupported'] as const)(
+    'preserves disk collection status %s with or without fresh volumes',
+    async (status) => {
+      const h = await harness();
+      for (const value of [
+        null,
+        [],
+        [{ mount: '/', total: 100, free: 80, status: 'ok' as const, observedAt: Date.now(), ttlMs: 5_000 }],
+      ]) {
+        const disks = diskFact(value, status);
+        disks.observedAt = Date.now();
+        await h.sample(mkBody({ disks }));
+        expect(h.runtime.state().self.body.disks.status).toBe(status);
+        expect(h.runtime.factMeta('/self/body/disks')?.deadlineMono).toBe(Infinity);
+        const presented = h.presenter.snapshot().state.self.body.disks;
+        expect(presented.status).toBe(status);
+        expect(presented.staleInMs).toBeUndefined();
+        if (value?.length) expect(presented.value?.[0].status).toBe('ok');
+      }
+      h.presenter.close();
+      await h.runtime.stop();
+    },
+  );
+
   it.each([false, true])('publishes complete body commits to every subscriber with session=%s', async (session) => {
     const h = await harness();
     if (session) {

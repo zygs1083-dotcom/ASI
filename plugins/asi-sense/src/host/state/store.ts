@@ -33,7 +33,7 @@ export class StateStore {
   private readonly wallClock: () => number;
   private readonly monotonic: () => number;
   private readonly defaultTtlMs: number;
-  private readonly project: (state: SenseState, signal?: Signal) => SenseState;
+  private readonly expiry: FactExpiry;
   private readonly listeners = new Set<(snapshot: SenseState) => void>();
   private readonly state: SenseState;
   private batchState?: { raw: SenseState; projected: SenseState };
@@ -56,7 +56,8 @@ export class StateStore {
         : this.ordering.earlier(signal) || !this.applyOne(signal)
           ? 'older'
           : 'applied',
-    (signal) => this.emit(signal),
+    (signals) => this.expiry.observe(this.state, signals),
+    () => this.emit(),
   );
   /**
    * `monotonicClock` (never `Date.now`) drives job-tombstone retention.
@@ -65,14 +66,14 @@ export class StateStore {
     wallClock: () => number = Date.now,
     defaultTtlMs = 60_000,
     monotonicClock: () => number = () => performance.now(),
-    project?: (state: SenseState, signal?: Signal) => SenseState,
+    expiry?: FactExpiry,
   ) {
     this.wallClock = wallClock;
     this.monotonic = monotonicClock;
     this.defaultTtlMs = defaultTtlMs;
     this.state = initialState(this.wallClock(), defaultTtlMs);
-    const expiry = new FactExpiry({ mono: monotonicClock });
-    this.project = project ?? ((state, signal) => expiry.snapshot(state, signal));
+    this.expiry = expiry ?? new FactExpiry({ mono: monotonicClock });
+    this.expiry.observe(this.state);
   }
   /**
    * Feeds one signal into the fact table and notifies subscribers. The
@@ -101,7 +102,7 @@ export class StateStore {
       return clone;
     }
     const clone = structuredClone(this.state);
-    if (now === undefined) return this.project(clone);
+    if (now === undefined) return this.expiry.snapshot(clone);
     recomputeStatuses(clone, now ?? this.wallClock());
     return clone;
   }
@@ -159,8 +160,8 @@ export class StateStore {
    * added mid-emit fire on the next apply only, and a throwing listener is
    * isolated so it cannot starve the rest of the set or the queue.
    */
-  private emit(signal: Signal): void {
-    const snap = this.project(structuredClone(this.state), signal);
+  private emit(): void {
+    const snap = this.expiry.snapshot(structuredClone(this.state));
     for (const listener of [...this.listeners]) {
       if (!this.listeners.has(listener)) continue;
       try {

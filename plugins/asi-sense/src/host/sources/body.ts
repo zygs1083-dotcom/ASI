@@ -239,7 +239,7 @@ export class BodySource {
     this.sync();
     const pending: Promise<void>[] = [];
     let signals: Signal[] = [];
-    await this.monitor.evaluateAuto(this.previous ?? next, next, this.state, (result, publish) => {
+    const commit: NonNullable<Parameters<typeof this.monitor.evaluateAuto>[3]> = (result, publish) => {
       this.state = result.state;
       this.previous = next;
       signals = [...result.signals];
@@ -266,7 +266,8 @@ export class BodySource {
           this.changed();
         }, publish),
       );
-    });
+    };
+    await this.monitor.evaluateAuto(this.previous ?? next, next, this.state, commit, this.clock);
     await Promise.all(pending);
     for (const signal of signals) this.register(signal);
   }

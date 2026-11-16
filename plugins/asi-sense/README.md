@@ -479,3 +479,12 @@ Regression tests:
 3. Parent and per-volume expiry: `counts down a disk parent until its last fresh volume expires` (`test/presenter/presenter.test.ts`).
 4. Recovery after retry exhaustion: `starts another bounded recovery round after %s` (`test/runtime/helper.test.ts`).
 5. Stop/replacement race: `discards an in-flight snapshot continuation after stop or replacement (%s)` and `does not apply later snapshot fields after stop interrupts an awaited field` (`test/runtime/helper-recovery.test.ts`).
+
+## Core re-review 4 regressions
+
+1. Atomic expiry metadata: `commits every fact deadline before batched notifications with session=%s` and `keeps reentrant reads on the old or fully committed fact deadlines`.
+2. Delayed event evidence: `anchors delayed disk rate events to their evidence without hiding the current ETA` and `keeps delayed rate event evidence aligned across a %i ms wall jump`.
+3. Evaluation-time ETA: `uses elapsed monotonic time for delayed context ETA alerts and event details`, `evaluates ETA when a received sample waits before publication`, and `clamps an already elapsed observation ETA to zero at evaluation` (`test/body/rate.test.ts`).
+4. Disk aggregation and cache expiry: `aggregates disk parent from final volume deadlines after cached republishes` and `never revives an expired cached disk when its TTL metadata changes`.
+
+Tests are in `test/presenter/presenter.test.ts` unless otherwise noted. Rate signals retain their evaluation-time `at` and remaining ETA, alongside the observation `evidenceAt`; panel events project the evidence time to the display timeline, while current ETA remains anchored to the observation. Disk parent status and deadline reflect the final fresh-volume set; repeated cached volume timestamps cannot extend a volume's deadline. Collection-level `denied` and `unsupported` remain unchanged even with no volumes or an explicitly fresh volume, as covered by `preserves disk collection status %s with or without fresh volumes`.

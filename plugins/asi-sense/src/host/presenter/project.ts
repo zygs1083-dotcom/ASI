@@ -123,14 +123,22 @@ export function projectEvents(
   return entries.slice(-200).map((entry) => {
     const hidden = !sendTitles && entry.kind.startsWith('window');
     const detail = hidden ? undefined : eventDetail(entry);
+    const evidenceAt =
+      entry.kind !== 'body.rate'
+        ? undefined
+        : typeof entry.detail?.evidenceMono === 'number'
+          ? at(entry.detail.evidenceMono)
+          : typeof entry.detail?.evidenceAt === 'number'
+            ? fromWall(entry.detail.evidenceAt)
+            : undefined;
     return {
       signal: {
         id: entry.id,
         kind: entry.kind,
-        at: entry.mono === undefined ? fromWall(entry.at) : at(entry.mono),
+        at: evidenceAt ?? (entry.mono === undefined ? fromWall(entry.at) : at(entry.mono)),
         source: entry.source,
         subject: hidden ? '' : entry.subject,
-        data: {},
+        data: evidenceAt === undefined ? {} : { evidenceAt },
       },
       level: entry.reason === 'wake-budget' || entry.reason === 'no-session' ? 'suppressed' : entry.level,
       reason: hidden ? '' : (entry.reason ?? ''),

@@ -10,9 +10,17 @@ const metricPaths: Record<string, string> = {
 };
 
 export class FactExpiry {
-  private readonly deadlines = new Map<
+  private deadlines = new Map<
     string,
-    { stamp: string; at: number; receivedMono: number; observedMono: number; wall: number; fired: boolean }
+    {
+      stamp: string;
+      at: number;
+      receivedMono: number;
+      observedMono: number;
+      wall: number;
+      fired: boolean;
+      volumeAt?: number;
+    }
   >();
   private observationTimes?: Record<string, { wall: number; mono: number }>;
   constructor(private readonly clock: { mono(): number; wall?(): number }) {}
@@ -29,22 +37,28 @@ export class FactExpiry {
     const entry = this.deadlines.get(path);
     return entry && { observedMono: entry.observedMono, deadlineMono: entry.at };
   }
-  observe(state: SenseState, signal?: Signal): void {
+  observe(state: SenseState, signals: Signal[] = []): void {
     const seen = new Set<string>();
-    const touched =
-      signal?.kind === 'fact.updated' && typeof signal.data.path === 'string'
-        ? `/${signal.data.path.replaceAll('.', '/')}`
-        : signal?.kind === 'app.activated'
-          ? '/env/frontApp'
-          : signal?.kind === 'window.focused' || signal?.kind === 'window.title-changed'
-            ? '/env/focusedWindow'
-            : signal?.kind === 'file.changed'
-              ? '/env/watchedPaths'
-              : signal?.kind === 'job.started' || signal?.kind === 'job.exited'
-                ? '/env/activeJobs'
-                : signal?.kind === 'agent.status'
-                  ? '/self/activity'
-                  : '';
+    const deadlines = new Map(this.deadlines);
+    const mono = this.clock.mono();
+    const touched = new Map<string, Signal>();
+    for (const signal of signals) {
+      const path =
+        signal.kind === 'fact.updated' && typeof signal.data.path === 'string'
+          ? `/${signal.data.path.replaceAll('.', '/')}`
+          : signal.kind === 'app.activated'
+            ? '/env/frontApp'
+            : signal.kind === 'window.focused' || signal.kind === 'window.title-changed'
+              ? '/env/focusedWindow'
+              : signal.kind === 'file.changed'
+                ? '/env/watchedPaths'
+                : signal.kind === 'job.started' || signal.kind === 'job.exited'
+                  ? '/env/activeJobs'
+                  : signal.kind === 'agent.status'
+                    ? '/self/activity'
+                    : '';
+      if (path) touched.set(path, signal);
+    }
     const visit = (value: unknown, path: string, reference?: number): void => {
       if (!value || typeof value !== 'object') return;
       if (Array.isArray(value)) {
@@ -65,22 +79,23 @@ export class FactExpiry {
         seen.add(path);
         const stamp = JSON.stringify([entry.status, entry.observedAt, entry.ttlMs, entry.source]);
         const source = entry.source as { id?: string } | undefined;
+        const signal = touched.get(path);
         const received =
-          path === touched &&
+          !!signal &&
           source?.id === signal?.source.id &&
           (entry.observedAt === signal?.at || path === '/env/watchedPaths');
-        if (received || this.deadlines.get(path)?.stamp !== stamp) {
-          const previous = this.deadlines.get(path);
-          const mono = this.clock.mono();
+        if (received || deadlines.get(path)?.stamp !== stamp) {
+          const previous = deadlines.get(path);
           const prefix = '/self/body/disks/value/';
           const metric = path.startsWith(prefix) ? `disk:${path.slice(prefix.length)}` : metricPaths[path];
           const observation = metric && this.observationTimes?.[metric];
-          this.deadlines.set(path, {
+          const deadline = mono + Math.max(0, entry.observedAt + entry.ttlMs - (reference ?? entry.observedAt));
+          const volumeAt = path.startsWith(prefix)
+            ? Math.min(previous?.wall === entry.observedAt ? (previous.volumeAt ?? Infinity) : Infinity, deadline)
+            : undefined;
+          deadlines.set(path, {
             stamp,
-            at:
-              entry.status === 'ok'
-                ? this.clock.mono() + Math.max(0, entry.observedAt + entry.ttlMs - (reference ?? entry.observedAt))
-                : Infinity,
+            at: entry.status === 'ok' ? (volumeAt ?? deadline) : Infinity,
             receivedMono: mono,
             observedMono:
               observation && observation.wall === entry.observedAt
@@ -90,13 +105,14 @@ export class FactExpiry {
                   : mono - Math.max(0, (this.clock.wall?.() ?? entry.observedAt) - entry.observedAt),
             wall: entry.observedAt,
             fired: false,
+            ...(volumeAt === undefined ? {} : { volumeAt }),
           });
         }
       }
       for (const [key, child] of Object.entries(entry)) {
         if (path === '/self/body/disks' && key === 'value') {
           visit(
-            effectiveDisks(state.self.body.disks, state.self.body.disks.observedAt).value,
+            effectiveDisks(state.self.body.disks, Number.NEGATIVE_INFINITY).value,
             `${path}/${key}`,
             state.self.body.disks.observedAt,
           );
@@ -104,13 +120,25 @@ export class FactExpiry {
       }
     };
     visit(state, '');
-    for (const key of this.deadlines.keys()) if (!seen.has(key)) this.deadlines.delete(key);
+    for (const key of deadlines.keys()) if (!seen.has(key)) deadlines.delete(key);
+    const disk = deadlines.get('/self/body/disks');
+    if (disk) {
+      const volumes = effectiveDisks(state.self.body.disks, Number.NEGATIVE_INFINITY).value ?? [];
+      const fresh = volumes.flatMap((volume) => {
+        const deadline = deadlines.get(`/self/body/disks/value/${volume.mount}`);
+        return volume.status === 'ok' && deadline && deadline.at > mono ? [deadline.at] : [];
+      });
+      const status = state.self.body.disks.status;
+      deadlines.set('/self/body/disks', {
+        ...disk,
+        at: status !== 'denied' && status !== 'unsupported' && fresh.length ? Math.max(...fresh) : Infinity,
+      });
+    }
+    this.deadlines = deadlines;
   }
-  snapshot(state: SenseState, signal?: Signal): SenseState {
-    this.observe(state, signal);
-    const disk = this.deadlines.get('/self/body/disks');
-    if (disk)
-      state.self.body.disks = effectiveDisks(state.self.body.disks, disk.wall + this.clock.mono() - disk.receivedMono);
+  snapshot(state: SenseState): SenseState {
+    const mono = this.clock.mono();
+    state.self.body.disks = effectiveDisks(state.self.body.disks, Number.NEGATIVE_INFINITY);
     const visit = (value: unknown, path: string): void => {
       if (!value || typeof value !== 'object') return;
       if (Array.isArray(value)) {
@@ -122,11 +150,12 @@ export class FactExpiry {
       }
       const entry = value as Record<string, unknown>;
       const deadline = this.deadlines.get(path);
-      if (path !== '/self/body/disks' && entry.status === 'ok' && deadline && deadline.at <= this.clock.mono())
+      if (path !== '/self/body/disks' && entry.status === 'ok' && deadline && deadline.at <= mono)
         entry.status = 'stale';
       for (const [key, child] of Object.entries(entry)) visit(child, `${path}/${key}`);
     };
     visit(state, '');
+    state.self.body.disks = effectiveDisks(state.self.body.disks, Number.NEGATIVE_INFINITY);
     return state;
   }
   next(): number | undefined {

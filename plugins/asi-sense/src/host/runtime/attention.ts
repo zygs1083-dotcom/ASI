@@ -65,7 +65,7 @@ export class RuntimeAttention {
       () => clock.wall(),
       60_000,
       () => clock.mono(),
-      (state, signal) => expiry.snapshot(state, signal),
+      expiry,
     );
     this.pipeline = new AttentionPipeline({
       store: this.store,

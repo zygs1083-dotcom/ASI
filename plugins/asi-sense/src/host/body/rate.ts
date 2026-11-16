@@ -38,7 +38,7 @@ interface Point {
 }
 
 export type RateTimes = Record<string, { mono: number; wall: number }>;
-type RateSample = BodyThresholdSample & { rateTimes?: RateTimes };
+type RateSample = BodyThresholdSample & { rateTimes?: RateTimes; evaluatedAt?: { mono: number; wall: number } };
 
 export function captureRateTimes(body: Body, mono: number, receivedWall: number, previous: RateTimes): RateTimes {
   const next: RateTimes = {};
@@ -139,7 +139,8 @@ export class RateEvaluator implements BodyEvaluator {
     if (!Number.isFinite(mono) || (inHist?.lastMono !== undefined && mono <= inHist.lastMono)) {
       return { signals: [], state: pub };
     }
-    const metrics = readMetrics(next);
+    const evaluation = (next as RateSample).evaluatedAt ?? { mono, wall: next.at };
+    const metrics = readMetrics({ ...next, at: next.at + Math.max(0, evaluation.mono - mono) });
     const windows: Record<string, RateWindow> = {};
     for (const [k, w] of Object.entries(inHist?.windows ?? {})) {
       if (metrics.has(k)) windows[k] = w; // missing metric → window dropped, latch retained
@@ -166,7 +167,7 @@ export class RateEvaluator implements BodyEvaluator {
       if (!old || observedMono > old.lastMono) {
         pts.push({ at: observedMono, value: metric.value, ...(stamp ? { wall: stamp.wall } : {}) });
       }
-      pts = pts.filter((p) => p.at >= mono - this.retention(key));
+      pts = pts.filter((p) => p.at >= evaluation.mono - this.retention(key));
       const w: RateWindow = { points: pts, lastMono: old ? Math.max(old.lastMono, observedMono) : observedMono };
       updated.set(key, w);
       return w;
@@ -178,10 +179,10 @@ export class RateEvaluator implements BodyEvaluator {
       for (const key of this.metricKeys(rule, metrics)) {
         const metric = metrics.get(key) as Metric;
         const w = windowFor(key, metric);
-        const pts = w.points.filter((p) => p.at >= mono - rule.windowMs);
+        const pts = w.points.filter((p) => p.at >= evaluation.mono - rule.windowMs);
         if (windows[key] && w.lastMono === windows[key].lastMono) continue;
         if (pts.length < 2) continue;
-        const sig = this.step(rule, key, metric, pts, next, pub, streamLatch);
+        const sig = this.step(rule, key, metric, pts, next, pub, streamLatch, evaluation);
         if (sig) signals.push(sig);
       }
     }
@@ -205,6 +206,7 @@ export class RateEvaluator implements BodyEvaluator {
     next: BodyThresholdSample,
     pub: BodyThresholdState,
     streamLatch: Record<string, 'normal' | 'warn'>,
+    evaluation: { mono: number; wall: number },
   ): BodySignal | undefined {
     const first = pts[0];
     const last = pts[pts.length - 1];
@@ -212,7 +214,10 @@ export class RateEvaluator implements BodyEvaluator {
     const slope = ols(pts);
     if (slope === undefined) return undefined; // degenerate x — cannot measure a rate
     const floor = rule.floor ?? metric.floor;
-    const eta = floor !== undefined && slope < 0 ? Math.max(0, ((last.value - floor) / -slope) * 1000) : undefined;
+    const observedEta =
+      floor !== undefined && slope < 0 ? Math.max(0, ((last.value - floor) / -slope) * 1000) : undefined;
+    const eta =
+      observedEta === undefined ? undefined : Math.max(0, observedEta - Math.max(0, evaluation.mono - last.at));
     let magnitude: number;
     let limit: number;
     if (rule.maxEtaMs !== undefined) {
@@ -250,6 +255,8 @@ export class RateEvaluator implements BodyEvaluator {
       delta,
       slope,
       direction: rule.direction,
+      evidenceAt: last.wall ?? next.at - (next.monotonicAt - last.at),
+      evidenceMono: last.at,
     };
     if (eta !== undefined) {
       data.etaToFloorMs = data.timeToFloorMs = eta;
@@ -257,7 +264,7 @@ export class RateEvaluator implements BodyEvaluator {
     return {
       id: `${next.source.id}:${latchKey}:${next.monotonicAt}:${severity}`,
       kind: 'body.rate',
-      at: next.at,
+      at: evaluation.wall,
       source: next.source,
       subject: latchKey,
       layer: 'rate',
