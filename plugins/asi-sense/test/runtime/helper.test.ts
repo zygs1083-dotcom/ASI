@@ -502,6 +502,77 @@ describe('helper protocol integration', () => {
     await h.runtime.stop();
   });
 
+  it('accepts a snapshot without an app or window as a known empty desktop', async () => {
+    const h = setup();
+    await h.runtime.start();
+    await h.settle();
+    const child = h.children[0];
+    child.snapshotReply = false;
+    child.send({ type: 'error', code: 'output_overflow', dropped: 1 });
+    await h.settle();
+    child.send({ type: 'snapshot', thermal: 'nominal' });
+    await h.settle();
+    expect(h.runtime.state().env.frontApp).toMatchObject({ status: 'ok', value: null });
+    expect(h.runtime.state().env.focusedWindow).toMatchObject({ status: 'ok', value: null });
+    expect(h.runtime.state().observation.sources.helper?.status).toBe('ok');
+    await h.runtime.stop();
+  });
+
+  it('retries incomplete snapshots with bounded exponential backoff and recovers', async () => {
+    const h = setup();
+    await h.runtime.start();
+    await h.settle();
+    const child = h.children[0];
+    child.snapshotReply = false;
+    let snapshots = 0;
+    child.stdin.on('data', (chunk: Buffer) => {
+      if (chunk.toString().includes('"snapshot"')) snapshots++;
+    });
+    child.send({ type: 'error', code: 'output_overflow', dropped: 1 });
+    await h.settle();
+    expect(snapshots).toBe(1);
+    const incomplete = { type: 'snapshot', frontApp: { name: 'ExampleApp', bundleId: 'example.app' } };
+    child.send(incomplete);
+    await h.settle();
+    await h.advance(1_999);
+    expect(snapshots).toBe(1);
+    await h.advance(1);
+    expect(snapshots).toBe(2);
+    child.send(incomplete);
+    await h.settle();
+    await h.advance(4_000);
+    expect(snapshots).toBe(3);
+    child.send({ type: 'snapshot', thermal: 'critical' });
+    await h.settle();
+    expect(h.runtime.state().observation.sources.helper?.status).toBe('ok');
+    await h.advance(60_000);
+    expect(snapshots).toBe(3);
+    await h.runtime.stop();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('stops retrying incomplete snapshots after ten attempts', async () => {
+    const h = setup();
+    await h.runtime.start();
+    await h.settle();
+    const child = h.children[0];
+    child.snapshotReply = false;
+    let snapshots = 0;
+    child.stdin.on('data', (chunk: Buffer) => {
+      if (chunk.toString().includes('"snapshot"')) snapshots++;
+    });
+    child.send({ type: 'error', code: 'output_overflow', dropped: 1 });
+    await h.settle();
+    for (let i = 0; i < 11; i++) {
+      child.send({ type: 'snapshot', frontApp: { name: 'ExampleApp', bundleId: 'example.app' } });
+      await h.settle();
+      await h.advance(Math.min(60_000, 2_000 * 2 ** i));
+    }
+    expect(snapshots).toBe(11);
+    expect(h.runtime.state().observation.sources.helper?.status).toBe('unavailable');
+    await h.runtime.stop();
+  });
+
   it('applies complete snapshot fields after an unusable incremental thermal event', async () => {
     const h = setup();
     await h.runtime.start();

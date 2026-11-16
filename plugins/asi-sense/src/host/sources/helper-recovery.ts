@@ -36,9 +36,10 @@ export class HelperRecovery {
 export function missingSnapshot(event: Message): string[] {
   const app = object(event.frontApp);
   const window = object(event.focusedWindow);
+  const empty = !Object.hasOwn(event, 'frontApp') && !Object.hasOwn(event, 'focusedWindow');
   return [
-    ...(!validApp(app) ? ['frontApp'] : []),
-    ...(!window || !['ok', 'unknown', 'denied', 'unsupported'].includes(String(window.status))
+    ...(!empty && !validApp(app) ? ['frontApp'] : []),
+    ...(!empty && (!window || !['ok', 'unknown', 'denied', 'unsupported'].includes(String(window.status)))
       ? ['focusedWindow']
       : []),
     ...(!['nominal', 'fair', 'serious', 'critical'].includes(String(event.thermal)) ? ['thermal'] : []),
@@ -87,6 +88,23 @@ export async function applyHelperEvent(
   body: BodySource,
 ): Promise<boolean> {
   if (raw.type !== 'snapshot') recovery.delta(raw);
+  if (raw.type === 'snapshot' && !Object.hasOwn(raw, 'frontApp') && !Object.hasOwn(raw, 'focusedWindow')) {
+    for (const [field, path] of [
+      ['frontApp', 'env.frontApp'],
+      ['focusedWindow', 'env.focusedWindow'],
+    ] as const) {
+      if (recovery.degraded && recovery.dirty.has(field)) continue;
+      attention.store.apply({
+        id: attention.id(),
+        kind: 'fact.updated',
+        at: raw.at as number,
+        source: { id: `helper.${field}`, api: 'ndjson', host: 'local' },
+        subject: path,
+        data: { path, value: null, status: 'ok', ttlMs: 60_000, preserveSourceStatus: recovery.degraded },
+      });
+    }
+    attention.changed();
+  }
   await helperEvent(safe, attention, body, recovery.degraded, recovery.degraded ? recovery.dirty : undefined);
   if (!recovery.degraded || raw.type !== 'snapshot') return false;
   const missing = missingSnapshot(raw);

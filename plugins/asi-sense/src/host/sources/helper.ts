@@ -13,6 +13,8 @@ export class HelperSource {
   private child?: ChildProcessWithoutNullStreams;
   private stopped = false;
   private retry?: number;
+  private snapshotRetry?: number;
+  private snapshotAttempts = 0;
   private deadline?: number;
   private crashes: number[] = [];
   private session?: string;
@@ -26,7 +28,6 @@ export class HelperSource {
   private readonly writer = new HelperWriter((child) => this.fail('stdin-error', child));
   private recovery = new HelperRecovery();
   private lastFailure?: string;
-
   constructor(
     private readonly spawner: HelperSpawner,
     private readonly path: string | undefined,
@@ -47,10 +48,9 @@ export class HelperSource {
     this.launch();
   }
   nextDeadline(): number | undefined {
-    const deadlines = [this.retry, this.deadline, ...[...this.children.values()].map((child) => child.killAt)].filter(
-      (value): value is number => value !== undefined,
-    );
-    return deadlines.length ? Math.min(...deadlines) : undefined;
+    const kill = [...this.children.values()].map((child) => child.killAt);
+    const due = [this.retry, this.deadline, this.snapshotRetry, ...kill].filter((v): v is number => v !== undefined);
+    return due.length ? Math.min(...due) : undefined;
   }
   tick(): void {
     const now = this.clock.mono();
@@ -61,6 +61,10 @@ export class HelperSource {
       }
     }
     if (this.deadline !== undefined && now >= this.deadline) this.fail('handshake-timeout');
+    if (this.snapshotRetry !== undefined && now >= this.snapshotRetry) {
+      this.snapshotRetry = undefined;
+      this.requestSnapshot();
+    }
     if (this.retry !== undefined && now >= this.retry) {
       if (this.children.size) this.retry = now + 50;
       else {
@@ -81,6 +85,7 @@ export class HelperSource {
   async stop(): Promise<void> {
     this.stopped = true;
     this.retry = undefined;
+    this.snapshotRetry = undefined;
     this.deadline = undefined;
     this.child = undefined;
     this.writer.stop();
@@ -217,6 +222,7 @@ export class HelperSource {
       return;
     }
     if (raw.type === 'error') {
+      if (!this.recovery.degraded) this.snapshotAttempts = 0;
       this.recovery.degraded = true;
       markHelperFacts(this.attention, this.body, raw.at as number, ['frontApp', 'focusedWindow', 'thermal'], 'stale');
       const code = await helperError(this.attention, raw);
@@ -234,10 +240,16 @@ export class HelperSource {
         return;
       }
     }
-    if (
-      await applyHelperEvent(this.recovery, raw, (this.titles ? raw : strip(raw)) as Message, this.attention, this.body)
-    )
+    const safe = (this.titles ? raw : strip(raw)) as Message;
+    const recovered = await applyHelperEvent(this.recovery, raw, safe, this.attention, this.body);
+    if (recovered) {
+      this.snapshotRetry = undefined;
+      this.snapshotAttempts = 0;
       await this.status('ok', 'snapshot');
+    } else if (raw.type === 'snapshot' && this.recovery.degraded && this.snapshotAttempts < 10) {
+      this.snapshotRetry = this.clock.mono() + Math.min(60_000, 2_000 * 2 ** this.snapshotAttempts++);
+    }
+    this.reschedule();
   }
   private async status(status: 'ok' | 'unavailable' | 'error', reason: string): Promise<void> {
     await helperStatus(this.attention, this.clock.wall(), status, reason, this.crashes.length, this.lastFailure);
@@ -271,6 +283,7 @@ export class HelperSource {
   }
   private restart(reason: string): void {
     this.deadline = undefined;
+    this.snapshotRetry = undefined;
     this.titles = false;
     this.lastFailure = reason;
     if (this.stopped) return;
