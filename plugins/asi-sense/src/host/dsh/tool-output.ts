@@ -1,8 +1,33 @@
+import os from 'node:os';
 import { isRemoteJsonValue } from '@deepseek-ai/dsh-typert-protocol';
 import type { createSenseRuntime } from '../runtime/index.ts';
 import type { JsonValue } from './wire-types.ts';
 
 const MAX_BYTES = 32_768;
+
+export function modelText(value: string, hostname = os.hostname()): string {
+  const safe = value
+    .replace(/https?:\/\/[^\s"'<>]+/gi, '[endpoint]')
+    .replace(/(?<![\w<])(?:[A-Za-z]:\\|\/)(?:[^\s"'<>/\\]+[/\\])*[^\s"'<>/\\]*/g, (path) => {
+      const parts = path.split(/[\\/]/).filter(Boolean);
+      return parts.at(-1) ?? '[path]';
+    });
+  return hostname ? safe.replace(new RegExp(hostname.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi'), '[host]') : safe;
+}
+
+function minimize(value: JsonValue, hostname: string): JsonValue {
+  if (typeof value === 'string') return modelText(value, hostname);
+  if (Array.isArray(value)) return value.map((item) => minimize(item, hostname));
+  if (value === null || typeof value !== 'object') return value;
+  const entries = Object.fromEntries(
+    Object.entries(value)
+      .filter(([key]) => key !== 'host' && key !== 'endpoint' && key !== 'command' && key !== 'userSession')
+      .map(([key, child]) => [modelText(key, hostname), minimize(child, hostname)]),
+  );
+  if ('api' in entries && 'id' in entries && !('value' in entries)) entries.host = 'local';
+  if ('os' in entries && 'pid' in entries) delete entries.pid;
+  return entries;
+}
 
 function json(value: unknown): JsonValue {
   const text = JSON.stringify(value, (_key, item: unknown) => {
@@ -39,7 +64,7 @@ function ages(value: JsonValue, now: number): JsonValue {
 }
 
 export function modelOutput(value: unknown, now?: number): JsonValue {
-  const normalized = json(value);
+  const normalized = minimize(json(value), os.hostname());
   const result = now === undefined ? normalized : ages(normalized, now);
   if (Buffer.byteLength(JSON.stringify(result), 'utf8') <= MAX_BYTES) return result;
   return {
@@ -50,8 +75,8 @@ export function modelOutput(value: unknown, now?: number): JsonValue {
 
 type Runtime = Pick<ReturnType<typeof createSenseRuntime>, 'tools' | 'events' | 'rules'>;
 
-export function environmentDetail(runtime: Runtime, app?: string, window?: string): JsonValue {
-  const snapshot = runtime.tools.envState();
+export function environmentDetail(runtime: Runtime, app?: string, window?: string, sessionId?: string): JsonValue {
+  const snapshot = runtime.tools.envState(undefined, sessionId);
   if (!('env' in snapshot) || !('observation' in snapshot)) throw new TypeError('full sense state unavailable');
   const { env, observation } = snapshot;
   const front = env.frontApp.value;

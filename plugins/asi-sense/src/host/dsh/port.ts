@@ -1,4 +1,5 @@
 import { execFile } from 'node:child_process';
+import { performance } from 'node:perf_hooks';
 import { promisify } from 'node:util';
 import type { Context } from '@deepseek-ai/cordis';
 import type { Agent } from '@deepseek-ai/dsh-agent';
@@ -21,15 +22,18 @@ const open = promisify(execFile);
 export function createDshPort(
   ctx: Context,
   sendTitles: () => boolean,
+  mono: () => number = () => performance.now(),
 ): DshPort & {
   onDeliveryCommitted(cb: (sessionId: string, id: string) => void): () => void;
-  nowReadings(): NowReadings;
+  nowReadings(sessionId?: string): NowReadings;
   onNowChanged(cb: () => void): () => void;
 } {
   const resolve = (id: string): Agent | undefined => ctx.agents.get(SessionId(id));
   const activeTools = new Map<string, ActiveTool>();
   const executingTools = new Map<string, string>();
-  const thinking = new Set<string>();
+  const thinking = new Map<string, { agent: Agent; revision: number; attemptId: string; at: number }>();
+  const revisions = new WeakMap<Agent, number>();
+  const waiting = new Map<string, { agent: Agent; tokens: Set<symbol> }>();
   let selected: string | undefined;
   const committed = new Set<(sessionId: string, id: string) => void>();
   const jobs = new JobEventCorrelator(activeTools);
@@ -71,13 +75,30 @@ export function createDshPort(
     );
   };
   return {
-    nowReadings: () => nowReadings(ctx, selected, executingTools, thinking),
+    nowReadings: (sessionId) =>
+      nowReadings(
+        ctx,
+        sessionId,
+        executingTools,
+        new Set(
+          [...thinking]
+            .filter(([id, stream]) => resolve(id) === stream.agent && mono() - stream.at < 30_000)
+            .map(([id]) => id),
+        ),
+        new Set([...waiting].filter(([id, item]) => resolve(id) === item.agent).map(([id]) => id)),
+      ),
     onNowChanged(cb) {
       let active = true;
       const notify = () => {
         if (active) cb();
       };
-      const offStatus = ctx.on('agent/status', notify);
+      const offStatus = ctx.on('agent/status', ({ agent, status }) => {
+        if (status === 'idle') {
+          thinking.delete(agent.id);
+          waiting.delete(agent.id);
+        }
+        notify();
+      });
       const offInbox = ctx.on('agent/inbox/inserted', notify);
       const offClaim = ctx.on('agent/inbox/claimed', notify);
       const offDiscard = ctx.on('agent/inbox/discarded', notify);
@@ -85,6 +106,7 @@ export function createDshPort(
       const offExecute = ctx.on('tools/execute', async (exec, next) => {
         if (!exec.agent) return next();
         const key = `${exec.agent.id}:${exec.callId}`;
+        thinking.delete(exec.agent.id);
         executingTools.set(key, exec.agent.id);
         notify();
         try {
@@ -95,11 +117,46 @@ export function createDshPort(
         }
       });
       const offStream = ctx.on('agent/assistant-stream', ({ agent, frame }) => {
-        if (frame.type === 'start') thinking.add(agent.id);
-        else if (frame.type === 'end') thinking.delete(agent.id);
-        else return;
+        if (resolve(agent.id) !== agent) return;
+        const current = thinking.get(agent.id);
+        if (current && mono() - current.at >= 30_000) thinking.delete(agent.id);
+        if (frame.type === 'start') {
+          if (agent.status === 'idle') return;
+          if (frame.revision <= (revisions.get(agent) ?? 0)) return;
+          revisions.set(agent, frame.revision);
+          thinking.set(agent.id, { agent, revision: frame.revision, attemptId: frame.attemptId, at: mono() });
+        } else if (
+          thinking.get(agent.id) === current &&
+          current?.agent === agent &&
+          current.revision === frame.revision &&
+          current.attemptId === frame.attemptId
+        ) {
+          if (frame.type === 'end') thinking.delete(agent.id);
+          else current.at = mono();
+        } else return;
         notify();
       });
+      const interaction = async (request: { agent: Agent }, next: () => Promise<unknown>) => {
+        const existing = waiting.get(request.agent.id);
+        const requests =
+          existing?.agent === request.agent ? existing : { agent: request.agent, tokens: new Set<symbol>() };
+        const token = Symbol();
+        requests.tokens.add(token);
+        waiting.set(request.agent.id, requests);
+        notify();
+        try {
+          return await next();
+        } finally {
+          requests.tokens.delete(token);
+          if (!requests.tokens.size && waiting.get(request.agent.id) === requests) waiting.delete(request.agent.id);
+          notify();
+        }
+      };
+      const onInteraction = ctx as unknown as {
+        on(name: string, listener: typeof interaction, options: { prepend: boolean; global: boolean }): () => void;
+      };
+      const offApproval = onInteraction.on('approval/request', interaction, { prepend: true, global: true });
+      const offQuestions = onInteraction.on('user-questions/request', interaction, { prepend: true, global: true });
       const offJobs = ctx.jobs.events.subscribe({ owners: 'all' }, (event) => {
         if (event.type !== 'output') notify();
       });
@@ -112,8 +169,11 @@ export function createDshPort(
         offTools();
         offExecute();
         offStream();
+        offApproval();
+        offQuestions();
         offJobs();
         thinking.clear();
+        waiting.clear();
         executingTools.clear();
       };
     },
@@ -135,6 +195,7 @@ export function createDshPort(
         }
         turns.delete(agent.id);
         thinking.delete(agent.id);
+        waiting.delete(agent.id);
         deliver.clear(agent.id);
         call(cb, { type: 'disposed', sessionId: agent.id });
       });
@@ -246,6 +307,13 @@ export function createDshPort(
       };
     },
     deliver,
+    modelJobs(sessionId) {
+      if (!resolve(sessionId)) return [];
+      return ctx.jobs
+        .list(SessionId(sessionId))
+        .filter((job) => job.owner === sessionId && (job.status === 'running' || job.status === 'stopping'))
+        .map((job) => ({ id: job.id, startedAt: job.startedAt, status: 'running' as const }));
+    },
     async tokenSnapshot(sessionId) {
       const agent = resolve(sessionId);
       if (!agent) return undefined;

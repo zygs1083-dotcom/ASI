@@ -51,7 +51,7 @@ function harness(options: SenseOptions = {}) {
     delivered,
     agent: (event: AgentEvent) => agent(event),
     tool: (event: ToolEvent) => tool(event),
-    job: (event: JobEvent) => job(event),
+    job: (event: JobEvent) => job({ sessionId: 's', ...event }),
     elapseMono: (ms: number) => {
       mono += ms;
     },

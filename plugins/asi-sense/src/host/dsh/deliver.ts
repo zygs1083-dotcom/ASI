@@ -4,6 +4,7 @@ import { freezeMessage, MessageId, type UserMessage } from '@deepseek-ai/dsh-llm
 import { DeliveryFailure } from '../attention/drain.ts';
 import type { DeliveryIntent } from '../attention/pipeline.ts';
 import { formatEnvUpdate } from '../delivery/format.ts';
+import { modelText } from './tool-output.ts';
 
 declare module '@deepseek-ai/dsh-llm' {
   interface MessageSourceMap {
@@ -24,7 +25,14 @@ export function createDelivery(
       id: MessageId(id),
       role: 'user',
       source: { kind: 'environment' },
-      content: [{ type: 'text', text: formatEnvUpdate(intent.update, { includeWindowTitles: sendTitles() }) }],
+      content: [
+        {
+          type: 'text',
+          text: modelText(
+            formatEnvUpdate(intent.update, { includeWindowTitles: sendTitles(), includeJobCommands: false }),
+          ),
+        },
+      ],
     });
   const perform = async (sessionId: string, intent: DeliveryIntent, id: string): Promise<void> => {
     const agent = getAgent(sessionId);

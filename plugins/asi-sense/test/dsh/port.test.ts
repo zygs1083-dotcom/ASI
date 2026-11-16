@@ -534,7 +534,7 @@ describe('uncommitted context routing', () => {
     await h.step(h.b, undefined, false);
     expect(h.b.send).toHaveBeenCalledTimes(1);
     const message = vi.mocked(h.b.send).mock.calls[0]?.[0];
-    expect(JSON.stringify(message)).toContain('job: `group` exited');
+    expect(JSON.stringify(message)).toContain('job: `job` exited');
     expect(JSON.stringify(message)).toContain('job.failed');
     expect(h.attention.pipeline.suppressed).toBe(0);
   });

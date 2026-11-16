@@ -12,7 +12,7 @@ import { createSenseRuntime } from '../../src/host/runtime/index.ts';
 import type { SensePorts } from '../../src/host/runtime/ports.ts';
 import { StateStore } from '../../src/host/state/store.ts';
 
-async function fixture() {
+async function fixture(liveState = false) {
   const ctx = new Context();
   await ctx.plugin(SystemPrompt);
   await ctx.plugin(ToolsService);
@@ -31,6 +31,16 @@ async function fixture() {
     probe: { create: () => ({ onSample: () => () => {}, start: () => {}, stop: async () => {} }) },
     files: { watch: () => ({ close: () => {} }) },
   };
+  const jobs = [
+    { id: 'a-job', owner: 'session-a', command: 'private-a-command', status: 'running' as const, startedAt: 1 },
+    { id: 'b-job', owner: 'session-b', command: 'private-b-command', status: 'running' as const, startedAt: 2 },
+    { id: 'orphan', owner: undefined, command: 'private-orphan-command', status: 'running' as const, startedAt: 3 },
+  ];
+  Object.assign(ports.dsh, {
+    nowReadings: () => ({ 'env.activeJobs': { value: jobs } }),
+    modelJobs: (session: string) =>
+      jobs.filter((job) => job.owner === session).map(({ id, status, startedAt }) => ({ id, status, startedAt })),
+  });
   const live = createSenseRuntime(ports, { platform: 'linux' });
   await live.start();
   const state = new StateStore(() => 990).snapshot();
@@ -61,7 +71,7 @@ async function fixture() {
       },
     ],
   };
-  const off = registerSenseTools(ctx, runtime, ports.clock.wall);
+  const off = registerSenseTools(ctx, liveState ? live : runtime, ports.clock.wall);
   const id = SessionId('synthetic-tool-test');
   const agent: Agent = {
     id,
@@ -93,13 +103,19 @@ async function fixture() {
     await live.stop();
     await ctx.fiber.dispose();
   });
-  const call = (name: string, args: object, options: { agent?: boolean; signal?: AbortSignal } = {}) =>
+  const call = (
+    name: string,
+    args: object,
+    options: { agent?: boolean; signal?: AbortSignal; session?: string } = {},
+  ) =>
     executeToolFixture(ctx, {
       callId: ToolCallId(`call-${name}`),
       name,
       arguments: args,
       signal: options.signal ?? new AbortController().signal,
-      ...(options.agent === false ? {} : { agent }),
+      ...(options.agent === false
+        ? {}
+        : { agent: options.session ? { ...agent, id: SessionId(options.session) } : agent }),
     });
   return { ctx, live, state, call, off, setTitles: (value: boolean) => (titles = value) };
 }
@@ -146,6 +162,53 @@ describe('model-facing tools', () => {
     const hidden = await h.call('env_detail', { window: 'Synthetic title' });
     expect(hidden).toMatchObject({ isError: false, value: { match: 'unknown', window: { value: null } } });
     expect(JSON.stringify(hidden.value)).not.toContain('Synthetic title');
+  });
+
+  it('minimizes machine, endpoint, paths, and foreign job commands in model output', async () => {
+    const h = await fixture();
+    h.state.env.where.harness.value = { host: 'fixture-host.invalid', os: 'FixtureOS', pid: 123 };
+    h.state.env.where.observed.value = { host: 'fixture-host.invalid', userSession: 'fixture' };
+    h.state.env.where.toolExec.value = { host: 'fixture-host.invalid', cwd: '/private/fixture/work' };
+    h.state.env.where.model.value = {
+      provider: 'fixture-provider',
+      endpoint: 'https://fixture-host.invalid:443',
+      local: false,
+    };
+    h.state.self.activity.source.host = 'fixture-host.invalid';
+    h.state.env.frontApp.source.host = 'fixture-host.invalid';
+    h.state.env.watchedPaths.value = { '/private/fixture/project': { changes: 0, lastChange: 0 } };
+    h.state.env.activeJobs.value = [{ id: 'foreign', startedAt: 1, status: 'running', command: 'foreign-command' }];
+    const result = await h.call('env_state', {});
+    const text = JSON.stringify(result.value);
+    expect(text).not.toContain('fixture-host.invalid');
+    expect(text).not.toContain('/private/fixture');
+    expect(text).not.toContain('foreign-command');
+    expect(result.value).toMatchObject({
+      env: {
+        where: {
+          harness: { value: { os: 'FixtureOS' } },
+          model: { value: { provider: 'fixture-provider', local: false } },
+        },
+      },
+    });
+    expect(JSON.stringify((await h.call('env_detail', {})).value)).not.toContain('fixture-host.invalid');
+  });
+
+  it('isolates actual model state by caller while retaining all jobs in the local panel state', async () => {
+    const h = await fixture(true);
+    expect(JSON.stringify(h.live.state().env.activeJobs)).toContain('private-orphan-command');
+    for (const [session, own, foreign] of [
+      ['session-a', 'a-job', 'b-job'],
+      ['session-b', 'b-job', 'a-job'],
+    ]) {
+      const result = await h.call('env_state', { section: 'env' }, { session });
+      expect(result).toMatchObject({ isError: false, value: { activeJobs: { value: [{ id: own }] } } });
+      const text = JSON.stringify(result.value);
+      expect(text).not.toContain(foreign);
+      expect(text).not.toContain('orphan');
+      expect(text).not.toContain('private-');
+      expect(JSON.stringify((await h.call('env_detail', {}, { session })).value)).not.toContain('private-');
+    }
   });
 
   it('proposes wake rules as an agent, does not remove user rules, and respects cancellation', async () => {

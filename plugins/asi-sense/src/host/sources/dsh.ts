@@ -87,12 +87,12 @@ export class DshSource {
   }
   private refresh(): void {
     if (!this.active || this.paused()) return;
-    const extended = this.port as DshPort & { nowReadings?: () => NowReadings };
+    const extended = this.port as DshPort & { nowReadings?: (sessionId?: string) => NowReadings };
     const reason = this.instances.size ? 'DSH 未提供事实来源' : '没有活动会话';
     let readings: NowReadings;
     try {
       readings =
-        extended.nowReadings?.() ??
+        extended.nowReadings?.(this.attention.currentSessionId()) ??
         Object.fromEntries(
           [
             'env.where.model',
@@ -154,8 +154,12 @@ export class DshSource {
       const valid = () =>
         this.active && !!instance && this.instances.get(event.sessionId) === instance && this.selection === sequence;
       if (!instance) return;
-      if (!this.paused()) await this.body.tokens(event.sessionId, valid);
-      if (valid()) await this.attention.preStep(event.sessionId, event.userInitiated, !this.paused());
+      try {
+        if (!this.paused()) await this.body.tokens(event.sessionId, valid);
+        if (valid()) await this.attention.preStep(event.sessionId, event.userInitiated, !this.paused());
+      } finally {
+        this.requestRefresh();
+      }
     }
     if (event.type === 'post-step') {
       this.attention.postStep(event.sessionId);
@@ -188,6 +192,7 @@ export class DshSource {
           cause: 'agent',
           data: {
             id: event.toolCallId,
+            sessionId: event.sessionId,
             command: event.command,
             pid: event.pid ?? window?.pid,
             ppid: event.ppid,
@@ -210,6 +215,7 @@ export class DshSource {
         subject: event.command ?? event.id,
         data: {
           id: event.id,
+          sessionId: event.sessionId,
           command: event.command,
           pid: event.pid,
           ppid: event.ppid,

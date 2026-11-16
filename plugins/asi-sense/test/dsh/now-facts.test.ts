@@ -1,5 +1,5 @@
-import type { Context } from '@deepseek-ai/cordis';
-import { describe, expect, it } from 'vitest';
+import { Context } from '@deepseek-ai/cordis';
+import { describe, expect, it, vi } from 'vitest';
 import { nowReadings } from '../../src/host/dsh/now-facts.ts';
 import { createDshPort } from '../../src/host/dsh/port.ts';
 
@@ -30,7 +30,7 @@ function fixture() {
   let failTools = false;
   let agents = [agent];
   const ctx = {
-    agents: { list: () => agents },
+    agents: { list: () => agents, get: (id: string) => agents.find((item) => item.id === id) },
     jobs: {
       list: (id?: string) => {
         if (failJobs) throw new Error('private fixture details');
@@ -122,7 +122,7 @@ describe('DSH now facts', () => {
     expect(facts['self.activity']).toEqual({ value: 'tool' });
     f.setAgents([f.agent, { ...f.agent, id: 'other-session' }]);
     facts = nowReadings(f.ctx, undefined, new Map(), new Set());
-    expect(facts['self.pending']).toMatchObject({ status: 'unknown', reason: '没有明确的当前会话' });
+    expect(facts['self.pending']).toMatchObject({ status: 'unknown', reason: '没有活动会话' });
   });
 
   it('classifies a configured remote endpoint without leaking its path or query', () => {
@@ -143,6 +143,36 @@ describe('DSH now facts', () => {
     expect(facts['self.pending']).toMatchObject({ status: 'unavailable', reason: 'DSH 任务列表不可用' });
     expect(facts['self.tools']).toMatchObject({ status: 'unavailable', reason: 'DSH 工具列表不可用' });
     expect(JSON.stringify(facts)).not.toContain('private fixture details');
+  });
+
+  it('counts only the selected session jobs, not unowned jobs', () => {
+    const f = fixture();
+    f.jobs.push({
+      id: 'unowned',
+      owner: undefined as never,
+      status: 'running',
+      startedAt: 30,
+      label: 'orphan-command',
+    });
+    const facts = nowReadings(f.ctx, f.agent.id, new Map(), new Set());
+    expect(facts['self.pending']).toEqual({ value: { inbox: 3, jobs: 1 } });
+    expect(facts['env.activeJobs'].value).toHaveLength(2);
+  });
+
+  it('reads only owned job summaries for each model session', () => {
+    const f = fixture();
+    const other = { ...f.agent, id: 'other-session' };
+    f.setAgents([f.agent, other]);
+    f.jobs.push(
+      { id: 'other-job', owner: other.id, status: 'running', startedAt: 30, label: 'private-other-command' },
+      { id: 'orphan', owner: undefined as never, status: 'running', startedAt: 40, label: 'private-orphan-command' },
+    );
+    const ctx = f.ctx as unknown as Record<string, unknown>;
+    ctx.sessionProjections = { register: async () => ({}) };
+    const port = createDshPort(f.ctx, () => false);
+    expect(port.modelJobs?.(f.agent.id)).toEqual([{ id: 'job-1', startedAt: 10, status: 'running' }]);
+    expect(port.modelJobs?.(other.id)).toEqual([{ id: 'other-job', startedAt: 30, status: 'running' }]);
+    expect(port.modelJobs?.('missing')).toEqual([]);
   });
 
   it('tracks dispatched tools until they settle without notifying after disposal', async () => {
@@ -171,13 +201,137 @@ describe('DSH now facts', () => {
           release = resolve;
         }),
     );
-    expect(port.nowReadings()['self.activity']).toEqual({ value: 'tool' });
+    expect(port.nowReadings(f.agent.id)['self.activity']).toEqual({ value: 'tool' });
     expect(notifications).toBe(1);
     off();
     release('fixture-result');
     await expect(result).resolves.toBe('fixture-result');
     expect(notifications).toBe(1);
-    expect(port.nowReadings()['self.activity']).toMatchObject({ status: 'unknown' });
+    expect(port.nowReadings(f.agent.id)['self.activity']).toMatchObject({ status: 'unknown' });
     expect(listeners.size).toBe(0);
+  });
+
+  it('expires lost streams, ignores late end frames and does not reuse old lifecycle state', () => {
+    vi.useFakeTimers();
+    try {
+      const f = fixture();
+      f.agent.status = 'running';
+      const ctx = f.ctx as unknown as Record<string, unknown>;
+      const listeners = new Map<string, (...args: never[]) => void>();
+      ctx.on = (event: string, callback: (...args: never[]) => void) => {
+        listeners.set(event, callback);
+        return () => listeners.delete(event);
+      };
+      ctx.jobs = { ...(ctx.jobs as object), events: { subscribe: () => () => {} } };
+      ctx.sessionProjections = { register: async () => ({}) };
+      let mono = 0;
+      const port = createDshPort(
+        f.ctx,
+        () => false,
+        () => mono,
+      );
+      const off = port.onNowChanged(() => {});
+      const stream = listeners.get('agent/assistant-stream') as unknown as (event: unknown) => void;
+      const status = listeners.get('agent/status') as unknown as (event: unknown) => void;
+      stream({ agent: f.agent, frame: { type: 'start', attemptId: 'first', revision: 1 } });
+      expect(port.nowReadings(f.agent.id)['self.activity']).toEqual({ value: 'thinking' });
+      mono += 31_000;
+      expect(port.nowReadings(f.agent.id)['self.activity']).toMatchObject({ status: 'unknown' });
+      stream({ agent: f.agent, frame: { type: 'chunk', attemptId: 'first', revision: 1 } });
+      expect(port.nowReadings(f.agent.id)['self.activity']).toMatchObject({ status: 'unknown' });
+      stream({ agent: f.agent, frame: { type: 'start', attemptId: 'second', revision: 2 } });
+      stream({ agent: f.agent, frame: { type: 'end', attemptId: 'first', revision: 1 } });
+      expect(port.nowReadings(f.agent.id)['self.activity']).toEqual({ value: 'thinking' });
+      status({ agent: f.agent, status: 'idle' });
+      stream({ agent: f.agent, frame: { type: 'start', attemptId: 'first', revision: 1 } });
+      expect(port.nowReadings(f.agent.id)['self.activity']).toMatchObject({ status: 'unknown' });
+      const replacement = { ...f.agent };
+      f.setAgents([replacement]);
+      expect(port.nowReadings(replacement.id)['self.activity']).toMatchObject({ status: 'unknown' });
+      off();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it.each(['approval/request', 'user-questions/request'])(
+    'tracks local %s until its answerer settles',
+    async (name) => {
+      const f = fixture();
+      f.agent.status = 'running';
+      const ctx = f.ctx as unknown as Record<string, unknown>;
+      const listeners = new Map<string, unknown>();
+      ctx.on = (event: string, callback: unknown) => {
+        listeners.set(event, callback);
+        return () => listeners.delete(event);
+      };
+      ctx.jobs = { ...(ctx.jobs as object), events: { subscribe: () => () => {} } };
+      ctx.sessionProjections = { register: async () => ({}) };
+      const port = createDshPort(f.ctx, () => false);
+      const off = port.onNowChanged(() => {});
+      const execute = listeners.get('tools/execute') as (
+        event: unknown,
+        next: () => Promise<unknown>,
+      ) => Promise<unknown>;
+      const request = listeners.get(name) as (event: unknown, next: () => Promise<unknown>) => Promise<unknown>;
+      let releaseTool!: () => void;
+      const tool = execute(
+        { agent: f.agent, callId: 'tool' },
+        () =>
+          new Promise<void>((resolve) => {
+            releaseTool = resolve;
+          }),
+      );
+      let answer!: () => void;
+      const waiting = request(
+        { agent: f.agent },
+        () =>
+          new Promise<void>((resolve) => {
+            answer = resolve;
+          }),
+      );
+      expect(port.nowReadings(f.agent.id)['self.activity']).toEqual({ value: 'waiting-user' });
+      answer();
+      await waiting;
+      expect(port.nowReadings(f.agent.id)['self.activity']).toEqual({ value: 'tool' });
+      releaseTool();
+      await tool;
+      off();
+    },
+  );
+
+  it('observes an already-registered local answerer that does not delegate', async () => {
+    const f = fixture();
+    f.agent.status = 'running';
+    const bus = new Context();
+    const events = bus as unknown as {
+      on(name: string, listener: (...args: never[]) => unknown): () => void;
+      waterfall(name: string, request: unknown, next: () => Promise<unknown>): Promise<unknown>;
+    };
+    let answer!: () => void;
+    const offAnswerer = events.on(
+      'approval/request',
+      () =>
+        new Promise<void>((resolve) => {
+          answer = resolve;
+        }),
+    );
+    const ctx = f.ctx as unknown as Record<string, unknown>;
+    ctx.on = bus.on.bind(bus);
+    ctx.jobs = { ...(ctx.jobs as object), events: { subscribe: () => () => {} } };
+    ctx.sessionProjections = { register: async () => ({}) };
+    const port = createDshPort(f.ctx, () => false);
+    const off = port.onNowChanged(() => {});
+    try {
+      const request = events.waterfall('approval/request', { agent: f.agent }, async () => undefined);
+      expect(port.nowReadings(f.agent.id)['self.activity']).toEqual({ value: 'waiting-user' });
+      answer();
+      await request;
+      expect(port.nowReadings(f.agent.id)['self.activity']).toMatchObject({ status: 'unknown' });
+    } finally {
+      off();
+      offAnswerer();
+      await bus.fiber.dispose();
+    }
   });
 });

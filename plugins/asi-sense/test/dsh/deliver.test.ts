@@ -2,6 +2,7 @@ import type { EnvUpdate } from '@asi/sense-types';
 import { describe, expect, it, vi } from 'vitest';
 import type { DeliveryIntent } from '../../src/host/attention/pipeline.ts';
 import { createDelivery } from '../../src/host/dsh/deliver.ts';
+import { modelText } from '../../src/host/dsh/tool-output.ts';
 
 const update: EnvUpdate = {
   since: Date.UTC(2026, 0, 1, 12, 1, 3),
@@ -54,7 +55,7 @@ describe('DSH environment delivery', () => {
       content: [
         {
           type: 'text',
-          text: '<env-update since="12:01:03" source="asi-sense">\njob: `false` exited 1\n</env-update>',
+          text: '<env-update since="12:01:03" source="asi-sense">\njob: `job` exited 1\n</env-update>',
         },
       ],
     });
@@ -66,6 +67,40 @@ describe('DSH environment delivery', () => {
     await deliver('session-a', intent('inject'));
     expect(agent.inject).not.toHaveBeenCalled();
     expect(await deliver.messages('session-a')).toMatchObject([{ source: { kind: 'environment' } }]);
+  });
+
+  it('redacts absolute paths, endpoints and command labels at the model boundary', async () => {
+    const { agent, deliver } = fixture();
+    const mixed: EnvUpdate = {
+      ...update,
+      changes: [
+        {
+          ...update.changes[0],
+          signal: { ...update.changes[0].signal, data: { command: 'private-command /private/path', exitCode: 1 } },
+        },
+        {
+          count: 1,
+          level: 'context',
+          signal: {
+            id: 'file',
+            kind: 'file.changed',
+            at: update.at,
+            source: { id: 'files', api: 'fixture', host: 'fixture-host.invalid' },
+            subject: '/private/project/file.ts',
+            data: { path: '/private/project/file.ts' },
+          },
+          note: 'https://fixture-host.invalid:1234/private',
+        },
+      ],
+    };
+    await deliver('session-a', { ...intent('followup'), update: mixed });
+    const text = JSON.stringify(agent.followup.mock.calls);
+    expect(text).not.toContain('private-command');
+    expect(text).not.toContain('/private/');
+    expect(text).not.toContain('fixture-host.invalid');
+    expect(text).toContain('file.ts');
+    expect(text).toContain('</env-update>');
+    expect(modelText('title on fixture-host.invalid', 'fixture-host.invalid')).toBe('title on [host]');
   });
 
   it('rejects unknown or mismatched sessions rather than broadcasting', async () => {

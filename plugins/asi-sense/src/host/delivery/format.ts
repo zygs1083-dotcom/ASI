@@ -8,6 +8,7 @@ export interface FormatOptions {
    * @default true
    */
   includeWindowTitles?: boolean;
+  includeJobCommands?: boolean;
 }
 
 const WINDOW_KINDS: ReadonlySet<string> = new Set(['window.focused', 'window.title-changed']);
@@ -47,7 +48,7 @@ function durationMs(s: Signal): number | undefined {
   return undefined;
 }
 
-function changeLines(ch: EnvChange, includeTitles: boolean): string[] {
+function changeLines(ch: EnvChange, includeTitles: boolean, includeJobCommands: boolean): string[] {
   const s = ch.signal;
   let main: string;
   if (s.kind === 'app.activated') {
@@ -62,7 +63,7 @@ function changeLines(ch: EnvChange, includeTitles: boolean): string[] {
     main = `file: ${esc(path)} saved${ch.count > 1 ? ` ×${ch.count}` : ''}`;
   } else if (s.kind === 'job.exited' || s.kind === 'process.exited') {
     const label = s.kind === 'job.exited' ? 'job' : 'process';
-    const cmd = str(s.data.command) || s.subject;
+    const cmd = includeJobCommands ? str(s.data.command) || s.subject : str(s.data.id) || label;
     main = `${label}: \`${esc(cmd)}\` exited`;
     if (typeof s.data.exitCode === 'number') main += ` ${s.data.exitCode}`;
     const dur = durationMs(s);
@@ -98,7 +99,7 @@ export function formatEnvUpdate(update: EnvUpdate, options: FormatOptions = {}):
   const includeTitles = options.includeWindowTitles ?? true;
   const changes = [...update.changes].sort((a, b) => a.signal.at - b.signal.at || (a.signal.id < b.signal.id ? -1 : 1));
   const lines = [`<env-update since="${esc(hhmmss(update.since))}" source="asi-sense">`];
-  for (const ch of changes) lines.push(...changeLines(ch, includeTitles));
+  for (const ch of changes) lines.push(...changeLines(ch, includeTitles, options.includeJobCommands ?? true));
   if (update.suppressed > 0) lines.push(`suppressed: ${update.suppressed}`);
   if ((update.alreadyInjected ?? 0) > 0) lines.push(`另有 ${update.alreadyInjected} 条已在上一步注入`);
   lines.push('</env-update>');

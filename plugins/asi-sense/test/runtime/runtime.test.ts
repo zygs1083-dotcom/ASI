@@ -22,7 +22,7 @@ import { f, mkBody } from '../body/helpers.ts';
 
 afterEach(() => vi.useRealTimers());
 
-function harness(savedSettings?: string, options: SenseOptions = {}, nowReadings?: () => NowReadings) {
+function harness(savedSettings?: string, options: SenseOptions = {}, nowReadings?: (session?: string) => NowReadings) {
   vi.useFakeTimers();
   vi.setSystemTime(1_700_000_000_000);
   let mono = 0;
@@ -111,7 +111,7 @@ function harness(savedSettings?: string, options: SenseOptions = {}, nowReadings
     delivered,
     agent: (event: AgentEvent) => agent(event),
     tool: (event: ToolEvent) => tool(event),
-    job: (event: JobEvent) => job(event),
+    job: (event: JobEvent) => job({ sessionId: runtime.currentSessionId(), ...event }),
     file: async (event: FileChange) => {
       file(event);
       await vi.advanceTimersByTimeAsync(0);
@@ -183,6 +183,73 @@ describe('host runtime', () => {
     expect(vi.getTimerCount()).toBe(0);
   });
 
+  it('uses the delivery target for now facts after the latest session closes', async () => {
+    const h = harness(undefined, {}, (id) => ({ 'self.tools': { value: id ? [id] : [] } }));
+    await h.runtime.start();
+    for (const sessionId of ['a', 'b', 'c']) {
+      await h.agent({ type: 'created', sessionId });
+      await h.agent({ type: 'pre-step', sessionId });
+      await vi.advanceTimersByTimeAsync(0);
+    }
+    expect(h.runtime.state().self.tools.value).toEqual(['c']);
+    await h.agent({ type: 'disposed', sessionId: 'c' });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(h.runtime.state().self.tools.value).toEqual(['b']);
+    await h.agent({ type: 'pre-step', sessionId: 'a' });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(h.runtime.state().self.tools.value).toEqual(['a']);
+    await h.agent({ type: 'disposed', sessionId: 'b' });
+    await h.agent({ type: 'disposed', sessionId: 'a' });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(h.runtime.state().self.tools.value).toEqual([]);
+    await h.runtime.stop();
+  });
+
+  it('never delivers foreign or unowned job commands after retargeting', async () => {
+    const h = harness();
+    await h.runtime.start();
+    for (const sessionId of ['a', 'b']) await h.agent({ type: 'created', sessionId });
+    await h.agent({ type: 'pre-step', sessionId: 'a' });
+    await h.job({ type: 'exited', id: 'a-job', sessionId: 'a', command: 'private-a-command', exitCode: 1 });
+    await h.job({ type: 'exited', id: 'orphan', sessionId: undefined, command: 'private-orphan-command', exitCode: 1 });
+    await h.agent({ type: 'pre-step', sessionId: 'b' });
+    await h.advance(3_000);
+    expect(JSON.stringify(h.delivered)).not.toContain('private-a-command');
+    expect(JSON.stringify(h.delivered)).not.toContain('private-orphan-command');
+    expect(JSON.stringify(h.delivered)).not.toContain('orphan');
+    expect(h.runtime.events().some((event) => event.subject === 'private-orphan-command')).toBe(true);
+    await h.job({ type: 'exited', id: 'b-job', sessionId: 'b', command: 'private-b-command', exitCode: 1 });
+    await h.advance(3_000);
+    expect(h.delivered).toContainEqual(
+      expect.objectContaining({
+        sessionId: 'b',
+        kind: 'send',
+        update: expect.objectContaining({
+          changes: expect.arrayContaining([
+            expect.objectContaining({ signal: expect.objectContaining({ subject: 'b-job' }) }),
+          ]),
+        }),
+      }),
+    );
+    expect(JSON.stringify(h.delivered)).not.toContain('private-b-command');
+    await h.runtime.stop();
+  });
+
+  it('does not transfer an old job to a recreated session with the same id', async () => {
+    const h = harness();
+    await h.runtime.start();
+    await h.agent({ type: 'created', sessionId: 'a' });
+    await h.agent({ type: 'pre-step', sessionId: 'a' });
+    await h.job({ type: 'exited', id: 'old-job', sessionId: 'a', command: 'private-old-command', exitCode: 1 });
+    await h.agent({ type: 'disposed', sessionId: 'a' });
+    await h.agent({ type: 'created', sessionId: 'a' });
+    await h.agent({ type: 'pre-step', sessionId: 'a' });
+    await h.advance(3_000);
+    expect(JSON.stringify(h.delivered)).not.toContain('old-job');
+    expect(JSON.stringify(h.delivered)).not.toContain('private-old-command');
+    await h.runtime.stop();
+  });
+
   it('keeps token read failures distinct from missing usage until session presence changes', async () => {
     const h = harness();
     h.ports.dsh.tokenSnapshot = async () => {
@@ -252,8 +319,8 @@ describe('host runtime', () => {
     await h.agent({ type: 'created', sessionId: 'a' });
     await h.agent({ type: 'created', sessionId: 'b' });
     await h.agent({ type: 'pre-step', sessionId: 'a', userInitiated: true });
-    await h.job({ type: 'exited', id: 'failed-job', exitCode: 1 });
-    await h.advance(2_000);
+    await h.file({ path: '/workspace/retry.txt', change: 'modify' });
+    await h.advance(5_000);
     await h.advance(1_000);
     expect(attempts).toBe(2);
     await h.agent({ type: 'pre-step', sessionId: 'b', userInitiated: true }).catch(() => {});
@@ -557,7 +624,7 @@ describe('host runtime', () => {
     await h.job({ type: 'exited', id: 'wake', exitCode: 1 });
     await h.advance(2_000);
     expect(h.delivered).toEqual([]);
-    expect(h.runtime.events().find((event) => event.subject === 'wake')?.reason).toBe('no-session');
+    expect(h.runtime.events().find((event) => event.subject === 'wake')?.reason).toBe('session-private');
     await h.runtime.stop();
   });
 
@@ -612,18 +679,18 @@ describe('host runtime', () => {
     await h.agent({ type: 'created', sessionId: 'b' });
     await h.agent({ type: 'pre-step', sessionId: 'a' });
     await h.agent({ type: 'post-step', sessionId: 'a' });
-    await h.job({ type: 'exited', id: 'first', command: 'first', exitCode: 1 });
-    const signalId = h.runtime.events().find((event) => event.subject === 'first')?.id;
+    await h.file({ path: '/workspace/first', change: 'modify' });
+    const signalId = h.runtime.events().find((event) => event.subject === '/workspace/first')?.id;
     await h.agent({ type: 'pre-step', sessionId: 'b' });
-    await h.advance(2_000);
+    await h.advance(5_000);
     expect(h.delivered[0]).toMatchObject({ kind: 'send', sessionId: 'b', target: 'next-step' });
     expect(h.delivered[0]?.deliveryId).toBe(
       createHash('sha256')
         .update(JSON.stringify(['b', [signalId]]))
         .digest('hex'),
     );
-    await h.job({ type: 'exited', id: 'second', command: 'second', exitCode: 1 });
-    await h.advance(2_000);
+    await h.file({ path: '/workspace/second', change: 'modify' });
+    await h.advance(5_000);
     await h.agent({ type: 'pre-step', sessionId: 'b' });
     expect(h.delivered[1]).toMatchObject({ kind: 'inject', sessionId: 'b' });
     await h.runtime.stop();
@@ -644,8 +711,8 @@ describe('host runtime', () => {
     await h.agent({ type: 'created', sessionId: 'a' });
     await h.agent({ type: 'pre-step', sessionId: 'a' });
     await h.agent({ type: 'post-step', sessionId: 'a' });
-    await h.job({ type: 'exited', id: 'failed', exitCode: 1 });
-    await h.advance(2_000);
+    await h.file({ path: '/workspace/failed', change: 'modify' });
+    await h.advance(5_000);
     await h.agent({ type: 'disposed', sessionId: 'a' });
     await h.advance(1_000);
     expect(h.delivered).toEqual([]);
@@ -1194,15 +1261,20 @@ describe('host runtime', () => {
   it('bounds no-session context by subject and reports evictions', async () => {
     const h = harness();
     await h.runtime.start();
-    for (let i = 0; i < 205; i++) await h.job({ type: 'exited', id: `job-${i}`, exitCode: 0 });
-    await h.job({ type: 'exited', id: 'job-204', exitCode: 0 });
+    await h.runtime.actions.toggleRule('files-wake', false);
+    await h.runtime.tools.envWatch({
+      action: 'add',
+      rule: { id: 'files-context', match: { kind: 'file.changed', subject: '/workspace/**' }, level: 'context' },
+    });
+    for (let i = 0; i < 205; i++) await h.file({ path: `/workspace/file-${i}`, change: 'modify' });
+    await h.file({ path: '/workspace/file-204', change: 'modify' });
     expect(h.runtime.events().some((event) => event.reason === 'pending-evicted:5')).toBe(true);
     await h.agent({ type: 'created', sessionId: 's' });
     await h.agent({ type: 'pre-step', sessionId: 's' });
     const changes = h.delivered.flatMap((intent) => intent.update.changes);
     expect(changes).toHaveLength(200);
-    expect(changes.find((change) => change.signal.subject === 'job-204')?.count).toBe(2);
-    expect(changes.some((change) => change.signal.subject === 'job-0')).toBe(false);
+    expect(changes.find((change) => change.signal.subject === '/workspace/file-204')?.count).toBe(2);
+    expect(changes.some((change) => change.signal.subject === '/workspace/file-0')).toBe(false);
     await h.runtime.stop();
   });
 
@@ -1276,21 +1348,26 @@ describe('host runtime', () => {
   it('records a no-session wake as suppressed and retains context for the first session', async () => {
     const h = harness();
     await h.runtime.start();
-    await h.job({ type: 'exited', id: 'failure', command: 'pnpm test', exitCode: 1 });
-    await h.job({ type: 'exited', id: 'success', command: 'pnpm test', exitCode: 0 });
+    await h.file({ path: '/workspace/failure', change: 'modify' });
     expect(h.runtime.events()).toContainEqual(
       expect.objectContaining({
-        kind: 'job.exited',
+        kind: 'file.changed',
         level: 'wake',
         reason: 'no-session',
       }),
     );
+    await h.runtime.actions.toggleRule('files-wake', false);
+    await h.runtime.tools.envWatch({
+      action: 'add',
+      rule: { id: 'files-context', match: { kind: 'file.changed', subject: '/workspace/**' }, level: 'context' },
+    });
+    await h.file({ path: '/workspace/success', change: 'modify' });
     await h.agent({ type: 'created', sessionId: 's' });
     await h.agent({ type: 'pre-step', sessionId: 's' });
     expect(h.delivered).toHaveLength(1);
     expect(h.delivered[0]).toMatchObject({
       kind: 'inject',
-      update: { changes: [{ signal: { data: { exitCode: 0 } } }] },
+      update: { changes: [{ signal: { subject: '/workspace/success' } }] },
     });
     await h.runtime.stop();
   });

@@ -36,6 +36,7 @@ export class RuntimeAttention {
   private batchEntries?: EventLog;
   private readonly pending = new PendingContext(this.mark.bind(this), (id) => this.entries.some((e) => e.id === id));
   private readonly sessions = new Map<string, SessionContext>();
+  private readonly sessionTokens = new Map<string, string>();
   private readonly recent: string[] = [];
   private readonly inflight = new Set<Promise<void>>();
   private selected?: string;
@@ -75,6 +76,23 @@ export class RuntimeAttention {
         deliver: async (intent) => {
           if (this.stopped) throw new Error('stopped');
           const safe = structuredClone(intent);
+          safe.update.changes = safe.update.changes.filter(
+            ({ signal }) =>
+              signal.source.id !== 'dsh' ||
+              !signal.kind.startsWith('job.') ||
+              (signal.data.sessionId === intent.sessionId &&
+                signal.data.sessionToken === this.sessionTokens.get(intent.sessionId)),
+          );
+          if (!safe.update.changes.length) throw new DeliveryFailure('exhausted');
+          for (const { signal } of safe.update.changes) {
+            if (signal.source.id === 'dsh' && signal.kind.startsWith('job.')) {
+              signal.subject = typeof signal.data.id === 'string' ? signal.data.id : 'job';
+              delete signal.data.command;
+              delete signal.data.path;
+              delete signal.data.sessionId;
+              delete signal.data.sessionToken;
+            }
+          }
           if (!this.titlesAllowed()) {
             for (const change of safe.update.changes) {
               change.signal.data = withoutTitles(change.signal.data) as Signal['data'];
@@ -126,6 +144,9 @@ export class RuntimeAttention {
     return events;
   }
   current(): string | undefined {
+    return this.currentSessionId();
+  }
+  currentSessionId(): string | undefined {
     return this.selected;
   }
   feedback(id: string, verdict: 'useful' | 'noise'): void {
@@ -145,9 +166,11 @@ export class RuntimeAttention {
   }
   create(id: string): void {
     this.sessions.set(id, { id, busy: false, userInitiated: false });
+    this.sessionTokens.set(id, randomUUID());
   }
   dispose(id: string): void {
     this.sessions.delete(id);
+    this.sessionTokens.delete(id);
     this.pipeline.disposeSession(id);
     this.pending.suspend(id, this.pipeline);
     const index = this.recent.indexOf(id);
@@ -202,6 +225,22 @@ export class RuntimeAttention {
       typeof evaluated === 'number' && Number.isFinite(evaluated)
         ? evaluated
         : this.clock.mono() - Math.max(0, this.clock.wall() - signal.at);
+    if (
+      signal.source.id === 'dsh' &&
+      signal.kind.startsWith('job.') &&
+      (!signal.data.sessionId || signal.data.sessionId !== this.currentSessionId())
+    ) {
+      await new Promise<void>((resolve) =>
+        this.store.apply(signal, () => {
+          this.log({ signal, level: 'record', reason: 'session-private' }, mono);
+          resolve();
+        }),
+      );
+      return;
+    }
+    if (signal.source.id === 'dsh' && signal.kind.startsWith('job.')) {
+      signal.data.sessionToken = this.sessionTokens.get(signal.data.sessionId as string);
+    }
     const session = this.selected && this.sessions.get(this.selected);
     if (!session) {
       const prior = this.store.snapshot().observation.sources[signal.source.id];

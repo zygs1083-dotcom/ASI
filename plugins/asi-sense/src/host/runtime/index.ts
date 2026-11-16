@@ -223,7 +223,18 @@ export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}
   };
   const guarded = guardActions(unguarded, () => generation, check);
   const actions = guarded.actions;
-  const tools = runtimeTools(attention, body, settings, actions, files, syncRules, check, () => allowTitles, changed);
+  const tools = runtimeTools(
+    attention,
+    body,
+    settings,
+    actions,
+    files,
+    syncRules,
+    check,
+    () => allowTitles,
+    changed,
+    deliveryPort,
+  );
   function stop(): Promise<void> {
     if (stopping) return stopping;
     generation++;
@@ -278,6 +289,7 @@ export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}
       }
     },
     stop,
+    currentSessionId: () => attention.currentSessionId(),
     state: () => attention.state(),
     factMeta: (path: string) => expiry.factMeta(path),
     subscribe: listeners.subscribe,

@@ -30,7 +30,7 @@ export function createSenseTools(runtime: Runtime, now: () => number) {
     output,
     async execute({ section }, exec) {
       requireAgent(exec);
-      return modelOutput(runtime.tools.envState(section), now());
+      return modelOutput(runtime.tools.envState(section, exec.agent?.id), now());
     },
   });
   const envWatch = defineTool({
@@ -90,7 +90,7 @@ export function createSenseTools(runtime: Runtime, now: () => number) {
     async execute(args, exec) {
       requireAgent(exec);
       bounded(args);
-      return environmentDetail(runtime, args.app, args.window);
+      return environmentDetail(runtime, args.app, args.window, exec.agent?.id);
     },
   });
   const bodyTune = defineTool({

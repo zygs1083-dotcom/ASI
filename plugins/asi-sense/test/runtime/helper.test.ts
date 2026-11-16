@@ -17,6 +17,8 @@ class FakeChild extends EventEmitter {
   readonly commands: { cmd: string; id: string; enabled: boolean }[] = [];
   closed = false;
   gen = 0;
+  permission: 'granted' | 'denied' = 'granted';
+  rechecks = 0;
   snapshotReply = true;
   pendingWrites: { chunk: string; callback: (error?: Error | null) => void }[] = [];
   constructor(
@@ -44,6 +46,9 @@ class FakeChild extends EventEmitter {
             focusedWindow: { status: 'ok', pid: 123 },
             thermal: 'nominal',
           });
+        } else if (command.cmd === 'recheck-permissions') {
+          this.rechecks++;
+          this.send({ type: 'hello', session: 'fixture-session', permissions: { accessibility: this.permission } });
         }
       }
     });
@@ -162,6 +167,34 @@ function setup(autoAck = true, stubborn = false, holdWrites = false) {
 afterEach(() => vi.useRealTimers());
 
 describe('helper protocol integration', () => {
+  it('rechecks permission without prompting and invalidates it immediately on helper loss', async () => {
+    const h = setup();
+    await h.runtime.start();
+    await h.settle();
+    const child = h.children[0];
+    if (!child) throw new Error('missing helper');
+    expect(h.runtime.state().self.permissions).toMatchObject({ value: { 辅助功能: 'granted' } });
+    expect(h.runtime.state().self.permissions.ttlMs).toBeLessThanOrEqual(60_000);
+    child.permission = 'denied';
+    await h.advance(30_000);
+    await h.settle();
+    expect(child.rechecks).toBeGreaterThan(0);
+    expect(h.runtime.state().self.permissions).toMatchObject({ value: { 辅助功能: 'denied' } });
+    child.permission = 'granted';
+    await h.advance(30_000);
+    await h.settle();
+    expect(h.runtime.state().self.permissions).toMatchObject({ value: { 辅助功能: 'granted' } });
+    child.send({ type: 'error', code: 'fixture-error' });
+    await h.settle();
+    expect(h.runtime.state().self.permissions).toMatchObject({ value: null, status: 'unknown' });
+    child.send({ type: 'hello', session: 'fixture-session', permissions: { accessibility: 'granted' } });
+    await h.settle();
+    child.crash();
+    await h.settle();
+    expect(h.runtime.state().self.permissions).toMatchObject({ value: null, status: 'unknown' });
+    await h.runtime.stop();
+  });
+
   it('restarts three times and emits one context after exceeding the restart limit', async () => {
     const h = setup();
     await h.runtime.start();

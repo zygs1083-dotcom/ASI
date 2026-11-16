@@ -44,11 +44,11 @@ export function nowReadings(
   selected: string | undefined,
   executingTools: ReadonlyMap<string, string>,
   thinking: ReadonlySet<string>,
+  waitingSessions: ReadonlySet<string> = new Set(),
 ): NowReadings {
   const agents = ctx.agents.list();
-  const agent: Agent | undefined =
-    agents.find((item) => item.id === selected) ?? (agents.length === 1 ? agents[0] : undefined);
-  const reason = agents.length ? '没有明确的当前会话' : '没有活动会话';
+  const agent: Agent | undefined = agents.find((item) => item.id === selected);
+  const reason = '没有活动会话';
   const missing = { value: null, status: 'unknown' as const, reason };
   const result: NowReadings = {
     'env.where.model': missing,
@@ -76,7 +76,7 @@ export function nowReadings(
     if (agent) {
       selectedJobs = perSession
         .get(agent.id)
-        ?.filter((job) => job.status === 'running' || job.status === 'stopping').length;
+        ?.filter((job) => job.owner === agent.id && (job.status === 'running' || job.status === 'stopping')).length;
     }
   } catch {
     result['env.activeJobs'] = { value: null, status: 'unavailable', reason: 'DSH 任务列表不可用' };
@@ -97,12 +97,15 @@ export function nowReadings(
     result['env.where.model'] = { value: null, status: 'unknown', reason: '会话尚未选择模型' };
   }
   const gateway = (ctx as Context & { get(name: 'typertGateway'): PendingGateway | undefined }).get('typertGateway');
-  const waiting = gateway
-    ?.getPendingRemoteEvents()
-    .some(
-      (event) =>
-        event.agentId === agent.id && (event.event === 'approval/request' || event.event === 'user-questions/request'),
-    );
+  const waiting =
+    waitingSessions.has(agent.id) ||
+    gateway
+      ?.getPendingRemoteEvents()
+      .some(
+        (event) =>
+          event.agentId === agent.id &&
+          (event.event === 'approval/request' || event.event === 'user-questions/request'),
+      );
   const executing = [...executingTools.values()].includes(agent.id);
   result['self.activity'] =
     agent.status === 'idle'
