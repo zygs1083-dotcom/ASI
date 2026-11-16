@@ -14,6 +14,7 @@ private struct SessionControl<O> {
   // Only delivered focus commits dedup; stale posts remain unreported.
   var deliveredApp = -1, deliveredWin = -1
   var pendingApp = -1, pendingWin = -1, pendingID = 0
+  var focusUndelivered = false, focusRetryPosted = false, focusRetryAgain = false
 }
 
 public final class AXSession<B: AXBackend> {
@@ -26,6 +27,8 @@ public final class AXSession<B: AXBackend> {
   private let toMain: (@escaping () -> Void) -> Void
   private let emit: (_ event: any Encodable) -> Void
   private let emitFocus: (WindowEvent, @escaping (Bool) -> Void) -> Void
+  private let canRetryFocus: () -> Bool
+  private let onFocusUndelivered: (() -> Void)?
   private let nowMs: () -> Int64, isTrusted: () -> Bool
   private let uptime: () -> TimeInterval
   private let schedule: (TimeInterval, DispatchWorkItem) -> Void
@@ -45,10 +48,13 @@ public final class AXSession<B: AXBackend> {
   private let refreshState = Locked<(posted: Bool, pending: Bool, appGen: Int, privGen: Int)>((false, false, 0, 0))
   private let titleState = Locked<(posted: Bool, element: B.Element?, appGen: Int, privGen: Int)>((false, nil, 0, 0))
   private let privState = Locked<(posted: Bool, pending: Bool, gen: Int)>((false, false, 0))
+  private let queuedControlJobs = Locked(0)
 
   public init(backend: B, isTrusted: @escaping () -> Bool, nowMs: @escaping () -> Int64,
               emit: @escaping (_ event: any Encodable) -> Void,
               emitFocus: ((WindowEvent, @escaping (Bool) -> Void) -> Void)? = nil,
+              canRetryFocus: @escaping () -> Bool = { true },
+              onFocusUndelivered: (() -> Void)? = nil,
               queue: DispatchQueue = .init(label: "asi-sense-helper.ax"),
               toMain: @escaping (@escaping () -> Void) -> Void = { DispatchQueue.main.async(execute: $0) },
               uptime: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
@@ -56,6 +62,8 @@ public final class AXSession<B: AXBackend> {
     self.backend = backend; self.isTrusted = isTrusted; self.nowMs = nowMs
     self.emit = emit; axQueue = queue; self.toMain = toMain; self.uptime = uptime
     self.emitFocus = emitFocus ?? { event, done in emit(event); done(true) }
+    self.canRetryFocus = canRetryFocus
+    self.onFocusUndelivered = onFocusUndelivered
     schedule = scheduler ?? { [queue] in queue.asyncAfter(deadline: .now() + $0, execute: $1) }
   }
   public var isAttached: Bool { control.get().pubPid != 0 }
@@ -86,13 +94,16 @@ public final class AXSession<B: AXBackend> {
       guard let pending else { return }
       self.emitFocus(event) { [weak self] written in
         guard let self else { return }
-        let recorded = self.control.mutate { c -> Bool in
-          guard c.pendingID == pending else { return false }
+        let (recorded, dropped) = self.control.mutate { c -> (Bool, Bool) in
+          guard c.pendingID == pending else { return (false, false) }
           c.pendingApp = -1; c.pendingWin = -1
-          guard written, c.appGen == stamp.app, c.winGen == stamp.win else { return false }
+          guard c.appGen == stamp.app, c.winGen == stamp.win else { return (false, false) }
+          guard written else { c.focusUndelivered = true; return (false, true) }
+          c.focusUndelivered = false
           c.deliveredApp = stamp.app; c.deliveredWin = stamp.win
-          return c.privGen == stamp.priv
+          return (c.privGen == stamp.priv, false)
         }
+        if dropped { self.requestFocusCapacity() }
         if recorded, let t = emittedTitle {
           self.axQueue.async { [weak self] in
             guard let self else { return }
@@ -180,8 +191,35 @@ public final class AXSession<B: AXBackend> {
     }
   }
   public func shutdown() { axQueue.async { self.detachNow() } }
-  public func retryUndeliveredFocus() {
-    axQueue.async { self.repostFocusIfUnreported(gen: self.attachedGen) }
+  public func focusCapacityRecovered() {
+    if control.mutate({ c -> Bool in
+      guard c.focusUndelivered else { return false }
+      if c.focusRetryPosted { c.focusRetryAgain = true; return false }
+      c.focusRetryPosted = true
+      return true
+    }) { queueControlJob { self.focusRetryStep() } }
+  }
+  private func requestFocusCapacity() {
+    if let onFocusUndelivered { onFocusUndelivered() }
+    else if canRetryFocus() { focusCapacityRecovered() }
+  }
+  private func queueControlJob(_ work: @escaping () -> Void) {
+    queuedControlJobs.mutate { $0 += 1 }
+    axQueue.async {
+      self.queuedControlJobs.mutate { $0 -= 1 }
+      work()
+    }
+  }
+  private func focusRetryStep() {
+    if control.get().focusUndelivered {
+      if canRetryFocus() { repostFocusIfUnreported(gen: attachedGen) }
+      else { requestFocusCapacity() }
+    }
+    if control.mutate({ c -> Bool in
+      if c.focusRetryAgain { c.focusRetryAgain = false; return true }
+      c.focusRetryPosted = false
+      return false
+    }) { queueControlJob { self.focusRetryStep() } }
   }
   // Ingress captures the published observer AND current app+privacy generations.
   public func notify(_ name: String, observer o: B.Observer, element: B.Element) {
@@ -213,6 +251,9 @@ public final class AXSession<B: AXBackend> {
     let g = control.mutate { c -> Int in
       c.privGen = Self.nextPrivacyGeneration(c.privGen)
       c.titles = c.privGen == Int.max ? false : on
+      if c.deliveredApp != c.appGen || c.deliveredWin != c.winGen {
+        c.focusUndelivered = true
+      }
       return c.privGen
     }
     titleState.mutate { $0.element = nil }
@@ -220,7 +261,7 @@ public final class AXSession<B: AXBackend> {
       st.gen = g
       if st.posted { st.pending = true; return false }
       st.posted = true; return true
-    }) { axQueue.async { self.privacyStep() } }
+    }) { queueControlJob { self.privacyStep() } }
     return g
   }
   // Stamps are captured BEFORE the hop; a privacy change skips the title
@@ -534,16 +575,16 @@ public final class AXSession<B: AXBackend> {
       privacyAppliedGen = st.gen
       applyTitles(privGen: st.gen)
     }
+    if control.get().focusUndelivered { requestFocusCapacity() }
     if privState.mutate({ s -> Bool in
       if s.pending { s.pending = false; return true } // one successor, latest gen
       s.posted = false; return false
-    }) { axQueue.async { self.privacyStep() } }
+    }) { queueControlJob { self.privacyStep() } }
   }
   private func applyTitles(privGen g: Int) {
     let appG = attachedGen // this job manages THIS worker context only
     var c = control.get()
     guard c.appGen == appG, c.privGen == g else { return }
-    defer { repostFocusIfUnreported(gen: appG) }
     if c.titles {
       debouncer.reset()
       guard isTrusted() else { detachNow(); return }
@@ -599,4 +640,7 @@ public final class AXSession<B: AXBackend> {
   }
   // Test support (@testable): run when the AX queue has quiesced.
   func drainQueueForTesting() { axQueue.sync {} }
+  public var pendingFocusAndPrivacyJobsForTesting: Int {
+    queuedControlJobs.get()
+  }
 }

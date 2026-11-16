@@ -13,6 +13,8 @@ public final class InputReader {
   private var quitParsed = false
   private var stalledCommand: Command?, stalledBytes = Data()
   private var retryTimer: DispatchSourceTimer?
+  private let eofTimer: DispatchSourceTimer
+  private let eofDetected = Locked(false)
   private var batchDropped = 0, batchTypes: [String: Int] = [:]
   private let lifecycle = Locked((started: false, stopped: false, suspended: false))
   public private(set) var peakPending = 0 // test seam: bounded-pending evidence
@@ -29,21 +31,33 @@ public final class InputReader {
     self.queue = queue
     _ = fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK)
     source = DispatchSource.makeReadSource(fileDescriptor: fd, queue: queue)
+    eofTimer = DispatchSource.makeTimerSource(queue: .global())
     source.setEventHandler { [weak self] in self?.readable() }
+    eofTimer.schedule(deadline: .now(), repeating: .milliseconds(10))
+    eofTimer.setEventHandler { [weak self] in
+      guard let self else { return }
+      var p = pollfd(fd: self.fd, events: Int16(POLLHUP | POLLERR), revents: 0)
+      if poll(&p, 1, 0) > 0, p.revents & Int16(POLLHUP | POLLERR) != 0 {
+        self.notifyEOFDetected()
+      }
+    }
   }
   public func start() {
     lifecycle.mutate { s in
       guard !s.stopped, !s.started else { return }
       s.started = true
       source.resume()
+      eofTimer.resume()
     }
   }
   public func stop() {
     lifecycle.mutate { s in
       guard !s.stopped else { return }
       if !s.started || s.suspended { source.resume() } // activate a never-started source so cancel is safe
+      if !s.started { eofTimer.resume() }
       s.stopped = true
       source.cancel()
+      eofTimer.cancel()
     }
     queue.async { [weak self] in
       self?.retryTimer?.cancel()
@@ -88,7 +102,7 @@ public final class InputReader {
       var line = scratch
       line.append(contentsOf: seg[seg.startIndex..<nl])
       scratch.removeAll()
-      if !complete(line) {
+      if !autoreleasepool(invoking: { complete(line) }) {
         stalledBytes = Data(rest)
         pauseInput()
         return
@@ -150,7 +164,7 @@ public final class InputReader {
     var p = pollfd(fd: fd, events: Int16(POLLHUP | POLLERR), revents: 0)
     if poll(&p, 1, 0) > 0, p.revents & Int16(POLLHUP | POLLERR) != 0 {
       stalledCommand = nil; stalledBytes.removeAll()
-      onEOFDetected?()
+      notifyEOFDetected()
       stop()
       onEOF?()
       return
@@ -232,7 +246,7 @@ public final class InputReader {
     guard !eof else { return }
     eof = true
     source.cancel()
-    onEOFDetected?() // runtime arms its exit deadline here, before the drain
+    notifyEOFDetected() // runtime arms its exit deadline here, before the drain
     // The trailing partial line is the final command (unless it continues a
     // rejected oversized line); a parsed quit ends input right here.
     if !quitParsed {
@@ -248,5 +262,12 @@ public final class InputReader {
     }
     flushOverflow()
     pump()
+  }
+  private func notifyEOFDetected() {
+    if eofDetected.mutate({ detected -> Bool in
+      guard !detected else { return false }
+      detected = true
+      return true
+    }) { onEOFDetected?() }
   }
 }

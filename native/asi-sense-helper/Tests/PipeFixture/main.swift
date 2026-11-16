@@ -37,11 +37,14 @@ final class SyntheticAX: AXBackend {
 }
 
 let frontPid: Int32 = 4242, frontBid = "fixture.app"
-var titleLen = 64, gateFrom = 0, releaseMs = 750, deferActivation = false
+var titleLen = 64, gateFrom = 0, releaseMs = 750, deferActivation = false, measureJobs = 0
+var blockMainMs = 0
 for arg in CommandLine.arguments.dropFirst() {
   if arg.hasPrefix("--title-len="), let v = Int(arg.dropFirst(12)) { titleLen = v }
   if arg.hasPrefix("--gate-fw-from="), let v = Int(arg.dropFirst(15)) { gateFrom = v }
   if arg.hasPrefix("--release-delay-ms="), let v = Int(arg.dropFirst(19)) { releaseMs = v }
+  if arg.hasPrefix("--measure-jobs="), let v = Int(arg.dropFirst(15)) { measureJobs = v }
+  if arg.hasPrefix("--block-main-ms="), let v = Int(arg.dropFirst(16)) { blockMainMs = v }
   if arg == "--defer-activation" { deferActivation = true }
 }
 
@@ -60,12 +63,18 @@ session = AXSession(backend: synthetic, isTrusted: { true }, nowMs: nowMs,
   if e.type == "window.focused" {
     note("fixture:focus-queued")
   }
-})
+}, canRetryFocus: { channel.writer.hasLowWaterCapacity },
+   onFocusUndelivered: { channel.writer.requestCapacityNotification() })
+var appliedControls = 0, peakJobs = 0
 channel.onTitles = { on in
   let gen = session.setTitlesEnabled(on)
+  if blockMainMs > 0 {
+    note("fixture:main-blocked")
+    Thread.sleep(forTimeInterval: Double(blockMainMs) / 1000)
+  }
   // Posted on .main so it runs only after the whole titles control returns:
   // the channel-side purge and the ack enqueue have both completed by then.
-  DispatchQueue.main.async { note("fixture:titles-applied") }
+  if measureJobs == 0 { DispatchQueue.main.async { note("fixture:titles-applied") } }
   // The gate releases on an independent delay AFTER the toggle (and after the
   // ack is enqueued), never before it.
   if !on, let g = synthetic.gate {
@@ -73,7 +82,14 @@ channel.onTitles = { on in
   }
   return gen
 }
-channel.onTitlesApplied = { session.retryUndeliveredFocus() }
+channel.writer.onCapacityRecovered = { session.focusCapacityRecovered() }
+channel.onTitlesApplied = {
+  if measureJobs > 0 {
+    appliedControls += 1
+    peakJobs = max(peakJobs, session.pendingFocusAndPrivacyJobsForTesting)
+    if appliedControls == measureJobs { note("fixture:peak-ax-jobs=\(peakJobs)") }
+  }
+}
 channel.onCommand = { cmd, done in
   switch cmd {
   case .snapshot:
@@ -95,24 +111,26 @@ channel.onCommand = { cmd, done in
   default: done()
   }
 }
+let exitDeadline = ShutdownDeadline()
 func shutdown(drainAll: Bool = false) {
+  if !drainAll { exitDeadline.arm() }
   channel.stopInput()
   session.shutdown()
-  channel.flushOutput(deadline: drainAll ? .infinity : 0.2)
+  channel.flushOutput(deadline: drainAll ? .infinity : exitDeadline.remaining)
   channel.closeOutput()
   exit(0)
 }
 channel.onQuit = { shutdown(drainAll: true) }
 channel.onEOF = { shutdown() }
 let controlQueue = DispatchQueue(label: "asi-sense-pipe-fixture.control")
-channel.onEOFDetected = { DispatchQueue.global().asyncAfter(deadline: .now() + 0.2) { exit(0) } }
+channel.onEOFDetected = { exitDeadline.arm() }
 channel.onFatal = { exit(1) }
 signal(SIGTERM, SIG_IGN)
 let sigtermSource = DispatchSource.makeSignalSource(signal: SIGTERM, queue: controlQueue)
 sigtermSource.setEventHandler {
-  DispatchQueue.global().asyncAfter(deadline: .now() + 0.25) { exit(0) }
+  exitDeadline.arm()
   channel.stopInput()
-  channel.flushOutput(deadline: 0.2)
+  channel.flushOutput(deadline: exitDeadline.remaining)
   exit(0)
 }
 sigtermSource.resume()

@@ -179,9 +179,12 @@ Errors (`error` event, process keeps running unless noted):
 - On a focused-window refresh the window identity is compared first (`CFEqual`
   in production): the same window keeps the pending title debounce and emits
   no extra `window.focused` only after the whole focus line is written to
-  stdout. A queued focus is tracked separately; eviction or privacy purge
-  clears the pending state so the next evaluation or privacy switch can
-  repost the current focus once (title-free when disabled).
+  stdout. A queued focus is tracked separately; eviction, rejection or privacy
+  purge marks it undelivered. When the writer's backlog recovers to at most
+  half of both its line and byte limits, one coalesced AX retry reposts the
+  current focus (title-free when disabled), without waiting for another
+  control or polling while full. A privacy apply only marks/coalesces this
+  state; it does not enqueue a separate retry for every control.
   A different window unsubscribes the old title
   observation, resets the debounce, subscribes the new one (only when titles
   are on) and emits one `window.focused`.
@@ -257,12 +260,13 @@ to complete, so no truncated title or title suffix can ever follow the ack.
 
 ## Exit
 
-- stdin EOF: stop reading and exit 0, with an independent 200ms deadline
-  including the best-effort output drain; pending input or AX work may be
-  abandoned. A paused reader detects EOF even if its pipe still has bytes.
+- stdin EOF or SIGTERM: exit 0 within **300ms end-to-end** from EOF or signal,
+  including detection (at most 20ms), at most 200ms for best-effort output
+  drain, and scheduling/cleanup margin. An independent 10ms EOF monitor
+  detects a closed input even with unread pipe bytes or a busy main queue;
+  the drain budget starts at detection and is capped at 150ms, with an
+  independent fallback at the same deadline. Pending input or AX work may
+  be abandoned. Process exit releases kernel AX resources.
 - `{"cmd":"quit"}`: stop parsing later input, drain queued output in FIFO
   order, then exit 0. If stdout is not read, use EOF or SIGTERM to terminate.
-- SIGTERM: stop input and attempt a 200ms drain on an independent control
-  queue, then exit 0; an independent 250ms fallback exits even if shutdown
-  cannot acquire a lock. Process exit releases kernel AX resources.
 - stdout write failure: exit 1 (SIGPIPE is ignored). The helper writes no files.

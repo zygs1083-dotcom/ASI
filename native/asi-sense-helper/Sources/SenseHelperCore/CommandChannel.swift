@@ -1,4 +1,19 @@
 import Foundation
+public final class ShutdownDeadline {
+  private let end = Locked<TimeInterval?>(nil)
+  public init() {}
+  public func arm() {
+    let first = end.mutate { value -> Bool in
+      guard value == nil else { return false }
+      value = ProcessInfo.processInfo.systemUptime + 0.15
+      return true
+    }
+    if first { DispatchQueue.global().asyncAfter(deadline: .now() + 0.15) { exit(0) } }
+  }
+  public var remaining: TimeInterval {
+    max(0, (end.get() ?? ProcessInfo.processInfo.systemUptime) - ProcessInfo.processInfo.systemUptime)
+  }
+}
 // Shared stdin/privacy/stdout wiring for the real helper and the synthetic
 // pipe fixture: owns the bounded InputReader, the LineEncoder and the
 // OutputWriter. Controls (`titles`, `quit`) are delivered by the reader ahead
@@ -44,8 +59,8 @@ public final class CommandChannel {
       guard let self else { return true }
       var p = pollfd(fd: inputFD, events: Int16(POLLHUP | POLLERR), revents: 0)
       guard poll(&p, 1, 0) > 0, p.revents & Int16(POLLHUP | POLLERR) != 0 else { return false }
-      self.stopInput()
       self.onEOFDetected?()
+      self.stopInput()
       self.onEOF?()
       return true
     }

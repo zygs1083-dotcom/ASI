@@ -471,6 +471,57 @@ final class AXSessionTests: XCTestCase {
     release(); drain()
     XCTAssertEqual(fake.titleCalls, base + 1, "coalesced flips run one title read")
   }
+  func testFocusRetryWaitsForCapacityAndCoalescesNotifications() {
+    fake = FakeAX(); events = []
+    axQ = DispatchQueue(label: "test.ax.capacity")
+    let available = Locked(false), attempts = Locked(0)
+    session = S(backend: fake, isTrusted: { true }, nowMs: { 7 }, emit: { _ in },
+                emitFocus: { [self] event, done in
+      let n = attempts.mutate { value -> Int in value += 1; return value }
+      if n > 1 { events.append(Self.dict(event)) }
+      done(n > 1)
+    }, canRetryFocus: { available.get() }, queue: axQ, toMain: { $0() })
+    attach(7, win: 1)
+    XCTAssertEqual(attempts.get(), 1)
+    for _ in 0..<100 { session.setTitlesEnabled(false) }
+    drain()
+    XCTAssertEqual(attempts.get(), 1)
+    let release = hold()
+    available.set(true)
+    for _ in 0..<10000 { session.focusCapacityRecovered() }
+    XCTAssertLessThanOrEqual(session.pendingFocusAndPrivacyJobsForTesting, 2)
+    release()
+    drain()
+    XCTAssertEqual(attempts.get(), 2)
+    XCTAssertEqual(ofType("window.focused").count, 1)
+  }
+  func testFocusRetryRearmsWhenCapacityDisappearsBeforeExecution() {
+    fake = FakeAX(); events = []
+    axQ = DispatchQueue(label: "test.ax.capacity-race")
+    let available = Locked(false), attempts = Locked(0), requests = Locked(0)
+    session = S(backend: fake, isTrusted: { true }, nowMs: { 7 }, emit: { _ in },
+                emitFocus: { [self] event, done in
+      let n = attempts.mutate { value -> Int in value += 1; return value }
+      if n > 1 { events.append(Self.dict(event)) }
+      done(n > 1)
+    }, canRetryFocus: { available.get() },
+       onFocusUndelivered: { requests.mutate { $0 += 1 } }, queue: axQ, toMain: { $0() })
+    attach(7, win: 1)
+    XCTAssertEqual(requests.get(), 1)
+    let release = hold()
+    available.set(true)
+    session.focusCapacityRecovered()
+    available.set(false)
+    release()
+    drain()
+    XCTAssertEqual(attempts.get(), 1)
+    XCTAssertEqual(requests.get(), 2)
+    available.set(true)
+    session.focusCapacityRecovered()
+    drain()
+    XCTAssertEqual(attempts.get(), 2)
+    XCTAssertEqual(ofType("window.focused").count, 1)
+  }
   // #8: errors produced before an app switch die at main delivery.
   func testStaleAxErrorsDropAfterAppSwitch() {
     makeSession(captureMain: true)

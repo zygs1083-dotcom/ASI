@@ -686,24 +686,71 @@ final class ProcessTests: XCTestCase {
     XCTAssertEqual(p.waitExit(timeout: 3), 0)
   }
 
-  private func assertCongestedTermination(signal: Bool) throws {
+  private func timedTermination(_ process: Process, signal: Bool, closeInput: () -> Void) -> TimeInterval {
+    let kq = kqueue()
+    XCTAssertGreaterThanOrEqual(kq, 0)
+    defer { close(kq) }
+    var registration = kevent(ident: UInt(process.processIdentifier), filter: Int16(EVFILT_PROC),
+                              flags: UInt16(EV_ADD | EV_ONESHOT), fflags: UInt32(NOTE_EXIT),
+                              data: 0, udata: nil)
+    XCTAssertEqual(kevent(kq, &registration, 1, nil, 0, nil), 0)
+    let start = ProcessInfo.processInfo.systemUptime
+    if signal { process.terminate() } else { closeInput() }
+    var event = kevent(), timeout = timespec(tv_sec: 1, tv_nsec: 0)
+    let result = kevent(kq, nil, 0, &event, 1, &timeout)
+    let elapsed = ProcessInfo.processInfo.systemUptime - start
+    XCTAssertEqual(result, 1, "kernel must report process exit")
+    if result == 1 {
+      process.waitUntilExit()
+      XCTAssertEqual(process.terminationStatus, 0)
+    }
+    XCTAssertLessThan(elapsed, 0.3)
+    return elapsed
+  }
+
+  private func assertCongestedTermination(signal: Bool) throws -> TimeInterval {
     let p = try launchFixture(prefillStdout: true, drainStdout: false)
     let data = congestedControls()
     XCTAssertLessThan(p.writeFlood(data, timeout: 1), data.count)
     XCTAssertTrue(p.process.isRunning)
-    guard p.process.isRunning else { return }
-    let start = ProcessInfo.processInfo.systemUptime
-    if signal { p.process.terminate() } else { p.closeStdin() }
-    XCTAssertEqual(p.waitExit(timeout: 1), 0)
-    XCTAssertLessThan(ProcessInfo.processInfo.systemUptime - start, 0.4)
+    guard p.process.isRunning else { return .infinity }
+    return timedTermination(p.process, signal: signal) { p.closeStdin() }
   }
 
   func testFixtureCongestedEOFStopsWithinDrainDeadline() throws {
-    try assertCongestedTermination(signal: false)
+    let times = try (0..<5).map { _ in try assertCongestedTermination(signal: false) }
+    print("fixture EOF exit ms: \(times.map { String(format: "%.1f", $0 * 1000) })")
   }
 
   func testFixtureCongestedSIGTERMStopsWithinDrainDeadline() throws {
-    try assertCongestedTermination(signal: true)
+    let times = try (0..<5).map { _ in try assertCongestedTermination(signal: true) }
+    print("fixture SIGTERM exit ms: \(times.map { String(format: "%.1f", $0 * 1000) })")
+  }
+
+  private func assertRealTermination(signal: Bool) throws -> [TimeInterval] {
+    try (0..<5).map { _ in
+      let p = try HelperProcess(binary: Self.binary(), stdout: .unread, prefillStdout: true)
+      saturateOutput(p)
+      return timedTermination(p.process, signal: signal) { p.closeStdin() }
+    }
+  }
+  func testRealHelperCongestedEOFEndToEndDeadline() throws {
+    let times = try assertRealTermination(signal: false)
+    print("real EOF exit ms: \(times.map { String(format: "%.1f", $0 * 1000) })")
+  }
+  func testRealHelperCongestedSIGTERMEndToEndDeadline() throws {
+    let times = try assertRealTermination(signal: true)
+    print("real SIGTERM exit ms: \(times.map { String(format: "%.1f", $0 * 1000) })")
+  }
+  func testFixtureExitDeadlineWithBlockedMainAndUnreadInput() throws {
+    for signal in [false, true] {
+      let p = try launchFixture(["--block-main-ms=1000"], prefillStdout: true, drainStdout: false)
+      p.send("{\"cmd\":\"titles\",\"enabled\":false}\n")
+      XCTAssertTrue(p.waitStderr("fixture:main-blocked"))
+      let input = Data(repeating: 0x20, count: 8192)
+      XCTAssertEqual(p.writeFlood(input, timeout: 1), input.count)
+      _ = timedTermination(p.process, signal: signal) { p.closeStdin() }
+    }
   }
 
   func testFixtureNonAckCriticalBackpressureStillDetectsEOF() throws {
@@ -766,7 +813,7 @@ final class ProcessTests: XCTestCase {
     XCTAssertEqual(p.waitExit(), 0)
   }
 
-  func testFixtureEvictedFocusRepostedOnceAfterPrivacySwitch() throws {
+  func testFixtureEvictedFocusRepostedOnceOnCapacityRecovery() throws {
     let p = try launchFixture(prefillStdout: true, drainStdout: false)
     XCTAssertTrue(p.waitStderr("fixture:focus-queued"))
     p.send("{\"cmd\":\"snapshot\"}\n")
@@ -775,20 +822,64 @@ final class ProcessTests: XCTestCase {
     let controls = String(repeating: "{\"cmd\":\"titles\",\"enabled\":false}\n", count: 1021)
     XCTAssertEqual(p.writeFlood(Data(controls.utf8), timeout: 5), controls.utf8.count)
     XCTAssertTrue(p.waitStderr("fixture:titles-applied", count: 1021))
+    let resumed = ProcessInfo.processInfo.systemUptime
     p.discardPrefillAndDrain()
+    guard let focus = p.waitForLine(containing: "\"type\":\"window.focused\"", timeout: 1) else {
+      return XCTFail("capacity recovery must repost focus without another control")
+    }
+    XCTAssertLessThan(ProcessInfo.processInfo.systemUptime - resumed, 1)
+    XCTAssertNil(jsonDict(focus)?["title"])
     XCTAssertNotNil(p.waitForLines(containing: "titles.ack", count: 1021, timeout: 10))
     guard let overflow = p.waitForLine(containing: "output_overflow"),
           let types = jsonDict(overflow)?["droppedTypes"] as? [String: Int] else {
       return XCTFail("output overflow must report the eviction")
     }
     XCTAssertGreaterThan(types["window.focused"] ?? 0, 0)
-    Thread.sleep(forTimeInterval: 0.3)
-    p.send("{\"cmd\":\"titles\",\"enabled\":false,\"id\":\"retry-focus\"}\n")
-    XCTAssertNotNil(p.waitForLine(containing: "\"id\":\"retry-focus\""))
-    XCTAssertNotNil(p.waitForLine(containing: "\"type\":\"window.focused\"", timeout: 2))
-    Thread.sleep(forTimeInterval: 0.3)
+    Thread.sleep(forTimeInterval: max(0, 1 - (ProcessInfo.processInfo.systemUptime - resumed)))
     XCTAssertEqual(p.snapshotLines().filter { eventType($0) == "window.focused" }.count, 1)
     p.send("{\"cmd\":\"quit\"}\n")
     XCTAssertEqual(p.waitExit(), 0)
+  }
+
+  func testFixtureBlockedAXControlFloodCoalescesJobsAndRSS() throws {
+    let p = try launchFixture(["--gate-fw-from=1", "--measure-jobs=32000"])
+    XCTAssertTrue(p.waitStderr("fixture:gate-hold"))
+    let control = "{\"cmd\":\"titles\",\"enabled\":true}\n"
+    let warmup = Data(String(repeating: control, count: 2000).utf8)
+    XCTAssertEqual(p.writeFlood(warmup, timeout: 10), warmup.count)
+    XCTAssertNotNil(p.waitForLines(containing: "titles.ack", count: 2000, timeout: 15))
+    let before = Self.rssBytes(of: p.process.processIdentifier)
+    let peakRSS = Locked(before)
+    let sampler = DispatchSource.makeTimerSource(queue: .global())
+    sampler.schedule(deadline: .now(), repeating: .milliseconds(10))
+    sampler.setEventHandler {
+      let rss = Self.rssBytes(of: p.process.processIdentifier)
+      peakRSS.mutate { $0 = max($0, rss) }
+    }
+    sampler.resume()
+    defer { sampler.cancel() }
+    let flood = Data(String(repeating: control, count: 30000).utf8)
+    XCTAssertEqual(p.writeFlood(flood, timeout: 30), flood.count)
+    guard let acks = p.waitForLines(containing: "titles.ack", count: 32000, timeout: 30) else {
+      return XCTFail("all controls must be acknowledged while AX is blocked")
+    }
+    XCTAssertEqual(acks.count, 32000)
+    for (index, ack) in acks.enumerated() {
+      XCTAssertEqual(jsonDict(ack)?["gen"] as? Int, index + 1)
+    }
+    XCTAssertTrue(p.waitStderr("fixture:peak-ax-jobs=", timeout: 5))
+    let after = Self.rssBytes(of: p.process.processIdentifier)
+    let marker = p.stderrText().components(separatedBy: "fixture:peak-ax-jobs=").last ?? ""
+    let peak = Int(marker.prefix { $0.isNumber }) ?? Int.max
+    XCTAssertLessThanOrEqual(peak, 2)
+    XCTAssertFalse(p.stderrText().contains("fixture:gate-release"))
+    XCTAssertGreaterThan(before, 0)
+    XCTAssertGreaterThan(after, 0)
+    let peakBytes = max(peakRSS.get(), after)
+    let growth = peakBytes > before ? peakBytes - before : 0
+    print("blocked AX queue peak: \(peak), RSS growth: \(growth) bytes")
+    XCTAssertLessThan(growth, 2 * 1024 * 1024)
+    p.process.terminate()
+    XCTAssertEqual(p.waitExit(timeout: 2), 0)
   }
 }

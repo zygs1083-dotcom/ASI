@@ -61,8 +61,9 @@ helper (bounds and semantics: PROTOCOL.md):
   runtime and the `Tests/PipeFixture` synthetic process used by pipe-level
   regression tests.
 - **shutdown**: in-band `quit` drains queued output in order. EOF or SIGTERM
-  stops input and attempts a <=200ms drain; if stdout is not being read, close
-  stdin or send SIGTERM (SIGKILL is the host's last resort).
+  stops input and exits within 300ms end-to-end, including detection and a
+  <=200ms drain; if stdout is not being read, close stdin or send SIGTERM
+  (SIGKILL is the host's last resort).
 
 ## Accessibility permission
 

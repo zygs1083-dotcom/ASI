@@ -23,11 +23,17 @@ public final class OutputWriter {
   private var reservedBytes = 0, reservedLines = 0
   private var callbacks: [() -> Void] = []
   private var dropTotal = 0, dropTypes: [String: Int] = [:]
+  private var capacityNotificationPending = false
   private var failed = false, closed = false, suspended = true
   private let lock = NSLock(), fd: Int32
   private let source: DispatchSourceWrite
   public var onFatal: (() -> Void)?
   public var onCapacityWait: (() -> Bool)?
+  public var onCapacityRecovered: (() -> Void)?
+  public var hasLowWaterCapacity: Bool {
+    lock.lock(); defer { lock.unlock() }
+    return lowWaterLocked()
+  }
   // Encodes the output_overflow record (dropped total + per-type counts).
   // Called from the enqueueing thread while the writer lock is held.
   public var makeOverflowLine: ((_ dropped: Int, _ types: [String: Int]) -> Data)?
@@ -54,6 +60,8 @@ public final class OutputWriter {
         reservedLines += 1
         reservedBytes += bytes
         reserved = true
+      } else {
+        capacityNotificationPending = true
       }
       syncOverflowLocked()
       updateSourceLocked()
@@ -68,6 +76,13 @@ public final class OutputWriter {
     reservedLines = 0; reservedBytes = 0
     lock.unlock()
   }
+  public func requestCapacityNotification() {
+    lock.lock()
+    capacityNotificationPending = true
+    let done = takeCallbacksLocked()
+    lock.unlock()
+    done.forEach { $0() }
+  }
   public func enqueue(_ data: Data, critical: Bool, hasTitle: Bool = false,
                       type: String = "unknown", reserved: Bool = false,
                       completion: ((Bool) -> Void)? = nil) {
@@ -81,6 +96,7 @@ public final class OutputWriter {
       } else {
         var accepted = true
         while !fits(data.count) {
+          capacityNotificationPending = true
           if let i = eldestEvictableLocked() {
             evictLocked(i)
             continue
@@ -124,6 +140,10 @@ public final class OutputWriter {
     entries.count - head + reservedLines + 1 <= Self.maxLines
       && queuedBytes + reservedBytes + bytes <= Self.maxBytes
   }
+  private func lowWaterLocked() -> Bool {
+    !closed && !failed && entries.count - head + reservedLines <= Self.maxLines / 2
+      && queuedBytes + reservedBytes <= Self.maxBytes / 2
+  }
   private func eldestEvictableLocked() -> Int? {
     (head..<entries.count).first { entries[$0].offset == 0 && !entries[$0].critical }
   }
@@ -132,12 +152,17 @@ public final class OutputWriter {
     dropTypes[EventKinds.normalize(type), default: 0] += 1
   }
   private func evictLocked(_ i: Int) {
+    capacityNotificationPending = true
     recordDropLocked(entries[i].type)
     queuedBytes -= entries[i].data.count - entries[i].offset
     if let completion = entries[i].completion { callbacks.append { completion(false) } }
     entries.remove(at: i)
   }
   private func takeCallbacksLocked() -> [() -> Void] {
+    if capacityNotificationPending && lowWaterLocked() {
+      capacityNotificationPending = false
+      if let onCapacityRecovered { callbacks.append(onCapacityRecovered) }
+    }
     let result = callbacks
     callbacks.removeAll()
     return result
@@ -183,6 +208,7 @@ public final class OutputWriter {
         entries[i].hasTitle = false
       } else {
         queuedBytes -= entries[i].data.count
+        if entries[i].type == "window.focused" { capacityNotificationPending = true }
         if let completion = entries[i].completion { callbacks.append { completion(false) } }
         entries.remove(at: i)
       }

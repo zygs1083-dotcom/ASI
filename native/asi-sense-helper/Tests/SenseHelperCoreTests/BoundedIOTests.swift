@@ -77,6 +77,23 @@ final class OutputWriterTests: PipeCase {
     d.append(0x0A)
     return d
   }
+  func testCapacityRecoveryNotifiesOnceAtLowWater() {
+    fillPipe()
+    var notifications = 0
+    writer.onCapacityRecovered = { [self] in
+      lock.lock(); notifications += 1; lock.unlock()
+    }
+    for _ in 0..<1100 {
+      writer.enqueue(line("queued"), critical: false, type: "window.title")
+    }
+    lock.lock(); XCTAssertEqual(notifications, 0); lock.unlock()
+    drainUntil({ _ in }, { self.waitFor(0.01) { notifications == 1 } })
+    XCTAssertTrue(waitFor { notifications == 1 })
+    Thread.sleep(forTimeInterval: 0.05)
+    lock.lock(); XCTAssertEqual(notifications, 1); lock.unlock()
+    writer.requestCapacityNotification()
+    XCTAssertTrue(waitFor { notifications == 2 })
+  }
   // A >PIPE_BUF line writes across drain cycles, intact and in order.
   func testPartialWriteKeepsLineOrder() {
     let big = line("BIG:", size: 128 * 1024)
