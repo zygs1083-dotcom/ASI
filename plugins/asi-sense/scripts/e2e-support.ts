@@ -1,5 +1,5 @@
 import { type ChildProcess, spawn } from 'node:child_process';
-import { mkdtemp, readdir, readFile, rm } from 'node:fs/promises';
+import { access, mkdtemp, readdir, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -9,6 +9,14 @@ export async function temporaryProfile() {
     root,
     async [Symbol.asyncDispose]() {
       await rm(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
+      const remains = await access(root).then(
+        () => true,
+        (error: NodeJS.ErrnoException) => {
+          if (error.code !== 'ENOENT') throw error;
+          return false;
+        },
+      );
+      if (remains) throw new Error('Temporary profile still exists');
       console.log('Temporary profile removed: yes');
     },
   };
@@ -140,6 +148,57 @@ export function envFollowups(log: Record<string, unknown>[]): Record<string, unk
 
 export function envInjections(log: Record<string, unknown>[]): Record<string, unknown>[] {
   return envInbox(log, 'next-step');
+}
+
+export function wakeDiagnostics(log: Record<string, unknown>[]) {
+  const wakes = envFollowups(log);
+  const wake = wakes[0];
+  const index = wake ? log.indexOf(wake) : -1;
+  const tail = index < 0 ? [] : log.slice(index + 1);
+  const end = tail.find((event) => event.type === 'turn/end');
+  const reason = record(record(end?.data).reason);
+  const turn = record(end?.data).turn;
+  const assistantLength = (event: Record<string, unknown> | undefined) => {
+    if (!event) return null;
+    const content = record(record(event.data).message).content;
+    return Array.isArray(content)
+      ? content
+          .map(record)
+          .reduce(
+            (sum, part) => sum + (part.type === 'text' && typeof part.text === 'string' ? part.text.length : 0),
+            0,
+          )
+      : 0;
+  };
+  const last = [...log].reverse().find((event) => event.type === 'assistant/message');
+  const reply = [...tail]
+    .reverse()
+    .find(
+      (event) =>
+        event.type === 'assistant/message' &&
+        record(event.data).turn === turn &&
+        record(event.data).interrupted !== true,
+    );
+  const status =
+    wakes.length > 1
+      ? '唤醒次数不符'
+      : !wake
+        ? '等待唤醒超时'
+        : !end
+          ? '唤醒已发生但回复未完成'
+          : reason.kind !== 'completed' || !assistantLength(reply)
+            ? '回复有错误'
+            : '完成';
+  const lastEnd = [...log].reverse().find((event) => event.type === 'turn/end');
+  return {
+    status,
+    wakeCount: wakes.length,
+    environmentMessages: envMessages(log).length,
+    lastAssistantLength: assistantLength(last),
+    lastTurnEnd: record(record(lastEnd?.data).reason).kind ?? null,
+    wakeTurnEnd: reason.kind ?? null,
+    wakeErrorCode: record(reason.error).code ?? null,
+  };
 }
 
 export function emptyResponse(log: Record<string, unknown>[]): string | undefined {
