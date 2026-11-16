@@ -3,7 +3,46 @@ import { once } from 'node:events';
 import { access, writeFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
-import { stop, temporaryProfile } from '../../scripts/e2e-support.ts';
+import { stop, temporaryProfile, wakeDiagnostics } from '../../scripts/e2e-support.ts';
+
+describe('woken model turn diagnostics', () => {
+  const wake = {
+    type: 'agent/inbox/spliced',
+    data: { target: 'next-turn', inserted: [{ source: { kind: 'environment' } }] },
+  };
+  const assistant = (turn: number, text: string) => ({
+    type: 'assistant/message',
+    data: { turn, message: { content: [{ type: 'text', text }] } },
+  });
+  const end = (turn: number, kind: string) => ({ type: 'turn/end', data: { turn, reason: { kind } } });
+
+  it('distinguishes a missing wake from a wake whose reply has not finished', () => {
+    const initial = [assistant(1, 'ready'), end(1, 'completed')];
+    expect(wakeDiagnostics(initial)).toMatchObject({
+      status: '等待唤醒超时',
+      wakeCount: 0,
+      lastAssistantLength: 5,
+      lastTurnEnd: 'completed',
+    });
+    expect(wakeDiagnostics([...initial, wake])).toMatchObject({
+      status: '唤醒已发生但回复未完成',
+      wakeCount: 1,
+      wakeTurnEnd: null,
+    });
+  });
+
+  it('distinguishes a failed, empty, or successful woken turn', () => {
+    expect(wakeDiagnostics([wake, end(2, 'error')])).toMatchObject({ status: '回复有错误', wakeTurnEnd: 'error' });
+    expect(wakeDiagnostics([wake, assistant(2, ''), end(2, 'completed')])).toMatchObject({ status: '回复有错误' });
+    expect(wakeDiagnostics([wake, assistant(2, 'ACK'), end(2, 'completed')])).toMatchObject({
+      status: '完成',
+      wakeCount: 1,
+      lastAssistantLength: 3,
+      wakeTurnEnd: 'completed',
+    });
+    expect(wakeDiagnostics([wake, wake])).toMatchObject({ status: '唤醒次数不符', wakeCount: 2 });
+  });
+});
 
 describe('private DSH fixture profile', () => {
   it.each(['success', 'execution failure', 'initialization failure'])('removes the profile after %s', async (phase) => {

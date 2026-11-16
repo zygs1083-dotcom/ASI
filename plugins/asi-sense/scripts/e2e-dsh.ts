@@ -4,6 +4,7 @@ import { createRequire } from 'node:module';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { type Browser, chromium, expect, type Page } from '@playwright/test';
+import { checkFileHost, setupFileHost } from './e2e-file-host.ts';
 import { setup } from './e2e-setup.ts';
 import {
   bashCommands,
@@ -13,10 +14,12 @@ import {
   envInjections,
   envMessages,
   events,
+  record,
   run,
   stop,
   temporaryProfile,
   waitFor,
+  wakeDiagnostics,
   webUrl,
 } from './e2e-support.ts';
 import { syntheticBundle } from './e2e-synthetic.ts';
@@ -41,7 +44,10 @@ const services = join(root, 'service-status.json');
 const sessionRoot = join(home, 'sessions');
 const helper = join(pkg, 'lib/asi-sense-helper');
 const synthetic = process.env.ASI_E2E_SYNTHETIC === '1';
+const fileTest = process.env.ASI_E2E_FILE_TEST === '1';
 if (synthetic && process.env.ASI_E2E_NO_MODEL !== '1') throw new Error('Synthetic mode requires ASI_E2E_NO_MODEL=1');
+if (fileTest && (synthetic || process.env.ASI_E2E_NO_MODEL !== '1'))
+  throw new Error('File test requires real no-model mode');
 const limit = process.env.ASI_E2E_NO_MODEL === '1' ? 0 : Number(process.env.ASI_E2E_MODEL_BUDGET ?? '6');
 if (!Number.isInteger(limit) || limit < 0 || limit > 6) throw new Error('Invalid E2E model request budget');
 const env = {
@@ -80,6 +86,10 @@ try {
     workspace,
     env,
   );
+  if (fileTest) {
+    const plugin = await setupFileHost(root, workspace, overlay);
+    await run(process.execPath, [...args, 'plugin', '--profile', 'asi-dev', 'add', plugin], workspace, env);
+  }
   await run(process.execPath, [...args, 'plugin', '--profile', 'asi-dev', 'add', bundle], workspace, env);
   await run(
     process.execPath,
@@ -106,6 +116,7 @@ try {
     ],
     { cwd: workspace, env, detached: true, stdio: ['ignore', 'pipe', 'pipe'] },
   );
+  console.log(`Owned DSH PID: ${server.pid}`);
   const url = await webUrl(server);
   server.stdout?.resume();
   server.stderr?.resume();
@@ -119,7 +130,7 @@ try {
     'request budget',
   );
   if (!synthetic) {
-    await waitFor(
+    const pids = await waitFor(
       async () => {
         const pids = helperPids();
         return pids.length ? pids : undefined;
@@ -127,6 +138,7 @@ try {
       20_000,
       'helper startup',
     );
+    console.log(`Owned helper PIDs: ${pids.join(',')}`);
   }
   browser = await chromium.launch({ headless: true });
   const context = await browser.newContext({ viewport: { width: 1440, height: 900 } });
@@ -189,11 +201,17 @@ try {
   for (const metric of ['cpu', 'memory', 'disks']) {
     await expect(panel.locator(`[data-tile="${metric}"]`)).toContainText(/\d/, { timeout: 25_000 });
   }
+  if (fileTest) {
+    phase = 'real DSH file monitoring and latency';
+    await checkFileHost(root, workspace, sessionRoot, panel);
+  }
   if (process.env.ASI_E2E_NO_MODEL !== '1' && process.env.ASI_E2E_ONLY_BACKGROUND !== '1') {
-    phase = 'agent self-caused failure and file write';
+    phase = 'agent self-caused failure';
     await prompt(
       chat,
-      `Use the bash tool for exactly two separate calls: run the foreground command false; then run the foreground command printf test > agent-created.txt in the session working directory. Do not call other tools or retry. When done reply READY.`,
+      process.env.ASI_E2E_TEST_TOOL === '1'
+        ? 'Use the bash tool once to run the foreground command `false`, and call env_state with section self once. Do not call other tools or retry. When done reply READY.'
+        : 'Use the bash tool for exactly two separate calls: run the foreground command false; then run the foreground command printf test > agent-created.txt in the session working directory. Do not call other tools or retry. When done reply READY.',
     );
     await waitFor(
       async () => {
@@ -206,14 +224,15 @@ try {
           () => false,
         );
         return commands.some((command) => command.trim() === 'false') &&
-          commands.some((command) => command.includes('agent-created.txt')) &&
-          fileExists &&
+          (process.env.ASI_E2E_TEST_TOOL === '1'
+            ? log.some((event) => event.type === 'tool/call' && record(event.data).name === 'env_state')
+            : commands.some((command) => command.includes('agent-created.txt')) && fileExists) &&
           log.some((event) => event.type === 'turn/end')
           ? log
           : undefined;
       },
       120_000,
-      'agent shell and file operations',
+      'agent failing shell operation',
     );
     await delay(3000);
     const first = await events(sessionRoot);
@@ -225,19 +244,59 @@ try {
       .filter({ hasText: 'false' })
       .filter({ hasText: 'self-caused' })
       .filter({ hasText: 'Agent 自己引起' });
+    if (process.env.ASI_E2E_TEST_TOOL === '1') {
+      phase = 'agent env_state tool';
+      const log = await waitFor(
+        async () => {
+          const current = await events(sessionRoot);
+          const call = current.find((event) => event.type === 'tool/call' && record(event.data).name === 'env_state');
+          if (!call) return undefined;
+          const callId = record(call.data).callId;
+          const result = current.find(
+            (event) =>
+              event.type === 'tool/result' && record(record(record(event.data).message).source).callId === callId,
+          );
+          return result ? { call, result } : undefined;
+        },
+        120_000,
+        'agent env_state result',
+      );
+      const message = record(record(log.result.data).message);
+      expect(message.isError).not.toBe(true);
+      expect(record(log.result.data).error).toBeUndefined();
+      const content = Array.isArray(message.content) ? message.content : [];
+      const text = content.map(record).find((part) => part.type === 'text')?.text;
+      expect(typeof text).toBe('string');
+      const state = record(JSON.parse(String(text)));
+      const body = record(state.body);
+      for (const metric of ['cpu', 'memory', 'disks', 'network', 'harnessProcess']) {
+        const fact = record(body[metric]);
+        expect(typeof fact.status).toBe('string');
+        expect(fact).toHaveProperty('value');
+        expect(fact).toHaveProperty('source');
+      }
+      console.log('env_state: real agent tool call and structured self.body result passed');
+    }
+    phase = 'self-caused DOM status';
     await expect(failedShell.first()).toHaveCount(1, { timeout: 10_000 });
-    await expect(
-      panel
-        .locator('li[data-level]')
-        .filter({ hasText: 'agent-created.txt' })
-        .filter({ hasText: 'self-caused' })
-        .filter({ hasText: 'Agent 自己引起' })
-        .first(),
-    ).toHaveCount(1, { timeout: 10_000 });
+    console.log(
+      `b1: zero followups and injections; self-caused DOM level=${await failedShell.first().getAttribute('data-level')}`,
+    );
+    if (process.env.ASI_E2E_TEST_TOOL !== '1')
+      await expect(
+        panel
+          .locator('li[data-level]')
+          .filter({ hasText: 'agent-created.txt' })
+          .filter({ hasText: 'self-caused' })
+          .filter({ hasText: 'Agent 自己引起' })
+          .first(),
+      ).toHaveCount(1, { timeout: 10_000 });
+    await expect(failedShell.first()).toHaveAttribute('data-level', 'suppressed');
+    console.log('b1: self-caused event is shown as suppressed');
   }
   if (process.env.ASI_E2E_NO_MODEL !== '1' && process.env.ASI_E2E_ONLY_SELF !== '1') {
     const baseline = envMessages(await events(sessionRoot)).length;
-    phase = 'background failure wake';
+    phase = 'background followup arrival';
     await prompt(
       chat,
       'Use the bash tool once with command `sleep 20; exit 1` and run_in_background set to true. Do not wait for it or call other tools. Reply READY immediately. When an environment update arrives, reply ACK without calling any tools.',
@@ -250,14 +309,47 @@ try {
       120_000,
       'environment follow-up',
     );
+    console.log(`b2: environment messages=${envMessages(log).length}, followups=${envFollowups(log).length}`);
     expect(bashCommands(log).some((command) => command.includes('sleep 20') && command.includes('exit 1'))).toBe(true);
     expect(envMessages(log)).toHaveLength(baseline + 1);
     expect(envFollowups(log)).toHaveLength(1);
+    const wake = envFollowups(log)[0];
+    phase = 'woken model turn completion';
+    const completed = await waitFor(
+      async () => {
+        const current = await events(sessionRoot);
+        const start = current.findIndex((event) => event.type === wake.type && event.seq === wake.seq);
+        if (start < 0) return undefined;
+        const tail = current.slice(start + 1);
+        const end = tail.find((event) => event.type === 'turn/end');
+        return end ? { tail, end } : undefined;
+      },
+      120_000,
+      'woken model turn completion',
+    );
+    expect(record(record(completed.end.data).reason).kind).toBe('completed');
+    const turn = record(completed.end.data).turn;
+    const replies = completed.tail.filter(
+      (event) => event.type === 'assistant/message' && record(event.data).turn === turn,
+    );
+    expect(
+      replies.some((event) => {
+        const data = record(event.data);
+        const content = record(data.message).content;
+        return (
+          data.interrupted !== true &&
+          Array.isArray(content) &&
+          content.map(record).some((part) => part.type === 'text' && typeof part.text === 'string' && part.text.trim())
+        );
+      }),
+    ).toBe(true);
     await delay(4000);
     const final = await events(sessionRoot);
     expect(envMessages(final)).toHaveLength(baseline + 1);
     expect(envFollowups(final)).toHaveLength(1);
     await expect(panel.locator('[data-tile="tokens"]')).toContainText(/\d/, { timeout: 20_000 });
+    console.log('b2 diagnostics:', JSON.stringify(wakeDiagnostics(final)));
+    console.log('b2: exactly one followup and environment message; woken turn completed with nonempty reply');
   }
   let shots: string | undefined;
   if (synthetic) {
@@ -273,17 +365,24 @@ try {
   if (shots)
     console.log(`Synthetic screenshots: ${join(shots, 'asi-sense.png')} ${join(shots, 'asi-sense-mobile.png')}`);
 } catch (error) {
-  console.error(`DSH e2e failed during ${phase}; model request upper bound ${await count()}/${limit}`);
+  console.error(
+    `DSH e2e failed during ${phase} (${error instanceof Error ? error.name : 'unknown error'}); model request upper bound ${await count()}/${limit}`,
+  );
+  if (error instanceof Error && error.message.startsWith('Timed out waiting for ')) console.error(error.message);
+  if (phase === 'background followup arrival' || phase === 'woken model turn completion') {
+    const log = await events(sessionRoot);
+    console.error('b2 diagnostics:', JSON.stringify(wakeDiagnostics(log)));
+  }
   const serviceStatus = await readFile(services, 'utf8').catch(() => '');
   if (serviceStatus) console.error(`DSH services: ${serviceStatus}`);
-  throw error;
+  process.exitCode = 1;
 } finally {
   const cleanup = await Promise.allSettled([
     browser?.close() ?? Promise.resolve(),
     server ? stop(server) : Promise.resolve(),
   ]);
   if (cleanup.some((result) => result.status === 'rejected')) {
-    console.error('DSH or browser cleanup failed');
+    console.error(`Browser cleanup: ${cleanup[0].status}; DSH cleanup: ${cleanup[1].status}`);
     process.exitCode = 1;
   }
   const remaining = helperPids();
