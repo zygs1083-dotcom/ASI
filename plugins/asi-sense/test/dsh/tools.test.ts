@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import os from 'node:os';
 import type { SenseState } from '@asi/sense-types';
 import { Context } from '@deepseek-ai/cordis';
@@ -239,6 +240,53 @@ describe('model-facing tools', () => {
     });
   });
 
+  it('projects file and helper source identifiers stably regardless of source order', async () => {
+    const h = await fixture();
+    const hash = (id: string) => `files:r-${createHash('sha256').update(id).digest('hex').slice(0, 8)}`;
+    const sources = {
+      'files:ascii.rule-1': { status: 'unavailable' as const, lastSignalAt: 990 },
+      'files:规则一': { status: 'denied' as const, lastSignalAt: 991 },
+      'files:规则二': { status: 'unknown' as const, lastSignalAt: 992 },
+      'helper.frontApp': { status: 'ok' as const, lastSignalAt: 993 },
+      'helper.focusedWindow': { status: 'unknown' as const, lastSignalAt: 994 },
+    };
+    const expected = {
+      'files:ascii.rule-1': { status: 'unavailable' },
+      [hash('规则一')]: { status: 'denied' },
+      [hash('规则二')]: { status: 'unknown' },
+      'helper.frontApp': { status: 'ok' },
+      'helper.focusedWindow': { status: 'unknown' },
+    };
+    for (const entries of [Object.entries(sources), Object.entries(sources).reverse()]) {
+      h.state.observation.sources = Object.fromEntries(entries);
+      h.state.env.frontApp.source = { id: 'helper.frontApp', api: 'ndjson', host: 'local' };
+      h.state.env.focusedWindow.source = { id: 'helper.focusedWindow', api: 'ndjson', host: 'local' };
+      h.state.env.watchedPaths.source = { id: 'files:规则一', api: 'watch', host: 'local' };
+      const state = (await h.call('env_state', {})).value;
+      expect(state).toMatchObject({
+        observation: { sources: expected },
+        env: {
+          frontApp: { source: { id: 'helper.frontApp' } },
+          focusedWindow: { source: { id: 'helper.focusedWindow' } },
+          watchedPaths: { source: { id: hash('规则一') } },
+        },
+      });
+      expect((await h.call('env_detail', {})).value).toMatchObject({ sources: expected });
+      expect(JSON.stringify(state)).not.toContain('规则');
+    }
+    expect(h.state.observation.sources).toHaveProperty('files:规则一');
+    const collision = {
+      [hash('规则一')]: { status: 'ok' as const, lastSignalAt: 995 },
+      'files:规则一': { status: 'denied' as const, lastSignalAt: 991 },
+    };
+    for (const entries of [Object.entries(collision), Object.entries(collision).reverse()]) {
+      h.state.observation.sources = Object.fromEntries(entries);
+      const state = (await h.call('env_state', { section: 'observation' })).value;
+      expect(state).toMatchObject({ sources: { [hash('规则一')]: { status: 'unknown', ambiguous: true } } });
+      expect(JSON.stringify(state)).not.toContain(' (2)');
+    }
+  });
+
   it('retains fixed source keys without exempting matching window titles from host redaction', async () => {
     const hostname = vi.spyOn(os, 'hostname').mockReturnValue('helper');
     try {
@@ -374,6 +422,21 @@ describe('model-facing tools', () => {
       window: { value: { title: 'ssh <host>' } },
     });
   });
+
+  it.each(['ssh user@服务器:22/tmp/report', 'ssh 服务器:22/tmp/report'])(
+    'hides Unicode hosts in both model tools: %s',
+    async (title) => {
+      const h = await fixture();
+      h.state.env.focusedWindow.value = { title };
+      expect((await h.call('env_state', { section: 'env' })).value).toMatchObject({
+        focusedWindow: { value: { title: 'ssh <host>' } },
+      });
+      expect((await h.call('env_detail', { window: 'ssh <host>' })).value).toMatchObject({
+        current: true,
+        window: { value: { title: 'ssh <host>' } },
+      });
+    },
+  );
 
   it('isolates actual model state by caller and selects the local panel session', async () => {
     const h = await fixture(true);

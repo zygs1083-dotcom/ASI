@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
 import type { Fact, SenseState, WatchRule } from '@asi/sense-types';
@@ -12,6 +13,8 @@ const FIXED_IDENTIFIERS = new Set([
   'helper',
   'helper.ax',
   'helper.window',
+  'helper.frontApp',
+  'helper.focusedWindow',
   'ndjson',
   'dsh',
   'events',
@@ -42,13 +45,13 @@ export function modelTitle(value: string, hostname = os.hostname()): string {
   const escapedHost = hostname.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const projected = value
     .replace(/\b[a-z][a-z\d+.-]*:\/\/[^\s"'<>]+/gi, hide)
-    .replace(/\b[\w.+%-]+@(?:\[[\da-f:.]+\]|[\w.-]+)(?::\d+)?(?:[/\\][^\s"'<>]*)?/gi, hide)
+    .replace(/(?<![\p{L}\p{N}_])[\w.+%-]+@(?:\[[\da-f:.]+\]|[\p{L}\p{N}_.-]+)(?::\d+)?(?:[/\\][^\s"'<>]*)?/giu, hide)
     .replace(
       /\[[\da-f:.]+\](?::\d+)?(?:[/\\][^\s"'<>]*)?|(?<![\w:])(?:[\da-f]{0,4}:){2,}[\da-f]{0,4}(?![\w:])(?:[/\\][^\s"'<>]*)?/gi,
       hide,
     )
     .replace(/\b(?:\d{1,3}\.){3}\d{1,3}(?::\d+)?\b(?:[/\\][^\s"'<>]*)?/gi, hide)
-    .replace(/\b[a-z\d_-]+(?:\.[a-z\d_-]+)*:\d+\b(?:[/\\][^\s"'<>]*)?/gi, hide)
+    .replace(/(?<![\p{L}\p{N}_:])[\p{L}\p{N}_.-]+:\d+\b(?:[/\\][^\s"'<>]*)?/giu, hide)
     .replace(/(?<![\w])(?:[A-Za-z]:\\|\/|[\p{L}\p{N}._-]+\/)(?:[^\s"'<>/\\]+[/\\])*[^\s"'<>/\\]*/gu, (path) => {
       const parts = path.split(/[\\/]/).filter(Boolean);
       return parts.at(-1) ?? '[path]';
@@ -61,7 +64,7 @@ function minimize(value: JsonValue, hostname: string, path = '', appNamePaths: r
   if (typeof value === 'string') {
     if (
       appNamePaths.includes(path) ||
-      ((path.endsWith('.source.id') || path.endsWith('.source.api')) && FIXED_IDENTIFIERS.has(value))
+      ((path.endsWith('.source.id') || path.endsWith('.source.api')) && isSourceIdentifier(value))
     )
       return value;
     return path === 'title' || path.endsWith('.title') ? modelTitle(value, hostname) : modelText(value, hostname);
@@ -73,7 +76,7 @@ function minimize(value: JsonValue, hostname: string, path = '', appNamePaths: r
     if (key === 'host' || key === 'endpoint' || key === 'command' || key === 'userSession') continue;
     const fixedKey =
       (path === 'sources' || path === 'observation.sources' || path.endsWith('permissions.value')) &&
-      FIXED_IDENTIFIERS.has(key);
+      isSourceIdentifier(key);
     const base = fixedKey ? key : modelText(key, hostname);
     let name = base;
     for (let n = 2; Object.hasOwn(entries, name); n++) name = `${base} (${n})`;
@@ -101,7 +104,15 @@ function identifier(value: string): string {
   return /^[\w-]+$/.test(value) ? modelText(value) : '[redacted]';
 }
 
+function isSourceIdentifier(value: string): boolean {
+  return FIXED_IDENTIFIERS.has(value) || /^files:\p{ASCII}*$/u.test(value);
+}
+
 function sourceIdentifier(value: string): string {
+  if (value.startsWith('files:')) {
+    const id = value.slice('files:'.length);
+    return /^\p{ASCII}*$/u.test(id) ? value : `files:r-${createHash('sha256').update(id).digest('hex').slice(0, 8)}`;
+  }
   return FIXED_IDENTIFIERS.has(value) ? value : identifier(value);
 }
 
@@ -121,20 +132,36 @@ function fact<T>(input: Fact<T>, project: (value: T) => unknown): object {
   };
 }
 
-function dictionary<T>(values: Record<string, T>, key: (value: string) => string, project: (value: T) => unknown) {
+function dictionary<T>(
+  values: Record<string, T>,
+  key: (value: string) => string,
+  project: (value: T) => unknown,
+  sourceKeys = false,
+) {
   const entries: Record<string, unknown> = Object.create(null);
   for (const [original, value] of Object.entries(values)) {
     const base = key(original);
+    const projected = project(value);
+    if (sourceKeys && base.startsWith('files:') && Object.hasOwn(entries, base)) {
+      const previous = entries[base] as { lastSignalAt: number };
+      const current = projected as { lastSignalAt: number };
+      entries[base] = {
+        status: 'unknown',
+        lastSignalAt: Math.max(previous.lastSignalAt, current.lastSignalAt),
+        ambiguous: true,
+      };
+      continue;
+    }
     let name = base;
     for (let n = 2; Object.hasOwn(entries, name); n++) name = `${base} (${n})`;
-    entries[name] = project(value);
+    entries[name] = projected;
   }
   return entries;
 }
 
 function observations(state: SenseState['observation']) {
   return {
-    sources: dictionary(state.sources, sourceIdentifier, (source) => pick(source, ['status', 'lastSignalAt'])),
+    sources: dictionary(state.sources, sourceIdentifier, (source) => pick(source, ['status', 'lastSignalAt']), true),
   };
 }
 

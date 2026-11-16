@@ -384,4 +384,25 @@ describe('DSH environment delivery', () => {
     expect(text).not.toContain('/private/fixture');
     expect(text).not.toContain('build-node');
   });
+
+  it.each(['inject', 'followup', 'send'] as const)('redacts Unicode hosts before %s', async (kind) => {
+    const { agent, deliver } = fixture();
+    const changes = ['ssh user@服务器:22/tmp/report', 'ssh 服务器:22/tmp/report'].map((title, index) => ({
+      count: 1,
+      level: 'context' as const,
+      signal: {
+        id: `window-${index}`,
+        kind: 'window.focused',
+        at: update.at,
+        source: { id: 'test', api: 'fixture', host: 'local' },
+        subject: 'fixture',
+        data: { title },
+      },
+    }));
+    await deliver('session-a', { ...intent(kind), update: { ...update, changes } });
+    const text = JSON.stringify(kind === 'inject' ? await deliver.messages('session-a') : agent[kind].mock.calls);
+    expect(text.match(/ssh &lt;host&gt;/g)).toHaveLength(2);
+    expect(text).not.toContain('服务器');
+    expect(text).not.toContain('/tmp/');
+  });
 });
