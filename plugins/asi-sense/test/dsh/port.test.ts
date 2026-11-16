@@ -373,7 +373,13 @@ describe('uncommitted context routing', () => {
       kind: 'job.exited',
       subject: 'fixture-command',
       source: { id: 'dsh', api: 'events', host: 'local' },
-      data: { id: 'owned-job', sessionId: h.a.id, command: 'fixture-command', exitCode: 0 },
+      data: {
+        id: 'owned-job',
+        sessionId: h.a.id,
+        sessionToken: h.attention.sessionToken(h.a.id),
+        command: 'fixture-command',
+        exitCode: 0,
+      },
     });
     expect((await h.cancel()).messages).toHaveLength(1);
     if (dispose) await h.unregisterA();

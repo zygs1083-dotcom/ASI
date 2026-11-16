@@ -66,7 +66,7 @@ export class PendingContext {
     }
   }
 
-  committed(session: string, id: string, pipeline: AttentionPipeline): void {
+  committed(session: string, id: string, pipeline: AttentionPipeline): Promise<void> {
     const key = id.replace(/^asi-sense:/, '');
     const stagedKey = JSON.stringify([session, key]);
     const outcomes = this.staged.get(stagedKey) ?? [];
@@ -83,7 +83,7 @@ export class PendingContext {
     this.confirmed.add(key);
     if (this.confirmed.size > 1024) this.confirmed.delete(this.confirmed.values().next().value as string);
     this.confirm(key);
-    void pipeline.confirm(key);
+    return pipeline.confirm(key);
   }
 
   suspend(id: string, pipeline: AttentionPipeline): void {

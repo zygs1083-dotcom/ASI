@@ -1,5 +1,6 @@
 import type { Signal, WatchRule } from '@asi/sense-types';
 import { describe, expect, it } from 'vitest';
+import { createDelivery } from '../../src/host/dsh/deliver.ts';
 import { RuntimeAttention } from '../../src/host/runtime/attention.ts';
 import { FactExpiry } from '../../src/host/runtime/expiry.ts';
 import type { Clock, DshPort } from '../../src/host/runtime/ports.ts';
@@ -54,13 +55,285 @@ function harness(failFirst: boolean, configuredRules = rules, blockFirst = true,
     delivered,
     waiting,
     release,
-    advance: () => {
-      now = 2_000;
+    advance: (ms = 2_000) => {
+      now += ms;
     },
   };
 }
 
 describe('in-flight session ownership', () => {
+  it('does not enqueue a job if the owner generation changes during store notification', async () => {
+    const configured: WatchRule[] = [
+      { id: 'jobs', match: { kind: 'job.exited' }, level: 'wake', createdBy: 'user', approved: true },
+    ];
+    const h = harness(false, configured, false);
+    h.attention.create('a');
+    await h.attention.preStep('a');
+    const token = h.attention.sessionToken('a');
+    const off = h.attention.store.subscribe(() => {
+      off();
+      h.attention.dispose('a');
+      h.attention.create('a');
+    });
+    await h.attention.accept({
+      id: 'old-event',
+      kind: 'job.exited',
+      at: 0,
+      subject: 'old-job',
+      source: { id: 'dsh', api: 'events', host: 'local' },
+      data: { id: 'old-job', sessionId: 'a', sessionToken: token, exitCode: 1 },
+    });
+    const drain = (h.attention.pipeline as unknown as { drain: { pending: Map<number, unknown> } }).drain;
+    expect(drain.pending.size).toBe(0);
+    expect(h.attention.events()).toContainEqual(
+      expect.objectContaining({ id: 'old-event', reason: 'session-private' }),
+    );
+    await h.attention.stop();
+  });
+
+  it('bounds 350 waiting owned jobs and delivers one counted summary to their owner', async () => {
+    const configured: WatchRule[] = [
+      { id: 'jobs', match: { kind: 'job.exited' }, level: 'wake', createdBy: 'user', approved: true },
+    ];
+    const h = harness(false, configured, false);
+    h.attention.create('a');
+    h.attention.create('b');
+    await h.attention.preStep('b');
+    const token = h.attention.sessionToken('a');
+    for (let i = 0; i < 350; i++) {
+      await h.attention.accept({
+        id: `event-${i}`,
+        kind: 'job.exited',
+        at: i,
+        subject: `job-${i}`,
+        source: { id: 'dsh', api: 'events', host: 'local' },
+        data: { id: `job-${i}`, sessionId: 'a', sessionToken: token, exitCode: i % 2 },
+      });
+    }
+    const drain = (
+      h.attention.pipeline as unknown as {
+        drain: {
+          pending: Map<number, { details: Map<string, { ids: string[] }>; jobs: { recent: Map<string, unknown> } }>;
+        };
+      }
+    ).drain;
+    expect(drain.pending.size).toBe(1);
+    const bucket = [...drain.pending.values()][0];
+    if (!bucket) throw new Error('job bucket missing');
+    expect(bucket?.jobs.recent.size).toBe(20);
+    expect([...bucket.details.values()].flatMap((detail) => detail.ids)).toHaveLength(200);
+    expect(h.delivered).toHaveLength(0);
+    h.advance();
+    await h.attention.preStep('a');
+    expect(h.delivered).toHaveLength(1);
+    expect(h.delivered[0]).toMatchObject({
+      sessionId: 'a',
+      update: { changes: [expect.objectContaining({ count: 350 })] },
+    });
+    const messages: unknown[] = [];
+    const agent = { inject: () => {}, send: (message: unknown) => messages.push(message), followup: () => {} };
+    const deliver = createDelivery(
+      () => agent as never,
+      () => true,
+      async () => false,
+    );
+    await deliver('a', h.delivered[0] as Parameters<typeof deliver>[1]);
+    const text = JSON.stringify(messages);
+    expect(text).toContain('jobs: 350 events');
+    expect(text).toContain('另有 330 个未列出');
+    expect(text.match(/job: `job-/g)).toHaveLength(20);
+    expect(text).toContain('job-330');
+    expect(text).toContain('job-349');
+    expect(text).not.toContain('job-329');
+    await h.attention.stop();
+  });
+
+  it('keeps repeated job events and mixed levels in one bounded summary across merge windows', async () => {
+    const configured: WatchRule[] = [
+      { id: 'starts', match: { kind: 'job.started' }, level: 'context', createdBy: 'user', approved: true },
+      { id: 'exits', match: { kind: 'job.exited' }, level: 'wake', createdBy: 'user', approved: true },
+    ];
+    const h = harness(false, configured, false);
+    h.attention.create('a');
+    h.attention.create('b');
+    await h.attention.preStep('b');
+    for (let i = 0; i < 30; i++) {
+      for (const kind of ['job.started', 'job.exited'] as const) {
+        await h.attention.accept({
+          id: `event-${i}-${kind}`,
+          kind,
+          at: i,
+          subject: `job-${i}`,
+          source: { id: 'dsh', api: 'events', host: 'local' },
+          data: { id: `job-${i}`, sessionId: 'a', sessionToken: h.attention.sessionToken('a'), exitCode: 1 },
+        });
+      }
+      h.advance(3_000);
+    }
+    await h.attention.preStep('a');
+    const changes = h.delivered.flatMap((intent) => intent.update.changes);
+    expect(changes).toHaveLength(1);
+    expect(changes[0]).toMatchObject({
+      count: 60,
+      level: 'wake',
+      signal: {
+        data: {
+          jobSummary: {
+            total: 60,
+            omitted: 20,
+            recent: expect.arrayContaining([expect.objectContaining({ id: 'job-29', count: 2, kind: 'job.exited' })]),
+          },
+        },
+      },
+    });
+    await h.attention.stop();
+  });
+
+  it('bounds new job summaries behind a failed immutable job delivery', async () => {
+    let now = 0;
+    let failing = true;
+    const delivered: Parameters<DshPort['deliver']>[1][] = [];
+    const clock: Clock = { wall: () => now, mono: () => now };
+    const attention = new RuntimeAttention(
+      clock,
+      {
+        deliver: async (_session: string, intent: Parameters<DshPort['deliver']>[1]) => {
+          if (failing) throw new Error('fixture failure');
+          delivered.push(intent);
+        },
+      } as DshPort,
+      () => [{ id: 'jobs', match: { kind: 'job.exited' }, level: 'wake', createdBy: 'user', approved: true }],
+      () => {},
+      () => true,
+      () => {},
+      new FactExpiry(clock),
+    );
+    attention.create('a');
+    attention.create('b');
+    await attention.preStep('a');
+    const add = (i: number) =>
+      attention.accept({
+        id: `event-${i}`,
+        kind: 'job.exited',
+        at: now,
+        subject: `job-${i}`,
+        source: { id: 'dsh', api: 'events', host: 'local' },
+        data: { id: `job-${i}`, sessionId: 'a', sessionToken: attention.sessionToken('a'), exitCode: 1 },
+      });
+    await add(0);
+    now += 2_000;
+    await attention.flush().catch(() => {});
+    for (let cycle = 0; cycle < 6; cycle++) {
+      await attention.preStep('b');
+      for (let i = 1; i <= 30; i++) await add(cycle * 30 + i);
+      now += 3_000;
+      await attention.preStep('a').catch(() => {});
+    }
+    const drain = (
+      attention.pipeline as unknown as { drain: { pending: Map<number, { details: Map<string, { count: number }> }> } }
+    ).drain;
+    expect(drain.pending.size).toBeLessThanOrEqual(2);
+    expect(
+      [...drain.pending.values()].flatMap((bucket) => [...bucket.details.values()]).reduce((n, d) => n + d.count, 0),
+    ).toBe(181);
+    failing = false;
+    await attention.preStep('a');
+    await attention.flush();
+    await attention.preStep('a');
+    expect(delivered.flatMap((intent) => intent.update.changes).reduce((n, change) => n + change.count, 0)).toBe(181);
+    await attention.stop();
+  });
+
+  it('bounds job context waiting for the next pre-step without scheduling a busy loop', async () => {
+    const configured: WatchRule[] = [
+      { id: 'jobs', match: { kind: 'job.exited' }, level: 'context', createdBy: 'user', approved: true },
+    ];
+    const h = harness(false, configured, false);
+    h.attention.create('a');
+    await h.attention.preStep('a');
+    for (let i = 0; i < 50; i++) {
+      await h.attention.accept({
+        id: `event-${i}`,
+        kind: 'job.exited',
+        at: i,
+        subject: `job-${i}`,
+        source: { id: 'dsh', api: 'events', host: 'local' },
+        data: { id: `job-${i}`, sessionId: 'a', sessionToken: h.attention.sessionToken('a'), exitCode: 0 },
+      });
+      h.advance();
+      await h.attention.flush();
+    }
+    const drain = (
+      h.attention.pipeline as unknown as { drain: { pending: Map<number, unknown>; ready: Map<string, unknown[]> } }
+    ).drain;
+    expect(drain.pending.size).toBe(1);
+    expect(drain.ready.get('a')).toHaveLength(1);
+    expect(h.attention.pipeline.nextDeadline()).toBeUndefined();
+    await h.attention.preStep('a');
+    expect(h.delivered.flatMap((intent) => intent.update.changes).reduce((n, change) => n + change.count, 0)).toBe(50);
+    await h.attention.stop();
+  });
+
+  it('reschedules a blocked job summary after a staged job batch is committed', async () => {
+    let now = 0;
+    let scheduled = 0;
+    let commit: (session: string, id: string) => void = () => {};
+    const delivered: Parameters<DshPort['deliver']>[1][] = [];
+    const clock: Clock = { wall: () => now, mono: () => now };
+    const dsh = {
+      onAgentEvent: () => () => {},
+      onTool: () => () => {},
+      onJob: () => () => {},
+      tokenSnapshot: async () => undefined,
+      deliver: async (_session: string, intent: Parameters<DshPort['deliver']>[1]) => {
+        delivered.push(intent);
+      },
+      onDeliveryCommitted: (cb: (session: string, id: string) => void) => {
+        commit = cb;
+        return () => {};
+      },
+    };
+    const attention = new RuntimeAttention(
+      clock,
+      dsh,
+      () => [{ id: 'jobs', match: { kind: 'job.exited' }, level: 'context', createdBy: 'user', approved: true }],
+      () => {
+        scheduled++;
+      },
+      () => true,
+      () => {},
+      new FactExpiry(clock),
+    );
+    attention.create('a');
+    await attention.preStep('a');
+    const add = (id: string) =>
+      attention.accept({
+        id,
+        kind: 'job.exited',
+        at: now,
+        subject: id,
+        source: { id: 'dsh', api: 'events', host: 'local' },
+        data: { id, sessionId: 'a', sessionToken: attention.sessionToken('a'), exitCode: 0 },
+      });
+    await add('first');
+    await attention.preStep('a');
+    await add('second');
+    now += 2_000;
+    expect(attention.pipeline.nextDeadline()).toBeUndefined();
+    const before = scheduled;
+    const id = delivered[0]?.deliveryId;
+    if (!id) throw new Error('staged delivery missing');
+    commit('a', `asi-sense:${id}`);
+    await attention.pipeline.retarget('a');
+    await Promise.resolve();
+    expect(scheduled).toBeGreaterThan(before);
+    expect(attention.pipeline.nextDeadline()).toBe(2_000);
+    await attention.preStep('a');
+    expect(delivered).toHaveLength(2);
+    expect(delivered[1]?.update.changes[0]?.signal.subject).toBe('second');
+    await attention.stop();
+  });
+
   it('keeps staged private token buckets separate when ordinary context transfers', async () => {
     const configured = [
       ...rules,

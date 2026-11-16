@@ -51,6 +51,24 @@ function durationMs(s: Signal): number | undefined {
 function changeLines(ch: EnvChange, includeTitles: boolean, includeJobCommands: boolean): string[] {
   const s = ch.signal;
   let main: string;
+  const summary = s.data.jobSummary;
+  if (summary && typeof summary === 'object' && !Array.isArray(summary)) {
+    const { total, omitted, recent } = summary as Record<string, unknown>;
+    if (typeof total === 'number' && typeof omitted === 'number' && Array.isArray(recent)) {
+      return [
+        `jobs: ${total} events`,
+        ...recent.flatMap((item: unknown) => {
+          if (!item || typeof item !== 'object') return [];
+          const { id, kind, count, exitCode } = item as Record<string, unknown>;
+          if (typeof id !== 'string' || !['job.exited', 'job.started'].includes(String(kind))) return [];
+          return [
+            `job: \`${esc(id)}\` ${kind === 'job.exited' ? 'exited' : 'started'}${typeof exitCode === 'number' ? ` ${exitCode}` : ''}${typeof count === 'number' && count > 1 ? ` ×${count}` : ''}`,
+          ];
+        }),
+        ...(omitted > 0 ? [`另有 ${omitted} 个未列出`] : []),
+      ];
+    }
+  }
   if (s.kind === 'app.activated') {
     main = `front-app: ${esc(typeof s.data.name === 'string' ? s.data.name : s.subject)}`;
     const prev = str(s.data.previousName);

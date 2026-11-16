@@ -17,7 +17,8 @@ export type NowReadings = Record<
 const source = { id: 'dsh', api: 'events', host: 'local' };
 
 export class DshSource {
-  private readonly windows = new Map<string, ToolWindow>();
+  private readonly windows = new Map<string, ToolWindow & { sessionToken?: string }>();
+  private readonly jobs = new Map<string, { sessionId?: string; sessionToken?: string }>();
   private readonly off: Unsubscribe[] = [];
   private active = false;
   private readonly inflight = new Set<Promise<void>>();
@@ -69,6 +70,7 @@ export class DshSource {
     this.timer = undefined;
     for (const off of this.off.splice(0)) off();
     this.windows.clear();
+    this.jobs.clear();
     this.instances.clear();
     this.sessions.clear();
     return Promise.allSettled([...this.inflight]).then(() => {});
@@ -277,7 +279,13 @@ export class DshSource {
     const key = `${event.sessionId}:${event.toolCallId}`;
     const at = event.at ?? this.clock.wall();
     if (event.type === 'pre-execute') {
-      this.windows.set(key, { startedAt: at, startedMono: this.clock.mono(), cwd: event.cwd, pid: event.pid });
+      this.windows.set(key, {
+        startedAt: at,
+        startedMono: this.clock.mono(),
+        cwd: event.cwd,
+        pid: event.pid,
+        sessionToken: this.attention.sessionToken(event.sessionId),
+      });
       if (this.windows.size > 1024) this.windows.delete(this.windows.keys().next().value as string);
       return;
     }
@@ -299,6 +307,7 @@ export class DshSource {
           data: {
             id: event.toolCallId,
             sessionId: event.sessionId,
+            sessionToken: window?.sessionToken,
             command: event.command,
             pid: event.pid ?? window?.pid,
             ppid: event.ppid,
@@ -311,6 +320,14 @@ export class DshSource {
     }
   }
   private async job(event: JobEvent): Promise<void> {
+    if (event.type === 'started') {
+      this.jobs.set(event.id, {
+        sessionId: event.sessionId,
+        sessionToken: this.attention.sessionToken(event.sessionId),
+      });
+    }
+    const owner = this.jobs.get(event.id);
+    if (event.type === 'exited') this.jobs.delete(event.id);
     if (this.paused()) return;
     await this.attention.accept(
       this.classify({
@@ -321,7 +338,8 @@ export class DshSource {
         subject: event.command ?? event.id,
         data: {
           id: event.id,
-          sessionId: event.sessionId,
+          sessionId: owner ? owner.sessionId : event.sessionId,
+          sessionToken: owner?.sessionToken,
           command: event.command,
           pid: event.pid,
           ppid: event.ppid,

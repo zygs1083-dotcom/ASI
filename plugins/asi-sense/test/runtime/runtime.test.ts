@@ -44,6 +44,7 @@ function harness(
   let file: (event: FileChange) => void = () => {};
   let sample: (body: Body) => void = () => {};
   let token: TokenSnapshot | undefined;
+  const startedJobs = new Set<string>();
   let failSave = false;
   let watchers = 0;
   let probes = 0;
@@ -124,7 +125,16 @@ function harness(
     delivered,
     agent: (event: AgentEvent) => agent(event),
     tool: (event: ToolEvent) => tool(event),
-    job: (event: JobEvent) => job({ sessionId: runtime.currentSessionId(), ...event }),
+    job: async (event: JobEvent) => {
+      const item = { sessionId: runtime.currentSessionId(), ...event };
+      if (item.type === 'exited' && item.sessionId && !startedJobs.has(item.id)) {
+        await job({ ...item, type: 'started' });
+      }
+      if (item.type === 'started') startedJobs.add(item.id);
+      else startedJobs.delete(item.id);
+      await job(item);
+    },
+    jobRaw: (event: JobEvent) => job(event),
     file: async (event: FileChange) => {
       file(event);
       await vi.advanceTimersByTimeAsync(0);
@@ -685,6 +695,52 @@ describe('host runtime', () => {
     await h.runtime.stop();
   });
 
+  it('logs a late old-generation job exit without delivering it to the recreated session', async () => {
+    const h = harness();
+    await h.runtime.start();
+    await h.agent({ type: 'created', sessionId: 'a' });
+    await h.agent({ type: 'pre-step', sessionId: 'a' });
+    await h.job({ type: 'started', id: 'synthetic-old-job', sessionId: 'a' });
+    await h.agent({ type: 'disposed', sessionId: 'a' });
+    await h.agent({ type: 'created', sessionId: 'a' });
+    await h.agent({ type: 'pre-step', sessionId: 'a' });
+    await h.job({ type: 'exited', id: 'synthetic-old-job', sessionId: 'a', exitCode: 1 });
+    await h.advance(3_000);
+    expect(JSON.stringify(h.delivered)).not.toContain('synthetic-old-job');
+    expect(h.runtime.events()).toContainEqual(
+      expect.objectContaining({ kind: 'job.exited', subject: 'synthetic-old-job', reason: 'session-private' }),
+    );
+    await h.runtime.stop();
+  });
+
+  it('does not attach an unregistered job exit to the current generation', async () => {
+    const h = harness();
+    await h.runtime.start();
+    await h.agent({ type: 'created', sessionId: 'a' });
+    await h.agent({ type: 'pre-step', sessionId: 'a' });
+    await h.jobRaw({ type: 'exited', id: 'unknown-job', sessionId: 'a', exitCode: 1 });
+    await h.advance(3_000);
+    expect(JSON.stringify(h.delivered)).not.toContain('unknown-job');
+    expect(h.runtime.events()).toContainEqual(expect.objectContaining({ subject: 'unknown-job', level: 'record' }));
+    await h.runtime.stop();
+  });
+
+  it('uses the registered job owner even if an exit reports another session', async () => {
+    const h = harness();
+    await h.runtime.start();
+    for (const sessionId of ['a', 'b']) await h.agent({ type: 'created', sessionId });
+    await h.agent({ type: 'pre-step', sessionId: 'b' });
+    await h.jobRaw({ type: 'started', id: 'owned-job', sessionId: 'a' });
+    await h.jobRaw({ type: 'exited', id: 'owned-job', sessionId: 'b', exitCode: 1 });
+    await h.advance(3_000);
+    expect(h.delivered).toHaveLength(0);
+    await h.agent({ type: 'pre-step', sessionId: 'a' });
+    expect(h.delivered).toMatchObject([
+      { sessionId: 'a', update: { changes: [{ signal: { subject: 'owned-job' } }] } },
+    ]);
+    await h.runtime.stop();
+  });
+
   it('keeps token read failures distinct from missing usage until session presence changes', async () => {
     const h = harness();
     h.ports.dsh.tokenSnapshot = async () => {
@@ -1225,7 +1281,9 @@ describe('host runtime', () => {
       level: 'record',
     });
     await h.job({ type: 'exited', id: 'late-job', pid: 42, exitCode: 1, at: Date.now() + 10_000 });
-    expect(h.runtime.events().find((entry) => entry.subject === 'late-job')).toMatchObject({
+    expect(
+      h.runtime.events().find((entry) => entry.subject === 'late-job' && entry.kind === 'job.exited'),
+    ).toMatchObject({
       cause: 'agent',
       level: 'record',
       reason: 'self-caused',

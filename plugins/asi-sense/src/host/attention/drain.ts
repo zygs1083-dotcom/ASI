@@ -8,6 +8,7 @@ import {
   byChangeAtId,
   privateBucket,
   upsertBucket,
+  upsertJobs,
 } from './buckets.ts';
 import {
   batchIntent,
@@ -43,6 +44,7 @@ export class DeliveryFailure extends Error {
  */
 export class BucketDrain {
   private readonly pending = new Map<number, Bucket>();
+  private readonly jobs = new Map<string, Bucket>();
   private readonly ready = new Map<string, Bucket[]>();
   private readonly batches = new Map<string, InjectBatch[]>();
   private readonly deliverer: DrainHooks['deliverer'];
@@ -89,9 +91,17 @@ export class BucketDrain {
     let min: number | undefined;
     for (const b of this.pending.values()) {
       if (privateBucket(b) && !this.isCurrent()(b.sessionId)) continue;
+      if (b.jobs && !b.sealed && this.blockedJobs(b.sessionId)) continue;
       if (min === undefined || b.deadline < min) min = b.deadline;
     }
     return min;
+  }
+  private blockedJobs(sessionId: string): boolean {
+    return (
+      [...this.pending.values()].some((bucket) => bucket.sessionId === sessionId && bucket.sealed && bucket.jobs) ||
+      (this.ready.get(sessionId)?.some((bucket) => bucket.jobs) ?? false) ||
+      (this.batches.get(sessionId)?.some((batch) => batch.buckets.some((bucket) => bucket.jobs)) ?? false)
+    );
   }
   retarget(sessionId: string): void {
     if (!this.isCurrent()(sessionId)) return;
@@ -109,6 +119,8 @@ export class BucketDrain {
       privateBucket(bucket) &&
       (token === undefined ||
         [...bucket.details.values()].every((detail) => detail.latest.data.sessionToken === token));
+    const jobBucket = this.jobs.get(id);
+    if (jobBucket && matches(jobBucket)) this.jobs.delete(id);
     for (const [key, bucket] of this.pending) {
       if (matches(bucket)) this.pending.delete(key);
     }
@@ -149,6 +161,33 @@ export class BucketDrain {
     windowMs: number,
     count = 1,
   ): void {
+    if (
+      signal.source.id === 'dsh' &&
+      signal.kind.startsWith('job.') &&
+      typeof signal.data.sessionId === 'string' &&
+      typeof signal.data.sessionToken === 'string'
+    ) {
+      let bucket = this.jobs.get(sessionId);
+      if (
+        !bucket ||
+        bucket.sealed ||
+        this.pending.get(bucket.id) !== bucket ||
+        [...bucket.details.values()].some((detail) => detail.latest.data.sessionToken !== signal.data.sessionToken)
+      ) {
+        bucket = {
+          id: ++this.seq,
+          sessionId,
+          subject: signal.subject,
+          startedAt: now,
+          deadline: now + windowMs,
+          details: new Map(),
+        };
+        this.pending.set(bucket.id, bucket);
+        this.jobs.set(sessionId, bucket);
+      }
+      upsertJobs(bucket, signal, level, rule, reason);
+      return;
+    }
     upsertBucket(this.pending, signal, sessionId, level, rule, reason, now, windowMs, () => (this.seq += 1));
     if (count > 1) {
       for (const bucket of this.pending.values()) {
@@ -179,6 +218,7 @@ export class BucketDrain {
     if (!current(sessionId)) return;
     for (const b of [...this.pending.values()]) {
       if (b.sessionId !== sessionId || b.sealed) continue;
+      if (b.jobs && this.blockedJobs(sessionId)) continue;
       if (bucketLevel(b) === 'context') {
         this.pending.delete(b.id);
         this.list(this.ready, sessionId).push(b);
@@ -216,6 +256,7 @@ export class BucketDrain {
     for (const b of [...this.pending.values()]) {
       if (!current(b.sessionId)) continue;
       if (now < b.deadline) continue;
+      if (b.jobs && !b.sealed && this.blockedJobs(b.sessionId)) continue;
       this.pending.delete(b.id);
       b.sealed = true;
       try {

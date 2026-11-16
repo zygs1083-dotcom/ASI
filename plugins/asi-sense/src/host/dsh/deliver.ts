@@ -95,12 +95,36 @@ function modelUpdate(update: EnvUpdate): EnvUpdate {
           data.externalDeleted = deleted - agentDeleted;
         if (signal.data.externalDeletionExceeded === true) data.externalDeletionExceeded = true;
       }
+      const summary = signal.data.jobSummary;
+      if (summary && typeof summary === 'object' && !Array.isArray(summary)) {
+        const { total, omitted, recent } = summary as Record<string, unknown>;
+        if (typeof total === 'number' && typeof omitted === 'number' && Array.isArray(recent)) {
+          data.jobSummary = {
+            total,
+            omitted,
+            recent: recent.slice(-20).flatMap((item: unknown) => {
+              if (!item || typeof item !== 'object') return [];
+              const { id, kind, count, exitCode } = item as Record<string, unknown>;
+              if (typeof id !== 'string' || !['job.started', 'job.exited'].includes(String(kind))) return [];
+              return [
+                {
+                  id: modelLabel(id),
+                  kind,
+                  count: typeof count === 'number' ? count : 1,
+                  ...(typeof exitCode === 'number' ? { exitCode } : {}),
+                },
+              ];
+            }),
+          };
+        }
+      }
       const kinds = [
         'app.activated',
         'window.focused',
         'window.title-changed',
         'file.changed',
         'job.exited',
+        'job.started',
         'job.failed',
         'process.exited',
         'body.threshold',

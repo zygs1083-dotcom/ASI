@@ -117,7 +117,11 @@ export class RuntimeAttention {
         },
       },
     });
-    this.offCommit = staged.onDeliveryCommitted?.((session, id) => this.pending.committed(session, id, this.pipeline));
+    this.offCommit = staged.onDeliveryCommitted?.((session, id) => {
+      void this.pending.committed(session, id, this.pipeline).then(() => {
+        if (!this.stopped) this.reschedule();
+      });
+    });
   }
 
   id(): string {
@@ -248,9 +252,6 @@ export class RuntimeAttention {
         ? evaluated
         : this.clock.mono() - Math.max(0, this.clock.wall() - signal.at);
     const job = signal.source.id === 'dsh' && signal.kind.startsWith('job.');
-    if (job && typeof signal.data.sessionId === 'string') {
-      signal.data.sessionToken = this.sessionTokens.get(signal.data.sessionId);
-    }
     if (isSessionOwned(signal) || job) {
       const owner = typeof signal.data.sessionId === 'string' ? signal.data.sessionId : undefined;
       const token = signal.data.sessionToken;
@@ -259,11 +260,27 @@ export class RuntimeAttention {
           ? this.sessions.get(owner)
           : undefined;
       if (session) {
-        await this.pipeline.accept(signal, session, (change) => {
-          this.log(change, mono);
-          this.reschedule();
-        });
+        await this.pipeline.accept(
+          signal,
+          session,
+          (change) => {
+            this.log(change, mono);
+            this.reschedule();
+          },
+          () =>
+            !this.stopped &&
+            owner !== undefined &&
+            this.sessions.get(owner) === session &&
+            this.sessionTokens.get(owner) === token,
+        );
       } else {
+        if (owner) {
+          this.log(
+            { signal, level: 'record', reason: signal.cause === 'agent' ? 'self-caused' : 'session-private' },
+            mono,
+          );
+          return;
+        }
         await new Promise<void>((resolve) =>
           this.store.apply(signal, () => {
             this.log({ signal, level: 'record', reason: 'session-private' }, mono);

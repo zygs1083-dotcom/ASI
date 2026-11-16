@@ -64,6 +64,10 @@ export interface Bucket {
   splitFrom?: Bucket;
   /** Signals already injected from this bucket via split context. */
   alreadyInjected?: number;
+  jobs?: {
+    recent: Map<string, { id: string; kind: string; count: number; exitCode?: number }>;
+    omitted: number;
+  };
 }
 
 /** A bucket is a wake group iff any of its kind details is wake-level. */
@@ -164,11 +168,62 @@ export function upsertBucket(
   }
 }
 
+export function upsertJobs(
+  bucket: Bucket,
+  signal: Signal,
+  level: DeliveryLevel,
+  rule: WatchRule | undefined,
+  reason: string | undefined,
+): void {
+  let detail = bucket.details.get('jobs');
+  if (!detail) {
+    detail = { kind: signal.kind, level, count: 0, since: signal.at, latest: signal, ids: [] };
+    bucket.details.set('jobs', detail);
+  }
+  detail.count++;
+  detail.since = Math.min(detail.since, signal.at);
+  detail.latest = signal;
+  detail.ids.push(signal.id);
+  if (detail.ids.length > 200) detail.ids.shift();
+  if (LEVEL_RANK[level] >= LEVEL_RANK[detail.level]) {
+    detail.level = level;
+    detail.ruleId = rule?.id;
+    detail.note = rule?.note;
+    detail.reason = reason;
+  }
+  bucket.jobs ??= { recent: new Map(), omitted: 0 };
+  const jobs = bucket.jobs;
+  const id = typeof signal.data.id === 'string' ? signal.data.id : signal.subject;
+  const prior = jobs.recent.get(id);
+  jobs.recent.delete(id);
+  jobs.recent.set(id, {
+    id,
+    kind: signal.kind,
+    count: (prior?.count ?? 0) + 1,
+    ...(typeof signal.data.exitCode === 'number' ? { exitCode: signal.data.exitCode } : {}),
+  });
+  if (jobs.recent.size > 20) {
+    const oldest = jobs.recent.keys().next().value as string;
+    jobs.omitted += jobs.recent.get(oldest)?.count ?? 0;
+    jobs.recent.delete(oldest);
+  }
+}
+
 /** Converts a completed bucket into one sorted {@link EnvChange} per (kind, level) detail. */
 export function bucketChanges(b: Bucket): EnvChange[] {
   const changes: EnvChange[] = [];
   for (const d of b.details.values()) {
-    const c: EnvChange = { signal: d.latest, count: d.count, level: d.level };
+    const signal =
+      b.jobs && d.count > 1
+        ? {
+            ...d.latest,
+            data: {
+              ...d.latest.data,
+              jobSummary: { total: d.count, omitted: b.jobs.omitted, recent: [...b.jobs.recent.values()] },
+            },
+          }
+        : d.latest;
+    const c: EnvChange = { signal, count: d.count, level: d.level };
     if (d.ruleId !== undefined) c.ruleId = d.ruleId;
     if (d.note !== undefined) c.note = d.note;
     if (d.reason !== undefined) c.reason = d.reason;
