@@ -17,11 +17,13 @@ export const inject = [
   'agents',
   'jobs',
   'llm',
+  'sessionController',
   'sessionProjections',
   'sessions',
   'systemPrompt',
   'tokenMeter',
   'tools',
+  'workspaceRegistry',
 ];
 
 export interface Config {

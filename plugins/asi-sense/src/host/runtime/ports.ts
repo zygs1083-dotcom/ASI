@@ -40,7 +40,16 @@ export interface JobEvent {
 export type TokenSnapshot = NonNullable<Body['tokens']['value']> & {
   contextWindowSource?: 'configured' | 'catalog' | 'fallback';
 };
+export interface SessionRow {
+  id: string;
+  title: string;
+  updatedAt: number;
+  running: boolean;
+}
 export interface DshPort {
+  listSessions?(): Promise<SessionRow[]>;
+  ensureSession?(id: string): Promise<void>;
+  onSessionsChanged?(cb: (closed?: string) => void): Unsubscribe;
   onAgentEvent(cb: (event: AgentEvent) => Promise<void>): Unsubscribe;
   onTool(cb: (event: ToolEvent) => Promise<void>): Unsubscribe;
   onJob(cb: (event: JobEvent) => Promise<void>): Unsubscribe;

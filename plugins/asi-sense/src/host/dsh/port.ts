@@ -15,6 +15,7 @@ import type { NowReadings } from '../sources/dsh.ts';
 import { createDelivery } from './deliver.ts';
 import { type ActiveTool, JobEventCorrelator, mapToolEvent } from './events.ts';
 import { nowReadings } from './now-facts.ts';
+import { sessionCatalog } from './sessions.ts';
 import { tokenSnapshot } from './tokens.ts';
 
 const open = promisify(execFile);
@@ -75,6 +76,7 @@ export function createDshPort(
     );
   };
   return {
+    ...sessionCatalog(ctx),
     nowReadings: (sessionId) =>
       nowReadings(
         ctx,

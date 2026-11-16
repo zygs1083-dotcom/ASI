@@ -3,6 +3,15 @@
 Pure-TypeScript local core: fact store, attention pipeline, body thresholds,
 and deterministic environment-update formatting.
 
+## DSH 会话接口
+
+固定版的 `packages/api/session-controller/src/index.ts:267-286` 提供宿主
+`sessionController.list` 和 `resolveAgent`；`src/list.ts:125-168` 定义活动时间、
+运行状态与按时间排序的会话列表，标题来自 `packages/session/session-title/src/types.ts:77-88`
+的 `title` 投影。`packages/core/session/src/index.ts:45-81` 提供创建、释放和日志事件，
+`session/title` 是改名事件；`packages/workspace/workspace/src/index.ts:148-164,361-363`
+提供归档事件与已归档集合。释放只表示会话离开内存，并不等同于持久数据被删除。
+
 ## 安装
 
 ### 前置条件
