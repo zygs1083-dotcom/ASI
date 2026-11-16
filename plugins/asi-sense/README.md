@@ -168,11 +168,10 @@ staged context to commit before clearing degradation.
 `selfCauseGraceMs` is an optional DSH plugin configuration and
 `createSenseRuntime` option, defaulting to 2000 ms; set it to 0 to disable the
 trailing grace. A file event under a tool's absolute cwd is self-caused when
-its wall timestamp or monotonic receipt falls in `[pre, post + grace)`.
-With grace disabled, the original inclusive tool window still applies.
+its monotonic receipt falls in `[pre, post + grace)`.
 This can also suppress user edits inside that cwd during the grace interval;
 paths outside it and job/process events receive no trailing grace. A delayed
-event with an in-window mtime can still be self-caused after the grace expires.
+event arriving after the grace is not self-caused, regardless of its mtime.
 The local watcher uses `lstat` mtime for adds/modifications when it is not
 older than watcher startup; otherwise (including deletes) it uses callback time.
 
@@ -199,8 +198,8 @@ without model requests. Add `ASI_E2E_SYNTHETIC=1` to replace the host plugin
 with a fabricated frame and save panel-only screenshots under
 `/tmp/asi-sense-e2e-shots/`; this mode never starts body-probe or the helper.
 On macOS, delayed filesystem notifications are handled
-using the mtime and trailing grace described above; notifications without
-in-window timestamps that arrive after the grace can still cause a wake.
+using the monotonic receipt time and trailing grace described above;
+notifications arriving after the grace can still cause a wake.
 
 DSH bundle regressions: `marks the old frame stale on carrier loss, accepts a
 new baseline and cancels on dispose`; `cancels while waiting for a replacement
@@ -211,10 +210,10 @@ the real host entry before plugin installation`; `removes the profile after
 `terminates and waits for a stubborn child after its parent has exited`.
 
 For the dangerous-action sidebar check, build the bundle and run
-`DSH_ROOT=/path/to/dsh ASI_E2E_TMPDIR=/tmp pnpm --filter asi-sense exec tsx test/dsh/danger-e2e.ts`.
-It uses isolated synthetic storage, blocks model requests, checks resume
-pending/persistence and reset confirmation focus, and writes cropped screenshots
-under its temporary test profile.
+`DSH_ROOT=/path/to/dsh pnpm --filter asi-sense exec tsx test/dsh/danger-e2e.ts`.
+It uses a synthetic runtime with isolated storage, blocks model requests, checks
+resume pending/persistence and reset confirmation focus, and removes its
+temporary profile and cropped screenshots on exit.
 
 `start()` restores before starting sources and may be called once. `stop()`
 closes subscriptions, watchers, probe, helper and timers, then waits for
@@ -578,8 +577,9 @@ Pause and resume are serialized through resource changes and persistence; a fail
 save restores the preceding resource state. If rollback itself fails, further
 pause requests fail until restart rather than claiming an inconsistent state.
 File rules with an explicit subject require an absolute path. Missing roots are
-watched through their nearest existing directory, with unrelated events filtered,
-and switch to the root when it appears. A failing root reports `unavailable` as
+watched through their nearest existing directory, with unrelated events filtered.
+Directories are watched directly; single-file roots are watched through their
+parent so atomic replacements remain observable. A failing root reports `unavailable` as
 `files:<rule id>` without stopping other rules; a later rule refresh retries it.
 Agent-added rules are activated before saving, and failed activations are not saved.
 

@@ -97,5 +97,11 @@ export function createDelivery(
       staged.delete(sessionId);
       delivered.delete(sessionId);
     },
+    select(sessionId: string): void {
+      for (const id of staged.keys()) if (id !== sessionId) staged.delete(id);
+    },
+    discard(sessionId: string): void {
+      staged.delete(sessionId);
+    },
   });
 }

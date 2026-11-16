@@ -22,4 +22,17 @@ describe('synthetic screenshot fixture', () => {
     expect(frame.sendTitles).toBe(false);
     expect(syntheticFrame().state.env.focusedWindow.value?.title).toBe('example.ts — demo');
   });
+
+  it('uses the synthetic runtime and isolated storage for dangerous-action screenshots', async () => {
+    await using profile = await temporaryProfile();
+    const pkg = fileURLToPath(new URL('../..', import.meta.url));
+    const bundle = await syntheticBundle(profile.root, pkg, `${profile.root}/storage`);
+    const host = await readFile(`${bundle}/fixture.js`, 'utf8');
+    const runtime = await readFile(`${pkg}/scripts/e2e-synthetic-runtime.ts`, 'utf8');
+    expect(host).toContain('syntheticDanger');
+    expect(host).toContain(`${profile.root}/storage`);
+    expect(runtime).toContain("platform: 'linux'");
+    expect(runtime).toContain('spawn: () => undefined');
+    expect(runtime).toContain('onSample: () => () => {}');
+  });
 });

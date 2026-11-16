@@ -42,7 +42,7 @@ export function syntheticFrame(): SensePanelModel {
   };
 }
 
-export async function syntheticBundle(root: string, pkg: string): Promise<string> {
+export async function syntheticBundle(root: string, pkg: string, dangerStorage?: string): Promise<string> {
   const bundle = join(root, 'synthetic-bundle');
   const manifest = JSON.parse(await readFile(join(pkg, 'package.json'), 'utf8'));
   manifest.main = './fixture.js';
@@ -55,7 +55,16 @@ export async function syntheticBundle(root: string, pkg: string): Promise<string
     writeFile(join(bundle, 'frame.json'), JSON.stringify(syntheticFrame())),
     writeFile(
       join(bundle, 'fixture.js'),
-      `import { readFileSync } from 'node:fs';
+      dangerStorage
+        ? `import { AsiSenseRemote } from ${JSON.stringify(pathToFileURL(join(pkg, 'lib/index.js')).href)};
+import { syntheticDanger } from ${JSON.stringify(pathToFileURL(join(pkg, 'scripts/e2e-synthetic-runtime.ts')).href)};
+export const name = 'asi-sense';
+export async function apply(ctx) {
+  const { actions, frames } = await syntheticDanger(ctx, ${JSON.stringify(dangerStorage)});
+  new AsiSenseRemote(ctx, actions, frames);
+}
+`
+        : `import { readFileSync } from 'node:fs';
 import { AsiSenseRemote } from ${JSON.stringify(pathToFileURL(join(pkg, 'lib/index.js')).href)};
 export const name = 'asi-sense';
 export function apply(ctx) {

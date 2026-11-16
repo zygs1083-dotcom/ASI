@@ -96,7 +96,7 @@ describe('AttentionPipeline merging', () => {
   it('self-caused signals record only, even on wake rules', async () => {
     const c = new FakeClock();
     const { intents, pipeline } = pipe(c);
-    const s = sess({ toolWindows: [{ startedAt: 0, pid: 42 }] });
+    const s = sess({ toolWindows: [{ startedAt: 0, startedMono: 0, pid: 42 }] });
     const ch = await pipeline.accept(jobExit('w', 0, 1, 'j1', { data: { exitCode: 1, pid: 42 } }), s);
     expect(ch).toMatchObject({
       level: 'record',

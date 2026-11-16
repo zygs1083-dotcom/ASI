@@ -3,6 +3,7 @@ import { performance } from 'node:perf_hooks';
 import type { DeliveryLevel, EnvChange, Signal, WatchRule } from '@asi/sense-types';
 import type { StateStore } from '../state/store.ts';
 import { BucketDrain } from './drain.ts';
+import type { InjectBatch } from './drain-transfer.ts';
 import type { AttentionPipelineOptions, SessionContext, SessionState } from './pipeline-types.ts';
 import { DEFAULT_RULES, isRuleApproved, selectRule, validateRule } from './rules.ts';
 import { classifyCause } from './selfcause.ts';
@@ -15,7 +16,6 @@ export type {
   SessionContext,
   SessionState,
 } from './pipeline-types.ts';
-
 /** Thrown for flush/preStep calls in an active delivery's async context. */
 export class ReentrantDeliveryError extends Error {
   constructor() {
@@ -25,7 +25,6 @@ export class ReentrantDeliveryError extends Error {
 }
 
 const DEDUP_MAX = 1024;
-
 /**
  * Host-driven pipeline (DESIGN §2.3): no internal timers — `accept` is
  * intake only; the host calls {@link flush} at {@link nextDeadline} and
@@ -116,6 +115,18 @@ export class AttentionPipeline {
   retarget(sessionId: string): Promise<void> {
     return this.enqueueDrain(async () => this.drain.retarget(sessionId));
   }
+  confirm(id: string): Promise<void> {
+    return this.enqueueDrain(async () => this.drain.confirm(id));
+  }
+  suspend(id: string): Promise<InjectBatch[]> {
+    let batches: InjectBatch[] = [];
+    return this.enqueueDrain(async () => {
+      batches = this.drain.suspend(id);
+    }).then(() => batches);
+  }
+  restore(id: string, batch: InjectBatch): Promise<void> {
+    return this.enqueueDrain(async () => this.drain.restore(id, batch));
+  }
 
   /**
    * Adds or replaces a rule by id. Invalid input throws `TypeError` and a
@@ -162,7 +173,7 @@ export class AttentionPipeline {
     onIntake?: (change: EnvChange) => void,
   ): Promise<EnvChange> {
     const ev = structuredClone(signal);
-    ev.cause = classifyCause(ev, session.toolWindows ?? []);
+    ev.cause = classifyCause(ev, session.toolWindows ?? [], 0, this.clock());
     if (!apply) return this.intake(ev, session, this.clock(), count, other);
     return await new Promise<EnvChange>((resolve, reject) => {
       this.store.apply(ev, (result) => {

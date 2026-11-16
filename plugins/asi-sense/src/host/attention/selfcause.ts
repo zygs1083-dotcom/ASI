@@ -49,15 +49,15 @@ function relatedToShell(signal: Signal, shellPid: number): boolean {
 
 /**
  * Self-cause classification (DESIGN §2.3 step 2). Only file/job/process
- * signals can be agent-caused; they match a tool window when `signal.at` is
- * within the inclusive `[startedAt, endedAt]` bounds and either the signal
+ * signals can be agent-caused; they match a tool window when receipt is
+ * within its monotonic bounds and either the signal
  * is related to the window's shell pid (pid/ppid/ancestors) or its path
  * (`data.path`, else subject for `file.changed`) lies under `window.cwd`
  * (path-boundary safe: `/repo` does not match `/repository`). Concurrent or
  * nested windows are handled by checking every window. An explicit
  * `cause: 'agent'` is always preserved; `user`/`unknown` are upgraded to
  * `agent` on match, never downgraded. File paths under cwd also match within
- * optional trailing grace by wall timestamp or monotonic receipt.
+ * optional trailing grace by monotonic receipt.
  */
 export function classifyCause(
   signal: Signal,
@@ -70,16 +70,16 @@ export function classifyCause(
   if (!CAUSAL_KINDS.has(signal.kind)) return base;
   for (const w of toolWindows) {
     const p = signalPath(signal);
-    if (signal.kind === 'file.changed' && w.cwd !== undefined && p !== undefined && underDir(w.cwd, p)) {
-      const inWall = signal.at >= w.startedAt && (w.endedAt === undefined || signal.at < w.endedAt + graceMs);
-      const inMono =
-        receivedMono !== undefined &&
-        w.startedMono !== undefined &&
-        receivedMono >= w.startedMono &&
-        (w.endedMono === undefined || receivedMono < w.endedMono + graceMs);
-      if (inWall || inMono) return 'agent';
+    if (receivedMono === undefined || w.startedMono === undefined || receivedMono < w.startedMono) continue;
+    if (
+      w.endedMono !== undefined &&
+      (signal.kind === 'file.changed' ? receivedMono >= w.endedMono + graceMs : receivedMono > w.endedMono)
+    )
+      continue;
+    if (signal.kind === 'file.changed') {
+      if (w.cwd !== undefined && p !== undefined && underDir(w.cwd, p)) return 'agent';
+      continue;
     }
-    if (signal.at < w.startedAt || (w.endedAt !== undefined && signal.at > w.endedAt)) continue;
     if (w.pid !== undefined && relatedToShell(signal, w.pid)) return 'agent';
     if (w.cwd !== undefined && p !== undefined && underDir(w.cwd, p)) return 'agent';
   }

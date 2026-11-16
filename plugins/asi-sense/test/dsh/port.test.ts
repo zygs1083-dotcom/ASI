@@ -5,6 +5,8 @@ import { Session, SessionId } from '@deepseek-ai/dsh-session';
 import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection';
 import { describe, expect, it, onTestFinished, vi } from 'vitest';
 import { createDshPort } from '../../src/host/dsh/port.ts';
+import { RuntimeAttention } from '../../src/host/runtime/attention.ts';
+import { FactExpiry } from '../../src/host/runtime/expiry.ts';
 import type { AgentEvent } from '../../src/host/runtime/ports.ts';
 
 const update = {
@@ -26,6 +28,8 @@ const update = {
   ],
   suppressed: 0,
 };
+const sample = update.changes[0]?.signal;
+if (!sample) throw new Error('missing fixture signal');
 
 async function fixture() {
   const ctx = new Context();
@@ -199,5 +203,185 @@ describe('DSH agent port', () => {
     const next = await run(new AbortController().signal);
     expect(next.kind === 'enter' && next.messages).toHaveLength(2);
     expect(agent.inject).not.toHaveBeenCalled();
+  });
+
+  it('does not discard a newer pre-step staging for the same session', async () => {
+    const { ctx, agent, port } = await fixture();
+    const unregister = await ctx.agents.register(agent);
+    onTestFinished(unregister);
+    let releaseFirst = () => {};
+    let releaseSecond = () => {};
+    let enteredFirst = () => {};
+    let enteredSecond = () => {};
+    const firstEntered = new Promise<void>((resolve) => {
+      enteredFirst = resolve;
+    });
+    const secondEntered = new Promise<void>((resolve) => {
+      enteredSecond = resolve;
+    });
+    const firstGate = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    const secondGate = new Promise<void>((resolve) => {
+      releaseSecond = resolve;
+    });
+    onTestFinished(() => {
+      releaseFirst();
+      releaseSecond();
+    });
+    let calls = 0;
+    const off = port.onAgentEvent(async (event) => {
+      if (event.type !== 'pre-step') return;
+      await port.deliver(event.sessionId, { kind: 'inject', sessionId: event.sessionId, deliveryId: 'a', update });
+      if (++calls === 1) {
+        enteredFirst();
+        await firstGate;
+      } else {
+        enteredSecond();
+        await secondGate;
+      }
+    });
+    onTestFinished(off);
+    const user = createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text: 'fixture' }] });
+    const step = () =>
+      agentEvents(ctx, agent).waterfall(
+        'agent/pre-step',
+        {
+          turn: 1,
+          step: 1,
+          messages: [user],
+          signal: new AbortController().signal,
+          modelSelection: { provider: 'x', model: 'x' },
+        },
+        async () => ({ kind: 'enter' as const, messages: [user] }),
+      );
+    const first = step();
+    await firstEntered;
+    const second = step();
+    await secondEntered;
+    releaseFirst();
+    expect(await first).toMatchObject({ messages: [user] });
+    releaseSecond();
+    const result = await second;
+    expect(result.kind === 'enter' && result.messages).toHaveLength(2);
+  });
+});
+
+describe('uncommitted context routing', () => {
+  async function routing() {
+    const { ctx, agent: a, port } = await fixture();
+    const bId = SessionId('synthetic-session-b');
+    const b = { ...a, id: bId, session: Session.create(bId) };
+    const clock = { wall: () => 1000, mono: () => 1000 };
+    const attention = new RuntimeAttention(
+      clock,
+      port,
+      () => [{ id: 'ctx', match: { kind: 'app.activated' }, level: 'context', createdBy: 'user', approved: true }],
+      () => {},
+      () => true,
+      () => {},
+      new FactExpiry(clock),
+    );
+    let abort: AbortController | undefined;
+    const off = port.onAgentEvent(async (event) => {
+      if (event.type === 'created') attention.create(event.sessionId);
+      if (event.type === 'disposed') attention.dispose(event.sessionId);
+      if (event.type === 'pre-step') {
+        await attention.preStep(event.sessionId);
+        abort?.abort();
+        abort = undefined;
+      }
+    });
+    const unregisterA = await ctx.agents.register(a);
+    const unregisterB = await ctx.agents.register(b);
+    onTestFinished(async () => {
+      off();
+      await attention.stop();
+      await unregisterA();
+      await unregisterB();
+    });
+    const user = createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text: 'fixture' }] });
+    const step = async (agent: Agent, controller = new AbortController()) => {
+      const decision = await agentEvents(ctx, agent).waterfall(
+        'agent/pre-step',
+        {
+          turn: 1,
+          step: 1,
+          messages: [user],
+          signal: controller.signal,
+          modelSelection: { provider: 'x', model: 'x' },
+        },
+        async () => ({ kind: 'enter' as const, messages: [user] }),
+      );
+      if (decision.kind !== 'enter') throw new Error('expected an entered step');
+      return decision;
+    };
+    await step(a);
+    await attention.accept(sample);
+    return {
+      ctx,
+      a,
+      b,
+      attention,
+      step,
+      cancel: async () => {
+        const controller = new AbortController();
+        abort = controller;
+        return step(a, controller);
+      },
+      unregisterA,
+    };
+  }
+
+  it('moves an aborted staged context to the next session without later duplication', async () => {
+    const h = await routing();
+    expect((await h.cancel()).messages).toHaveLength(1);
+    const decision = await h.step(h.b);
+    expect(decision.messages).toHaveLength(2);
+    const message = decision.messages[1];
+    if (!message) throw new Error('missing context message');
+    const event = h.b.session.append('user/message', message, { surfaceOp: 'append' });
+    h.ctx.emit('session/event', h.b.session, event);
+    expect((await h.step(h.a)).messages).toHaveLength(1);
+  });
+
+  it('retains an aborted staged context when its session is disposed', async () => {
+    const h = await routing();
+    expect((await h.cancel()).messages).toHaveLength(1);
+    await h.unregisterA();
+    expect((await h.step(h.b)).messages).toHaveLength(2);
+  });
+
+  it('removes a committed staged batch even when disposal races its confirmation', async () => {
+    const h = await routing();
+    const result = await h.step(h.a);
+    expect(result.messages).toHaveLength(2);
+    await h.unregisterA();
+    const message = result.messages[1];
+    if (!message) throw new Error('missing context message');
+    const event = h.a.session.append('user/message', message, { surfaceOp: 'append' });
+    h.ctx.emit('session/event', h.a.session, event);
+    expect((await h.step(h.b)).messages).toHaveLength(1);
+  });
+
+  it('keeps multiple unconfirmed batches of the same subject after disposal', async () => {
+    const h = await routing();
+    await h.cancel();
+    for (let i = 1; i < 19; i++) {
+      await h.attention.accept({ ...sample, id: `signal-${i}`, at: i });
+      await h.cancel();
+    }
+    await h.unregisterA();
+    expect((await h.step(h.b)).messages).toHaveLength(20);
+  });
+
+  it('shares the 200-subject no-session limit with disposed staged batches', async () => {
+    const h = await routing();
+    for (let i = 0; i < 200; i++) {
+      await h.attention.accept({ ...sample, id: `signal-${i}`, subject: `fixture-${i}` });
+    }
+    await h.cancel();
+    await h.unregisterA();
+    expect((await h.step(h.b)).messages).toHaveLength(201);
   });
 });

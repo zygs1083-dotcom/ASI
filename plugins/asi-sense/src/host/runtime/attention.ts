@@ -1,12 +1,13 @@
 import { randomUUID } from 'node:crypto';
 import type { DeliveryLevel, SenseState, Signal, SignalCause, SourceRef, WatchRule } from '@asi/sense-types';
+import { DeliveryFailure } from '../attention/drain.ts';
 import { AttentionPipeline, type SessionContext } from '../attention/pipeline.ts';
 import { isRuleApproved, selectRule } from '../attention/rules.ts';
 import { sourceObservation } from '../state/source-health.ts';
 import { StateStore } from '../state/store.ts';
 import { eventDetail } from './event-detail.ts';
 import type { FactExpiry } from './expiry.ts';
-import { PendingContext } from './pending-context.ts';
+import { PendingContext, withoutTitles } from './pending-context.ts';
 import type { Clock, DshPort } from './ports.ts';
 
 export interface EventEntry {
@@ -27,16 +28,6 @@ export interface EventEntry {
 }
 export type EventLog = EventEntry[];
 
-function withoutTitles(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map(withoutTitles);
-  if (!value || typeof value !== 'object') return value;
-  return Object.fromEntries(
-    Object.entries(value)
-      .filter(([key]) => key !== 'title')
-      .map(([key, child]) => [key, withoutTitles(child)]),
-  );
-}
-
 export class RuntimeAttention {
   readonly store: StateStore;
   readonly pipeline: AttentionPipeline;
@@ -51,6 +42,7 @@ export class RuntimeAttention {
   private sequence = 0;
   private stopped = false;
   private readonly prefix = randomUUID();
+  private readonly offCommit?: () => void;
 
   constructor(
     private readonly clock: Clock,
@@ -61,6 +53,7 @@ export class RuntimeAttention {
     readonly changed: () => void,
     expiry: FactExpiry,
   ) {
+    const staged = dsh as DshPort & { onDeliveryCommitted?: (cb: (session: string, id: string) => void) => () => void };
     this.store = new StateStore(
       () => clock.wall(),
       60_000,
@@ -93,6 +86,7 @@ export class RuntimeAttention {
           } finally {
             this.inflight.delete(delivery);
           }
+          if (intent.kind === 'inject' && staged.onDeliveryCommitted) throw new DeliveryFailure('deferred');
           if (this.stopped) return;
           for (const change of intent.update.changes) {
             if (change.reason) this.mark(change.signal.id, change.reason);
@@ -100,6 +94,7 @@ export class RuntimeAttention {
         },
       },
     });
+    this.offCommit = staged.onDeliveryCommitted?.((_session, id) => this.pending.committed(id, this.pipeline));
   }
 
   id(): string {
@@ -143,7 +138,8 @@ export class RuntimeAttention {
   }
   stop(): Promise<void> {
     this.stopped = true;
-    return Promise.allSettled([...this.inflight]).then(() => {});
+    this.offCommit?.();
+    return Promise.allSettled([...this.inflight, this.pending.settled()]).then(() => {});
   }
   create(id: string): void {
     this.sessions.set(id, { id, busy: false, userInitiated: false });
@@ -151,6 +147,7 @@ export class RuntimeAttention {
   dispose(id: string): void {
     this.sessions.delete(id);
     this.pipeline.disposeSession(id);
+    this.pending.suspend(id, this.pipeline);
     const index = this.recent.indexOf(id);
     if (index >= 0) this.recent.splice(index, 1);
     if (this.selected === id) {
@@ -173,11 +170,13 @@ export class RuntimeAttention {
     session.userInitiated = userInitiated;
     this.pipeline.setSession(session);
     if (!drain) return;
+    await this.pending.settled();
     await this.pipeline.retarget(id);
     if (this.stopped || generation !== this.selectionGeneration || this.selected !== id) return;
     let entry = this.pending.take();
     while (entry) {
-      await this.pipeline.acceptCount(entry.signal, session, entry.count, entry.other);
+      if ('batch' in entry) await this.pipeline.restore(id, entry.batch);
+      else await this.pipeline.acceptCount(entry.signal, session, entry.count, entry.other);
       if (this.stopped || generation !== this.selectionGeneration || this.selected !== id) return;
       entry = this.pending.take();
     }

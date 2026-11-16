@@ -79,3 +79,38 @@ it('reports changes to an existing file root using the file path itself', async 
     await fs.rm(temp, { recursive: true });
   }
 });
+
+it.each([true, false])(
+  'observes repeated atomic saves of a file root initially present=%s',
+  async (present) => {
+    const temp = await fs.realpath(await fs.mkdtemp(join(tmpdir(), 'asi-sense-watch-atomic-')));
+    const target = join(temp, 'synthetic.txt');
+    const sibling = join(temp, 'unrelated.txt');
+    if (present) await fs.writeFile(target, 'initial');
+    const events: string[] = [];
+    const local = localPorts({ logger: { warn: vi.fn() } } as unknown as Context, join(temp, 'storage'));
+    const watcher = local.files.watch(target, (event) => events.push(event.path));
+    try {
+      if (!present) {
+        await fs.writeFile(target, 'created');
+        await vi.waitFor(() => expect(events).toContain(target), { timeout: 5_000 });
+      }
+      for (let i = 0; i < 2; i++) {
+        const before = events.length;
+        const replacement = join(temp, `replacement-${i}`);
+        await fs.writeFile(replacement, 'replacement');
+        await fs.rename(replacement, target);
+        await vi.waitFor(() => expect(events.length).toBeGreaterThan(before), { timeout: 5_000 });
+        const replaced = events.length;
+        await fs.appendFile(target, 'changed');
+        await vi.waitFor(() => expect(events.length).toBeGreaterThan(replaced), { timeout: 5_000 });
+      }
+      await fs.writeFile(sibling, 'unrelated');
+      expect(events.every((path) => path === target)).toBe(true);
+    } finally {
+      watcher.close();
+      await fs.rm(temp, { recursive: true });
+    }
+  },
+  15_000,
+);

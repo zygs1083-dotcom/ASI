@@ -35,33 +35,42 @@ export function localPorts(ctx: Context, storageRoot: string): Omit<SensePorts, 
           for (;;) {
             try {
               const directory = statSync(candidate).isDirectory();
-              if (candidate !== target && !directory) {
+              if (!directory) {
                 candidate = dirname(candidate);
                 continue;
               }
               const base = candidate;
-              const next = watch(base, { recursive: true }, (event, filename) => {
-                if (closed || watcher !== next) return;
-                const path = !directory || filename === null ? base : resolve(base, filename.toString());
-                if (!inside(base, path)) return;
-                if (base !== target ? existsSync(target) : event === 'rename' && !existsSync(target)) {
+              const next = watch(
+                base,
+                { recursive: base === target || base !== dirname(target) },
+                (event, filename) => {
+                  if (closed || watcher !== next) return;
+                  const path = !directory || filename === null ? base : resolve(base, filename.toString());
+                  if (!inside(base, path)) return;
                   try {
-                    attach();
+                    if (
+                      !existsSync(base) ||
+                      (base !== target &&
+                        existsSync(target) &&
+                        (dirname(target) !== base || statSync(target).isDirectory()))
+                    ) {
+                      attach();
+                    }
                   } catch {
                     fail();
                   }
-                }
-                if (!inside(target, path) || filename === null) return;
-                let at = Date.now();
-                const change = event === 'change' ? 'modify' : existsSync(path) ? 'add' : 'delete';
-                if (change !== 'delete') {
-                  try {
-                    const mtime = lstatSync(path).mtimeMs;
-                    if (Number.isFinite(mtime) && mtime >= startedAt) at = mtime;
-                  } catch {}
-                }
-                callback({ path, change, at });
-              });
+                  if (!inside(target, path) || filename === null) return;
+                  let at = Date.now();
+                  const change = event === 'change' ? 'modify' : existsSync(path) ? 'add' : 'delete';
+                  if (change !== 'delete') {
+                    try {
+                      const mtime = lstatSync(path).mtimeMs;
+                      if (Number.isFinite(mtime) && mtime >= startedAt) at = mtime;
+                    } catch {}
+                  }
+                  callback({ path, change, at });
+                },
+              );
               next.on('error', () => {
                 if (closed || watcher !== next) return;
                 fail();

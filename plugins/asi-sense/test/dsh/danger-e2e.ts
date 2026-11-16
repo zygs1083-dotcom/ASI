@@ -1,23 +1,24 @@
 import { type ChildProcess, spawn, spawnSync } from 'node:child_process';
-import { access, mkdtemp, readFile, realpath, unlink, writeFile } from 'node:fs/promises';
+import { access, readFile, realpath, unlink, writeFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
-import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { type Browser, chromium, expect, type Page } from '@playwright/test';
 import { setup } from '../../scripts/e2e-setup.ts';
-import { run, stop, waitFor, webUrl } from '../../scripts/e2e-support.ts';
+import { run, stop, temporaryProfile, waitFor, webUrl } from '../../scripts/e2e-support.ts';
+import { syntheticBundle } from '../../scripts/e2e-synthetic.ts';
 import { createSenseRuntime } from '../../src/host/runtime/index.ts';
 import type { SensePorts } from '../../src/host/runtime/ports.ts';
 
 const pkg = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
+await using profile = await temporaryProfile();
 const dsh = resolve(process.env.DSH_ROOT ?? '');
 if (!process.env.DSH_ROOT) throw new Error('Set DSH_ROOT to the read-only DeepSeek Harness checkout');
 const cli = join(dsh, 'apps/cli/src/bin.ts');
 const picker = join(dsh, 'apps/web/tests/pin-browse-picker.overlay.yml');
 await Promise.all([access(cli), access(picker)]);
 const args = ['--import', createRequire(join(dsh, 'package.json')).resolve('tsx/esm'), cli];
-const root = await realpath(await mkdtemp(join(process.env.ASI_E2E_TMPDIR ?? tmpdir(), 'asi-sense-danger-e2e-')));
+const root = await realpath(profile.root);
 const home = join(root, 'home');
 const workspace = join(root, 'deepseek-harness/default-workspace');
 const counter = join(root, 'model-requests.txt');
@@ -32,16 +33,7 @@ const env = {
   ASI_MAGPIE_PLACEHOLDER: 'magpie',
   TSX_TSCONFIG_PATH: join(dsh, 'tsconfig.json'),
 };
-const overlay = await setup({
-  root,
-  home,
-  workspace,
-  sessionRoot: join(home, 'sessions'),
-  counter,
-  budgetReady,
-  services,
-  limit: 0,
-});
+let overlay = '';
 
 function helperPids(): string[] {
   const result = spawnSync('pgrep', ['-f', helper], { encoding: 'utf8' });
@@ -144,15 +136,26 @@ async function openPanel(): Promise<Page> {
 }
 
 try {
+  overlay = await setup({
+    root,
+    home,
+    workspace,
+    sessionRoot: join(home, 'sessions'),
+    counter,
+    budgetReady,
+    services,
+    limit: 0,
+  });
   if (helperPids().length) throw new Error('An ASI helper from this worktree is already running');
   await seedStorageFailure();
+  const bundle = await syntheticBundle(root, pkg, join(home, 'data/asi-sense'));
   await run(
     process.execPath,
     [...args, '--profile', 'asi-dev', '--from-default-profile', 'web', '--dump-config'],
     workspace,
     env,
   );
-  await run(process.execPath, [...args, 'plugin', '--profile', 'asi-dev', 'add', pkg], workspace, env);
+  await run(process.execPath, [...args, 'plugin', '--profile', 'asi-dev', 'add', bundle], workspace, env);
   await run(
     process.execPath,
     [...args, 'plugin', '--profile', 'asi-dev', 'add', join(pkg, 'test/dsh/budget-plugin')],
@@ -175,14 +178,13 @@ try {
   await waitFor(async () => arrived || undefined, 10_000, 'resume RPC');
   const pending = page.getByRole('button', { name: '恢复 AI 调参 · 处理中', exact: true });
   await expect(pending).toBeDisabled();
-  const resumeShot = join(root, 'resume-pending.png');
-  await pending.locator('..').screenshot({ path: resumeShot });
+  await pending.locator('..').screenshot({ path: join(root, 'resume-pending.png') });
   unblockRoute?.();
   unblockRoute = undefined;
   await expect(page.getByText('保存调参数据失败，AI 调参已停用')).toHaveCount(0, { timeout: 15_000 });
   const snapshot = JSON.parse(await readFile(bodyFile, 'utf8'));
   expect(snapshot.disabled).toBeUndefined();
-  console.log(`Resume RPC: pending, then persisted and reflected; screenshot: ${resumeShot}`);
+  console.log('Resume RPC: pending, then persisted and reflected');
   await shutdown();
 
   await unlink(budgetReady);
@@ -192,13 +194,13 @@ try {
   const dialog = page.getByRole('alertdialog', { name: '重置调参' });
   await expect(dialog).toBeVisible();
   await expect(dialog.getByRole('button', { name: '取消', exact: true })).toBeFocused();
-  const resetShot = join(root, 'reset-confirmation.png');
-  await dialog.screenshot({ path: resetShot });
+  await dialog.screenshot({ path: join(root, 'reset-confirmation.png') });
   await dialog.getByRole('button', { name: '取消', exact: true }).click();
   await expect(dialog).toHaveCount(0);
+  console.log('Reset confirmation: Cancel focused');
   const count = (await readFile(counter, 'utf8').catch(() => '')).split('\n').filter(Boolean).length;
   expect(count).toBe(0);
-  console.log(`Reset confirmation: Cancel focused; screenshot: ${resetShot}`);
+  console.log('Screenshots: synthetic host only');
   console.log(`Model requests: ${count}/0`);
 } finally {
   await shutdown();

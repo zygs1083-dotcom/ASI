@@ -130,4 +130,25 @@ describe('missing file watcher roots', () => {
     expect(fsMocks.watch.mock.calls[0]?.[0]).toBe('/sandbox');
     watcher.close();
   });
+
+  it('reports a reattach failure rather than claiming the rule source is healthy', () => {
+    let emit!: (event: 'rename' | 'change', filename: string | null) => void;
+    let failed = false;
+    fsMocks.statSync.mockImplementation(() => {
+      if (failed) throw Object.assign(new Error('denied'), { code: 'EACCES' });
+      return { isDirectory: () => true };
+    });
+    fsMocks.existsSync.mockReturnValue(false);
+    fsMocks.watch.mockImplementation((_root, _options, cb) => {
+      emit = cb;
+      return { on: vi.fn(), close: vi.fn() };
+    });
+    const events: unknown[] = [];
+    const ports = localPorts({ logger: { warn: vi.fn() } } as unknown as Context, '/storage');
+    const watcher = ports.files.watch('/sandbox/root', (event) => events.push(event));
+    failed = true;
+    emit('rename', null);
+    expect(events).toEqual([{ path: '/sandbox/root', change: 'modify', watchError: true }]);
+    watcher.close();
+  });
 });

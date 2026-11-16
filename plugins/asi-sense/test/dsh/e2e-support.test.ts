@@ -36,6 +36,23 @@ describe('private DSH fixture profile', () => {
     expect(code).not.toBe(0);
     expect(output).toContain('Temporary profile removed: yes');
   });
+
+  it('removes the danger fixture profile when initialization fails', async () => {
+    const child = spawn(
+      process.execPath,
+      ['--import', import.meta.resolve('tsx/esm'), fileURLToPath(new URL('./danger-e2e.ts', import.meta.url))],
+      { env: { ...process.env, DSH_ROOT: '' }, stdio: ['ignore', 'pipe', 'pipe'] },
+    );
+    let output = '';
+    child.stdout.setEncoding('utf8').on('data', (text: string) => {
+      output += text;
+    });
+    child.stderr.resume();
+    const [code, signal] = await once(child, 'exit');
+    expect(signal).toBeNull();
+    expect(code).not.toBe(0);
+    expect(output).toContain('Temporary profile removed: yes');
+  });
 });
 
 describe.skipIf(process.platform === 'win32')('DSH fixture process group', () => {

@@ -1,9 +1,17 @@
 import type { Signal } from '@asi/sense-types';
 import { describe, expect, it } from 'vitest';
 import { createWatchRule, matchesRule, validateRule } from '../src/host/attention/rules.ts';
-import { classifyCause, type ToolWindow } from '../src/host/attention/selfcause.ts';
+import { classifyCause as classifyReceived, type ToolWindow } from '../src/host/attention/selfcause.ts';
 import { StateStore } from '../src/host/state/store.ts';
 import { FakeClock, pipe, SRC, SRC2, sess, sig } from './helpers.ts';
+
+const classifyCause = (signal: Signal, windows: ToolWindow[]) =>
+  classifyReceived(
+    signal,
+    windows.map((window) => ({ ...window, startedMono: window.startedAt, endedMono: window.endedAt })),
+    0,
+    signal.at,
+  );
 
 describe('self-cause ancestry', () => {
   it('classifies shell children and grandchildren across concurrent tool windows', () => {

@@ -1,4 +1,3 @@
-import { createHash } from 'node:crypto';
 import type { EnvUpdate, Signal, WatchRule } from '@asi/sense-types';
 import {
   type Bucket,
@@ -9,8 +8,15 @@ import {
   byChangeAtId,
   upsertBucket,
 } from './buckets.ts';
-import { type InjectBatch, retargetBuckets } from './drain-transfer.ts';
-import type { DeliveryIntent, SessionState } from './pipeline.ts';
+import {
+  confirmBatch,
+  type DrainHooks,
+  deliveryId,
+  type InjectBatch,
+  retargetBuckets,
+  throwCollected,
+} from './drain-transfer.ts';
+import type { DeliveryIntent } from './pipeline.ts';
 
 const WAKE_WINDOW_MS = 600_000;
 const WAKE_MAX = 3;
@@ -23,28 +29,6 @@ export class DeliveryFailure extends Error {
   ) {
     super(`delivery ${kind}`, cause === undefined ? undefined : { cause });
   }
-}
-/** Collaborators the drain needs from the pipeline. */
-export interface DrainHooks {
-  deliverer: { deliver(intent: DeliveryIntent): Promise<void> };
-  sessions: Map<string, SessionState>;
-  /** Monotonic clock for wake-budget checks and charges. */
-  clock: () => number;
-  /** Wall clock, used only for the `EnvUpdate.at` display timestamp. */
-  wallClock: () => number;
-  isCurrent?: () => (sessionId: string) => boolean;
-}
-function throwCollected(errors: unknown[], label: string): void {
-  // raw rejections propagate unchanged — even an empty AggregateError
-  if (errors.length === 1) throw errors[0];
-  if (errors.length > 1) throw new AggregateError(errors, label);
-}
-/** Idempotency key: session + SORTED original signal ids — same payload ⇒ same id on retry. */
-function deliveryId(sessionId: string, buckets: Bucket[]): string {
-  const ids = buckets.flatMap((b) => [...b.details.values()].flatMap((d) => d.ids)).sort();
-  return createHash('sha256')
-    .update(JSON.stringify([sessionId, ids]))
-    .digest('hex');
 }
 /**
  * Merge buckets (pending) plus the ready context queue, delivered through
@@ -91,6 +75,20 @@ export class BucketDrain {
     this.suppressedGroups -= retargetBuckets(this.pending, this.ready, this.batches, sessionId, (id, buckets, at) =>
       this.buildInjectBatch(id, buckets, at),
     );
+  }
+  confirm(id: string): void {
+    confirmBatch(this.batches, id);
+  }
+  suspend(id: string): InjectBatch[] {
+    const batches = this.batches.get(id) ?? [];
+    this.batches.delete(id);
+    return batches;
+  }
+  restore(sessionId: string, batch: InjectBatch): void {
+    const next = this.buildInjectBatch(sessionId, batch.buckets, batch.intent.update.at);
+    next.aliases = [...(batch.aliases ?? []), ...(batch.intent.deliveryId ? [batch.intent.deliveryId] : [])];
+    for (const bucket of next.buckets) bucket.sessionId = sessionId;
+    this.list(this.batches, sessionId).push(next);
   }
   /** Enqueues one classified signal into its session+subject merge window. */
   enqueue(

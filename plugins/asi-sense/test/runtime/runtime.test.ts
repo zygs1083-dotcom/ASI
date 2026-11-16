@@ -617,7 +617,7 @@ describe('host runtime', () => {
     { delay: 2_000, path: '/workspace/repo/a', agent: false },
     { delay: 2_500, path: '/workspace/repo/a', agent: false },
     { delay: 300, path: '/workspace/other/a', agent: false },
-    { delay: 2_500, path: '/workspace/repo/a', agent: true, oldMtime: true },
+    { delay: 2_500, path: '/workspace/repo/a', agent: false, oldMtime: true },
   ])('classifies a file callback after $delay ms at $path (agent=$agent)', async (scenario) => {
     const h = harness();
     await h.runtime.start();
