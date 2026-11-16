@@ -83,6 +83,83 @@ describe('MemorySampler', () => {
     });
   });
 
+  it.each([-20_000, 0, 20_000])('timestamps fresh memory independently of cached sysctls after a %i ms wall jump', async (jump) => {
+    let mono = 0;
+    let wall = 100_000;
+    let sysctlCalls = 0;
+    const baseRun = run(fx('vm_stat.txt'), '1\n', fx('swapusage.txt'));
+    const s = new MemorySampler({
+      platform: 'darwin',
+      run: async (file, args, signal) => {
+        if (file.endsWith('sysctl')) sysctlCalls++;
+        return baseRun(file, args, signal);
+      },
+      totalmem: () => 128 * 1024 ** 3,
+      now: () => mono,
+      wall: () => wall,
+    });
+    const periods = { pressureMs: 10_000, swapMs: 10_000 };
+    await s.sample(30_000, undefined, periods);
+    mono = 9_000;
+    wall += 9_000 + jump;
+    const result = await s.sample(30_000, undefined, periods);
+    expect(result.status).toBe('ok');
+    expect(result.observedAt).toBe(wall);
+    expect(result.ttlMs).toBe(21_000);
+    expect(sysctlCalls).toBe(1);
+    expect(fact.stale(result, 29_999, wall).status).toBe('ok');
+    expect(fact.stale(result, 30_000, wall).status).toBe('stale');
+  });
+
+  it.each(['vm_stat', 'sysctl'])('stamps each constituent when it completes if %s finishes first', async (first) => {
+    let mono = 0;
+    let wall = 100_000;
+    let resolveVm!: (value: string) => void;
+    let resolveSysctl!: (value: string) => void;
+    const vm = new Promise<string>((resolve) => { resolveVm = resolve; });
+    const sysctl = new Promise<string>((resolve) => { resolveSysctl = resolve; });
+    const s = new MemorySampler({
+      platform: 'darwin',
+      run: async (file) => file.endsWith('vm_stat') ? vm : sysctl,
+      totalmem: () => 128 * 1024 ** 3,
+      now: () => mono,
+      wall: () => wall,
+    });
+    const result = s.sample(6_000, undefined, { pressureMs: 2_000, swapMs: 2_000 });
+    const finishVm = () => resolveVm(fx('vm_stat.txt'));
+    const finishSysctl = () => resolveSysctl(`1\n${fx('swapusage.txt')}`);
+    (first === 'vm_stat' ? finishVm : finishSysctl)();
+    await new Promise((resolve) => setImmediate(resolve));
+    mono = 1_000;
+    wall -= 19_000;
+    (first === 'vm_stat' ? finishSysctl : finishVm)();
+    const reading = await result;
+    expect(reading.observedAt).toBe(first === 'vm_stat' ? 100_000 : 81_000);
+    expect(reading.ttlMs).toBe(first === 'vm_stat' ? 6_000 : 5_000);
+    expect(fact.stale(reading, 5_999, wall).status).toBe('ok');
+    expect(fact.stale(reading, 6_000, wall).status).toBe('stale');
+  });
+
+  it('keeps ttl nonnegative when an earlier constituent expires before vm_stat finishes', async () => {
+    let mono = 0;
+    let resolveVm!: (value: string) => void;
+    const vm = new Promise<string>((resolve) => { resolveVm = resolve; });
+    const s = new MemorySampler({
+      platform: 'darwin',
+      run: async (file) => file.endsWith('vm_stat') ? vm : `1\n${fx('swapusage.txt')}`,
+      now: () => mono,
+      wall: () => 100_000 + mono,
+    });
+    const result = s.sample(6_000, undefined, { pressureMs: 2_000, swapMs: 2_000 });
+    await new Promise((resolve) => setImmediate(resolve));
+    mono = 7_000;
+    resolveVm(fx('vm_stat.txt'));
+    const reading = await result;
+    expect(reading.observedAt).toBe(107_000);
+    expect(reading.ttlMs).toBe(0);
+    expect(fact.stale(reading, mono, 107_000).status).toBe('stale');
+  });
+
   it('clamps anonymous-purgeable at zero when purgeable exceeds anonymous', async () => {
     const s = new MemorySampler({
       platform: 'darwin',
@@ -163,7 +240,7 @@ describe('MemorySampler', () => {
     expect(calls).toBe(3);   // boundary expiry re-runs
   });
 
-  it('composes observedAt/ttlMs from the earliest absolute expiry, not the oldest field', async () => {
+  it('uses the vm observation time and earliest monotonic constituent deadline', async () => {
     let mono = 0;
     let wall = 1_000;
     const s = new MemorySampler({
@@ -179,13 +256,13 @@ describe('MemorySampler', () => {
 
     wall = 9_000; mono = 4_000;         // pressure & swap caches still valid
     const second = await s.sample(6000);
-    expect(second.observedAt).toBe(1000); // cached constituents are the oldest
-    expect(second.ttlMs).toBe(14_000);    // expires at 15000: the fresh vm read's ttl
+    expect(second.observedAt).toBe(9_000); // fresh vm observation
+    expect(second.ttlMs).toBe(6_000);     // expires 6s after the fresh vm read
 
     wall = 40_000; mono = 25_000;       // pressure expired (>5s), swap still cached
     const third = await s.sample(6000);
-    expect(third.observedAt).toBe(1000); // swap's original observation is oldest
-    expect(third.ttlMs).toBe(45_000);    // expires at 46000: the fresh vm read's ttl
+    expect(third.observedAt).toBe(40_000); // fresh vm observation
+    expect(third.ttlMs).toBe(6_000);      // expires 6s after the fresh vm read
     // the tracked monotonic deadline matches: vm part observed at mono 25000 + 6s
     expect(fact.stale(third, 30_999, 40_000).status).toBe('ok');
     expect(fact.stale(third, 31_001, 40_000).status).toBe('stale');

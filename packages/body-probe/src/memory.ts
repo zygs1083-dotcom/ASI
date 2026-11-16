@@ -72,7 +72,7 @@ export interface MemoryPeriods {
 
 interface Cached<T> {
   at: number;          // monotonic stamp used for expiry
-  observedAt: number;  // wall stamp carried into the composite fact
+  observedAt: number;  // wall stamp of the cached observation
   value: T;
 }
 
@@ -110,24 +110,24 @@ export class MemorySampler {
         ...(pressure ? [] : ['kern.memorystatus_vm_pressure_level']),
         ...(swap ? [] : ['vm.swapusage']),
       ];
+      const stamp = (value: string) => ({ value, observedAt: wall(), at: now() });
       const [vmR, sysctlR] = await Promise.allSettled([
-        run('/usr/bin/vm_stat', [], signal),
-        sysctlKeys.length ? run('/usr/sbin/sysctl', ['-n', ...sysctlKeys], signal) : Promise.resolve(''),
+        run('/usr/bin/vm_stat', [], signal).then(stamp),
+        sysctlKeys.length ? run('/usr/sbin/sysctl', ['-n', ...sysctlKeys], signal).then(stamp) : Promise.resolve(undefined),
       ]);
       // A fast failure still waits for the slower sibling: the process may be
       // lingering until here, so only map the error after all have settled.
       if (vmR.status === 'rejected') throw vmR.reason;
       if (sysctlR.status === 'rejected') throw sysctlR.reason;
       if (signal?.aborted) throw signal.reason;
-      const sysctlLines = sysctlR.value.trim().split('\n');
+      const sysctlLines = (sysctlR.value?.value ?? '').trim().split('\n');
       const pressureText = pressure ? '' : sysctlLines.shift() ?? '';
       const swapText = swap ? '' : sysctlLines.shift() ?? '';
-      const wallNow = wall();
-      const monoNow = now();
-      // The fact keeps the oldest constituent's wall time and expires at the
-      // earliest absolute constituent deadline (vm's period is ttl/3).
-      const parts: fact.FactMeta[] = [{ observedAt: wallNow, periodMs: ttlMs / 3, at: monoNow }];
-      const vm = parseVmStat(vmR.value);
+      const { observedAt: wallNow, at: monoNow } = sysctlR.value ?? vmR.value;
+      // The fact uses the vm reading's wall time and expires at the earliest
+      // absolute constituent deadline (vm's period is ttl/3).
+      const parts: fact.FactMeta[] = [{ observedAt: vmR.value.observedAt, periodMs: ttlMs / 3, at: vmR.value.at }];
+      const vm = parseVmStat(vmR.value.value);
       let swapUsed: number;
       if (swap) {
         swapUsed = swap.value;
@@ -153,7 +153,7 @@ export class MemorySampler {
         cached: (vm.fileBacked + vm.purgeable) * vm.pageSize,
         pressure: level,
         swapUsed,
-      }, this.src, meta.ttlMs, meta.observedAt);
+      }, this.src, Math.max(0, meta.expiresAt! - vmR.value.at), vmR.value.observedAt);
       if (meta.expiresAt !== undefined) fact.trackDeadline(f, meta.expiresAt);
       return f;
     } catch (err) {

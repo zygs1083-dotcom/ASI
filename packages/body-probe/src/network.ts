@@ -107,7 +107,7 @@ const MAX_BPS = 10_000_000_000 / 8;
 
 interface RouteEntry {
   at: number;          // monotonic stamp used for expiry
-  observedAt: number;  // wall stamp carried into the composite fact
+  observedAt: number;  // wall stamp of the cached route observation
   value: boolean;      // success (true) or known-offline (false); unknown is never cached
 }
 
@@ -181,7 +181,7 @@ export class NetworkSampler {
         { observedAt: wallNow, periodMs: ttlMs / 3, at: now },
         ...online.parts,
       ]);
-      const f = fact.ok({ online: online.verdict, rxBps, txBps }, this.src, meta.ttlMs, meta.observedAt);
+      const f = fact.ok({ online: online.verdict, rxBps, txBps }, this.src, meta.expiresAt! - now, wallNow);
       if (meta.expiresAt !== undefined) fact.trackDeadline(f, meta.expiresAt);
       return f;
     } catch (err) {

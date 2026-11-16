@@ -802,9 +802,10 @@ describe('BodyProbe', () => {
     const net = probe.latest()!.network;
     expect(mem.status).toBe('ok');
     expect(net.status).toBe('ok');
-    expect(mem.observedAt).toBeLessThan(Date.now()); // built on a t=0 swap read
-    expect(mem.ttlMs).toBe(21_000); // earliest expiry: fresh vm/pressure reads at t6 (+15s)
-    expect(net.ttlMs).toBe(21_000); // the t6 rate sample's own ttl, not the route's
+    expect(mem.observedAt).toBe(Date.now()); // fresh vm read, despite the t=0 swap cache
+    expect(net.observedAt).toBe(Date.now());
+    expect(mem.ttlMs).toBe(15_000); // earliest expiry: fresh vm/pressure reads at t6 (+15s)
+    expect(net.ttlMs).toBe(15_000); // the t6 rate sample's own ttl, not the route's
     const until = (f: Fact<unknown>) => f.observedAt + f.ttlMs;
     const toBoundary = Math.min(until(mem), until(net)) - Date.now() - 1;
     const pastBoundary = Math.max(until(mem), until(net)) - Date.now() + 1;
