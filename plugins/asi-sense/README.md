@@ -11,6 +11,17 @@ and deterministic environment-update formatting.
 的 `title` 投影。`packages/core/session/src/index.ts:45-81` 提供创建、释放和日志事件，
 `session/title` 是改名事件；`packages/workspace/workspace/src/index.ts:148-164,361-363`
 提供归档事件与已归档集合。释放只表示会话离开内存，并不等同于持久数据被删除。
+冷会话缺少标题投影缓存时，使用 `packages/session-query/session-query/src/index.ts:255-274`
+的 `readTitleSnapshots` 读取标题，不直接读取会话文件或恢复 agent。
+
+## 选择投递目标
+
+侧栏标题下的「投递到」默认为自动：把无归属的环境 context/wake 发给最近一次
+pre-step 的活跃会话。展开后可按标题搜索并固定目标，列表按最近活动排序；方向键、
+Enter 和 Escape 均可操作。固定目标也用于「现在」的会话事实和唤醒预算；
+已归属某会话的任务等主事件仍只投给原会话。切换目标时未确认的无归属桶会转移。
+选择按 profile 保存在本地，重启时恢复；目标关闭或归档时回退自动、记录事件并提示一次。
+`env_state` 包含 `deliveryTarget: "auto" | "pinned"`，不包含选中的对话标题。
 
 ## 安装
 
@@ -316,6 +327,9 @@ and run `pnpm --filter asi-sense e2e:dsh`. The fixture uses a private temporary
 profile, disables title sharing and caps model requests at six per run. Profiles
 are removed even when initialization or execution fails. Real observations are
 used only for assertions and are never photographed.
+Set `ASI_E2E_ONLY_TARGET=1` to create two synthetic conversations, select the
+older one by search and verify one background-failure wake reaches only that
+conversation. The DSH process is stopped if the run exceeds ten minutes.
 Set `ASI_E2E_NO_MODEL=1` for sidebar, responsive layout and cleanup checks
 without model requests. Add `ASI_E2E_SYNTHETIC=1` to replace the host plugin
 with a fabricated frame and save panel-only screenshots under

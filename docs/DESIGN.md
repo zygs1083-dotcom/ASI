@@ -196,6 +196,7 @@ interface Body {
    - 同一 `subject` 在合并窗口（默认 2s，保存文件类 5s）内的多个信号合成一条（"a.ts 保存了 3 次"）。
    - `wake` 预算：每会话默认每 10 分钟最多 3 次、两次之间至少 60s；超出降级为 `context`，并在侧栏显示"已抑制 N 次"。
    - 用户正在和 agent 对话（`waiting-user` 以外的活跃轮次由用户发起）时，`wake` 降级为 `next-step` 注入，不另开新轮。
+   - 无会话归属的环境变化投给侧栏当前目标；会话自己的任务等主事件始终归属原会话，不随目标切换。预算按实际接收会话计算。切换目标时未确认的无归属桶按现有转桶机制迁移，不重复投递；已确认的投递不撤回。
 
 规则形式（用户在侧栏编辑，模型用 `env_watch` 提议，**模型新增的 `wake` 规则需用户在侧栏确认后才生效**）：
 
@@ -241,13 +242,13 @@ note: 测试失败时看日志并决定是否提醒我
 
 | 工具 | 作用 |
 |---|---|
-| `env_state({ section? })` | 返回状态快照（带每条事实的 status/年龄），默认省略窗口标题若隐私开关关闭 |
+| `env_state({ section? })` | 返回状态快照（带每条事实的 status/年龄）和 `deliveryTarget` 模式（`auto` / `pinned`，不含会话标题）；默认省略窗口标题若隐私开关关闭 |
 | `env_watch({ action: 'list'|'add'|'remove', rule? })` | 管理关注规则；`add` 一条 `wake` 规则进入"待用户确认" |
 | `env_detail({ app?, window? })` | 需要细节时委托给 DSH 已有的 computer-use 能力（受其授权流程约束）；本插件不自己截图 |
 
 ### 2.6 侧栏界面
 
-左侧栏注册一个图标（`sidebar.panellist`，`id: 'asi-sense'`），对应 `main` 区域面板，四个区块：
+左侧栏注册一个图标（`sidebar.panellist`，`id: 'asi-sense'`），对应 `main` 区域面板。标题下的「投递到」支持按标题搜索对话并显示最近活动时间；默认自动选择最近活跃会话，也可固定一个目标（§7.3）。其下有四个区块：
 
 0. **身体**（置顶）：健康度概览 + CPU、内存（含压力）、磁盘、电池、温控、网络、DSH 进程、token（上下文余量环形图 + 会话消耗 + 余额）；数值实时刷新，带 5 分钟迷你走势图和阈值配色。
 1. **现在**：四个"在哪里"、前台应用/窗口、活动任务、agent 自身状态；每项显示新鲜度（ok/过期/无权限），无权限项给出授权引导按钮（打开系统设置对应页，不弹系统对话框）。
@@ -264,7 +265,7 @@ note: 测试失败时看日志并决定是否提醒我
    - `DshPort`：`onAgentEvent(cb)`（created/disposed/pre-step/post-step，带 sessionId）、`onTool(cb)`（pre/post-execute：sessionId、toolCallId、pid?、cwd?、exitCode?、command 摘要）、`onJob(cb)`、`deliver(sessionId, intent)`（inject / followup / send-next-step，返回 Promise）、`tokenSnapshot(sessionId)`（contextUsed、contextWindow、contextWindowSource、sessionUsage）。
    - `StoragePort`：`load(key)`/`save(key, json)`，save reject ⇔ 未安装（§2.2c 持久化提交语义）。
    - `HelperSpawner`、`ProbeFactory`、`FileWatcher`、`Clock{wall(), mono()}`：测试用假实现。
-   - 会话选择（§7.3 首版）：投给最近一次 pre-step 的活跃会话；无会话时 context 留桶、wake 记录为 suppressed(no-session)。
+   - 会话选择（§7.3）：自动模式投给最近一次 pre-step 的活跃会话；固定模式投给用户选定的会话。无会话时 context 留桶、wake 记录为 suppressed(no-session)；带归属的主事件始终留在所属会话。
    - 存储实现（2026-11-16）：DSH `storage-json` 的 atomic 写在 rename 之后还会因目录 fsync 失败而 reject，且 storage-domain 在 reject 时回滚内存，不满足"reject ⇔ 未安装"。因此安全关键快照不用 `ctx.storageDomain`，由插件自带 FileStoragePort：tmp → fsync(file) → rename（最后可失败步骤）→ fsync(dir)（失败只记日志）。
 2. **presenter**（`src/host/presenter/**`）：把 runtime 公开读接口投影为 `SensePanelModel`（`@asi/sense-ui` 的类型，type-only import），含 5 分钟历史环形缓冲（按 `sampleIntervalsMs` 各序列独立）、insights、learning、tuning、events（最近 200 条，含等级与抑制原因）、rules。输出 `frames(): AsyncIterable<SensePanelModel>`，节流 ≥500ms，同引用复用未变部分。
 3. **actions**：`SenseActions`（全部由宿主以 `user` 身份调用，来源只能是侧栏 Remote 调用）：`toggleRule/confirmRule/deleteRule/pause/setSendTitles/openPermissionSettings/revertTuning/lockParam/feedback/acceptRebaseline/resumeTuning/resetTuning`。模型工具（`env_state/env_watch/env_detail/body_tune`）以 `agent` 身份走同一 runtime，不经 `SenseActions`。
@@ -324,5 +325,5 @@ plugins/asi-sense/
 
 1. `createUserMessage` 的 `source.kind` 是否允许自定义值（影响 §2.4）。
 2. 宿主插件如何拿到"当前活跃会话"——是订阅 `agent/created` 自己维护，还是 DSH 有现成的当前会话服务。
-3. 多会话时信号投递给谁：首版只投给最近活跃的一个会话，规则可指定会话。
+3. **会话选择（已定）**：侧栏可搜索当前 profile 的对话并选择固定目标，默认自动（最近一次 pre-step 的活跃会话）。目标与「现在」区块共用 `currentSessionId()`；无归属的 context/wake 及唤醒预算按目标会话处理，切换时转移尚未确认的无归属桶，会话已有的主事件仍只归其原会话。选择按 profile 保存并在重启时恢复；目标关闭、归档或不存在时回退自动、记录事件并在侧栏提示一次。模型的 `env_state` 只暴露目标模式，不暴露会话标题。固定版 DSH 使用 `packages/api/session-controller/src/index.ts:267-285` 列表与恢复接口、`src/list.ts:125-176` 最近活动与运行状态、`packages/session/session-title/src/types.ts:79-86` 标题投影、`packages/core/session/src/index.ts:45-81` 会话事件和 `packages/workspace/workspace/src/index.ts:148-164,355-362` 归档事件及集合。
 4. 状态持久化用 JSON 还是 SQLite（看 DSH 有没有现成存储服务）。
