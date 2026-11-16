@@ -27,6 +27,8 @@ export const SCENARIOS = [
   'rapid-change',
   'token-fallback',
   'disk-partial',
+  'tuning-disabled',
+  'rebaseline-suggested',
 ] as const
 
 export type ScenarioName = (typeof SCENARIOS)[number]
@@ -57,7 +59,7 @@ function permissionDenied(): SensePanelModel {
   state.env.focusedWindow = denied('未授予辅助功能权限')
   state.env.frontApp = fact(
     { name: 'Finder', bundleId: 'com.demo.finder' },
-    { ageMs: 120_000 },
+    { status: 'stale', ageMs: 120_000 },
   )
   state.self.permissions = fact({ 辅助功能: 'denied', 完全磁盘访问: 'granted' })
   const body = makeBody()
@@ -227,6 +229,28 @@ function rapidChange(): SensePanelModel {
   })
 }
 
+function tuningDisabled(): SensePanelModel {
+  const model = rapidChange()
+  return { ...model, tuning: { ...model.tuning!, disabled: { reason: 'restore-failed' } } }
+}
+
+function rebaselineSuggested(): SensePanelModel {
+  const model = rapidChange()
+  return {
+    ...model,
+    tuning: {
+      ...model.tuning!,
+      disabled: { reason: 'storage-failed' },
+      suggestions: [
+        { id: 'baseline-cpu', metric: 'cpu', unit: 'ratio', slotLabel: '周二 14 时', from: 0.2, to: 0.68, samples: 12, dates: 3 },
+        { id: 'baseline-network', metric: 'networkRx', unit: 'bytes-per-second', slotLabel: '周五 10 时', from: 400_000, to: 1_400_000, samples: 9, dates: 3 },
+        { id: 'baseline-disk', metric: 'disk:/demo', unit: 'bytes', slotLabel: '周三 9 时', from: 80 * 1024 ** 3, to: 60 * 1024 ** 3, samples: 10, dates: 3 },
+        { id: 'baseline-context', metric: 'tokens', unit: 'tokens', slotLabel: '周四 11 时', from: 50_000, to: 30_000, samples: 11, dates: 3 },
+      ],
+    },
+  }
+}
+
 const BUILDERS: Record<ScenarioName, () => SensePanelModel> = {
   healthy,
   'memory-pressure': memoryPressure,
@@ -238,6 +262,8 @@ const BUILDERS: Record<ScenarioName, () => SensePanelModel> = {
   'rapid-change': rapidChange,
   'token-fallback': tokenFallback,
   'disk-partial': diskPartial,
+  'tuning-disabled': tuningDisabled,
+  'rebaseline-suggested': rebaselineSuggested,
 }
 
 export function makeScenario(name: ScenarioName): SensePanelModel {

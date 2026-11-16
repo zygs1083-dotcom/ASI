@@ -37,6 +37,11 @@
       "types": "./src/index.ts",
       "import": "./src/index.ts",
       "default": "./src/index.ts"
+    },
+    "./model": {
+      "types": "./src/view-model.ts",
+      "import": "./src/view-model.ts",
+      "default": "./src/view-model.ts"
     }
   }
 }

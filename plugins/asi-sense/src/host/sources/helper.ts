@@ -2,16 +2,19 @@ import type { ChildProcessWithoutNullStreams } from 'node:child_process';
 import type { RuntimeAttention } from '../runtime/attention.ts';
 import type { Clock, HelperSpawner } from '../runtime/ports.ts';
 import type { BodySource } from './body.ts';
-import { axStatus, clearWindow, helperEvent, type Message, object, source, strip } from './helper-events.ts';
+import { SnapshotBackoff } from './helper-backoff.ts';
+import { axStatus, clearWindow, helperError, helperStatus, type Message, object, strip } from './helper-events.ts';
+import { applyHelperEvent, HelperRecovery, markHelperFacts } from './helper-recovery.ts';
+import { HelperWriter } from './helper-writer.ts';
 
 const HANDSHAKE_MS = 3_000;
 const WINDOW_MS = 600_000;
 const MAX_RESTARTS = 5;
-
 export class HelperSource {
   private child?: ChildProcessWithoutNullStreams;
   private stopped = false;
   private retry?: number;
+  private readonly snapshots = new SnapshotBackoff();
   private deadline?: number;
   private crashes: number[] = [];
   private session?: string;
@@ -22,9 +25,9 @@ export class HelperSource {
   private desired = true;
   private buffer = '';
   private readonly children = new Map<ChildProcessWithoutNullStreams, { done: Promise<void>; killAt?: number }>();
-  private writeTail = Promise.resolve();
+  private readonly writer = new HelperWriter((child) => this.fail('stdin-error', child));
+  private recovery = new HelperRecovery();
   private lastFailure?: string;
-
   constructor(
     private readonly spawner: HelperSpawner,
     private readonly path: string | undefined,
@@ -45,10 +48,11 @@ export class HelperSource {
     this.launch();
   }
   nextDeadline(): number | undefined {
-    const deadlines = [this.retry, this.deadline, ...[...this.children.values()].map((child) => child.killAt)].filter(
-      (value): value is number => value !== undefined,
+    const kill = [...this.children.values()].map((child) => child.killAt);
+    const due = [this.retry, this.deadline, this.snapshots.deadline, ...kill].filter(
+      (v): v is number => v !== undefined,
     );
-    return deadlines.length ? Math.min(...deadlines) : undefined;
+    return due.length ? Math.min(...due) : undefined;
   }
   tick(): void {
     const now = this.clock.mono();
@@ -59,6 +63,7 @@ export class HelperSource {
       }
     }
     if (this.deadline !== undefined && now >= this.deadline) this.fail('handshake-timeout');
+    if (this.snapshots.due(now)) this.requestSnapshot();
     if (this.retry !== undefined && now >= this.retry) {
       if (this.children.size) this.retry = now + 50;
       else {
@@ -79,8 +84,10 @@ export class HelperSource {
   async stop(): Promise<void> {
     this.stopped = true;
     this.retry = undefined;
+    this.snapshots.reset();
     this.deadline = undefined;
     this.child = undefined;
+    this.writer.stop();
     const children = [...this.children.entries()];
     for (const [child] of children) {
       child.stdin.end();
@@ -112,17 +119,15 @@ export class HelperSource {
       else this.restart('spawn-failed');
       return;
     }
-    if (!child) {
-      void this.status('unavailable', 'not-installed');
-      return;
-    }
+    if (!child) return void this.status('unavailable', 'not-installed');
     this.child = child;
     this.session = undefined;
     this.gen = -1;
     this.titles = false;
     this.buffer = '';
     this.intent = undefined;
-    this.writeTail = Promise.resolve();
+    this.writer.start(child);
+    this.recovery = new HelperRecovery(this.recovery.degraded);
     this.deadline = this.clock.mono() + HANDSHAKE_MS;
     const done = new Promise<void>((resolve) => child.once('close', () => resolve()));
     this.children.set(child, { done });
@@ -179,12 +184,16 @@ export class HelperSource {
     }
   }
   private async event(raw: Message): Promise<void> {
+    const child = this.child;
+    const recovery = this.recovery;
+    const valid = () => !this.stopped && this.child === child && this.recovery === recovery;
     if (raw.type === 'hello') {
       if (typeof raw.session !== 'string' || (this.session && this.session !== raw.session))
         throw new Error('invalid session');
       const first = !this.session;
       this.session = raw.session;
       if (first) this.sendIntent();
+      this.recovery.delta(raw);
       const permissions = object(raw.permissions);
       await axStatus(this.attention, permissions?.accessibility === 'granted' ? 'ok' : 'denied', raw.at as number);
       return;
@@ -206,31 +215,44 @@ export class HelperSource {
         this.intent = undefined;
         this.deadline = undefined;
         this.reschedule();
-        await this.status('ok', 'ready');
-        this.write({ cmd: 'snapshot' });
+        if (!this.recovery.degraded) await this.status('ok', 'ready');
+        if (!valid()) return;
+        this.requestSnapshot();
       }
       return;
     }
-    if (raw.type === 'error' && raw.code === 'privacy-generation-exhausted')
-      throw new Error('privacy generation exhausted');
+    if (raw.type === 'error') {
+      if (!this.recovery.degraded) this.snapshots.reset();
+      this.recovery.degraded = true;
+      markHelperFacts(this.attention, this.body, raw.at as number, ['frontApp', 'focusedWindow', 'thermal'], 'stale');
+      const code = await helperError(this.attention, raw);
+      if (!valid()) return;
+      if (code === 'privacy-generation-exhausted') throw new Error('privacy generation exhausted');
+      if (this.recovery.waiting) this.recovery.obsolete = true;
+      else this.requestSnapshot();
+      return;
+    }
     if (this.paused()) return;
-    await helperEvent((this.titles ? raw : strip(raw)) as Message, this.attention, this.body);
+    if (raw.type === 'snapshot') {
+      this.recovery.waiting = false;
+      if (this.recovery.obsolete) {
+        this.recovery.obsolete = false;
+        this.requestSnapshot();
+        return;
+      }
+    }
+    const safe = (this.titles ? raw : strip(raw)) as Message;
+    const recovered = await applyHelperEvent(recovery, raw, safe, this.attention, this.body, valid);
+    if (!valid()) return;
+    if (recovered) {
+      this.snapshots.reset();
+      await this.status('ok', 'snapshot');
+    } else if (raw.type === 'snapshot' && this.recovery.degraded) this.snapshots.failed(this.clock.mono());
+    else if (this.recovery.degraded && !this.recovery.waiting && this.snapshots.delta(raw)) this.requestSnapshot();
+    this.reschedule();
   }
   private async status(status: 'ok' | 'unavailable' | 'error', reason: string): Promise<void> {
-    await this.attention.accept({
-      id: this.attention.id(),
-      kind: 'source.status',
-      at: this.clock.wall(),
-      source,
-      subject: source.id,
-      data: {
-        status,
-        reason,
-        restarts: this.crashes.length,
-        lastFailure: this.lastFailure,
-        ...(status === 'error' ? { error: reason } : {}),
-      },
-    });
+    await helperStatus(this.attention, this.clock.wall(), status, reason, this.crashes.length, this.lastFailure);
   }
   private sendIntent(): void {
     const child = this.child;
@@ -238,26 +260,19 @@ export class HelperSource {
     const intent = { id: String(++this.sequence), enabled: this.desired };
     this.intent = intent;
     this.titles = false;
-    this.deadline = this.clock.mono() + HANDSHAKE_MS;
-    this.write({ cmd: 'titles', ...intent });
+    this.deadline ??= this.clock.mono() + HANDSHAKE_MS;
+    this.writer.write({ cmd: 'titles', ...intent });
     this.reschedule();
   }
-  private write(command: Message): void {
-    const child = this.child;
-    if (!child) return;
-    this.writeTail = this.writeTail.then(
-      () =>
-        new Promise<void>((resolve, reject) => {
-          if (this.child !== child) return resolve();
-          child.stdin.write(`${JSON.stringify(command)}\n`, (error) => (error ? reject(error) : resolve()));
-        }),
-    );
-    void this.writeTail.catch(() => this.fail('stdin-error', child));
+  private requestSnapshot(): void {
+    if (!this.recovery.request()) return;
+    this.writer.write({ cmd: 'snapshot' });
   }
   private fail(reason: string, expected = this.child): void {
     const child = this.child;
     if (!child || child !== expected) return;
     this.child = undefined;
+    this.writer.stop();
     this.titles = false;
     clearWindow(this.attention, this.clock.wall());
     const state = this.children.get(child);
@@ -268,6 +283,7 @@ export class HelperSource {
   }
   private restart(reason: string): void {
     this.deadline = undefined;
+    this.snapshots.reset();
     this.titles = false;
     this.lastFailure = reason;
     if (this.stopped) return;

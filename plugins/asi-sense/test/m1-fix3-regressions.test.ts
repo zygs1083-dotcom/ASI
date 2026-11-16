@@ -6,11 +6,11 @@ import { FakeClock, jobExit, pipe, sess, sig } from './helpers.ts';
 
 let seq = 0;
 const started = (job: string, at: number) =>
-  sig({ id: `st-${job}-${at}-${seq++}`, kind: 'job.started', at, subject: job, data: { command: job } });
+  sig({ id: `st-${job}-${at}-${seq++}`, kind: 'job.started', at, subject: job, data: { command: job, sequence: at } });
 const exited = (job: string, at: number) =>
-  sig({ id: `ex-${job}-${at}-${seq++}`, kind: 'job.exited', at, subject: job, data: { exitCode: 0 } });
+  sig({ id: `ex-${job}-${at}-${seq++}`, kind: 'job.exited', at, subject: job, data: { exitCode: 0, sequence: at } });
 const factUpdate = (id: string, at: number, value: unknown, extra: Partial<Signal['data']> = {}) =>
-  sig({ id, kind: 'fact.updated', at, data: { path: 'env.activeJobs', value, ...extra } });
+  sig({ id, kind: 'fact.updated', at, data: { path: 'env.activeJobs', value, sequence: at, ...extra } });
 const jobIds = (st: StateStore) => (st.snapshot().env.activeJobs.value ?? []).map((j) => j.id);
 const jobsFact = (st: StateStore) => st.snapshot().env.activeJobs;
 

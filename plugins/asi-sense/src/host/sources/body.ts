@@ -9,7 +9,9 @@ import {
   type ParameterSpec,
   Tuner,
 } from '../body/index.ts';
+import { captureRateTimes, type RateTimes } from '../body/rate.ts';
 import type { RuntimeAttention } from '../runtime/attention.ts';
+import type { FactExpiry } from '../runtime/expiry.ts';
 import type { Clock, DshPort, ProbeFactory, StoragePort, TokenSnapshot } from '../runtime/ports.ts';
 
 const source = { id: 'body', api: 'probe', host: 'local' };
@@ -48,9 +50,12 @@ export class BodySource {
   private token?: Fact<NonNullable<Body['tokens']['value']>>;
   private tokenSource?: TokenSnapshot['contextWindowSource'];
   private tokenGeneration = 0;
+  private readonly tokenWork = new Set<Promise<void>>();
   private thermal?: Body['thermal'];
+  private thermalRecovering = false;
   private burstRoots = '';
   private detector = new FileBurstDetector();
+  private rateTimes: RateTimes = {};
 
   constructor(
     factory: ProbeFactory,
@@ -58,13 +63,16 @@ export class BodySource {
     storage: StoragePort,
     private readonly clock: Clock,
     private readonly attention: RuntimeAttention,
+    private readonly expiry: FactExpiry,
     private readonly paused: () => boolean,
+    private readonly changed: () => void,
   ) {
     this.probe = factory.create();
     this.tuner = new Tuner(specs, {
       actor: () => this.identity.getStore() ?? 'agent',
       clock: () => clock.mono(),
       wallClock: () => clock.wall(),
+      onChange: changed,
     });
     this.monitor = new BodyMonitor({
       tuner: this.tuner,
@@ -75,6 +83,10 @@ export class BodySource {
   }
   async start(intervalMs: number): Promise<void> {
     await this.monitor.restore();
+    if (this.stopped) {
+      await this.monitor.close();
+      return;
+    }
     this.state = this.monitor.restoredState ?? {};
     this.off = this.probe.onSample((body) => {
       const at = this.clock.wall();
@@ -100,12 +112,22 @@ export class BodySource {
   sync(): void {
     this.state = this.monitor.restoredState ?? this.state;
   }
-  async tokens(session: string): Promise<void> {
+  tokens(session: string, valid: () => boolean = () => true): Promise<void> {
+    if (this.stopped) return Promise.resolve();
+    const work = this.readTokens(session, valid);
+    this.tokenWork.add(work);
+    void work.then(
+      () => this.tokenWork.delete(work),
+      () => this.tokenWork.delete(work),
+    );
+    return work;
+  }
+  private async readTokens(session: string, valid: () => boolean): Promise<void> {
     const generation = ++this.tokenGeneration;
     const snapshot = await Promise.resolve()
       .then(() => this.dsh.tokenSnapshot(session))
       .catch(() => undefined);
-    if (this.stopped || generation !== this.tokenGeneration) return;
+    if (this.stopped || generation !== this.tokenGeneration || !valid()) return;
     this.tokenSource = snapshot?.contextWindowSource;
     this.token = {
       value: snapshot ?? null,
@@ -115,10 +137,17 @@ export class BodySource {
       ttlMs: 15_000,
     };
     this.write('tokens', this.token);
+    this.changed();
   }
-  setThermal(fact: Body['thermal']): void {
+  setThermal(fact: Body['thermal'], recovering = false): void {
+    if (this.stopped) return;
     this.thermal = fact;
+    this.thermalRecovering = recovering;
     this.write('thermal', fact);
+    this.changed();
+  }
+  finishThermalRecovery(): void {
+    this.thermalRecovering = false;
   }
   setRoots(roots: string[]): void {
     const ordered = [...roots].sort();
@@ -131,21 +160,29 @@ export class BodySource {
     });
   }
   async burst(signal: Signal): Promise<void> {
-    for (const burst of this.detector.accept(signal, this.clock.mono())) await this.publish(burst);
+    if (this.stopped) return;
+    for (const burst of this.detector.accept(signal, this.clock.mono())) {
+      burst.data.feedbackAvailable = false;
+      await this.attention.accept(burst);
+      this.register(burst);
+    }
   }
   async stop(): Promise<void> {
     this.stopped = true;
+    const tokens = Promise.allSettled([...this.tokenWork]);
     this.off?.();
     if (this.sampling) await this.probe.stop();
     this.sampling = false;
     await this.tail;
     await this.monitor.close();
+    await tokens;
   }
   private enqueue(work: () => Promise<void>): void {
     const run = this.tail.then(work);
     this.tail = run.catch(() => {});
   }
   private write(key: keyof Body, fact: Fact<unknown>): void {
+    if (this.stopped) return;
     this.attention.store.apply({
       id: this.attention.id(),
       kind: 'fact.updated',
@@ -157,35 +194,85 @@ export class BodySource {
         value: fact.value,
         status: fact.status,
         ttlMs: fact.ttlMs,
+        ...(key === 'thermal' && this.thermalRecovering ? { preserveSourceStatus: true } : {}),
         ...('unavailableMounts' in fact ? { unavailableMounts: fact.unavailableMounts } : {}),
       },
     });
   }
   private async sample(body: Body, at: number, mono: number): Promise<void> {
     if (this.stopped || this.paused()) return;
-    if (this.token) body.tokens = this.token;
-    if (this.thermal) body.thermal = this.thermal;
-    for (const key of Object.keys(body) as (keyof Body)[]) this.write(key, body[key]);
+    const current = this.token || this.thermal ? this.attention.state().self.body : undefined;
+    if (this.token && current) body.tokens = current.tokens;
+    if (this.thermal && current) body.thermal = current.thermal;
+    const tokenTime = this.token && this.expiry.factMeta('/self/body/tokens');
+    if (tokenTime && current?.tokens.status === 'ok')
+      this.rateTimes.context = { wall: current.tokens.observedAt, mono: tokenTime.observedMono };
+    this.rateTimes = captureRateTimes(body, mono, at, this.rateTimes);
     const evaluated = structuredClone(body);
-    if (this.tokenSource === 'fallback' && evaluated.tokens.value) delete evaluated.tokens.value.contextWindow;
-    const next: BodyThresholdSample = { body: evaluated, at, monotonicAt: mono, source };
-    this.sync();
-    const result = await this.monitor.evaluateAuto(this.previous ?? next, next, this.state);
-    this.state = result.state;
-    this.previous = next;
-    if (result.tuningError) {
-      await this.attention.accept({
-        id: this.attention.id(),
-        kind: 'source.error',
-        at,
-        source,
-        subject: 'body-tuning',
-        data: { error: 'tuning-error' },
-      });
+    for (const [key, metric] of Object.entries({
+      cpu: 'cpu',
+      memory: 'memory',
+      battery: 'battery',
+      network: 'network.rx',
+      harnessProcess: 'rss',
+      tokens: 'context',
+    })) {
+      const stamp = this.rateTimes[metric];
+      if (stamp) evaluated[key as keyof Body].observedAt = at - (mono - stamp.mono);
     }
-    for (const signal of result.signals) await this.publish(signal);
+    for (const disk of evaluated.disks.value ?? []) {
+      const stamp = this.rateTimes[`disk:${disk.mount}`];
+      if (stamp) disk.observedAt = at - (mono - stamp.mono);
+    }
+    const diskTimes = (evaluated.disks.value ?? []).flatMap((disk) =>
+      disk.observedAt === undefined ? [] : [disk.observedAt],
+    );
+    if (diskTimes.length) evaluated.disks.observedAt = Math.min(...diskTimes);
+    if (this.thermal && evaluated.thermal.status === 'ok') evaluated.thermal.observedAt = at;
+    if (
+      evaluated.tokens.value &&
+      (this.tokenSource === 'fallback' ||
+        ('contextWindowSource' in evaluated.tokens.value && evaluated.tokens.value.contextWindowSource === 'fallback'))
+    )
+      delete evaluated.tokens.value.contextWindow;
+    const next = { body: evaluated, at, monotonicAt: mono, source, rateTimes: this.rateTimes };
+    this.sync();
+    const pending: Promise<void>[] = [];
+    let signals: Signal[] = [];
+    const commit: NonNullable<Parameters<typeof this.monitor.evaluateAuto>[3]> = (result, publish) => {
+      this.state = result.state;
+      this.previous = next;
+      signals = [...result.signals];
+      if (result.tuningError) {
+        signals.push({
+          id: this.attention.id(),
+          kind: 'source.error',
+          at,
+          source,
+          subject: 'body-tuning',
+          data: { error: 'tuning-error' },
+        });
+      }
+      this.expiry.withObservationTimes(this.rateTimes, () =>
+        this.attention.batch(() => {
+          for (const key of Object.keys(body) as (keyof Body)[]) {
+            if ((key === 'tokens' && this.token) || (key === 'thermal' && this.thermal)) continue;
+            this.write(key, body[key]);
+          }
+          for (const signal of signals) {
+            signal.data.feedbackAvailable = false;
+            pending.push(this.attention.accept(signal));
+          }
+          this.changed();
+        }, publish),
+      );
+    };
+    await this.monitor.evaluateAuto(this.previous ?? next, next, this.state, commit, this.clock);
+    await Promise.all(pending);
+    for (const signal of signals) this.register(signal);
   }
-  private async publish(signal: Signal): Promise<void> {
+  private register(signal: Signal): void {
+    if (this.stopped) return;
     const id = signal.data.ruleId;
     const rules = [...defaultRateRules(), ...defaultAnomalyRules()];
     const param =
@@ -195,19 +282,18 @@ export class BodySource {
           : 'file.burst.maxChanges'
         : rules.find((rule) => rule.id === id)?.param;
     if (typeof id === 'string' && param && signal.data.severity !== 'normal' && signal.cause !== 'agent') {
-      try {
-        await this.tuner.registerAlert(signal.id, id, param);
-      } catch {
-        await this.attention.accept({
-          id: this.attention.id(),
-          kind: 'source.error',
-          at: this.clock.wall(),
-          source,
-          subject: 'body-tuning',
-          data: { error: 'tuning-error' },
-        });
-      }
+      void this.tuner.registerAlert(signal.id, id, param).then(
+        () => this.changed(),
+        () =>
+          this.attention.accept({
+            id: this.attention.id(),
+            kind: 'source.error',
+            at: this.clock.wall(),
+            source,
+            subject: 'body-tuning',
+            data: { error: 'tuning-error' },
+          }),
+      );
     }
-    await this.attention.accept(signal);
   }
 }

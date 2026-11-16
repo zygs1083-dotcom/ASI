@@ -18,7 +18,11 @@ export function strip(value: unknown): unknown {
 export function object(value: unknown): Message | undefined {
   return value && typeof value === 'object' && !Array.isArray(value) ? (value as Message) : undefined;
 }
+export function validApp(value: Message | undefined): value is Message {
+  return value !== undefined && typeof value.name === 'string' && typeof value.bundleId === 'string';
+}
 export function clearWindow(attention: RuntimeAttention, at: number): void {
+  if (attention.isStopped()) return;
   attention.store.apply({
     id: attention.id(),
     kind: 'fact.updated',
@@ -27,12 +31,49 @@ export function clearWindow(attention: RuntimeAttention, at: number): void {
     subject: 'env.focusedWindow',
     data: { path: 'env.focusedWindow', value: null, status: 'unknown' },
   });
+  attention.changed();
+}
+export async function helperStatus(
+  attention: RuntimeAttention,
+  at: number,
+  status: 'ok' | 'unavailable' | 'error',
+  reason: string,
+  restarts: number,
+  lastFailure?: string,
+): Promise<void> {
+  await attention.accept({
+    id: attention.id(),
+    kind: 'source.status',
+    at,
+    source,
+    subject: source.id,
+    data: {
+      status,
+      reason,
+      restarts,
+      lastFailure,
+      ...(status === 'error' ? { error: reason } : {}),
+    },
+  });
+}
+export async function helperError(attention: RuntimeAttention, event: Message): Promise<string> {
+  const code = typeof event.code === 'string' ? event.code : 'protocol-error';
+  await attention.accept({
+    id: attention.id(),
+    kind: 'source.error',
+    at: event.at as number,
+    source,
+    subject: source.id,
+    data: { error: code, dropped: event.dropped, droppedTypes: event.droppedTypes },
+  });
+  return code;
 }
 export async function axStatus(
   attention: RuntimeAttention,
   status: 'ok' | 'denied' | 'unsupported',
   at: number,
 ): Promise<void> {
+  if (attention.isStopped()) return;
   const previous = attention.state().env.focusedWindow.status;
   if (status !== 'ok' || previous === 'denied' || previous === 'unsupported') {
     attention.store.apply({
@@ -53,7 +94,15 @@ export async function axStatus(
     data: { status },
   });
 }
-export async function helperEvent(event: Message, attention: RuntimeAttention, body: BodySource): Promise<void> {
+export async function helperEvent(
+  event: Message,
+  attention: RuntimeAttention,
+  body: BodySource,
+  recovering = false,
+  skip: ReadonlySet<string> = new Set(),
+  valid: () => boolean = () => true,
+): Promise<void> {
+  if (attention.isStopped()) return;
   const at = event.at as number;
   const emit = async (kind: string, data: Message) => {
     await attention.accept({
@@ -62,31 +111,51 @@ export async function helperEvent(event: Message, attention: RuntimeAttention, b
       at,
       source: kind.startsWith('window') ? ax : source,
       subject: typeof data.bundleId === 'string' ? data.bundleId : 'helper',
-      data,
+      data: recovering ? { ...data, preserveSourceStatus: true } : data,
     });
   };
-  if (event.type === 'thermal' && ['nominal', 'fair', 'serious', 'critical'].includes(String(event.state))) {
-    body.setThermal({
-      value: event.state as Body['thermal']['value'],
-      status: 'ok',
-      source,
-      observedAt: at,
-      ttlMs: 60_000,
-    });
+  if (event.type === 'thermal' && ['unknown', 'nominal', 'fair', 'serious', 'critical'].includes(String(event.state))) {
+    body.setThermal(
+      {
+        value: event.state === 'unknown' ? null : (event.state as Body['thermal']['value']),
+        status: event.state === 'unknown' ? 'unknown' : 'ok',
+        source,
+        observedAt: at,
+        ttlMs: 60_000,
+      },
+      recovering,
+    );
   } else if (event.type === 'snapshot') {
     const app = object(event.frontApp);
-    if (app) await emit('app.activated', app);
+    if (validApp(app) && !skip.has('frontApp')) await emit('app.activated', app);
+    if (!valid()) return;
     const window = object(event.focusedWindow);
-    if (window?.status === 'denied' || window?.status === 'unsupported') await axStatus(attention, window.status, at);
-    else if (window && typeof window.title === 'string') await emit('window.focused', window);
-    else if (window) clearWindow(attention, at);
+    if (!skip.has('focusedWindow')) {
+      if (window?.status === 'denied' || window?.status === 'unsupported') await axStatus(attention, window.status, at);
+      else if (window?.status === 'ok' && typeof window.title === 'string') await emit('window.focused', window);
+      else if (window) clearWindow(attention, at);
+    }
+    if (!valid()) return;
+    if (!skip.has('thermal') && ['nominal', 'fair', 'serious', 'critical'].includes(String(event.thermal))) {
+      body.setThermal(
+        { value: event.thermal as Body['thermal']['value'], status: 'ok', source, observedAt: at, ttlMs: 60_000 },
+        recovering,
+      );
+    }
   } else if (event.type === 'ax.unsupported') {
     await axStatus(attention, 'unsupported', at);
   } else if (event.type === 'app.activated' || event.type === 'app.launched' || event.type === 'app.terminated') {
+    if (event.type === 'app.activated' && !validApp(event)) return;
+    if (
+      recovering &&
+      event.type === 'app.activated' &&
+      !['denied', 'unsupported'].includes(attention.state().env.focusedWindow.status)
+    )
+      clearWindow(attention, at);
     await emit(event.type, event);
   } else if ((event.type === 'window.focused' || event.type === 'window.title') && typeof event.title === 'string') {
     await emit(event.type === 'window.title' ? 'window.title-changed' : event.type, event);
-  } else if (event.type === 'window.focused' && event.window === null) {
+  } else if (event.type === 'window.focused') {
     clearWindow(attention, at);
   }
 }

@@ -88,19 +88,16 @@ and deterministic environment-update formatting.
   bucket is sealed: it retries whole, never split.
 - **Job tracking**: `StateStore(wallClock?, defaultTtlMs?, monotonicClock?)` — exit
   tombstones use the injected _monotonic_ clock over the half-open
-  `[receivedAt, receivedAt+600s)` window while fact TTL keeps the wall clock.
-  `env.activeJobs` reports order on a single `jobsFactAt` watermark — EVERY
-  accepted `fact.updated` for the path advances it, `unknown` included —
-  and a report older than it is dropped before touching fact, tracking or
-  tombstones. Job events are no watermark: a report older than individual
-  job events still merges per job id — a newer tombstone or running event
-  wins, the value rebuilds from merged tracking, and `null` clears only
-  when no newer running job survives. A non-unknown report also advances
-  `jobSnapshotAt`, below which `job.started` is ignored. An `unknown`
-  report marks **only** the status — value, provenance, freshness, jobs
-  and tombstones preserved — yet still moves `jobsFactAt`. A start arriving
-  after its tombstone prunes is an ordinary new event — still subject to
-  the watermark and signal-id dedup.
+  `[receivedAt, receivedAt+600s)` window. Live fact TTL uses monotonic
+  receipt time; explicit `snapshot(now)` remains a wall-time replay seam.
+  Samples, source health, file changes and job events use receipt order.
+  A safe integer `data.sequence` can identify an earlier sample only when
+  both observations have comparable sequences from the same source; wall
+  `at` is display metadata, not an ordering key. An `env.activeJobs`
+  snapshot merges with explicitly newer comparable per-job events, and an
+  `unknown` report changes only the status while advancing its report
+  sequence. Exit tombstones prevent earlier comparable events from resurrecting
+  jobs until pruning; an unsequenced later arrival is accepted.
 - **Self-cause**: a causal-kind signal inside a tool window's inclusive
   bounds is agent-caused when its `pid`, `ppid` or any `ancestors` entry
   equals `window.pid` (the shell pid — children and grandchildren match), or
@@ -148,7 +145,8 @@ model tools must use `tools` and cannot choose their own identity. Pausing
 stops collection and defers pending deliveries until resumed.
 
 The latest active session to issue `pre-step` is selected. Without one,
-context is retained for a subsequent `pre-step`, while wake is recorded with
+context is retained for a subsequent `pre-step` (200 subjects, at most 16
+kind groups per subject including `other`), while wake is recorded with
 `reason: 'no-session'`. Helper title events are stripped until the latest
 matching process-session/id/generation acknowledgement; queued deliveries
 are stripped again when titles are disabled. Five restarts per ten monotonic
@@ -158,6 +156,10 @@ existing state store deliberately normalizes that status to `unavailable`
 with the reason in `error`, and the event log retains the reason/count.
 Fallback token capacity remains visible with its source tag but is omitted
 from threshold and rate evaluations.
+Drains recheck the selected session after every delivery; unattempted and
+failed buckets migrate to the new session. Helper overflow marks helper
+facts stale; recovery applies all snapshot fields and concurrent deltas and
+keeps the source degraded if a required field is missing.
 
 `bodyTune` accepts only the parameters wired to `BodyMonitor`/`Tuner`:
 `floor.{disk,context,battery}.{warn,critical}`, `rate.disk.maxDelta`,
@@ -170,6 +172,18 @@ user approval. `bodyTune({ action: 'feedback', alertId, verdict })` and the
 trusted-user feedback action accept alerts registered by the runtime. The
 body monitor's `evaluateAuto` and all tuning operations are awaited; tuning
 failures are surfaced without discarding confirmed state.
+
+The presenter keeps per-metric five-minute, interval-slotted ring buffers
+(at most 300 points) and projects rate ETA from the monitor's current
+monotonic evidence, not the bounded event log. A body sample notifies change
+subscribers once after its facts, latches and events commit.
+
+Presenter tuning entries expose `status` (`undoable`, `reverted`,
+`superseded`, `rejected`, or `other`) and `undoable`. Only an applied revert
+sets the existing UI `reverted` field; non-undoable and rejected entries carry
+a corresponding explanation in `reason`. The current sense-ui contract has
+no disable-undo field, so it may still show an undo button for those entries;
+the tuner rejects invalid or superseded IDs.
 
 ## M1 boundaries
 
@@ -395,3 +409,82 @@ In `m1-fix3-regressions.test.ts`:
 1. 去重范围：`send` / `followup` / `inject` 是否共享同一 `deliveryId` 去重记录，跨 session 的边界是什么？
 2. 未知提交时的保留期：DSH 可能已提交但确认丢失时，未确认的 `deliveryId` 和待重试消息应保留多久，何时重试或释放？
 3. DSH 是否支持原子提交的幂等键？仅靠本地 ID 集合无法同时消除提交前记账导致的丢失和提交后记账导致的重复；当前只能承诺 at-least-once，不能保证 exactly-once。
+
+## Host runtime review fixes → regression tests
+
+In `test/runtime/runtime.test.ts` unless otherwise noted:
+
+1. Lifecycle generation: `rejects a start stopped while settings load is pending without installing resources`; `closes a body restore that finishes after stop without starting its probe`; `does not deliver when a stopped pre-step resumes after token lookup`; `waits for an in-flight action and rejects it after the runtime stops`.
+2. Session ownership, busy routing, target budget and identity: `reassigns a pending wake to the busy selected session and charges its budget`.
+3. Failed wake retained through session disposal: `retains a failed wake across disposal until another session pre-step`.
+4. Job/tool self-cause, including ancestry and cwd: `classifies job and tool exits using the active tool pid window`.
+5. Serialized watcher refresh: `serializes overlapping rule refreshes and never reopens deleted roots`.
+6. Monotonic TTL: `notifies stale at the monotonic deadline after wall clock rollback`; `renews a repeated fact on receipt even when its wall timestamp is unchanged`; `notifies at independent disk-volume deadlines after wall-clock rollback`; `uses monotonic receipt time for live TTL after wall-clock rollback` (`test/store.test.ts`). Explicit `StateStore.snapshot(now)` remains a wall-time replay seam.
+7. Missing window title: `clears the old title when the next focused window has no readable title` (`test/runtime/helper.test.ts`).
+8. Overlapping roots: `deduplicates one event delivered by overlapping watched roots`.
+9. Bounded pending, sessions and paths: `bounds no-session context by subject and reports evictions`; `reclaims disposed session state after ten minutes of monotonic time` (`test/pipeline.test.ts`); `bounds watched paths at 5000 and evicts the least recently used path` (`test/store.test.ts`).
+10. Bounded helper writes and deadline: `coalesces title switches behind a blocked stdin write`; `does not extend the handshake deadline during repeated title switches`; `never applies an older enable after a newer disable was requested` (`test/runtime/helper.test.ts`).
+11. Alert feedback capacity and registration failure: `evicts the oldest unfeedbacked alert at capacity and records the eviction` (`test/body/tuner.test.ts`); `marks an alert non-feedbackable when registration returns false`.
+12. Helper error and recovery: `records helper output overflow, marks the source degraded and requests a snapshot`; `does not recover from a snapshot requested before output overflow` (`test/runtime/helper.test.ts`).
+13. Resource snapshot stability: `leaves no additional active timer or child process resources after stop` (`test/runtime/helper.test.ts`).
+
+## Host runtime re-review fixes → regression tests
+
+1. In-flight routing: `moves the due wake after an in-flight context delivery changes session`; `retains a failed wake and moves all later buckets before another delivery`; `invalidates an in-flight drain even if a disposed session id is reused` (`test/runtime/routing-rereview.test.ts`).
+2. Receipt ordering and monotonic TTL: `accepts new same-source samples after wall rollback and expires from receipt time`; `uses receipt order for job samples, job events and source health after wall rollback`; `does not advance a fact sequence on an invalid sample or compare different sources` (`test/store.test.ts`); `recognizes source-health transitions in receipt order after a wall-clock rollback` (`test/pipeline.test.ts`).
+3. Complete helper recovery: `retains thermal and app deltas during overflow recovery and rejects an older snapshot`; `keeps a missing snapshot field unknown and the helper degraded`; `applies critical thermal from a recovery snapshot and emits the critical alert` (`test/runtime/helper.test.ts`).
+4. Source-root file deduplication: `preserves same-root same-millisecond deletions while pairing overlapping copies`; `deduplicates one event delivered by overlapping watched roots` (`test/runtime/runtime.test.ts`).
+5. No-session subject capacity: `counts subjects rather than kinds when retaining 200 subjects`; `bounds per-subject kinds and merges excess into other` (`test/runtime/routing-rereview.test.ts`).
+
+## Presenter and runtime fix-2
+
+The panel's display timeline is the presenter's startup wall time plus monotonic
+elapsed time. Fact `observedAt`, event and history times, ETA `asOf`, tuning
+times and frame `now` use this timeline; wall-clock adjustments do not change
+their relative ages. Fact status comes from the runtime; `staleInMs` is the
+remaining monotonic duration at frame creation. Histories cover five minutes,
+using at least one-second slots and at most 300 points.
+
+Rate evidence deduplicates each metric by the first occurrence of its
+`observedAt`, converting that timestamp to monotonic time using its age at
+receipt, as for the fact's display time. A wall-clock jump between acquisition
+and receipt can make this conversion inaccurate; without acquisition-time
+monotonic stamps the original interval cannot be recovered. Another known
+limitation: if a clock rollback makes a genuinely new reading's `observedAt`
+identical to the preceding reading, it is indistinguishable from a cache
+republish and is not counted. Exposing per-metric acquisition generations or
+monotonic timestamps from body-probe is future work.
+
+Alert registration is persisted asynchronously after the alert is published.
+Its initial `feedbackAvailable` is conservatively `false`; queued and already
+delivered signals are not rewritten if registration later succeeds. Feedback
+is usable after successful registration, but the original signal does not
+reflect that later change; publishing updated availability is future work.
+
+Regression tests:
+
+1. Five-minute history: `covers at least 295 seconds after five minutes of 100ms CPU samples` (`test/presenter/history.test.ts`).
+2. Fresh evidence: `does not add rate evidence or refresh asOf when cached disk readings are republished`; `stamps the first occurrence of each reading on the monotonic observation timeline`.
+3. Runtime freshness: `projects runtime status and a monotonic stale countdown across wall jumps`.
+4. Independent notifications: `notifies independent events and later samples while alert storage is hung`.
+5. Display timeline: `keeps all frame time differences stable across a %i ms wall jump` (±61 seconds).
+6. Undoability: `distinguishes reverted, superseded, rejected and undoable tuning entries`.
+7. Pre-step races: `discards an older pre-step when another session pre-steps during token lookup`; `discards a pre-step for a disposed session even if the same id is recreated`.
+8. Helper recovery: `accepts a snapshot without an app or window as a known empty desktop`; `retries incomplete snapshots with bounded exponential backoff and recovers`; `stops retrying incomplete snapshots after ten attempts`.
+
+## Core re-review 3 regressions
+
+1. Atomic facts, monitor and events, including reentrant intake: `publishes complete body commits to every subscriber with session=%s` (`test/presenter/presenter.test.ts`).
+2. Delayed observation and ETA anchor: `anchors delayed rate points and ETA to the same observation time as the fact` (`test/presenter/presenter.test.ts`).
+3. Parent and per-volume expiry: `counts down a disk parent until its last fresh volume expires` (`test/presenter/presenter.test.ts`).
+4. Recovery after retry exhaustion: `starts another bounded recovery round after %s` (`test/runtime/helper.test.ts`).
+5. Stop/replacement race: `discards an in-flight snapshot continuation after stop or replacement (%s)` and `does not apply later snapshot fields after stop interrupts an awaited field` (`test/runtime/helper-recovery.test.ts`).
+
+## Core re-review 4 regressions
+
+1. Atomic expiry metadata: `commits every fact deadline before batched notifications with session=%s` and `keeps reentrant reads on the old or fully committed fact deadlines`.
+2. Delayed event evidence: `anchors delayed disk rate events to their evidence without hiding the current ETA` and `keeps delayed rate event evidence aligned across a %i ms wall jump`.
+3. Evaluation-time ETA: `uses elapsed monotonic time for delayed context ETA alerts and event details`, `evaluates ETA when a received sample waits before publication`, and `clamps an already elapsed observation ETA to zero at evaluation` (`test/body/rate.test.ts`).
+4. Disk aggregation and cache expiry: `aggregates disk parent from final volume deadlines after cached republishes` and `never revives an expired cached disk when its TTL metadata changes`.
+
+Tests are in `test/presenter/presenter.test.ts` unless otherwise noted. Rate signals retain their evaluation-time `at` and remaining ETA, alongside the observation `evidenceAt`; panel events project the evidence time to the display timeline, while current ETA remains anchored to the observation. Disk parent status and deadline reflect the final fresh-volume set; repeated cached volume timestamps cannot extend a volume's deadline. Collection-level `denied` and `unsupported` remain unchanged even with no volumes or an explicitly fresh volume, as covered by `preserves disk collection status %s with or without fresh volumes`.

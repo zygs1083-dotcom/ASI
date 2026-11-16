@@ -3,21 +3,25 @@
 
 import type {
   DisksFact as SharedDisksFact,
+  DiskVolume as SharedDiskVolume,
   Fact as SharedFact,
   FactStatus,
   SourceRef,
 } from '@asi/sense-types'
+import type { TuningState } from './tuning-model'
 
-export type { DiskVolume, FactStatus, SourceRef } from '@asi/sense-types'
+export type { FactStatus, SourceRef } from '@asi/sense-types'
+export type { TuningEntry, TuningParam, TuningState } from './tuning-model'
 
 /** UI 事实：共享 Fact 骨架 + 宿主可读原因（denied/unavailable 时展示）。 */
-export type Fact<T> = SharedFact<T> & { reason?: string }
+export type Fact<T> = SharedFact<T> & { reason?: string; staleInMs?: number }
+export type DiskVolume = SharedDiskVolume & { staleInMs?: number }
 
 /**
- * 磁盘事实：value 为各挂载点独立读数，父级状态只兜底缺省卷（见 sense-types/disks.ts）。
+ * 磁盘事实：value 为各挂载点独立读数，父级状态只兜底缺省卷。
  * unavailableMounts 声明读不出的挂载点：即使 value 里带记录也一律不展示。
  */
-export type DisksFact = SharedDisksFact & { reason?: string }
+export type DisksFact = Omit<SharedDisksFact, 'value'> & { value: DiskVolume[] | null; reason?: string; staleInMs?: number }
 
 export interface Signal {
   id: string
@@ -243,30 +247,6 @@ export interface LearningState {
   confidence?: number
 }
 
-export interface TuningParam {
-  key: string
-  label: string
-  value: number | string
-  unit?: string
-  locked: boolean
-}
-
-export interface TuningEntry {
-  id: string
-  paramKey: string
-  previous: number | string
-  next: number | string
-  by: 'agent' | 'user' | 'auto'
-  reason: string
-  at: number
-  reverted?: boolean
-}
-
-export interface TuningState {
-  parameters: TuningParam[]
-  log: TuningEntry[]
-}
-
 export interface SensePanelModel {
   state: SenseState
   events: SenseEvent[]
@@ -292,4 +272,7 @@ export interface SensePanelProps {
   onRevertTuning: (id: string) => void
   onLockParam: (key: string, locked: boolean) => void
   onFeedback: (signalId: string, value: 'useful' | 'noise') => void
+  onResumeTuning: () => Promise<void>
+  onResetTuning: () => Promise<void>
+  onAcceptRebaseline: (id: string) => Promise<void>
 }

@@ -168,3 +168,37 @@
 .tuneArrow {
   color: var(--dsw-alias-label-secondary, #61666b);
 }
+
+.notice {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sense-gap);
+  padding: var(--sense-pad-row);
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: var(--dsw-radius-xs);
+  background: var(--dsw-alias-bg-layer-1);
+}
+
+.suggestion {
+  padding: var(--sense-pad-row) 0;
+  border-bottom: 0.5px solid var(--dsw-alias-border-l1);
+}
+
+.confirmAction,
+.confirmation {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--sense-gap);
+}
+
+.confirmation {
+  color: var(--dsw-alias-label-primary);
+}
+
+.confirmButtons {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sense-gap);
+}

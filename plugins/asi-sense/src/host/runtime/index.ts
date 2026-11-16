@@ -1,64 +1,65 @@
-import type { SenseState, WatchRule } from '@asi/sense-types';
+import type { WatchRule } from '@asi/sense-types';
 import { BodySource } from '../sources/body.ts';
 import { DshSource } from '../sources/dsh.ts';
 import { FileSource } from '../sources/files.ts';
 import { HelperSource } from '../sources/helper.ts';
+import { boundedShutdown, guardActions } from './action-guard.ts';
 import { RuntimeAttention } from './attention.ts';
+import { createChanges, createStateListeners, observableActions, settleShutdown } from './changes.ts';
 import { FactExpiry } from './expiry.ts';
-import type { SenseActions, SenseOptions, SensePorts, TuneRequest } from './ports.ts';
+import type { SenseActions, SenseOptions, SensePorts } from './ports.ts';
 import { Settings } from './settings.ts';
+import { runtimeTools } from './tools.ts';
 
 export type { EventEntry, EventLog } from './attention.ts';
 export type * from './ports.ts';
-
 export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}) {
   const { clock } = ports;
   const settings = new Settings(ports.storage, options.rules);
   let running = false;
   let started = false;
+  let generation = 0;
   let stopping: Promise<void> | undefined;
   let allowTitles = true;
+  let titleIntent = 0;
   let paused = false;
+  const isPaused = () => paused;
   let timer: ReturnType<typeof setTimeout> | undefined;
   let nextToken = Number.POSITIVE_INFINITY;
   let retryAfter = 0;
   let installed = settings.enabled().map((rule) => rule.id);
+  const changes = createChanges();
+  const changed = () => {
+    if (generation === 0) changes.changed();
+  };
+  const onChange = (listener: () => void) => (generation === 0 ? changes.subscribe(listener) : () => {});
+  const check = (epoch = generation) => {
+    if (stopping || epoch !== generation) throw new Error('stopped');
+  };
+  const expiry = new FactExpiry(clock);
   const attention = new RuntimeAttention(
     clock,
     ports.dsh,
     () => settings.enabled(),
     schedule,
     () => allowTitles && helper.titlesEnabled(),
+    changed,
+    expiry,
   );
-  const expiry = new FactExpiry(clock);
-  const listeners = new Set<(state: SenseState) => void>();
-  const notify = (state: SenseState) => {
-    for (const listener of listeners) {
-      try {
-        listener(structuredClone(state));
-      } catch {}
-    }
-  };
+  const listeners = createStateListeners();
   const offStore = attention.store.subscribe((state) => {
-    expiry.observe(state);
-    notify(state);
+    listeners.notify(state);
     schedule();
   });
-  const body = new BodySource(ports.probe, ports.dsh, ports.storage, clock, attention, () => paused);
-  const dsh = new DshSource(
-    ports.dsh,
-    clock,
-    attention,
-    (id) => body.tokens(id),
-    () => paused,
-  );
+  const body = new BodySource(ports.probe, ports.dsh, ports.storage, clock, attention, expiry, isPaused, changed);
+  const dsh = new DshSource(ports.dsh, clock, attention, body.tokens.bind(body), isPaused);
   const files = new FileSource(
     ports.files,
     clock,
     attention,
     dsh,
     () => settings.enabled(),
-    () => paused,
+    isPaused,
     (signal) => body.burst(signal),
     (roots) => body.setRoots(roots),
   );
@@ -70,19 +71,19 @@ export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}
     attention,
     body,
     schedule,
-    () => paused,
+    isPaused,
   );
-
   function schedule(): void {
     if (timer) clearTimeout(timer);
     timer = undefined;
     if (!running) return;
-    const due = paused ? undefined : attention.pipeline.nextDeadline();
+    const due = paused || !attention.current() ? undefined : attention.pipeline.nextDeadline();
     const deadline = Math.min(
       due === undefined ? Infinity : Math.max(due, retryAfter),
       helper.nextDeadline() ?? Infinity,
       nextToken,
       expiry.next() ?? Infinity,
+      attention.pipeline.retentionDeadline() ?? Infinity,
     );
     if (!Number.isFinite(deadline)) return;
     timer = setTimeout(
@@ -96,13 +97,17 @@ export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}
   }
   async function tick(): Promise<void> {
     if (!running) return;
-    if (expiry.expire()) notify(attention.state());
+    if (expiry.expire()) {
+      listeners.notify(attention.state());
+      changed();
+    }
     if (clock.mono() >= nextToken) {
       nextToken = clock.mono() + 5_000;
       const session = attention.current();
       if (session && !paused) void body.tokens(session);
     }
     helper.tick();
+    attention.pipeline.pruneSessions();
     const due = attention.pipeline.nextDeadline();
     if (!paused && due !== undefined && due <= clock.mono() && clock.mono() >= retryAfter) {
       retryAfter = clock.mono() + 250;
@@ -118,8 +123,12 @@ export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}
     if (running) await files.refresh();
   }
   async function update(change: Parameters<Settings['update']>[0]): Promise<void> {
+    const epoch = generation;
+    check(epoch);
     await settings.update(change);
+    check(epoch);
     await syncRules();
+    changed();
   }
   function ruleChange(id: string, change: (rule: WatchRule) => void): Promise<void> {
     return update((draft) => {
@@ -128,7 +137,7 @@ export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}
       change(rule);
     });
   }
-  const actions: SenseActions = {
+  const unguarded: SenseActions = {
     toggleRule: (id, enabled) =>
       update((draft) => {
         if (!draft.rules.some((rule) => rule.id === id)) throw new Error('unknown rule');
@@ -146,30 +155,40 @@ export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}
         draft.disabled = draft.disabled.filter((item) => item !== id);
       }),
     pause: async (value) => {
+      const epoch = generation;
       if (value && !paused) {
         paused = true;
         schedule();
         await Promise.all([body.setPaused(true), files.refresh(), helper.stop()]);
+        check(epoch);
       }
       await settings.update((draft) => {
         draft.paused = value;
       });
+      check(epoch);
       if (!value && paused) {
         paused = false;
         await body.setPaused(false);
+        check(epoch);
         await files.refresh();
+        check(epoch);
         helper.start(settings.sendTitles);
         schedule();
       }
     },
     setSendTitles: async (enabled) => {
+      const epoch = generation;
+      const intent = ++titleIntent;
       if (!enabled) {
         allowTitles = false;
         helper.setTitles(false);
+        changed();
       }
       await settings.update((draft) => {
         draft.sendTitles = enabled;
       });
+      check(epoch);
+      if (intent !== titleIntent) return;
       allowTitles = enabled;
       if (enabled) helper.setTitles(true);
     },
@@ -183,7 +202,12 @@ export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}
         return result;
       }),
     lockParam: (param, locked) => body.asUser(() => (locked ? body.tuner.lock(param) : body.tuner.unlock(param))),
-    feedback: (id, verdict) => body.asUser(() => body.tuner.feedback(id, verdict)),
+    feedback: (id, verdict) =>
+      body.asUser(async () => {
+        const result = await body.tuner.feedback(id, verdict);
+        if (result.applied) attention.feedback(id, verdict);
+        return result;
+      }),
     acceptRebaseline: (id) =>
       body.asUser(async () => {
         const result = await body.monitor.acceptRebaseline(id);
@@ -193,99 +217,67 @@ export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}
     resumeTuning: () => body.asUser(() => body.tuner.resumeTuning()),
     resetTuning: () => body.asUser(() => body.tuner.resetTuning()),
   };
-  const tools = {
-    envState: (section?: 'self' | 'env' | 'observation') => {
-      const state = attention.state();
-      if (!allowTitles) state.env.focusedWindow.value = null;
-      return section ? state[section] : state;
-    },
-    envWatch: async (request: {
-      action: 'list' | 'add' | 'remove';
-      rule?: Omit<WatchRule, 'approved' | 'createdBy'>;
-      id?: string;
-    }) => {
-      if ('param' in request) throw new Error('unsupported-param');
-      if (request.action === 'list') return settings.list();
-      if (request.action === 'add' && request.rule) {
-        await settings.add(request.rule);
-        await syncRules();
-        return settings.list();
-      }
-      if (request.action === 'remove' && request.id) {
-        const rule = settings.list().find((item) => item.id === request.id);
-        if (rule?.createdBy !== 'agent') throw new Error('only agent rules can be removed');
-        await actions.deleteRule(request.id);
-        return settings.list();
-      }
-      throw new TypeError('invalid env_watch request');
-    },
-    bodyTune: (request: TuneRequest) =>
-      'action' in request
-        ? body.tuner.feedback(request.alertId, request.verdict)
-        : body.tuner.get(request.param) === undefined
-          ? Promise.reject(new Error('unsupported-param'))
-          : body.tuner.propose(request),
-  };
+  const guarded = guardActions(unguarded, () => generation, check);
+  const actions = guarded.actions;
+  const tools = runtimeTools(attention, body, settings, actions, syncRules, check, () => allowTitles, changed);
   function stop(): Promise<void> {
-    if (!started) return Promise.resolve();
     if (stopping) return stopping;
+    generation++;
+    started = true;
     running = false;
     if (timer) clearTimeout(timer);
     timer = undefined;
-    dsh.stop();
+    const deliveries = attention.stop();
+    const callbacks = dsh.stop();
     offStore();
     listeners.clear();
-    const work = Promise.allSettled([files.stop(), helper.stop(), body.stop(), settings.close()]).then((results) => {
-      const errors = results.filter((result): result is PromiseRejectedResult => result.status === 'rejected');
-      if (errors.length === 1) throw errors[0]?.reason;
-      if (errors.length > 1)
-        throw new AggregateError(
-          errors.map((result) => result.reason),
-          'runtime shutdown failed',
-        );
-    });
-    stopping = (async () => {
-      let timeout: ReturnType<typeof setTimeout> | undefined;
-      try {
-        await Promise.race([
-          work,
-          new Promise<never>((_, reject) => {
-            timeout = setTimeout(() => reject(new Error('runtime shutdown timed out')), 950);
-          }),
-        ]);
-      } finally {
-        if (timeout) clearTimeout(timeout);
-      }
-    })();
+    changes.clear();
+    const work = settleShutdown([
+      deliveries,
+      callbacks,
+      guarded.wait(),
+      files.stop(),
+      helper.stop(),
+      body.stop(),
+      settings.close(),
+    ]);
+    stopping = boundedShutdown(work);
     return stopping;
   }
   return {
     async start(): Promise<void> {
       if (started) throw new Error('runtime cannot be restarted');
       started = true;
+      const epoch = generation;
       try {
         await settings.restore();
+        check(epoch);
         allowTitles = settings.sendTitles;
         paused = settings.paused;
         await syncRules();
+        check(epoch);
         await body.start(options.intervalMs ?? 2_000);
+        check(epoch);
         running = true;
         dsh.start();
         await files.refresh();
+        check(epoch);
         if (!paused) helper.start(settings.sendTitles);
         nextToken = clock.mono() + 5_000;
         schedule();
+        changed();
       } catch (error) {
+        const stopped = epoch !== generation;
         await stop().catch(() => {});
+        if (stopped) throw new Error('stopped');
         throw error;
       }
     },
     stop,
     state: () => attention.state(),
-    subscribe: (listener: (state: SenseState) => void) => {
-      listeners.add(listener);
-      return () => listeners.delete(listener);
-    },
+    factMeta: (path: string) => expiry.factMeta(path),
+    subscribe: listeners.subscribe,
+    onChange,
     events: () => attention.events(),
     rules: {
       list: () => settings.list(),
@@ -293,7 +285,7 @@ export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}
       settings: () => ({ paused, sendTitles: allowTitles }),
     },
     body: { monitor: body.monitor, tuner: body.tuner },
-    actions,
+    actions: observableActions(actions, changed),
     tools,
   };
 }
