@@ -94,6 +94,9 @@ importers:
         specifier: workspace:*
         version: link:../../packages/sense-types
     devDependencies:
+      '@asi/sense-ui':
+        specifier: workspace:*
+        version: link:../../packages/sense-ui
       '@vitest/coverage-v8':
         specifier: 5.1.0
         version: 5.1.0(vitest@5.1.0)
