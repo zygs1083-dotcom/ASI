@@ -76,6 +76,7 @@ async function prompt(page: Page, text: string): Promise<void> {
 let server: ChildProcess | undefined;
 let browser: Browser | undefined;
 let phase = 'profile setup';
+let backgroundTurn: number | undefined;
 try {
   if (helperPids().length) throw new Error('An ASI helper from this worktree is already running');
   const overlay = await setup({ root, home, workspace, sessionRoot, counter, budgetReady, services, limit });
@@ -292,64 +293,80 @@ try {
           .first(),
       ).toHaveCount(1, { timeout: 10_000 });
     await expect(failedShell.first()).toHaveAttribute('data-level', 'suppressed');
+    await expect(failedShell.first()).toContainText('已抑制');
     console.log('b1: self-caused event is shown as suppressed');
   }
   if (process.env.ASI_E2E_NO_MODEL !== '1' && process.env.ASI_E2E_ONLY_SELF !== '1') {
     const baseline = envMessages(await events(sessionRoot)).length;
-    phase = 'background followup arrival';
+    phase = 'b2 initial background command';
     await prompt(
       chat,
       'Use the bash tool once with command `sleep 20; exit 1` and run_in_background set to true. Do not wait for it or call other tools. Reply READY immediately. When an environment update arrives, reply ACK without calling any tools.',
     );
-    const log = await waitFor(
+    const initial = await waitFor(
       async () => {
         const current = await events(sessionRoot);
-        return envMessages(current).length && envFollowups(current).length ? current : undefined;
+        const end = current.find((event) => event.type === 'turn/end');
+        return end ? { log: current, end } : undefined;
       },
       120_000,
-      'environment follow-up',
+      'initial background turn completion',
     );
-    console.log(`b2: environment messages=${envMessages(log).length}, followups=${envFollowups(log).length}`);
-    expect(bashCommands(log).some((command) => command.includes('sleep 20') && command.includes('exit 1'))).toBe(true);
-    expect(envMessages(log)).toHaveLength(baseline + 1);
-    expect(envFollowups(log)).toHaveLength(1);
-    const wake = envFollowups(log)[0];
-    phase = 'woken model turn completion';
-    const completed = await waitFor(
+    const turn = record(initial.end.data).turn;
+    if (typeof turn !== 'number') throw new Error('Initial background turn has no turn number');
+    backgroundTurn = turn;
+    expect(record(record(initial.end.data).reason).kind).toBe('completed');
+    const bash = initial.log.find((event) => {
+      const data = record(event.data);
+      if (event.type !== 'tool/call' || data.name !== 'bash' || typeof data.arguments !== 'string') return false;
+      const args = record(JSON.parse(data.arguments));
+      return (
+        typeof args.command === 'string' &&
+        args.command.includes('sleep 20') &&
+        args.command.includes('exit 1') &&
+        args.run_in_background === true
+      );
+    });
+    expect(bash).toBeDefined();
+    expect(envMessages(initial.log)).toHaveLength(baseline);
+    const jobNotice = initial.log.some(
+      (event) =>
+        event.type === 'agent/inbox/spliced' &&
+        Array.isArray(record(event.data).inserted) &&
+        (record(event.data).inserted as unknown[]).some((item) => record(record(item).source).kind === 'tool-jobs'),
+    );
+    expect(jobNotice).toBe(false);
+    const failedJob = panel.locator('li[data-level]').filter({ hasText: 'sleep 20' }).filter({ hasText: 'job-failed' });
+    expect(await failedJob.count()).toBe(0);
+    phase = 'b2 background failure';
+    await expect(failedJob.first()).toHaveCount(1, { timeout: 120_000 });
+    phase = 'b2 woken turn completion';
+    await waitFor(
       async () => {
         const current = await events(sessionRoot);
-        const start = current.findIndex((event) => event.type === wake.type && event.seq === wake.seq);
-        if (start < 0) return undefined;
-        const tail = current.slice(start + 1);
-        const end = tail.find((event) => event.type === 'turn/end');
-        return end ? { tail, end } : undefined;
+        const diagnostics = wakeDiagnostics(current, backgroundTurn);
+        return diagnostics.status !== '等待后台失败' &&
+          diagnostics.status !== '等待唤醒超时' &&
+          diagnostics.status !== '唤醒已发生但回复未完成'
+          ? diagnostics
+          : undefined;
       },
       120_000,
       'woken model turn completion',
     );
-    expect(record(record(completed.end.data).reason).kind).toBe('completed');
-    const turn = record(completed.end.data).turn;
-    const replies = completed.tail.filter(
-      (event) => event.type === 'assistant/message' && record(event.data).turn === turn,
-    );
-    expect(
-      replies.some((event) => {
-        const data = record(event.data);
-        const content = record(data.message).content;
-        return (
-          data.interrupted !== true &&
-          Array.isArray(content) &&
-          content.map(record).some((part) => part.type === 'text' && typeof part.text === 'string' && part.text.trim())
-        );
-      }),
-    ).toBe(true);
+    let current = await events(sessionRoot);
+    let diagnostics = wakeDiagnostics(current, backgroundTurn);
+    console.log('b2 diagnostics:', JSON.stringify(diagnostics));
+    expect(diagnostics.status).toBe('完成');
+    expect(envMessages(current)).toHaveLength(baseline + 1);
     await delay(4000);
-    const final = await events(sessionRoot);
-    expect(envMessages(final)).toHaveLength(baseline + 1);
-    expect(envFollowups(final)).toHaveLength(1);
+    current = await events(sessionRoot);
+    diagnostics = wakeDiagnostics(current, backgroundTurn);
+    console.log('b2 diagnostics after 4s:', JSON.stringify(diagnostics));
+    expect(diagnostics.status).toBe('完成');
+    expect(envMessages(current)).toHaveLength(baseline + 1);
     await expect(panel.locator('[data-tile="tokens"]')).toContainText(/\d/, { timeout: 20_000 });
-    console.log('b2 diagnostics:', JSON.stringify(wakeDiagnostics(final)));
-    console.log('b2: exactly one followup and environment message; woken turn completed with nonempty reply');
+    console.log('b2: exactly one new turn and environment message; turn completed with nonempty reply');
   }
   let shots: string | undefined;
   if (synthetic) {
@@ -369,9 +386,9 @@ try {
     `DSH e2e failed during ${phase} (${error instanceof Error ? error.name : 'unknown error'}); model request upper bound ${await count()}/${limit}`,
   );
   if (error instanceof Error && error.message.startsWith('Timed out waiting for ')) console.error(error.message);
-  if (phase === 'background followup arrival' || phase === 'woken model turn completion') {
+  if (phase.startsWith('b2 ')) {
     const log = await events(sessionRoot);
-    console.error('b2 diagnostics:', JSON.stringify(wakeDiagnostics(log)));
+    console.error('b2 diagnostics:', JSON.stringify(wakeDiagnostics(log, backgroundTurn)));
   }
   const serviceStatus = await readFile(services, 'utf8').catch(() => '');
   if (serviceStatus) console.error(`DSH services: ${serviceStatus}`);

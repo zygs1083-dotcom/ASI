@@ -857,6 +857,30 @@ describe('presenter', () => {
     await h.runtime.stop();
   });
 
+  it('projects self-caused events as suppressed without changing their reason or cause', async () => {
+    const h = await harness();
+    vi.spyOn(h.runtime, 'events').mockReturnValue([
+      {
+        id: 'self-caused',
+        kind: 'process.exited',
+        subject: 'false',
+        at: Date.now(),
+        level: 'record',
+        reason: 'self-caused',
+        cause: 'agent',
+        source: { id: 'synthetic', api: 'dsh', host: 'local' },
+      },
+    ]);
+    expect(h.presenter.snapshot().events[0]).toMatchObject({
+      level: 'suppressed',
+      reason: 'self-caused',
+      cause: 'agent',
+      signal: { subject: 'false' },
+    });
+    h.presenter.close();
+    await h.runtime.stop();
+  });
+
   it('projects natural suggestion values and the disabled reason without converting units', async () => {
     const h = await harness();
     const metrics = ['cpu', 'memory', 'disk:/data', 'rss', 'context', 'network.rx', 'network.tx', 'battery', 'thermal'];
