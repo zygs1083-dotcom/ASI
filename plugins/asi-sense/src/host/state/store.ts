@@ -2,13 +2,13 @@ import { performance } from 'node:perf_hooks';
 import type { Fact, FactStatus, JobSummary, SenseState, Signal } from '@asi/sense-types';
 import { FactExpiry } from './expiry.ts';
 import { FACT_PATHS, factAt, initialState, num, recomputeStatuses, str, ttlOf } from './facts.ts';
+import { type ApplyResult, SignalIntake } from './intake.ts';
 import { FactOrdering } from './ordering.ts';
 import { FACT_STATUSES, sourceObservation } from './source-health.ts';
 import { type JobTrack, jobOrder, mergeJobs, noteFile } from './updates.ts';
 
 const ACTIVITIES: ReadonlySet<string> = new Set(['idle', 'thinking', 'tool', 'waiting-user']);
 type Activity = 'idle' | 'thinking' | 'tool' | 'waiting-user';
-type ApplyResult = 'applied' | 'duplicate' | 'older';
 
 /**
  * In-memory fact table (DESIGN §2.2); the host feeds it signals and reads
@@ -36,6 +36,7 @@ export class StateStore {
   private readonly project: (state: SenseState, signal?: Signal) => SenseState;
   private readonly listeners = new Set<(snapshot: SenseState) => void>();
   private readonly state: SenseState;
+  private batchState?: { raw: SenseState; projected: SenseState };
   private readonly seenIds = new Set<string>();
   private readonly seenOrder: string[] = [];
   private readonly jobs = new Map<string, JobTrack>();
@@ -48,8 +49,15 @@ export class StateStore {
    * Serialized signal intake preserves receipt order during reentrant
    * subscriber and callback activity.
    */
-  private readonly queue: { signal: Signal; afterApply?: (result: ApplyResult) => void }[] = [];
-  private processing = false;
+  private readonly intake = new SignalIntake(
+    (signal) =>
+      this.isDuplicate(signal.id)
+        ? 'duplicate'
+        : this.ordering.earlier(signal) || !this.applyOne(signal)
+          ? 'older'
+          : 'applied',
+    (signal) => this.emit(signal),
+  );
   /**
    * `monotonicClock` (never `Date.now`) drives job-tombstone retention.
    */
@@ -75,35 +83,23 @@ export class StateStore {
    * errors are collected and the first rethrown after the queue drains.
    */
   apply(signal: Signal, afterApply?: (result: ApplyResult) => void): void {
-    this.queue.push({ signal: structuredClone(signal), afterApply });
-    if (this.processing) return;
-    this.processing = true;
-    const errors: unknown[] = [];
-    try {
-      let next = this.queue.shift();
-      while (next !== undefined) {
-        const result = this.isDuplicate(next.signal.id)
-          ? 'duplicate'
-          : this.ordering.earlier(next.signal) || !this.applyOne(next.signal)
-            ? 'older'
-            : 'applied';
-        if (result === 'applied') this.emit(next.signal);
-        if (next.afterApply !== undefined) {
-          try {
-            next.afterApply(result);
-          } catch (e) {
-            errors.push(e);
-          }
-        }
-        next = this.queue.shift();
-      }
-    } finally {
-      this.processing = false;
-    }
-    if (errors.length > 0) throw errors[0];
+    this.intake.apply(signal, afterApply);
+  }
+  batch<T>(work: () => T, publish: () => void = () => {}): T {
+    if (this.batchState) return work();
+    this.batchState = { raw: structuredClone(this.state), projected: this.snapshot() };
+    return this.intake.batch(work, () => {
+      this.batchState = undefined;
+      publish();
+    });
   }
   /** Returns an isolated deep-cloned snapshot with TTL statuses computed at `now`. */
   snapshot(now?: number): SenseState {
+    if (this.batchState) {
+      const clone = structuredClone(now === undefined ? this.batchState.projected : this.batchState.raw);
+      if (now !== undefined) recomputeStatuses(clone, now);
+      return clone;
+    }
     const clone = structuredClone(this.state);
     if (now === undefined) return this.project(clone);
     recomputeStatuses(clone, now ?? this.wallClock());

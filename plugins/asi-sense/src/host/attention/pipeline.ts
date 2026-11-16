@@ -147,8 +147,8 @@ export class AttentionPipeline {
    * durable before the promise resolves; no delivery is attempted or
    * awaited — inside an in-flight `deliver` it still completes.
    */
-  async accept(signal: Signal, session: SessionContext): Promise<EnvChange> {
-    return this.process(signal, session, 1, true);
+  async accept(signal: Signal, session: SessionContext, onIntake?: (change: EnvChange) => void): Promise<EnvChange> {
+    return this.process(signal, session, 1, true, false, onIntake);
   }
   async acceptCount(signal: Signal, session: SessionContext, count: number, other = false): Promise<EnvChange> {
     return this.process(signal, session, count, false, other);
@@ -159,6 +159,7 @@ export class AttentionPipeline {
     count: number,
     apply: boolean,
     other = false,
+    onIntake?: (change: EnvChange) => void,
   ): Promise<EnvChange> {
     const ev = structuredClone(signal);
     ev.cause = classifyCause(ev, session.toolWindows ?? []);
@@ -166,11 +167,12 @@ export class AttentionPipeline {
     return await new Promise<EnvChange>((resolve, reject) => {
       this.store.apply(ev, (result) => {
         try {
-          resolve(
+          const change =
             result === 'older'
               ? { signal: ev, count: 1, level: 'record', reason: 'older-sequence' }
-              : this.intake(ev, session, this.clock(), count),
-          );
+              : this.intake(ev, session, this.clock(), count);
+          onIntake?.(change as EnvChange);
+          resolve(change as EnvChange);
         } catch (e) {
           reject(e);
         }

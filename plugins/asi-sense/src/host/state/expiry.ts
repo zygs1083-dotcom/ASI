@@ -1,11 +1,30 @@
 import { effectiveDisks, type SenseState, type Signal } from '@asi/sense-types';
 
+const metricPaths: Record<string, string> = {
+  '/self/body/cpu': 'cpu',
+  '/self/body/memory': 'memory',
+  '/self/body/battery': 'battery',
+  '/self/body/network': 'network.rx',
+  '/self/body/harnessProcess': 'rss',
+  '/self/body/tokens': 'context',
+};
+
 export class FactExpiry {
   private readonly deadlines = new Map<
     string,
     { stamp: string; at: number; receivedMono: number; observedMono: number; wall: number; fired: boolean }
   >();
+  private observationTimes?: Record<string, { wall: number; mono: number }>;
   constructor(private readonly clock: { mono(): number; wall?(): number }) {}
+  withObservationTimes<T>(times: Record<string, { wall: number; mono: number }>, work: () => T): T {
+    const previous = this.observationTimes;
+    this.observationTimes = times;
+    try {
+      return work();
+    } finally {
+      this.observationTimes = previous;
+    }
+  }
   factMeta(path: string) {
     const entry = this.deadlines.get(path);
     return entry && { observedMono: entry.observedMono, deadlineMono: entry.at };
@@ -53,6 +72,9 @@ export class FactExpiry {
         if (received || this.deadlines.get(path)?.stamp !== stamp) {
           const previous = this.deadlines.get(path);
           const mono = this.clock.mono();
+          const prefix = '/self/body/disks/value/';
+          const metric = path.startsWith(prefix) ? `disk:${path.slice(prefix.length)}` : metricPaths[path];
+          const observation = metric && this.observationTimes?.[metric];
           this.deadlines.set(path, {
             stamp,
             at:
@@ -61,9 +83,11 @@ export class FactExpiry {
                 : Infinity,
             receivedMono: mono,
             observedMono:
-              previous?.wall === entry.observedAt
-                ? previous.observedMono
-                : mono - Math.max(0, (this.clock.wall?.() ?? entry.observedAt) - entry.observedAt),
+              observation && observation.wall === entry.observedAt
+                ? observation.mono
+                : previous?.wall === entry.observedAt
+                  ? previous.observedMono
+                  : mono - Math.max(0, (this.clock.wall?.() ?? entry.observedAt) - entry.observedAt),
             wall: entry.observedAt,
             fired: false,
           });

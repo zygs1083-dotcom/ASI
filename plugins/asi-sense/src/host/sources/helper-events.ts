@@ -100,6 +100,7 @@ export async function helperEvent(
   body: BodySource,
   recovering = false,
   skip: ReadonlySet<string> = new Set(),
+  valid: () => boolean = () => true,
 ): Promise<void> {
   if (attention.isStopped()) return;
   const at = event.at as number;
@@ -127,12 +128,14 @@ export async function helperEvent(
   } else if (event.type === 'snapshot') {
     const app = object(event.frontApp);
     if (validApp(app) && !skip.has('frontApp')) await emit('app.activated', app);
+    if (!valid()) return;
     const window = object(event.focusedWindow);
     if (!skip.has('focusedWindow')) {
       if (window?.status === 'denied' || window?.status === 'unsupported') await axStatus(attention, window.status, at);
       else if (window?.status === 'ok' && typeof window.title === 'string') await emit('window.focused', window);
       else if (window) clearWindow(attention, at);
     }
+    if (!valid()) return;
     if (!skip.has('thermal') && ['nominal', 'fair', 'serious', 'critical'].includes(String(event.thermal))) {
       body.setThermal(
         { value: event.thermal as Body['thermal']['value'], status: 'ok', source, observedAt: at, ttlMs: 60_000 },

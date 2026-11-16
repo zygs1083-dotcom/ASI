@@ -11,6 +11,7 @@ import {
 } from '../body/index.ts';
 import { captureRateTimes, type RateTimes } from '../body/rate.ts';
 import type { RuntimeAttention } from '../runtime/attention.ts';
+import type { FactExpiry } from '../runtime/expiry.ts';
 import type { Clock, DshPort, ProbeFactory, StoragePort, TokenSnapshot } from '../runtime/ports.ts';
 
 const source = { id: 'body', api: 'probe', host: 'local' };
@@ -62,9 +63,9 @@ export class BodySource {
     storage: StoragePort,
     private readonly clock: Clock,
     private readonly attention: RuntimeAttention,
+    private readonly expiry: FactExpiry,
     private readonly paused: () => boolean,
     private readonly changed: () => void,
-    private readonly batch: <T>(work: () => T | Promise<T>) => Promise<T>,
   ) {
     this.probe = factory.create();
     this.tuner = new Tuner(specs, {
@@ -203,7 +204,10 @@ export class BodySource {
     const current = this.token || this.thermal ? this.attention.state().self.body : undefined;
     if (this.token && current) body.tokens = current.tokens;
     if (this.thermal && current) body.thermal = current.thermal;
-    this.rateTimes = captureRateTimes(body, mono, this.rateTimes);
+    const tokenTime = this.token && this.expiry.factMeta('/self/body/tokens');
+    if (tokenTime && current?.tokens.status === 'ok')
+      this.rateTimes.context = { wall: current.tokens.observedAt, mono: tokenTime.observedMono };
+    this.rateTimes = captureRateTimes(body, mono, at, this.rateTimes);
     const evaluated = structuredClone(body);
     for (const [key, metric] of Object.entries({
       cpu: 'cpu',
@@ -233,29 +237,37 @@ export class BodySource {
       delete evaluated.tokens.value.contextWindow;
     const next = { body: evaluated, at, monotonicAt: mono, source, rateTimes: this.rateTimes };
     this.sync();
-    const result = await this.monitor.evaluateAuto(this.previous ?? next, next, this.state);
-    this.state = result.state;
-    this.previous = next;
-    const signals = [...result.signals];
-    if (result.tuningError) {
-      signals.push({
-        id: this.attention.id(),
-        kind: 'source.error',
-        at,
-        source,
-        subject: 'body-tuning',
-        data: { error: 'tuning-error' },
-      });
-    }
-    await this.batch(async () => {
-      for (const key of Object.keys(body) as (keyof Body)[]) {
-        if ((key === 'tokens' && this.token) || (key === 'thermal' && this.thermal)) continue;
-        this.write(key, body[key]);
+    const pending: Promise<void>[] = [];
+    let signals: Signal[] = [];
+    await this.monitor.evaluateAuto(this.previous ?? next, next, this.state, (result, publish) => {
+      this.state = result.state;
+      this.previous = next;
+      signals = [...result.signals];
+      if (result.tuningError) {
+        signals.push({
+          id: this.attention.id(),
+          kind: 'source.error',
+          at,
+          source,
+          subject: 'body-tuning',
+          data: { error: 'tuning-error' },
+        });
       }
-      for (const signal of signals) signal.data.feedbackAvailable = false;
-      await Promise.all(signals.map((signal) => this.attention.accept(signal)));
-      this.changed();
+      this.expiry.withObservationTimes(this.rateTimes, () =>
+        this.attention.batch(() => {
+          for (const key of Object.keys(body) as (keyof Body)[]) {
+            if ((key === 'tokens' && this.token) || (key === 'thermal' && this.thermal)) continue;
+            this.write(key, body[key]);
+          }
+          for (const signal of signals) {
+            signal.data.feedbackAvailable = false;
+            pending.push(this.attention.accept(signal));
+          }
+          this.changed();
+        }, publish),
+      );
     });
+    await Promise.all(pending);
     for (const signal of signals) this.register(signal);
   }
   private register(signal: Signal): void {

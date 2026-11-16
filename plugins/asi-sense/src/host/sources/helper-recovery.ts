@@ -86,6 +86,7 @@ export async function applyHelperEvent(
   safe: Message,
   attention: RuntimeAttention,
   body: BodySource,
+  valid: () => boolean = () => true,
 ): Promise<boolean> {
   if (raw.type !== 'snapshot') recovery.delta(raw);
   if (raw.type === 'snapshot' && !Object.hasOwn(raw, 'frontApp') && !Object.hasOwn(raw, 'focusedWindow')) {
@@ -105,7 +106,8 @@ export async function applyHelperEvent(
     }
     attention.changed();
   }
-  await helperEvent(safe, attention, body, recovery.degraded, recovery.degraded ? recovery.dirty : undefined);
+  await helperEvent(safe, attention, body, recovery.degraded, recovery.degraded ? recovery.dirty : undefined, valid);
+  if (!valid()) return false;
   if (!recovery.degraded || raw.type !== 'snapshot') return false;
   const missing = missingSnapshot(raw);
   if (missing.length) {

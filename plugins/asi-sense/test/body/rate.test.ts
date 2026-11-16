@@ -28,17 +28,17 @@ const deltaRule = (over: Partial<RateRule> = {}): RateRule =>
 const ev = (rules: readonly RateRule[], thr?: (p: string, f: number) => number) => new RateEvaluator(rules, thr);
 const GIB = 1024 ** 3;
 
-it('stamps the first occurrence of each reading with its monotonic receipt time', () => {
+it('stamps the first occurrence of each reading on the monotonic observation timeline', () => {
   const body = diskBody(500);
   body.disks.observedAt = 1_000;
-  const first = captureRateTimes(body, 5_000, {});
-  expect(first['disk:/']).toEqual({ wall: 0, mono: 5_000 });
-  const cached = captureRateTimes(body, 7_000, first);
+  const first = captureRateTimes(body, 5_000, 1_000, {});
+  expect(first['disk:/']).toEqual({ wall: 0, mono: 4_000 });
+  const cached = captureRateTimes(body, 7_000, 3_000, first);
   expect(cached['disk:/']).toEqual(first['disk:/']);
   if (!body.disks.value) throw new Error('missing disk');
   body.disks.value[0].observedAt = 2_000;
-  const next = captureRateTimes(body, 7_000, cached);
-  expect(next['disk:/']).toEqual({ wall: 2_000, mono: 7_000 });
+  const next = captureRateTimes(body, 7_000, 3_000, cached);
+  expect(next['disk:/']).toEqual({ wall: 2_000, mono: 6_000 });
 });
 
 const run = (e: RateEvaluator, frames: [number, number, number][] /* [at, mono, rss] */) => {

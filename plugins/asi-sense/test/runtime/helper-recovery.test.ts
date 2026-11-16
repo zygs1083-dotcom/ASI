@@ -3,9 +3,101 @@ import { RuntimeAttention } from '../../src/host/runtime/attention.ts';
 import { FactExpiry } from '../../src/host/runtime/expiry.ts';
 import type { DshPort } from '../../src/host/runtime/ports.ts';
 import type { BodySource } from '../../src/host/sources/body.ts';
-import { markHelperFacts } from '../../src/host/sources/helper-recovery.ts';
+import { HelperSource } from '../../src/host/sources/helper.ts';
+import { HelperRecovery, markHelperFacts } from '../../src/host/sources/helper-recovery.ts';
 
 describe('helper recovery source isolation', () => {
+  it('does not apply later snapshot fields after stop interrupts an awaited field', async () => {
+    const clock = { wall: () => 1_000, mono: () => 0 };
+    const attention = new RuntimeAttention(
+      clock,
+      {} as DshPort,
+      () => [],
+      () => {},
+      () => true,
+      () => {},
+      new FactExpiry(clock),
+    );
+    const setThermal = vi.fn();
+    const body = { setThermal, finishThermalRecovery: vi.fn() } as unknown as BodySource;
+    const helper = new HelperSource(
+      { spawn: () => undefined },
+      '/fixture',
+      'darwin',
+      clock,
+      attention,
+      body,
+      () => {},
+      () => false,
+    );
+    const inner = helper as unknown as {
+      child: unknown;
+      session: string;
+      recovery: HelperRecovery;
+      event: (value: Record<string, unknown>) => Promise<void>;
+    };
+    inner.child = {};
+    inner.session = 'fixture';
+    inner.recovery = new HelperRecovery(true);
+    const pending = inner.event({
+      type: 'snapshot',
+      at: 1_000,
+      frontApp: { name: 'Example', bundleId: 'example' },
+      focusedWindow: { status: 'unknown' },
+      thermal: 'critical',
+    });
+    await helper.stop();
+    await pending;
+    expect(setThermal).not.toHaveBeenCalled();
+    expect(body.finishThermalRecovery).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])(
+    'discards an in-flight snapshot continuation after stop or replacement (%s)',
+    async (replace) => {
+      const clock = { wall: () => 1_000, mono: () => 0 };
+      const attention = new RuntimeAttention(
+        clock,
+        {} as DshPort,
+        () => [],
+        () => {},
+        () => true,
+        () => {},
+        new FactExpiry(clock),
+      );
+      const body = { setThermal: vi.fn(), finishThermalRecovery: vi.fn() } as unknown as BodySource;
+      const helper = new HelperSource(
+        { spawn: () => undefined },
+        '/fixture',
+        'darwin',
+        clock,
+        attention,
+        body,
+        () => {},
+        () => false,
+      );
+      const inner = helper as unknown as {
+        child: unknown;
+        stopped: boolean;
+        session: string;
+        recovery: HelperRecovery;
+        event: (value: Record<string, unknown>) => Promise<void>;
+      };
+      inner.child = {};
+      inner.session = 'fixture';
+      inner.recovery = new HelperRecovery(true);
+      const pending = inner.event({ type: 'snapshot', at: 1_000, frontApp: { name: 'Example', bundleId: 'example' } });
+      await helper.stop();
+      if (replace) {
+        inner.stopped = false;
+        inner.child = {};
+        inner.recovery = new HelperRecovery(true);
+      }
+      await pending;
+      expect(helper.nextDeadline()).toBeUndefined();
+    },
+  );
+
   it('stales helper facts without invalidating facts supplied by other sources', () => {
     const clock = { wall: () => 1_000, mono: () => 0 };
     const attention = new RuntimeAttention(

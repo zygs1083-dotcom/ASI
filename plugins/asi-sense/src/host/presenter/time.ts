@@ -44,7 +44,9 @@ export function createTimeline(runtime: Runtime, clock: Clock) {
     if (fresh.length) {
       disks.observedAt = Math.min(...fresh.map((disk) => disk.observedAt ?? disks.observedAt));
       const deadlines = fresh.map((disk) => (disk as { staleInMs?: number }).staleInMs).filter(Number.isFinite);
-      if (deadlines.length) (disks as { staleInMs?: number }).staleInMs = Math.min(...(deadlines as number[]));
+      if (deadlines.length === fresh.length)
+        (disks as { staleInMs?: number }).staleInMs = Math.max(...(deadlines as number[]));
+      else delete (disks as { staleInMs?: number }).staleInMs;
     }
     return result;
   };

@@ -4,7 +4,7 @@ import type { SensePanelProps } from '@asi/sense-ui/model';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createPresenter } from '../../src/host/presenter/index.ts';
 import { createSenseRuntime } from '../../src/host/runtime/index.ts';
-import type { JobEvent } from '../../src/host/runtime/ports.ts';
+import type { AgentEvent, JobEvent, TokenSnapshot } from '../../src/host/runtime/ports.ts';
 import { diskFact, f, mkBody } from '../body/helpers.ts';
 
 afterEach(() => vi.useRealTimers());
@@ -15,19 +15,39 @@ async function harness() {
   let mono = 0;
   let sample: (body: Body) => void = () => {};
   let job: (event: JobEvent) => Promise<void> = async () => {};
-  const clock = { wall: () => Date.now(), mono: () => mono };
+  let agent: (event: AgentEvent) => Promise<void> = async () => {};
+  let tokens: TokenSnapshot | undefined;
+  let clockObserver: (() => void) | undefined;
+  let observingClock = false;
+  const clock = {
+    wall: () => Date.now(),
+    mono: () => {
+      if (clockObserver && !observingClock) {
+        observingClock = true;
+        try {
+          clockObserver();
+        } finally {
+          observingClock = false;
+        }
+      }
+      return mono;
+    },
+  };
   const runtime = createSenseRuntime(
     {
       clock,
       dsh: {
-        onAgentEvent: () => () => {},
+        onAgentEvent: (cb) => {
+          agent = cb;
+          return () => {};
+        },
         onTool: () => () => {},
         onJob: (cb) => {
           job = cb;
           return () => {};
         },
         deliver: async () => {},
-        tokenSnapshot: async () => undefined,
+        tokenSnapshot: async () => tokens,
       },
       storage: { load: async () => undefined, save: async () => {} },
       helper: { spawn: () => undefined },
@@ -50,6 +70,13 @@ async function harness() {
   return {
     runtime,
     presenter,
+    tokens: (value: TokenSnapshot) => {
+      tokens = value;
+    },
+    observeClock: (observer?: () => void) => {
+      clockObserver = observer;
+    },
+    agent: (event: AgentEvent) => agent(event),
     job: (event: JobEvent) => job(event),
     advance: async (ms: number) => {
       mono += ms;
@@ -59,10 +86,183 @@ async function harness() {
       sample(body);
       await vi.advanceTimersByTimeAsync(0);
     },
+    sampleRaw: (body: Body) => sample(body),
+    settle: () => vi.advanceTimersByTimeAsync(0),
   };
 }
 
 describe('presenter', () => {
+  it.each([false, true])('publishes complete body commits to every subscriber with session=%s', async (session) => {
+    const h = await harness();
+    if (session) {
+      await h.agent({ type: 'created', sessionId: 's' });
+      await h.agent({ type: 'pre-step', sessionId: 's' });
+    }
+    const body = (cpu: number, pressure: 'normal' | 'critical') =>
+      mkBody({
+        cpu: { ...f({ usage: cpu, perCore: [cpu], load1: 0, load5: 0, load15: 0 }), observedAt: Date.now() },
+        memory: { ...f({ total: 100, used: 90, pressure, swapUsed: 0 }), observedAt: Date.now() },
+      });
+    await h.sample(body(0.1, 'normal'));
+    const seen: unknown[] = [];
+    const jobs: boolean[] = [];
+    let queuedJob: Promise<void> | undefined;
+    const off = h.runtime.subscribe((state) => {
+      jobs.push(!!state.env.activeJobs.value?.some((job) => job.id === 'synthetic-job'));
+      queuedJob ??= h.job({ type: 'started', id: 'synthetic-job' });
+      seen.push({
+        cpu: state.self.body.cpu.value?.usage,
+        memory: state.self.body.memory.value?.pressure,
+        currentCpu: h.runtime.state().self.body.cpu.value?.usage,
+        currentMemory: h.runtime.state().self.body.memory.value?.pressure,
+        latch: h.runtime.body.monitor.restoredState?.memory,
+        event: h.runtime.events().some((event) => event.kind === 'body.threshold' && event.subject === 'memory'),
+      });
+    });
+    await h.advance(1_000);
+    await h.sample(body(0.9, 'critical'));
+    await queuedJob;
+    expect(seen.length).toBeGreaterThan(1);
+    expect(jobs.at(-1)).toBe(true);
+    expect(jobs.slice(0, -1).every((value) => !value)).toBe(true);
+    for (const entry of seen) {
+      expect(entry).toEqual({
+        cpu: 0.9,
+        memory: 'critical',
+        currentCpu: 0.9,
+        currentMemory: 'critical',
+        latch: 'critical',
+        event: true,
+      });
+    }
+    off();
+    h.presenter.close();
+    await h.runtime.stop();
+  });
+
+  it('anchors delayed rate points and ETA to the same observation time as the fact', async () => {
+    const h = await harness();
+    const start = Date.now();
+    const gib = 1024 ** 3;
+    for (const [delay, observed, free] of [
+      [0, 0, 80],
+      [10_000, 10_000, 76],
+      [10_000, 15_000, 75],
+    ]) {
+      await h.advance(delay);
+      const disks = diskFact([{ mount: '/', total: 100 * gib, free: free * gib, observedAt: start + observed }]);
+      disks.observedAt = start + observed;
+      await h.sample(mkBody({ disks }));
+    }
+    const model = h.presenter.snapshot();
+    expect(model.state.self.body.disks.value?.[0].observedAt).toBe(start + 15_000);
+    const eta = model.insights?.['disk:/']?.currentEta;
+    expect(eta?.asOf).toBe(start + 15_000);
+    expect((eta?.ratePerMinute ?? 0) / gib).toBeCloseTo(-20.5714285714, 6);
+    h.presenter.close();
+    await h.runtime.stop();
+  });
+
+  it('keeps fact and rate anchors aligned if wall time jumps after sample receipt', async () => {
+    const h = await harness();
+    const start = Date.now();
+    const gib = 1024 ** 3;
+    for (const [delay, observed, free] of [
+      [0, 0, 80],
+      [10_000, 10_000, 76],
+      [10_000, 15_000, 75],
+    ]) {
+      await h.advance(delay);
+      const disks = diskFact([{ mount: '/', total: 100 * gib, free: free * gib, observedAt: start + observed }]);
+      disks.observedAt = start + observed;
+      h.sampleRaw(mkBody({ disks }));
+      if (free === 75) vi.setSystemTime(Date.now() + 61_000);
+      await h.settle();
+    }
+    const model = h.presenter.snapshot();
+    expect(model.state.self.body.disks.value?.[0].observedAt).toBe(start + 15_000);
+    expect(model.insights?.['disk:/']?.currentEta?.asOf).toBe(start + 15_000);
+    h.presenter.close();
+    await h.runtime.stop();
+  });
+
+  it('uses the existing token fact anchor when the wall clock jumps before its first rate sample', async () => {
+    const h = await harness();
+    const start = Date.now();
+    h.tokens({
+      contextWindow: 1_000,
+      contextUsed: 100,
+      contextWindowSource: 'configured',
+      sessionUsage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    });
+    await h.agent({ type: 'created', sessionId: 's' });
+    await h.agent({ type: 'pre-step', sessionId: 's' });
+    vi.setSystemTime(Date.now() + 61_000);
+    await h.sample(mkBody());
+    expect(h.presenter.snapshot().state.self.body.tokens.observedAt).toBe(start);
+    expect(h.runtime.body.monitor.rateEvidence('context').points).toEqual([{ mono: 0, value: 900 }]);
+    h.presenter.close();
+    await h.runtime.stop();
+  });
+
+  it('exposes only old or complete body snapshots to synchronous reentrant readers during commit', async () => {
+    const h = await harness();
+    const body = (cpu: number, pressure: 'normal' | 'critical') =>
+      mkBody({
+        cpu: { ...f({ usage: cpu, perCore: [cpu], load1: 0, load5: 0, load15: 0 }), observedAt: Date.now() },
+        memory: { ...f({ total: 100, used: 90, pressure, swapUsed: 0 }), observedAt: Date.now() },
+      });
+    await h.sample(body(0.1, 'normal'));
+    await h.advance(1_000);
+    const read = () => ({
+      cpu: h.runtime.state().self.body.cpu.value?.usage,
+      memory: h.runtime.state().self.body.memory.value?.pressure,
+      latch: h.runtime.body.monitor.restoredState?.memory,
+      event: h.runtime.events().some((event) => event.kind === 'body.threshold' && event.subject === 'memory'),
+    });
+    const old = read();
+    const seen: ReturnType<typeof read>[] = [];
+    h.observeClock(() => seen.push(read()));
+    await h.sample(body(0.9, 'critical'));
+    h.observeClock();
+    const fresh = read();
+    expect(fresh).toEqual({ cpu: 0.9, memory: 'critical', latch: 'critical', event: true });
+    expect(seen).toContainEqual(old);
+    expect(seen).toContainEqual(fresh);
+    expect(
+      seen.filter(
+        (entry) => JSON.stringify(entry) !== JSON.stringify(old) && JSON.stringify(entry) !== JSON.stringify(fresh),
+      ),
+    ).toEqual([]);
+    h.presenter.close();
+    await h.runtime.stop();
+  });
+
+  it('counts down a disk parent until its last fresh volume expires', async () => {
+    const h = await harness();
+    const now = Date.now();
+    const disks = diskFact([
+      { mount: '/a', total: 100, free: 80, observedAt: now, ttlMs: 4_000, status: 'ok' },
+      { mount: '/b', total: 100, free: 80, observedAt: now, ttlMs: 10_000, status: 'ok' },
+    ]);
+    disks.observedAt = now;
+    disks.ttlMs = 4_000;
+    await h.sample(mkBody({ disks }));
+    let result = h.presenter.snapshot().state.self.body.disks;
+    expect(result.staleInMs).toBe(10_000);
+    expect(result.value?.map((volume) => volume.staleInMs)).toEqual([4_000, 10_000]);
+    await h.advance(4_000);
+    result = h.presenter.snapshot().state.self.body.disks;
+    expect(h.runtime.state().self.body.disks.status).toBe('ok');
+    expect(result.status).toBe('ok');
+    expect(result.staleInMs).toBe(6_000);
+    await h.advance(6_000);
+    expect(h.runtime.state().self.body.disks.status).toBe('stale');
+    expect(h.presenter.snapshot().state.self.body.disks.status).toBe('stale');
+    h.presenter.close();
+    await h.runtime.stop();
+  });
+
   it('requires three new rate points after an unavailable reading', async () => {
     const h = await harness();
     const gib = 1024 ** 3;

@@ -446,7 +446,10 @@ remaining monotonic duration at frame creation. Histories cover five minutes,
 using at least one-second slots and at most 300 points.
 
 Rate evidence deduplicates each metric by the first occurrence of its
-`observedAt`, and fits against the host's monotonic receipt times. Known
+`observedAt`, converting that timestamp to monotonic time using its age at
+receipt, as for the fact's display time. A wall-clock jump between acquisition
+and receipt can make this conversion inaccurate; without acquisition-time
+monotonic stamps the original interval cannot be recovered. Another known
 limitation: if a clock rollback makes a genuinely new reading's `observedAt`
 identical to the preceding reading, it is indistinguishable from a cache
 republish and is not counted. Exposing per-metric acquisition generations or
@@ -461,10 +464,18 @@ reflect that later change; publishing updated availability is future work.
 Regression tests:
 
 1. Five-minute history: `covers at least 295 seconds after five minutes of 100ms CPU samples` (`test/presenter/history.test.ts`).
-2. Fresh evidence: `does not add rate evidence or refresh asOf when cached disk readings are republished`; `stamps the first occurrence of each reading with its monotonic receipt time`.
+2. Fresh evidence: `does not add rate evidence or refresh asOf when cached disk readings are republished`; `stamps the first occurrence of each reading on the monotonic observation timeline`.
 3. Runtime freshness: `projects runtime status and a monotonic stale countdown across wall jumps`.
 4. Independent notifications: `notifies independent events and later samples while alert storage is hung`.
 5. Display timeline: `keeps all frame time differences stable across a %i ms wall jump` (±61 seconds).
 6. Undoability: `distinguishes reverted, superseded, rejected and undoable tuning entries`.
 7. Pre-step races: `discards an older pre-step when another session pre-steps during token lookup`; `discards a pre-step for a disposed session even if the same id is recreated`.
 8. Helper recovery: `accepts a snapshot without an app or window as a known empty desktop`; `retries incomplete snapshots with bounded exponential backoff and recovers`; `stops retrying incomplete snapshots after ten attempts`.
+
+## Core re-review 3 regressions
+
+1. Atomic facts, monitor and events, including reentrant intake: `publishes complete body commits to every subscriber with session=%s` (`test/presenter/presenter.test.ts`).
+2. Delayed observation and ETA anchor: `anchors delayed rate points and ETA to the same observation time as the fact` (`test/presenter/presenter.test.ts`).
+3. Parent and per-volume expiry: `counts down a disk parent until its last fresh volume expires` (`test/presenter/presenter.test.ts`).
+4. Recovery after retry exhaustion: `starts another bounded recovery round after %s` (`test/runtime/helper.test.ts`).
+5. Stop/replacement race: `discards an in-flight snapshot continuation after stop or replacement (%s)` and `does not apply later snapshot fields after stop interrupts an awaited field` (`test/runtime/helper-recovery.test.ts`).

@@ -40,11 +40,11 @@ interface Point {
 export type RateTimes = Record<string, { mono: number; wall: number }>;
 type RateSample = BodyThresholdSample & { rateTimes?: RateTimes };
 
-export function captureRateTimes(body: Body, mono: number, previous: RateTimes): RateTimes {
+export function captureRateTimes(body: Body, mono: number, receivedWall: number, previous: RateTimes): RateTimes {
   const next: RateTimes = {};
   const add = (key: string, wall: number, usable: boolean) => {
     if (!usable || !Number.isFinite(wall)) return;
-    next[key] = previous[key]?.wall === wall ? previous[key] : { wall, mono };
+    next[key] = previous[key]?.wall === wall ? previous[key] : { wall, mono: mono - Math.max(0, receivedWall - wall) };
   };
   const fact = (key: string, item: Body[keyof Body]) =>
     add(key, item.observedAt, item.status === 'ok' && item.value !== null);

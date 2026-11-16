@@ -573,6 +573,42 @@ describe('helper protocol integration', () => {
     await h.runtime.stop();
   });
 
+  it.each(['delta', 'cooldown'] as const)('starts another bounded recovery round after %s', async (trigger) => {
+    const h = setup();
+    await h.runtime.start();
+    await h.settle();
+    const child = h.children[0];
+    child.snapshotReply = false;
+    let snapshots = 0;
+    child.stdin.on('data', (chunk: Buffer) => {
+      if (chunk.toString().includes('"snapshot"')) snapshots++;
+    });
+    child.send({ type: 'error', code: 'output_overflow', dropped: 1 });
+    await h.settle();
+    for (let i = 0; i < 11; i++) {
+      child.send({ type: 'snapshot', frontApp: { name: 'ExampleApp', bundleId: 'example.app' } });
+      await h.settle();
+      if (i < 10) await h.advance(Math.min(60_000, 2_000 * 2 ** i));
+    }
+    expect(snapshots).toBe(11);
+    if (trigger === 'delta') {
+      child.send({ type: 'thermal', state: 'unknown' });
+      await h.settle();
+      expect(snapshots).toBe(11);
+      child.send({ type: 'thermal', state: 'nominal' });
+      await h.settle();
+    } else {
+      await h.advance(299_999);
+      expect(snapshots).toBe(11);
+      await h.advance(1);
+    }
+    expect(snapshots).toBe(12);
+    child.send({ type: 'snapshot', thermal: 'nominal' });
+    await h.settle();
+    expect(h.runtime.state().observation.sources.helper?.status).toBe('ok');
+    await h.runtime.stop();
+  });
+
   it('applies complete snapshot fields after an unusable incremental thermal event', async () => {
     const h = setup();
     await h.runtime.start();

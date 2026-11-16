@@ -41,6 +41,7 @@ export class RuntimeAttention {
   readonly store: StateStore;
   readonly pipeline: AttentionPipeline;
   private readonly entries: EventLog = [];
+  private batchEntries?: EventLog;
   private readonly pending = new PendingContext();
   private readonly sessions = new Map<string, SessionContext>();
   private readonly recent: string[] = [];
@@ -107,8 +108,15 @@ export class RuntimeAttention {
   state(): SenseState {
     return this.store.snapshot();
   }
+  batch<T>(work: () => T, publish: () => void): T {
+    this.batchEntries = structuredClone(this.entries);
+    return this.store.batch(work, () => {
+      this.batchEntries = undefined;
+      publish();
+    });
+  }
   events(): EventLog {
-    const events = structuredClone(this.entries);
+    const events = structuredClone(this.batchEntries ?? this.entries);
     if (!this.titlesAllowed()) {
       for (const entry of events) {
         if (!entry.kind.startsWith('window')) continue;
@@ -227,9 +235,10 @@ export class RuntimeAttention {
       );
       return;
     }
-    const change = await this.pipeline.accept(signal, session);
-    this.log(change, mono);
-    this.reschedule();
+    await this.pipeline.accept(signal, session, (change) => {
+      this.log(change, mono);
+      this.reschedule();
+    });
   }
   async flush(): Promise<void> {
     try {

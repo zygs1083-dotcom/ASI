@@ -51,16 +51,7 @@ export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}
     listeners.notify(state);
     schedule();
   });
-  const body = new BodySource(
-    ports.probe,
-    ports.dsh,
-    ports.storage,
-    clock,
-    attention,
-    isPaused,
-    changed,
-    changes.batch,
-  );
+  const body = new BodySource(ports.probe, ports.dsh, ports.storage, clock, attention, expiry, isPaused, changed);
   const dsh = new DshSource(ports.dsh, clock, attention, body.tokens.bind(body), isPaused);
   const files = new FileSource(
     ports.files,
