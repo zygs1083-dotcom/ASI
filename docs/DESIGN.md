@@ -241,6 +241,26 @@ note: 测试失败时看日志并决定是否提醒我
 
 数据通道：宿主插件暴露 Remote API（`TypertRemoteService`），客户端订阅状态变化和事件流。
 
+### 2.7 M3/M4 集成契约（2026-11-16 协调端定稿）
+
+分层（只依赖上一层的公开 API，不互相 import 内部实现）：
+
+1. **runtime**（`plugins/asi-sense/src/host/runtime/**`、`src/host/sources/**`）：纯 Node，不 import Cordis/DSH。`createSenseRuntime(ports, options)` 组合 body-probe 采样、helper 子进程、文件监视、StateStore、AttentionPipeline、BodyMonitor、持久化与单一 deadline 定时器（取 pipeline/body/TTL 的最早 deadline，墙钟只用于展示）。所有外部依赖经端口注入：
+   - `DshPort`：`onAgentEvent(cb)`（created/disposed/pre-step/post-step，带 sessionId）、`onTool(cb)`（pre/post-execute：sessionId、toolCallId、pid?、cwd?、exitCode?、command 摘要）、`onJob(cb)`、`deliver(sessionId, intent)`（inject / followup / send-next-step，返回 Promise）、`tokenSnapshot(sessionId)`（contextUsed、contextWindow、contextWindowSource、sessionUsage）。
+   - `StoragePort`：`load(key)`/`save(key, json)`，save reject ⇔ 未安装（§2.2c 持久化提交语义）。
+   - `HelperSpawner`、`ProbeFactory`、`FileWatcher`、`Clock{wall(), mono()}`：测试用假实现。
+   - 会话选择（§7.3 首版）：投给最近一次 pre-step 的活跃会话；无会话时 context 留桶、wake 记录为 suppressed(no-session)。
+2. **presenter**（`src/host/presenter/**`）：把 runtime 公开读接口投影为 `SensePanelModel`（`@asi/sense-ui` 的类型，type-only import），含 5 分钟历史环形缓冲（按 `sampleIntervalsMs` 各序列独立）、insights、learning、tuning、events（最近 200 条，含等级与抑制原因）、rules。输出 `frames(): AsyncIterable<SensePanelModel>`，节流 ≥500ms，同引用复用未变部分。
+3. **actions**：`SenseActions`（全部由宿主以 `user` 身份调用，来源只能是侧栏 Remote 调用）：`toggleRule/confirmRule/deleteRule/pause/setSendTitles/openPermissionSettings/revertTuning/lockParam/feedback/acceptRebaseline/resumeTuning/resetTuning`。模型工具（`env_state/env_watch/env_detail/body_tune`）以 `agent` 身份走同一 runtime，不经 `SenseActions`。
+4. **dsh**（`src/host/dsh/**`、`src/client/**`、包清单）：唯一 import DSH/Cordis 的层——实现 DshPort/StoragePort（`ctx.storageDomain`）、`TypertRemoteService`（`frames` 为 stream，actions 为 unary）、工具与系统提示段、客户端侧栏挂载 `SensePanel`。
+
+`SensePanelModel.tuning` 扩展（sense-ui 与 presenter 共同遵守）：
+```ts
+disabled?: { reason: 'storage-failed' | 'restore-failed' }
+suggestions?: { id: string; metric: MetricKey; slotLabel: string /* 例 "周二 14 时" */; from: number; to: number; samples: number; dates: number }[]
+```
+UI：disabled 时规则区顶部提示条——storage-failed 给「恢复 AI 调参」（`onResumeTuning`），restore-failed 给「重置调参」（`onResetTuning`，二次确认）；suggestions 列在调整日志上方，每条「确认重新基线」（`onAcceptRebaseline(id)`，二次确认，文案说明"持续故障与新负载无法自动区分"）。
+
 ## 3. 目录结构（计划）
 
 ```
