@@ -11,8 +11,9 @@
     "dev": "vite",
     "build": "vite build",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run --browser.headless",
-    "e2e": "playwright test",
+    "test": "vitest run --browser.enabled=false --exclude '**/*.test.tsx'",
+    "test:browser": "vitest run --browser.headless --exclude '**/*.test.ts'",
+    "e2e": "pnpm test:browser && playwright test",
     "e2e:update": "playwright test --update-snapshots=all",
     "check": "pnpm typecheck && pnpm test"
   },
