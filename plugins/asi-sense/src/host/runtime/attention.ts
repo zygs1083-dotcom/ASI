@@ -18,6 +18,7 @@ export interface EventEntry {
   ruleId?: string;
   cause?: SignalCause;
   at: number;
+  mono?: number;
   restarts?: number;
   source: SourceRef;
   detail?: Record<string, string | number | boolean>;
@@ -187,6 +188,7 @@ export class RuntimeAttention {
   }
   async accept(signal: Signal): Promise<void> {
     if (this.stopped) return;
+    const mono = this.clock.mono() - Math.max(0, this.clock.wall() - signal.at);
     const session = this.selected && this.sessions.get(this.selected);
     if (!session) {
       const prior = this.store.snapshot().observation.sources[signal.source.id];
@@ -194,7 +196,7 @@ export class RuntimeAttention {
         this.store.apply(signal, (result) => {
           try {
             if (result !== 'applied') {
-              this.log({ signal, level: 'record', reason: result === 'older' ? 'older-sequence' : 'duplicate' });
+              this.log({ signal, level: 'record', reason: result === 'older' ? 'older-sequence' : 'duplicate' }, mono);
               resolve();
               return;
             }
@@ -216,7 +218,7 @@ export class RuntimeAttention {
               const evicted = this.pending.add(signal);
               if (evicted !== undefined) reason = `pending-evicted:${evicted}`;
             }
-            this.log({ signal, level, ruleId: rule?.id, reason });
+            this.log({ signal, level, ruleId: rule?.id, reason }, mono);
             resolve();
           } catch (error) {
             reject(error);
@@ -226,7 +228,7 @@ export class RuntimeAttention {
       return;
     }
     const change = await this.pipeline.accept(signal, session);
-    this.log(change);
+    this.log(change, mono);
     this.reschedule();
   }
   async flush(): Promise<void> {
@@ -240,7 +242,7 @@ export class RuntimeAttention {
       this.reschedule();
     }
   }
-  private log(change: { signal: Signal; level: DeliveryLevel; ruleId?: string; reason?: string }): void {
+  private log(change: { signal: Signal; level: DeliveryLevel; ruleId?: string; reason?: string }, mono: number): void {
     const { signal, level, ruleId, reason } = change;
     const sourceReason =
       signal.kind === 'source.status' && typeof signal.data.reason === 'string'
@@ -257,6 +259,7 @@ export class RuntimeAttention {
       kind: signal.kind,
       subject: signal.subject,
       at: signal.at,
+      mono,
       level,
       ruleId,
       reason: reason ?? sourceReason,

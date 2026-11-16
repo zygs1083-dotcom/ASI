@@ -1,4 +1,4 @@
-import { type Body, diskVolumeAt, factStatusAt } from '@asi/sense-types';
+import type { Body } from '@asi/sense-types';
 import type { BodyHistory, MetricInsight, MetricKey, ThresholdLayer } from '@asi/sense-ui/model';
 import type { Clock } from '../runtime/index.ts';
 import type { Runtime } from './project.ts';
@@ -39,12 +39,13 @@ const keys: MetricKey[] = [
   'tokens',
 ];
 
-function available(body: Body, key: MetricKey, now: number): boolean {
+function available(body: Body, key: MetricKey): boolean {
   if (key.startsWith('disk:')) {
     const disk = body.disks.value?.find((item) => item.mount === key.slice(5));
     return (
       !!disk &&
-      diskVolumeAt(body.disks, disk, now).status === 'ok' &&
+      (disk.status ?? body.disks.status) === 'ok' &&
+      !body.disks.unavailableMounts?.includes(disk.mount) &&
       Number.isFinite(disk.total) &&
       disk.total > 0 &&
       Number.isFinite(disk.free) &&
@@ -58,7 +59,7 @@ function available(body: Body, key: MetricKey, now: number): boolean {
       : key === 'processCpu' || key === 'processRss'
         ? body.harnessProcess
         : body[key as 'cpu' | 'memory' | 'battery' | 'thermal' | 'tokens'];
-  return factStatusAt(fact, now) === 'ok' && fact.value !== null;
+  return fact.status === 'ok' && fact.value !== null;
 }
 
 function convert(key: MetricKey, value: number, body: Body): number | undefined {
@@ -78,6 +79,7 @@ function etaFor(
   monitor: Runtime['body']['monitor'],
   body: Body,
   interval: number,
+  at: (mono: number) => number,
 ): MetricInsight['currentEta'] {
   const metric = key.startsWith('disk:') ? key : natural[key];
   if (!metric || (!key.startsWith('disk:') && key !== 'tokens')) return undefined;
@@ -92,7 +94,7 @@ function etaFor(
   const timeToThresholdMs = (Math.max(0, last.value - floor) / loss) * 60_000;
   if (!Number.isFinite(timeToThresholdMs)) return undefined;
   return {
-    asOf: evidence.asOf,
+    asOf: at(last.mono),
     sampleIntervalMs: interval,
     ratePerMinute: key === 'tokens' ? loss : -loss,
     timeToThresholdMs,
@@ -104,8 +106,9 @@ export function projectInsights(
   history: BodyHistory,
   clock: Clock,
   intervals: Partial<Record<MetricKey, number>>,
+  body: Body,
+  at: (mono: number) => number,
 ): { insights: Partial<Record<MetricKey, MetricInsight>>; learning: SenseLearning } {
-  const body = runtime.state().self.body;
   const monitor = runtime.body.monitor;
   const tuner = runtime.body.tuner;
   const baseline = monitor.baseline.clone();
@@ -115,7 +118,7 @@ export function projectInsights(
   const insights: Partial<Record<MetricKey, MetricInsight>> = {};
   const all = [...keys, ...Object.keys(history.disks).map((mount): MetricKey => `disk:${mount}`)];
   for (const key of all) {
-    if (!available(body, key, now)) continue;
+    if (!available(body, key)) continue;
     const token = body.tokens.value;
     const fallback = token && 'contextWindowSource' in token && token.contextWindowSource === 'fallback';
     if (key === 'tokens' && fallback) continue;
@@ -192,7 +195,7 @@ export function projectInsights(
     }
     const defaultInterval = disk ? 10_000 : key === 'battery' ? 30_000 : 2_000;
     const interval = intervals[key] ?? defaultInterval;
-    const eta = etaFor(key, monitor, body, Number.isFinite(interval) && interval > 0 ? interval : defaultInterval);
+    const eta = etaFor(key, monitor, body, Number.isFinite(interval) && interval > 0 ? interval : defaultInterval, at);
     if (eta) item.currentEta = eta;
     insights[key] = item;
   }

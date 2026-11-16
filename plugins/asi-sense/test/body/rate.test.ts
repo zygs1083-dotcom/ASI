@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import type { BodyThresholdState, Signal } from '@asi/sense-types';
 import { describe, expect, it } from 'vitest';
-import { RateEvaluator, type RateRule } from '../../src/host/body/rate.ts';
+import { captureRateTimes, RateEvaluator, type RateRule } from '../../src/host/body/rate.ts';
 import { type AdaptiveState, BODY_HISTORY } from '../../src/host/body/state.ts';
 import { SRC } from '../helpers.ts';
 import {
@@ -27,6 +27,19 @@ const deltaRule = (over: Partial<RateRule> = {}): RateRule =>
   }) as RateRule;
 const ev = (rules: readonly RateRule[], thr?: (p: string, f: number) => number) => new RateEvaluator(rules, thr);
 const GIB = 1024 ** 3;
+
+it('stamps the first occurrence of each reading with its monotonic receipt time', () => {
+  const body = diskBody(500);
+  body.disks.observedAt = 1_000;
+  const first = captureRateTimes(body, 5_000, {});
+  expect(first['disk:/']).toEqual({ wall: 0, mono: 5_000 });
+  const cached = captureRateTimes(body, 7_000, first);
+  expect(cached['disk:/']).toEqual(first['disk:/']);
+  if (!body.disks.value) throw new Error('missing disk');
+  body.disks.value[0].observedAt = 2_000;
+  const next = captureRateTimes(body, 7_000, cached);
+  expect(next['disk:/']).toEqual({ wall: 2_000, mono: 7_000 });
+});
 
 const run = (e: RateEvaluator, frames: [number, number, number][] /* [at, mono, rss] */) => {
   let state: BodyThresholdState = {};

@@ -10,6 +10,7 @@ import {
   projectTuning,
   type Runtime,
 } from './project.ts';
+import { createTimeline } from './time.ts';
 
 type Waiter = (value: IteratorResult<PresenterModel>) => void;
 interface Subscriber {
@@ -44,8 +45,14 @@ export function createPresenter(
   },
 ) {
   const { clock } = options;
-  const intervals = { ...options.sampleIntervalsMs };
+  const intervals = Object.fromEntries(
+    Object.entries(options.sampleIntervalsMs ?? {}).map(([key, value]) => [
+      key,
+      value !== undefined && Number.isFinite(value) && value > 0 ? Math.max(1_000, value) : value,
+    ]),
+  ) as Partial<Record<MetricKey, number>>;
   const history = createHistory(intervals);
+  const timeline = createTimeline(runtime, clock);
   const subscribers = new Set<Subscriber>();
   let cached: PresenterModel | undefined;
   let published: PresenterModel | undefined;
@@ -56,21 +63,21 @@ export function createPresenter(
 
   function snapshot(): PresenterModel {
     if (closed && cached) return cached;
-    const now = clock.wall();
-    const state = projectState(runtime);
-    history.record(runtime.state().self.body, now, clock.mono());
+    const now = timeline.at(clock.mono());
+    const state = projectState(timeline.state());
+    history.record(state.self.body, now, clock.mono());
     const samples = history.snapshot(clock.mono());
     const entries = runtime.events();
     const settings = runtime.rules.settings();
-    const { insights, learning } = projectInsights(runtime, samples, clock, intervals);
+    const { insights, learning } = projectInsights(runtime, samples, clock, intervals, state.self.body, timeline.at);
     const next: PresenterModel = {
       state,
       history: samples,
       insights,
       learning,
-      tuning: projectTuning(runtime),
-      events: projectEvents(entries, settings.sendTitles),
-      rules: projectRules(runtime),
+      tuning: projectTuning(runtime, timeline.stable),
+      events: projectEvents(entries, settings.sendTitles, timeline.at, (at) => timeline.stable(`event:${at}`, at)),
+      rules: projectRules(runtime, timeline.stable),
       ...settings,
       now,
       sampleIntervalsMs: intervals,
@@ -110,12 +117,15 @@ export function createPresenter(
   }
   function schedule() {
     if (closed) return;
+    for (const entry of runtime.body.tuner.logs) timeline.stable(`tuning:${entry.id}`, entry.at);
     dirty = true;
     if (!subscribers.size || timer) return;
     timer = setTimeout(emit, Math.max(0, 500 - (clock.mono() - lastEmission)));
     timer.unref?.();
   }
-  const offState = runtime.subscribe((state) => history.record(state.self.body, clock.wall(), clock.mono()));
+  const offState = runtime.subscribe(() => {
+    history.record(timeline.state().self.body, timeline.at(clock.mono()), clock.mono());
+  });
   const offChange = runtime.onChange(schedule);
   snapshot();
 

@@ -10,11 +10,13 @@ export class DshSource {
   private readonly off: Unsubscribe[] = [];
   private active = false;
   private readonly inflight = new Set<Promise<void>>();
+  private readonly instances = new Map<string, object>();
+  private selection = 0;
   constructor(
     private readonly port: DshPort,
     private readonly clock: Clock,
     private readonly attention: RuntimeAttention,
-    private readonly tokens: (session: string) => Promise<void>,
+    private readonly tokens: (session: string, valid?: () => boolean) => Promise<void>,
     private readonly paused: () => boolean,
   ) {}
   start(): void {
@@ -27,6 +29,7 @@ export class DshSource {
     this.active = false;
     for (const off of this.off.splice(0)) off();
     this.windows.clear();
+    this.instances.clear();
     return Promise.allSettled([...this.inflight]).then(() => {});
   }
   private track(work: () => Promise<void>): Promise<void> {
@@ -43,11 +46,22 @@ export class DshSource {
     return { ...signal, cause: classifyCause(signal, [...this.windows.values()]) };
   }
   private async agent(event: AgentEvent): Promise<void> {
-    if (event.type === 'created') this.attention.create(event.sessionId);
-    if (event.type === 'disposed') this.attention.dispose(event.sessionId);
+    if (event.type === 'created') {
+      this.instances.set(event.sessionId, {});
+      this.attention.create(event.sessionId);
+    }
+    if (event.type === 'disposed') {
+      this.instances.delete(event.sessionId);
+      this.attention.dispose(event.sessionId);
+    }
     if (event.type === 'pre-step') {
-      if (!this.paused()) await this.tokens(event.sessionId);
-      if (this.active) await this.attention.preStep(event.sessionId, event.userInitiated, !this.paused());
+      const sequence = ++this.selection;
+      const instance = this.instances.get(event.sessionId);
+      const valid = () =>
+        this.active && !!instance && this.instances.get(event.sessionId) === instance && this.selection === sequence;
+      if (!instance) return;
+      if (!this.paused()) await this.tokens(event.sessionId, valid);
+      if (valid()) await this.attention.preStep(event.sessionId, event.userInitiated, !this.paused());
     }
     if (event.type === 'post-step') {
       this.attention.postStep(event.sessionId);

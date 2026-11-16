@@ -13,7 +13,6 @@ import { runtimeTools } from './tools.ts';
 
 export type { EventEntry, EventLog } from './attention.ts';
 export type * from './ports.ts';
-
 export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}) {
   const { clock } = ports;
   const settings = new Settings(ports.storage, options.rules);
@@ -285,6 +284,7 @@ export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}
     },
     stop,
     state: () => attention.state(),
+    factMeta: (path: string) => expiry.factMeta(path),
     subscribe: listeners.subscribe,
     onChange,
     events: () => attention.events(),

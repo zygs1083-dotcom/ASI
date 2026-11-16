@@ -3,9 +3,13 @@ import { effectiveDisks, type SenseState, type Signal } from '@asi/sense-types';
 export class FactExpiry {
   private readonly deadlines = new Map<
     string,
-    { stamp: string; at: number; receivedMono: number; wall: number; fired: boolean }
+    { stamp: string; at: number; receivedMono: number; observedMono: number; wall: number; fired: boolean }
   >();
-  constructor(private readonly clock: { mono(): number }) {}
+  constructor(private readonly clock: { mono(): number; wall?(): number }) {}
+  factMeta(path: string) {
+    const entry = this.deadlines.get(path);
+    return entry && { observedMono: entry.observedMono, deadlineMono: entry.at };
+  }
   observe(state: SenseState, signal?: Signal): void {
     const seen = new Set<string>();
     const touched =
@@ -47,13 +51,19 @@ export class FactExpiry {
           source?.id === signal?.source.id &&
           (entry.observedAt === signal?.at || path === '/env/watchedPaths');
         if (received || this.deadlines.get(path)?.stamp !== stamp) {
+          const previous = this.deadlines.get(path);
+          const mono = this.clock.mono();
           this.deadlines.set(path, {
             stamp,
             at:
               entry.status === 'ok'
                 ? this.clock.mono() + Math.max(0, entry.observedAt + entry.ttlMs - (reference ?? entry.observedAt))
                 : Infinity,
-            receivedMono: this.clock.mono(),
+            receivedMono: mono,
+            observedMono:
+              previous?.wall === entry.observedAt
+                ? previous.observedMono
+                : mono - Math.max(0, (this.clock.wall?.() ?? entry.observedAt) - entry.observedAt),
             wall: entry.observedAt,
             fired: false,
           });

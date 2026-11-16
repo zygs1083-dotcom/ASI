@@ -18,7 +18,7 @@ export function rateEvidence(
   const points =
     rule && window
       ? window.points
-          .filter((point) => point.at >= window.lastMono - rule.windowMs)
+          .filter((point) => point.at >= (history?.lastMono ?? window.lastMono) - rule.windowMs)
           .map((point) => ({
             mono: point.at,
             value: point.value,
@@ -26,7 +26,8 @@ export function rateEvidence(
       : [];
   const last = points.at(-1);
   if (!last) return { latched, points };
-  const asOf = sample?.mono === last.mono ? sample.wall : undefined;
+  const lastRaw = window?.points.at(-1);
+  const asOf = lastRaw?.wall ?? (sample?.mono === last.mono ? sample.wall : undefined);
   const meanX = points.reduce((sum, point) => sum + (point.mono - last.mono), 0) / points.length;
   const meanY = points.reduce((sum, point) => sum + point.value, 0) / points.length;
   let sxx = 0;

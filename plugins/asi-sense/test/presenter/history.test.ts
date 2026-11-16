@@ -12,8 +12,8 @@ describe('presenter history', () => {
       history.record(body, at, at);
     }
     const first = history.snapshot(9_999);
-    expect(first.cpu).toHaveLength(100);
-    expect(first.cpu[0]).toEqual({ at: 99, value: 0.0099 });
+    expect(first.cpu).toHaveLength(10);
+    expect(first.cpu[0]).toEqual({ at: 999, value: 0.0999 });
     expect(first.cpu.at(-1)).toEqual({ at: 9_999, value: 0.9999 });
     expect(first.cpu.length).toBeLessThanOrEqual(300);
     expect(history.snapshot(9_999).cpu).toBe(first.cpu);
@@ -24,10 +24,25 @@ describe('presenter history', () => {
       history.record(body, at, at);
     }
     const wrapped = history.snapshot(109_990);
-    expect(wrapped.cpu).toHaveLength(300);
-    expect(wrapped.cpu[0]?.at).toBe(80_090);
+    expect(wrapped.cpu).toHaveLength(110);
+    expect(wrapped.cpu[0]?.at).toBe(999);
     expect(wrapped.cpu.at(-1)?.at).toBe(109_990);
     expect(first.cpu.at(-1)).toEqual({ at: 9_999, value: 0.9999 });
+  });
+
+  it('covers at least 295 seconds after five minutes of 100ms CPU samples', () => {
+    const history = createHistory({ cpu: 100 });
+    const body = mkBody({ cpu: f({ usage: 0.5, perCore: [0.5], load1: 0, load5: 0, load15: 0 }) });
+    for (let at = 0; at <= 300_000; at += 100) {
+      body.cpu.observedAt = at;
+      history.record(body, at, at);
+    }
+    const points = history.snapshot(300_000).cpu;
+    expect(points.length).toBeLessThanOrEqual(300);
+    const last = points.at(-1);
+    if (!last) throw new Error('missing history');
+    expect(last.at - points[0].at).toBeGreaterThanOrEqual(295_000);
+    expect(points.at(-1)?.at).toBe(300_000);
   });
 
   it('maps fresh facts to their documented units and keeps unchanged series by reference', () => {

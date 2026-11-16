@@ -1,4 +1,4 @@
-import { type Body, diskVolumeAt, type Fact, factStatusAt } from '@asi/sense-types';
+import type { Body, Fact } from '@asi/sense-types';
 import type { BodyHistory, MetricKey, MetricPoint } from '@asi/sense-ui/model';
 
 const WINDOW = 300_000;
@@ -28,7 +28,10 @@ export function createHistory(intervals: Partial<Record<MetricKey, number>> = {}
       if (!ring) {
         const fallback = key.startsWith('disk:') ? 10_000 : key === 'battery' ? 30_000 : 2_000;
         const requested = intervals[key];
-        const interval = requested !== undefined && Number.isFinite(requested) && requested > 0 ? requested : fallback;
+        const interval =
+          requested !== undefined && Number.isFinite(requested) && requested > 0
+            ? Math.max(1_000, requested)
+            : fallback;
         ring = {
           slots: [],
           start: 0,
@@ -42,8 +45,9 @@ export function createHistory(intervals: Partial<Record<MetricKey, number>> = {}
       const lastIndex = (ring.start + ring.size - 1 + ring.capacity) % ring.capacity;
       const last = ring.size ? ring.slots[lastIndex] : undefined;
       if (last && last.point.at === at && last.point.value === value) return;
-      const slot = Math.floor(mono / ring.interval);
-      const entry = { point: { at, value }, mono, slot };
+      const observedMono = mono - (now - at);
+      const slot = Math.floor(observedMono / ring.interval);
+      const entry = { point: { at, value }, mono: observedMono, slot };
       if (last && last.slot === slot) ring.slots[lastIndex] = entry;
       else if (ring.size < ring.capacity) {
         ring.slots[(ring.start + ring.size) % ring.capacity] = entry;
@@ -55,7 +59,7 @@ export function createHistory(intervals: Partial<Record<MetricKey, number>> = {}
       ring.dirty = true;
     };
     const fact = <T>(value: Fact<T>, read: (v: T) => void) => {
-      if (factStatusAt(value, now) === 'ok' && value.value !== null) read(value.value);
+      if (value.status === 'ok' && value.value !== null) read(value.value);
     };
     fact(body.cpu, (v) => add('cpu', body.cpu.observedAt, v.usage >= 0 && v.usage <= 1 ? v.usage : undefined));
     fact(body.memory, (v) =>
@@ -85,9 +89,19 @@ export function createHistory(intervals: Partial<Record<MetricKey, number>> = {}
       ),
     );
     for (const volume of body.disks.value ?? []) {
-      const d = diskVolumeAt(body.disks, volume, now);
-      if (d.status === 'ok' && Number.isFinite(d.total) && d.total > 0 && d.free >= 0 && d.free <= d.total) {
-        add(`disk:${d.mount}`, d.observedAt, (d.total - d.free) / d.total);
+      if (
+        (volume.status ?? body.disks.status) === 'ok' &&
+        !body.disks.unavailableMounts?.includes(volume.mount) &&
+        Number.isFinite(volume.total) &&
+        volume.total > 0 &&
+        volume.free >= 0 &&
+        volume.free <= volume.total
+      ) {
+        add(
+          `disk:${volume.mount}`,
+          volume.observedAt ?? body.disks.observedAt,
+          (volume.total - volume.free) / volume.total,
+        );
       }
     }
   }

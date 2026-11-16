@@ -435,3 +435,36 @@ In `test/runtime/runtime.test.ts` unless otherwise noted:
 3. Complete helper recovery: `retains thermal and app deltas during overflow recovery and rejects an older snapshot`; `keeps a missing snapshot field unknown and the helper degraded`; `applies critical thermal from a recovery snapshot and emits the critical alert` (`test/runtime/helper.test.ts`).
 4. Source-root file deduplication: `preserves same-root same-millisecond deletions while pairing overlapping copies`; `deduplicates one event delivered by overlapping watched roots` (`test/runtime/runtime.test.ts`).
 5. No-session subject capacity: `counts subjects rather than kinds when retaining 200 subjects`; `bounds per-subject kinds and merges excess into other` (`test/runtime/routing-rereview.test.ts`).
+
+## Presenter and runtime fix-2
+
+The panel's display timeline is the presenter's startup wall time plus monotonic
+elapsed time. Fact `observedAt`, event and history times, ETA `asOf`, tuning
+times and frame `now` use this timeline; wall-clock adjustments do not change
+their relative ages. Fact status comes from the runtime; `staleInMs` is the
+remaining monotonic duration at frame creation. Histories cover five minutes,
+using at least one-second slots and at most 300 points.
+
+Rate evidence deduplicates each metric by the first occurrence of its
+`observedAt`, and fits against the host's monotonic receipt times. Known
+limitation: if a clock rollback makes a genuinely new reading's `observedAt`
+identical to the preceding reading, it is indistinguishable from a cache
+republish and is not counted. Exposing per-metric acquisition generations or
+monotonic timestamps from body-probe is future work.
+
+Alert registration is persisted asynchronously after the alert is published.
+Its initial `feedbackAvailable` is conservatively `false`; queued and already
+delivered signals are not rewritten if registration later succeeds. Feedback
+is usable after successful registration, but the original signal does not
+reflect that later change; publishing updated availability is future work.
+
+Regression tests:
+
+1. Five-minute history: `covers at least 295 seconds after five minutes of 100ms CPU samples` (`test/presenter/history.test.ts`).
+2. Fresh evidence: `does not add rate evidence or refresh asOf when cached disk readings are republished`; `stamps the first occurrence of each reading with its monotonic receipt time`.
+3. Runtime freshness: `projects runtime status and a monotonic stale countdown across wall jumps`.
+4. Independent notifications: `notifies independent events and later samples while alert storage is hung`.
+5. Display timeline: `keeps all frame time differences stable across a %i ms wall jump` (±61 seconds).
+6. Undoability: `distinguishes reverted, superseded, rejected and undoable tuning entries`.
+7. Pre-step races: `discards an older pre-step when another session pre-steps during token lookup`; `discards a pre-step for a disposed session even if the same id is recreated`.
+8. Helper recovery: `accepts a snapshot without an app or window as a known empty desktop`; `retries incomplete snapshots with bounded exponential backoff and recovers`; `stops retrying incomplete snapshots after ten attempts`.

@@ -96,6 +96,86 @@ describe('presenter', () => {
     await h.runtime.stop();
   });
 
+  it('does not add rate evidence or refresh asOf when cached disk readings are republished', async () => {
+    const h = await harness();
+    const gib = 1024 ** 3;
+    const disk = (free: number) => {
+      const disks = diskFact([{ mount: '/', total: 100 * gib, free: free * gib, observedAt: Date.now() }]);
+      disks.observedAt = Date.now();
+      return mkBody({ disks });
+    };
+    const first = disk(80);
+    await h.sample(first);
+    for (let i = 0; i < 4; i++) {
+      await h.advance(2_000);
+      await h.sample(structuredClone(first));
+    }
+    expect(h.runtime.body.monitor.rateEvidence('disk:/').points).toHaveLength(1);
+    await h.advance(2_000);
+    const second = disk(76);
+    await h.sample(second);
+    await h.advance(2_000);
+    await h.sample(structuredClone(second));
+    expect(h.runtime.body.monitor.rateEvidence('disk:/').points).toHaveLength(2);
+    expect(h.presenter.snapshot().insights?.['disk:/']?.currentEta).toBeUndefined();
+    await h.advance(8_000);
+    await h.sample(disk(75));
+    const asOf = h.presenter.snapshot().insights?.['disk:/']?.currentEta?.asOf;
+    expect(asOf).toBe(Date.now());
+    await h.advance(2_000);
+    const third = disk(75);
+    if (!third.disks.value) throw new Error('missing disk');
+    third.disks.value[0].observedAt = Date.now() - 2_000;
+    third.disks.observedAt = Date.now() - 2_000;
+    await h.sample(third);
+    expect(h.presenter.snapshot().insights?.['disk:/']?.currentEta?.asOf).toBe(asOf);
+    expect(h.runtime.body.monitor.rateEvidence('disk:/').points).toHaveLength(3);
+    h.presenter.close();
+    await h.runtime.stop();
+  });
+
+  it('retains cached rate evidence across a forward wall jump', async () => {
+    const h = await harness();
+    const gib = 1024 ** 3;
+    let last = mkBody();
+    for (const free of [80, 76, 75]) {
+      if (free !== 80) await h.advance(10_000);
+      const disks = diskFact([{ mount: '/', total: 100 * gib, free: free * gib, observedAt: Date.now() }]);
+      disks.observedAt = Date.now();
+      last = mkBody({ disks });
+      await h.sample(last);
+    }
+    const asOf = h.presenter.snapshot().insights?.['disk:/']?.currentEta?.asOf;
+    vi.setSystemTime(Date.now() + 61_000);
+    await h.advance(2_000);
+    await h.sample(structuredClone(last));
+    expect(h.runtime.body.monitor.rateEvidence('disk:/').points).toHaveLength(3);
+    expect(h.presenter.snapshot().insights?.['disk:/']?.currentEta?.asOf).toBe(asOf);
+    h.presenter.close();
+    await h.runtime.stop();
+  });
+
+  it('projects runtime status and a monotonic stale countdown across wall jumps', async () => {
+    const h = await harness();
+    const cpu = {
+      ...f({ usage: 0.5, perCore: [0.5], load1: 0, load5: 0, load15: 0 }),
+      observedAt: Date.now(),
+      ttlMs: 5_000,
+    };
+    await h.sample(mkBody({ cpu }));
+    expect(h.presenter.snapshot().state.self.body.cpu).toMatchObject({ status: 'ok', staleInMs: 5_000 });
+    vi.setSystemTime(Date.now() + 61_000);
+    await h.advance(2_000);
+    expect(h.presenter.snapshot().state.self.body.cpu).toMatchObject({ status: 'ok', staleInMs: 3_000 });
+    vi.setSystemTime(Date.now() - 122_000);
+    await h.advance(3_000);
+    const expired = h.presenter.snapshot().state.self.body.cpu;
+    expect(expired.status).toBe('stale');
+    expect(expired.staleInMs).toBeUndefined();
+    h.presenter.close();
+    await h.runtime.stop();
+  });
+
   it('keeps an active rate ETA after the triggering event is evicted', async () => {
     const h = await harness();
     const gib = 1024 ** 3;
@@ -123,7 +203,7 @@ describe('presenter', () => {
       await h.sample(mkBody({ disks }));
     }
     const eta = h.presenter.snapshot().insights?.['disk:/']?.currentEta;
-    expect(eta?.asOf).toBe(Date.now());
+    expect(eta?.asOf).toBe(Date.now() - jump);
     expect(eta?.ratePerMinute).toBeCloseTo(-15 * gib, 3);
     expect(eta?.timeToThresholdMs).toBeCloseTo((70 / 15) * 60_000, 3);
     const evidence = h.runtime.body.monitor.rateEvidence('disk:/');
@@ -131,6 +211,62 @@ describe('presenter', () => {
     expect(evidence.points.map((point) => point.mono)).toEqual([0, 10_000, 20_000]);
     evidence.points[0].value = 0;
     expect(h.runtime.body.monitor.rateEvidence('disk:/').points[0].value).toBe(80 * gib);
+    h.presenter.close();
+    await h.runtime.stop();
+  });
+
+  it.each([61_000, -61_000])('keeps all frame time differences stable across a %i ms wall jump', async (jump) => {
+    const h = await harness();
+    const gib = 1024 ** 3;
+    for (const free of [80, 76, 75]) {
+      if (free !== 80) await h.advance(10_000);
+      const disks = diskFact([{ mount: '/', total: 100 * gib, free: free * gib, observedAt: Date.now() }]);
+      disks.observedAt = Date.now();
+      await h.sample(
+        mkBody({
+          disks,
+          cpu: { ...f({ usage: 0.5, perCore: [0.5], load1: 0, load5: 0, load15: 0 }), observedAt: Date.now() },
+        }),
+      );
+    }
+    await h.job({ type: 'started', id: 'synthetic' });
+    await h.advance(2_000);
+    const before = h.presenter.snapshot();
+    expect(before.state.self.body.cpu.staleInMs).toBe(58_000);
+    expect(before.state.self.body.disks.value?.[0].staleInMs).toBe(58_000);
+    const differences = (frame: typeof before) => {
+      const point = frame.history.cpu.at(-1);
+      const eta = frame.insights?.['disk:/']?.currentEta;
+      const event = frame.events.find((e) => e.signal.kind === 'job.started');
+      if (!point || !eta || !event) throw new Error('missing timeline evidence');
+      return {
+        now: frame.now,
+        cpuAge: frame.now - frame.state.self.body.cpu.observedAt,
+        cpuStaleIn: frame.state.self.body.cpu.staleInMs,
+        diskStaleIn: frame.state.self.body.disks.value?.[0].staleInMs,
+        historyAge: frame.now - point.at,
+        etaAge: frame.now - eta.asOf,
+        eventAge: frame.now - event.signal.at,
+      };
+    };
+    vi.setSystemTime(Date.now() + jump);
+    const after = h.presenter.snapshot();
+    expect(differences(after)).toEqual(differences(before));
+    expect(after.state.self.body.disks.status).toBe('ok');
+    await h.advance(1_000);
+    const disks = diskFact([{ mount: '/', total: 100 * gib, free: 74 * gib, observedAt: Date.now() }]);
+    disks.observedAt = Date.now();
+    await h.sample(mkBody({ disks }));
+    await h.job({ type: 'exited', id: 'synthetic' });
+    await h.runtime.tools.bodyTune({ param: 'rate.rss.maxRatio', to: 0.6 });
+    const next = h.presenter.snapshot();
+    expect(next.now - before.now).toBe(1_000);
+    expect(next.state.self.body.disks.value?.[0].observedAt).toBe(next.now);
+    expect(next.insights?.['disk:/']?.currentEta?.asOf).toBe(next.now);
+    expect(next.history.disks['/'].at(-1)?.at).toBe(next.now);
+    expect(next.events.find((e) => e.signal.kind === 'job.exited')?.signal.at).toBe(next.now);
+    expect(next.state.observation.sources.dsh.lastSignalAt).toBe(next.now);
+    expect(next.tuning.log.at(-1)?.at).toBe(next.now);
     h.presenter.close();
     await h.runtime.stop();
   });
@@ -165,9 +301,9 @@ describe('presenter', () => {
     if (result.done) throw new Error('missing frame');
     const frame = result.value;
     expect((await bNext).value).toBe(frame);
-    expect(frame.history.cpu.map((point) => point.value)).toEqual([0.1, 0.2]);
+    expect(frame.history.cpu.map((point) => point.value)).toEqual([0.2]);
     expect(frame.history.memory).toHaveLength(1);
-    expect(frame.sampleIntervalsMs?.cpu).toBe(100);
+    expect(frame.sampleIntervalsMs?.cpu).toBe(1_000);
     const memory = frame.history.memory;
     expect(h.presenter.snapshot().history.memory).toBe(memory);
     await h.runtime.actions.pause(true);
@@ -574,6 +710,9 @@ describe('presenter', () => {
       onRevertTuning: noop,
       onLockParam: noop,
       onFeedback: noop,
+      onResumeTuning: async () => {},
+      onResetTuning: async () => {},
+      onAcceptRebaseline: async () => {},
     };
     expect(renderToString(React.createElement(ui.SensePanel, props))).toContain('环境感知');
     h.presenter.close();

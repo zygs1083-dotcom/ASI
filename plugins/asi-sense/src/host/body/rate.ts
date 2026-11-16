@@ -1,4 +1,4 @@
-import type { BodyEvaluation, BodyEvaluator, BodyThresholdSample, BodyThresholdState } from '@asi/sense-types';
+import type { Body, BodyEvaluation, BodyEvaluator, BodyThresholdSample, BodyThresholdState } from '@asi/sense-types';
 import { type BodySignal, type Metric, readMetrics } from './metrics.ts';
 import { type AdaptiveState, BODY_HISTORY, type RateHistory, type RateWindow } from './state.ts';
 
@@ -34,6 +34,35 @@ export type RateRule = {
 interface Point {
   at: number;
   value: number;
+  wall?: number;
+}
+
+export type RateTimes = Record<string, { mono: number; wall: number }>;
+type RateSample = BodyThresholdSample & { rateTimes?: RateTimes };
+
+export function captureRateTimes(body: Body, mono: number, previous: RateTimes): RateTimes {
+  const next: RateTimes = {};
+  const add = (key: string, wall: number, usable: boolean) => {
+    if (!usable || !Number.isFinite(wall)) return;
+    next[key] = previous[key]?.wall === wall ? previous[key] : { wall, mono };
+  };
+  const fact = (key: string, item: Body[keyof Body]) =>
+    add(key, item.observedAt, item.status === 'ok' && item.value !== null);
+  fact('cpu', body.cpu);
+  fact('rss', body.harnessProcess);
+  fact('memory', body.memory);
+  fact('context', body.tokens);
+  fact('battery', body.battery);
+  fact('network.rx', body.network);
+  fact('network.tx', body.network);
+  for (const disk of body.disks.value ?? []) {
+    add(
+      `disk:${disk.mount}`,
+      disk.observedAt ?? body.disks.observedAt,
+      (disk.status ?? body.disks.status) === 'ok' && !body.disks.unavailableMounts?.includes(disk.mount),
+    );
+  }
+  return next;
 }
 
 const LIMITS = ['maxDelta', 'maxSlope', 'maxRatio', 'maxEtaMs'] as const;
@@ -120,17 +149,25 @@ export class RateEvaluator implements BodyEvaluator {
       const done = updated.get(key);
       if (done) return done;
       const old = windows[key];
+      const stamp = (next as RateSample).rateTimes?.[key];
+      const observedMono = stamp?.mono ?? mono;
       let pts: Point[];
       if (old) {
         pts = old.points.slice();
       } else {
         const seed = Number.isFinite(prev.at) ? readMetrics(prev).get(key) : undefined;
-        const pMono = prev.monotonicAt;
-        pts = seed && Number.isFinite(pMono) && pMono < mono ? [{ at: pMono as number, value: seed.value }] : [];
+        const prior = (prev as RateSample).rateTimes?.[key];
+        const pMono = prior?.mono ?? prev.monotonicAt;
+        pts =
+          seed && Number.isFinite(pMono) && pMono < observedMono
+            ? [{ at: pMono, value: seed.value, ...(prior ? { wall: prior.wall } : {}) }]
+            : [];
       }
-      pts.push({ at: mono, value: metric.value });
+      if (!old || observedMono > old.lastMono) {
+        pts.push({ at: observedMono, value: metric.value, ...(stamp ? { wall: stamp.wall } : {}) });
+      }
       pts = pts.filter((p) => p.at >= mono - this.retention(key));
-      const w: RateWindow = { points: pts, lastMono: mono };
+      const w: RateWindow = { points: pts, lastMono: old ? Math.max(old.lastMono, observedMono) : observedMono };
       updated.set(key, w);
       return w;
     };
@@ -142,6 +179,7 @@ export class RateEvaluator implements BodyEvaluator {
         const metric = metrics.get(key) as Metric;
         const w = windowFor(key, metric);
         const pts = w.points.filter((p) => p.at >= mono - rule.windowMs);
+        if (windows[key] && w.lastMono === windows[key].lastMono) continue;
         if (pts.length < 2) continue;
         const sig = this.step(rule, key, metric, pts, next, pub, streamLatch);
         if (sig) signals.push(sig);

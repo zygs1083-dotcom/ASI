@@ -158,6 +158,42 @@ describe('host runtime', () => {
     await h.runtime.stop();
   });
 
+  it('notifies independent events and later samples while alert storage is hung', async () => {
+    const h = harness();
+    await h.runtime.start();
+    const rss = (value: number) =>
+      mkBody({
+        harnessProcess: { ...f({ rss: value, cpu: 0, uptimeSec: 1 }), observedAt: Date.now() },
+      });
+    await h.sample(rss(100));
+    await h.advance(5_000);
+    let release!: () => void;
+    const stalled = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let saving = false;
+    h.ports.storage.save = async (key) => {
+      if (key === 'body') {
+        saving = true;
+        await stalled;
+      }
+    };
+    const frames: string[][] = [];
+    h.runtime.onChange(() => frames.push(h.runtime.events().map((event) => event.kind)));
+    await h.sample(rss(200));
+    expect(saving).toBe(true);
+    expect(frames.some((events) => events.includes('body.rate'))).toBe(true);
+    frames.length = 0;
+    await h.job({ type: 'started', id: 'independent' });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(frames.some((events) => events.includes('job.started'))).toBe(true);
+    await h.advance(2_000);
+    await h.sample(rss(300));
+    expect(h.runtime.state().self.body.harnessProcess.value?.rss).toBe(300);
+    release();
+    await h.runtime.stop();
+  });
+
   it('does not notify old or new change subscribers after stop', async () => {
     const h = harness();
     await h.runtime.start();
@@ -233,6 +269,54 @@ describe('host runtime', () => {
     resolve(undefined);
     await Promise.all([step, stop]);
     expect(h.delivered).toEqual([]);
+  });
+
+  it('discards an older pre-step when another session pre-steps during token lookup', async () => {
+    const h = harness();
+    await h.runtime.start();
+    await h.agent({ type: 'created', sessionId: 'a' });
+    await h.agent({ type: 'created', sessionId: 'b' });
+    let release!: (value: TokenSnapshot | undefined) => void;
+    h.ports.dsh.tokenSnapshot = (id) =>
+      id === 'a'
+        ? new Promise((resolve) => {
+            release = resolve;
+          })
+        : Promise.resolve(undefined);
+    const old = h.agent({ type: 'pre-step', sessionId: 'a' });
+    await Promise.resolve();
+    await Promise.resolve();
+    await h.agent({ type: 'pre-step', sessionId: 'b' });
+    release(undefined);
+    await old;
+    await h.job({ type: 'exited', id: 'wake', exitCode: 1 });
+    await h.advance(2_000);
+    expect(h.delivered).toContainEqual(expect.objectContaining({ sessionId: 'b' }));
+    expect(h.delivered.some((intent) => intent.sessionId === 'a')).toBe(false);
+    await h.runtime.stop();
+  });
+
+  it('discards a pre-step for a disposed session even if the same id is recreated', async () => {
+    const h = harness();
+    await h.runtime.start();
+    await h.agent({ type: 'created', sessionId: 'a' });
+    let release!: (value: TokenSnapshot | undefined) => void;
+    h.ports.dsh.tokenSnapshot = () =>
+      new Promise((resolve) => {
+        release = resolve;
+      });
+    const old = h.agent({ type: 'pre-step', sessionId: 'a' });
+    await Promise.resolve();
+    await Promise.resolve();
+    await h.agent({ type: 'disposed', sessionId: 'a' });
+    await h.agent({ type: 'created', sessionId: 'a' });
+    release(undefined);
+    await old;
+    await h.job({ type: 'exited', id: 'wake', exitCode: 1 });
+    await h.advance(2_000);
+    expect(h.delivered).toEqual([]);
+    expect(h.runtime.events().find((event) => event.subject === 'wake')?.reason).toBe('no-session');
+    await h.runtime.stop();
   });
 
   it('waits for an in-flight action and rejects it after the runtime stops', async () => {

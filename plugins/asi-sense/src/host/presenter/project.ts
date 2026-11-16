@@ -1,3 +1,4 @@
+import type { SenseState } from '@asi/sense-types';
 import type { DetailUnit, MetricKey, SenseEvent, SensePanelModel, SenseRule, TuningState } from '@asi/sense-ui/model';
 import type { createSenseRuntime, EventEntry } from '../runtime/index.ts';
 import { type SuggestionUnit, suggestionMetric, suggestionUnit } from './units.ts';
@@ -27,8 +28,7 @@ export type PresenterModel = Omit<SensePanelModel, 'tuning'> & {
 const displayValue = (value: number | string | boolean): number | string =>
   typeof value === 'boolean' ? String(value) : value;
 
-export function projectState(runtime: Runtime): SensePanelModel['state'] {
-  const state = runtime.state();
+export function projectState(state: SenseState): SensePanelModel['state'] {
   return {
     ...state,
     env: {
@@ -41,12 +41,13 @@ export function projectState(runtime: Runtime): SensePanelModel['state'] {
   };
 }
 
-export function projectRules(runtime: Runtime): SenseRule[] {
+export function projectRules(runtime: Runtime, time: (key: string, at: number) => number): SenseRule[] {
   return runtime.rules.list().map((rule) => ({
     ...rule,
     name: rule.id,
     enabled: runtime.rules.isEnabled(rule.id),
     confirmed: rule.approved,
+    ...(rule.expiresAt === undefined ? {} : { expiresAt: time(`rule:${rule.id}`, rule.expiresAt) }),
   }));
 }
 
@@ -113,7 +114,12 @@ function eventDetail(entry: EventEntry): SenseEvent['detail'] {
   return undefined;
 }
 
-export function projectEvents(entries: EventEntry[], sendTitles: boolean): SenseEvent[] {
+export function projectEvents(
+  entries: EventEntry[],
+  sendTitles: boolean,
+  at: (mono: number) => number,
+  fromWall: (wall: number) => number,
+): SenseEvent[] {
   return entries.slice(-200).map((entry) => {
     const hidden = !sendTitles && entry.kind.startsWith('window');
     const detail = hidden ? undefined : eventDetail(entry);
@@ -121,7 +127,7 @@ export function projectEvents(entries: EventEntry[], sendTitles: boolean): Sense
       signal: {
         id: entry.id,
         kind: entry.kind,
-        at: entry.at,
+        at: entry.mono === undefined ? fromWall(entry.at) : at(entry.mono),
         source: entry.source,
         subject: hidden ? '' : entry.subject,
         data: {},
@@ -136,7 +142,7 @@ export function projectEvents(entries: EventEntry[], sendTitles: boolean): Sense
   });
 }
 
-export function projectTuning(runtime: Runtime): PresenterModel['tuning'] {
+export function projectTuning(runtime: Runtime, time: (key: string, at: number) => number): PresenterModel['tuning'] {
   const { tuner, monitor } = runtime.body;
   const undoable = new Set(tuner.undoableChanges.map((entry) => entry.id));
   const logs = tuner.logs;
@@ -199,7 +205,7 @@ export function projectTuning(runtime: Runtime): PresenterModel['tuning'] {
         previous: displayValue(entry.from),
         next: displayValue(entry.to),
         by: entry.by,
-        at: entry.at,
+        at: time(`tuning:${entry.id}`, entry.at),
         reason: suffix ? `${entry.reason} (${suffix})` : entry.reason,
         status,
         undoable: canUndo,
