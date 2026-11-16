@@ -11,7 +11,8 @@ pnpm install                    # 根目录 workspace 安装（链接 @asi/sense
 cd packages/sense-ui            # 以下命令也可在根目录用 pnpm --filter @asi/sense-ui <script>
 pnpm dev                        # Vite 预览：?scenario=<名>&theme=light|dark&realtime=1
 pnpm typecheck                  # tsc --noEmit
-pnpm test                       # Vitest 浏览器模式（本机 Chromium）
+pnpm test                       # Vitest 浏览器模式（本机 Google Chrome）
+PLAYWRIGHT_SKIP_BROWSER_GC=1 pnpm exec playwright install --only-shell chromium # 安装对应的 Chromium，保留共享缓存
 pnpm e2e                        # Playwright：axe + 8 场景 × 2 宽度 × 2 主题截图
 pnpm e2e:update                 # 显式更新截图基线
 pnpm build                      # 构建预览页到 dist/（预览产物，非库产物）
@@ -20,7 +21,7 @@ pnpm check                      # typecheck + test（根级 pnpm check 跑全部
 
 `pnpm-lock.yaml` 由根工作区统一管理，test-results/artifacts 已 gitignore；**截图 `test/screenshots/` 不入 gitignore，随包提交**供评审比对。普通 `pnpm e2e` 只比较、不写基线，容许像素差比例最多 0.001；只有显式执行 `pnpm e2e:update` 才更新基线。
 
-安装说明：依赖构建脚本由根 `pnpm-workspace.yaml` 的 `allowBuilds` 白名单放行（esbuild 的 postinstall 只是平台二进制校验，optional 依赖已提供二进制）；测试用本机安装的 Google Chrome channel，不下载浏览器。
+安装说明：依赖构建脚本由根 `pnpm-workspace.yaml` 的 `allowBuilds` 白名单放行（esbuild 的 postinstall 只是平台二进制校验，optional 依赖已提供二进制）；Vitest 单测使用本机安装的 Google Chrome，Playwright E2E 使用与 lockfile 中 `@playwright/test` 版本对应的 Chromium headless shell，不依赖会自动升级的系统 Chrome。升级 Playwright 后需重新安装对应浏览器并评审截图差异。
 
 默认单测验证 200,000 点降采样及渲染的输出点数、极值和处理次数，不按机器相关的墙钟耗时判定。需要单独检查 50ms 性能预算时，在仓库根目录运行（夹具分配不计时）：
 
