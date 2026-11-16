@@ -66,10 +66,12 @@ clamped to at least `ttlMs / 3` under standalone use
 (`sample(ttl, signal, periods)` overrides).
 
 `memory` and `network` facts are composite: a fresh `ok` fact takes the
-oldest constituent's `observedAt` and expires at the earliest absolute
-constituent deadline — `ttlMs = min(observedAt + 3*periodMs) - observedAt`
-(vm read vs cached pressure/swap; rate sample vs needed families' route
-observations).
+`observedAt` of its primary value — the vm read for memory, the rate sample
+for network — so trend points and "last updated" reflect when that value was
+actually sampled. It still expires at the earliest absolute constituent
+deadline (`ttlMs = max(0, min(at + 3*periodMs) - primary.at)`, counting cached
+pressure/swap and the needed families' route observations), so a stale cache
+shortens freshness rather than backdating the value.
 
 `network.online` runs `/sbin/route -n get -inet default` / `-inet6 default`
 only for families with a usable address (non-internal IPv4 or global IPv6 in
