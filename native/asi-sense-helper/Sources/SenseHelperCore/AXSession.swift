@@ -13,6 +13,7 @@ private struct SessionControl<O> {
   var pubPid: Int32 = 0, pubObs: O?
   // Only delivered focus commits dedup; stale posts remain unreported.
   var deliveredApp = -1, deliveredWin = -1
+  var pendingApp = -1, pendingWin = -1, pendingID = 0
 }
 
 public final class AXSession<B: AXBackend> {
@@ -24,6 +25,7 @@ public final class AXSession<B: AXBackend> {
   private let backend: B, axQueue: DispatchQueue
   private let toMain: (@escaping () -> Void) -> Void
   private let emit: (_ event: any Encodable) -> Void
+  private let emitFocus: (WindowEvent, @escaping (Bool) -> Void) -> Void
   private let nowMs: () -> Int64, isTrusted: () -> Bool
   private let uptime: () -> TimeInterval
   private let schedule: (TimeInterval, DispatchWorkItem) -> Void
@@ -46,12 +48,14 @@ public final class AXSession<B: AXBackend> {
 
   public init(backend: B, isTrusted: @escaping () -> Bool, nowMs: @escaping () -> Int64,
               emit: @escaping (_ event: any Encodable) -> Void,
+              emitFocus: ((WindowEvent, @escaping (Bool) -> Void) -> Void)? = nil,
               queue: DispatchQueue = .init(label: "asi-sense-helper.ax"),
               toMain: @escaping (@escaping () -> Void) -> Void = { DispatchQueue.main.async(execute: $0) },
               uptime: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
               scheduler: ((TimeInterval, DispatchWorkItem) -> Void)? = nil) {
     self.backend = backend; self.isTrusted = isTrusted; self.nowMs = nowMs
     self.emit = emit; axQueue = queue; self.toMain = toMain; self.uptime = uptime
+    self.emitFocus = emitFocus ?? { event, done in emit(event); done(true) }
     schedule = scheduler ?? { [queue] in queue.asyncAfter(deadline: .now() + $0, execute: $1) }
   }
   public var isAttached: Bool { control.get().pubPid != 0 }
@@ -70,28 +74,35 @@ public final class AXSession<B: AXBackend> {
   private func postFocus(_ event: WindowEvent, stamp: Stamp, emittedTitle: String? = nil) {
     toMain { [weak self] in
       guard let self else { return }
-      do {
-        let c = self.control.get()
+      let pending = self.control.mutate { c -> Int? in
         guard c.appGen == stamp.app, c.winGen == stamp.win, c.privGen == stamp.priv
-        else { return }
-        guard !(c.deliveredApp == stamp.app && c.deliveredWin == stamp.win) else { return }
+        else { return nil }
+        guard !(c.deliveredApp == stamp.app && c.deliveredWin == stamp.win),
+              !(c.pendingApp == stamp.app && c.pendingWin == stamp.win) else { return nil }
+        c.pendingID &+= 1
+        c.pendingApp = stamp.app; c.pendingWin = stamp.win
+        return c.pendingID
       }
-      self.emit(event)
-      let recorded = self.control.mutate { c -> Bool in
-        guard c.appGen == stamp.app, c.winGen == stamp.win,
-              c.privGen == stamp.priv else { return false }
-        c.deliveredApp = stamp.app; c.deliveredWin = stamp.win
-        return true
-      }
-      if recorded, let t = emittedTitle {
-        self.axQueue.async { [weak self] in
-          guard let self else { return }
-          let c = self.control.get()
-          guard c.appGen == stamp.app, c.winGen == stamp.win,
-                c.privGen == stamp.priv else { return }
-          // A newer notification may already have queued a different title.
-          if self.debouncer.pendingTitle == nil || self.debouncer.pendingTitle == t {
-            self.debouncer.markEmitted(t)
+      guard let pending else { return }
+      self.emitFocus(event) { [weak self] written in
+        guard let self else { return }
+        let recorded = self.control.mutate { c -> Bool in
+          guard c.pendingID == pending else { return false }
+          c.pendingApp = -1; c.pendingWin = -1
+          guard written, c.appGen == stamp.app, c.winGen == stamp.win else { return false }
+          c.deliveredApp = stamp.app; c.deliveredWin = stamp.win
+          return c.privGen == stamp.priv
+        }
+        if recorded, let t = emittedTitle {
+          self.axQueue.async { [weak self] in
+            guard let self else { return }
+            let c = self.control.get()
+            guard c.appGen == stamp.app, c.winGen == stamp.win,
+                  c.privGen == stamp.priv else { return }
+            // A newer notification may already have queued a different title.
+            if self.debouncer.pendingTitle == nil || self.debouncer.pendingTitle == t {
+              self.debouncer.markEmitted(t)
+            }
           }
         }
       }
@@ -169,6 +180,9 @@ public final class AXSession<B: AXBackend> {
     }
   }
   public func shutdown() { axQueue.async { self.detachNow() } }
+  public func retryUndeliveredFocus() {
+    axQueue.async { self.repostFocusIfUnreported(gen: self.attachedGen) }
+  }
   // Ingress captures the published observer AND current app+privacy generations.
   public func notify(_ name: String, observer o: B.Observer, element: B.Element) {
     let c = control.get()

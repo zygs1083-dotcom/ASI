@@ -184,6 +184,35 @@ private final class FixtureProcess {
     }
   }
   func send(_ s: String) { stdinPipe.fileHandleForWriting.write(Data(s.utf8)) }
+  func writeFlood(_ data: Data, offset: Int = 0, timeout: TimeInterval) -> Int {
+    signal(SIGPIPE, SIG_IGN)
+    let fd = stdinPipe.fileHandleForWriting.fileDescriptor
+    let flags = fcntl(fd, F_GETFL)
+    _ = fcntl(fd, F_SETFL, flags | O_NONBLOCK)
+    defer { _ = fcntl(fd, F_SETFL, flags) }
+    let deadline = ProcessInfo.processInfo.systemUptime + timeout
+    var written = offset
+    while written < data.count && ProcessInfo.processInfo.systemUptime < deadline {
+      let n = data.withUnsafeBytes {
+        write(fd, $0.baseAddress!.advanced(by: written), $0.count - written)
+      }
+      if n > 0 { written += n; continue }
+      if n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR { break }
+      var p = pollfd(fd: fd, events: Int16(POLLOUT), revents: 0)
+      _ = poll(&p, 1, 10)
+    }
+    return written
+  }
+  func discardPrefillAndDrain() {
+    var remaining = stdoutBuffered()
+    var buf = [UInt8](repeating: 0, count: 4096)
+    while remaining > 0 {
+      let n = read(stdoutPipe.fileHandleForReading.fileDescriptor, &buf, min(remaining, buf.count))
+      if n <= 0 { break }
+      remaining -= n
+    }
+    startDraining()
+  }
   func closeStdin() { try? stdinPipe.fileHandleForWriting.close() }
   func snapshotLines() -> [String] { lock.lock(); defer { lock.unlock() }; return lines }
   func rawOutput() -> Data { lock.lock(); defer { lock.unlock() }; return outData }
@@ -627,5 +656,139 @@ final class ProcessTests: XCTestCase {
     p.send("{\"cmd\":\"quit\"}\n")
     XCTAssertEqual(p.waitExit(timeout: 1), 0)
     XCTAssertLessThanOrEqual(ProcessInfo.processInfo.systemUptime - start, 0.2)
+  }
+
+  private func congestedControls() -> Data {
+    let padding = String(repeating: "x", count: 1200)
+    return Data(((0..<1100).map {
+      "{\"cmd\":\"titles\",\"enabled\":false,\"id\":\"\($0)-\(padding)\"}\n"
+    }.joined() + "{\"cmd\":\"quit\"}\n").utf8)
+  }
+
+  func testFixtureBackpressureResumesAllOrderedAcksBeforeQuit() throws {
+    let p = try launchFixture(prefillStdout: true, drainStdout: false)
+    let data = congestedControls()
+    let sent = p.writeFlood(data, timeout: 1)
+    XCTAssertLessThan(sent, data.count, "stdout saturation must backpressure the sender")
+    XCTAssertTrue(p.process.isRunning, "critical saturation must not terminate the helper")
+    guard p.process.isRunning else { return }
+    p.discardPrefillAndDrain()
+    XCTAssertEqual(p.writeFlood(data, offset: sent, timeout: 10), data.count)
+    guard let acks = p.waitForLines(containing: "titles.ack", count: 1100, timeout: 15) else {
+      return XCTFail("all 1100 acknowledgements must arrive")
+    }
+    XCTAssertEqual(acks.count, 1100)
+    for (i, line) in acks.enumerated() {
+      guard let ack = jsonDict(line) else { return XCTFail("invalid ack JSON") }
+      XCTAssertTrue((ack["id"] as? String)?.hasPrefix("\(i)-") == true)
+      XCTAssertEqual(ack["gen"] as? Int, i + 1)
+    }
+    XCTAssertEqual(p.waitExit(timeout: 3), 0)
+  }
+
+  private func assertCongestedTermination(signal: Bool) throws {
+    let p = try launchFixture(prefillStdout: true, drainStdout: false)
+    let data = congestedControls()
+    XCTAssertLessThan(p.writeFlood(data, timeout: 1), data.count)
+    XCTAssertTrue(p.process.isRunning)
+    guard p.process.isRunning else { return }
+    let start = ProcessInfo.processInfo.systemUptime
+    if signal { p.process.terminate() } else { p.closeStdin() }
+    XCTAssertEqual(p.waitExit(timeout: 1), 0)
+    XCTAssertLessThan(ProcessInfo.processInfo.systemUptime - start, 0.4)
+  }
+
+  func testFixtureCongestedEOFStopsWithinDrainDeadline() throws {
+    try assertCongestedTermination(signal: false)
+  }
+
+  func testFixtureCongestedSIGTERMStopsWithinDrainDeadline() throws {
+    try assertCongestedTermination(signal: true)
+  }
+
+  func testFixtureNonAckCriticalBackpressureStillDetectsEOF() throws {
+    let p = try launchFixture(prefillStdout: true, drainStdout: false)
+    let commands = Data(String(repeating: "{\"cmd\":\"recheck-permissions\"}\n", count: 1100).utf8)
+    XCTAssertEqual(p.writeFlood(commands, timeout: 5), commands.count)
+    XCTAssertTrue(p.waitStderr("fixture:recheck-done", count: 1020, timeout: 10))
+    Thread.sleep(forTimeInterval: 0.2)
+    XCTAssertFalse(p.waitStderr("fixture:recheck-done", count: 1100, timeout: 0.1))
+    XCTAssertTrue(p.process.isRunning)
+    let start = ProcessInfo.processInfo.systemUptime
+    p.closeStdin()
+    XCTAssertEqual(p.waitExit(timeout: 1), 0)
+    XCTAssertLessThan(ProcessInfo.processInfo.systemUptime - start, 0.4)
+  }
+
+  func testFixtureQuitWaitsForQueuedAckWhileStdoutIsBlocked() throws {
+    let p = try launchFixture(prefillStdout: true, drainStdout: false)
+    p.send("{\"cmd\":\"titles\",\"enabled\":false,\"id\":\"quit-fence\"}\n" +
+           "{\"cmd\":\"quit\"}\n")
+    Thread.sleep(forTimeInterval: 0.45)
+    XCTAssertTrue(p.process.isRunning, "in-band quit must not abandon queued acknowledgements")
+    guard p.process.isRunning else { return }
+    p.discardPrefillAndDrain()
+    XCTAssertNotNil(p.waitForLine(containing: "\"id\":\"quit-fence\""))
+    XCTAssertEqual(p.waitExit(timeout: 2), 0)
+  }
+
+  func testFixtureQuitDrainCanBeInterruptedByEOF() throws {
+    let p = try launchFixture(prefillStdout: true, drainStdout: false)
+    p.send("{\"cmd\":\"titles\",\"enabled\":false}\n{\"cmd\":\"quit\"}\n")
+    Thread.sleep(forTimeInterval: 0.3)
+    XCTAssertTrue(p.process.isRunning)
+    let start = ProcessInfo.processInfo.systemUptime
+    p.closeStdin()
+    XCTAssertEqual(p.waitExit(timeout: 1), 0)
+    XCTAssertLessThan(ProcessInfo.processInfo.systemUptime - start, 0.4)
+  }
+
+  func testFixturePurgedFocusRepostedOnceWithoutTitle() throws {
+    let p = try launchFixture(["--defer-activation"], prefillStdout: true, drainStdout: false)
+    p.send("{\"cmd\":\"titles\",\"enabled\":true,\"id\":\"enable-focus\"}\n")
+    XCTAssertTrue(p.waitStderr("fixture:titles-applied"))
+    p.send("{\"cmd\":\"recheck-permissions\"}\n")
+    XCTAssertTrue(p.waitStderr("fixture:focus-queued"))
+    XCTAssertTrue(p.waitStderr("fixture:title-read"))
+    p.send("{\"cmd\":\"titles\",\"enabled\":false,\"id\":\"purge-focus\"}\n")
+    XCTAssertTrue(p.waitStderr("fixture:titles-applied", count: 2))
+    p.discardPrefillAndDrain()
+    XCTAssertNotNil(p.waitForLine(containing: "\"id\":\"purge-focus\""))
+    guard let focus = p.waitForLine(containing: "\"type\":\"window.focused\"") else {
+      return XCTFail("the purged focus must be reposted")
+    }
+    XCTAssertNil(jsonDict(focus)?["title"], "reposted focus must be title-free")
+    p.send("{\"cmd\":\"titles\",\"enabled\":false,\"id\":\"dedup-focus\"}\n")
+    XCTAssertNotNil(p.waitForLine(containing: "\"id\":\"dedup-focus\""))
+    Thread.sleep(forTimeInterval: 0.3)
+    XCTAssertEqual(p.snapshotLines().filter { eventType($0) == "window.focused" }.count, 1)
+    p.send("{\"cmd\":\"quit\"}\n")
+    XCTAssertEqual(p.waitExit(), 0)
+  }
+
+  func testFixtureEvictedFocusRepostedOnceAfterPrivacySwitch() throws {
+    let p = try launchFixture(prefillStdout: true, drainStdout: false)
+    XCTAssertTrue(p.waitStderr("fixture:focus-queued"))
+    p.send("{\"cmd\":\"snapshot\"}\n")
+    XCTAssertTrue(p.waitStderr("fixture:snapshot-done"))
+    Thread.sleep(forTimeInterval: 0.2)
+    let controls = String(repeating: "{\"cmd\":\"titles\",\"enabled\":false}\n", count: 1021)
+    XCTAssertEqual(p.writeFlood(Data(controls.utf8), timeout: 5), controls.utf8.count)
+    XCTAssertTrue(p.waitStderr("fixture:titles-applied", count: 1021))
+    p.discardPrefillAndDrain()
+    XCTAssertNotNil(p.waitForLines(containing: "titles.ack", count: 1021, timeout: 10))
+    guard let overflow = p.waitForLine(containing: "output_overflow"),
+          let types = jsonDict(overflow)?["droppedTypes"] as? [String: Int] else {
+      return XCTFail("output overflow must report the eviction")
+    }
+    XCTAssertGreaterThan(types["window.focused"] ?? 0, 0)
+    Thread.sleep(forTimeInterval: 0.3)
+    p.send("{\"cmd\":\"titles\",\"enabled\":false,\"id\":\"retry-focus\"}\n")
+    XCTAssertNotNil(p.waitForLine(containing: "\"id\":\"retry-focus\""))
+    XCTAssertNotNil(p.waitForLine(containing: "\"type\":\"window.focused\"", timeout: 2))
+    Thread.sleep(forTimeInterval: 0.3)
+    XCTAssertEqual(p.snapshotLines().filter { eventType($0) == "window.focused" }.count, 1)
+    p.send("{\"cmd\":\"quit\"}\n")
+    XCTAssertEqual(p.waitExit(), 0)
   }
 }

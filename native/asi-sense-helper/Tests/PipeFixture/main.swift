@@ -37,11 +37,12 @@ final class SyntheticAX: AXBackend {
 }
 
 let frontPid: Int32 = 4242, frontBid = "fixture.app"
-var titleLen = 64, gateFrom = 0, releaseMs = 750
+var titleLen = 64, gateFrom = 0, releaseMs = 750, deferActivation = false
 for arg in CommandLine.arguments.dropFirst() {
   if arg.hasPrefix("--title-len="), let v = Int(arg.dropFirst(12)) { titleLen = v }
   if arg.hasPrefix("--gate-fw-from="), let v = Int(arg.dropFirst(15)) { gateFrom = v }
   if arg.hasPrefix("--release-delay-ms="), let v = Int(arg.dropFirst(19)) { releaseMs = v }
+  if arg == "--defer-activation" { deferActivation = true }
 }
 
 let synthetic = SyntheticAX()
@@ -52,7 +53,14 @@ if gateFrom > 0 { synthetic.gateFrom = gateFrom; synthetic.gate = DispatchSemaph
 let channel = CommandChannel(queue: .main, nowMs: nowMs)
 var session: AXSession<SyntheticAX>!
 session = AXSession(backend: synthetic, isTrusted: { true }, nowMs: nowMs,
-                    emit: { e in channel.send(e) })
+                    emit: { e in
+  channel.send(e)
+}, emitFocus: { e, done in
+  channel.sendFocus(e, completion: done)
+  if e.type == "window.focused" {
+    note("fixture:focus-queued")
+  }
+})
 channel.onTitles = { on in
   let gen = session.setTitlesEnabled(on)
   // Posted on .main so it runs only after the whole titles control returns:
@@ -65,6 +73,7 @@ channel.onTitles = { on in
   }
   return gen
 }
+channel.onTitlesApplied = { session.retryUndeliveredFocus() }
 channel.onCommand = { cmd, done in
   switch cmd {
   case .snapshot:
@@ -80,28 +89,39 @@ channel.onCommand = { cmd, done in
     channel.send(HelloEvent(at: nowMs(), pid: ProcessInfo.processInfo.processIdentifier,
                             session: channel.session,
                             permissions: .init(accessibility: "granted")))
+    note("fixture:recheck-done")
+    if deferActivation { session.activate(pid: frontPid, bundleId: frontBid) }
     done()
   default: done()
   }
 }
-func shutdown() {
+func shutdown(drainAll: Bool = false) {
   channel.stopInput()
   session.shutdown()
-  channel.flushOutput(deadline: 0.2)
+  channel.flushOutput(deadline: drainAll ? .infinity : 0.2)
   channel.closeOutput()
   exit(0)
 }
-channel.onQuit = { shutdown() }
+channel.onQuit = { shutdown(drainAll: true) }
 channel.onEOF = { shutdown() }
 let controlQueue = DispatchQueue(label: "asi-sense-pipe-fixture.control")
-channel.onEOFDetected = { controlQueue.asyncAfter(deadline: .now() + 0.75) { exit(0) } }
+channel.onEOFDetected = { DispatchQueue.global().asyncAfter(deadline: .now() + 0.2) { exit(0) } }
 channel.onFatal = { exit(1) }
+signal(SIGTERM, SIG_IGN)
+let sigtermSource = DispatchSource.makeSignalSource(signal: SIGTERM, queue: controlQueue)
+sigtermSource.setEventHandler {
+  DispatchQueue.global().asyncAfter(deadline: .now() + 0.25) { exit(0) }
+  channel.stopInput()
+  channel.flushOutput(deadline: 0.2)
+  exit(0)
+}
+sigtermSource.resume()
 
 channel.send(HelloEvent(at: nowMs(), pid: ProcessInfo.processInfo.processIdentifier,
                         session: channel.session,
                         permissions: .init(accessibility: "granted")))
 channel.send(ThermalEvent(at: nowMs(), state: "nominal"))
 channel.start()
-session.activate(pid: frontPid, bundleId: frontBid)
+if !deferActivation { session.activate(pid: frontPid, bundleId: frontBid) }
 note("fixture:ready")
 RunLoop.main.run()

@@ -9,6 +9,7 @@ import Foundation
 public final class CommandChannel {
   public var onCommand: ((Command, @escaping () -> Void) -> Void)? // ordinary work
   public var onTitles: ((Bool) -> Int)?    // synchronous mutation -> privacy gen
+  public var onTitlesApplied: (() -> Void)?
   public var onQuit: (() -> Void)?
   public var onEOF: (() -> Void)?
   public var onEOFDetected: (() -> Void)?
@@ -39,8 +40,25 @@ public final class CommandChannel {
         dropped: dropped, droppedTypes: types)).line) ?? Data()
     }
     writer.onFatal = { [weak self] in self?.onFatal?() }
+    writer.onCapacityWait = { [weak self] in
+      guard let self else { return true }
+      var p = pollfd(fd: inputFD, events: Int16(POLLHUP | POLLERR), revents: 0)
+      guard poll(&p, 1, 0) > 0, p.revents & Int16(POLLHUP | POLLERR) != 0 else { return false }
+      self.stopInput()
+      self.onEOFDetected?()
+      self.onEOF?()
+      return true
+    }
     reader.onLine = { [weak self] line, done in self?.ordinary(line, done: done) }
     reader.onControlLine = { [weak self] cmd in self?.control(cmd) }
+    reader.reserveControl = { [weak self] cmd in
+      guard let self else { return false }
+      guard case .titles(let on, let id) = cmd else { return true }
+      let ack = TitlesAckEvent(at: Int64.min, session: self.session, id: id,
+                               enabled: on, gen: Int.max)
+      guard let size = try? self.encoder.encodeLine(ack).line.count else { return false }
+      return self.writer.reserveAck(bytes: size)
+    }
     reader.onError = { [weak self] _ in
       self?.emitError("line-too-long", "command line exceeds 64KiB")
     }
@@ -60,9 +78,21 @@ public final class CommandChannel {
   // Every event goes through the encoder (privacy stripping/bounding) and the
   // bounded writer; criticality is derived centrally from the event type.
   public func send<E: Encodable>(_ event: E) {
-    guard let line = try? encoder.encodeLine(event) else { return }
+    send(event, reserved: false, completion: nil)
+  }
+  public func sendFocus(_ event: WindowEvent, completion: @escaping (Bool) -> Void) {
+    send(event, reserved: false, completion: completion)
+  }
+  private func send<E: Encodable>(_ event: E, reserved: Bool,
+                                  completion: ((Bool) -> Void)?) {
+    guard let line = try? encoder.encodeLine(event) else {
+      if reserved { writer.releaseAck() }
+      completion?(false)
+      return
+    }
     writer.enqueue(line.line, critical: EventKinds.critical.contains(line.type),
-                   hasTitle: line.hasTitle, type: line.type)
+                   hasTitle: line.hasTitle, type: line.type, reserved: reserved,
+                   completion: completion)
   }
   public func emitError(_ code: String, _ message: String) {
     send(ErrorEvent(at: nowMs(), code: code, message: message))
@@ -87,11 +117,13 @@ public final class CommandChannel {
     switch cmd {
     case .titles(let on, let id):
       let gen = onTitles?(on) ?? -1 // session generation, bumped synchronously
-      guard gen != Int.max else { privacyExhausted(); return }
+      guard gen != Int.max else { writer.releaseAck(); privacyExhausted(); return }
       titlesEnabled = on
       encoder.titlesEnabled = on
       if !on { writer.purgeUnstartedTitles(stripCritical: LineEncoder.stripTitles(fromLine:)) }
-      send(TitlesAckEvent(at: nowMs(), session: session, id: id, enabled: on, gen: gen))
+      send(TitlesAckEvent(at: nowMs(), session: session, id: id, enabled: on, gen: gen),
+           reserved: true, completion: nil)
+      onTitlesApplied?()
     case .quit:
       // Invalidates the privacy generation so in-flight title work dies, and
       // purges queued titles before the bounded shutdown drain.

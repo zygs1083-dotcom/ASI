@@ -61,9 +61,12 @@ One per line, <=64KiB; partial lines and CRLF handled. Optional `v` must equal
 | `{"cmd":"quit"}` | clean shutdown, exit 0 |
 
 **Controls.** Every `titles`/`quit` is applied synchronously in arrival order,
-at its complete physical line, before parsing the next line. Controls bypass
-queued ordinary commands and an in-flight snapshot. No controls are coalesced
-or silently discarded: each `titles`, including redundant ones, increments
+at its complete physical line, before parsing the next line. Before applying
+each `titles`, the reader reserves one critical output slot and enough bytes
+for its ack. If capacity is unavailable, it suspends stdin reads until stdout
+frees space; the sender eventually blocks in its pipe. Controls bypass queued
+ordinary commands and an in-flight snapshot. No controls are coalesced
+or silently discarded: each applied `titles`, including redundant ones, increments
 the privacy generation, flips the encoder, purges queued titles when disabling,
 and enqueues its own critical `titles.ack`. Only actual AX title work coalesces.
 `quit` increments the privacy generation, disables titles and purges queued
@@ -97,31 +100,35 @@ Errors (`error` event, process keeps running unless noted):
   each entry charged `max(64, bytes+1)` to cover framing overhead so empty
   lines cannot queue unbounded records; anything beyond the cap is dropped
   and counted in a coalesced `input_overflow` per readiness batch.
-- Control capacity is one in service, **zero pending**: the synchronous
-  callback must finish before framing another line or reading stdin again.
-  A busy control consumer naturally backpressures the pipe; only the current
-  <=16KiB read chunk and <=64KiB line scratch are retained. No overwrite/drop.
+- Control capacity is one in service plus at most one framed control waiting
+  for an ack reservation. Its remaining <=16KiB read chunk is retained;
+  no further stdin bytes are read until capacity is available. No
+  overwrite/drop. A `quit` behind it cannot jump the FIFO.
 - Ordinary commands run one at a time (next delivered only after the previous
   completion, including the async `snapshot` read); a flood cannot queue
   unbounded work.
-- EOF: buffered complete commands run normally and a trailing partial line
-  parses as the final command. An independent ~750ms control-queue deadline
-  arms at EOF detection, so a stalled command is abandoned only if it fires.
+- EOF normally permits already-buffered commands, including a trailing partial
+  line, to run within the shutdown deadline. If input is paused for output
+  capacity, EOF is detected even with unread pipe bytes, stops acceptance,
+  and abandons the waiting command and unread input.
 
 ## Output bounds
 
 - All stdout writes are nonblocking (`O_NONBLOCK`) through a bounded queue -
   at most **1024 queued lines** and **1MiB queued bytes** - drained by a
-  `DispatchSourceWrite`. Enqueue never blocks, spins on EAGAIN, or interleaves
-  lines; a partially written line resumes at its byte offset when space frees.
+  `DispatchSourceWrite`. Writes do not spin on EAGAIN or interleave lines; a
+  partially written line resumes at its byte offset when space frees.
 - On saturation the **oldest unstarted noncritical** events are evicted; one
   coalesced critical `output_overflow` record (`dropped`, `droppedTypes`)
-  rides as the next whole line right behind any partially-written head.
+  rides as the next whole line right behind any partially-written head once
+  a slot is available.
 - **Critical** - never evicted, never purged-without-transform:
   `hello`, `error`, `app.terminated`, `ax.unsupported`, `snapshot`,
-  `titles.ack`. If nothing removable remains (or a critical event exceeds
-  the byte bound) the helper fails fast with exit 1 rather than discard
-  critical data or grow memory.
+  `titles.ack`. Full critical queues backpressure producers instead of causing
+  an exit. An ack already enqueued is never evicted; its reservation covers
+  both a line and its encoded bytes. Other critical producers wait for space.
+  A critical record larger than the entire byte bound is an encoding failure
+  and exits 1 rather than growing memory.
 - Title-bearing lines are capped at **PIPE_BUF bytes** including the LF -
   `min(4096, PIPE_BUF)` = 512 on Darwin (a platform-safety tightening of the
   requested <=4096); the encoder truncates or strips title strings to fit
@@ -129,9 +136,11 @@ Errors (`error` event, process keeps running unless noted):
   the whole line crosses in one `write()` or the entry waits at offset 0 -
   a partial title line never exists, so it can never be resumed, purged
   mid-wire, or glued onto a following record.
-- Normal shutdown drains only ready output under a strict 200ms deadline;
-  it does not guarantee delivery of everything queued. Filled stdout can
-  never block EOF or SIGTERM handling.
+- In-band `quit` waits for queued output to drain in order. EOF or SIGTERM
+  instead stops input and makes a best effort to drain already-queued output
+  for at most 200ms; this independent path can abandon queued records.
+  When the host is not reading stdout it should close stdin or send SIGTERM;
+  SIGKILL is the host's last resort.
 
 ## AX semantics
 
@@ -169,8 +178,10 @@ Errors (`error` event, process keeps running unless noted):
   serializes as `""` for missing identifiers.
 - On a focused-window refresh the window identity is compared first (`CFEqual`
   in production): the same window keeps the pending title debounce and emits
-  no extra `window.focused` only after successful stamped delivery; a focus
-  discarded on a privacy transition is reposted (title-free when disabled).
+  no extra `window.focused` only after the whole focus line is written to
+  stdout. A queued focus is tracked separately; eviction or privacy purge
+  clears the pending state so the next evaluation or privacy switch can
+  repost the current focus once (title-free when disabled).
   A different window unsubscribes the old title
   observation, resets the debounce, subscribes the new one (only when titles
   are on) and emits one `window.focused`.
@@ -234,21 +245,24 @@ to complete, so no truncated title or title suffix can ever follow the ack.
 
 - `titles:true` resets title dedup and re-reads through the normal 250ms
   debounce. While titles are off the helper does not read `AXTitle`.
-- After each AXTitle result, the AX queue bounds the source to 2048 Unicode
+- AX returns the complete title value before truncation; AX and conversion to
+  Swift `String` may allocate or copy that full source. After each AXTitle
+  result, the AX queue bounds the source to 2048 Unicode
   scalars, discards a possibly partial final grapheme, then limits to 1024
   Characters before events/encoding; even one giant grapheme stays bounded.
-  AX may itself allocate the source.
+  `scripts/title-budget.py` measures `processing_peak_increment` after the
+  synthetic source is already allocated, not a total memory upper bound.
 - Only two AX attributes are ever read: `AXFocusedWindow` and `AXTitle`.
   `AXIsProcessTrusted` only - never prompts.
 
 ## Exit
 
-- stdin EOF: buffered complete commands run normally, the trailing partial
-  line is parsed as a final command (or discarded if it continues a rejected
-  oversized line), and the process exits 0 within ~1s even when stdout is
-  full; only the ~750ms control-queue deadline may abandon remaining work.
-- `{"cmd":"quit"}` / SIGTERM: exit 0. SIGTERM is handled on an independent
-  control queue that exits directly without waiting on main/AX/output locks;
-  process exit releases kernel AX resources. The normal path performs local
-  teardown without blocking on AX IPC and drains output for at most 200ms.
+- stdin EOF: stop reading and exit 0, with an independent 200ms deadline
+  including the best-effort output drain; pending input or AX work may be
+  abandoned. A paused reader detects EOF even if its pipe still has bytes.
+- `{"cmd":"quit"}`: stop parsing later input, drain queued output in FIFO
+  order, then exit 0. If stdout is not read, use EOF or SIGTERM to terminate.
+- SIGTERM: stop input and attempt a 200ms drain on an independent control
+  queue, then exit 0; an independent 250ms fallback exits even if shutdown
+  cannot acquire a lock. Process exit releases kernel AX resources.
 - stdout write failure: exit 1 (SIGPIPE is ignored). The helper writes no files.

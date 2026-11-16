@@ -114,11 +114,29 @@ final class OutputWriterTests: PipeCase {
     XCTAssertTrue(wire.contains { $0.hasPrefix("n1099") }, "newest noncritical retained")
     XCTAssertEqual(wire.filter { $0.contains("output_overflow") }.count, 1, "one coalesced report")
   }
-  // An all-critical backlog fails fast instead of growing or dropping.
-  func testAllCriticalBacklogFailsFast() {
+  // An all-critical backlog waits for room instead of growing or dropping.
+  func testAllCriticalBacklogWaitsForCapacity() {
     fillPipe()
-    for _ in 0..<20 { writer.enqueue(line("crit", size: 64 * 1024), critical: true) }
-    XCTAssertTrue(waitFor { fatals > 0 })
+    var fillerBytes = Int32(0)
+    _ = ioctl(fds.r, 0x4004_667f, &fillerBytes)
+    let finished = DispatchSemaphore(value: 0)
+    let writer = self.writer!
+    let data = line("crit", size: 64 * 1024)
+    DispatchQueue.global().async {
+      for _ in 0..<20 { writer.enqueue(data, critical: true) }
+      finished.signal()
+    }
+    XCTAssertEqual(finished.wait(timeout: .now() + 0.3), .timedOut)
+    lock.lock(); XCTAssertEqual(fatals, 0); lock.unlock()
+    var received = Data()
+    var completed = false
+    drainUntil({ received.append($0) }, {
+      if finished.wait(timeout: .now()) == .success { completed = true }
+      return completed
+    })
+    XCTAssertTrue(completed)
+    drainUntil({ received.append($0) }, { writer.headOffsetForTesting == -1 })
+    XCTAssertEqual(received.count, Int(fillerBytes) + 20 * data.count)
   }
   // An oversize critical line that can never fit fails immediately.
   func testOversizeCriticalFailsImmediately() {

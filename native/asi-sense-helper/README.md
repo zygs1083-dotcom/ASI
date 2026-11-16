@@ -33,14 +33,16 @@ helper (bounds and semantics: PROTOCOL.md):
 - **stdin**: nonblocking reader, 16KiB chunks, <=64KiB physical-line framing,
   <=256KiB ordinary pending, serialized commands. Valid `titles`/`quit`
   commands apply individually in order, bypassing a snapshot in flight;
-  synchronous consumption backpressures stdin without a pending control queue.
+  each titles ack reserves output capacity before application. A full critical
+  queue pauses stdin, retaining only the current chunk and waiting control.
   Parsing stops at quit; ordinary drops report `input_overflow` with
   per-type counts.
 - **stdout**: nonblocking bounded writer (1024 lines / 1MiB); oldest
   noncritical evictions report one coalesced `output_overflow`
   (`dropped`/`droppedTypes`) as the next whole line; criticals
   (`hello`,`error`,`app.terminated`,`ax.unsupported`,`snapshot`,`titles.ack`)
-  never drop - a full critical queue fails fast.
+  never drop; critical producers wait for space rather than exiting on a full
+  queue.
 - **privacy**: titles start off; hello/acks share a random per-process session.
   The host waits for its latest intent's matching ack. `titles` applies synchronously (saturating generation bump),
   flips the central encoder (recursive `title`-key stripping), purges queued
@@ -50,13 +52,17 @@ helper (bounds and semantics: PROTOCOL.md):
   prefix on the wire.
 - **AX**: all IPC on a serial queue with a 0.5s timeout; app/window/privacy
   generation checks drop stale results; one coalesced privacy job applies the
-  latest generation regardless of toggle storms. Source titles are truncated
-  to 1024 Characters on the AX queue before encoding.
+  latest generation regardless of toggle storms. AX returns the complete title
+  before the AX queue truncates it to 1024 Characters for encoding; AX and
+  conversion may allocate or copy the full source. The title-budget script's
+  `processing_peak_increment` starts after synthetic source allocation and is
+  not an upper bound on total memory.
 - `CommandChannel` owns the stdin/privacy/stdout plumbing shared by the real
   runtime and the `Tests/PipeFixture` synthetic process used by pipe-level
   regression tests.
-- **shutdown**: SIGTERM exits directly on a control queue; EOF/`quit` exit
-  within ~1s under a full stdout pipe; normal shutdown flushes <=200ms.
+- **shutdown**: in-band `quit` drains queued output in order. EOF or SIGTERM
+  stops input and attempts a <=200ms drain; if stdout is not being read, close
+  stdin or send SIGTERM (SIGKILL is the host's last resort).
 
 ## Accessibility permission
 

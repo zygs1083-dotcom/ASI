@@ -9,7 +9,7 @@ import Foundation
 // truncated title line can ever sit at the wire head.
 // Oldest unstarted noncritical eviction is reported by ONE coalesced critical
 // `output_overflow` record emitted as the next whole line; criticals are
-// never dropped: nothing removable -> onFatal (exit 1).
+// never dropped: a critical producer waits for capacity.
 public final class OutputWriter {
   public static let maxLines = 1024, maxBytes = 1 << 20
   public static let atomicLineBytes = LineEncoder.maxTitleLineBytes // PIPE_BUF
@@ -17,13 +17,17 @@ public final class OutputWriter {
     var data: Data, offset = 0
     var critical = false, hasTitle = false, overflow = false
     var type = "unknown"
+    var completion: ((Bool) -> Void)?
   }
   private var entries: [Entry] = [], head = 0, queuedBytes = 0
+  private var reservedBytes = 0, reservedLines = 0
+  private var callbacks: [() -> Void] = []
   private var dropTotal = 0, dropTypes: [String: Int] = [:]
   private var failed = false, closed = false, suspended = true
   private let lock = NSLock(), fd: Int32
   private let source: DispatchSourceWrite
   public var onFatal: (() -> Void)?
+  public var onCapacityWait: (() -> Bool)?
   // Encodes the output_overflow record (dropped total + per-type counts).
   // Called from the enqueueing thread while the writer lock is held.
   public var makeOverflowLine: ((_ dropped: Int, _ types: [String: Int]) -> Data)?
@@ -41,40 +45,84 @@ public final class OutputWriter {
     // Sources start suspended and park while empty; `suspended` mirrors the
     // dispatch object's real state for balanced resume/suspend and cancel.
   }
+  public func reserveAck(bytes: Int) -> Bool {
+    lock.lock()
+    var reserved = false
+    if !closed && !failed && bytes <= Self.maxBytes {
+      while !fits(bytes), let i = eldestEvictableLocked() { evictLocked(i) }
+      if fits(bytes) {
+        reservedLines += 1
+        reservedBytes += bytes
+        reserved = true
+      }
+      syncOverflowLocked()
+      updateSourceLocked()
+    }
+    let done = takeCallbacksLocked()
+    lock.unlock()
+    done.forEach { $0() }
+    return reserved
+  }
+  public func releaseAck() {
+    lock.lock()
+    reservedLines = 0; reservedBytes = 0
+    lock.unlock()
+  }
   public func enqueue(_ data: Data, critical: Bool, hasTitle: Bool = false,
-                      type: String = "unknown") {
+                      type: String = "unknown", reserved: Bool = false,
+                      completion: ((Bool) -> Void)? = nil) {
     var fatal = false
     lock.lock()
+    if reserved { reservedLines = 0; reservedBytes = 0 }
     if !closed && !failed {
       let t = EventKinds.normalize(type)
-      if hasTitle && data.count > Self.atomicLineBytes {
-        failed = true // encoder contract broken: title lines stay <= PIPE_BUF
+      if (hasTitle && data.count > Self.atomicLineBytes) || (critical && data.count > Self.maxBytes) {
+        failed = true // encoder contract broken or critical line exceeds the byte bound
       } else {
         var accepted = true
         while !fits(data.count) {
-          guard let i = eldestEvictableLocked() else {
-            if critical { failed = true } else { recordDropLocked(t) }
+          if let i = eldestEvictableLocked() {
+            evictLocked(i)
+            continue
+          }
+          if !critical {
+            recordDropLocked(t)
             accepted = false
             break
           }
-          evictLocked(i)
+          let done = takeCallbacksLocked()
+          lock.unlock()
+          done.forEach { $0() }
+          if onCapacityWait?() == true { return }
+          var p = pollfd(fd: fd, events: Int16(POLLOUT), revents: 0)
+          _ = poll(&p, 1, 10)
+          lock.lock()
+          drainLocked()
+          if closed || failed { accepted = false; break }
         }
         if accepted {
           entries.append(Entry(data: data, critical: critical,
-                               hasTitle: hasTitle, type: t))
+                               hasTitle: hasTitle, type: t, completion: completion))
           queuedBytes += data.count
+        } else if let completion {
+          callbacks.append { completion(false) }
         }
         syncOverflowLocked()
         drainLocked()
       }
       fatal = failed
       updateSourceLocked()
+    } else if let completion {
+      callbacks.append { completion(false) }
     }
+    let done = takeCallbacksLocked()
     lock.unlock()
+    done.forEach { $0() }
     if fatal { onFatal?() }
   }
   private func fits(_ bytes: Int) -> Bool {
-    entries.count - head + 1 <= Self.maxLines && queuedBytes + bytes <= Self.maxBytes
+    entries.count - head + reservedLines + 1 <= Self.maxLines
+      && queuedBytes + reservedBytes + bytes <= Self.maxBytes
   }
   private func eldestEvictableLocked() -> Int? {
     (head..<entries.count).first { entries[$0].offset == 0 && !entries[$0].critical }
@@ -86,7 +134,13 @@ public final class OutputWriter {
   private func evictLocked(_ i: Int) {
     recordDropLocked(entries[i].type)
     queuedBytes -= entries[i].data.count - entries[i].offset
+    if let completion = entries[i].completion { callbacks.append { completion(false) } }
     entries.remove(at: i)
+  }
+  private func takeCallbacksLocked() -> [() -> Void] {
+    let result = callbacks
+    callbacks.removeAll()
+    return result
   }
   // Counters hold drops not yet STARTED reporting. An unstarted pending
   // report's drops are still in them, so it is removed and rebuilt merged;
@@ -102,9 +156,8 @@ public final class OutputWriter {
     }
     var data = make(dropTotal, dropTypes)
     guard !data.isEmpty else { return }
-    while entries.count - head + 1 > Self.maxLines
-          || queuedBytes + data.count > Self.maxBytes {
-      guard let i = eldestEvictableLocked() else { failed = true; return }
+    while !fits(data.count) {
+      guard let i = eldestEvictableLocked() else { return }
       evictLocked(i)
       data = make(dropTotal, dropTypes) // counts moved: re-encode once more
     }
@@ -130,24 +183,30 @@ public final class OutputWriter {
         entries[i].hasTitle = false
       } else {
         queuedBytes -= entries[i].data.count
+        if let completion = entries[i].completion { callbacks.append { completion(false) } }
         entries.remove(at: i)
       }
     }
     updateSourceLocked()
+    let done = takeCallbacksLocked()
     lock.unlock()
+    done.forEach { $0() }
   }
-  // Best-effort bounded drain for normal shutdown; never waits past `deadline`.
+  // A finite deadline bounds shutdown; infinity waits for the FIFO quit drain.
   public func flush(deadline: TimeInterval = 0.2) {
     let end = ProcessInfo.processInfo.systemUptime + deadline
     while true {
       lock.lock(); drainLocked(); updateSourceLocked()
       let done = head >= entries.count || failed
+      let completions = takeCallbacksLocked()
       lock.unlock()
+      completions.forEach { $0() }
       if done { return }
       let remain = end - ProcessInfo.processInfo.systemUptime
       if remain <= 0 { return }
+      if !deadline.isFinite, onCapacityWait?() == true { return }
       var p = pollfd(fd: fd, events: Int16(POLLOUT), revents: 0)
-      poll(&p, 1, Int32(remain * 1000))
+      poll(&p, 1, deadline.isFinite ? Int32(remain * 1000) : 10)
     }
   }
   public func close() {
@@ -166,7 +225,9 @@ public final class OutputWriter {
     drainLocked()
     fatal = failed
     updateSourceLocked()
+    let done = takeCallbacksLocked()
     lock.unlock()
+    done.forEach { $0() }
     if fatal { onFatal?() }
   }
   // Strict line order: one write() attempt per entry. Title lines are <=
@@ -195,11 +256,13 @@ public final class OutputWriter {
       queuedBytes -= n
       entries[head].offset += n
       if entries[head].offset < entries[head].data.count { break } // keep line order
+      if let completion = entries[head].completion { callbacks.append { completion(true) } }
       head += 1
     }
     // Compact consumed prefixes so storage stays bounded by live backlog.
     if head >= entries.count { entries.removeAll(); head = 0 }
     else if head >= 64 && head * 2 >= entries.count { entries.removeFirst(head); head = 0 }
+    syncOverflowLocked()
   }
   private func updateSourceLocked() {
     let needs = head < entries.count && !closed && !failed

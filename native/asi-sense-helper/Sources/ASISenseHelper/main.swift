@@ -19,16 +19,20 @@ final class HelperRuntime {
 
   func start() {
     let backend = SystemAXBackend()
-    let session = AXSession(backend: backend, isTrusted: accessibilityTrusted, nowMs: nowMs) {
-      [weak self] event in self?.emit(event)
-    }
+    let session = AXSession(backend: backend, isTrusted: accessibilityTrusted, nowMs: nowMs,
+                            emit: { [weak self] event in self?.emit(event) },
+                            emitFocus: { [weak self] event, done in
+      guard let self, !self.stopping else { done(false); return }
+      self.channel.sendFocus(event, completion: done)
+    })
     self.session = session
     backend.callback = { [weak session] obs, element, name in
       session?.notify(name, observer: obs, element: element)
     }
     channel.onTitles = { [weak self] on in self?.session.setTitlesEnabled(on) ?? -1 }
+    channel.onTitlesApplied = { [weak self] in self?.session.retryUndeliveredFocus() }
     channel.onCommand = { [weak self] cmd, done in self?.execute(cmd, done: done) }
-    channel.onQuit = { [weak self] in self?.shutdown(exitCode: 0) }
+    channel.onQuit = { [weak self] in self?.shutdown(exitCode: 0, drainAll: true) }
     channel.onEOF = { [weak self] in self?.shutdown(exitCode: 0) }
     channel.onEOFDetected = { armExitDeadline() }
     channel.onFatal = { exit(1) }
@@ -141,16 +145,21 @@ final class HelperRuntime {
     guard frontApp != nil else { finish("unknown", nil); return }
     session.snapshot(pid: pid, bundleId: bid) { status, title in finish(status, title) }
   }
-  func shutdown(exitCode: Int32) {
+  func shutdown(exitCode: Int32, drainAll: Bool = false) {
     guard !stopping else { return }
     stopping = true
     channel.stopInput()
     for token in workspaceTokens { NSWorkspace.shared.notificationCenter.removeObserver(token) }
     for (center, token) in centerTokens { center.removeObserver(token) }
     session.shutdown()              // posts local teardown to the AX queue; never blocks on AX IPC
-    channel.flushOutput(deadline: 0.2) // deliver only what the pipe accepts within the deadline
+    channel.flushOutput(deadline: drainAll ? .infinity : 0.2) // quit drains; EOF has a deadline
     channel.closeOutput()
     exit(exitCode)
+  }
+  func terminateFromControlQueue() {
+    channel.stopInput()
+    channel.flushOutput(deadline: 0.2)
+    exit(0)
   }
 }
 
@@ -159,19 +168,22 @@ signal(SIGTERM, SIG_IGN)
 
 let runtime = HelperRuntime()
 
-// Independent control queue: SIGTERM/EOF deadline exit directly, no locks.
+// Independent control queue handles SIGTERM without waiting for main or AX.
 let controlQueue = DispatchQueue(label: "asi-sense-helper.control")
 let sigtermSource = DispatchSource.makeSignalSource(signal: SIGTERM, queue: controlQueue)
-sigtermSource.setEventHandler { exit(0) }
+sigtermSource.setEventHandler {
+  DispatchQueue.global().asyncAfter(deadline: .now() + 0.25) { exit(0) }
+  runtime.terminateFromControlQueue()
+}
 sigtermSource.resume()
 
-// Armed at EOF detection: bounds exit to ~1s even if a command's AX work
+// Armed at EOF detection: bounds exit to ~200ms even if a command's AX work
 // stalls; the normal shutdown path finishes first and is gone anyway.
 private var deadlineArmed = false
 func armExitDeadline() {
   guard !deadlineArmed else { return }
   deadlineArmed = true
-  controlQueue.asyncAfter(deadline: .now() + 0.75) { exit(0) }
+  DispatchQueue.global().asyncAfter(deadline: .now() + 0.2) { exit(0) }
 }
 
 runtime.start()
