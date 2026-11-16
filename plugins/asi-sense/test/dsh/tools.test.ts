@@ -42,10 +42,12 @@ async function fixture() {
   state.env.focusedWindow.status = 'ok';
   state.observation.sources.helper = { status: 'ok', lastSignalAt: 990 };
   let titles = true;
+  let refresh = async () => true;
   const runtime = {
     ...live,
     tools: {
       ...live.tools,
+      refreshDetail: () => refresh(),
       envState: (section?: 'self' | 'env' | 'observation') => {
         const copy = structuredClone(state);
         if (!titles) copy.env.focusedWindow.value = null;
@@ -103,7 +105,15 @@ async function fixture() {
       signal: options.signal ?? new AbortController().signal,
       ...(options.agent === false ? {} : { agent }),
     });
-  return { ctx, live, state, call, off, setTitles: (value: boolean) => (titles = value) };
+  return {
+    ctx,
+    live,
+    state,
+    call,
+    off,
+    setTitles: (value: boolean) => (titles = value),
+    setRefresh: (value: () => Promise<boolean>) => (refresh = value),
+  };
 }
 
 describe('model-facing tools', () => {
@@ -165,11 +175,27 @@ describe('model-facing tools', () => {
       value: { pid: { value: 123, status: 'ok' }, windowCount: { value: null, status: 'denied' } },
     });
     h.state.env.frontApp.value.windowCount = 0;
+    const denied = await h.call('env_detail', {});
+    expect((denied.value as { app: { value: { windowCount?: number } } }).app.value.windowCount).toBeUndefined();
     h.state.env.frontApp.status = 'stale';
     h.state.observation.sources['helper.ax'].status = 'ok';
     expect(await h.call('env_detail', {})).toMatchObject({
       value: { pid: { value: 123, status: 'stale' }, windowCount: { value: 0, status: 'stale' } },
     });
+  });
+
+  it('awaits a fresh detail snapshot and does not expose a count when refresh fails', async () => {
+    const h = await fixture();
+    h.setRefresh(async () => {
+      if (!h.state.env.frontApp.value) throw new Error('fixture missing');
+      h.state.env.frontApp.value.windowCount = 1;
+      return true;
+    });
+    expect(await h.call('env_detail', {})).toMatchObject({ value: { windowCount: { value: 1, status: 'ok' } } });
+    h.setRefresh(async () => false);
+    const result = await h.call('env_detail', {});
+    expect(result).toMatchObject({ value: { windowCount: { value: null, status: 'unknown' } } });
+    expect((result.value as { app: { value: { windowCount?: number } } }).app.value.windowCount).toBeUndefined();
   });
 
   it('proposes wake rules as an agent, does not remove user rules, and respects cancellation', async () => {

@@ -3,7 +3,16 @@ import type { RuntimeAttention } from '../runtime/attention.ts';
 import type { Clock, HelperSpawner } from '../runtime/ports.ts';
 import type { BodySource } from './body.ts';
 import { SnapshotBackoff } from './helper-backoff.ts';
-import { axStatus, clearWindow, helperError, helperStatus, type Message, object, strip } from './helper-events.ts';
+import {
+  axStatus,
+  clearWindow,
+  helperError,
+  helperStatus,
+  type Message,
+  object,
+  strip,
+  validApp,
+} from './helper-events.ts';
 import { applyHelperEvent, HelperRecovery, markHelperFacts } from './helper-recovery.ts';
 import { HelperWriter } from './helper-writer.ts';
 
@@ -28,6 +37,9 @@ export class HelperSource {
   private readonly writer = new HelperWriter((child) => this.fail('stdin-error', child));
   private recovery = new HelperRecovery();
   private metadataSnapshot = false;
+  private readonly snapshotWaiters = new Set<(success: boolean) => void>();
+  private detailRefresh?: Promise<boolean>;
+  private detailRequests = 0;
   private lastFailure?: string;
   constructor(
     private readonly spawner: HelperSpawner,
@@ -82,12 +94,50 @@ export class HelperSource {
     clearWindow(this.attention, this.clock.wall());
     if (this.child && this.session) this.sendIntent();
   }
+  refreshDetail(): Promise<boolean> {
+    if (this.detailRequests >= 2) return Promise.resolve(false);
+    this.detailRequests++;
+    const prior = this.detailRefresh;
+    const refresh = prior ? prior.catch(() => false).then(() => this.readDetail()) : this.readDetail();
+    this.detailRefresh = refresh;
+    const finish = () => {
+      this.detailRequests--;
+      if (this.detailRefresh === refresh) this.detailRefresh = undefined;
+    };
+    void refresh.then(finish, finish);
+    return refresh;
+  }
+  private async readDetail(): Promise<boolean> {
+    const child = this.child;
+    if (!child || !this.session || this.intent || this.paused() || this.stopped) return false;
+    if (this.recovery.waiting && !(await this.waitSnapshot())) return false;
+    if (this.child !== child || this.stopped || this.paused() || this.intent || this.recovery.waiting) return false;
+    const result = this.waitSnapshot();
+    this.requestSnapshot(true);
+    return result;
+  }
+  private waitSnapshot(): Promise<boolean> {
+    return new Promise((resolve) => {
+      const finish = (success: boolean) => {
+        clearTimeout(timeout);
+        this.snapshotWaiters.delete(finish);
+        resolve(success);
+      };
+      const timeout = setTimeout(() => finish(false), 3_000);
+      timeout.unref?.();
+      this.snapshotWaiters.add(finish);
+    });
+  }
+  private finishSnapshot(success: boolean): void {
+    for (const finish of this.snapshotWaiters) finish(success);
+  }
   async stop(): Promise<void> {
     this.stopped = true;
     this.retry = undefined;
     this.snapshots.reset();
     this.deadline = undefined;
     this.child = undefined;
+    this.finishSnapshot(false);
     this.writer.stop();
     const children = [...this.children.entries()];
     for (const [child] of children) {
@@ -144,6 +194,7 @@ export class HelperSource {
       this.children.delete(child);
       if (this.child === child) {
         this.child = undefined;
+        this.finishSnapshot(false);
         clearWindow(this.attention, this.clock.wall());
         this.restart('process-exited');
       }
@@ -236,35 +287,42 @@ export class HelperSource {
     }
     if (this.paused()) return;
     let skip: Set<string> | undefined;
+    let metadataOnly = false;
     if (raw.type === 'snapshot') {
       this.recovery.waiting = false;
       if (this.recovery.obsolete) {
         this.recovery.obsolete = false;
         this.requestSnapshot();
+        this.finishSnapshot(false);
         return;
       }
       if (this.metadataSnapshot && !this.recovery.degraded) {
-        skip = new Set(['focusedWindow', 'thermal']);
-        const previous = this.attention.state().env.frontApp.value;
-        const app = object(raw.frontApp);
-        if (
-          !previous ||
-          !app ||
-          app.bundleId !== previous.bundleId ||
-          (previous.pid !== undefined && app.pid !== previous.pid)
-        )
-          skip.add('frontApp');
+        metadataOnly = true;
+        skip = new Set(['frontApp', 'focusedWindow', 'thermal']);
       }
       this.metadataSnapshot = false;
     }
     const safe = (this.titles ? raw : strip(raw)) as Message;
-    const recovered = await applyHelperEvent(recovery, raw, safe, this.attention, this.body, valid, skip);
+    const recovered = await applyHelperEvent(recovery, raw, safe, this.attention, this.body, valid, skip, metadataOnly);
     if (!valid()) return;
     if (recovered) {
       this.snapshots.reset();
       await this.status('ok', 'snapshot');
     } else if (raw.type === 'snapshot' && this.recovery.degraded) this.snapshots.failed(this.clock.mono());
     else if (this.recovery.degraded && !this.recovery.waiting && this.snapshots.delta(raw)) this.requestSnapshot();
+    if (raw.type === 'snapshot') {
+      const app = object(raw.frontApp);
+      const current = this.attention.state().env.frontApp.value;
+      this.finishSnapshot(
+        !!current &&
+          validApp(app) &&
+          !this.recovery.degraded &&
+          app.bundleId === current.bundleId &&
+          (current.pid === undefined || app.pid === current.pid) &&
+          !this.recovery.dirty.has('frontApp') &&
+          !this.recovery.dirty.has('focusedWindow'),
+      );
+    }
     if (
       !this.intent &&
       !this.recovery.degraded &&
@@ -297,6 +355,7 @@ export class HelperSource {
     const child = this.child;
     if (!child || child !== expected) return;
     this.child = undefined;
+    this.finishSnapshot(false);
     this.writer.stop();
     this.titles = false;
     clearWindow(this.attention, this.clock.wall());

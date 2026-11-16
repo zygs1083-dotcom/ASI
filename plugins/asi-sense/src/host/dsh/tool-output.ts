@@ -50,18 +50,19 @@ export function modelOutput(value: unknown, now?: number): JsonValue {
 
 type Runtime = Pick<ReturnType<typeof createSenseRuntime>, 'tools' | 'events' | 'rules'>;
 
-export function environmentDetail(runtime: Runtime, app?: string, window?: string): JsonValue {
+export function environmentDetail(runtime: Runtime, app?: string, window?: string, countFresh = true): JsonValue {
   const snapshot = runtime.tools.envState();
   if (!('env' in snapshot) || !('observation' in snapshot)) throw new TypeError('full sense state unavailable');
   const { env, observation } = snapshot;
   const front = env.frontApp.value;
+  const axStatus = observation.sources['helper.ax']?.status;
+  const countDenied = axStatus === 'denied' || axStatus === 'unsupported';
+  if ((!countFresh || countDenied) && front) delete front.windowCount;
   const title = env.focusedWindow.value?.title;
   const matchesApp = front === null ? null : app === undefined || app === front.name || app === front.bundleId;
   const matchesWindow = window === undefined ? true : title === undefined ? null : title === window;
   const available = matchesApp === true && matchesWindow === true;
   const mismatch = matchesApp === false || matchesWindow === false;
-  const axStatus = observation.sources['helper.ax']?.status;
-  const countDenied = axStatus === 'denied' || axStatus === 'unsupported';
   const pid =
     available && front?.pid !== undefined
       ? { value: front.pid, status: env.frontApp.status }

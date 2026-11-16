@@ -295,9 +295,10 @@ logged without rejecting the already-installed snapshot. DSH's
 rename, so its rejection does not imply that the old snapshot is still installed.
 
 `env_detail` returns local structured facts and source status without invoking
-computer-use or reading window contents. The current runtime projection does
-not expose the foreground PID or window count, so those fields are explicitly
-reported as unknown.
+computer-use or reading window contents. It requests a fresh helper snapshot
+before returning the foreground window count, so changes to other windows are
+visible even when focus stays put. If a fresh snapshot cannot be obtained, the
+count is unknown (or denied/unsupported); no additional permissions are needed.
 
 To run the isolated real-DSH check, set `DSH_ROOT` to a read-only DSH checkout
 and run `pnpm --filter asi-sense e2e:dsh`. The fixture uses a private temporary

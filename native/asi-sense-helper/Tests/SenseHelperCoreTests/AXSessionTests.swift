@@ -155,6 +155,31 @@ final class AXSessionTests: XCTestCase {
     attach(6, "", win: 8)
     XCTAssertEqual(ofType("window.focused").count, 1)
   }
+  func testUnsupportedProcessDoesNotMaskAnotherProcessInSameBundle() {
+    makeSession(titles: false)
+    fake.errors["add:\(-7):\(S.focusedNotification)"] = .notificationUnsupported
+    attach(7, "b.u")
+    fake.counts[8] = 2
+    attach(8, "b.u", win: 1)
+    var status = "", count: Int?
+    session.snapshotDetail(pid: 8, bundleId: "b.u") { s, _, c in status = s; count = c }; drain()
+    XCTAssertEqual(status, "ok")
+    XCTAssertEqual(count, 2)
+  }
+  func testTerminatedUnsupportedProcessDoesNotMaskReusedPid() {
+    makeSession(titles: false)
+    fake.errors["add:\(-7):\(S.focusedNotification)"] = .notificationUnsupported
+    attach(7, "b.u")
+    attach(8, "b.other", win: 2)
+    session.appTerminated(pid: 7); drain()
+    fake.errors.removeAll()
+    fake.counts[7] = 1
+    attach(7, "b.u", win: 1)
+    var status = "", count: Int?
+    session.snapshotDetail(pid: 7, bundleId: "b.u") { s, _, c in status = s; count = c }; drain()
+    XCTAssertEqual(status, "ok")
+    XCTAssertEqual(count, 1)
+  }
   func testRetryableFailuresRecoverOnActivateAndRecheck() {
     makeSession()
     fake.errors["add:\(-9):\(S.focusedNotification)"] = .cannotComplete

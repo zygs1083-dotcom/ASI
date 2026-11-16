@@ -100,7 +100,7 @@ export function createSenseTools(runtime: Runtime, now: () => number) {
     async execute(args, exec) {
       requireAgent(exec);
       bounded(args);
-      return environmentDetail(runtime, args.app, args.window);
+      return environmentDetail(runtime, args.app, args.window, await runtime.tools.refreshDetail());
     },
   });
   const bodyTune = defineTool({

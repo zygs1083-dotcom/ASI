@@ -165,6 +165,7 @@ public final class AXSession<B: AXBackend> {
   }
   // Logical detach is synchronous; resource teardown stays queued.
   public func appTerminated(pid p: Int32) {
+    axQueue.async { self.unsupported = Set(self.unsupported.filter { !$0.hasPrefix("\(p):") }) }
     guard let g = control.mutate({ c -> Int? in
       guard c.desiredPid == p || c.pubPid == p else { return nil }
       c.appGen &+= 1
@@ -282,7 +283,7 @@ public final class AXSession<B: AXBackend> {
     axQueue.async {
       var status = "unknown", title: String? = nil
       var count: Int? = nil
-      let k = b.isEmpty ? "pid:\(p)" : b
+      let k = "\(p):\(b)"
       let c = self.control.get()
       if c.appGen == snap.app, c.winGen == snap.win {
         if !self.isTrusted() { status = "denied" }
@@ -343,7 +344,7 @@ public final class AXSession<B: AXBackend> {
   private func attachNow(pid p: Int32, bundleId b: String, appGen g: Int, privGen pr: Int) {
     if observer != nil, p == pid, attachedGen == g, !needsRetry { return }
     detachNow()
-    pid = p; bundleId = b; key = b.isEmpty ? "pid:\(p)" : b; attachedGen = g
+    pid = p; bundleId = b; key = "\(p):\(b)"; attachedGen = g
     needsRetry = false; retryableNoted = false
     guard isTrusted(), !unsupported.contains(key) else { return }
     func current() -> Bool { let c = control.get(); return c.appGen == g && c.desiredPid == p }
