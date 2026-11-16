@@ -1,41 +1,51 @@
 import { useEffect, useId, useRef, useState } from 'react'
 import { formatBytes, formatPercent, formatPercentValue, formatRate, formatTokens, formatTuningValue } from '../format'
 import type { MetricKey, SensePanelProps, TuningState } from '../view-model'
+import type { TuningOperations } from './tuning-operation'
 import css from './rules.module.css'
 
 type Suggestion = NonNullable<TuningState['suggestions']>[number]
 
-function ConfirmAction({ label, confirmLabel, message, onConfirm, describedBy }: {
+function ConfirmAction({ label, confirmLabel, message, onConfirm, describedBy, operation, onOpen, onClose }: {
   label: string
   confirmLabel: string
   message: string
   onConfirm: () => void
   describedBy?: string
+  operation?: { phase: 'pending' | 'waiting' | 'error' }
+  onOpen?: () => void
+  onClose?: () => void
 }) {
   const [open, setOpen] = useState(false)
   const messageId = useId()
   const trigger = useRef<HTMLButtonElement>(null)
-  const confirm = useRef<HTMLButtonElement>(null)
+  const cancel = useRef<HTMLButtonElement>(null)
   useEffect(() => {
-    if (open) confirm.current?.focus()
+    if (open) cancel.current?.focus()
   }, [open])
   const close = () => {
     setOpen(false)
+    onClose?.()
     trigger.current?.focus()
   }
+  const busy = operation?.phase === 'pending' || operation?.phase === 'waiting'
   return (
     <div className={css.confirmAction}>
-      <button ref={trigger} type="button" aria-expanded={open} aria-describedby={describedBy} onClick={() => setOpen(true)}>
-        {label}
+      <button ref={trigger} type="button" aria-expanded={open} aria-describedby={describedBy} disabled={busy} onClick={() => {
+        if (open) cancel.current?.focus()
+        else { setOpen(true); onOpen?.() }
+      }}>
+        {busy ? `${label} · 处理中` : label}
       </button>
+      {operation?.phase === 'error' && <span role="alert">操作失败，请重试</span>}
       {open && (
         <div className={css.confirmation}>
           <span id={messageId}>{message}</span>
           <div className={css.confirmButtons}>
-            <button ref={confirm} type="button" aria-describedby={[describedBy, messageId].filter(Boolean).join(' ')} onClick={() => { close(); onConfirm() }}>
+            <button type="button" aria-describedby={[describedBy, messageId].filter(Boolean).join(' ')} onClick={() => { close(); onConfirm() }}>
               {confirmLabel}
             </button>
-            <button type="button" onClick={close}>取消</button>
+            <button ref={cancel} type="button" onClick={close}>取消</button>
           </div>
         </div>
       )}
@@ -43,17 +53,22 @@ function ConfirmAction({ label, confirmLabel, message, onConfirm, describedBy }:
   )
 }
 
-export function TuningDisabled({ model, onResumeTuning, onResetTuning }: Pick<
+export function TuningDisabled({ model, onResumeTuning, onResetTuning, operations }: Pick<
   SensePanelProps, 'model' | 'onResumeTuning' | 'onResetTuning'
->) {
+> & { operations: TuningOperations }) {
   const reason = model.tuning?.disabled?.reason
+  const resume = operations.operations.resume
+  const busy = resume?.phase === 'pending' || resume?.phase === 'waiting'
   if (!reason) return null
   return (
     <div className={css.notice} role="status">
       {reason === 'storage-failed' ? (
         <>
           <span>保存调参数据失败，AI 调参已停用</span>
-          <button type="button" onClick={onResumeTuning}>恢复 AI 调参</button>
+          <button type="button" disabled={busy} onClick={() => operations.run('resume', onResumeTuning)}>
+            {busy ? '恢复 AI 调参 · 处理中' : '恢复 AI 调参'}
+          </button>
+          {resume?.phase === 'error' && <span role="alert">操作失败，请重试</span>}
         </>
       ) : (
         <>
@@ -61,8 +76,9 @@ export function TuningDisabled({ model, onResumeTuning, onResetTuning }: Pick<
           <ConfirmAction
             label="重置调参"
             confirmLabel="确认重置"
-            message="确认重置保存的调参数据？"
-            onConfirm={onResetTuning}
+            message="将丢弃已保存的调参、锁定和调整记录，所有参数恢复默认值，基线重新学习"
+            operation={operations.operations.reset}
+            onConfirm={() => operations.run('reset', onResetTuning)}
           />
         </>
       )}
@@ -85,22 +101,26 @@ function metricValue(unit: Suggestion['unit'], value: number): string {
     case 'ratio': return formatPercent(value)
     case 'percent': return formatPercentValue(value)
     case 'ordinal': return formatTuningValue(value, '档')
-    case 'bytes-per-second': return formatRate(value)
-    case 'bytes': return formatBytes(value)
+    case 'bytes-per-second': return Math.abs(value) < 1024 ? formatTuningValue(value, 'B/s') : formatRate(value)
+    case 'bytes': return Math.abs(value) < 1024 ? formatTuningValue(value, 'B') : formatBytes(value)
     case 'tokens': return formatTokens(value)
+    default: return formatTuningValue(value, '单位未知')
   }
 }
 
 function exactValue(unit: Suggestion['unit'], value: number): string {
   if (unit === 'ratio') return `${formatTuningValue(Number((value * 100).toPrecision(15)))}%`
   if (unit === 'percent') return `${formatTuningValue(value)}%`
-  const suffix = { bytes: 'B', 'bytes-per-second': 'B/s', tokens: 'token', ordinal: '档' }[unit]
+  const suffix = { bytes: 'B', 'bytes-per-second': 'B/s', tokens: 'token', ordinal: '档' }[unit] ?? '单位未知'
   return formatTuningValue(value, suffix)
 }
 
-function SuggestionRow({ suggestion, onAcceptRebaseline }: {
+function SuggestionRow({ suggestion, onAcceptRebaseline, operations, onOpen, onClose }: {
   suggestion: Suggestion
-  onAcceptRebaseline: (id: string) => void
+  onAcceptRebaseline: (id: string) => void | Promise<void>
+  operations: TuningOperations
+  onOpen: () => void
+  onClose: () => void
 }) {
   const { metric, unit, slotLabel, from, to, samples, dates, id } = suggestion
   const descriptionId = useId()
@@ -122,26 +142,45 @@ function SuggestionRow({ suggestion, onAcceptRebaseline }: {
         confirmLabel="确认应用"
         message="持续故障和新负载无法自动区分，请确认这是正常的新状态"
         describedBy={descriptionId}
-        onConfirm={() => onAcceptRebaseline(id)}
+        operation={operations.operations[`suggestion:${id}`]}
+        onOpen={onOpen}
+        onClose={onClose}
+        onConfirm={() => operations.run(`suggestion:${id}`, () => onAcceptRebaseline(id))}
       />
     </li>
   )
 }
 
-export function RebaselineSuggestions({ model, onAcceptRebaseline }: Pick<
+export function RebaselineSuggestions({ model, onAcceptRebaseline, operations }: Pick<
   SensePanelProps, 'model' | 'onAcceptRebaseline'
->) {
-  const suggestions = model.tuning?.suggestions
-  if (!suggestions?.length) return null
+> & { operations: TuningOperations }) {
+  const suggestions = model.tuning?.suggestions ?? []
+  const [active, setActive] = useState<Record<string, string>>({})
+  const [notice, setNotice] = useState(false)
+  const heading = useRef<HTMLDivElement>(null)
+  useEffect(() => {
+    const valid = Object.fromEntries(Object.entries(active).filter(([id, content]) =>
+      suggestions.some((suggestion) => suggestion.id === id && JSON.stringify(suggestion) === content)))
+    if (Object.keys(valid).length !== Object.keys(active).length) {
+      setActive(valid)
+      setNotice(true)
+      heading.current?.focus()
+    }
+  }, [active, suggestions])
+  if (!suggestions.length && !Object.keys(active).length && !notice) return null
   return (
     <div>
-      <div className={css.ruleName}>重新基线建议</div>
+      <div ref={heading} tabIndex={-1} className={css.ruleName}>重新基线建议</div>
+      <div aria-live="polite">{notice ? '建议已更新，请重新确认' : ''}</div>
       <ul className={css.rules} aria-label="重新基线建议">
         {suggestions.map((suggestion) => (
           <SuggestionRow
             key={JSON.stringify(suggestion)}
             suggestion={suggestion}
             onAcceptRebaseline={onAcceptRebaseline}
+            operations={operations}
+            onOpen={() => { setNotice(false); setActive((previous) => ({ ...previous, [suggestion.id]: JSON.stringify(suggestion) })) }}
+            onClose={() => setActive((previous) => Object.fromEntries(Object.entries(previous).filter(([id]) => id !== suggestion.id)))}
           />
         ))}
       </ul>

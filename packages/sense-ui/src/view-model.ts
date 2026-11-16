@@ -270,7 +270,7 @@ export interface SensePanelProps {
   onRevertTuning: (id: string) => void
   onLockParam: (key: string, locked: boolean) => void
   onFeedback: (signalId: string, value: 'useful' | 'noise') => void
-  onResumeTuning: () => void
-  onResetTuning: () => void
-  onAcceptRebaseline: (id: string) => void
+  onResumeTuning: () => void | Promise<void>
+  onResetTuning: () => void | Promise<void>
+  onAcceptRebaseline: (id: string) => void | Promise<void>
 }

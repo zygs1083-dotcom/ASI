@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { formatTimestamp, formatTuningValue } from '../format'
 import { EyeOffIcon, PauseIcon } from '../icons'
 import { RebaselineSuggestions, TuningDisabled } from './tuning-actions'
+import { useTuningOperations, type TuningOperations } from './tuning-operation'
 import type {
   SensePanelProps,
   SenseRule,
@@ -85,7 +86,8 @@ function TuningView({
   onLockParam,
   onRevertTuning,
   onAcceptRebaseline,
-}: Pick<SensePanelProps, 'model' | 'onLockParam' | 'onRevertTuning' | 'onAcceptRebaseline'>) {
+  operations,
+}: Pick<SensePanelProps, 'model' | 'onLockParam' | 'onRevertTuning' | 'onAcceptRebaseline'> & { operations: TuningOperations }) {
   const tuning = model.tuning
   const params: TuningParam[] = tuning?.parameters ?? []
   const log = tuning?.log ?? []
@@ -116,7 +118,7 @@ function TuningView({
           ))}
         </ul>
       )}
-      <RebaselineSuggestions model={model} onAcceptRebaseline={onAcceptRebaseline} />
+      <RebaselineSuggestions model={model} onAcceptRebaseline={onAcceptRebaseline} operations={operations} />
       <ul className={css.rules}>
         {log.length === 0 && <li className={css.empty}>暂无调整记录</li>}
         {log.map((e) => (
@@ -162,6 +164,7 @@ function TuningView({
 
 export function RulesSection(props: SensePanelProps & { tuningReq?: number }) {
   const { model, onPause, onToggleTitles, tuningReq } = props
+  const operations = useTuningOperations(model)
   const [view, setView] = useState<'rules' | 'tuning'>('rules')
   const tuneRef = useRef<HTMLDivElement | null>(null)
   const rulesButton = useRef<HTMLButtonElement | null>(null)
@@ -180,8 +183,9 @@ export function RulesSection(props: SensePanelProps & { tuningReq?: number }) {
     <>
       <TuningDisabled
         {...props}
-        onResumeTuning={() => { focusView(); props.onResumeTuning() }}
-        onResetTuning={() => { focusView(); props.onResetTuning() }}
+        operations={operations}
+        onResumeTuning={() => { focusView(); return props.onResumeTuning() }}
+        onResetTuning={() => { focusView(); return props.onResetTuning() }}
       />
       <label className={css.switch}>
         <input
@@ -227,7 +231,8 @@ export function RulesSection(props: SensePanelProps & { tuningReq?: number }) {
         <div ref={tuneRef} tabIndex={-1} className={css.tuneView}>
           <TuningView
             {...props}
-            onAcceptRebaseline={(id) => { tuningButton.current?.focus(); props.onAcceptRebaseline(id) }}
+            operations={operations}
+            onAcceptRebaseline={(id) => { tuningButton.current?.focus(); return props.onAcceptRebaseline(id) }}
           />
         </div>
       )}
