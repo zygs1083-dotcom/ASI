@@ -77,16 +77,18 @@ async function fixture(liveState = false, isolated = false) {
   const live = createSenseRuntime(ports, { platform: 'linux' });
   await live.start();
   const state = new StateStore(() => 990).snapshot();
-  state.env.frontApp.value = { name: 'Fixture App', bundleId: 'org.fixture.app' };
+  state.env.frontApp.value = { name: 'Fixture App', bundleId: 'org.fixture.app', pid: 123, windowCount: 2 };
   state.env.frontApp.status = 'ok';
   state.env.focusedWindow.value = { title: 'Synthetic title' };
   state.env.focusedWindow.status = 'ok';
   state.observation.sources.helper = { status: 'ok', lastSignalAt: 990 };
   let titles = true;
+  let refresh = async () => true;
   const runtime = {
     ...live,
     tools: {
       ...live.tools,
+      refreshDetail: () => refresh(),
       envState: (section?: 'self' | 'env' | 'observation') => {
         const copy = structuredClone(state);
         if (!titles) copy.env.focusedWindow.value = null;
@@ -160,6 +162,7 @@ async function fixture(liveState = false, isolated = false) {
     toolEvent: (event: ToolEvent) => toolEvent(event),
     jobEvent: (event: JobEvent) => jobEvent(event),
     setTitles: (value: boolean) => (titles = value),
+    setRefresh: (value: () => Promise<boolean>) => (refresh = value),
   };
 }
 
@@ -188,10 +191,10 @@ describe('model-facing tools', () => {
       isError: false,
       value: {
         current: true,
-        app: { value: { name: 'Fixture App' } },
+        app: { value: { name: 'Fixture App', pid: 123, windowCount: 2 } },
         window: { value: { title: 'Synthetic title' } },
-        pid: { value: null, status: 'unknown' },
-        windowCount: { value: null, status: 'unknown' },
+        pid: { value: 123, status: 'ok' },
+        windowCount: { value: 2, status: 'ok' },
         recentEvents: [{ kind: 'window.focused' }],
         sources: { helper: { status: 'ok' } },
         guidance: '如需查看窗口内容，请使用当前会话可用的 computer-use 工具（需经其授权流程）',
@@ -199,7 +202,14 @@ describe('model-facing tools', () => {
     });
     expect(await h.call('env_detail', { app: 'not-current' })).toMatchObject({
       isError: false,
-      value: { match: 'not-current', app: null, window: null, recentEvents: [] },
+      value: {
+        match: 'not-current',
+        app: null,
+        window: null,
+        recentEvents: [],
+        pid: { value: null, status: 'unknown' },
+        windowCount: { value: null, status: 'unknown' },
+      },
     });
     h.setTitles(false);
     const hidden = await h.call('env_detail', { window: 'Synthetic title' });
@@ -266,6 +276,8 @@ describe('model-facing tools', () => {
       current: true,
       match: 'current',
       window: { value: { title: projected } },
+      pid: { value: 123, status: 'ok' },
+      windowCount: { value: 2, status: 'ok' },
       recentEvents: [{ kind: 'window.focused' }],
     });
     expect((await h.call('env_detail', { window: title })).value).toMatchObject({ match: 'not-current' });
@@ -360,6 +372,37 @@ describe('model-facing tools', () => {
       expect(text).not.toContain('private-command');
       expect(JSON.stringify((await h.call('env_detail', {}, { session })).value)).not.toContain('private-command');
     }
+  });
+
+  it('distinguishes denied and stale foreground details without inventing a count', async () => {
+    const h = await fixture();
+    h.state.env.frontApp.value = { name: 'Fixture App', bundleId: 'org.fixture.app', pid: 123 };
+    h.state.observation.sources['helper.ax'] = { status: 'denied', lastSignalAt: 990 };
+    expect(await h.call('env_detail', {})).toMatchObject({
+      value: { pid: { value: 123, status: 'ok' }, windowCount: { value: null, status: 'denied' } },
+    });
+    h.state.env.frontApp.value.windowCount = 0;
+    const denied = await h.call('env_detail', {});
+    expect((denied.value as { app: { value: { windowCount?: number } } }).app.value.windowCount).toBeUndefined();
+    h.state.env.frontApp.status = 'stale';
+    h.state.observation.sources['helper.ax'].status = 'ok';
+    expect(await h.call('env_detail', {})).toMatchObject({
+      value: { pid: { value: 123, status: 'stale' }, windowCount: { value: 0, status: 'stale' } },
+    });
+  });
+
+  it('awaits a fresh detail snapshot and does not expose a count when refresh fails', async () => {
+    const h = await fixture();
+    h.setRefresh(async () => {
+      if (!h.state.env.frontApp.value) throw new Error('fixture missing');
+      h.state.env.frontApp.value.windowCount = 1;
+      return true;
+    });
+    expect(await h.call('env_detail', {})).toMatchObject({ value: { windowCount: { value: 1, status: 'ok' } } });
+    h.setRefresh(async () => false);
+    const result = await h.call('env_detail', {});
+    expect(result).toMatchObject({ value: { windowCount: { value: null, status: 'unknown' } } });
+    expect((result.value as { app: { value: { windowCount?: number } } }).app.value.windowCount).toBeUndefined();
   });
 
   it('proposes wake rules as an agent, does not remove user rules, and respects cancellation', async () => {

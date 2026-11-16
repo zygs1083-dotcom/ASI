@@ -165,6 +165,7 @@ public final class AXSession<B: AXBackend> {
   }
   // Logical detach is synchronous; resource teardown stays queued.
   public func appTerminated(pid p: Int32) {
+    axQueue.async { self.unsupported = Set(self.unsupported.filter { !$0.hasPrefix("\(p):") }) }
     guard let g = control.mutate({ c -> Int? in
       guard c.desiredPid == p || c.pubPid == p else { return nil }
       c.appGen &+= 1
@@ -274,10 +275,15 @@ public final class AXSession<B: AXBackend> {
   // read and yields no title.
   public func snapshot(pid p: Int32, bundleId b: String,
                        completion: @escaping (_ status: String, _ title: String?) -> Void) {
+    snapshotDetail(pid: p, bundleId: b) { status, title, _ in completion(status, title) }
+  }
+  public func snapshotDetail(pid p: Int32, bundleId b: String,
+                             completion: @escaping (_ status: String, _ title: String?, _ count: Int?) -> Void) {
     let snap = stampNow()
     axQueue.async {
       var status = "unknown", title: String? = nil
-      let k = b.isEmpty ? "pid:\(p)" : b
+      var count: Int? = nil
+      let k = "\(p):\(b)"
       let c = self.control.get()
       if c.appGen == snap.app, c.winGen == snap.win {
         if !self.isTrusted() { status = "denied" }
@@ -286,7 +292,15 @@ public final class AXSession<B: AXBackend> {
         // unknown rather than fabricating ok from a direct one-off read.
         else if self.observer == nil || self.pid != p { status = "unknown" }
         else {
-          let (err, win) = self.backend.focusedWindow(self.backend.application(pid: p))
+          let app = self.backend.application(pid: p)
+          let (countErr, observedCount) = self.backend.windowCount(app)
+          if countErr == .success, let observedCount, observedCount >= 0,
+             self.control.get().appGen == snap.app, self.isTrusted() { count = observedCount }
+          guard self.control.get().appGen == snap.app, self.isTrusted() else {
+            self.toMain { completion("unknown", nil, nil) }
+            return
+          }
+          let (err, win) = self.backend.focusedWindow(app)
           let c1 = self.control.get()
           if c1.appGen == snap.app {
             self.classifyRead(err, Self.focusedNotification, stamp: snap,
@@ -308,7 +322,8 @@ public final class AXSession<B: AXBackend> {
       self.toMain { [gen = self.control] in
         let c = gen.get()
         let valid = c.appGen == snap.app && c.winGen == snap.win
-        completion(valid ? status : "unknown", valid && c.privGen == snap.priv ? title : nil)
+        completion(valid ? status : "unknown", valid && c.privGen == snap.priv ? title : nil,
+                   valid && self.isTrusted() ? count : nil)
       }
     }
   }
@@ -329,7 +344,7 @@ public final class AXSession<B: AXBackend> {
   private func attachNow(pid p: Int32, bundleId b: String, appGen g: Int, privGen pr: Int) {
     if observer != nil, p == pid, attachedGen == g, !needsRetry { return }
     detachNow()
-    pid = p; bundleId = b; key = b.isEmpty ? "pid:\(p)" : b; attachedGen = g
+    pid = p; bundleId = b; key = "\(p):\(b)"; attachedGen = g
     needsRetry = false; retryableNoted = false
     guard isTrusted(), !unsupported.contains(key) else { return }
     func current() -> Bool { let c = control.get(); return c.appGen == g && c.desiredPid == p }

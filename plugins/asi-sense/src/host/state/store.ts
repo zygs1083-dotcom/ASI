@@ -115,7 +115,18 @@ export class StateStore {
     const d = s.data;
     switch (s.kind) {
       case 'app.activated':
-        this.setFact(this.state.env.frontApp, { name: str(d.name), bundleId: str(d.bundleId) || s.subject }, s);
+        this.setFact(
+          this.state.env.frontApp,
+          {
+            name: str(d.name),
+            bundleId: str(d.bundleId) || s.subject,
+            ...(Number.isSafeInteger(d.pid) && (d.pid as number) > 0 ? { pid: d.pid as number } : {}),
+            ...(Number.isSafeInteger(d.windowCount) && (d.windowCount as number) >= 0
+              ? { windowCount: d.windowCount as number }
+              : {}),
+          },
+          s,
+        );
         break;
       case 'window.focused':
       case 'window.title-changed':

@@ -25,6 +25,31 @@ describe('factStatusAt', () => {
 });
 
 describe('StateStore', () => {
+  it('retains valid foreground pid and window count and drops them on the next app', () => {
+    const store = storeAt(new FakeClock());
+    store.apply(
+      sig({
+        id: 'front-1',
+        kind: 'app.activated',
+        data: { name: 'Fixture', bundleId: 'fixture.app', pid: 123, windowCount: 0 },
+      }),
+    );
+    expect(store.snapshot().env.frontApp.value).toEqual({
+      name: 'Fixture',
+      bundleId: 'fixture.app',
+      pid: 123,
+      windowCount: 0,
+    });
+    store.apply(
+      sig({
+        id: 'front-2',
+        kind: 'app.activated',
+        data: { name: 'Other', bundleId: 'other.app', pid: -1, windowCount: -1 },
+      }),
+    );
+    expect(store.snapshot().env.frontApp.value).toEqual({ name: 'Other', bundleId: 'other.app' });
+  });
+
   it('preserves a fact reason and clears it on a subsequent observation without one', () => {
     const store = storeAt(new FakeClock());
     store.apply(

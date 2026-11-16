@@ -235,6 +235,7 @@ export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}
     settings,
     actions,
     files,
+    helper,
     syncRules,
     check,
     () => allowTitles,

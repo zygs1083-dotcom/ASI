@@ -113,8 +113,9 @@ public struct TitlesAckEvent: Encodable {
 public struct SnapshotEvent: Encodable {
   public struct FrontApp: Encodable {
     public var name: String; public var bundleId: String; public var pid: Int32
-    public init(name: String, bundleId: String, pid: Int32) {
-      self.name = name; self.bundleId = bundleId; self.pid = pid }
+    public var windowCount: Int?
+    public init(name: String, bundleId: String, pid: Int32, windowCount: Int? = nil) {
+      self.name = name; self.bundleId = bundleId; self.pid = pid; self.windowCount = windowCount }
   }
   public struct FocusedWindow: Encodable {
     public var pid: Int32; public var bundleId: String

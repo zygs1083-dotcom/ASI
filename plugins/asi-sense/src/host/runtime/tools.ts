@@ -3,6 +3,7 @@ import { createWatchRule, validateRule } from '../attention/rules.ts';
 import type { BodySource } from '../sources/body.ts';
 import type { DshSource } from '../sources/dsh.ts';
 import type { FileSource } from '../sources/files.ts';
+import type { HelperSource } from '../sources/helper.ts';
 import type { RuntimeAttention } from './attention.ts';
 import type { DshPort, SenseActions, TuneRequest } from './ports.ts';
 import type { Settings } from './settings.ts';
@@ -51,6 +52,7 @@ export function runtimeTools(
   settings: Settings,
   actions: SenseActions,
   files: FileSource,
+  helper: HelperSource,
   syncRules: () => Promise<void>,
   check: () => void,
   titlesAllowed: () => boolean,
@@ -59,6 +61,7 @@ export function runtimeTools(
   dshSource: DshSource,
 ) {
   return {
+    refreshDetail: () => helper.refreshDetail(),
     envState: (section?: 'self' | 'env' | 'observation', sessionId?: string) => {
       const state = dshSource.stateFor(sessionId ?? attention.currentSessionId(), attention.state());
       if (!titlesAllowed()) state.env.focusedWindow.value = null;

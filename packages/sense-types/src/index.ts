@@ -96,7 +96,7 @@ export interface EnvWhere {
 /** Observed environment state. */
 export interface EnvState {
   where: EnvWhere;
-  frontApp: Fact<{ name: string; bundleId: string }>;
+  frontApp: Fact<{ name: string; bundleId: string; pid?: number; windowCount?: number }>;
   focusedWindow: Fact<{ title: string }>;
   activeJobs: Fact<JobSummary[]>;
   watchedPaths: Fact<Record<string, { lastChange: number; changes: number }>>;

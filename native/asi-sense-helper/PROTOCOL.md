@@ -34,9 +34,11 @@ event (`code:"thermal-state"`) is emitted instead of an invented state.
 
 ### `snapshot` response
 
-`{frontApp:{name,bundleId,pid}, focusedWindow:{pid,bundleId,status,title?}, thermal, permissions}`
+`{frontApp:{name,bundleId,pid,windowCount?}, focusedWindow:{pid,bundleId,status,title?}, thermal, permissions}`
 
 - `frontApp`/`focusedWindow`: omitted when no front app exists.
+- `frontApp.windowCount`: non-negative count from the app's AX windows attribute;
+  omitted when permission, attachment, or the attribute read is unavailable.
 - `focusedWindow.status`: `ok` (attached observer and a focused window was read), `denied` (no
   Accessibility trust), `unsupported` (the app rejected AX observation),
   `unknown` (trusted but no attached observer or focused window;
@@ -161,7 +163,7 @@ Errors (`error` event, process keeps running unless noted):
 - Permanent unsupported errors (`notificationUnsupported`,
   `attributeUnsupported`, `parameterizedAttributeUnsupported`,
   `actionUnsupported`, `notImplemented`) emit `ax.unsupported` once per app key
-  per run. Every other failure emits `ax-retryable` once per context and is
+  until the process terminates. Every other failure emits `ax-retryable` once per context and is
   retried on the next activation or `recheck-permissions`. `noValue` means
   windowless/unknown: it emits `window.focused` with `window:null` (once per
   windowless context; repeated windowless notifications are deduplicated, and
@@ -173,9 +175,9 @@ Errors (`error` event, process keeps running unless noted):
   A required registration failure under a changed privacy epoch retries
   once under the current epoch while the app is still desired; a repeated
   failure then reports current `ax.unsupported` or `ax-retryable` normally.
-- The internal dedup key is the bundle id, or `pid:<n>` when the app has none -
-  two bundle-less apps never share unsupported state; on the wire `bundleId`
-  serializes as `""` for missing identifiers.
+- The internal dedup key combines bundle id and pid, so distinct app processes
+  never share unsupported state; on the wire `bundleId` serializes as `""` for
+  missing identifiers.
 - On a focused-window refresh the window identity is compared first (`CFEqual`
   in production): the same window keeps the pending title debounce and emits
   no extra `window.focused` only after the whole focus line is written to
@@ -255,7 +257,7 @@ to complete, so no truncated title or title suffix can ever follow the ack.
   Characters before events/encoding; even one giant grapheme stays bounded.
   `scripts/title-budget.py` measures `processing_peak_increment` after the
   synthetic source is already allocated, not a total memory upper bound.
-- Only two AX attributes are ever read: `AXFocusedWindow` and `AXTitle`.
+- Only three AX attributes are ever read: `AXFocusedWindow`, `AXTitle`, and `AXWindows` (count only).
   `AXIsProcessTrusted` only - never prompts.
 
 ## Exit

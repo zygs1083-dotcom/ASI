@@ -1,7 +1,7 @@
 import type { FactStatus } from '@asi/sense-types';
 import type { RuntimeAttention } from '../runtime/attention.ts';
 import type { BodySource } from './body.ts';
-import { helperEvent, type Message, object, validApp } from './helper-events.ts';
+import { appObservation, axStatus, helperEvent, type Message, object, validApp } from './helper-events.ts';
 
 export class HelperRecovery {
   constructor(public degraded = false) {}
@@ -17,12 +17,12 @@ export class HelperRecovery {
   }
 
   delta(event: Message): void {
-    if (!this.degraded || !this.waiting) return;
+    if (!this.waiting) return;
+    if (event.type === 'hello') this.dirty.add('permissions');
     if (event.type === 'thermal' && ['nominal', 'fair', 'serious', 'critical'].includes(String(event.state)))
       this.dirty.add('thermal');
     const appActivated = event.type === 'app.activated' && validApp(event);
     if (appActivated) this.dirty.add('frontApp');
-    if (event.type === 'hello') this.dirty.add('permissions');
     if (
       appActivated ||
       event.type === 'hello' ||
@@ -88,14 +88,62 @@ export async function applyHelperEvent(
   attention: RuntimeAttention,
   body: BodySource,
   valid: () => boolean = () => true,
+  skip: ReadonlySet<string> = new Set(),
+  metadataOnly = false,
 ): Promise<boolean> {
   if (raw.type !== 'snapshot') recovery.delta(raw);
+  if (raw.type === 'snapshot' && metadataOnly) {
+    const app = object(safe.frontApp);
+    const state = attention.state();
+    const current = state.env.frontApp.value;
+    const window = object(raw.focusedWindow);
+    const permission = object(raw.permissions)?.accessibility;
+    const sameApp =
+      validApp(app) &&
+      current &&
+      app.bundleId === current.bundleId &&
+      (current.pid === undefined || app.pid === current.pid);
+    if (sameApp && !recovery.dirty.has('frontApp')) {
+      const observed = { ...app };
+      if (
+        permission === 'denied' ||
+        window?.status === 'denied' ||
+        window?.status === 'unsupported' ||
+        (state.observation.sources['helper.ax']?.status === 'denied' && permission !== 'granted')
+      )
+        delete observed.windowCount;
+      await appObservation(attention, observed, raw.at as number, false, valid);
+    }
+    if (!valid()) return false;
+    if (!recovery.dirty.has('permissions')) {
+      const state = attention.state();
+      const currentStatus = state.observation.sources['helper.ax']?.status;
+      const status =
+        permission === 'denied'
+          ? 'denied'
+          : recovery.dirty.has('focusedWindow')
+            ? undefined
+            : sameApp && window?.status === 'denied'
+              ? 'denied'
+              : sameApp && window?.status === 'unsupported'
+                ? 'unsupported'
+                : sameApp &&
+                    (currentStatus !== 'denied' || permission === 'granted') &&
+                    (window?.status === 'ok' ||
+                      (Number.isSafeInteger(app.windowCount) && (app.windowCount as number) >= 0))
+                  ? 'ok'
+                  : undefined;
+      if (status && (status !== currentStatus || (status === 'denied' && state.env.focusedWindow.status !== 'denied')))
+        await axStatus(attention, status, raw.at as number);
+    }
+    if (!valid()) return false;
+  }
   if (raw.type === 'snapshot' && !Object.hasOwn(raw, 'frontApp') && !Object.hasOwn(raw, 'focusedWindow')) {
     for (const [field, path] of [
       ['frontApp', 'env.frontApp'],
       ['focusedWindow', 'env.focusedWindow'],
     ] as const) {
-      if (recovery.degraded && recovery.dirty.has(field)) continue;
+      if (recovery.dirty.has(field) || skip.has(field)) continue;
       attention.store.apply({
         id: attention.id(),
         kind: 'fact.updated',
@@ -107,7 +155,14 @@ export async function applyHelperEvent(
     }
     attention.changed();
   }
-  await helperEvent(safe, attention, body, recovery.degraded, recovery.degraded ? recovery.dirty : undefined, valid);
+  await helperEvent(
+    safe,
+    attention,
+    body,
+    recovery.degraded,
+    raw.type === 'snapshot' ? new Set([...recovery.dirty, ...skip]) : undefined,
+    valid,
+  );
   if (!valid()) return false;
   if (!recovery.degraded || raw.type !== 'snapshot') return false;
   const missing = missingSnapshot(raw);
