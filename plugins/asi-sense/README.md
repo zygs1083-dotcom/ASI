@@ -8,7 +8,7 @@ and deterministic environment-update formatting.
 ### 前置条件
 
 - Apple Silicon Mac，macOS 13 或更新版本；本项目在 macOS 15.7.7 上验收。
-- Node `^22.12.0 || ^24.0.0 || >=26.0.0`、pnpm、Swift 和 Apple Command Line Tools。
+- Node `^22.12.0 || ^24.0.0 || >=26.0.0` 和 pnpm；从仓库构建还需要 Swift 和 Apple Command Line Tools。
 - DSH `0.2.2-rc.3`：可以安装[官方 npm 包](https://github.com/deepseek-ai/deepseek-harness#run-from-npm)，或使用已构建的[官方源码](https://github.com/deepseek-ai/deepseek-harness#run-from-source)，固定 commit `39163dd30f703a79079e2d2446545cff3c453738`。
 
 官方包安装方式：
@@ -55,6 +55,23 @@ node -e 'require("node:fs").writeFileSync(process.env.DSH_HOME + "/workspace.jso
 这里为本次安装新建独立 `DSH_HOME` 并从 `web` 模板初始化 `asi-dev` profile，不影响已有 DSH profile 数据。`workspace.json` 让首次启动的默认工作区也位于独立 home 内，而不是共享的 Documents 目录；启动时必须加上该 patch。示例 home 位于系统临时目录，可能被系统清理；需要长期保留数据时，将 `mktemp` 的模板改为持久目录中的新路径。后续每次操作同一 profile 时都要使用同一个 `DSH_HOME`；不要重复执行 `--from-default-profile`，它会重新初始化 profile。
 
 产物是 `plugins/asi-sense/dist/asi-sense-0.0.0.tgz`（文件名中的版本取自包的 `version`）。安装后保留该文件，profile 的依赖指向它。启动脚本也随 tarball 的 `package/scripts/dsh.sh` 分发：打包它是为了把产物复制到其他机器时仍可使用同一启动方式；上面的命令使用仓库中的副本。
+
+### 只有安装包时
+
+满足前置条件后，把第一行改为安装包的绝对路径，在同一终端执行：
+
+```sh
+export ASI_TGZ="/absolute/path/to/asi-sense-0.0.0.tgz"
+export ASI_INSTALL="$(mktemp -d "${TMPDIR:-/tmp}/asi-sense-install.XXXXXX")"
+tar -xzf "$ASI_TGZ" -C "$ASI_INSTALL" package/scripts/dsh.sh
+export DSH_LAUNCHER="$ASI_INSTALL/package/scripts/dsh.sh"
+export DSH_HOME="$(mktemp -d "${TMPDIR:-/tmp}/asi-sense-dsh.XXXXXX")"
+node -e 'require("node:fs").writeFileSync(process.env.DSH_HOME + "/workspace.json", JSON.stringify([{id:"workspace-controller",config:{documentsDirectory:process.env.DSH_HOME}}]))'
+"$DSH_LAUNCHER" --profile asi-dev --from-default-profile web --dump-config
+"$DSH_LAUNCHER" plugin --profile asi-dev add "$ASI_TGZ"
+```
+
+保留安装包和提取的启动脚本；后续启动使用下面的命令和同一 `DSH_HOME`。临时目录可能被系统清理，需要长期使用时应改为持久目录中的新路径。
 
 ### 启动
 
