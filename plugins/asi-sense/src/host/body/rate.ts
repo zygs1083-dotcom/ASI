@@ -180,7 +180,7 @@ export class RateEvaluator implements BodyEvaluator {
         const metric = metrics.get(key) as Metric;
         const w = windowFor(key, metric);
         const pts = w.points.filter((p) => p.at >= evaluation.mono - rule.windowMs);
-        if (windows[key] && w.lastMono === windows[key].lastMono) continue;
+        if (rule.maxEtaMs === undefined && windows[key] && w.lastMono === windows[key].lastMono) continue;
         if (pts.length < 2) continue;
         const sig = this.step(rule, key, metric, pts, next, pub, streamLatch, evaluation);
         if (sig) signals.push(sig);

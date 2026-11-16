@@ -284,6 +284,22 @@ describe('位置链', () => {
 })
 
 describe('事件流', () => {
+  it('说明列表时间和变化率事件预计的共同起点', () => {
+    const model = makeScenario('healthy')
+    model.events = [makeEvent(1, {
+      signal: { kind: 'body.rate', at: T0, subject: '磁盘 /' },
+      detail: { kind: 'body.rate', metric: 'disk:/', windowMs: 60_000, delta: -100, unit: 'bytes', timeToFloorMs: 600_000 },
+    })]
+    const { view } = renderPanel(model)
+    const timeMeaning = screen.getByText(/变化率预计从事件时间起算/)
+    expect(timeMeaning.textContent).toContain('变化率为评估时间')
+    for (const width of [320, 420]) {
+      view.container.style.width = `${width}px`
+      expect(timeMeaning.scrollWidth).toBeLessThanOrEqual(timeMeaning.clientWidth)
+    }
+    expect(screen.getByText(/当时预计 10 分 0 秒后触及底线/)).toBeTruthy()
+  })
+
   it('超过 200 截断、每页 10 条、可翻页', async () => {
     renderPanel(makeScenario('busy-events'))
     expect(screen.getByText(/最新 200 条/)).toBeTruthy()

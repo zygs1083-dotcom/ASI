@@ -87,6 +87,42 @@ describe('RateEvaluator maxDelta', () => {
 });
 
 describe('RateEvaluator maxRatio + maxEtaMs', () => {
+  it('reevaluates a cached ETA as time passes without adding evidence or emitting duplicates', () => {
+    const e = ev([{ id: 'c', metric: 'context', windowMs: 300_000, direction: 'down', maxEtaMs: 5_000, floor: 0 }]);
+    const first = { ...sample(ctxBody(1000, 980), 0, undefined, 0), rateTimes: { context: { mono: 0, wall: 0 } } };
+    const second = {
+      ...sample(ctxBody(1000, 990), 10_000, undefined, 10_000),
+      rateTimes: { context: { mono: 10_000, wall: 10_000 } },
+    };
+    const initial = e.evaluate(first, second, {});
+    expect(initial.signals).toHaveLength(0);
+    const cached = { ...second, at: 15_000, monotonicAt: 15_000 };
+    const warning = e.evaluate(second, cached, initial.state);
+    expect(warning.signals[0]).toMatchObject({
+      at: 15_000,
+      data: { severity: 'warn', evidenceAt: 10_000, evidenceMono: 10_000, timeToFloorMs: 5_000 },
+    });
+    expect((warning.state as AdaptiveState)[BODY_HISTORY]?.fs?.rate?.windows.context.points).toHaveLength(2);
+    expect(e.evaluate(cached, { ...cached, at: 16_000, monotonicAt: 16_000 }, warning.state).signals).toHaveLength(0);
+  });
+
+  it('does not reevaluate other rules or manufacture recovery when cached evidence is insufficient', () => {
+    const e = ev([
+      { id: 'c', metric: 'context', windowMs: 20_000, direction: 'down', maxEtaMs: 5_000, floor: 0 },
+      { id: 'd', metric: 'context', windowMs: 20_000, direction: 'down', maxDelta: 5 },
+    ]);
+    const first = { ...sample(ctxBody(1000, 980), 0, undefined, 0), rateTimes: { context: { mono: 0, wall: 0 } } };
+    const second = {
+      ...sample(ctxBody(1000, 990), 10_000, undefined, 10_000),
+      rateTimes: { context: { mono: 10_000, wall: 10_000 } },
+    };
+    const initial = e.evaluate(first, second, {});
+    expect(initial.signals.map((s) => s.data.ruleId)).toEqual(['d']);
+    const expired = e.evaluate(second, { ...second, at: 25_000, monotonicAt: 25_000 }, initial.state);
+    expect(expired.signals).toHaveLength(0);
+    expect(expired.state['rate:d']).toBe('warn');
+  });
+
   it('clamps an already elapsed observation ETA to zero at evaluation', () => {
     const e = ev([{ id: 'c', metric: 'context', windowMs: 300_000, direction: 'down', maxEtaMs: 5_000, floor: 0 }]);
     const prev = { ...sample(ctxBody(1000, 985), 0, undefined, 0), rateTimes: { context: { mono: 0, wall: 0 } } };

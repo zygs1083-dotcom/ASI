@@ -302,6 +302,31 @@ describe('attentionLine 宿主 currentEta 投影', () => {
     expect(line(m)).toBeNull()
   })
 
+  it('延迟评估以证据时间比较，仍保留同一采样的当前 ETA', () => {
+    const m = noRateEvents(makeScenario('rapid-change'))
+    setEta(m, { asOf: T0 - 10_000, sampleIntervalMs: 5_000 })
+    const delayed = rateEvent({}, T0 - 1_000)
+    delayed.signal.data.evidenceAt = T0 - 10_000
+    m.events = [delayed]
+    expect(line(m)).toBe('磁盘 9 分钟后见底')
+    delayed.signal.data.evidenceAt = T0 - 5_000
+    expect(line(m)).toBeNull()
+  })
+
+  it('未来事件忽略，缺失或无效的证据时间回退到事件时间', () => {
+    const m = noRateEvents(makeScenario('rapid-change'))
+    setEta(m, { asOf: T0 - 10_000, sampleIntervalMs: 5_000 })
+    const event = rateEvent({}, T0 + 1)
+    event.signal.data.evidenceAt = T0 - 5_000
+    m.events = [event]
+    expect(line(m)).toBe('磁盘 9 分钟后见底')
+    event.signal.at = T0 - 1_000
+    event.signal.data.evidenceAt = Number.NaN
+    expect(line(m)).toBeNull()
+    delete event.signal.data.evidenceAt
+    expect(line(m)).toBeNull()
+  })
+
   it.each([
     { desc: '无 ETA（timeToFloorMs 缺省）', over: { timeToFloorMs: undefined } },
     { desc: '零速率', over: { delta: 0 } },

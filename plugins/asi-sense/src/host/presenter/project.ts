@@ -135,7 +135,7 @@ export function projectEvents(
       signal: {
         id: entry.id,
         kind: entry.kind,
-        at: evidenceAt ?? (entry.mono === undefined ? fromWall(entry.at) : at(entry.mono)),
+        at: entry.mono === undefined ? fromWall(entry.at) : at(entry.mono),
         source: entry.source,
         subject: hidden ? '' : entry.subject,
         data: evidenceAt === undefined ? {} : { evidenceAt },
