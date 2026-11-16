@@ -22,6 +22,12 @@ pnpm check                      # typecheck + test（根级 pnpm check 跑全部
 
 安装说明：依赖构建脚本由根 `pnpm-workspace.yaml` 的 `allowBuilds` 白名单放行（esbuild 的 postinstall 只是平台二进制校验，optional 依赖已提供二进制）；测试用本机安装的 Google Chrome channel，不下载浏览器。
 
+默认单测验证 200,000 点降采样及渲染的输出点数、极值和处理次数，不按机器相关的墙钟耗时判定。需要单独检查 50ms 性能预算时，在仓库根目录运行（夹具分配不计时）：
+
+```sh
+ASI_PERF_STRICT=1 pnpm --filter @asi/sense-ui exec vitest run --browser.headless test/unit/sparkline.test.tsx -t '200,000 点'
+```
+
 ## 使用
 
 ```tsx

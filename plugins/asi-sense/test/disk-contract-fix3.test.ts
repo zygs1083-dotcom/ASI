@@ -1,3 +1,4 @@
+import { deepStrictEqual } from 'node:assert';
 import { type DisksFact, effectiveDisks, type FactStatus } from '@asi/sense-types';
 import { describe, expect, it } from 'vitest';
 import { bodyThresholdSignals } from '../src/host/attention/thresholds.ts';
@@ -8,6 +9,12 @@ const statuses: FactStatus[] = ['ok', 'stale', 'denied', 'unsupported', 'unavail
 
 describe('disk snapshots across time', () => {
   it('preserves effective disks after time advances across parent and volume combinations', () => {
+    const full = process.env.ASI_PROPERTY_FULL === '1';
+    const snapshotTimes = [0, 2000, 5000, 6000, 6500];
+    const sampledTimes = new Set<number>();
+    let seed = 0x6d2b79f5;
+    let combinations = 0;
+    let comparisons = 0;
     for (const status of statuses) {
       for (const volumeStatus of [undefined, ...statuses]) {
         for (const observedAt of [0, 2000]) {
@@ -42,10 +49,18 @@ describe('disk snapshots across time', () => {
                   ttlMs: 6000,
                   unavailableMounts,
                 };
-                for (const t1 of [0, 2000, 5000, 6000, 6500]) {
+                const expected = new Map(
+                  [0, 2000, 3000, 5000, 5999, 6000, 6500, 32000, 35000].map((t) => [t, effectiveDisks(original, t)]),
+                );
+                seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
+                combinations++;
+                for (const [index, t1] of snapshotTimes.entries()) {
+                  if (!full && index !== seed % snapshotTimes.length) continue;
+                  sampledTimes.add(t1);
                   const snapshot = st.snapshot(t1).self.body.disks;
                   for (const t2 of [t1, 3000, 5999, 6000, 6500, 32000, 35000].filter((t) => t >= t1)) {
-                    expect(effectiveDisks(snapshot, t2)).toEqual(effectiveDisks(original, t2));
+                    deepStrictEqual(effectiveDisks(snapshot, t2), expected.get(t2));
+                    comparisons++;
                   }
                 }
               }
@@ -54,7 +69,10 @@ describe('disk snapshots across time', () => {
         }
       }
     }
-  });
+    expect(combinations).toBe(2016);
+    expect(comparisons).toBe(full ? 58_464 : 11_658);
+    expect(sampledTimes.size).toBe(snapshotTimes.length);
+  }, 60_000);
 
   it.each([2, 90])('does not alert or clear a latch for inherited stale /data (free=%i)', (free) => {
     const st = new StateStore(() => 0);

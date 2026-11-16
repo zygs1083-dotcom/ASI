@@ -1,10 +1,20 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { cleanup, render, screen } from '@testing-library/react'
 import { afterEach } from 'vitest'
 import { Sparkline, sampleHistory } from '../../src/sparkline'
 import type { SparkThreshold } from '../../src/thresholds'
 import { formatCount, formatPercent } from '../../src/format'
 import { T0 } from '../../src/mock/fixtures'
+import { buildSpark } from '../../src/geometry'
+
+vi.mock('../../src/history', async (orig) => {
+  const mod = await orig<typeof import('../../src/history')>()
+  return { ...mod, sampleHistory: vi.fn(mod.sampleHistory) }
+})
+vi.mock('../../src/geometry', async (orig) => {
+  const mod = await orig<typeof import('../../src/geometry')>()
+  return { ...mod, buildSpark: vi.fn(mod.buildSpark) }
+})
 
 afterEach(cleanup)
 
@@ -269,7 +279,11 @@ describe('sampleHistory 降采样', () => {
     const pts = big()
     const t0 = performance.now()
     const out = sampleHistory(pts, T0)
-    expect(performance.now() - t0).toBeLessThan(50)
+    const elapsed = performance.now() - t0
+    if (import.meta.env.ASI_PERF_STRICT === '1') {
+      console.log(`[sparkline-200k] sample ${elapsed.toFixed(1)}ms`)
+      expect(elapsed).toBeLessThan(50)
+    }
     expect(out.length).toBeLessThanOrEqual(240)
     expect(out[0]!.at).toBe(pts[0]!.at)
     expect(out[out.length - 1]!.at).toBe(pts[199_999]!.at)
@@ -348,14 +362,20 @@ describe('sampleHistory 降采样', () => {
     expect(out.map((p) => p.value)).toEqual([0.3, 0.4, 0.9, 0.6])
   })
 
-  it('200,000 点整图渲染 <50ms（夹具分配不计时）', () => {
+  it('200,000 点整图渲染点数受限（夹具分配不计时）', () => {
     const pts = big()
+    vi.clearAllMocks()
     const t0 = performance.now()
     const { container } = render(
       <Sparkline points={pts} now={T0} label="压力" format={formatCount} />,
     )
-    console.log(`[sparkline-200k] render ${(performance.now() - t0).toFixed(1)}ms`)
-    expect(performance.now() - t0).toBeLessThan(50)
+    const elapsed = performance.now() - t0
+    if (import.meta.env.ASI_PERF_STRICT === '1') {
+      console.log(`[sparkline-200k] render ${elapsed.toFixed(1)}ms`)
+      expect(elapsed).toBeLessThan(50)
+    }
+    expect(vi.mocked(sampleHistory)).toHaveBeenCalledTimes(1)
+    expect(vi.mocked(buildSpark)).toHaveBeenCalledTimes(1)
     const d = container.querySelector('path')!.getAttribute('d')!
     expect(d.split('L').length).toBeLessThanOrEqual(240)
   })
