@@ -1,6 +1,8 @@
 import { type Fact, factStatusAt } from '@asi/sense-types';
 import { describe, expect, it } from 'vitest';
+import { initialState } from '../src/host/state/facts.ts';
 import { StateStore } from '../src/host/state/store.ts';
+import { noteFile } from '../src/host/state/updates.ts';
 import { FakeClock, SRC, sig } from './helpers.ts';
 
 function storeAt(clock: FakeClock) {
@@ -23,6 +25,24 @@ describe('factStatusAt', () => {
 });
 
 describe('StateStore', () => {
+  it('uses monotonic receipt time for live TTL after wall-clock rollback', () => {
+    const clock = new FakeClock();
+    const store = new StateStore(clock.wallTime, 1_000, clock.time);
+    store.apply(sig({ id: 'app', kind: 'app.activated', at: 0, data: { name: 'Example' } }));
+    clock.jumpWall(-10_000);
+    clock.now += 1_000;
+    expect(store.snapshot().env.frontApp.status).toBe('stale');
+  });
+  it('bounds watched paths at 5000 and evicts the least recently used path', () => {
+    const state = initialState(0, 60_000);
+    for (let i = 0; i < 5000; i++)
+      noteFile(state, sig({ id: String(i), kind: 'file.changed', subject: `/f/${i}`, at: i }), 60_000);
+    noteFile(state, sig({ id: 'touch', kind: 'file.changed', subject: '/f/0', at: 5000 }), 60_000);
+    noteFile(state, sig({ id: 'new', kind: 'file.changed', subject: '/f/new', at: 5001 }), 60_000);
+    expect(Object.keys(state.env.watchedPaths.value ?? {})).toHaveLength(5000);
+    expect(state.env.watchedPaths.value?.['/f/0']).toBeDefined();
+    expect(state.env.watchedPaths.value?.['/f/1']).toBeUndefined();
+  });
   it('initializes every fact unknown/null with the internal source', () => {
     const clock = new FakeClock();
     const s = storeAt(clock).snapshot();

@@ -1,5 +1,6 @@
 import { performance } from 'node:perf_hooks';
 import type { Fact, FactStatus, JobSummary, SenseState, Signal } from '@asi/sense-types';
+import { FactExpiry } from './expiry.ts';
 import { FACT_PATHS, factAt, initialState, num, recomputeStatuses, str, ttlOf } from './facts.ts';
 import { FACT_STATUSES, sourceObservation } from './source-health.ts';
 import { type JobTrack, mergeJobs, noteFile } from './updates.ts';
@@ -30,6 +31,7 @@ export class StateStore {
   private readonly wallClock: () => number;
   private readonly monotonic: () => number;
   private readonly defaultTtlMs: number;
+  private readonly project: (state: SenseState, signal?: Signal) => SenseState;
   private readonly listeners = new Set<(snapshot: SenseState) => void>();
   private readonly state: SenseState;
   private readonly seenIds = new Set<string>();
@@ -49,7 +51,6 @@ export class StateStore {
    */
   private jobObservedAt = Number.NEGATIVE_INFINITY;
   private processing = false;
-
   /**
    * `monotonicClock` (never `Date.now`) drives job-tombstone retention.
    */
@@ -57,13 +58,15 @@ export class StateStore {
     wallClock: () => number = Date.now,
     defaultTtlMs = 60_000,
     monotonicClock: () => number = () => performance.now(),
+    project?: (state: SenseState, signal?: Signal) => SenseState,
   ) {
     this.wallClock = wallClock;
     this.monotonic = monotonicClock;
     this.defaultTtlMs = defaultTtlMs;
     this.state = initialState(this.wallClock(), defaultTtlMs);
+    const expiry = new FactExpiry({ mono: monotonicClock });
+    this.project = project ?? ((state, signal) => expiry.snapshot(state, signal));
   }
-
   /**
    * Feeds one signal into the fact table and notifies subscribers. The
    * signal is deep-cloned on entry, so later caller mutation cannot corrupt
@@ -82,7 +85,7 @@ export class StateStore {
       while (next !== undefined) {
         if (!this.isDuplicate(next.signal.id)) {
           this.applyOne(next.signal);
-          this.emit();
+          this.emit(next.signal);
         }
         if (next.afterApply !== undefined) {
           try {
@@ -98,20 +101,18 @@ export class StateStore {
     }
     if (errors.length > 0) throw errors[0];
   }
-
   /** Returns an isolated deep-cloned snapshot with TTL statuses computed at `now`. */
-  snapshot(now: number = this.wallClock()): SenseState {
+  snapshot(now?: number): SenseState {
     const clone = structuredClone(this.state);
-    recomputeStatuses(clone, now);
+    if (now === undefined) return this.project(clone);
+    recomputeStatuses(clone, now ?? this.wallClock());
     return clone;
   }
-
   /** Subscribes to post-apply snapshots; returns an unsubscribe function. */
   subscribe(listener: (snapshot: SenseState) => void): () => void {
     this.listeners.add(listener);
     return () => this.listeners.delete(listener);
   }
-
   private applyOne(s: Signal): void {
     this.updateSource(s);
     const d = s.data;
@@ -144,7 +145,6 @@ export class StateStore {
         break;
     }
   }
-
   private isDuplicate(id: string): boolean {
     if (this.seenIds.has(id)) return true;
     this.seenIds.add(id);
@@ -162,8 +162,8 @@ export class StateStore {
    * added mid-emit fire on the next apply only, and a throwing listener is
    * isolated so it cannot starve the rest of the set or the queue.
    */
-  private emit(): void {
-    const snap = this.snapshot();
+  private emit(signal: Signal): void {
+    const snap = this.project(structuredClone(this.state), signal);
     for (const listener of [...this.listeners]) {
       if (!this.listeners.has(listener)) continue;
       try {

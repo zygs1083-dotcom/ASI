@@ -395,3 +395,21 @@ In `m1-fix3-regressions.test.ts`:
 1. 去重范围：`send` / `followup` / `inject` 是否共享同一 `deliveryId` 去重记录，跨 session 的边界是什么？
 2. 未知提交时的保留期：DSH 可能已提交但确认丢失时，未确认的 `deliveryId` 和待重试消息应保留多久，何时重试或释放？
 3. DSH 是否支持原子提交的幂等键？仅靠本地 ID 集合无法同时消除提交前记账导致的丢失和提交后记账导致的重复；当前只能承诺 at-least-once，不能保证 exactly-once。
+
+## Host runtime review fixes → regression tests
+
+In `test/runtime/runtime.test.ts` unless otherwise noted:
+
+1. Lifecycle generation: `rejects a start stopped while settings load is pending without installing resources`; `closes a body restore that finishes after stop without starting its probe`; `does not deliver when a stopped pre-step resumes after token lookup`; `waits for an in-flight action and rejects it after the runtime stops`.
+2. Session ownership, busy routing, target budget and identity: `reassigns a pending wake to the busy selected session and charges its budget`.
+3. Failed wake retained through session disposal: `retains a failed wake across disposal until another session pre-step`.
+4. Job/tool self-cause, including ancestry and cwd: `classifies job and tool exits using the active tool pid window`.
+5. Serialized watcher refresh: `serializes overlapping rule refreshes and never reopens deleted roots`.
+6. Monotonic TTL: `notifies stale at the monotonic deadline after wall clock rollback`; `renews a repeated fact on receipt even when its wall timestamp is unchanged`; `notifies at independent disk-volume deadlines after wall-clock rollback`; `uses monotonic receipt time for live TTL after wall-clock rollback` (`test/store.test.ts`). Explicit `StateStore.snapshot(now)` remains a wall-time replay seam.
+7. Missing window title: `clears the old title when the next focused window has no readable title` (`test/runtime/helper.test.ts`).
+8. Overlapping roots: `deduplicates one event delivered by overlapping watched roots`.
+9. Bounded pending, sessions and paths: `bounds no-session context by subject and reports evictions`; `reclaims disposed session state after ten minutes of monotonic time` (`test/pipeline.test.ts`); `bounds watched paths at 5000 and evicts the least recently used path` (`test/store.test.ts`).
+10. Bounded helper writes and deadline: `coalesces title switches behind a blocked stdin write`; `does not extend the handshake deadline during repeated title switches`; `never applies an older enable after a newer disable was requested` (`test/runtime/helper.test.ts`).
+11. Alert feedback capacity and registration failure: `evicts the oldest unfeedbacked alert at capacity and records the eviction` (`test/body/tuner.test.ts`); `marks an alert non-feedbackable when registration returns false`.
+12. Helper error and recovery: `records helper output overflow, marks the source degraded and requests a snapshot`; `does not recover from a snapshot requested before output overflow` (`test/runtime/helper.test.ts`).
+13. Resource snapshot stability: `leaves no additional active timer or child process resources after stop` (`test/runtime/helper.test.ts`).

@@ -2,12 +2,21 @@ import type { ChildProcessWithoutNullStreams } from 'node:child_process';
 import type { RuntimeAttention } from '../runtime/attention.ts';
 import type { Clock, HelperSpawner } from '../runtime/ports.ts';
 import type { BodySource } from './body.ts';
-import { axStatus, clearWindow, helperEvent, type Message, object, source, strip } from './helper-events.ts';
+import {
+  axStatus,
+  clearWindow,
+  helperError,
+  helperEvent,
+  helperStatus,
+  type Message,
+  object,
+  strip,
+} from './helper-events.ts';
+import { HelperWriter } from './helper-writer.ts';
 
 const HANDSHAKE_MS = 3_000;
 const WINDOW_MS = 600_000;
 const MAX_RESTARTS = 5;
-
 export class HelperSource {
   private child?: ChildProcessWithoutNullStreams;
   private stopped = false;
@@ -22,7 +31,10 @@ export class HelperSource {
   private desired = true;
   private buffer = '';
   private readonly children = new Map<ChildProcessWithoutNullStreams, { done: Promise<void>; killAt?: number }>();
-  private writeTail = Promise.resolve();
+  private readonly writer = new HelperWriter((child) => this.fail('stdin-error', child));
+  private degraded = false;
+  private snapshotWaiting = false;
+  private recoverySnapshot = false;
   private lastFailure?: string;
 
   constructor(
@@ -81,6 +93,7 @@ export class HelperSource {
     this.retry = undefined;
     this.deadline = undefined;
     this.child = undefined;
+    this.writer.stop();
     const children = [...this.children.entries()];
     for (const [child] of children) {
       child.stdin.end();
@@ -122,7 +135,10 @@ export class HelperSource {
     this.titles = false;
     this.buffer = '';
     this.intent = undefined;
-    this.writeTail = Promise.resolve();
+    this.writer.start(child);
+    this.degraded = false;
+    this.snapshotWaiting = false;
+    this.recoverySnapshot = false;
     this.deadline = this.clock.mono() + HANDSHAKE_MS;
     const done = new Promise<void>((resolve) => child.once('close', () => resolve()));
     this.children.set(child, { done });
@@ -206,31 +222,37 @@ export class HelperSource {
         this.intent = undefined;
         this.deadline = undefined;
         this.reschedule();
-        await this.status('ok', 'ready');
-        this.write({ cmd: 'snapshot' });
+        if (!this.degraded) await this.status('ok', 'ready');
+        this.requestSnapshot();
       }
       return;
     }
-    if (raw.type === 'error' && raw.code === 'privacy-generation-exhausted')
-      throw new Error('privacy generation exhausted');
+    if (raw.type === 'error') {
+      this.degraded = true;
+      const code = await helperError(this.attention, raw);
+      if (code === 'privacy-generation-exhausted') throw new Error('privacy generation exhausted');
+      if (this.snapshotWaiting) this.recoverySnapshot = true;
+      else this.requestSnapshot();
+      return;
+    }
     if (this.paused()) return;
+    if (raw.type === 'snapshot') {
+      this.snapshotWaiting = false;
+      if (this.recoverySnapshot) {
+        this.recoverySnapshot = false;
+        this.requestSnapshot();
+        return;
+      }
+    }
+    if (this.degraded && raw.type !== 'snapshot') return;
     await helperEvent((this.titles ? raw : strip(raw)) as Message, this.attention, this.body);
+    if (this.degraded && raw.type === 'snapshot') {
+      this.degraded = false;
+      await this.status('ok', 'snapshot');
+    }
   }
   private async status(status: 'ok' | 'unavailable' | 'error', reason: string): Promise<void> {
-    await this.attention.accept({
-      id: this.attention.id(),
-      kind: 'source.status',
-      at: this.clock.wall(),
-      source,
-      subject: source.id,
-      data: {
-        status,
-        reason,
-        restarts: this.crashes.length,
-        lastFailure: this.lastFailure,
-        ...(status === 'error' ? { error: reason } : {}),
-      },
-    });
+    await helperStatus(this.attention, this.clock.wall(), status, reason, this.crashes.length, this.lastFailure);
   }
   private sendIntent(): void {
     const child = this.child;
@@ -238,26 +260,20 @@ export class HelperSource {
     const intent = { id: String(++this.sequence), enabled: this.desired };
     this.intent = intent;
     this.titles = false;
-    this.deadline = this.clock.mono() + HANDSHAKE_MS;
-    this.write({ cmd: 'titles', ...intent });
+    this.deadline ??= this.clock.mono() + HANDSHAKE_MS;
+    this.writer.write({ cmd: 'titles', ...intent });
     this.reschedule();
   }
-  private write(command: Message): void {
-    const child = this.child;
-    if (!child) return;
-    this.writeTail = this.writeTail.then(
-      () =>
-        new Promise<void>((resolve, reject) => {
-          if (this.child !== child) return resolve();
-          child.stdin.write(`${JSON.stringify(command)}\n`, (error) => (error ? reject(error) : resolve()));
-        }),
-    );
-    void this.writeTail.catch(() => this.fail('stdin-error', child));
+  private requestSnapshot(): void {
+    if (this.snapshotWaiting) return;
+    this.snapshotWaiting = true;
+    this.writer.write({ cmd: 'snapshot' });
   }
   private fail(reason: string, expected = this.child): void {
     const child = this.child;
     if (!child || child !== expected) return;
     this.child = undefined;
+    this.writer.stop();
     this.titles = false;
     clearWindow(this.attention, this.clock.wall());
     const state = this.children.get(child);
