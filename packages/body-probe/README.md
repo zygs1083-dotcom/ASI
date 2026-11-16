@@ -112,6 +112,14 @@ absolute expiry — matching the shared `DisksFact` contract in
 remains. Per-volume `status`/`observedAt`/`ttlMs` are authoritative for that
 mount; volumes that never declared metadata inherit the parent's effective
 status. `unavailableMounts` always wins over a same-named record in `value`.
+`latest()` re-aggregates the disk parent between publications using the
+remaining monotonic deadlines; TTL expires at the deadline itself. After a
+wall-clock jump, its returned disk TTLs express those deadlines against the
+current wall clock while retaining the original observation timestamps.
+For a null or empty disk value without a disk marker, use
+`factStatusAt(fact, now, 'disks')` or `effectiveDisks(fact, now)` because the
+generic `Fact` shape cannot otherwise distinguish an empty disk list from
+another kind of fact.
 
 `collectDisks` remains the standalone sequential helper: it checks its
 `AbortSignal` before every `stat`/`statfs`.

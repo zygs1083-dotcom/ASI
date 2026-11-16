@@ -1,7 +1,8 @@
 /** 身体各项指标的阈值与聚合健康度。全部纯函数，时间一律用传入的 now。 */
 
 import type { Body, Fact, MetricInsight, MetricKey } from './view-model'
-import { diskSeverity, diskUsable, unavailableMountSet } from './disk-health'
+import { effectiveDisks } from '@asi/sense-types'
+import { diskSeverity, diskUsable, diskValid } from './disk-health'
 import {
   effectiveSeverity,
   effectiveStatus,
@@ -101,18 +102,18 @@ function evalMemory(body: Body, now: number): RowResult {
 }
 
 function evalDisks(body: Body, now: number): RowResult {
-  const f = body.disks
+  const f = effectiveDisks(body.disks, now)
   const values = f.value ?? []
   // 只聚合新鲜可用卷：stale/unknown/unavailable/无效读数不告警；
   // 没有任何新鲜卷才算缺失，父级状态不再一票否决。
-  const fresh = values.filter((d) => diskUsable(f, d, now))
+  const fresh = values.filter((d) => d.status === 'ok' && diskValid(d))
   if (fresh.length === 0) return unusable()
   let severity: Severity = 'good'
   for (const d of fresh) {
     severity = maxSeverity(severity, diskSeverity(d.free / d.total))
   }
   const partial =
-    unavailableMountSet(f).size > 0 || values.some((d) => !diskUsable(f, d, now))
+    f.indeterminateMounts.length > 0 || values.some((d) => !diskValid(d))
   return { severity, hidden: false, ...(partial ? { partial: true } : {}) }
 }
 

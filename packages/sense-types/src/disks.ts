@@ -1,3 +1,4 @@
+import { ttlStatusAt } from './freshness.js';
 import type { Fact, FactStatus } from './index.js';
 
 /**
@@ -36,3 +37,45 @@ export interface DiskVolume {
 export type DisksFact = Fact<DiskVolume[]> & {
   unavailableMounts?: string[];
 };
+
+export function diskVolumeAt(
+  fact: DisksFact,
+  volume: DiskVolume,
+  now: number,
+): DiskVolume & {
+  status: FactStatus;
+  observedAt: number;
+  ttlMs: number;
+} {
+  const observedAt = volume.observedAt ?? fact.observedAt;
+  const ttlMs = volume.ttlMs ?? fact.ttlMs;
+  const status = (fact.unavailableMounts ?? []).includes(volume.mount)
+    ? 'unavailable'
+    : (volume.status ?? ttlStatusAt(fact, now));
+  return { ...volume, observedAt, ttlMs, status: ttlStatusAt({ status, observedAt, ttlMs }, now) };
+}
+
+export function effectiveDisks(fact: DisksFact, now: number): DisksFact & { indeterminateMounts: string[] } {
+  const volumes = (fact.value ?? []).map((volume) => diskVolumeAt(fact, volume, now));
+  const fresh = volumes.filter((volume) => volume.status === 'ok');
+  const indeterminateMounts = [
+    ...new Set([
+      ...volumes.filter((volume) => volume.status !== 'ok').map((volume) => volume.mount),
+      ...(fact.unavailableMounts ?? []),
+    ]),
+  ];
+  const pool = fresh.length ? fresh : volumes.filter((volume) => volume.status === 'stale');
+  const observedAt = pool.length ? Math.min(...pool.map((volume) => volume.observedAt)) : fact.observedAt;
+  const ttlMs = pool.length
+    ? Math.min(...pool.map((volume) => volume.observedAt + volume.ttlMs)) - observedAt
+    : fact.ttlMs;
+  const status =
+    fact.status === 'denied' || fact.status === 'unsupported'
+      ? fact.status
+      : fresh.length
+        ? 'ok'
+        : pool.length
+          ? 'stale'
+          : 'unknown';
+  return { ...fact, value: fact.value === null ? null : volumes, status, observedAt, ttlMs, indeterminateMounts };
+}

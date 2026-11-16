@@ -1,5 +1,5 @@
 import { attentionLine } from '../attention'
-import { ClockProvider } from '../clock'
+import { ClockProvider, SamplingProvider } from '../clock'
 import { evaluateBody, type Severity } from '../health'
 import { formatPercent } from '../format'
 import { DisksTile } from './disk-rows'
@@ -92,6 +92,7 @@ export function BodySection({
     onAdjust: onAdjustMetric,
     onOpenPermissionSettings,
   }
+  const interval = model.sampleIntervalMs
 
   return (
     <>
@@ -102,16 +103,18 @@ export function BodySection({
         partial={evalResult.partial}
       />
       <ClockProvider value={now}>
-        <div className={css.tiles}>
-        <CpuTile model={model} rows={rows} ctx={ctx} />
-        <MemoryTile model={model} rows={rows} ctx={ctx} />
-        <TokenTile model={model} rows={rows} ctx={ctx} />
-        <DisksTile model={model} rows={rows} ctx={ctx} />
-        <NetworkTile model={model} rows={rows} ctx={ctx} />
-        <ThermalTile model={model} rows={rows} ctx={ctx} />
-        {!rows.battery.hidden && <BatteryTile model={model} rows={rows} ctx={ctx} />}
-        <ProcessTile model={model} rows={rows} ctx={ctx} />
-        </div>
+        <SamplingProvider value={interval && Number.isFinite(interval) && interval > 0 ? interval : 2000}>
+          <div className={css.tiles}>
+            <CpuTile model={model} rows={rows} ctx={ctx} />
+            <MemoryTile model={model} rows={rows} ctx={ctx} />
+            <TokenTile model={model} rows={rows} ctx={ctx} />
+            <DisksTile model={model} rows={rows} ctx={ctx} />
+            <NetworkTile model={model} rows={rows} ctx={ctx} />
+            <ThermalTile model={model} rows={rows} ctx={ctx} />
+            {!rows.battery.hidden && <BatteryTile model={model} rows={rows} ctx={ctx} />}
+            <ProcessTile model={model} rows={rows} ctx={ctx} />
+          </div>
+        </SamplingProvider>
       </ClockProvider>
     </>
   )

@@ -10,6 +10,7 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run --browser.headless",
     "e2e": "playwright test",
+    "e2e:update": "playwright test --update-snapshots=all",
     "check": "pnpm typecheck && pnpm test"
   },
   "dependencies": {

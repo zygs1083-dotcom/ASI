@@ -5,9 +5,13 @@
  */
 
 import type { Body } from './body.js';
+import { effectiveDisks } from './disks.js';
+import { ttlStatusAt } from './freshness.js';
 
 export type { Body } from './body.js';
 export type { DisksFact, DiskVolume } from './disks.js';
+export { diskVolumeAt, effectiveDisks } from './disks.js';
+export { ttlStatusAt } from './freshness.js';
 
 /** Identifies a signal/fact producer: which source, via which API, on which host. */
 export interface SourceRef {
@@ -30,12 +34,17 @@ export interface Fact<T> {
 
 /**
  * Computes the effective status of a fact at `now`.
- * Only `ok` can become `stale` (when `now >= observedAt + ttlMs`); every
- * non-`ok` status is preserved as stored.
+ * Non-disk `ok` facts become stale at `now >= observedAt + ttlMs`.
+ * Disk facts aggregate volume statuses; pass `disks` for unmarked null/empty values.
  */
-export function factStatusAt(fact: Fact<unknown>, now: number): FactStatus {
-  if (fact.status !== 'ok') return fact.status;
-  return now >= fact.observedAt + fact.ttlMs ? 'stale' : 'ok';
+export function factStatusAt(fact: Fact<unknown>, now: number, kind?: 'disks'): FactStatus {
+  if (
+    kind === 'disks' ||
+    'unavailableMounts' in fact ||
+    (Array.isArray(fact.value) && fact.value.some((v: unknown) => typeof v === 'object' && v !== null && 'mount' in v))
+  )
+    return effectiveDisks(fact as import('./disks.js').DisksFact, now).status;
+  return ttlStatusAt(fact, now);
 }
 
 /** Who caused a signal, for self-cause suppression. */

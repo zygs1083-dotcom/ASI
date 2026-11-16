@@ -9,7 +9,6 @@ const axeSource = fs.readFileSync(
   'utf8',
 )
 
-const SHOT_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../screenshots')
 const RESULTS_DIR = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
   '../../test-results',
@@ -111,10 +110,7 @@ test.describe('场景 × 宽度 × 主题截图与无障碍', () => {
           await expectNoOverflow(page)
           await axeCheck(page)
 
-          fs.mkdirSync(SHOT_DIR, { recursive: true })
-          const file = path.join(SHOT_DIR, `${scenario}-${width}-${theme}.png`)
-          await page.screenshot({ path: file, fullPage: true, animations: 'disabled' })
-          expect(fs.statSync(file).size).toBeLessThan(300 * 1024)
+          await expect(page).toHaveScreenshot(`${scenario}-${width}-${theme}.png`, { fullPage: true })
           expect(errors).toEqual([])
         })
       }
@@ -139,9 +135,7 @@ test.describe('展开明细截图（Token / 磁盘，420px × 明暗）', () => 
         await expect(t.getByText('现在', { exact: true }).first()).toBeVisible()
         await expect(t.getByText(/来源/).first()).toBeVisible()
         await axeCheck(page)
-        const file = path.join(SHOT_DIR, `detail-${c.name}-420-${theme}.png`)
-        await page.screenshot({ path: file, fullPage: true, animations: 'disabled' })
-        expect(fs.statSync(file).size).toBeLessThan(300 * 1024)
+        await expect(page).toHaveScreenshot(`detail-${c.name}-420-${theme}.png`, { fullPage: true })
         expect(errors).toEqual([])
       })
     }
@@ -464,9 +458,7 @@ test.describe('容量未确认（fallback 上下文窗口）', () => {
       await expect(t.locator('svg[data-unconfirmed]')).toHaveCount(1)
       await expect(t.locator('[class*="sevTag"][data-sev="warn"]')).toHaveCount(0)
       await axeCheck(page)
-      const file = path.join(SHOT_DIR, `token-fallback-420-${theme}.png`)
-      await page.screenshot({ path: file, fullPage: true, animations: 'disabled' })
-      expect(fs.statSync(file).size).toBeLessThan(300 * 1024)
+      await expect(page).toHaveScreenshot(`token-fallback-420-${theme}.png`, { fullPage: true })
       expect(errors).toEqual([])
     })
   }
@@ -512,10 +504,7 @@ test.describe('磁盘卷级状态（disk-partial，420px × 明暗）', () => {
       ).toHaveCount(0)
       await expectNoOverflow(page)
       await axeCheck(page)
-      fs.mkdirSync(SHOT_DIR, { recursive: true })
-      const file = path.join(SHOT_DIR, `disk-partial-420-${theme}.png`)
-      await page.screenshot({ path: file, fullPage: true, animations: 'disabled' })
-      expect(fs.statSync(file).size).toBeLessThan(300 * 1024)
+      await expect(page).toHaveScreenshot(`disk-partial-420-${theme}.png`, { fullPage: true })
       expect(errors).toEqual([])
     })
   }

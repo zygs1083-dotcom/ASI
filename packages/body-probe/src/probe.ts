@@ -6,74 +6,16 @@ import * as fact from './fact.js';
 import { MemorySampler } from './memory.js';
 import { NetworkSampler } from './network.js';
 import { ExternalProcessSampler, SelfProcessSampler } from './process.js';
+import {
+  DEFAULT_CADENCE, HISTORY_WINDOW_MS,
+  type CacheMap, type ProbeClock, type ProbeCollectors, type RingPoint,
+  type SamplePoint, type SamplingCadence, type StartOptions,
+} from './probe-options.js';
 import type {
-  BatteryValue, Body, CpuValue, DisksFact, DisksValue, Fact, MemoryValue,
-  NetworkValue, ProcessValue, ThermalValue, TokenSource, TokensValue,
+  Body, DisksFact, Fact, ThermalValue, TokenSource,
 } from './types.js';
-
-export interface ProbeCollectors {
-  cpu(ttlMs: number, signal?: AbortSignal): Promise<Fact<CpuValue>>;
-  memory(ttlMs: number, signal?: AbortSignal): Promise<Fact<MemoryValue>>;
-  disks(cwd: string, ttlMs: number, signal?: AbortSignal): Promise<DisksFact>;
-  battery(ttlMs: number, signal?: AbortSignal): Promise<Fact<BatteryValue | null>>;
-  network(ttlMs: number, signal?: AbortSignal): Promise<Fact<NetworkValue>>;
-  process(pid: number, ttlMs: number, signal?: AbortSignal): Promise<Fact<ProcessValue>>;
-}
-
-export interface SamplingCadence {
-  memoryMs: number;   // MemorySampler invocation period
-  networkMs: number;  // NetworkSampler invocation period
-  pressureMs: number; // sysctl kern.memorystatus_vm_pressure_level period
-  swapMs: number;     // sysctl vm.swapusage period
-  routeMs: number;    // /sbin/route probe period per address family
-  batteryMs: number;  // BatterySampler (pmset) invocation period
-  disksMs: number;    // DiskSampler invocation period
-}
-
-export interface StartOptions {
-  intervalMs?: number;
-  cadence?: Partial<SamplingCadence>;
-  cwd?: string;
-  pid?: number;
-  tokenSource?: TokenSource;
-}
-
-export interface SamplePoint {
-  at: number;   // wall clock of the sample
-  body: Body;
-}
-
-// Optional clocks: `now` is monotonic (cadence, staleness, history window);
-// `wall` stamps observations. Both default to the process clocks.
-// `platform` overrides the OS gate of the built-in macOS samplers.
-export interface ProbeClock {
-  now?: () => number;
-  wall?: () => number;
-  platform?: NodeJS.Platform;
-}
-
-const HISTORY_WINDOW_MS = 300_000;
-const TOKEN_READ_TIMEOUT_MS = 1000;
-const DEFAULT_CADENCE: SamplingCadence = {
-  memoryMs: 5000,
-  networkMs: 5000,
-  pressureMs: 5000,
-  swapMs: 30_000,
-  routeMs: 30_000,
-  batteryMs: 30_000,
-  disksMs: 10_000,
-};
-
-interface CacheMap {
-  memory: MemoryValue;
-  network: NetworkValue;
-  disks: DisksValue;
-  battery: BatteryValue | null;
-}
-
-interface RingPoint extends SamplePoint {
-  mono: number; // private monotonic stamp; stripped from outward results
-}
+import { readTokens } from './token-reader.js';
+export type { ProbeClock, ProbeCollectors, SamplePoint, SamplingCadence, StartOptions } from './probe-options.js';
 
 export class BodyProbe {
   private readonly collectors: ProbeCollectors;
@@ -209,7 +151,9 @@ export class BodyProbe {
     // deadlines keyed by object identity survive; clone only afterwards.
     const body = {} as Record<keyof Body, Fact<unknown>>;
     for (const key of Object.keys(point.body) as (keyof Body)[]) {
-      body[key] = structuredClone(fact.stale(point.body[key], now, wall));
+      body[key] = structuredClone(key === 'disks'
+        ? fact.disksAt(point.body.disks, now, wall)
+        : fact.stale(point.body[key], now, wall));
     }
     return body as Body;
   }
@@ -253,7 +197,7 @@ export class BodyProbe {
         this.cached('battery', () => c.battery(this.cadence.batteryMs * 3, signal), signal),
         this.cached('network', () => c.network(this.cadence.networkMs * 3, signal), signal),
         this.call(() => c.process(this.pid, ttl, signal), 'harnessProcess', ttl, signal),
-        this.readTokens(ttl, signal),
+        readTokens(this.tokenSource, ttl, signal),
       ]),
       aborted,
     ]);
@@ -331,32 +275,6 @@ export class BodyProbe {
       return await fn();
     } catch {
       return fact.fail('unavailable', fact.source(id, 'collector'), ttlMs);
-    }
-  }
-
-  private async readTokens(ttl: number, signal: AbortSignal): Promise<Fact<TokensValue>> {
-    const source = this.tokenSource;
-    const fallback = () => fact.fail<TokensValue>('unavailable', fact.source('tokens', 'TokenSource.read'), ttl);
-    if (!source || signal.aborted) return fallback(); // abort may predate this call
-    let timer: NodeJS.Timeout | undefined;
-    let rejectAbort!: (e: unknown) => void;
-    const aborted = new Promise<never>((_res, rej) => { rejectAbort = rej; });
-    const onAbort = () => rejectAbort(signal.reason);
-    signal.addEventListener('abort', onAbort, { once: true });
-    try {
-      const f = await Promise.race([
-        Promise.resolve().then(() => source.read()),
-        aborted,
-        new Promise<never>((_res, rej) => {
-          timer = setTimeout(() => rej(new Error('tokenSource read timeout')), TOKEN_READ_TIMEOUT_MS);
-        }),
-      ]);
-      return f as Fact<TokensValue>;
-    } catch {
-      return fallback();
-    } finally {
-      signal.removeEventListener('abort', onAbort);
-      if (timer) clearTimeout(timer);
     }
   }
 

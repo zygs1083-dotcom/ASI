@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { ttlStatusAt } from '@asi/sense-types';
 import * as fact from './fact.js';
 import type { DisksFact, DisksValue, DiskVolume, SourceRef } from './types.js';
 
@@ -107,7 +108,7 @@ export class DiskSampler {
         const deadline = v.at + v.ttl;
         const rec: DiskVolume = {
           mount: q, total: v.value.total, free: v.value.free,
-          status: v.failed || now > deadline ? 'stale' : 'ok',
+          status: v.failed ? 'stale' : ttlStatusAt({ status: 'ok', observedAt: v.at, ttlMs: v.ttl }, now),
           observedAt: v.observedAt, ttlMs: v.ttl,
         };
         fact.trackDeadline(rec, deadline);

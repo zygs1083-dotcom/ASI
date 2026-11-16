@@ -1,6 +1,7 @@
 /** 磁盘卷级健康度：每卷独立求值，父事实只做缺省兜底。 */
 
 import type { DiskVolume, DisksFact, Fact } from './view-model'
+import { diskVolumeAt } from '@asi/sense-types'
 import { effectiveStatus, type Severity } from './fact-status'
 
 /** 有效磁盘读数：total 为正有限、free 有限（free 可为 0）。 */
@@ -21,18 +22,7 @@ export function unavailableMountSet(f: DisksFact): Set<string> {
  * 得含自身 TTL 的最终状态。
  */
 export function diskFact(parent: DisksFact, disk: DiskVolume, now: number): Fact<DiskVolume> {
-  const observedAt = disk.observedAt ?? parent.observedAt
-  const ttlMs = disk.ttlMs ?? parent.ttlMs
-  if (unavailableMountSet(parent).has(disk.mount)) {
-    return {
-      value: null,
-      status: 'unavailable',
-      source: parent.source,
-      observedAt,
-      ttlMs,
-    }
-  }
-  const status = disk.status ?? effectiveStatus(parent, now)
+  const { status, observedAt, ttlMs } = diskVolumeAt(parent, disk, now)
   return {
     value:
       status === 'ok' || status === 'stale'

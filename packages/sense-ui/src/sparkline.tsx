@@ -1,4 +1,6 @@
 import { memo, useRef } from 'react'
+import { useClock, useSamplingInterval } from './clock'
+import { formatAge } from './format'
 import type { Severity } from './health'
 import { buildSpark, sameThresholds } from './geometry'
 import type { SparkThreshold } from './thresholds'
@@ -10,6 +12,7 @@ export { HISTORY_WINDOW_MS, sampleHistory } from './history'
 interface SparklineProps {
   points: MetricPoint[]
   now: number
+  sampleIntervalMs?: number
   label: string
   format: (v: number) => string
   /** 严重度决定容器 data-sev 与末点标记（颜色只作用于越界段，不整体染色）。 */
@@ -61,6 +64,7 @@ function sameGeoKey(a: GeoKey | undefined, b: GeoKey): boolean {
 function SparklineBase({
   points,
   now,
+  sampleIntervalMs,
   label,
   format,
   severity,
@@ -79,20 +83,26 @@ function SparklineBase({
     severity,
     expanded,
   }
-  const cache = useRef<{ key: GeoKey; built: ReturnType<typeof buildSpark> }>()
+  const clock = useClock(now)
+  const interval = useSamplingInterval()
+  const cache = useRef<{ key: GeoKey; anchor: number; built: ReturnType<typeof buildSpark> }>()
   if (!sameGeoKey(cache.current?.key, key)) {
+    const anchor = cache.current?.key.points === points ? cache.current.anchor : now
     cache.current = {
       key,
-      built: buildSpark(points, now, { baseline, thresholds, severity, expanded }),
+      anchor,
+      built: buildSpark(points, anchor, { baseline, thresholds, severity, expanded }),
     }
   }
   const built = cache.current!.built
 
   if (!built) return <span className={css.sparkEmpty}>暂无趋势数据</span>
   const { g } = built
+  const paused = clock - g.last.at > 2 * (sampleIntervalMs ?? interval)
+  const age = formatAge(clock, g.last.at)
 
   const summary =
-    `${label}最近 5 分钟趋势：当前 ${format(g.last.value)}，最高 ${format(g.dataMax)}，` +
+    `${label}${paused ? `历史 5 分钟趋势，采集暂停 · 最后 ${age}：上次` : '最近 5 分钟趋势：当前'} ${format(g.last.value)}，最高 ${format(g.dataMax)}，` +
     `最低 ${format(g.dataMin)}` +
     (g.band ? `，基线区间 ${format(g.band.low)} 至 ${format(g.band.high)}` : '') +
     (thresholds.length
@@ -100,7 +110,7 @@ function SparklineBase({
           .map((t) => `${t.label ?? '底线'} ${format(t.value)}`)
           .join(' / ')}`
       : '') +
-    (severity ? `，当前状态${SEV_WORD[severity]}` : '')
+    (severity && !paused ? `，当前状态${SEV_WORD[severity]}` : '')
 
   return (
     <div className={expanded ? css.chartBoxExpanded : css.chartBox}>
@@ -157,7 +167,7 @@ function SparklineBase({
               vectorEffect="non-scaling-stroke"
             />
           )}
-          {(severity === 'warn' || severity === 'critical') && (
+          {!paused && (severity === 'warn' || severity === 'critical') && (
             <circle
               data-current={severity}
               className={
@@ -191,9 +201,10 @@ function SparklineBase({
       {expanded && (
         <div className={css.axisX}>
           <span>-5 分钟</span>
-          <span>现在</span>
+          <span>{paused ? `采集暂停 · 最后 ${age}` : '现在'}</span>
         </div>
       )}
+      {paused && !expanded && <div className={css.axisX} aria-hidden="true">采集暂停 · 最后 {age}</div>}
       <span className={css.srOnly}>{summary}</span>
     </div>
   )
@@ -205,6 +216,8 @@ export const Sparkline = memo(
   SparklineBase,
   (a, b) =>
     a.points === b.points &&
+    a.now === b.now &&
+    a.sampleIntervalMs === b.sampleIntervalMs &&
     a.label === b.label &&
     a.format === b.format &&
     a.severity === b.severity &&

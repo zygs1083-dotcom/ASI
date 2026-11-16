@@ -9,6 +9,7 @@ import { buildSpark } from '../../src/geometry'
 import { tick } from '../../src/preview/tick'
 import { Sparkline } from '../../src/sparkline'
 import { formatPercent } from '../../src/format'
+import { ClockProvider } from '../../src/clock'
 
 vi.mock('../../src/history', async (orig) => {
   const mod = await orig<typeof import('../../src/history')>()
@@ -150,5 +151,47 @@ describe('图表渲染预算', () => {
     )
     expect(histCalls()).toBe(0)
     expect(geoCalls()).toBe(0)
+  })
+
+  it('长时间停采与事实更新而历史不变时，图表标明历史锚点且不重做预处理', () => {
+    const m = makeScenario('healthy')
+    const points = m.history.cpu
+    const chart = (now: number, severity: 'good' | 'warn') => (
+      <ClockProvider value={now}>
+        <Sparkline expanded points={points} now={m.now} label="CPU" format={formatPercent}
+          severity={severity} sampleIntervalMs={5_000} />
+      </ClockProvider>
+    )
+    const view = render(chart(m.now, 'good'))
+    expect(view.container.textContent).toContain('现在')
+    vi.mocked(sampleHistory).mockClear()
+    vi.mocked(buildSpark).mockClear()
+    view.rerender(chart(m.now + 10_001, 'good'))
+    expect(view.container.textContent).toContain('采集暂停 · 最后 10 秒前')
+    expect(view.container.textContent).not.toContain('现在')
+    expect(view.container.textContent).not.toContain('当前')
+    expect(geoCalls()).toBe(0)
+    expect(histCalls()).toBe(0)
+    view.rerender(chart(m.now + 600_000, 'warn'))
+    expect(view.container.textContent).toContain('采集暂停 · 最后 600 秒前')
+    expect(view.container.textContent).not.toContain('当前')
+    expect(view.container.textContent).not.toContain('最近 5 分钟')
+  })
+
+  it('事实更新但历史引用未变时不把旧图当成当前', () => {
+    const m = makeScenario('healthy')
+    const props = makeProps({ ...m, sampleIntervalMs: 5000 })
+    const view = render(<SensePanel {...props} />)
+    const now = m.now + 600_000
+    const body = m.state.self.body
+    const cpu = { ...body.cpu, observedAt: now, ttlMs: 60_000, value: { ...body.cpu.value!, usage: 0.9 } }
+    view.rerender(<SensePanel {...props} model={{
+      ...props.model, now, state: { ...m.state, self: { ...m.state.self, body: { ...body, cpu } } },
+    }} />)
+    const tile = view.container.querySelector('details[data-tile="cpu"] summary')!
+    expect(tile.textContent).toContain('采集暂停 · 最后 600 秒前')
+    expect(tile.textContent).not.toContain('最近 5 分钟趋势')
+    expect(tile.textContent).not.toContain('当前')
+    expect(tile.querySelector('circle[data-current]')).toBeNull()
   })
 })

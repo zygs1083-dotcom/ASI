@@ -274,6 +274,7 @@ export interface SensePanelModel {
   paused: boolean
   sendTitles: boolean
   now: number
+  sampleIntervalMs?: number
   history: BodyHistory
   insights?: Partial<Record<MetricKey, MetricInsight>>
   learning?: LearningState

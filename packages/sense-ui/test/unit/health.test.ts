@@ -21,8 +21,8 @@ describe('effectiveStatus', () => {
   it('ok 但超过 TTL 记为 stale', () => {
     expect(effectiveStatus(fact(1, { ageMs: 6_000, ttlMs: 5_000 }), T0)).toBe('stale')
   })
-  it('恰好等于 TTL 不算过期', () => {
-    expect(effectiveStatus(fact(1, { ageMs: 5_000, ttlMs: 5_000 }), T0)).toBe('ok')
+  it('恰好等于 TTL 即过期', () => {
+    expect(effectiveStatus(fact(1, { ageMs: 5_000, ttlMs: 5_000 }), T0)).toBe('stale')
   })
   it('denied 不受 TTL 影响', () => {
     const f = fact<number>(null, { status: 'denied', ageMs: 99_000, ttlMs: 1_000 })
@@ -381,9 +381,9 @@ describe('卷级磁盘状态（status/observedAt/ttlMs + unavailableMounts）', 
     // 显式卷级元数据权威：父级 stale/denied/过期不再一票否决带元数据的 ok 卷；
     // 缺省（旧版）卷才继承父级有效状态作上界（时间戳同样回退父级）
     for (const p of [
-      mkDisks([], undefined, { status: 'stale' }),
-      mkDisks([], undefined, { status: 'denied' }),
-      mkDisks([], undefined, { ageMs: 90_000, ttlMs: 5_000 }),
+      mkDisks([vol], undefined, { status: 'stale' }),
+      mkDisks([vol], undefined, { status: 'denied' }),
+      mkDisks([vol], undefined, { ageMs: 90_000, ttlMs: 5_000 }),
     ]) {
       const df = diskFact(p, { ...vol, status: 'ok', observedAt: T0 - 1_000, ttlMs: 60_000 }, T0)
       expect(effectiveStatus(df, T0)).toBe('ok')

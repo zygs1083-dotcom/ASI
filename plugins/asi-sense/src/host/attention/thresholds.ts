@@ -9,7 +9,7 @@ import type {
   Signal,
   ThresholdSeverity,
 } from '@asi/sense-types';
-import { factStatusAt } from '@asi/sense-types';
+import { effectiveDisks, factStatusAt } from '@asi/sense-types';
 
 export type {
   BodyEvaluation,
@@ -76,7 +76,7 @@ function read(body: Body, at: number, key: string, t: BodyThresholds): Reading |
   const metric = i < 0 ? key : key.slice(0, i);
   const arg = i < 0 ? '' : key.slice(i + 1);
   if (metric === 'disk') {
-    const d = okFact(body.disks, at)?.find((x) => x.mount === arg);
+    const d = effectiveDisks(body.disks, at).value?.find((x) => x.mount === arg && x.status === 'ok');
     if (!d || !finite(d.total) || !finite(d.free) || d.total <= 0 || d.free < 0 || d.free > d.total) {
       return undefined;
     }
@@ -118,8 +118,8 @@ function read(body: Body, at: number, key: string, t: BodyThresholds): Reading |
 
 function metricKeys(body: Body, at: number): string[] {
   const keys = ['context', 'battery', 'memory', 'thermal'];
-  const disks = okFact(body.disks, at);
-  for (const d of disks ?? []) keys.push(`disk:${d.mount}`);
+  const disks = effectiveDisks(body.disks, at);
+  for (const d of disks.value ?? []) if (d.status === 'ok') keys.push(`disk:${d.mount}`);
   return keys;
 }
 

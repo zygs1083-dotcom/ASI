@@ -294,8 +294,9 @@ describe('NetworkSampler', () => {
     expect(f.observedAt).toBe(1000); // the cached route observation is oldest
     expect(f.ttlMs).toBe(10_000);    // expires at 11000: the rate sample's own 6s ttl
     expect(routeCalls).toBe(1);
-    // tracked monotonic deadline: rate part mono 4000 + 6s — boundary is not stale
-    expect(fact.stale(f, 10_000, 5_000).status).toBe('ok');
+    // tracked monotonic deadline: rate part mono 4000 + 6s — boundary is stale
+    expect(fact.stale(f, 9_999, 5_000).status).toBe('ok');
+    expect(fact.stale(f, 10_000, 5_000).status).toBe('stale');
     expect(fact.stale(f, 10_001, 5_000).status).toBe('stale');
     // a rolled-back wall cannot revive it either
     expect(fact.stale(f, 10_001, 1).status).toBe('stale');
