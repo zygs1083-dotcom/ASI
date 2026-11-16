@@ -40,6 +40,7 @@ import type { SensePanelModel, SensePanelProps } from '@asi/sense-ui'
 
 ## model 要点（单位与动态）
 
+- **时间线契约**：model 中所有时间戳由宿主保证单调一致，包括 `now`、事实、历史、事件和 ETA 时间戳。
 - **事实状态与时钟**：宿主的 `status` 为权威，UI 不用墙钟的 `observedAt + ttlMs` 重判过期；`observedAt` 仅用于年龄显示。事实和磁盘卷可选 `staleInMs`（相对该帧 `model.now` 的剩余单调毫秒）：UI 从收到帧起按本地单调时间倒计时，到期仅将 `ok` 投影为 `stale`；新帧替换倒计时，非正数立即到期，缺省或非有限数不倒计时，其他状态不改变。宿主须每帧提供对应的剩余量；组件卸载时清理定时器，不修改输入 model。
 - **单位**：CPU `usage`/`perCore` 与 DSH 进程 `cpu` 为 0..1 比例，CPU `load1`/`load5`/`load15` 为系统平均负载（不限制在 0..1）；内存/磁盘 `used`/`total`/`free`、进程 `rss` 为**原始字节**；token `contextUsed`/`contextWindow`/sessionUsage 为**token 计数**；电池 `percent` 为 **0..100**；温控为档位枚举。
 - **历史**：`history.*` 为 `{at, value}` 点列，UI 按下述锚点渲染 5 分钟窗（稀疏点按真实时间摆位）。单位：cpu 为 0..1 比例、memory 与 disks 为**占用比例**（磁盘是 used/total）、networkRx/Tx 为 B/s、tokens 为 token 计数、thermal 为序数 0..3、battery 为百分值、processCpu 0..1、processRss 字节。降采样为软上限：≤240 普通采样点（119 桶 min/max + 首末），另加全部阈值穿越/相等迁移的边界点对（含未激活参考线）——同桶多次越界 excursion 不会被聚合抹掉，越界点数不设上限。同时间戳按输入顺序稳定，末点为最晚时间戳的最后一个点。

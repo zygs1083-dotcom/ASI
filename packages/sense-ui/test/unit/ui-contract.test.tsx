@@ -30,6 +30,15 @@ function renderPanel(model: SensePanelModel) {
   return { props, view: render(<SensePanel {...props} />) }
 }
 
+function openDiskTile() {
+  const tile = document.querySelector('details[data-tile="disks"]')! as HTMLDetailsElement
+  act(() => {
+    tile.open = true
+    fireEvent(tile, new Event('toggle'))
+  })
+  return tile
+}
+
 describe('事实状态契约', () => {
   it('无剩余期限时信任 status，不根据墙钟或 TTL 判过期', () => {
     const f = fact(1, { ageMs: 6_000, ttlMs: 5_000 })
@@ -55,6 +64,77 @@ describe('事实状态契约', () => {
     }
     expect(document.querySelector('[class*="monitor"][data-sev]')?.getAttribute('data-sev')).toBe('critical')
     expect(screen.getByText('Terminal')).toBeTruthy()
+  })
+
+  it.each(['explicit', 'inherited'] as const)('展开的 %s 磁盘卷与卡片在墙钟前跳和回拨时保持新鲜', (mode) => {
+    const model = makeScenario('healthy')
+    model.state.self.body.disks = disksFixture([
+      { mount: '/', total: 100, free: 2, ...(mode === 'explicit' ? { status: 'ok' as const } : {}) },
+    ], { ageMs: 1_000, ttlMs: 5_000 })
+    const { props, view } = renderPanel(model)
+    const tile = openDiskTile()
+    const detail = () => tile.querySelector('[class*="detailFact"]')!
+    const metric = () => tile.querySelector('[data-metric="disk:/"]')!
+    for (const now of [T0, T0 + 61_000, T0 - 61_000, T0]) {
+      view.rerender(<SensePanel {...props} model={{ ...model, now }} />)
+      expect(tile.getAttribute('data-sev')).toBe('critical')
+      expect(tile.querySelector('summary [data-status="stale"]')).toBeNull()
+      expect(detail().textContent).not.toContain('已过期')
+      expect(metric().textContent).toContain('当前')
+      expect(metric().getAttribute('data-status')).toBeNull()
+    }
+  })
+
+  it('展开明细中显式卷独立于过期父级，缺省卷继承父级', () => {
+    const model = makeScenario('healthy')
+    model.state.self.body.disks = disksFixture([
+      { mount: '/', total: 100, free: 80 },
+      { mount: '/data', total: 100, free: 2, status: 'ok' },
+    ], { status: 'stale', ageMs: 1_000, ttlMs: 5_000 })
+    const { props, view } = renderPanel(model)
+    const tile = openDiskTile()
+    for (const now of [T0, T0 + 61_000, T0 - 61_000]) {
+      view.rerender(<SensePanel {...props} model={{ ...model, now }} />)
+      expect(tile.getAttribute('data-sev')).toBe('critical')
+      expect(tile.querySelector('[class*="detailFact"]')!.textContent).not.toContain('已过期')
+      expect(tile.querySelector('[data-metric="disk:/"]')!.textContent).toContain('上次读数')
+      expect(tile.querySelector('[data-metric="disk:/data"]')!.textContent).toContain('当前')
+    }
+  })
+
+  it.each(['explicit', 'inherited'] as const)('展开的 %s 卷在单调期限到达后与卡片一起过期', (mode) => {
+    vi.useFakeTimers()
+    const model = makeScenario('healthy')
+    model.state.self.body.disks = disksFixture([
+      { mount: '/', total: 100, free: 2, ...(mode === 'explicit' ? { status: 'ok' as const, staleInMs: 5_000 } : {}) },
+    ])
+    if (mode === 'inherited') model.state.self.body.disks.staleInMs = 5_000
+    renderPanel(model)
+    const tile = openDiskTile()
+    expect(tile.querySelector('[class*="detailFact"]')!.textContent).not.toContain('已过期')
+    act(() => vi.advanceTimersByTime(5_000))
+    expect(tile.querySelector('summary [data-status="stale"]')).toBeTruthy()
+    expect(tile.querySelector('[class*="detailFact"]')!.textContent).toContain('已过期')
+    expect(tile.querySelector('[data-metric="disk:/"]')!.textContent).toContain('上次读数')
+  })
+
+  it('父级单调期限到期不影响显式新鲜卷', () => {
+    vi.useFakeTimers()
+    const model = makeScenario('healthy')
+    model.state.self.body.disks = {
+      ...disksFixture([
+        { mount: '/', total: 100, free: 80 },
+        { mount: '/data', total: 100, free: 2, status: 'ok' },
+      ]),
+      staleInMs: 5_000,
+    }
+    renderPanel(model)
+    const tile = openDiskTile()
+    act(() => vi.advanceTimersByTime(5_000))
+    expect(tile.getAttribute('data-sev')).toBe('critical')
+    expect(tile.querySelector('[class*="detailFact"]')!.textContent).not.toContain('已过期')
+    expect(tile.querySelector('[data-metric="disk:/"]')!.textContent).toContain('上次读数')
+    expect(tile.querySelector('[data-metric="disk:/data"]')!.textContent).toContain('当前')
   })
 
   it('剩余单调期限到期后自动更新普通事实、磁盘卷和总览', () => {
@@ -171,5 +251,53 @@ describe('调整日志撤销契约', () => {
     }
     expect(props.onRevertTuning).toHaveBeenCalledWith('legacy')
     expect(props.onRevertTuning).toHaveBeenCalledWith('undoable')
+  })
+
+  it.each([
+    { undoable: false, text: '不可撤销' },
+    { reverted: true, text: '已撤销' },
+  ])('新帧移除聚焦的撤销按钮时，焦点移到对应记录：$text', ({ text, ...update }) => {
+    const model = makeScenario('rapid-change')
+    const entry = model.tuning!.log[0]!
+    model.tuning = { ...model.tuning!, log: [{ ...entry, reverted: false, undoable: true }] }
+    const { props, view } = renderPanel(model)
+    fireEvent.click(screen.getByText('规则', { selector: 'summary' }))
+    fireEvent.click(screen.getByRole('button', { name: '调整日志' }))
+    const button = screen.getByRole('button', { name: '撤销' })
+    const row = button.closest('li')!
+    button.focus()
+    expect(document.activeElement).toBe(button)
+    view.rerender(<SensePanel {...props} model={{
+      ...model, tuning: { ...model.tuning!, log: [{ ...model.tuning!.log[0]!, ...update }] },
+    }} />)
+    expect(row.textContent).toContain(text)
+    expect(document.activeElement).toBe(row)
+    expect(row.getAttribute('tabindex')).toBe('-1')
+  })
+
+  it('其他记录失效或新帧保留按钮时，不抢焦点', () => {
+    const model = makeScenario('rapid-change')
+    const entry = model.tuning!.log[0]!
+    model.tuning = { ...model.tuning!, log: [
+      { ...entry, id: 'first', reason: '第一条', reverted: false },
+      { ...entry, id: 'second', reason: '第二条', reverted: false },
+    ] }
+    const { props, view } = renderPanel(model)
+    fireEvent.click(screen.getByText('规则', { selector: 'summary' }))
+    fireEvent.click(screen.getByRole('button', { name: '调整日志' }))
+    const second = within(screen.getByText(/第二条/).closest('li')!).getByRole('button', { name: '撤销' })
+    second.focus()
+    view.rerender(<SensePanel {...props} model={{
+      ...model, now: T0 + 1_000, tuning: { ...model.tuning!, log: [
+        { ...model.tuning!.log[0]!, undoable: false }, model.tuning!.log[1]!,
+      ] },
+    }} />)
+    expect(document.activeElement).toBe(second)
+    const pause = screen.getByRole('checkbox', { name: /暂停感知/ })
+    pause.focus()
+    view.rerender(<SensePanel {...props} model={{
+      ...model, tuning: { ...model.tuning!, log: model.tuning!.log.map((e) => ({ ...e, undoable: false })) },
+    }} />)
+    expect(document.activeElement).toBe(pause)
   })
 })
