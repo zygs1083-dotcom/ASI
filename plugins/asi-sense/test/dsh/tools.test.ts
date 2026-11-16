@@ -12,7 +12,7 @@ import ToolsService from '@deepseek-ai/dsh-tools';
 import { describe, expect, it, onTestFinished, vi } from 'vitest';
 import { FileBurstDetector } from '../../src/host/body/burst.ts';
 import { createDelivery } from '../../src/host/dsh/deliver.ts';
-import { modelTune } from '../../src/host/dsh/tool-output.ts';
+import { modelOutput, modelRules, modelTune } from '../../src/host/dsh/tool-output.ts';
 import { registerSenseTools } from '../../src/host/dsh/tools.ts';
 import { createSenseRuntime } from '../../src/host/runtime/index.ts';
 import type { AgentEvent, JobEvent, SensePorts, ToolEvent } from '../../src/host/runtime/ports.ts';
@@ -245,13 +245,15 @@ describe('model-facing tools', () => {
     const hash = (id: string) => `files:r-${createHash('sha256').update(id).digest('hex').slice(0, 8)}`;
     const sources = {
       'files:ascii.rule-1': { status: 'unavailable' as const, lastSignalAt: 990 },
+      'files:/Users/example/private/work/project': { status: 'unavailable' as const, lastSignalAt: 989 },
       'files:规则一': { status: 'denied' as const, lastSignalAt: 991 },
       'files:规则二': { status: 'unknown' as const, lastSignalAt: 992 },
       'helper.frontApp': { status: 'ok' as const, lastSignalAt: 993 },
       'helper.focusedWindow': { status: 'unknown' as const, lastSignalAt: 994 },
     };
     const expected = {
-      'files:ascii.rule-1': { status: 'unavailable' },
+      [hash('ascii.rule-1')]: { status: 'unavailable' },
+      [hash('/Users/example/private/work/project')]: { status: 'unavailable' },
       [hash('规则一')]: { status: 'denied' },
       [hash('规则二')]: { status: 'unknown' },
       'helper.frontApp': { status: 'ok' },
@@ -273,17 +275,82 @@ describe('model-facing tools', () => {
       });
       expect((await h.call('env_detail', {})).value).toMatchObject({ sources: expected });
       expect(JSON.stringify(state)).not.toContain('规则');
+      expect(JSON.stringify(state)).not.toContain('/Users/example/private/work/project');
     }
     expect(h.state.observation.sources).toHaveProperty('files:规则一');
     const collision = {
-      [hash('规则一')]: { status: 'ok' as const, lastSignalAt: 995 },
-      'files:规则一': { status: 'denied' as const, lastSignalAt: 991 },
+      'files:synthetic-rule-43351': { status: 'ok' as const, lastSignalAt: 995 },
+      'files:synthetic-rule-66854': { status: 'denied' as const, lastSignalAt: 991 },
     };
+    expect(hash('synthetic-rule-43351')).toBe(hash('synthetic-rule-66854'));
     for (const entries of [Object.entries(collision), Object.entries(collision).reverse()]) {
       h.state.observation.sources = Object.fromEntries(entries);
       const state = (await h.call('env_state', { section: 'observation' })).value;
-      expect(state).toMatchObject({ sources: { [hash('规则一')]: { status: 'unknown', ambiguous: true } } });
+      expect(state).toMatchObject({
+        sources: { [hash('synthetic-rule-43351')]: { status: 'unknown', ambiguous: true } },
+      });
       expect(JSON.stringify(state)).not.toContain(' (2)');
+    }
+  });
+
+  it('projects raw file source identifiers instead of exempting paths', () => {
+    const value = modelOutput({
+      observation: { sources: { 'files:/Users/example/private/work/project': { status: 'ok' } } },
+      source: { id: 'files:/Users/example/private/work/project', api: 'watch' },
+    });
+    expect(JSON.stringify(value)).not.toContain('/Users/example/private/work/project');
+  });
+
+  it('projects a file rule whose ID is the full watched path', async () => {
+    const h = await fixture();
+    const id = '/Users/example/private/work/project';
+    const hash = `files:r-${createHash('sha256').update(id).digest('hex').slice(0, 8)}`;
+    h.state.observation.sources[`files:${id}`] = { status: 'unavailable', lastSignalAt: 990 };
+    h.state.env.watchedPaths.source = { id: `files:${id}`, api: 'watch', host: 'local' };
+    const projectedRule = modelRules([
+      { id, match: { kind: 'file.changed', subject: id }, level: 'context', createdBy: 'user', approved: true },
+    ]);
+    expect(projectedRule).toMatchObject([{ id: '[redacted]', match: { subject: 'project' } }]);
+    const state = (await h.call('env_state', {})).value;
+    expect(state).toMatchObject({
+      observation: { sources: { [hash]: { status: 'unavailable' } } },
+      env: { watchedPaths: { source: { id: hash } } },
+    });
+    expect(JSON.stringify(state)).not.toContain(id);
+  });
+
+  it('hides a watched path used as a rule ID in the live file-source tool flow', async () => {
+    const h = await fixture(true);
+    const id = '/Users/example/private/work/project';
+    const hash = `files:r-${createHash('sha256').update(id).digest('hex').slice(0, 8)}`;
+    const rules = await h.call('env_watch', {
+      action: 'add',
+      rule: { id, match: { kind: 'file.changed', subject: id }, level: 'context' },
+    });
+    expect(rules.isError).toBe(false);
+    expect(rules.value).toContainEqual(
+      expect.objectContaining({ id: '[redacted]', match: { kind: 'file.changed', subject: 'project' } }),
+    );
+    expect(h.live.state().observation.sources[`files:${id}`]?.status).toBe('ok');
+    const state = await h.call('env_state', { section: 'observation' });
+    expect(state.value).toMatchObject({ sources: { [hash]: { status: 'ok' } } });
+    expect(JSON.stringify(state.value)).not.toContain(id);
+  });
+
+  it('keeps projected file hashes stable even when the host name occurs in the hash', async () => {
+    const hostname = vi.spyOn(os, 'hostname').mockReturnValue('a44b3008');
+    try {
+      const h = await fixture();
+      const id = '/Users/example/private/work/project';
+      const hash = `files:r-${createHash('sha256').update(id).digest('hex').slice(0, 8)}`;
+      h.state.observation.sources[`files:${id}`] = { status: 'unavailable', lastSignalAt: 990 };
+      h.state.env.watchedPaths.source = { id: `files:${id}`, api: 'watch', host: 'local' };
+      expect((await h.call('env_state', {})).value).toMatchObject({
+        observation: { sources: { [hash]: { status: 'unavailable' } } },
+        env: { watchedPaths: { source: { id: hash } } },
+      });
+    } finally {
+      hostname.mockRestore();
     }
   });
 

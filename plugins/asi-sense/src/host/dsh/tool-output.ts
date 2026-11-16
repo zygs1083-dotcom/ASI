@@ -62,22 +62,20 @@ export function modelTitle(value: string, hostname = os.hostname()): string {
 
 function minimize(value: JsonValue, hostname: string, path = '', appNamePaths: readonly string[] = []): JsonValue {
   if (typeof value === 'string') {
-    if (
-      appNamePaths.includes(path) ||
-      ((path.endsWith('.source.id') || path.endsWith('.source.api')) && isSourceIdentifier(value))
-    )
-      return value;
-    return path === 'title' || path.endsWith('.title') ? modelTitle(value, hostname) : modelText(value, hostname);
+    const source = path.endsWith('.source.id') || path.endsWith('.source.api');
+    if (appNamePaths.includes(path) || (source && isSourceIdentifier(value))) return value;
+    return path === 'title' || path.endsWith('.title')
+      ? modelTitle(value, hostname)
+      : modelText(value, source && isHashedFileSource(value) ? '' : hostname);
   }
   if (Array.isArray(value)) return value.map((item) => minimize(item, hostname, path, appNamePaths));
   if (value === null || typeof value !== 'object') return value;
   const entries: Record<string, JsonValue> = Object.create(null);
   for (const [key, child] of Object.entries(value)) {
     if (key === 'host' || key === 'endpoint' || key === 'command' || key === 'userSession') continue;
-    const fixedKey =
-      (path === 'sources' || path === 'observation.sources' || path.endsWith('permissions.value')) &&
-      isSourceIdentifier(key);
-    const base = fixedKey ? key : modelText(key, hostname);
+    const sourceKey = path === 'sources' || path === 'observation.sources';
+    const fixedKey = (sourceKey || path.endsWith('permissions.value')) && isSourceIdentifier(key);
+    const base = fixedKey ? key : modelText(key, sourceKey && isHashedFileSource(key) ? '' : hostname);
     let name = base;
     for (let n = 2; Object.hasOwn(entries, name); n++) name = `${base} (${n})`;
     entries[name] = minimize(child, hostname, path ? `${path}.${key}` : key, appNamePaths);
@@ -105,13 +103,17 @@ function identifier(value: string): string {
 }
 
 function isSourceIdentifier(value: string): boolean {
-  return FIXED_IDENTIFIERS.has(value) || /^files:\p{ASCII}*$/u.test(value);
+  return FIXED_IDENTIFIERS.has(value);
+}
+
+function isHashedFileSource(value: string): boolean {
+  return /^files:r-[a-f0-9]{8}$/.test(value);
 }
 
 function sourceIdentifier(value: string): string {
   if (value.startsWith('files:')) {
     const id = value.slice('files:'.length);
-    return /^\p{ASCII}*$/u.test(id) ? value : `files:r-${createHash('sha256').update(id).digest('hex').slice(0, 8)}`;
+    return `files:r-${createHash('sha256').update(id).digest('hex').slice(0, 8)}`;
   }
   return FIXED_IDENTIFIERS.has(value) ? value : identifier(value);
 }
