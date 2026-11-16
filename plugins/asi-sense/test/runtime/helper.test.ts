@@ -282,6 +282,31 @@ describe('helper protocol integration', () => {
     await h.settle();
     expect(h.runtime.state().observation.sources['helper.ax']?.status).toBe('denied');
     expect(h.runtime.state().env.focusedWindow).toMatchObject({ status: 'denied', value: null });
+    expect(h.runtime.state().self.permissions).toMatchObject({
+      status: 'ok',
+      value: { 辅助功能: 'denied', '其他权限（DSH 未提供）': 'unknown' },
+    });
+    await h.runtime.stop();
+  });
+
+  it('uses explicit helper permission snapshots and does not confuse unsupported apps with permission denial', async () => {
+    const h = setup();
+    await h.runtime.start();
+    await h.settle();
+    const child = h.children[0];
+    if (!child) throw new Error('missing helper');
+    child.send({ type: 'hello', session: 'fixture-session', permissions: { accessibility: 'granted' } });
+    child.send({ type: 'ax.unsupported' });
+    await h.settle();
+    expect(h.runtime.state().self.permissions.value?.辅助功能).toBe('granted');
+    child.send({
+      type: 'snapshot',
+      permissions: { accessibility: 'denied' },
+      focusedWindow: { status: 'unsupported' },
+      thermal: 'nominal',
+    });
+    await h.settle();
+    expect(h.runtime.state().self.permissions.value?.辅助功能).toBe('denied');
     await h.runtime.stop();
   });
 

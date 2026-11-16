@@ -104,6 +104,9 @@ interface SenseState {
 
 - 宿主插件和侧栏共用这份类型，放在 `packages/sense-types`。
 - `where` 四项分开，是为了以后 harness 与被观察机器不是同一台（远程 DSH、SSH 工具执行）时不出错；首版四项通常相同，但必须分别填写来源。
+- 当前事实按事件及定时刷新。DSH 固定版 `packages/core/agent/src/runtime-types.ts:61,77-79,133-140,194-205,400` 提供会话模型、收件箱、idle/running 和流事件；Gateway 的待响应转发事件可识别等待用户（`packages/api/gateway/src/types.ts:148-165`）。其他 running 阶段不能推测；工具执行事件和注册表见 `packages/core/tools/src/events.ts:18-49`、`packages/core/tools/src/index.ts:245-255,299-307`，条件工具只在步骤 admission 时确定，面板仅列当前可确认可执行项。
+- 任务列表按各会话及无主任务合并去重（`packages/jobs/jobs/src/index.ts:116-121`、`packages/jobs/jobs/src/view.ts:72-87`）。模型 endpoint 只采用配置服务的脱敏显式 `baseURL`（`packages/llm/llm/src/index.ts:566-572`、`packages/llm/llm/src/types.ts:247-280`、`packages/settings/settings/src/index.ts:298-330`），只展示 origin，不把缺省或可能因模型不同而改变的地址当成实际地址。
+- 本机 Harness 信息来自 Node，观察会话标为本机控制台会话而非用户名。DSH 的 subprocess 服务将执行目标身份留给 provider（`packages/subprocess/subprocess/src/index.ts:100-106`），所以不能仅凭会话工作目录推断实际工具执行宿主；缺少可核实宿主时该事实显示原因。辅助功能权限来自 helper，其余权限未知；关注路径来自已启用的 `file.changed` 规则，空集表示未配置。
 
 ### 2.2b 身体状况（vitals）
 

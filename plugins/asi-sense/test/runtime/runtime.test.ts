@@ -17,11 +17,12 @@ import type {
 } from '../../src/host/runtime/ports.ts';
 import { Settings } from '../../src/host/runtime/settings.ts';
 import { pauseAction } from '../../src/host/runtime/tools.ts';
+import type { NowReadings } from '../../src/host/sources/dsh.ts';
 import { f, mkBody } from '../body/helpers.ts';
 
 afterEach(() => vi.useRealTimers());
 
-function harness(savedSettings?: string, options: SenseOptions = {}) {
+function harness(savedSettings?: string, options: SenseOptions = {}, nowReadings?: () => NowReadings) {
   vi.useFakeTimers();
   vi.setSystemTime(1_700_000_000_000);
   let mono = 0;
@@ -38,6 +39,7 @@ function harness(savedSettings?: string, options: SenseOptions = {}) {
   const ports: SensePorts = {
     clock: { wall: () => Date.now(), mono: () => mono },
     dsh: {
+      ...(nowReadings ? { nowReadings } : {}),
       onAgentEvent: (cb) => {
         agent = cb;
         return () => {};
@@ -135,6 +137,52 @@ function harness(savedSettings?: string, options: SenseOptions = {}) {
 }
 
 describe('host runtime', () => {
+  it('publishes local location and configured paths while explaining absent session facts', async () => {
+    const h = harness(undefined, { rules: [] });
+    await h.runtime.start();
+    const state = h.runtime.state();
+    expect(state.env.where.harness).toMatchObject({
+      status: 'ok',
+      value: { host: expect.any(String), os: expect.any(String), pid: expect.any(Number) },
+    });
+    expect(state.env.where.observed).toMatchObject({
+      status: 'ok',
+      value: { host: expect.any(String), userSession: expect.any(String) },
+    });
+    expect(state.env.where.model).toMatchObject({ status: 'unknown', reason: '没有活动会话' });
+    expect(state.env.where.toolExec).toMatchObject({ status: 'unknown', reason: expect.any(String) });
+    expect(state.self.activity).toMatchObject({ status: 'unknown', reason: '没有活动会话' });
+    expect(state.self.pending).toMatchObject({ status: 'unknown', reason: '没有活动会话' });
+    expect(state.self.tools).toMatchObject({ status: 'unknown', reason: '没有活动会话' });
+    expect(state.self.permissions).toMatchObject({ status: 'unknown', reason: expect.any(String) });
+    expect(state.env.activeJobs).toMatchObject({ status: 'unknown', reason: expect.any(String) });
+    expect(state.env.watchedPaths).toMatchObject({ status: 'ok', value: {} });
+    await h.runtime.stop();
+  });
+
+  it('tracks configured file patterns before changes and removes them when disabled', async () => {
+    const h = harness();
+    await h.runtime.start();
+    expect(h.runtime.state().env.watchedPaths.value?.['/workspace/**']).toEqual({ lastChange: 0, changes: 0 });
+    await h.file({ path: '/workspace/fixture.txt', change: 'add' });
+    expect(h.runtime.state().env.watchedPaths.value?.['/workspace/**']?.changes).toBe(1);
+    await h.runtime.actions.toggleRule('files-wake', false);
+    expect(h.runtime.state().env.watchedPaths.value).toEqual({});
+    await h.runtime.stop();
+  });
+
+  it('refreshes DSH snapshots on the timer and disposes the timer on stop', async () => {
+    let activity = 'idle';
+    const h = harness(undefined, {}, () => ({ 'self.activity': { value: activity } }));
+    await h.runtime.start();
+    expect(h.runtime.state().self.activity.value).toBe('idle');
+    activity = 'thinking';
+    await h.advance(5_000);
+    expect(h.runtime.state().self.activity.value).toBe('thinking');
+    await h.runtime.stop();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
   it('keeps token read failures distinct from missing usage until session presence changes', async () => {
     const h = harness();
     h.ports.dsh.tokenSnapshot = async () => {

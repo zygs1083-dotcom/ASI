@@ -271,6 +271,7 @@ export class StateStore {
       // freshness, jobs and tombstones are all preserved.
       if (status === 'unknown') {
         fact.status = 'unknown';
+        if (typeof signal.data.reason === 'string') fact.reason = signal.data.reason;
         return;
       }
     }

@@ -151,6 +151,22 @@ export class FileSource {
           await this.status(rule, status);
         }
       }
+      if (!this.stopped && !this.attention.isStopped()) {
+        const previous = this.attention.state().env.watchedPaths.value ?? {};
+        const paths = this.rules()
+          .filter((rule) => rule.match.kind === 'file.changed' && rule.match.subject !== undefined)
+          .map((rule) => rule.match.subject as string);
+        const value = Object.fromEntries(paths.map((path) => [path, previous[path] ?? { lastChange: 0, changes: 0 }]));
+        this.attention.store.apply({
+          id: this.attention.id(),
+          kind: 'fact.updated',
+          at: this.clock.wall(),
+          source,
+          subject: 'env.watchedPaths',
+          data: { path: 'env.watchedPaths', value, ttlMs: 86_400_000 },
+        });
+        this.attention.changed();
+      }
     });
     this.tail = run.catch(() => {});
     return run;
@@ -184,14 +200,13 @@ export class FileSource {
       at: event.at ?? this.clock.wall(),
       source,
       subject: path.normalize(event.path),
-      data: { path: path.normalize(event.path), change: event.change },
+      data: { path: path.normalize(event.path), change: event.change, ttlMs: 86_400_000 },
     });
-    if (
-      !this.rules().some(
-        (r) => r.match.kind === signal.kind && r.match.subject && matchesRule(r, signal, this.clock.wall()),
-      )
-    )
-      return;
+    const matching = this.rules().filter(
+      (r) => r.match.kind === signal.kind && r.match.subject && matchesRule(r, signal, this.clock.wall()),
+    );
+    if (!matching.length) return;
+    signal.data.watchedPaths = matching.map((rule) => rule.match.subject);
     await this.attention.accept(signal);
     if (this.active) await this.burst(signal);
   }

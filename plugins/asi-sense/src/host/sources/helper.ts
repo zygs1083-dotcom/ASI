@@ -3,7 +3,16 @@ import type { RuntimeAttention } from '../runtime/attention.ts';
 import type { Clock, HelperSpawner } from '../runtime/ports.ts';
 import type { BodySource } from './body.ts';
 import { SnapshotBackoff } from './helper-backoff.ts';
-import { axStatus, clearWindow, helperError, helperStatus, type Message, object, strip } from './helper-events.ts';
+import {
+  axStatus,
+  clearWindow,
+  helperError,
+  helperStatus,
+  type Message,
+  object,
+  permissionStatus,
+  strip,
+} from './helper-events.ts';
 import { applyHelperEvent, HelperRecovery, markHelperFacts } from './helper-recovery.ts';
 import { HelperWriter } from './helper-writer.ts';
 
@@ -195,7 +204,10 @@ export class HelperSource {
       if (first) this.sendIntent();
       this.recovery.delta(raw);
       const permissions = object(raw.permissions);
-      await axStatus(this.attention, permissions?.accessibility === 'granted' ? 'ok' : 'denied', raw.at as number);
+      if (permissions?.accessibility === 'granted' || permissions?.accessibility === 'denied') {
+        permissionStatus(this.attention, permissions.accessibility, raw.at as number);
+        await axStatus(this.attention, permissions.accessibility === 'granted' ? 'ok' : 'denied', raw.at as number);
+      }
       return;
     }
     if (!this.session) throw new Error('missing hello');
@@ -239,6 +251,13 @@ export class HelperSource {
         this.recovery.obsolete = false;
         this.requestSnapshot();
         return;
+      }
+      const permissions = object(raw.permissions);
+      if (
+        (!recovery.degraded || !recovery.dirty.has('permissions')) &&
+        (permissions?.accessibility === 'granted' || permissions?.accessibility === 'denied')
+      ) {
+        permissionStatus(this.attention, permissions.accessibility, raw.at as number);
       }
     }
     const safe = (this.titles ? raw : strip(raw)) as Message;

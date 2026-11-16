@@ -1,4 +1,5 @@
-import { isUsable } from '../health'
+import { useClock } from '../clock'
+import { effectiveStatus, isUsable } from '../health'
 import { formatAge } from '../format'
 import { FactMeta, FactValue, STATUS_TEXT } from '../fact'
 import { AppIcon } from '../icons'
@@ -7,6 +8,12 @@ import css from './now.module.css'
 
 type Panel = Pick<SensePanelProps, 'model' | 'onOpenPermissionSettings'>
 type Where = SensePanelProps['model']['state']['env']['where']
+
+function FocusAppMeta({ fact, now }: { fact: Fact<unknown>; now: number }) {
+  const current = useClock(now)
+  const shown = effectiveStatus(fact, current) === 'stale' || formatAge(current, fact.observedAt) !== '刚刚'
+  return shown ? <> · <FactMeta fact={fact} now={now} /></> : null
+}
 
 const ACTIVITY_TEXT = {
   idle: '空闲',
@@ -102,7 +109,7 @@ function Location({ where, now, onOpenPermissionSettings }: { where: Where; now:
       key: 'toolExec', label: '工具执行处', fact: where.toolExec as Fact<unknown>, host: where.toolExec.value?.host ?? null,
       detail: () => {
         const v = where.toolExec.value
-        return v ? `${v.host} · 工作目录 ${v.cwd}` : null
+        return v ? `${v.host} · 工作目录 ${v.cwd.split(/[\\/]/).filter(Boolean).at(-1) ?? v.cwd}` : null
       },
     },
   ]
@@ -202,7 +209,7 @@ export function NowSection({ model, onOpenPermissionSettings }: Panel) {
               {(v) => <strong className={css.focusName}>{v.name}</strong>}
             </FactValue>
             {isUsable(env.frontApp, now) && (
-              <FactMeta fact={env.frontApp} now={now} />
+              <FocusAppMeta fact={env.frontApp} now={now} />
             )}
           </span>
           <span className={css.focusTitle}>
@@ -230,6 +237,9 @@ export function NowSection({ model, onOpenPermissionSettings }: Panel) {
         {self.pending.value &&
           `收件箱 ${self.pending.value.inbox} · 任务 ${self.pending.value.jobs}`}
       </Item>
+      <Item label="可用工具" fact={self.tools} now={now} onOpenPermissionSettings={ops}>
+        {self.tools.value && (self.tools.value.length ? self.tools.value.join('、') : '无')}
+      </Item>
       <Item label="活动任务" fact={env.activeJobs} now={now} onOpenPermissionSettings={ops}>
         {env.activeJobs.value &&
           (env.activeJobs.value.length === 0
@@ -239,9 +249,11 @@ export function NowSection({ model, onOpenPermissionSettings }: Panel) {
       <Item label="关注路径" fact={env.watchedPaths} now={now} onOpenPermissionSettings={ops}>
         {env.watchedPaths.value &&
           (Object.keys(env.watchedPaths.value).length === 0
-            ? '无'
+            ? '未配置关注路径'
             : Object.entries(env.watchedPaths.value)
+                .filter(([p]) => model.rules.some((rule) => rule.enabled && rule.match.kind === 'file.changed' && rule.match.subject === p))
                 .map(([p, w]) => {
+                  if (w.changes === 0) return `${p} · 尚无变更`
                   const age = formatAge(now, w.lastChange)
                   return `${p} · ${w.changes} 次${age === '刚刚' ? '' : ` · ${age}`}`
                 })

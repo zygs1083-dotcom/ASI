@@ -10,8 +10,10 @@ import type {} from '@deepseek-ai/dsh-token-meter';
 import type { ToolExecution } from '@deepseek-ai/dsh-tools';
 import { z } from 'zod';
 import type { DshPort, ToolEvent } from '../runtime/ports.ts';
+import type { NowReadings } from '../sources/dsh.ts';
 import { createDelivery } from './deliver.ts';
 import { type ActiveTool, JobEventCorrelator, mapToolEvent } from './events.ts';
+import { nowReadings } from './now-facts.ts';
 import { tokenSnapshot } from './tokens.ts';
 
 const open = promisify(execFile);
@@ -21,9 +23,14 @@ export function createDshPort(
   sendTitles: () => boolean,
 ): DshPort & {
   onDeliveryCommitted(cb: (sessionId: string, id: string) => void): () => void;
+  nowReadings(): NowReadings;
+  onNowChanged(cb: () => void): () => void;
 } {
   const resolve = (id: string): Agent | undefined => ctx.agents.get(SessionId(id));
   const activeTools = new Map<string, ActiveTool>();
+  const executingTools = new Map<string, string>();
+  const thinking = new Set<string>();
+  let selected: string | undefined;
   const committed = new Set<(sessionId: string, id: string) => void>();
   const jobs = new JobEventCorrelator(activeTools);
   const accepted = ctx.sessionProjections.register({
@@ -64,6 +71,52 @@ export function createDshPort(
     );
   };
   return {
+    nowReadings: () => nowReadings(ctx, selected, executingTools, thinking),
+    onNowChanged(cb) {
+      let active = true;
+      const notify = () => {
+        if (active) cb();
+      };
+      const offStatus = ctx.on('agent/status', notify);
+      const offInbox = ctx.on('agent/inbox/inserted', notify);
+      const offClaim = ctx.on('agent/inbox/claimed', notify);
+      const offDiscard = ctx.on('agent/inbox/discarded', notify);
+      const offTools = ctx.on('tools/change', notify);
+      const offExecute = ctx.on('tools/execute', async (exec, next) => {
+        if (!exec.agent) return next();
+        const key = `${exec.agent.id}:${exec.callId}`;
+        executingTools.set(key, exec.agent.id);
+        notify();
+        try {
+          return await next();
+        } finally {
+          executingTools.delete(key);
+          notify();
+        }
+      });
+      const offStream = ctx.on('agent/assistant-stream', ({ agent, frame }) => {
+        if (frame.type === 'start') thinking.add(agent.id);
+        else if (frame.type === 'end') thinking.delete(agent.id);
+        else return;
+        notify();
+      });
+      const offJobs = ctx.jobs.events.subscribe({ owners: 'all' }, (event) => {
+        if (event.type !== 'output') notify();
+      });
+      return () => {
+        active = false;
+        offStatus();
+        offInbox();
+        offClaim();
+        offDiscard();
+        offTools();
+        offExecute();
+        offStream();
+        offJobs();
+        thinking.clear();
+        executingTools.clear();
+      };
+    },
     onDeliveryCommitted(cb) {
       committed.add(cb);
       return () => committed.delete(cb);
@@ -71,7 +124,6 @@ export function createDshPort(
     onAgentEvent(cb) {
       const turns = new Map<string, { turn: number; user: boolean }>();
       let selection = 0;
-      let selected: string | undefined;
       const offCreated = ctx.on('agent/created', async ({ agent }) => {
         await cb({ type: 'created', sessionId: agent.id });
         return undefined;
@@ -82,6 +134,7 @@ export function createDshPort(
           selection++;
         }
         turns.delete(agent.id);
+        thinking.delete(agent.id);
         deliver.clear(agent.id);
         call(cb, { type: 'disposed', sessionId: agent.id });
       });

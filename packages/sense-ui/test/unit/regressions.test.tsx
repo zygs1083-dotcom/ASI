@@ -231,7 +231,8 @@ describe('位置与焦点卡', () => {
     expect(details.open).toBe(true)
     expect(details.textContent).toContain('http://127.0.0.1:3425/v1')
     expect(details.textContent).toContain('macOS 15.2')
-    expect(details.textContent).toContain('/demo/elsewhere')
+    expect(details.textContent).toContain('工作目录 elsewhere')
+    expect(details.textContent).not.toContain('/demo/elsewhere')
     expect(details.textContent).toContain('来源')
   })
 
@@ -291,6 +292,7 @@ describe('位置与焦点卡', () => {
     renderPanel({ ...makeScenario('healthy'), state })
     const card = document.querySelector('[class*="focusCard"]')! as HTMLElement
     expect(card.textContent).toContain('60 秒前')
+    expect(card.textContent).toContain('Finder · 60 秒前')
     expect(within(card).getAllByText(/60 秒前/).length).toBe(2)
   })
 
@@ -299,10 +301,28 @@ describe('位置与焦点卡', () => {
     state.env.watchedPaths = fact({
       '/demo/src': { changes: 3, lastChange: T0 - 1_000 },
     })
-    renderPanel({ ...makeScenario('healthy'), state })
+    const scenario = makeScenario('healthy')
+    renderPanel({
+      ...scenario,
+      state,
+      rules: scenario.rules.map((rule) =>
+        rule.match.kind === 'file.changed' ? { ...rule, match: { ...rule.match, subject: '/demo/src' } } : rule,
+      ),
+    })
     const row = screen.getByText('关注路径').parentElement!
     expect(row.textContent).toContain('3 次')
     expect(row.textContent).not.toContain('刚刚')
+  })
+
+  it('显示未知原因与未配置关注路径', async () => {
+    const state = makeState()
+    state.self.activity = emptyFact('unknown', '没有活动会话')
+    state.env.watchedPaths = fact({})
+    renderPanel({ ...makeScenario('healthy'), state, rules: [] })
+    const activity = screen.getByText('自身状态').parentElement!
+    const paths = screen.getByText('关注路径').parentElement!
+    expect(activity.textContent).toContain('未知（没有活动会话）')
+    expect(paths.textContent).toContain('未配置关注路径')
   })
 })
 

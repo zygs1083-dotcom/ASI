@@ -22,6 +22,7 @@ export class HelperRecovery {
       this.dirty.add('thermal');
     const appActivated = event.type === 'app.activated' && validApp(event);
     if (appActivated) this.dirty.add('frontApp');
+    if (event.type === 'hello') this.dirty.add('permissions');
     if (
       appActivated ||
       event.type === 'hello' ||
