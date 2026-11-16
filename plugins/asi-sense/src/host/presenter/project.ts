@@ -70,7 +70,7 @@ function eventDetail(entry: EventEntry): SenseEvent['detail'] {
   ) {
     return {
       kind: 'body.rate',
-      metric: d.metric,
+      metric: suggestionMetric(d.metric) ?? d.metric,
       windowMs: d.windowMs,
       delta: d.delta,
       unit: detailUnit(d.metric),
@@ -86,7 +86,7 @@ function eventDetail(entry: EventEntry): SenseEvent['detail'] {
   ) {
     return {
       kind: 'body.anomaly',
-      metric: d.metric,
+      metric: suggestionMetric(d.metric) ?? d.metric,
       current: d.value,
       baseline: d.baseline,
       deviation: d.deviation,

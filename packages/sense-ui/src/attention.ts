@@ -2,6 +2,7 @@
 
 import {
   BODY_ROW_PRIORITY,
+  eventMetricKey,
   rowMetricKeys,
   rowUsable,
   type BodyEvaluation,
@@ -83,8 +84,9 @@ export function attentionLine(
     const at = typeof evidenceAt === 'number' && Number.isFinite(evidenceAt) && evidenceAt <= e.signal.at
       ? evidenceAt
       : e.signal.at
-    const cur = latestRateAt.get(d.metric)
-    if (cur == null || at > cur) latestRateAt.set(d.metric, at)
+    const metric = eventMetricKey(d.metric)
+    const cur = latestRateAt.get(metric)
+    if (cur == null || at > cur) latestRateAt.set(metric, at)
   }
 
   let best: { key: MetricKey; asOf: number; ms: number } | null = null

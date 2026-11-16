@@ -328,6 +328,34 @@ describe('attentionLine 宿主 currentEta 投影', () => {
   })
 
   it.each([
+    ['tokens', 'context', 'Token'],
+    ['processRss', 'rss', 'DSH 进程'],
+    ['networkRx', 'network.rx', '网络'],
+    ['networkTx', 'network.tx', '网络'],
+  ] as const)('非磁盘指标 %s 同时匹配自然键 %s 和投影键', (key, natural, label) => {
+    const m = makeScenario('healthy')
+    m.insights = {
+      [key]: ins({
+        triggered: ['rate'],
+        severity: 'warn',
+        currentEta: { asOf: T0 - 10_000, sampleIntervalMs: 5_000, timeToThresholdMs: 180_000, ratePerMinute: 1 },
+      }),
+    }
+    for (const metric of [natural, key]) {
+      const event = rateEvent({ metric }, T0 - 1_000)
+      event.signal.data.evidenceAt = T0 - 10_000
+      m.events = [event]
+      expect(line(m)).toBe(`${label} 3 分钟后触及阈值`)
+      event.signal.data.evidenceAt = T0 - 5_000
+      expect(line(m)).toBeNull()
+      delete event.signal.data.evidenceAt
+      expect(line(m)).toBeNull()
+    }
+    m.events = [rateEvent({ metric: 'unrelated' }, T0 - 1_000)]
+    expect(line(m)).toBe(`${label} 3 分钟后触及阈值`)
+  })
+
+  it.each([
     { desc: '无 ETA（timeToFloorMs 缺省）', over: { timeToFloorMs: undefined } },
     { desc: '零速率', over: { delta: 0 } },
     { desc: '反向速率', over: { delta: 2.1 * 1024 ** 3 } },
