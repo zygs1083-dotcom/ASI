@@ -593,4 +593,10 @@ Agent-added rules are activated before saving, and failed activations are not sa
 2. Deferred outcomes: `records confirmed inject outcomes, not cancelled or transferred attempts`; `confirms a transferred wake against an already-spent target budget`; `confirms every retained no-session context event in a merged inject`; `retains an outstanding outcome across more than 1024 unconfirmed transfers`.
 
 All tests are in `test/dsh/port.test.ts`. A staged inject remains unreported as delivered until the adapter confirms its session message; confirmation publishes the actual outcome for all retained merged events.
-Outstanding attempt identities remain while their events are visible; repeated abandoned transfers can accumulate until those events leave the 200-entry log.
+
+## DSH bundle fix-4 regressions
+
+1. Visible merged IDs: `confirms visible merged events after more than 1024 offline groups`; `releases merged mappings as events leave the visible log`.
+2. Transferred batch aliases: `clears every alias after 1025 transfers when attempt %i confirms and ignores late confirmations`; `preserves unconfirmed parts of a split batch when one transferred part commits`; `keeps independent batches staged when another batch confirms`.
+
+These tests are in `test/runtime/pending-context.test.ts`. Merged mappings retain only visible events; confirming an attempt removes its events from all historical attempts while leaving other unconfirmed batch parts intact. Confirmed events remain deduplicated until they leave the 200-entry log.

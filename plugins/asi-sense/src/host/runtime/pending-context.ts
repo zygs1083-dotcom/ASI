@@ -19,6 +19,7 @@ export class PendingContext {
   private readonly subjects = new Map<string, Map<string, Entry>>();
   private evicted = 0;
   private readonly confirmed = new Set<string>();
+  private readonly reported = new Set<string>();
   private readonly staged = new Map<string, InjectOutcome[]>();
   private readonly merged = new Map<string, string[]>();
   private readonly recentIds: { id: string; ids: string[] }[] = [];
@@ -32,15 +33,23 @@ export class PendingContext {
   stage(intent: DeliveryIntent): void {
     if (!intent.deliveryId) return;
     const key = JSON.stringify([intent.sessionId, intent.deliveryId]);
-    const outcomes = injectOutcomes(intent);
-    for (const outcome of outcomes) {
-      outcome.ids = outcome.ids.flatMap((id) => this.merged.get(id) ?? [id]).filter(this.retained);
-    }
+    const outcomes = injectOutcomes(intent).map((outcome) => ({
+      ...outcome,
+      ids: outcome.ids
+        .flatMap((id) => this.merged.get(id) ?? [id])
+        .filter((id) => this.retained(id) && !this.reported.has(id)),
+    }));
     if (outcomes.some((outcome) => outcome.ids.length)) this.staged.set(key, outcomes);
   }
 
   forget(id: string | undefined): void {
     if (id === undefined) return;
+    this.reported.delete(id);
+    for (const [key, ids] of this.merged) {
+      const index = ids.indexOf(id);
+      if (index >= 0) ids.splice(index, 1);
+      if (!ids.length) this.merged.delete(key);
+    }
     for (const [key, outcomes] of this.staged) {
       for (const outcome of outcomes) outcome.ids = outcome.ids.filter((item) => item !== id);
       if (outcomes.every((outcome) => !outcome.ids.length)) this.staged.delete(key);
@@ -50,10 +59,17 @@ export class PendingContext {
   committed(session: string, id: string, pipeline: AttentionPipeline): void {
     const key = id.replace(/^asi-sense:/, '');
     const stagedKey = JSON.stringify([session, key]);
-    for (const outcome of this.staged.get(stagedKey) ?? []) {
-      for (const signalId of outcome.ids) this.mark(signalId, outcome.reason, outcome.level);
-    }
+    const outcomes = this.staged.get(stagedKey) ?? [];
     this.staged.delete(stagedKey);
+    for (const outcome of outcomes) {
+      for (const signalId of outcome.ids) {
+        if (this.reported.has(signalId)) continue;
+        this.forget(signalId);
+        if (!this.retained(signalId)) continue;
+        this.reported.add(signalId);
+        this.mark(signalId, outcome.reason, outcome.level);
+      }
+    }
     this.confirmed.add(key);
     if (this.confirmed.size > 1024) this.confirmed.delete(this.confirmed.values().next().value as string);
     this.confirm(key);
@@ -152,8 +168,8 @@ export class PendingContext {
     const [kind, entry] = kinds.entries().next().value as [string, Entry];
     const batch = entry.batches.shift();
     if (!batch && entry.signal && entry.ids) {
-      this.merged.set(entry.signal.id, entry.ids);
-      if (this.merged.size > 1024) this.merged.delete(this.merged.keys().next().value as string);
+      const ids = entry.ids.filter(this.retained);
+      if (ids.length) this.merged.set(entry.signal.id, ids);
     }
     if (batch) {
       const bucket = batch.buckets[0];
