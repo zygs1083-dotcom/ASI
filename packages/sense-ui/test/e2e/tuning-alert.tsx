@@ -6,11 +6,16 @@ import '../../src/preview/preview.css'
 const model = makeScenario('rebaseline-suggested')
 let resolve: () => void
 let reject: () => void
+let rejectSuggestion: () => void
 window.addEventListener('test-resolve', () => resolve())
 window.addEventListener('test-reject', () => reject())
+window.addEventListener('test-reject-suggestion', () => rejectSuggestion())
 const pending = () => new Promise<void>((done, fail) => {
   resolve = done
   reject = () => fail(new Error('test failure'))
+})
+const pendingSuggestion = () => new Promise<void>((_, fail) => {
+  rejectSuggestion = () => fail(new Error('test failure'))
 })
 
 createRoot(document.getElementById('root')!).render(
@@ -28,7 +33,7 @@ createRoot(document.getElementById('root')!).render(
       onFeedback={() => {}}
       onResumeTuning={pending}
       onResetTuning={pending}
-      onAcceptRebaseline={pending}
+      onAcceptRebaseline={pendingSuggestion}
     />
   </main>,
 )

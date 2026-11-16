@@ -29,13 +29,23 @@ async function tabTo(page: Page, target: Locator) {
   expect(outline.width).toBeGreaterThanOrEqual(2)
 }
 
+async function expectInViewport(page: Page, target: Locator) {
+  const box = await target.boundingBox()
+  const viewport = page.viewportSize()!
+  expect(box).not.toBeNull()
+  expect(box!.x).toBeGreaterThanOrEqual(0)
+  expect(box!.y).toBeGreaterThanOrEqual(0)
+  expect(box!.x + box!.width).toBeLessThanOrEqual(viewport.width)
+  expect(box!.y + box!.height).toBeLessThanOrEqual(viewport.height)
+}
+
 for (const theme of ['light', 'dark']) {
   test(`收起后失败及超时提示保持可见，关闭后恢复焦点 ${theme}`, async ({ page }) => {
     const errors: string[] = []
     page.on('pageerror', (e) => errors.push(e.message))
     page.on('console', (m) => { if (m.type() === 'error') errors.push(m.text()) })
     await page.clock.install()
-    await page.setViewportSize({ width: 320, height: 900 })
+    await page.setViewportSize({ width: 320, height: 480 })
     await page.goto('/test/e2e/tuning-alert.html')
     if (theme === 'dark') await page.evaluate(() => document.body.setAttribute('data-ds-dark-theme', ''))
     const summary = page.locator('details > summary', { hasText: '规则' }).first()
@@ -46,6 +56,11 @@ for (const theme of ['light', 'dark']) {
     const alert = page.getByRole('alert')
     await expect(alert).toBeVisible()
     await expect(alert).toContainText('恢复 AI 调参失败，请重试')
+    await expectInViewport(page, alert)
+    await page.evaluate(() => window.scrollTo(0, 0))
+    await expectInViewport(page, alert)
+    await page.evaluate(() => window.scrollTo(0, document.documentElement.scrollHeight))
+    await expectInViewport(page, alert)
     expect(await alert.evaluate((el) => el.closest('details'))).toBeNull()
     expect(await page.evaluate(() => document.documentElement.scrollWidth - innerWidth)).toBeLessThanOrEqual(0)
     await checkA11y(page)
@@ -63,10 +78,114 @@ for (const theme of ['light', 'dark']) {
     await page.clock.fastForward(10_000)
     await expect(alert).toBeVisible()
     await expect(alert).toContainText('恢复 AI 调参：未确认结果，请检查状态')
+    await expectInViewport(page, alert)
+    await page.evaluate(() => window.scrollTo(0, 0))
+    await expectInViewport(page, alert)
+    await page.evaluate(() => window.scrollTo(0, document.documentElement.scrollHeight))
+    await expectInViewport(page, alert)
     await expect(alert.getByRole('button', { name: '关闭操作提示' })).toBeVisible()
     await checkA11y(page)
     expect(errors).toEqual([])
   })
+
+  test(`提示出现后危险操作不被遮挡 ${theme}`, async ({ page }) => {
+    await page.setViewportSize({ width: 320, height: 480 })
+    await page.goto('/test/e2e/tuning-alert.html')
+    if (theme === 'dark') await page.evaluate(() => document.body.setAttribute('data-ds-dark-theme', ''))
+    await page.locator('details > summary', { hasText: '规则' }).first().click()
+    const resume = page.getByRole('button', { name: '恢复 AI 调参' })
+    await resume.click()
+    await page.evaluate(() => window.dispatchEvent(new Event('test-reject')))
+    const alert = page.getByRole('alert')
+    await expect(alert).toContainText('失败')
+    await page.getByRole('button', { name: '调整日志' }).click()
+    for (const button of [resume, page.getByRole('button', { name: '确认重新基线' }).first()]) {
+      for (const block of ['start', 'end'] as const) {
+        await button.evaluate((target, position) => target.scrollIntoView({ block: position }), block)
+        await expectInViewport(page, alert)
+        const covered = await button.evaluate((target) => {
+          const rect = target.getBoundingClientRect()
+          return !target.contains(document.elementFromPoint(rect.x + rect.width / 2, rect.y + rect.height / 2))
+        })
+        expect(covered).toBe(false)
+      }
+    }
+    await resume.click()
+    await expect(resume).toBeDisabled()
+  })
+
+  test(`嵌入滚动容器中失败和超时提示保持在面板内 ${theme}`, async ({ page }) => {
+    await page.clock.install()
+    await page.setViewportSize({ width: 320, height: 480 })
+    await page.goto('/test/e2e/tuning-alert.html')
+    if (theme === 'dark') await page.evaluate(() => document.body.setAttribute('data-ds-dark-theme', ''))
+    const stage = page.locator('.stage')
+    await stage.evaluate((el) => Object.assign(el.style, { height: '320px', overflowY: 'auto', marginTop: '60px' }))
+    const summary = page.locator('details > summary', { hasText: '规则' }).first()
+    const resume = page.getByRole('button', { name: '恢复 AI 调参' })
+    const alert = page.getByRole('alert')
+    await summary.click()
+    await resume.click()
+    await page.evaluate(() => window.dispatchEvent(new Event('test-reject')))
+    await expect(alert).toContainText('失败')
+    await page.getByRole('button', { name: '调整日志' }).click()
+    const suggestion = page.getByRole('button', { name: '确认重新基线' }).first()
+    for (const block of ['start', 'end'] as const) {
+      await suggestion.evaluate((el, position) => el.scrollIntoView({ block: position }), block)
+      expect(await suggestion.evaluate((el) => {
+        const rect = el.getBoundingClientRect()
+        return el.contains(document.elementFromPoint(rect.x + rect.width / 2, rect.y + rect.height / 2))
+      })).toBe(true)
+    }
+    for (const scroll of ['top', 'bottom'] as const) {
+      await stage.evaluate((el, position) => { el.scrollTop = position === 'top' ? 0 : el.scrollHeight }, scroll)
+      const container = (await stage.boundingBox())!
+      const box = (await alert.boundingBox())!
+      expect(box.y).toBeGreaterThanOrEqual(container.y)
+      expect(box.y + box.height).toBeLessThanOrEqual(container.y + container.height)
+    }
+    await resume.click()
+    await summary.click()
+    await page.evaluate(() => window.dispatchEvent(new Event('test-resolve')))
+    await page.clock.fastForward(10_000)
+    await expect(alert).toContainText('未确认结果')
+    for (const scroll of ['top', 'bottom'] as const) {
+      await stage.evaluate((el, position) => { el.scrollTop = position === 'top' ? 0 : el.scrollHeight }, scroll)
+      const container = (await stage.boundingBox())!
+      const box = (await alert.boundingBox())!
+      expect(box.y).toBeGreaterThanOrEqual(container.y)
+      expect(box.y + box.height).toBeLessThanOrEqual(container.y + container.height)
+    }
+  })
+
+  for (const first of [0, 1]) {
+    test(`并发提示依次键盘关闭并聚焦相邻提示 ${theme} ${first}`, async ({ page }) => {
+      await page.setViewportSize({ width: 320, height: 480 })
+      await page.goto('/test/e2e/tuning-alert.html')
+      if (theme === 'dark') await page.evaluate(() => document.body.setAttribute('data-ds-dark-theme', ''))
+      const summary = page.locator('details > summary', { hasText: '规则' }).first()
+      await summary.click()
+      await page.getByRole('button', { name: '恢复 AI 调参' }).click()
+      await page.getByRole('button', { name: '调整日志' }).click()
+      await page.getByRole('button', { name: '确认重新基线' }).first().click()
+      await page.getByRole('button', { name: '确认应用' }).click()
+      await page.evaluate(() => {
+        window.dispatchEvent(new Event('test-reject'))
+        window.dispatchEvent(new Event('test-reject-suggestion'))
+      })
+      const alerts = page.getByRole('alert')
+      await expect(alerts).toHaveCount(2)
+      for (const alert of await alerts.all()) await expectInViewport(page, alert)
+      const close = alerts.nth(first).getByRole('button', { name: '关闭操作提示' })
+      await close.focus()
+      await page.keyboard.press('Enter')
+      const remaining = page.getByRole('alert').getByRole('button', { name: '关闭操作提示' })
+      await expect(remaining).toBeFocused()
+      await page.keyboard.press('Enter')
+      await expect(summary).toBeFocused()
+      await expect(alerts).toHaveCount(0)
+    })
+  }
 
   test(`tuning-disabled 420 ${theme}: 键盘确认重置`, async ({ page }) => {
     const errors: string[] = []
