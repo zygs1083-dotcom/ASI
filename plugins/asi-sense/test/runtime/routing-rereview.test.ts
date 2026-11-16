@@ -324,16 +324,74 @@ describe('in-flight session ownership', () => {
     ).toBeLessThanOrEqual(3);
     expect(h.delivered.filter((intent) => intent.kind === 'followup')).toHaveLength(1);
     expect(h.attention.pipeline.suppressed).toBe(1);
+    h.advance(1_000);
+    await h.attention.flush();
     expect(h.attention.pipeline.nextDeadline()).toBeUndefined();
-    h.advance(40_000);
+    h.advance(39_000);
     await add('failure-after-budget', 1);
-    expect(h.attention.pipeline.nextDeadline()).toBeDefined();
+    expect(h.attention.pipeline.nextDeadline()).toBe(71_000);
+    h.advance();
     await h.attention.flush();
     expect(h.delivered.filter((intent) => intent.kind === 'followup')).toHaveLength(2);
     await h.attention.preStep('a');
     expect(h.delivered.flatMap((intent) => intent.update.changes).reduce((sum, change) => sum + change.count, 0)).toBe(
       53,
     );
+    await h.attention.stop();
+  });
+
+  it('starts a new merge window when a parked budget-downgraded job becomes a wake', async () => {
+    const configured: WatchRule[] = [
+      {
+        id: 'failed',
+        match: { kind: 'job.exited', where: { exitCode: { '!=': 0 } } },
+        level: 'wake',
+        createdBy: 'user',
+        approved: true,
+      },
+      { id: 'done', match: { kind: 'job.exited' }, level: 'context', createdBy: 'user', approved: true },
+    ];
+    const h = harness(false, configured, false);
+    h.attention.create('a');
+    await h.attention.preStep('a');
+    h.attention.postStep('a');
+    const add = (id: string, exitCode: number) =>
+      h.attention.accept({
+        id,
+        kind: 'job.exited',
+        at: 0,
+        subject: id,
+        source: { id: 'dsh', api: 'events', host: 'local' },
+        data: { id, sessionId: 'a', sessionToken: h.attention.sessionToken('a'), exitCode },
+      });
+    await add('success', 0);
+    h.advance();
+    await h.attention.flush();
+    await add('first-wake', 1);
+    h.advance();
+    await h.attention.flush();
+    await add('downgraded', 1);
+    h.advance();
+    await h.attention.flush();
+    h.advance(58_000);
+    await add('new-wake', 1);
+    expect(h.attention.pipeline.nextDeadline()).toBe(66_000);
+    await h.attention.flush();
+    expect(h.delivered).toHaveLength(1);
+    h.advance(1_000);
+    await add('merged-wake', 1);
+    expect(h.attention.pipeline.nextDeadline()).toBe(66_000);
+    h.attention.pipeline.setMergeWindows(1_500, 5_000);
+    expect(h.attention.pipeline.nextDeadline()).toBe(65_500);
+    h.advance(500);
+    await h.attention.flush();
+    expect(h.delivered).toHaveLength(2);
+    expect(h.delivered[1]?.update.changes[0]).toMatchObject({
+      count: 3,
+      level: 'wake',
+      signal: { data: { jobSummary: { total: 3 } } },
+    });
+    expect(h.attention.pipeline.suppressed).toBe(1);
     await h.attention.stop();
   });
 

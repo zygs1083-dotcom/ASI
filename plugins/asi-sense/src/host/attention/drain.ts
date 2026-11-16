@@ -186,6 +186,10 @@ export class BucketDrain {
         this.pending.set(bucket.id, bucket);
         this.jobs.set(sessionId, bucket);
       }
+      if (bucket.budgetSuppressed && bucketLevel(bucket) === 'context' && level === 'wake') {
+        bucket.startedAt = now;
+        bucket.deadline = now + windowMs;
+      }
       upsertJobs(bucket, signal, level, rule, reason);
       return;
     }
