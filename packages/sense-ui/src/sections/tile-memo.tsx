@@ -1,7 +1,7 @@
 /** 指标卡片 memo 基础设施：行级依赖收集 + 重渲判定。 */
 
 import { memo, type ReactNode } from 'react'
-import { effectiveDisks } from '@asi/sense-types'
+import { effectiveDisks } from '../disk-health'
 import {
   diskFact,
   diskValid,
@@ -31,7 +31,7 @@ export interface MetricTileProps {
   ctx: TileCtx
 }
 
-/** 行事实集合：磁盘行含每卷派生事实（卷级 TTL/状态也参与时间翻转检测）。 */
+/** 行事实集合：磁盘行含每卷派生事实（卷级状态也参与变化检测）。 */
 function tileFacts(key: BodyRowKey, m: SensePanelModel, now: number): Fact<unknown>[] {
   if (key !== 'disks') return [rowFact(key, m.state.self.body)]
   const df = m.state.self.body.disks
@@ -71,7 +71,7 @@ function eventKeys(
  * 指标卡片 memo：now/events 引用不算依赖。重渲条件：
  * 行严重度/可见性/完整性(partial)、回调、自身 deps 引用、相关事件集合
  * （at≤now 全历史，未来事件到点即入选；rate 事件跨 5 分钟徽标窗也算变化）、
- * 以及每个行事实在前后两个 now 的有效状态翻转（TTL 过期）。
+ * 以及每个行事实在前后两帧的有效状态翻转。
  * 年龄由时钟订阅独立处理，图窗口随数据更新。
  */
 export function memoTile(

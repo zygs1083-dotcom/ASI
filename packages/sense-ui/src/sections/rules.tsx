@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { formatTimestamp, formatTuningValue } from '../format'
 import { EyeOffIcon, PauseIcon } from '../icons'
 import { RebaselineSuggestions, TuningDisabled } from './tuning-actions'
@@ -15,6 +15,15 @@ const BY_TEXT = { agent: 'Agent', user: '用户', auto: '自动' } as const
 
 function isPending(r: SenseRule): boolean {
   return r.createdBy === 'agent' && r.level === 'wake' && !r.confirmed
+}
+
+function UndoButton({ onClick }: { onClick: () => void }) {
+  const button = useRef<HTMLButtonElement | null>(null)
+  const ref = useCallback((node: HTMLButtonElement | null) => {
+    if (!node && button.current === document.activeElement) button.current?.parentElement?.focus()
+    button.current = node
+  }, [])
+  return <button ref={ref} type="button" onClick={onClick}>撤销</button>
 }
 
 function RuleList({
@@ -122,7 +131,7 @@ function TuningView({
       <ul className={css.rules}>
         {log.length === 0 && <li className={css.empty}>暂无调整记录</li>}
         {log.map((e) => (
-          <li key={e.id} className={css.tuneEntry} data-reverted={e.reverted || undefined}>
+          <li key={e.id} tabIndex={-1} className={css.tuneEntry} data-reverted={e.reverted || undefined}>
             <span className={css.tuneMain}>
               <span>
                 {labelOf(e.paramKey)} ·{' '}
@@ -150,10 +159,10 @@ function TuningView({
             </span>
             {e.reverted ? (
               <span className={css.reverted}>已撤销</span>
+            ) : e.undoable === false ? (
+              <span className={css.reverted}>不可撤销</span>
             ) : (
-              <button type="button" onClick={() => onRevertTuning(e.id)}>
-                撤销
-              </button>
+              <UndoButton onClick={() => onRevertTuning(e.id)} />
             )}
           </li>
         ))}

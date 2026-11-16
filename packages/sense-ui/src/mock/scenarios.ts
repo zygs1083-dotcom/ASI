@@ -59,7 +59,7 @@ function permissionDenied(): SensePanelModel {
   state.env.focusedWindow = denied('未授予辅助功能权限')
   state.env.frontApp = fact(
     { name: 'Finder', bundleId: 'com.demo.finder' },
-    { ageMs: 120_000 },
+    { status: 'stale', ageMs: 120_000 },
   )
   state.self.permissions = fact({ 辅助功能: 'denied', 完全磁盘访问: 'granted' })
   const body = makeBody()

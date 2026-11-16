@@ -18,11 +18,11 @@ describe('effectiveStatus', () => {
   it('ok 且未超 TTL 保持 ok', () => {
     expect(effectiveStatus(fact(1, { ageMs: 4_000, ttlMs: 5_000 }), T0)).toBe('ok')
   })
-  it('ok 但超过 TTL 记为 stale', () => {
-    expect(effectiveStatus(fact(1, { ageMs: 6_000, ttlMs: 5_000 }), T0)).toBe('stale')
+  it('ok 即使超过 TTL 也保持宿主状态', () => {
+    expect(effectiveStatus(fact(1, { ageMs: 6_000, ttlMs: 5_000 }), T0)).toBe('ok')
   })
-  it('恰好等于 TTL 即过期', () => {
-    expect(effectiveStatus(fact(1, { ageMs: 5_000, ttlMs: 5_000 }), T0)).toBe('stale')
+  it('恰好等于 TTL 仍保持宿主状态', () => {
+    expect(effectiveStatus(fact(1, { ageMs: 5_000, ttlMs: 5_000 }), T0)).toBe('ok')
   })
   it('denied 不受 TTL 影响', () => {
     const f = fact<number>(null, { status: 'denied', ageMs: 99_000, ttlMs: 1_000 })
@@ -173,11 +173,11 @@ describe('聚合健康度', () => {
     expect(r.sentence).toBe('网络已断开')
   })
 
-  it('ok 但过期的 CPU 参与聚合时按缺失处理', () => {
+  it('宿主标记过期的 CPU 参与聚合时按缺失处理', () => {
     const b = bodyWith({
       cpu: fact(
         { usage: 0.99, perCore: [], load1: 0, load5: 0, load15: 0 },
-        { ageMs: 60_000, ttlMs: 5_000 },
+        { status: 'stale', ageMs: 60_000, ttlMs: 5_000 },
       ),
     })
     const r = evaluateBody(b, T0)
@@ -362,7 +362,7 @@ describe('卷级磁盘状态（status/observedAt/ttlMs + unavailableMounts）', 
   const rootStaleBody = () =>
     bodyWith({
       disks: mkDisks([
-        { mount: '/', total: 100e9, free: 90e9, observedAt: T0 - 90_000, ttlMs: 5_000 },
+        { mount: '/', total: 100e9, free: 90e9, status: 'stale', observedAt: T0 - 90_000, ttlMs: 5_000 },
         { mount: '/data', total: 100e9, free: 90e9 },
       ]),
     })
@@ -370,14 +370,14 @@ describe('卷级磁盘状态（status/observedAt/ttlMs + unavailableMounts）', 
   it('diskFact：卷级覆盖与父事实有效状态上界', () => {
     const parent = mkDisks([])
     const vol: DiskVolume = { mount: '/x', total: 10e9, free: 5e9 }
-    // 继承父 ok；卷级 stale 保留读数；卷级 unknown 清空；卷级 TTL 过期→stale
+    // 继承父 ok；卷级 stale 保留读数；卷级 unknown 清空；卷级 ok 不受墙钟 TTL 影响
     expect(effectiveStatus(diskFact(parent, vol, T0), T0)).toBe('ok')
     const stale = diskFact(parent, { ...vol, status: 'stale' }, T0)
     expect(effectiveStatus(stale, T0)).toBe('stale')
     expect(stale.value).toMatchObject({ mount: '/x', free: 5e9 })
     expect(effectiveStatus(diskFact(parent, { ...vol, status: 'unknown' }, T0), T0)).toBe('unknown')
     const ttl = diskFact(parent, { ...vol, status: 'ok', observedAt: T0 - 90_000, ttlMs: 5_000 }, T0)
-    expect(effectiveStatus(ttl, T0)).toBe('stale')
+    expect(effectiveStatus(ttl, T0)).toBe('ok')
     // 显式卷级元数据权威：父级 stale/denied/过期不再一票否决带元数据的 ok 卷；
     // 缺省（旧版）卷才继承父级有效状态作上界（时间戳同样回退父级）
     for (const p of [
@@ -444,7 +444,7 @@ describe('卷级磁盘状态（status/observedAt/ttlMs + unavailableMounts）', 
     // 新鲜卷告警照常聚合；部分缺失只加 partial 徽标不覆盖告警句
     const alerted = bodyWith({
       disks: mkDisks([
-        { mount: '/', total: 100e9, free: 90e9, observedAt: T0 - 90_000, ttlMs: 5_000 },
+        { mount: '/', total: 100e9, free: 90e9, status: 'stale', observedAt: T0 - 90_000, ttlMs: 5_000 },
         { mount: '/data', total: 100e9, free: 2e9 }, // 2% → critical
       ]),
     })

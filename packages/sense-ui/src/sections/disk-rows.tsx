@@ -1,7 +1,7 @@
 /**
  * 磁盘卡片：默认只显示「需要注意的盘」（触发 insight / 最差剩余比例），
  * 其余挂载点在明细里逐个展开，各自着色、不再重复行级标签。
- * 每卷可带 status/observedAt/ttlMs（diskFact 推导新鲜度）；
+ * 每卷可带 status/observedAt/ttlMs（diskFact 按状态投影）；
  * unavailableMounts 的挂载点只显示「无法读取」，无数字、无历史、无图。
  */
 

@@ -17,6 +17,7 @@ export interface TuningEntry {
   reason: string
   at: number
   reverted?: boolean
+  undoable?: boolean
 }
 
 export interface TuningState {
