@@ -5,12 +5,11 @@
  */
 
 import type { Body } from './body.js';
-import { effectiveDisks } from './disks.js';
 import { ttlStatusAt } from './freshness.js';
 
 export type { Body } from './body.js';
 export type { DisksFact, DiskVolume } from './disks.js';
-export { diskVolumeAt, effectiveDisks } from './disks.js';
+export { disksStatusAt, diskVolumeAt, effectiveDisks } from './disks.js';
 export { ttlStatusAt } from './freshness.js';
 
 /** Identifies a signal/fact producer: which source, via which API, on which host. */
@@ -34,16 +33,10 @@ export interface Fact<T> {
 
 /**
  * Computes the effective status of a fact at `now`.
- * Non-disk `ok` facts become stale at `now >= observedAt + ttlMs`.
- * Disk facts aggregate volume statuses; pass `disks` for unmarked null/empty values.
+ * `ok` facts become stale at `now >= observedAt + ttlMs`.
+ * Disk facts use `disksStatusAt` instead.
  */
-export function factStatusAt(fact: Fact<unknown>, now: number, kind?: 'disks'): FactStatus {
-  if (
-    kind === 'disks' ||
-    'unavailableMounts' in fact ||
-    (Array.isArray(fact.value) && fact.value.some((v: unknown) => typeof v === 'object' && v !== null && 'mount' in v))
-  )
-    return effectiveDisks(fact as import('./disks.js').DisksFact, now).status;
+export function factStatusAt(fact: Fact<unknown>, now: number): FactStatus {
   return ttlStatusAt(fact, now);
 }
 

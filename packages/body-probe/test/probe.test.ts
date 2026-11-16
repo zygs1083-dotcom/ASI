@@ -103,7 +103,7 @@ describe('BodyProbe', () => {
     await flush();
     await probe.stop();
     const original = probe.history()[0]!.body.disks;
-    expect(factStatusAt(original, t0 + 6500)).toBe('ok');
+    expect(factStatusAt(original, t0 + 6500)).toBe('stale');
     expect(effectiveDisks(original, t0 + 6500)).toMatchObject({
       status: 'ok', observedAt: t0 + 2000, ttlMs: 30000,
       indeterminateMounts: ['/', '/missing'],
@@ -120,8 +120,8 @@ describe('BodyProbe', () => {
     expect(effectiveDisks({ ...original, status: 'denied' }, t0 + 6500).status).toBe('denied');
     expect(effectiveDisks({ ...original, status: 'unsupported' }, t0 + 6500).status).toBe('unsupported');
     expect(effectiveDisks({ ...original, value: null }, t0 + 6500).status).toBe('unknown');
-    expect(factStatusAt({ ...original, value: null }, t0 + 6500, 'disks')).toBe('unknown');
-    expect(factStatusAt({ ...original, value: [] }, t0 + 6500, 'disks')).toBe('unknown');
+    expect(effectiveDisks({ ...original, value: null }, t0 + 6500).status).toBe('unknown');
+    expect(effectiveDisks({ ...original, value: [] }, t0 + 6500).status).toBe('unknown');
     expect(factStatusAt({ value: [], status: 'ok', source: original.source, observedAt: t0, ttlMs: 30000 }, t0 + 6500)).toBe('ok');
     expect(probe.history()[0]!.body.disks).toEqual(original);
   });

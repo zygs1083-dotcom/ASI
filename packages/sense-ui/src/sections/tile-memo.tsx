@@ -1,6 +1,7 @@
 /** 指标卡片 memo 基础设施：行级依赖收集 + 重渲判定。 */
 
 import { memo, type ReactNode } from 'react'
+import { effectiveDisks } from '@asi/sense-types'
 import {
   diskFact,
   diskValid,
@@ -10,7 +11,6 @@ import {
   type BodyRowKey,
 } from '../health'
 import type {
-  DisksFact,
   Fact,
   SenseEvent,
   SensePanelModel,
@@ -33,10 +33,9 @@ export interface MetricTileProps {
 
 /** 行事实集合：磁盘行含每卷派生事实（卷级 TTL/状态也参与时间翻转检测）。 */
 function tileFacts(key: BodyRowKey, m: SensePanelModel, now: number): Fact<unknown>[] {
-  const f = rowFact(key, m.state.self.body)
-  if (key !== 'disks') return [f]
-  const df = f as DisksFact
-  return [df, ...(df.value ?? []).map((d) => diskFact(df, d, now))]
+  if (key !== 'disks') return [rowFact(key, m.state.self.body)]
+  const df = m.state.self.body.disks
+  return [effectiveDisks(df, now), ...(df.value ?? []).map((d) => diskFact(df, d, now))]
 }
 
 /** 本行相关事件：匹配行指标的 body.rate/body.anomaly 且 at≤now——不设下界，

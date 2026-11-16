@@ -79,3 +79,7 @@ export function effectiveDisks(fact: DisksFact, now: number): DisksFact & { inde
           : 'unknown';
   return { ...fact, value: fact.value === null ? null : volumes, status, observedAt, ttlMs, indeterminateMounts };
 }
+
+export function disksStatusAt(fact: DisksFact, now: number): FactStatus {
+  return effectiveDisks(fact, now).status;
+}

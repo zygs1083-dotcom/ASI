@@ -1,3 +1,4 @@
+import { useMemo } from 'react'
 import { attentionLine } from '../attention'
 import { ClockProvider, SamplingProvider } from '../clock'
 import { evaluateBody, type Severity } from '../health'
@@ -92,7 +93,10 @@ export function BodySection({
     onAdjust: onAdjustMetric,
     onOpenPermissionSettings,
   }
-  const interval = model.sampleIntervalMs
+  const sampling = useMemo(
+    () => ({ paused: model.paused, intervals: model.sampleIntervalsMs }),
+    [model.paused, model.sampleIntervalsMs],
+  )
 
   return (
     <>
@@ -103,7 +107,7 @@ export function BodySection({
         partial={evalResult.partial}
       />
       <ClockProvider value={now}>
-        <SamplingProvider value={interval && Number.isFinite(interval) && interval > 0 ? interval : 2000}>
+        <SamplingProvider value={sampling}>
           <div className={css.tiles}>
             <CpuTile model={model} rows={rows} ctx={ctx} />
             <MemoryTile model={model} rows={rows} ctx={ctx} />

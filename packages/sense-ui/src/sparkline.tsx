@@ -1,10 +1,10 @@
 import { memo, useRef } from 'react'
-import { useClock, useSamplingInterval } from './clock'
+import { useClock, useSampling } from './clock'
 import { formatAge } from './format'
 import type { Severity } from './health'
 import { buildSpark, sameThresholds } from './geometry'
 import type { SparkThreshold } from './thresholds'
-import type { MetricInsight, MetricPoint } from './view-model'
+import type { MetricInsight, MetricKey, MetricPoint } from './view-model'
 import css from './viz.module.css'
 
 export { HISTORY_WINDOW_MS, sampleHistory } from './history'
@@ -13,6 +13,8 @@ interface SparklineProps {
   points: MetricPoint[]
   now: number
   sampleIntervalMs?: number
+  metric?: MetricKey
+  paused?: boolean
   label: string
   format: (v: number) => string
   /** 严重度决定容器 data-sev 与末点标记（颜色只作用于越界段，不整体染色）。 */
@@ -65,6 +67,8 @@ function SparklineBase({
   points,
   now,
   sampleIntervalMs,
+  metric,
+  paused: pausedProp,
   label,
   format,
   severity,
@@ -84,7 +88,7 @@ function SparklineBase({
     expanded,
   }
   const clock = useClock(now)
-  const interval = useSamplingInterval()
+  const sampling = useSampling(metric, sampleIntervalMs)
   const cache = useRef<{ key: GeoKey; anchor: number; built: ReturnType<typeof buildSpark> }>()
   if (!sameGeoKey(cache.current?.key, key)) {
     const anchor = cache.current?.key.points === points ? cache.current.anchor : now
@@ -98,11 +102,14 @@ function SparklineBase({
 
   if (!built) return <span className={css.sparkEmpty}>暂无趋势数据</span>
   const { g } = built
-  const paused = clock - g.last.at > 2 * (sampleIntervalMs ?? interval)
+  const paused = pausedProp ?? sampling.paused
+  const lagging = !paused && clock - g.last.at > 3 * sampling.interval
+  const historical = paused || lagging
   const age = formatAge(clock, g.last.at)
+  const historyText = `${paused ? '采集暂停' : '数据滞后'} · 最后 ${age}`
 
   const summary =
-    `${label}${paused ? `历史 5 分钟趋势，采集暂停 · 最后 ${age}：上次` : '最近 5 分钟趋势：当前'} ${format(g.last.value)}，最高 ${format(g.dataMax)}，` +
+    `${label}${historical ? `历史 5 分钟趋势，${historyText}：上次` : '最近 5 分钟趋势：当前'} ${format(g.last.value)}，最高 ${format(g.dataMax)}，` +
     `最低 ${format(g.dataMin)}` +
     (g.band ? `，基线区间 ${format(g.band.low)} 至 ${format(g.band.high)}` : '') +
     (thresholds.length
@@ -110,7 +117,7 @@ function SparklineBase({
           .map((t) => `${t.label ?? '底线'} ${format(t.value)}`)
           .join(' / ')}`
       : '') +
-    (severity && !paused ? `，当前状态${SEV_WORD[severity]}` : '')
+    (severity && !historical ? `，当前状态${SEV_WORD[severity]}` : '')
 
   return (
     <div className={expanded ? css.chartBoxExpanded : css.chartBox}>
@@ -167,7 +174,7 @@ function SparklineBase({
               vectorEffect="non-scaling-stroke"
             />
           )}
-          {!paused && (severity === 'warn' || severity === 'critical') && (
+          {!historical && (severity === 'warn' || severity === 'critical') && (
             <circle
               data-current={severity}
               className={
@@ -201,10 +208,10 @@ function SparklineBase({
       {expanded && (
         <div className={css.axisX}>
           <span>-5 分钟</span>
-          <span>{paused ? `采集暂停 · 最后 ${age}` : '现在'}</span>
+          <span>{historical ? historyText : '现在'}</span>
         </div>
       )}
-      {paused && !expanded && <div className={css.axisX} aria-hidden="true">采集暂停 · 最后 {age}</div>}
+      {historical && !expanded && <div className={css.axisX} aria-hidden="true">{historyText}</div>}
       <span className={css.srOnly}>{summary}</span>
     </div>
   )
@@ -218,6 +225,8 @@ export const Sparkline = memo(
     a.points === b.points &&
     a.now === b.now &&
     a.sampleIntervalMs === b.sampleIntervalMs &&
+    a.metric === b.metric &&
+    a.paused === b.paused &&
     a.label === b.label &&
     a.format === b.format &&
     a.severity === b.severity &&

@@ -41,6 +41,43 @@ const histCalls = () => vi.mocked(sampleHistory).mock.calls.length
 const geoCalls = () => vi.mocked(buildSpark).mock.calls.length
 
 describe('图表渲染预算', () => {
+  it('按各序列周期标记滞后，显式暂停立即生效且不重建图形', async () => {
+    const m = makeScenario('healthy')
+    const points = [{ at: m.now - 60_000, value: 0.2 }, { at: m.now, value: 0.3 }]
+    const props = makeProps({
+      ...m,
+      sampleIntervalsMs: { 'disk:/': 10_000, battery: 30_000 },
+      history: { ...m.history, disks: { '/': points }, battery: points },
+    })
+    const view = render(<SensePanel {...props} />)
+    const disk = await waitFor(() => view.container.querySelector('details[data-tile="disks"] summary')!)
+    const battery = view.container.querySelector('details[data-tile="battery"] summary')!
+    vi.mocked(buildSpark).mockClear()
+    view.rerender(<SensePanel {...props} model={{ ...props.model, paused: true }} />)
+    expect(disk.textContent).toContain('采集暂停 · 最后')
+    expect(battery.textContent).toContain('采集暂停 · 最后')
+    expect(disk.textContent).not.toContain('当前')
+    expect(geoCalls()).toBe(0)
+    view.rerender(<SensePanel {...props} model={props.model} />)
+    view.rerender(<SensePanel {...props} model={{ ...props.model, now: m.now + 29_000 }} />)
+    expect(disk.textContent).not.toContain('数据滞后')
+    expect(battery.textContent).not.toContain('数据滞后')
+    view.rerender(<SensePanel {...props} model={{ ...props.model, now: m.now + 30_001 }} />)
+    expect(disk.textContent).toContain('数据滞后 · 最后 30 秒前')
+    expect(disk.textContent).not.toContain('采集暂停')
+    expect(battery.textContent).not.toContain('数据滞后')
+    const intervals = { 'disk:/': 20_000, battery: 30_000 } as const
+    view.rerender(<SensePanel {...props} model={{ ...props.model, sampleIntervalsMs: intervals, now: m.now + 30_001 }} />)
+    expect(disk.textContent).not.toContain('数据滞后')
+    view.rerender(<SensePanel {...props} model={{ ...props.model, sampleIntervalsMs: intervals, now: m.now + 60_001 }} />)
+    expect(disk.textContent).toContain('数据滞后 · 最后 60 秒前')
+    expect(battery.textContent).not.toContain('数据滞后')
+    view.rerender(<SensePanel {...props} model={{ ...props.model, sampleIntervalsMs: intervals, now: m.now + 90_000 }} />)
+    expect(battery.textContent).not.toContain('数据滞后')
+    view.rerender(<SensePanel {...props} model={{ ...props.model, sampleIntervalsMs: intervals, now: m.now + 90_001 }} />)
+    expect(battery.textContent).toContain('数据滞后 · 最后 90 秒前')
+  })
+
   it('折叠卡片不挂明细图；纯时钟推进零重采样/零几何重建', () => {
     const m = makeScenario('healthy')
     const props = makeProps(m)
@@ -153,7 +190,7 @@ describe('图表渲染预算', () => {
     expect(geoCalls()).toBe(0)
   })
 
-  it('长时间停采与事实更新而历史不变时，图表标明历史锚点且不重做预处理', () => {
+  it('长时间数据滞后与事实更新而历史不变时，图表标明历史锚点且不重做预处理', () => {
     const m = makeScenario('healthy')
     const points = m.history.cpu
     const chart = (now: number, severity: 'good' | 'warn') => (
@@ -166,21 +203,40 @@ describe('图表渲染预算', () => {
     expect(view.container.textContent).toContain('现在')
     vi.mocked(sampleHistory).mockClear()
     vi.mocked(buildSpark).mockClear()
-    view.rerender(chart(m.now + 10_001, 'good'))
-    expect(view.container.textContent).toContain('采集暂停 · 最后 10 秒前')
+    view.rerender(chart(m.now + 15_000, 'good'))
+    expect(view.container.textContent).toContain('现在')
+    view.rerender(chart(m.now + 15_001, 'good'))
+    expect(view.container.textContent).toContain('数据滞后 · 最后 15 秒前')
     expect(view.container.textContent).not.toContain('现在')
     expect(view.container.textContent).not.toContain('当前')
     expect(geoCalls()).toBe(0)
     expect(histCalls()).toBe(0)
     view.rerender(chart(m.now + 600_000, 'warn'))
-    expect(view.container.textContent).toContain('采集暂停 · 最后 600 秒前')
+    expect(view.container.textContent).toContain('数据滞后 · 最后 600 秒前')
     expect(view.container.textContent).not.toContain('当前')
     expect(view.container.textContent).not.toContain('最近 5 分钟')
   })
 
+  it('展开图显式暂停时立即停止称现在和当前', () => {
+    const m = makeScenario('healthy')
+    const chart = (paused: boolean) => (
+      <Sparkline expanded paused={paused} points={m.history.cpu} now={m.now}
+        label="CPU" format={formatPercent} severity="warn" sampleIntervalMs={5000} />
+    )
+    const view = render(chart(false))
+    expect(view.container.textContent).toContain('现在')
+    vi.mocked(buildSpark).mockClear()
+    view.rerender(chart(true))
+    expect(view.container.textContent).toContain('采集暂停 · 最后')
+    expect(view.container.textContent).not.toContain('现在')
+    expect(view.container.textContent).not.toContain('当前')
+    expect(view.container.querySelector('circle[data-current]')).toBeNull()
+    expect(geoCalls()).toBe(0)
+  })
+
   it('事实更新但历史引用未变时不把旧图当成当前', () => {
     const m = makeScenario('healthy')
-    const props = makeProps({ ...m, sampleIntervalMs: 5000 })
+    const props = makeProps({ ...m, sampleIntervalsMs: { cpu: 5000 } })
     const view = render(<SensePanel {...props} />)
     const now = m.now + 600_000
     const body = m.state.self.body
@@ -189,7 +245,7 @@ describe('图表渲染预算', () => {
       ...props.model, now, state: { ...m.state, self: { ...m.state.self, body: { ...body, cpu } } },
     }} />)
     const tile = view.container.querySelector('details[data-tile="cpu"] summary')!
-    expect(tile.textContent).toContain('采集暂停 · 最后 600 秒前')
+    expect(tile.textContent).toContain('数据滞后 · 最后 600 秒前')
     expect(tile.textContent).not.toContain('最近 5 分钟趋势')
     expect(tile.textContent).not.toContain('当前')
     expect(tile.querySelector('circle[data-current]')).toBeNull()

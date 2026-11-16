@@ -60,6 +60,22 @@ async function openTile(key: string): Promise<HTMLElement> {
 }
 
 describe('过期保留值', () => {
+  it('空磁盘在摘要及明细均按磁盘契约显示未知', async () => {
+    for (const disks of [
+      fact(null, { status: 'unavailable' }),
+      fact([], { status: 'ok' }),
+    ]) {
+      const state = makeState()
+      state.self.body.disks = disks
+      const { view } = renderPanel({ ...makeScenario('healthy'), state })
+      const tile = await openTile('disks')
+      expect(tile.querySelector('summary')!.textContent).toContain('未知')
+      expect(tile.querySelector('summary')!.textContent).not.toContain('不可用')
+      expect(tile.querySelector('[class*="detailFact"]')!.textContent).toContain('未知')
+      view.unmount()
+    }
+  })
+
   it('CPU 过期但保留值：摘要仍显示值 + 已过期年龄 + 未知标签', async () => {
     const state = makeState()
     state.self.body.cpu = fact(
@@ -543,9 +559,9 @@ describe('无有效磁盘读数', () => {
     state.self.body.disks = fact(disks)
     renderPanel({ ...makeScenario('healthy'), state })
     const tile = await openTile('disks')
-    expect(tile.textContent).toContain('无有效磁盘读数')
+    expect(tile.textContent).toContain(disks.length ? '无有效磁盘读数' : '未知')
     expect(tile.textContent).not.toContain('0 B')
-    expect(within(tile as HTMLElement).getByText('未知')).toBeTruthy()
+    expect(within(tile as HTMLElement).getAllByText('未知').length).toBeGreaterThan(0)
     expect(screen.getByText('数据待补全')).toBeTruthy()
   })
 })

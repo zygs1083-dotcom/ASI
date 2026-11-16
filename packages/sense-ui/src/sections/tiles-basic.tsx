@@ -83,6 +83,7 @@ export const CpuTile = memoTile(
               {formatLoad(val.load15)}
             </span>
             <Sparkline
+              metric="cpu"
               points={model.history.cpu}
               now={now}
               label="CPU 使用率"
@@ -190,6 +191,7 @@ export const MemoryTile = memoTile(
               </span>
             )}
             <Sparkline
+              metric="memory"
               points={model.history.memory}
               now={now}
               label="内存占用"

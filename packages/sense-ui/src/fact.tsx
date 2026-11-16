@@ -1,8 +1,9 @@
 import { useMemo, type ReactNode } from 'react'
+import { effectiveDisks } from '@asi/sense-types'
 import { useClock } from './clock'
 import { effectiveStatus } from './health'
 import { formatAge } from './format'
-import type { Fact, FactStatus } from './view-model'
+import type { DisksFact, DiskVolume, Fact, FactStatus } from './view-model'
 import css from './panel.module.css'
 
 export const STATUS_TEXT: Record<FactStatus, string> = {
@@ -84,6 +85,15 @@ export function FactStatusText<T>({
       {fact.reason ? `（${fact.reason}）` : ''}
     </>
   )
+}
+
+export function DisksStatusText({ fact, now, children }: {
+  fact: DisksFact
+  now: number
+  children: (value: DiskVolume[]) => ReactNode
+}) {
+  const effNow = useClock(now)
+  return <FactStatusText fact={effectiveDisks(fact, effNow)} now={effNow}>{children}</FactStatusText>
 }
 
 interface FactValueProps<T> {

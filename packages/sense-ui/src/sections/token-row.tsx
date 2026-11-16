@@ -196,6 +196,7 @@ function TokenSummary({
       )}
       <BalanceLine v={v} />
       <Sparkline
+        metric="tokens"
         points={model.history.tokens}
         now={now}
         label="上下文占用"

@@ -42,7 +42,7 @@ import type { SensePanelModel, SensePanelProps } from '@asi/sense-ui'
 - **learning**：`collectedMs/targetMs` 由宿主给，UI 只算 `clamp(collected/target)`，target 非法显示"进度不可用"。
 - **tuning**：参数列表 + 调整日志（`previous→next`、`agent|user|auto`、`reverted`）。锁定/撤销只是回调，宿主拥有护栏。
 - **events**：`detail` 为宿主投影的告警明细（body.rate / body.anomaly / file.burst），`feedback` 状态只在 model 中。窗口类事件在 `sendTitles=false` 时隐藏主体/原因/规则名/detail。
-- **图窗口与时钟**：走势图 x 域固定为 5 分钟窗，锚点是最近一次历史序列更新时的 `now`；历史引用不变时事实或语义更新也不移动锚点。宿主可通过 `model.sampleIntervalMs` 提供历史采样周期，缺省或非法时采用 BodyProbe 默认 2000ms。最新点早于 `now - 2×采样周期` 时，图与无障碍文案标「采集暂停 · 最后 X 前」，不称「现在/当前」；纯时钟推进只刷新文案，不重采样、不重算路径。
+- **图窗口与时钟**：走势图 x 域固定为 5 分钟窗，锚点是最近一次历史序列更新时的 `now`；历史引用不变时事实或语义更新也不移动锚点。宿主通过 `model.sampleIntervalsMs` 按指标键（含 `disk:<挂载点>`）提供各序列的历史采样周期；缺省或非法时磁盘为 10000ms、电池为 30000ms、其余为 2000ms。`model.paused` 立即显示「采集暂停 · 最后 X 前」；未暂停且最新点早于 `now - 3×该序列周期` 时显示「数据滞后 · 最后 X 前」，均不称「现在/当前」；纯时钟推进只刷新文案，不重采样、不重算路径。
 - **磁盘父事实**：有至少一卷新鲜则 `ok`，有值但全部 stale 则 `stale`，无值则 `unknown`；采集权限拒绝与不支持维持原状态。父级 `observedAt` 取新鲜卷最旧时间，`ttlMs` 截止于新鲜卷中最早的绝对过期时间。
 - **明细懒挂载**：卡片明细（展开图/阈值行/来源）仅 `<details>` 打开时挂载，收起态不付出明细渲染开销。
 - **预览的实时模式**是演示假数据 tick（`src/preview/tick.ts`），不属于组件：cpu/network/tokens 每秒重采样，其余 ok 事实到 2/3·TTL 才续期（非 ok 永不续期），未变化事实与历史序列保持原引用。
@@ -56,7 +56,7 @@ import type { SensePanelModel, SensePanelProps } from '@asi/sense-ui'
 
 ## 规模
 
-每个 src 文件 ≤300 行。E2E 截图矩阵 32 张（8 场景 × 320/420 × 明暗）+ 卡片明细 4 张 + fallback 容量 2 张（420px 明暗），存于 `test/screenshots/`。
+每个 src 文件 ≤300 行。E2E 截图矩阵 32 张（8 场景 × 320/420 × 明暗）+ 卡片明细 4 张 + fallback 容量 2 张 + disk-partial 2 张（420px 明暗），共 40 张，存于 `test/screenshots/`。
 
 ## 评审修复对应测试
 

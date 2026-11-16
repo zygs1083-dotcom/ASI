@@ -63,6 +63,7 @@ export const ThermalTile = memoTile(
             <span className={css.tileValue}>{THERMAL_TEXT[val]}</span>
             <span className={css.tileSub}>温控档位</span>
             <Sparkline
+              metric="thermal"
               points={model.history.thermal}
               now={now}
               label="温控档位"
@@ -128,6 +129,7 @@ export const BatteryTile = memoTile(
                   : ''}
               </span>
               <Sparkline
+                metric="battery"
                 points={model.history.battery}
                 now={now}
                 label="电池电量"

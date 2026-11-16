@@ -1,5 +1,5 @@
 import type { Fact, SenseState, SourceObservation, SourceRef } from '@asi/sense-types';
-import { factStatusAt } from '@asi/sense-types';
+import { effectiveDisks, factStatusAt } from '@asi/sense-types';
 
 /** Source stamped on facts before the first real observation. */
 export const INIT_SOURCE: SourceRef = {
@@ -103,6 +103,10 @@ export function factAt(state: SenseState, path: string): Fact<unknown> {
 /** Recomputes every fact's TTL status in place (on a cloned snapshot). */
 export function recomputeStatuses(state: SenseState, now: number): void {
   for (const path of FACT_PATHS) {
+    if (path === 'self.body.disks') {
+      state.self.body.disks = effectiveDisks(state.self.body.disks, now);
+      continue;
+    }
     const fact = factAt(state, path);
     fact.status = factStatusAt(fact, now);
   }

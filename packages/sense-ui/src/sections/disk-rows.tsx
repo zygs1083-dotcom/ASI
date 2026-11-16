@@ -5,7 +5,7 @@
  * unavailableMounts 的挂载点只显示「无法读取」，无数字、无历史、无图。
  */
 
-import { FactStatusText } from '../fact'
+import { DisksStatusText, FactStatusText } from '../fact'
 import { formatBytes, formatPercent, formatSignedDelta } from '../format'
 import {
   diskFact,
@@ -27,7 +27,8 @@ import type {
   MetricKey,
   SenseEvent,
 } from '../view-model'
-import { Tile, TileDetail, type DetailMetric } from './tile'
+import { Tile, type DetailMetric } from './tile'
+import { DisksDetail } from './disks-detail'
 import { memoTile, type MetricTileProps } from './tiles-basic'
 import css from './body.module.css'
 
@@ -184,8 +185,8 @@ export const DisksTile = memoTile(
       label="磁盘"
       sev={rows.disks.severity}
       detail={
-        <TileDetail
-          fact={disks}
+        <DisksDetail
+          disks={disks}
           now={now}
           events={events}
           onAdjust={ctx.onAdjust}
@@ -220,9 +221,9 @@ export const DisksTile = memoTile(
       ) : null}
       {focus == null ? (
         // 无可展示卷时父事实兜底：denied 原因 / 不可用状态 / 无有效读数
-        <FactStatusText fact={disks} now={now}>
+        <DisksStatusText fact={disks} now={now}>
           {() => <span className={css.tileSub}>无有效磁盘读数</span>}
-        </FactStatusText>
+        </DisksStatusText>
       ) : unavail.has(focus.mount) || !diskValid(focus) ? (
         <span className={css.tileSub}>
           {focus.mount} {unavail.has(focus.mount) ? '无法读取' : '· 未知'}
@@ -254,6 +255,7 @@ export const DisksTile = memoTile(
               </span>
               <FreeStrip d={d} />
               <Sparkline
+                metric={`disk:${d.mount}`}
                 points={model.history.disks[d.mount] ?? []}
                 now={now}
                 label={`磁盘 ${d.mount} 已用率`}

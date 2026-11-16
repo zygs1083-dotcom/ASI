@@ -185,7 +185,7 @@ function MetricBlock({
         </span>
       </div>
       <Sparkline
-        expanded
+        metric={m.key} expanded
         points={m.points}
         now={now}
         label={m.label}
