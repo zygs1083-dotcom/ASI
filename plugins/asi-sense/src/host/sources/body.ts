@@ -1,0 +1,213 @@
+import { AsyncLocalStorage } from 'node:async_hooks';
+import type { Body, BodyThresholdSample, BodyThresholdState, Fact, Signal } from '@asi/sense-types';
+import { BODY_THRESHOLDS } from '../attention/thresholds.ts';
+import {
+  BodyMonitor,
+  defaultAnomalyRules,
+  defaultRateRules,
+  FileBurstDetector,
+  type ParameterSpec,
+  Tuner,
+} from '../body/index.ts';
+import type { RuntimeAttention } from '../runtime/attention.ts';
+import type { Clock, DshPort, ProbeFactory, StoragePort, TokenSnapshot } from '../runtime/ports.ts';
+
+const source = { id: 'body', api: 'probe', host: 'local' };
+const specs: Record<string, ParameterSpec> = {
+  'rate.disk.maxDelta': { value: 2 * 1024 ** 3, min: 1, noiseDirection: 'up' },
+  'rate.rss.maxRatio': { value: 0.5, min: 0.01, max: 10, noiseDirection: 'up' },
+  'rate.context.maxEtaMs': { value: 600_000, min: 1, noiseDirection: 'down' },
+  'anomaly.cpu.sigma': { value: 3, min: 0.1, max: 20, noiseDirection: 'up' },
+  'anomaly.memory.sigma': { value: 3, min: 0.1, max: 20, noiseDirection: 'up' },
+  'anomaly.network.sigma': { value: 3, min: 0.1, max: 20, noiseDirection: 'up' },
+  'file.burst.windowMs': { value: 60_000, min: 1 },
+  'file.burst.maxChanges': { value: 100, min: 1, noiseDirection: 'up' },
+  'file.burst.maxDeleted': { value: 50, min: 1, noiseDirection: 'up' },
+  ...Object.fromEntries(
+    (['disk', 'context', 'battery'] as const).flatMap((metric) =>
+      (['warn', 'critical'] as const).map((severity) => [
+        `floor.${metric}.${severity}`,
+        { value: BODY_THRESHOLDS[metric][severity], min: 0, max: 1, tighten: 'up' as const },
+      ]),
+    ),
+  ),
+};
+
+export class BodySource {
+  readonly tuner: Tuner;
+  readonly monitor: BodyMonitor;
+  private readonly identity = new AsyncLocalStorage<'user'>();
+  private readonly probe: ReturnType<ProbeFactory['create']>;
+  private previous?: BodyThresholdSample;
+  private state: BodyThresholdState = {};
+  private tail = Promise.resolve();
+  private off?: () => void;
+  private stopped = false;
+  private intervalMs = 2_000;
+  private sampling = false;
+  private token?: Fact<NonNullable<Body['tokens']['value']>>;
+  private tokenSource?: TokenSnapshot['contextWindowSource'];
+  private tokenGeneration = 0;
+  private thermal?: Body['thermal'];
+  private burstRoots = '';
+  private detector = new FileBurstDetector();
+
+  constructor(
+    factory: ProbeFactory,
+    private readonly dsh: DshPort,
+    storage: StoragePort,
+    private readonly clock: Clock,
+    private readonly attention: RuntimeAttention,
+    private readonly paused: () => boolean,
+  ) {
+    this.probe = factory.create();
+    this.tuner = new Tuner(specs, {
+      actor: () => this.identity.getStore() ?? 'agent',
+      clock: () => clock.mono(),
+      wallClock: () => clock.wall(),
+    });
+    this.monitor = new BodyMonitor({
+      tuner: this.tuner,
+      clock: () => clock.mono(),
+      wallClock: () => clock.wall(),
+      persistence: { load: () => storage.load('body'), save: (value) => storage.save('body', value) },
+    });
+  }
+  async start(intervalMs: number): Promise<void> {
+    await this.monitor.restore();
+    this.state = this.monitor.restoredState ?? {};
+    this.off = this.probe.onSample((body) => {
+      const at = this.clock.wall();
+      const mono = this.clock.mono();
+      this.enqueue(() => this.sample(body, at, mono));
+    });
+    this.intervalMs = intervalMs;
+    await this.setPaused(this.paused());
+  }
+  async setPaused(paused: boolean): Promise<void> {
+    if (paused) this.tokenGeneration++;
+    if (paused && this.sampling) {
+      this.sampling = false;
+      await this.probe.stop();
+    } else if (!paused && !this.sampling && !this.stopped) {
+      this.sampling = true;
+      this.probe.start({ intervalMs: this.intervalMs });
+    }
+  }
+  asUser<T>(work: () => Promise<T>): Promise<T> {
+    return this.identity.run('user', work);
+  }
+  sync(): void {
+    this.state = this.monitor.restoredState ?? this.state;
+  }
+  async tokens(session: string): Promise<void> {
+    const generation = ++this.tokenGeneration;
+    const snapshot = await Promise.resolve()
+      .then(() => this.dsh.tokenSnapshot(session))
+      .catch(() => undefined);
+    if (this.stopped || generation !== this.tokenGeneration) return;
+    this.tokenSource = snapshot?.contextWindowSource;
+    this.token = {
+      value: snapshot ?? null,
+      status: snapshot ? 'ok' : 'unavailable',
+      source: { id: 'tokens', api: 'dsh', host: 'local' },
+      observedAt: this.clock.wall(),
+      ttlMs: 15_000,
+    };
+    this.write('tokens', this.token);
+  }
+  setThermal(fact: Body['thermal']): void {
+    this.thermal = fact;
+    this.write('thermal', fact);
+  }
+  setRoots(roots: string[]): void {
+    const ordered = [...roots].sort();
+    const key = JSON.stringify(ordered);
+    if (key === this.burstRoots) return;
+    this.burstRoots = key;
+    this.detector = new FileBurstDetector({
+      ...(ordered.length ? { roots: ordered } : {}),
+      threshold: (param, fallback) => this.tuner.number(param, fallback),
+    });
+  }
+  async burst(signal: Signal): Promise<void> {
+    for (const burst of this.detector.accept(signal, this.clock.mono())) await this.publish(burst);
+  }
+  async stop(): Promise<void> {
+    this.stopped = true;
+    this.off?.();
+    if (this.sampling) await this.probe.stop();
+    this.sampling = false;
+    await this.tail;
+    await this.monitor.close();
+  }
+  private enqueue(work: () => Promise<void>): void {
+    const run = this.tail.then(work);
+    this.tail = run.catch(() => {});
+  }
+  private write(key: keyof Body, fact: Fact<unknown>): void {
+    this.attention.store.apply({
+      id: this.attention.id(),
+      kind: 'fact.updated',
+      at: fact.observedAt,
+      source: fact.source,
+      subject: `self.body.${key}`,
+      data: {
+        path: `self.body.${key}`,
+        value: fact.value,
+        status: fact.status,
+        ttlMs: fact.ttlMs,
+        ...('unavailableMounts' in fact ? { unavailableMounts: fact.unavailableMounts } : {}),
+      },
+    });
+  }
+  private async sample(body: Body, at: number, mono: number): Promise<void> {
+    if (this.stopped || this.paused()) return;
+    if (this.token) body.tokens = this.token;
+    if (this.thermal) body.thermal = this.thermal;
+    for (const key of Object.keys(body) as (keyof Body)[]) this.write(key, body[key]);
+    const evaluated = structuredClone(body);
+    if (this.tokenSource === 'fallback' && evaluated.tokens.value) delete evaluated.tokens.value.contextWindow;
+    const next: BodyThresholdSample = { body: evaluated, at, monotonicAt: mono, source };
+    this.sync();
+    const result = await this.monitor.evaluateAuto(this.previous ?? next, next, this.state);
+    this.state = result.state;
+    this.previous = next;
+    if (result.tuningError) {
+      await this.attention.accept({
+        id: this.attention.id(),
+        kind: 'source.error',
+        at,
+        source,
+        subject: 'body-tuning',
+        data: { error: 'tuning-error' },
+      });
+    }
+    for (const signal of result.signals) await this.publish(signal);
+  }
+  private async publish(signal: Signal): Promise<void> {
+    const id = signal.data.ruleId;
+    const rules = [...defaultRateRules(), ...defaultAnomalyRules()];
+    const param =
+      signal.kind === 'file.burst'
+        ? signal.data.externalDeletionExceeded
+          ? 'file.burst.maxDeleted'
+          : 'file.burst.maxChanges'
+        : rules.find((rule) => rule.id === id)?.param;
+    if (typeof id === 'string' && param && signal.data.severity !== 'normal' && signal.cause !== 'agent') {
+      try {
+        await this.tuner.registerAlert(signal.id, id, param);
+      } catch {
+        await this.attention.accept({
+          id: this.attention.id(),
+          kind: 'source.error',
+          at: this.clock.wall(),
+          source,
+          subject: 'body-tuning',
+          data: { error: 'tuning-error' },
+        });
+      }
+    }
+    await this.attention.accept(signal);
+  }
+}

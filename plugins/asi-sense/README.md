@@ -110,6 +110,67 @@ and deterministic environment-update formatting.
   store defensive clones; `addRule` upserts by id; `removeRule(id)` returns
   whether a rule was removed. `matchesRule` fails closed and never throws.
 
+## Runtime 与端口
+
+`src/host/runtime/index.ts` exports `createSenseRuntime(ports, options)`, a
+Node-only composition layer with no Cordis or DSH imports. The DSH adapter
+owns the concrete ports declared in `runtime/ports.ts`:
+
+- `dsh`: subscribe to agent lifecycle, tool and job events; callbacks return
+  promises and the adapter must await them, particularly `pre-step`. Supply
+  `tokenSnapshot(sessionId)` and awaitable `deliver(sessionId, intent)`.
+  Delivery retains the pipeline's at-least-once / `deliveryId` contract;
+  the adapter must handle idempotency and never call a drain from `deliver`.
+- `storage`: asynchronous `load(key)` / `save(key, json)` for `settings`
+  and `body`. `save` rejects only when the new snapshot was **not**
+  installed; after an atomic rename, report later errors separately and do
+  not reject. A bad settings snapshot fails startup rather than widening
+  watching or privacy permissions.
+- `probe`: `create()` supplies a `BodyProbe`-compatible object; `helper`:
+  `spawn(path)` supplies a child process with piped stdin/stdout/stderr, or
+  `undefined` when not installed. `files.watch(path, callback)` watches the
+  supplied path and returns a closeable handle; events report absolute paths
+  and `add` / `modify` / `delete`. Only explicit absolute file-rule subjects
+  are watched; globs watch their static root and events are filtered again.
+- `clock`: `wall()` and `mono()` return milliseconds; monotonic deadlines
+  drive runtime scheduling, merge windows and helper retries. The probe and
+  body persistence retain their own internal sampling/save timers.
+
+`start()` restores before starting sources and may be called once. `stop()`
+closes subscriptions, watchers, probe, helper and timers, then waits for
+pending body/settings saves; it rejects on a shutdown timeout (950 ms) or
+save failure. A helper ignoring SIGTERM is sent SIGKILL before shutdown
+finishes. `state()`, `subscribe(listener)`, `events()`, `rules`, `body`,
+`actions` and `tools` are available to the presenter/adapter. `events()` is
+a defensive snapshot of the last 200 signal decisions. `rules.settings()`
+reports the effective pause/title switches. Actions are trusted user calls;
+model tools must use `tools` and cannot choose their own identity. Pausing
+stops collection and defers pending deliveries until resumed.
+
+The latest active session to issue `pre-step` is selected. Without one,
+context is retained for a subsequent `pre-step`, while wake is recorded with
+`reason: 'no-session'`. Helper title events are stripped until the latest
+matching process-session/id/generation acknowledgement; queued deliveries
+are stripped again when titles are disabled. Five restarts per ten monotonic
+minutes are allowed. On excess the helper emits `source.status` with
+`status: 'error'`, `reason: 'restart-limit'` and the restart count; the
+existing state store deliberately normalizes that status to `unavailable`
+with the reason in `error`, and the event log retains the reason/count.
+Fallback token capacity remains visible with its source tag but is omitted
+from threshold and rate evaluations.
+
+`bodyTune` accepts only the parameters wired to `BodyMonitor`/`Tuner`:
+`floor.{disk,context,battery}.{warn,critical}`, `rate.disk.maxDelta`,
+`rate.rss.maxRatio`, `rate.context.maxEtaMs`, `anomaly.{cpu,memory,network}.sigma`,
+and `file.burst.{windowMs,maxChanges,maxDeleted}`. Unsupported parameters,
+including merge-window and delivery-level tuning, reject with
+`unsupported-param`; `envWatch` also rejects a tuning `param`. Rule changes
+remain available through `envWatch` with agent-proposed wake rules pending
+user approval. `bodyTune({ action: 'feedback', alertId, verdict })` and the
+trusted-user feedback action accept alerts registered by the runtime. The
+body monitor's `evaluateAuto` and all tuning operations are awaited; tuning
+failures are surfaced without discarding confirmed state.
+
 ## M1 boundaries
 
 The M1 attention/state implementation remains unchanged: no persistence,

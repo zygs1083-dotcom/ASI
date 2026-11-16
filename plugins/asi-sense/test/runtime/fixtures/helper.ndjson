@@ -1,0 +1,3 @@
+{"v":1,"type":"hello","at":1700000000000,"version":"0.1.0","pid":123,"session":"fixture-session","permissions":{"accessibility":"granted"}}
+{"v":1,"type":"thermal","at":1700000000000,"state":"nominal"}
+{"v":1,"type":"window.focused","at":1700000000000,"bundleId":"example.app","pid":123,"title":"Fixture title","window":1}

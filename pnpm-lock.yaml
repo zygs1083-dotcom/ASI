@@ -87,6 +87,9 @@ importers:
 
   plugins/asi-sense:
     dependencies:
+      '@asi/body-probe':
+        specifier: workspace:*
+        version: link:../../packages/body-probe
       '@asi/sense-types':
         specifier: workspace:*
         version: link:../../packages/sense-types
