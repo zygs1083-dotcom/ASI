@@ -40,6 +40,7 @@ export class DshSource {
     },
     private readonly paused: () => boolean,
     private readonly selfCauseGraceMs = 2_000,
+    private readonly onAgentDisposed?: (sessionId: string) => void,
   ) {}
   start(): void {
     this.active = true;
@@ -242,6 +243,7 @@ export class DshSource {
           this.sessions.delete(event.sessionId);
           this.body.disposeSession(event.sessionId);
           this.attention.dispose(event.sessionId);
+          this.onAgentDisposed?.(event.sessionId);
           this.body.sessionsChanged(this.instances.size > 0);
           this.body.selectSession(this.attention.currentSessionId());
           this.refresh(true);

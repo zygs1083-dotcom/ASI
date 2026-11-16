@@ -57,8 +57,8 @@ export function sessionCatalog(ctx: Context) {
     onSessionsChanged(cb: (closed?: string) => void): () => void {
       const off = [
         ctx.on('session/created', () => cb()),
-        ctx.on('session/disposed', (session) => cb(session.id)),
-        ctx.on('agent/disposed', ({ agent }) => cb(agent.id)),
+        ctx.on('session/disposed', () => cb()),
+        ctx.on('agent/disposed', () => cb()),
         ctx.on('agent/status', () => cb()),
         ctx.on('session/event', (_session, event) => {
           if (event.type === 'session/title' || event.type === 'user/message') cb();

@@ -59,6 +59,7 @@ export class RuntimeAttention {
     private readonly titlesAllowed: () => boolean,
     readonly changed: () => void,
     expiry: FactExpiry,
+    private readonly ensureTarget?: () => Promise<void>,
   ) {
     const staged = dsh as DshPort & { onDeliveryCommitted?: (cb: (session: string, id: string) => void) => () => void };
     this.store = new StateStore(
@@ -257,11 +258,10 @@ export class RuntimeAttention {
     this.pending.suspend(id, this.pipeline);
     const index = this.recent.indexOf(id);
     if (index >= 0) this.recent.splice(index, 1);
-    if (this.pinned === id) this.pinned = undefined;
     if (this.selected === id) {
       this.selected = this.recent.at(-1);
       this.selectionGeneration++;
-      if (this.selected) void this.pipeline.retarget(this.selected);
+      if (this.selected) void this.pipeline.retarget(this.selected).then(this.reschedule, this.reschedule);
     }
     this.reschedule();
   }
@@ -269,11 +269,15 @@ export class RuntimeAttention {
     if (this.stopped || this.closed.has(id)) return;
     const session = this.sessions.get(id);
     if (!session) return;
+    if (this.needsRestore()) {
+      await this.ensureTarget?.();
+      if (this.stopped || this.sessions.get(id) !== session || this.closed.has(id)) return;
+    }
     const generation = ++this.selectionGeneration;
     const index = this.recent.indexOf(id);
     if (index >= 0) this.recent.splice(index, 1);
     this.recent.push(id);
-    this.selected = this.pinned ?? id;
+    this.selected = this.pinned && this.sessions.has(this.pinned) && !this.closed.has(this.pinned) ? this.pinned : id;
     this.privateStep = this.selected === id ? undefined : id;
     session.busy = true;
     session.userInitiated = userInitiated;
@@ -360,6 +364,11 @@ export class RuntimeAttention {
       }
       return;
     }
+    if (this.needsRestore() && signal.cause !== 'agent') {
+      const level = this.pipeline.selectRule(signal, this.rules())?.level;
+      if (level && level !== 'record') await this.ensureTarget?.();
+    }
+    if (this.stopped) return;
     const session = this.selected && this.sessions.get(this.selected);
     if (!session) {
       const prior = this.store.snapshot().observation.sources[signal.source.id];
@@ -406,11 +415,15 @@ export class RuntimeAttention {
   async flush(): Promise<void> {
     try {
       this.pipeline.pruneSessions();
+      if (this.needsRestore()) await this.ensureTarget?.();
       if (this.selected) await this.pipeline.retarget(this.selected);
       if (!this.stopped) await this.pipeline.flush();
     } finally {
       this.reschedule();
     }
+  }
+  private needsRestore(): boolean {
+    return !!this.pinned && (this.selected !== this.pinned || !this.sessions.has(this.pinned));
   }
   private log(change: { signal: Signal; level: DeliveryLevel; ruleId?: string; reason?: string }, mono: number): void {
     const { signal, level, ruleId, reason } = change;

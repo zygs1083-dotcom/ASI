@@ -92,7 +92,7 @@ export class BucketDrain {
   nextDeadline(): number | undefined {
     let min: number | undefined;
     for (const b of this.pending.values()) {
-      if (privateBucket(b) && !this.eligible(b, this.isCurrent())) continue;
+      if (!this.eligible(b, this.isCurrent())) continue;
       if (b.jobs && !b.sealed && this.blockedJobs(b.sessionId, bucketLevel(b))) continue;
       if (min === undefined || b.deadline < min) min = b.deadline;
     }

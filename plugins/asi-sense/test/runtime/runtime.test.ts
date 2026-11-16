@@ -161,6 +161,94 @@ function harness(
 }
 
 describe('host runtime', () => {
+  it.each([false, true])(
+    'resolves an unloaded pinned owner before draining an already queued wake (recreated=%s)',
+    async (recreated) => {
+      const h = harness();
+      let attempts = 0;
+      h.ports.dsh.listSessions = async () => ['a', 'b'].map((id) => ({ id, title: '', updatedAt: 1, running: false }));
+      await h.runtime.start();
+      for (const sessionId of ['b', 'a']) {
+        await h.agent({ type: 'created', sessionId });
+        await h.agent({ type: 'pre-step', sessionId });
+        await h.agent({ type: 'post-step', sessionId });
+      }
+      await h.runtime.actions.selectTarget?.('b');
+      await h.file({ path: '/workspace/fixture', change: 'modify' });
+      await h.agent({ type: 'disposed', sessionId: 'b' });
+      if (recreated) await h.agent({ type: 'created', sessionId: 'b' });
+      h.ports.dsh.ensureSession = async (id) => {
+        attempts++;
+        if (!recreated) await h.agent({ type: 'created', sessionId: id });
+      };
+      await h.advance(5_000);
+      expect(attempts).toBe(1);
+      expect(h.runtime.target()).toMatchObject({ mode: 'pinned', sessionId: 'b' });
+      expect(h.delivered.map((intent) => [intent.sessionId, intent.kind])).toEqual([['b', 'followup']]);
+      await h.runtime.stop();
+    },
+  );
+
+  it.each(['restored', 'missing', 'temporary'] as const)(
+    'preserves a pinned session through agent disposal and resolves it on delivery: %s',
+    async (result) => {
+      const h = harness();
+      const saved = new Map<string, string>();
+      let notify: (closed?: string) => void = () => {};
+      let attempts = 0;
+      let recovering = result;
+      h.ports.storage.load = async (key) => saved.get(key);
+      h.ports.storage.save = async (key, value) => {
+        saved.set(key, value);
+      };
+      h.ports.dsh.listSessions = async () => ['a', 'b'].map((id) => ({ id, title: '', updatedAt: 1, running: false }));
+      h.ports.dsh.onSessionsChanged = (cb) => {
+        notify = cb;
+        return () => {};
+      };
+      await h.runtime.start();
+      for (const sessionId of ['b', 'a']) {
+        await h.agent({ type: 'created', sessionId });
+        await h.agent({ type: 'pre-step', sessionId });
+        await h.agent({ type: 'post-step', sessionId });
+      }
+      await h.runtime.actions.selectTarget?.('b');
+      h.ports.dsh.ensureSession = async (id) => {
+        attempts++;
+        if (recovering === 'missing') throw Object.assign(new Error('missing'), { code: 'session/not-found' });
+        if (recovering === 'temporary') throw new Error('temporarily unavailable');
+        await h.agent({ type: 'created', sessionId: id });
+      };
+      await h.agent({ type: 'disposed', sessionId: 'b' });
+      notify();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(h.runtime.target()).toMatchObject({ mode: 'pinned', sessionId: 'b' });
+      expect(saved.get('session-target')).toContain('"b"');
+      expect(attempts).toBe(0);
+      await h.file({ path: '/workspace/fixture', change: 'modify' });
+      expect(attempts).toBe(1);
+      if (result === 'missing') {
+        expect(h.runtime.target()).toMatchObject({ mode: 'auto', notice: true });
+        expect(saved.get('session-target')).toContain('"sessionId":null');
+      } else if (result === 'temporary') {
+        expect(h.runtime.target()).toMatchObject({ mode: 'pinned', sessionId: 'b', unavailable: true });
+        expect(saved.get('session-target')).toContain('"b"');
+      }
+      await h.advance(5_000);
+      expect(h.delivered.map((intent) => [intent.sessionId, intent.kind])).toEqual([
+        [result === 'restored' ? 'b' : 'a', 'followup'],
+      ]);
+      if (result === 'temporary') {
+        recovering = 'restored';
+        await h.advance(10_000);
+        expect(h.runtime.currentSessionId()).toBe('b');
+        expect(h.runtime.target()).toMatchObject({ mode: 'pinned', sessionId: 'b' });
+        expect(saved.get('session-target')).toContain('"b"');
+      }
+      await h.runtime.stop();
+    },
+  );
+
   it('keeps running in automatic routing while a saved target is temporarily unavailable, then restores it', async () => {
     const h = harness();
     const saved = JSON.stringify({ version: 1, sessionId: 'a' });

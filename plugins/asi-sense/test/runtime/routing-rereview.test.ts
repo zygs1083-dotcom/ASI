@@ -62,6 +62,22 @@ function harness(failFirst: boolean, configuredRules = rules, blockFirst = true,
 }
 
 describe('in-flight session ownership', () => {
+  it('does not schedule an unowned bucket after the only target closes', async () => {
+    const h = harness(false, rules, false);
+    h.attention.create('b');
+    await h.attention.preStep('b');
+    await h.attention.setTarget('b');
+    await h.attention.accept(signal('pending', 'wake'));
+    await h.attention.closeSession('b');
+    await h.attention.setTarget(undefined);
+    expect(h.attention.currentSessionId()).toBeUndefined();
+    expect(h.attention.pipeline.nextDeadline()).toBeUndefined();
+    h.attention.create('a');
+    await h.attention.preStep('a');
+    expect(h.attention.pipeline.nextDeadline()).toBe(2_000);
+    await h.attention.stop();
+  });
+
   it('keeps an owned job context separate from a later owned wake', async () => {
     const h = harness(
       false,

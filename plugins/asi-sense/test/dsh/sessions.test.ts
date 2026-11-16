@@ -22,7 +22,7 @@ describe('DSH session rows', () => {
     expect(sessionRows([{ sessionId: 'archived', updatedAt: 1, running: false }], ['archived'])).toEqual([]);
   });
 
-  it('notifies on creation, title changes, archive and disposal, and unregisters listeners', async () => {
+  it('notifies on creation, title changes, archive and disposal without treating unloaded agents or sessions as closed', async () => {
     const ctx = new Context();
     const seen: Array<string | undefined> = [];
     const stop = sessionCatalog(ctx).onSessionsChanged((closed) => seen.push(closed));
@@ -37,7 +37,7 @@ describe('DSH session rows', () => {
     await ctx.parallel('workspace/session-archived', { sessionId: session.id });
     ctx.emit('agent/disposed', { agent: { id: session.id } as Agent });
     ctx.emit('session/disposed', session);
-    expect(seen).toEqual([undefined, undefined, 'fixture', 'fixture', 'fixture']);
+    expect(seen).toEqual([undefined, undefined, 'fixture', undefined, undefined]);
     stop();
     ctx.emit('session/disposed', session);
     expect(seen).toHaveLength(5);

@@ -16,6 +16,7 @@ export function createSessionTarget(
   let active = false;
   let loaded = false;
   let applied = false;
+  let lazy = false;
   let pendingClear = false;
   let retryDelay = 1_000;
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -40,6 +41,7 @@ export function createSessionTarget(
   const reset = async () => {
     selected = undefined;
     applied = false;
+    lazy = false;
     notice = true;
     pendingClear = true;
     recordReset();
@@ -94,7 +96,7 @@ export function createSessionTarget(
     if (selected && !rows.some((row) => row.id === selected)) {
       await lifecycle?.closed(selected);
       await reset();
-    } else if (selected && !applied) {
+    } else if (selected && !applied && !lazy) {
       try {
         await port.ensureSession?.(selected);
       } catch (error) {
@@ -161,9 +163,23 @@ export function createSessionTarget(
         selected = id;
         loaded = true;
         applied = !!id;
+        lazy = false;
         pendingClear = false;
         notice = false;
         changed();
+      });
+    },
+    unload(id: string): void {
+      if (selected === id) {
+        applied = false;
+        lazy = true;
+      }
+    },
+    ensure(): Promise<void> {
+      return enqueue(async () => {
+        if (!active || !selected || applied || (!lazy && unavailable)) return;
+        lazy = false;
+        await recover().catch(failed);
       });
     },
     dismiss(): void {
