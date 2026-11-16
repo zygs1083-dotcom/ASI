@@ -7,6 +7,8 @@ import { NativeToolExecutor } from '@deepseek-ai/dsh-tool-executor-native';
 import { executeToolFixture } from '@deepseek-ai/dsh-tool-testkit';
 import ToolsService from '@deepseek-ai/dsh-tools';
 import { describe, expect, it, onTestFinished, vi } from 'vitest';
+import { FileBurstDetector } from '../../src/host/body/burst.ts';
+import { formatEnvUpdate } from '../../src/host/delivery/format.ts';
 import { registerSenseTools } from '../../src/host/dsh/tools.ts';
 import { createSenseRuntime } from '../../src/host/runtime/index.ts';
 import type { SensePorts } from '../../src/host/runtime/ports.ts';
@@ -179,6 +181,41 @@ describe('model-facing tools', () => {
     expect(result).toMatchObject({ isError: false, value: { applied: false, change: { by: 'agent' } } });
     expect(h.live.body.tuner.get(param.key)).toBe(param.value);
     expect(h.live.body.tuner.logs.at(-1)).toMatchObject({ by: 'agent', status: 'rejected' });
+  });
+
+  it('round-trips a special-character file burst alert from formatted delivery to feedback', async () => {
+    const h = await fixture();
+    const detector = new FileBurstDetector({ roots: ['/fixture/R&D'], maxDeleted: 1 });
+    const emit = (id: string) =>
+      detector.accept(
+        {
+          id,
+          kind: 'file.changed',
+          at: 1_000,
+          subject: `/fixture/R&D/${id}`,
+          source: { id: 'fs', api: 'test', host: 'local' },
+          data: { change: 'delete' },
+        },
+        1_000,
+      );
+    emit('one');
+    const alert = emit('two')[0];
+    if (!alert) throw new Error('fixture alert missing');
+    expect(await h.live.body.tuner.registerAlert(alert.id, 'file.burst', 'file.burst.maxDeleted')).toBe(true);
+    alert.data.feedbackAvailable = true;
+    const text = formatEnvUpdate({
+      since: 1_000,
+      at: 1_000,
+      suppressed: 0,
+      changes: [{ signal: alert, count: 1, level: 'context' }],
+    });
+    const encoded = /alertId="([A-Za-z0-9_-]+)"/.exec(text)?.[1];
+    expect(encoded).toBeDefined();
+    expect(await h.call('body_tune', { action: 'feedback', alertId: encoded, verdict: 'useful' })).toMatchObject({
+      isError: false,
+      value: { applied: true },
+    });
+    expect(h.live.body.tuner.hasAlert(alert.id)).toBe(false);
   });
 
   it('bounds complete results and removes tool and prompt contributions on disposal', async () => {

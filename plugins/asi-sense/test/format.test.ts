@@ -14,11 +14,12 @@ function update(changes: EnvChange[], over: Partial<EnvUpdate> = {}): EnvUpdate 
 }
 
 describe('formatEnvUpdate', () => {
-  it('exposes a bounded escaped alert id only when feedback is available', () => {
+  it('exposes a bounded base64url alert id only when feedback is available', () => {
     const signal = sig({ id: 'alert<fixture>&"', kind: 'body.rate', at: T0, data: { feedbackAvailable: true } });
-    expect(formatEnvUpdate(update([change({ signal })]))).toContain(
-      'alertId="alert&lt;fixture&gt;&amp;&quot;" feedbackAvailable="true"',
-    );
+    const output = formatEnvUpdate(update([change({ signal })]));
+    const encoded = /alertId="([A-Za-z0-9_-]+)" feedbackAvailable="true"/.exec(output)?.[1];
+    expect(encoded).toBeDefined();
+    expect(Buffer.from(encoded as string, 'base64url').toString('utf8')).toBe(signal.id);
     signal.data.feedbackAvailable = false;
     expect(formatEnvUpdate(update([change({ signal })]))).not.toContain('alertId=');
     signal.id = 'x'.repeat(1_000);

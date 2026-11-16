@@ -190,7 +190,7 @@ export class RuntimeAttention {
     let entry = this.pending.take();
     while (entry) {
       if ('batch' in entry) await this.pipeline.restore(id, entry.batch);
-      else await this.pipeline.acceptCount(entry.signal, session, entry.count, entry.other);
+      else await this.pipeline.acceptCount(entry.signal, session, entry.count, entry.other, entry.classification);
       if (this.stopped || generation !== this.selectionGeneration || this.selected !== id) return;
       entry = this.pending.take();
     }
@@ -236,7 +236,7 @@ export class RuntimeAttention {
             }
             if (level === 'wake') reason = 'no-session';
             if (level === 'context') {
-              const evicted = this.pending.add(signal);
+              const evicted = this.pending.add(signal, { rule, reason });
               if (evicted !== undefined) reason = `pending-evicted:${evicted}`;
             }
             this.log({ signal, level, ruleId: rule?.id, reason }, mono);

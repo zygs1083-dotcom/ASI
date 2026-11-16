@@ -661,7 +661,7 @@ Alert registration is persisted asynchronously after the alert is published.
 Its initial `feedbackAvailable` is `false`; successful registration updates
 unattempted queued signals and the presenter, while already attempted deliveries
 retain their frozen payload. Registration failure, consumption and eviction
-leave feedback unavailable. Model updates include a bounded, escaped alert ID
+leave feedback unavailable. Model updates include a bounded, base64url alert ID
 only when it can be used for feedback.
 
 Regression tests:

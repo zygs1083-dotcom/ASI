@@ -83,11 +83,12 @@ function changeLines(ch: EnvChange, includeTitles: boolean): string[] {
   }
   if (ch.ruleId) main += ` [rule: ${esc(ch.ruleId)} → ${ch.level}]`;
   if (typeof s.data.feedbackAvailable === 'boolean') {
+    const bytes = Buffer.from(s.id, 'utf8');
     const available =
-      s.data.feedbackAvailable &&
-      Buffer.byteLength(s.id, 'utf8') <= 256 &&
-      [...s.id].every((char) => char >= ' ' && char !== '\x7f');
-    main += available ? ` alertId="${esc(s.id)}" feedbackAvailable="true"` : ' feedbackAvailable="false"';
+      s.data.feedbackAvailable && bytes.length > 0 && bytes.length <= 256 && bytes.toString('utf8') === s.id;
+    main += available
+      ? ` alertId="${bytes.toString('base64url')}" feedbackAvailable="true"`
+      : ' feedbackAvailable="false"';
   }
   const lines = [main];
   if (ch.note) lines.push(`note: ${esc(ch.note)}`);

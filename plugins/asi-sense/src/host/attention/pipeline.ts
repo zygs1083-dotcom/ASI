@@ -106,13 +106,16 @@ export class AttentionPipeline {
     this.fileMergeWindowMs = fileMergeWindowMs;
     this.drain.setMergeWindows(mergeWindowMs, fileMergeWindowMs);
   }
-  setDeliveryLevels(levels: AlertLevels): void {
+  setDeliveryLevels(levels: AlertLevels, actor: 'agent' | 'user' = 'agent'): void {
     if (
+      (actor !== 'agent' && actor !== 'user') ||
       !['record', 'context'].includes(levels['body.rate']) ||
       !['record', 'context'].includes(levels['body.anomaly']) ||
       !['record', 'context', 'wake'].includes(levels['file.burst'])
     )
       throw new TypeError('invalid alert delivery levels');
+    if (actor !== 'user' && levels['file.burst'] === 'wake' && this.levels['file.burst'] !== 'wake')
+      throw new TypeError('only a trusted user can restore wake');
     this.levels = { ...levels };
   }
   selectRule(signal: Signal, rules: readonly WatchRule[] = this.rules): WatchRule | undefined {
@@ -190,8 +193,14 @@ export class AttentionPipeline {
   async accept(signal: Signal, session: SessionContext, onIntake?: (change: EnvChange) => void): Promise<EnvChange> {
     return this.process(signal, session, 1, true, false, onIntake);
   }
-  async acceptCount(signal: Signal, session: SessionContext, count: number, other = false): Promise<EnvChange> {
-    return this.process(signal, session, count, false, other);
+  async acceptCount(
+    signal: Signal,
+    session: SessionContext,
+    count: number,
+    other = false,
+    pending?: { rule?: WatchRule; reason?: string },
+  ): Promise<EnvChange> {
+    return this.process(signal, session, count, false, other, undefined, pending);
   }
   private async process(
     signal: Signal,
@@ -200,10 +209,11 @@ export class AttentionPipeline {
     apply: boolean,
     other = false,
     onIntake?: (change: EnvChange) => void,
+    pending?: { rule?: WatchRule; reason?: string },
   ): Promise<EnvChange> {
     const ev = structuredClone(signal);
-    ev.cause = classifyCause(ev, session.toolWindows ?? [], 0, this.clock());
-    if (!apply) return this.intake(ev, session, this.clock(), count, other);
+    if (!pending) ev.cause = classifyCause(ev, session.toolWindows ?? [], 0, this.clock());
+    if (!apply) return this.intake(ev, session, this.clock(), count, other, pending);
     return await new Promise<EnvChange>((resolve, reject) => {
       this.store.apply(ev, (result) => {
         try {
@@ -221,7 +231,14 @@ export class AttentionPipeline {
   }
 
   /** All mutable accept intake — runs inside the store's apply callback (FIFO). */
-  private intake(ev: Signal, session: SessionContext, now: number, count: number, other = false): EnvChange {
+  private intake(
+    ev: Signal,
+    session: SessionContext,
+    now: number,
+    count: number,
+    other = false,
+    pending?: { rule?: WatchRule; reason?: string },
+  ): EnvChange {
     const s = this.session(session.id);
     s.context = session;
     const change: EnvChange = { signal: ev, count: 1, level: 'record' };
@@ -232,15 +249,15 @@ export class AttentionPipeline {
       if (ev.cause === 'agent') {
         change.reason = 'self-caused';
       } else {
-        const rule = this.selectRule(ev);
+        const rule = pending ? pending.rule : this.selectRule(ev);
         if (other) ev.kind = 'other';
-        let level: DeliveryLevel = rule?.level ?? 'record';
-        let reason: string | undefined;
-        if (level === 'wake' && rule && !isRuleApproved(rule)) {
+        let level: DeliveryLevel = pending ? 'context' : (rule?.level ?? 'record');
+        let reason: string | undefined = pending?.reason;
+        if (!pending && level === 'wake' && rule && !isRuleApproved(rule)) {
           level = 'context';
           reason = 'rule-pending-approval';
         }
-        if ((ev.kind === 'source.status' || ev.kind === 'source.error') && repeatedStatus) {
+        if (!pending && (ev.kind === 'source.status' || ev.kind === 'source.error') && repeatedStatus) {
           level = 'record';
         }
         change.level = level;

@@ -4,6 +4,16 @@ import { defaultBodyRules } from '../src/host/body/rules.ts';
 import { FakeClock, jobExit, pipe, sess, sig } from './helpers.ts';
 
 describe('runtime attention tuning', () => {
+  it('rejects wake escalation at the pipeline boundary unless explicitly trusted', () => {
+    const { pipeline } = pipe(new FakeClock(), [...DEFAULT_RULES, ...defaultBodyRules()]);
+    const lowered = { 'body.rate': 'record', 'body.anomaly': 'context', 'file.burst': 'context' } as const;
+    pipeline.setDeliveryLevels(lowered);
+    expect(() => pipeline.setDeliveryLevels({ ...lowered, 'file.burst': 'wake' })).toThrow();
+    expect(() => pipeline.setDeliveryLevels({ ...lowered, 'file.burst': 'wake' }, 'agent')).toThrow();
+    expect(() => pipeline.setDeliveryLevels({ ...lowered, 'body.rate': 'wake' }, 'user')).toThrow();
+    expect(() => pipeline.setDeliveryLevels({ ...lowered, 'file.burst': 'wake' }, 'user')).not.toThrow();
+  });
+
   it('shortens existing windows, never extends them, and delivers each generation once', async () => {
     const clock = new FakeClock();
     const { pipeline, intents } = pipe(clock);

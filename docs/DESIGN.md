@@ -168,6 +168,7 @@ interface Body {
       |---|---|---|---|
       | `mergeWindowMs` | 2000ms | 1000–30000ms | 当前值的 0.5–2 倍 |
       | `fileMergeWindowMs` | 5000ms | 1000–60000ms | 当前值的 0.5–2 倍 |
+      | `rate.context.maxEtaMs` | 600000ms | ≥600000ms | 只能调大，提高灵敏度；10 分钟硬预警不可放宽 |
       | `deliveryLevel.body.rate` / `deliveryLevel.body.anomaly` | context | record、context | record 与 context 间切换，不得升为 wake |
       | `deliveryLevel.file.burst` | wake | record、context、wake | 可从 wake 降为 context/record，或在 record 与 context 间切换，不得升为 wake |
 

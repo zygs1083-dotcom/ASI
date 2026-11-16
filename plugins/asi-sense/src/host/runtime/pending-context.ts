@@ -1,9 +1,19 @@
-import type { DeliveryLevel, Signal } from '@asi/sense-types';
+import type { DeliveryLevel, Signal, WatchRule } from '@asi/sense-types';
 import { confirmBatch, type InjectBatch, type InjectOutcome, injectOutcomes } from '../attention/drain-transfer.ts';
 import type { AttentionPipeline, DeliveryIntent } from '../attention/pipeline.ts';
 
-type Entry = { signal?: Signal; ids?: string[]; count: number; other: boolean; batches: InjectBatch[] };
-type Pending = { signal: Signal; count: number; other: boolean } | { batch: InjectBatch };
+type Classification = { rule?: WatchRule; reason?: string };
+type Entry = {
+  signal?: Signal;
+  ids?: string[];
+  count: number;
+  other: boolean;
+  batches: InjectBatch[];
+  classification?: Classification;
+};
+type Pending =
+  | { signal: Signal; count: number; other: boolean; classification: Classification }
+  | { batch: InjectBatch };
 
 export function withoutTitles(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(withoutTitles);
@@ -92,7 +102,7 @@ export class PendingContext {
     return this.transfers;
   }
 
-  add(signal: Signal): number | undefined {
+  add(signal: Signal, classification: Classification = {}): number | undefined {
     let kinds = this.subjects.get(signal.subject);
     let evicted: number | undefined;
     if (!kinds) {
@@ -118,6 +128,7 @@ export class PendingContext {
       ids,
       count: (previous?.count ?? 0) + 1,
       other,
+      classification,
       batches: previous?.batches ?? [],
     });
     return evicted;
@@ -196,7 +207,14 @@ export class PendingContext {
         if (key !== kind && !other.batches.length && !other.signal) kinds.delete(key);
       }
     }
-    const pending = batch ? { batch } : { signal: entry.signal as Signal, count: entry.count, other: entry.other };
+    const pending = batch
+      ? { batch }
+      : {
+          signal: entry.signal as Signal,
+          count: entry.count,
+          other: entry.other,
+          classification: entry.classification ?? {},
+        };
     if (!batch || (!entry.batches.length && !entry.signal)) kinds.delete(kind);
     if (!kinds.size) this.subjects.delete(subject);
     return pending;

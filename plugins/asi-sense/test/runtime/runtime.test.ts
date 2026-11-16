@@ -18,7 +18,7 @@ import type {
 } from '../../src/host/runtime/ports.ts';
 import { Settings } from '../../src/host/runtime/settings.ts';
 import { pauseAction } from '../../src/host/runtime/tools.ts';
-import { f, mkBody } from '../body/helpers.ts';
+import { diskFact, f, mkBody } from '../body/helpers.ts';
 
 afterEach(() => vi.useRealTimers());
 
@@ -1248,6 +1248,49 @@ describe('host runtime', () => {
     await h.runtime.stop();
   });
 
+  it('delivers offline context at its original level after the agent lowers the rule', async () => {
+    const h = harness();
+    await h.runtime.start();
+    await h.agent({ type: 'created', sessionId: 'old' });
+    await h.agent({ type: 'pre-step', sessionId: 'old' });
+    let release!: () => void;
+    let started!: () => void;
+    const entered = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let blocked = false;
+    h.ports.storage.save = async (key) => {
+      if (key === 'body' && !blocked) {
+        blocked = true;
+        started();
+        await gate;
+      }
+    };
+    const tuning = h.runtime.tools.bodyTune({ param: 'deliveryLevel.body.rate', to: 'record' });
+    await entered;
+    await h.agent({ type: 'disposed', sessionId: 'old' });
+    const rss = (value: number) =>
+      mkBody({ harnessProcess: { ...f({ rss: value, cpu: 0, uptimeSec: 0 }), observedAt: Date.now() } });
+    await h.sample(rss(100));
+    await h.advance(1_000);
+    await h.sample(rss(200));
+    const alert = h.runtime.events().find((event) => event.kind === 'body.rate');
+    expect(alert).toMatchObject({ level: 'context' });
+    release();
+    expect(await tuning).toMatchObject({
+      applied: true,
+    });
+    await h.agent({ type: 'created', sessionId: 'new' });
+    await h.agent({ type: 'pre-step', sessionId: 'new' });
+    expect(h.delivered.flatMap((intent) => intent.update.changes)).toContainEqual(
+      expect.objectContaining({ level: 'context', signal: expect.objectContaining({ id: alert?.id }) }),
+    );
+    await h.runtime.stop();
+  });
+
   it('keeps confirmed tuning when an atomic save rejects and disables AI tuning', async () => {
     const h = harness();
     await h.runtime.start();
@@ -1316,6 +1359,110 @@ describe('host runtime', () => {
     await h.runtime.stop();
   });
 
+  it('keeps the ten-minute ETA floor for direct and automatic noise tuning', async () => {
+    const h = harness();
+    await h.runtime.start();
+    const param = 'rate.context.maxEtaMs';
+    expect(await h.runtime.tools.bodyTune({ param, to: 300_000 })).toMatchObject({ applied: false });
+    for (let i = 0; i < 3; i++) {
+      const id = `eta-alert-${i}`;
+      await h.runtime.body.tuner.registerAlert(id, 'context-eta', param);
+      expect(await h.runtime.tools.bodyTune({ action: 'feedback', alertId: id, verdict: 'noise' })).toMatchObject({
+        applied: true,
+      });
+    }
+    expect(h.runtime.body.tuner.get(param)).toBe(600_000);
+    expect(await h.runtime.tools.bodyTune({ param, to: 900_000 })).toMatchObject({ applied: true });
+    expect(await h.runtime.tools.bodyTune({ param, to: 600_000 })).toMatchObject({
+      applied: false,
+      reason: 'safety: cannot loosen',
+    });
+    await h.runtime.stop();
+  });
+
+  it.each(['record', 'context'] as const)(
+    'delivers the ten-minute disk warning while a %s rate warning stays latched',
+    async (level) => {
+      const h = harness();
+      await h.runtime.start();
+      await h.agent({ type: 'created', sessionId: 's' });
+      await h.agent({ type: 'pre-step', sessionId: 's' });
+      await h.agent({ type: 'post-step', sessionId: 's' });
+      if (level === 'record') await h.runtime.tools.bodyTune({ param: 'deliveryLevel.body.rate', to: level });
+      const gib = 1024 ** 3;
+      const disk = (free: number) =>
+        mkBody({
+          disks: {
+            ...diskFact([{ mount: '/fixture', total: 500 * gib, free: free * gib, observedAt: Date.now() }]),
+            observedAt: Date.now(),
+          },
+        });
+      await h.sample(disk(88));
+      await h.advance(60_000);
+      await h.sample(disk(85));
+      expect(h.runtime.events().find((event) => event.subject === 'rate:disk-drop:disk:/fixture')).toMatchObject({
+        level,
+      });
+      for (let minute = 2; minute <= 10; minute++) {
+        await h.advance(60_000);
+        await h.sample(disk(88 - 3 * minute));
+      }
+      expect(h.runtime.events().filter((event) => event.subject === 'rate:disk-eta:disk:/fixture')).toHaveLength(0);
+      await h.advance(60_000);
+      await h.sample(disk(55));
+      await h.agent({ type: 'pre-step', sessionId: 's' });
+      expect(h.delivered.flatMap((intent) => intent.update.changes)).toContainEqual(
+        expect.objectContaining({
+          level: 'context',
+          signal: expect.objectContaining({
+            subject: 'rate:disk-eta:disk:/fixture',
+            data: expect.objectContaining({ timeToFloorMs: 600_000 }),
+          }),
+        }),
+      );
+      await h.advance(60_000);
+      await h.sample(disk(52));
+      expect(h.runtime.events().filter((event) => event.subject === 'rate:disk-eta:disk:/fixture')).toHaveLength(1);
+      await h.runtime.stop();
+    },
+  );
+
+  it('delivers the ten-minute context warning after a tuned twenty-minute warning stays latched', async () => {
+    const h = harness();
+    await h.runtime.start();
+    await h.runtime.tools.bodyTune({ param: 'deliveryLevel.body.rate', to: 'record' });
+    await h.runtime.tools.bodyTune({ param: 'rate.context.maxEtaMs', to: 900_000 });
+    await h.runtime.tools.bodyTune({ param: 'rate.context.maxEtaMs', to: 1_200_000 });
+    await h.agent({ type: 'created', sessionId: 's' });
+    const sample = async (minute: number) => {
+      h.token({
+        contextWindow: 25_000,
+        contextUsed: 4_000 + 1_000 * minute,
+        contextWindowSource: 'configured',
+        sessionUsage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      });
+      await h.agent({ type: 'pre-step', sessionId: 's' });
+      await h.sample();
+      await h.agent({ type: 'post-step', sessionId: 's' });
+    };
+    await sample(0);
+    for (let minute = 1; minute <= 11; minute++) {
+      await h.advance(60_000);
+      await sample(minute);
+    }
+    await h.agent({ type: 'pre-step', sessionId: 's' });
+    expect(h.delivered.flatMap((intent) => intent.update.changes)).toContainEqual(
+      expect.objectContaining({
+        level: 'context',
+        signal: expect.objectContaining({
+          subject: 'rate:context-critical-eta',
+          data: expect.objectContaining({ timeToFloorMs: 600_000 }),
+        }),
+      }),
+    );
+    await h.runtime.stop();
+  });
+
   it('applies, guards and reverts merge windows and delivery levels', async () => {
     const h = harness();
     await h.runtime.start();
@@ -1346,13 +1493,18 @@ describe('host runtime', () => {
     expect(await h.runtime.tools.bodyTune({ param: 'deliveryLevel.body.rate', to: 'record' })).toMatchObject({
       applied: true,
     });
-    expect(await h.runtime.tools.bodyTune({ param: 'deliveryLevel.file.burst', to: 'record' })).toMatchObject({
+    const burst = await h.runtime.tools.bodyTune({ param: 'deliveryLevel.file.burst', to: 'record' });
+    expect(burst).toMatchObject({
       applied: true,
     });
     expect(await h.runtime.tools.bodyTune({ param: 'deliveryLevel.file.burst', to: 'wake' })).toMatchObject({
       applied: false,
     });
     await h.runtime.actions.revertTuning(window.change.id);
+    expect(await h.runtime.actions.revertTuning(burst.change.id)).toMatchObject({ applied: true });
+    expect(h.runtime.body.tuner.get('deliveryLevel.file.burst')).toBe('wake');
+    for (let i = 0; i < 51; i++) await h.file({ path: `/workspace/${i}.ts`, change: 'delete' });
+    expect(h.runtime.events().find((event) => event.kind === 'file.burst')).toMatchObject({ level: 'wake' });
     expect(h.runtime.body.tuner.get('mergeWindowMs')).toBe(2_000);
     await h.runtime.stop();
   });
@@ -1374,6 +1526,7 @@ describe('host runtime', () => {
     await first.runtime.stop();
     if (!saved) throw new Error('missing snapshot');
     const legacy = JSON.parse(saved);
+    legacy.version = 1;
     const tuner = JSON.parse(legacy.tuner);
     tuner.values = tuner.values.filter(
       ([key]: [string, unknown]) =>
@@ -1439,6 +1592,63 @@ describe('host runtime', () => {
       Object.assign(restored.ports.storage, storage);
       await restored.runtime.start();
       expect(restored.runtime.body.tuner.tuningDisabled).toBe('restore-failed');
+      await restored.runtime.stop();
+    }
+  });
+
+  it('rejects damaged or disguised snapshots without silently restoring wake', async () => {
+    let saved: string | undefined;
+    const storage = {
+      load: async (key: string) => (key === 'body' ? saved : undefined),
+      save: async (key: string, value: string) => {
+        if (key === 'body') saved = value;
+      },
+    };
+    const first = harness();
+    Object.assign(first.ports.storage, storage);
+    await first.runtime.start();
+    await first.runtime.tools.bodyTune({ param: 'deliveryLevel.file.burst', to: 'context' });
+    await first.advance(86_400_001);
+    await first.runtime.stop();
+    if (!saved) throw new Error('missing snapshot');
+    const valid = saved;
+    expect(JSON.parse(valid).version).toBe(2);
+    for (const damage of [
+      'missing-added',
+      'disguised-legacy',
+      'disguised-history-only',
+      'unknown-applied',
+      'bad-baseline',
+      'forged-wake',
+    ]) {
+      const snapshot = JSON.parse(valid);
+      const tuner = JSON.parse(snapshot.tuner);
+      if (damage === 'missing-added' || damage === 'disguised-legacy' || damage === 'disguised-history-only') {
+        tuner.values = tuner.values.filter(
+          ([key]: [string, unknown]) =>
+            key !== 'mergeWindowMs' && key !== 'fileMergeWindowMs' && !key.startsWith('deliveryLevel.'),
+        );
+        if (damage !== 'missing-added') snapshot.version = 1;
+        if (damage === 'disguised-history-only') tuner.applied = [];
+      }
+      if (damage === 'unknown-applied') {
+        tuner.applied[0].param = 'unknown-param';
+        tuner.log[0].param = 'unknown-param';
+      }
+      if (damage === 'bad-baseline') snapshot.baseline = 'broken';
+      if (damage === 'forged-wake') {
+        tuner.values.find(([key]: [string, unknown]) => key === 'deliveryLevel.file.burst')[1] = 'wake';
+      }
+      snapshot.tuner = JSON.stringify(tuner);
+      saved = JSON.stringify(snapshot);
+      const restored = harness();
+      Object.assign(restored.ports.storage, storage);
+      await restored.runtime.start();
+      expect(restored.runtime.body.tuner.tuningDisabled, damage).toBe('restore-failed');
+      expect(restored.runtime.body.tuner.get('deliveryLevel.file.burst'), damage).not.toBe('wake');
+      await expect(restored.runtime.tools.bodyTune({ param: 'rate.rss.maxRatio', to: 0.6 })).rejects.toThrow(
+        'restore-failed',
+      );
       await restored.runtime.stop();
     }
   });

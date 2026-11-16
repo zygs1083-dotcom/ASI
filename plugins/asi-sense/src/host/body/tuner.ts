@@ -205,6 +205,9 @@ export class Tuner {
     }
     const v = validateSnapshot(data, Object.fromEntries(this.store.specs));
     if (v === undefined || (v.disabled === 'restore-failed' && v.values.length === 0)) {
+      this.store.reset();
+      if (this.store.specs.get('deliveryLevel.file.burst')?.choices?.includes('context'))
+        this.store.values.set('deliveryLevel.file.burst', 'context');
       this.store.disabled = 'restore-failed';
       this.store.resetIds();
       this.store.restored = true;
