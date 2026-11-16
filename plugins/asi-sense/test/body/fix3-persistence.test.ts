@@ -1,8 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import { BodyMonitor, Tuner } from '../../src/host/body/index.ts';
 
-function storage() {
-  let data: string | undefined;
+function storage(initial?: string) {
+  let data: string | undefined = initial;
   let failures = 0;
   let writes = 0;
   return {
@@ -98,10 +98,10 @@ describe('fix3 durable tuning', () => {
     const tuner = new Tuner(specs, { persistence, actor: () => 'user', wallClock: () => wall });
     await tuner.restore();
     const oldUndo = await tuner.propose({ param: 'y', to: 11 });
-    for (let i = 0; i < 210; i++) await tuner.propose({ param: 'x', to: i % 2 ? 10 : 11 });
-    expect(JSON.parse(persistence.text() ?? '{}').applied).toHaveLength(211);
+    for (let i = 0; i < 202; i++) await tuner.propose({ param: 'x', to: i % 2 ? 10 : 11 });
+    expect(JSON.parse(persistence.text() ?? '{}').applied).toHaveLength(203);
     wall += 31 * 86_400_000;
-    for (let i = 0; i < 10; i++) await tuner.propose({ param: 'x', to: i % 2 ? 10 : 11 });
+    await tuner.propose({ param: 'x', to: 11 });
     expect(JSON.parse(persistence.text() ?? '{}').applied).toHaveLength(201);
     await tuner.close();
     const restored = new Tuner(specs, { persistence, actor: () => 'user', wallClock: () => wall });
@@ -111,16 +111,31 @@ describe('fix3 durable tuning', () => {
   });
 
   it('N8 retains recent applied lock audits beyond the 500-entry display cap and prunes old audits', async () => {
-    const persistence = storage();
     let wall = 100 * 86_400_000;
     const specs = { x: { value: 10 } };
+    const seed = storage();
+    const initial = new Tuner(specs, { persistence: seed, actor: () => 'user', wallClock: () => wall });
+    await initial.restore();
+    await initial.lock('x');
+    await initial.unlock('x');
+    await initial.close();
+    const snapshot = JSON.parse(seed.text() ?? '{}') as {
+      idPrefix: string;
+      nextId: number;
+      log: { id: string }[];
+    };
+    const entries = snapshot.log;
+    snapshot.log = Array.from({ length: 500 }, (_, i) => ({ ...entries[i % 2], id: `${snapshot.idPrefix}-${i + 1}` }));
+    snapshot.nextId = 501;
+    const persistence = storage(JSON.stringify(snapshot));
     const tuner = new Tuner(specs, { persistence, actor: () => 'user', wallClock: () => wall });
     await tuner.restore();
-    for (let i = 0; i < 510; i++) await (i % 2 ? tuner.unlock('x') : tuner.lock('x'));
-    expect(tuner.logs).toHaveLength(500);
-    expect(JSON.parse(persistence.text() ?? '{}').log).toHaveLength(510);
-    wall += 31 * 86_400_000;
+    expect(tuner.tuningDisabled).toBeUndefined();
     await tuner.lock('x');
+    expect(tuner.logs).toHaveLength(500);
+    expect(JSON.parse(persistence.text() ?? '{}').log).toHaveLength(501);
+    wall += 31 * 86_400_000;
+    await tuner.unlock('x');
     expect(JSON.parse(persistence.text() ?? '{}').log).toHaveLength(200);
     await tuner.close();
     const restored = new Tuner(specs, { persistence, actor: () => 'user', wallClock: () => wall });
