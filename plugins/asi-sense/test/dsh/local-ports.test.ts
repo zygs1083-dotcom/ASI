@@ -6,6 +6,7 @@ const fsMocks = vi.hoisted(() => ({
   watch: vi.fn(),
   existsSync: vi.fn(),
   lstatSync: vi.fn(),
+  statSync: vi.fn(),
 }));
 
 vi.mock('node:fs', async (importOriginal) => ({
@@ -24,6 +25,7 @@ describe('local file watcher timestamps', () => {
     vi.setSystemTime(10_000);
     let emit!: (event: 'rename' | 'change', filename: string | null) => void;
     const close = vi.fn();
+    fsMocks.statSync.mockReturnValue({ isDirectory: () => true });
     fsMocks.watch.mockImplementation((_root, _options, cb) => {
       emit = cb;
       return { on: vi.fn(), close };
@@ -42,7 +44,7 @@ describe('local file watcher timestamps', () => {
       throw new Error('missing');
     });
     emit('change', 'missing.txt');
-    fsMocks.existsSync.mockReturnValue(false);
+    fsMocks.existsSync.mockImplementation((path: string) => path === '/workspace');
     emit('rename', 'deleted.txt');
     expect(events).toEqual([
       { path: '/workspace/new.txt', change: 'add', at: 10_500 },
@@ -53,5 +55,79 @@ describe('local file watcher timestamps', () => {
     ]);
     watcher.close();
     expect(close).toHaveBeenCalledOnce();
+  });
+});
+
+describe('missing file watcher roots', () => {
+  it('watches the nearest existing ancestor, filters siblings, and switches when the target appears', () => {
+    const paths = new Set(['/sandbox']);
+    const callbacks = new Map<string, (event: 'rename' | 'change', filename: string | null) => void>();
+    const closed: string[] = [];
+    fsMocks.existsSync.mockImplementation((path: string) => paths.has(path));
+    fsMocks.statSync.mockImplementation((path: string) => {
+      if (!paths.has(path)) throw Object.assign(new Error('missing'), { code: 'ENOENT' });
+      return { isDirectory: () => true };
+    });
+    fsMocks.lstatSync.mockImplementation((path: string) => {
+      if (!paths.has(path)) throw Object.assign(new Error('missing'), { code: 'ENOENT' });
+      return { mtimeMs: 0, isDirectory: () => true };
+    });
+    fsMocks.watch.mockImplementation((root: string, _options, cb) => {
+      if (!paths.has(root)) throw Object.assign(new Error('missing'), { code: 'ENOENT' });
+      callbacks.set(root, cb);
+      return { on: vi.fn(), close: () => closed.push(root) };
+    });
+    const events: string[] = [];
+    const ports = localPorts({ logger: { warn: vi.fn() } } as unknown as Context, '/storage');
+    const watcher = ports.files.watch('/sandbox/parent/target', (event) => events.push(event.path));
+    expect([...callbacks.keys()]).toEqual(['/sandbox']);
+    paths.add('/sandbox/sibling');
+    callbacks.get('/sandbox')?.('rename', 'sibling');
+    expect(events).toEqual([]);
+    paths.add('/sandbox/parent');
+    paths.add('/sandbox/parent/target');
+    callbacks.get('/sandbox')?.('rename', 'parent/target');
+    expect(closed).toContain('/sandbox');
+    expect(callbacks.has('/sandbox/parent/target')).toBe(true);
+    const beforeStale = [...events];
+    callbacks.get('/sandbox')?.('rename', 'sibling');
+    expect(events).toEqual(beforeStale);
+    paths.add('/sandbox/parent/target/synthetic.txt');
+    callbacks.get('/sandbox/parent/target')?.('change', 'synthetic.txt');
+    expect(events).toContain('/sandbox/parent/target/synthetic.txt');
+    watcher.close();
+    expect(closed).toContain('/sandbox/parent/target');
+  });
+
+  it('reports an asynchronous native watcher error without fabricating a file change', () => {
+    let fail!: () => void;
+    fsMocks.statSync.mockReturnValue({ isDirectory: () => true });
+    fsMocks.watch.mockReturnValue({
+      on: (_event: string, callback: () => void) => {
+        fail = callback;
+      },
+      close: vi.fn(),
+    });
+    const events: unknown[] = [];
+    const ports = localPorts({ logger: { warn: vi.fn() } } as unknown as Context, '/storage');
+    const watcher = ports.files.watch('/sandbox', (event) => events.push(event));
+    fail();
+    expect(events).toEqual([{ path: '/sandbox', change: 'modify', watchError: true }]);
+    watcher.close();
+    fail();
+    expect(events).toHaveLength(1);
+  });
+
+  it('watches the parent directory when a missing root has a file as an ancestor', () => {
+    fsMocks.statSync.mockImplementation((path: string) => {
+      if (path === '/sandbox/file/child') throw Object.assign(new Error('not a directory'), { code: 'ENOTDIR' });
+      return { isDirectory: () => path === '/sandbox' };
+    });
+    fsMocks.watch.mockReturnValue({ on: vi.fn(), close: vi.fn() });
+    const ports = localPorts({ logger: { warn: vi.fn() } } as unknown as Context, '/storage');
+    const watcher = ports.files.watch('/sandbox/file/child', () => {});
+    expect(fsMocks.watch).toHaveBeenCalledOnce();
+    expect(fsMocks.watch.mock.calls[0]?.[0]).toBe('/sandbox');
+    watcher.close();
   });
 });

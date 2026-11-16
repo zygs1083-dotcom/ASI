@@ -14,6 +14,8 @@ import type {
   TokenSnapshot,
   ToolEvent,
 } from '../../src/host/runtime/ports.ts';
+import { Settings } from '../../src/host/runtime/settings.ts';
+import { pauseAction } from '../../src/host/runtime/tools.ts';
 import { f, mkBody } from '../body/helpers.ts';
 
 afterEach(() => vi.useRealTimers());
@@ -616,6 +618,277 @@ describe('host runtime', () => {
     await h.runtime.stop();
   });
 
+  it('isolates failed restored file rules and keeps other watches active', async () => {
+    const rules = [
+      {
+        id: 'bad',
+        match: { kind: 'file.changed', subject: '/bad/**' },
+        level: 'context',
+        createdBy: 'user',
+        approved: true,
+      },
+      {
+        id: 'good',
+        match: { kind: 'file.changed', subject: '/good/**' },
+        level: 'context',
+        createdBy: 'user',
+        approved: true,
+      },
+    ] as const;
+    const h = harness(JSON.stringify({ version: 1, paused: false, sendTitles: true, rules, disabled: [] }));
+    let good: ((event: FileChange) => void) | undefined;
+    h.ports.files.watch = (path, callback) => {
+      if (path === '/bad/') throw new Error('synthetic watch failure');
+      good = callback;
+      return { close: () => {} };
+    };
+    await h.runtime.start();
+    expect(h.runtime.state().observation.sources['files:bad']?.status).toBe('unavailable');
+    expect(h.runtime.state().observation.sources['files:good']?.status).toBe('ok');
+    good?.({ path: '/good/synthetic.txt', change: 'add' });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(h.runtime.state().env.watchedPaths.value?.['/good/synthetic.txt']?.changes).toBe(1);
+    expect(h.runtime.state().observation.sources['files:bad']?.status).toBe('unavailable');
+    await h.runtime.stop();
+  });
+
+  it('marks only the affected rule unavailable on an asynchronous watcher error', async () => {
+    const h = harness();
+    const callbacks = new Map<string, (event: FileChange) => void>();
+    const closed = new Set<string>();
+    h.ports.files.watch = (path, callback) => {
+      callbacks.set(path, callback);
+      return {
+        close: () => {
+          closed.add(path);
+        },
+      };
+    };
+    await h.runtime.start();
+    await h.runtime.tools.envWatch({
+      action: 'add',
+      rule: { id: 'other', match: { kind: 'file.changed', subject: '/other/**' }, level: 'context' },
+    });
+    const error = { path: '/other', change: 'modify' as const, watchError: true };
+    callbacks.get('/other/')?.(error);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(closed.has('/other/')).toBe(true);
+    expect(h.runtime.state().observation.sources['files:other']?.status).toBe('unavailable');
+    expect(h.runtime.state().observation.sources['files:files-wake']?.status).toBe('ok');
+    callbacks.get('/workspace/')?.({ path: '/workspace/synthetic.txt', change: 'add' });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(h.runtime.state().env.watchedPaths.value?.['/workspace/synthetic.txt']?.changes).toBe(1);
+    await h.runtime.stop();
+  });
+
+  it('serializes a watcher error with later rule refresh and reports recovery', async () => {
+    const h = harness();
+    let callback: ((event: FileChange) => void) | undefined;
+    let release!: () => void;
+    let entered!: () => void;
+    const closing = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    const barrier = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let first = true;
+    h.ports.files.watch = (path, emit) => {
+      if (path === '/workspace/') callback = emit;
+      return {
+        close: async () => {
+          if (path === '/workspace/' && first) {
+            first = false;
+            entered();
+            await barrier;
+          }
+        },
+      };
+    };
+    await h.runtime.start();
+    const error = { path: '/workspace', change: 'modify' as const, watchError: true };
+    callback?.(error);
+    await closing;
+    const add = h.runtime.tools.envWatch({
+      action: 'add',
+      rule: { id: 'other', match: { kind: 'file.changed', subject: '/other/**' }, level: 'context' },
+    });
+    release();
+    await add;
+    expect(h.runtime.state().observation.sources['files:files-wake']?.status).toBe('ok');
+    await h.runtime.stop();
+  });
+
+  it('does not persist a file rule if validation or watch activation fails', async () => {
+    const h = harness();
+    let settingsWrites = 0;
+    h.ports.storage.save = async (key) => {
+      if (key === 'settings') settingsWrites++;
+    };
+    h.ports.files.watch = (path) => {
+      if (path === '/bad/') throw new Error('synthetic watch failure');
+      return { close: () => {} };
+    };
+    await h.runtime.start();
+    await expect(
+      h.runtime.tools.envWatch({
+        action: 'add',
+        rule: { id: 'relative', match: { kind: 'file.changed', subject: 'relative/**' }, level: 'context' },
+      }),
+    ).rejects.toThrow();
+    await expect(
+      h.runtime.tools.envWatch({
+        action: 'add',
+        rule: { id: 'bad', match: { kind: 'file.changed', subject: '/bad/**' }, level: 'context' },
+      }),
+    ).rejects.toThrow('synthetic watch failure');
+    expect(settingsWrites).toBe(0);
+    expect(h.runtime.rules.list().some((rule) => rule.id === 'relative' || rule.id === 'bad')).toBe(false);
+    await h.runtime.stop();
+  });
+
+  it('does not save a newly staged rule when its watcher fails before commit', async () => {
+    const h = harness();
+    let settingsWrites = 0;
+    h.ports.storage.save = async (key) => {
+      if (key === 'settings') settingsWrites++;
+    };
+    h.ports.files.watch = (path, callback) => {
+      if (path === '/bad/') {
+        const event = { path: '/bad', change: 'modify' as const, watchError: true };
+        void Promise.resolve().then(() => callback(event));
+      }
+      return { close: () => {} };
+    };
+    await h.runtime.start();
+    await expect(
+      h.runtime.tools.envWatch({
+        action: 'add',
+        rule: { id: 'bad', match: { kind: 'file.changed', subject: '/bad/**' }, level: 'context' },
+      }),
+    ).rejects.toThrow();
+    expect(settingsWrites).toBe(0);
+    expect(h.runtime.rules.list().some((rule) => rule.id === 'bad')).toBe(false);
+    await h.runtime.stop();
+  });
+
+  it('rechecks a staged watcher when its settings commit was queued', async () => {
+    const h = harness();
+    let release!: () => void;
+    let entered!: () => void;
+    let watching!: () => void;
+    let callback: ((event: FileChange) => void) | undefined;
+    const saving = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    const ready = new Promise<void>((resolve) => {
+      watching = resolve;
+    });
+    const barrier = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let writes = 0;
+    h.ports.storage.save = async (key) => {
+      if (key === 'settings') {
+        writes++;
+        entered();
+        await barrier;
+      }
+    };
+    h.ports.files.watch = (path, emit) => {
+      if (path === '/bad/') {
+        callback = emit;
+        watching();
+      }
+      return { close: () => {} };
+    };
+    await h.runtime.start();
+    const titles = h.runtime.actions.setSendTitles(false);
+    await saving;
+    const add = h.runtime.tools.envWatch({
+      action: 'add',
+      rule: { id: 'bad', match: { kind: 'file.changed', subject: '/bad/**' }, level: 'context' },
+    });
+    const rejected = expect(add).rejects.toThrow('file watch activation failed');
+    await ready;
+    const error = { path: '/bad', change: 'modify' as const, watchError: true };
+    callback?.(error);
+    release();
+    await titles;
+    await rejected;
+    expect(writes).toBe(1);
+    expect(h.runtime.rules.list().some((rule) => rule.id === 'bad')).toBe(false);
+    await h.runtime.stop();
+  });
+
+  it('closes a staged watch when saving the new rule fails', async () => {
+    const h = harness();
+    const watched = new Set<string>();
+    h.ports.files.watch = (path) => {
+      watched.add(path);
+      return {
+        close: () => {
+          watched.delete(path);
+        },
+      };
+    };
+    await h.runtime.start();
+    h.failSave(true);
+    await expect(
+      h.runtime.tools.envWatch({
+        action: 'add',
+        rule: { id: 'new', match: { kind: 'file.changed', subject: '/new/**' }, level: 'context' },
+      }),
+    ).rejects.toThrow('uninstalled');
+    expect(watched.has('/new/')).toBe(false);
+    expect(h.runtime.rules.list().some((rule) => rule.id === 'new')).toBe(false);
+    h.failSave(false);
+    await h.runtime.stop();
+    expect(watched.size).toBe(0);
+  });
+
+  it('closes staged watches when pausing during a pending rule save', async () => {
+    const h = harness();
+    const watched = new Set<string>();
+    let release!: () => void;
+    let entered!: () => void;
+    const saving = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    const barrier = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    h.ports.files.watch = (path) => {
+      watched.add(path);
+      return {
+        close: () => {
+          watched.delete(path);
+        },
+      };
+    };
+    h.ports.storage.save = async (key, value) => {
+      if (key === 'settings' && JSON.parse(value).rules.some((rule: { id: string }) => rule.id === 'new')) {
+        entered();
+        await barrier;
+      }
+    };
+    await h.runtime.start();
+    const add = h.runtime.tools.envWatch({
+      action: 'add',
+      rule: { id: 'new', match: { kind: 'file.changed', subject: '/new/**' }, level: 'context' },
+    });
+    await saving;
+    const pause = h.runtime.actions.pause(true);
+    await Promise.resolve();
+    release();
+    await Promise.all([add, pause]);
+    expect(h.runtime.rules.settings().paused).toBe(true);
+    expect(watched.size).toBe(0);
+    await h.runtime.actions.pause(false);
+    expect([...watched].sort()).toEqual(['/new/', '/workspace/']);
+    await h.runtime.stop();
+  });
+
   it('deduplicates one event delivered by overlapping watched roots', async () => {
     const h = harness();
     const watches = new Map<string, (event: FileChange) => void>();
@@ -868,6 +1141,106 @@ describe('host runtime', () => {
     expect(h.delivered.map((intent) => intent.kind)).toEqual(['followup']);
     await h.runtime.stop();
     expect(h.probeCount()).toBe(0);
+  });
+
+  it('serializes overlapping pause and resume transactions until resources and storage agree', async () => {
+    const h = harness();
+    let release!: () => void;
+    const barrier = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let closeStarted = false;
+    let activeWatches = 0;
+    let persisted = false;
+    h.ports.files.watch = () => {
+      activeWatches++;
+      return {
+        close: async () => {
+          closeStarted = true;
+          await barrier;
+          activeWatches--;
+        },
+      };
+    };
+    h.ports.storage.save = async (key, value) => {
+      if (key === 'settings') persisted = JSON.parse(value).paused;
+    };
+    await h.runtime.start();
+    const pause = h.runtime.actions.pause(true);
+    while (!closeStarted) await Promise.resolve();
+    let secondFinished = false;
+    const secondPause = h.runtime.actions.pause(true).then(() => {
+      secondFinished = true;
+    });
+    const resume = h.runtime.actions.pause(false);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(secondFinished).toBe(false);
+    expect(h.probeCount()).toBe(0);
+    release();
+    await Promise.all([pause, secondPause, resume]);
+    expect(h.runtime.rules.settings().paused).toBe(false);
+    expect(persisted).toBe(false);
+    expect(h.probeCount()).toBe(1);
+    expect(activeWatches).toBe(1);
+    await h.runtime.stop();
+    expect(activeWatches).toBe(0);
+  });
+
+  it('recovers from a failed pause save before processing the next pause intent', async () => {
+    const h = harness();
+    let fail = true;
+    let persisted = false;
+    h.ports.storage.save = async (key, value) => {
+      if (key !== 'settings') return;
+      if (fail) {
+        fail = false;
+        throw new Error('uninstalled');
+      }
+      persisted = JSON.parse(value).paused;
+    };
+    await h.runtime.start();
+    const pause = h.runtime.actions.pause(true);
+    const resume = h.runtime.actions.pause(false);
+    await expect(pause).rejects.toThrow('uninstalled');
+    await resume;
+    expect(h.runtime.rules.settings().paused).toBe(false);
+    expect(persisted).toBe(false);
+    expect(h.probeCount()).toBe(1);
+    expect(h.watcherCount()).toBe(1);
+    await h.runtime.stop();
+  });
+
+  it('restores the paused resources if saving a resume fails', async () => {
+    const h = harness();
+    await h.runtime.start();
+    await h.runtime.actions.pause(true);
+    h.failSave(true);
+    await expect(h.runtime.actions.pause(false)).rejects.toThrow('uninstalled');
+    expect(h.runtime.rules.settings().paused).toBe(true);
+    expect(h.probeCount()).toBe(0);
+    expect(h.watcherCount()).toBe(0);
+    h.failSave(false);
+    await h.runtime.actions.pause(false);
+    expect(h.probeCount()).toBe(1);
+    expect(h.watcherCount()).toBe(1);
+    await h.runtime.stop();
+  });
+
+  it('rejects subsequent pause requests after rollback fails', async () => {
+    const settings = new Settings({ load: async () => undefined, save: async () => {} }, []);
+    let paused = false;
+    const pause = pauseAction(
+      settings,
+      () => paused,
+      async (value) => {
+        paused = value;
+        throw new Error('synthetic resource failure');
+      },
+      () => {},
+    );
+    await expect(pause(true)).rejects.toThrow('pause failed and rollback failed');
+    await expect(pause(false)).rejects.toThrow('pause state unavailable');
   });
 
   it('notifies state subscribers at the earliest fact TTL deadline', async () => {
