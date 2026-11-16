@@ -1,6 +1,6 @@
 import type { ChildProcessWithoutNullStreams } from 'node:child_process';
 import type { BodyProbe } from '@asi/body-probe';
-import type { Body, TuningValue, WatchRule } from '@asi/sense-types';
+import type { Body, JobSummary, TuningValue, WatchRule } from '@asi/sense-types';
 import type { DeliveryIntent } from '../attention/pipeline.ts';
 
 export type Unsubscribe = () => void;
@@ -28,6 +28,7 @@ export interface ToolEvent {
 export interface JobEvent {
   type: 'started' | 'exited';
   id: string;
+  sessionId?: string;
   command?: string;
   pid?: number;
   ppid?: number;
@@ -45,6 +46,7 @@ export interface DshPort {
   onJob(cb: (event: JobEvent) => Promise<void>): Unsubscribe;
   deliver(sessionId: string, intent: DeliveryIntent): Promise<void>;
   tokenSnapshot(sessionId: string): Promise<TokenSnapshot | undefined>;
+  modelJobs?(sessionId: string): JobSummary[];
   openPermissionSettings?(): Promise<void>;
 }
 export interface StoragePort {

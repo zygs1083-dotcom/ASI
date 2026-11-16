@@ -29,6 +29,49 @@ const deltaRule = (over: Partial<RateRule> = {}): RateRule =>
 const ev = (rules: readonly RateRule[], thr?: (p: string, f: number) => number) => new RateEvaluator(rules, thr);
 const GIB = 1024 ** 3;
 
+it('keeps soft and hard context ETA latches independent across session generations', () => {
+  const evaluator = ev([
+    { id: 'c', metric: 'context', windowMs: 30_000, direction: 'down', maxEtaMs: 20_000, hardEtaMs: 5_000, floor: 0 },
+  ]);
+  const frame = (owner: string, at: number, remaining: number, observedAt = at, sessions = ['a', 'b']) => ({
+    ...sample(ctxBody(100, 100 - remaining), at, undefined, at),
+    contextSession: owner,
+    contextSessions: sessions,
+    rateTimes: { context: { mono: observedAt, wall: observedAt } },
+  });
+  let previous = frame('a', 0, 100);
+  let state: BodyThresholdState = {};
+  const step = (next: ReturnType<typeof frame>) => {
+    const result = evaluator.evaluate(previous, next, state);
+    previous = next;
+    state = result.state;
+    return result.signals;
+  };
+  expect(step(previous)).toHaveLength(0);
+  expect(step(frame('a', 1_000, 90))).toHaveLength(1);
+  expect(step(frame('b', 2_000, 100))).toHaveLength(0);
+  expect(step(frame('b', 3_000, 90))).toHaveLength(1);
+  expect(step(frame('a', 7_000, 90, 1_000))).toHaveLength(1);
+  expect(step(frame('b', 8_000, 90, 3_000))).toHaveLength(1);
+  expect(step(frame('a', 9_000, 90, 1_000, ['a']))).toHaveLength(0);
+  const latch = (state as AdaptiveState)[BODY_HISTORY]?.fs?.rate?.latch ?? {};
+  expect(latch['rate:c:soft@a']).toBe('warn');
+  expect(latch['rate:c:hard@a']).toBe('warn');
+  expect(Object.keys(latch).some((key) => key.endsWith('@b'))).toBe(false);
+});
+
+it('does not embed disk paths in the rate alert identifier', () => {
+  const evaluator = ev([deltaRule({ id: 'disk', metric: 'disk:*', direction: 'down', maxDelta: 1 })]);
+  const result = evaluator.evaluate(
+    sample(diskBody(100, 1000, '/private/fixture/volume'), 0),
+    sample(diskBody(80, 1000, '/private/fixture/volume'), 1_000),
+    {},
+  );
+  expect(result.signals).toHaveLength(1);
+  expect(result.signals[0].id).toMatch(/^body\.rate:[a-f0-9]{64}$/);
+  expect(result.signals[0].id).not.toContain('/private/');
+});
+
 it('stamps the first occurrence of each reading on the monotonic observation timeline', () => {
   const body = diskBody(500);
   body.disks.observedAt = 1_000;

@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import type { Body, BodyEvaluation, BodyEvaluator, BodyThresholdSample, BodyThresholdState } from '@asi/sense-types';
 import { type BodySignal, type Metric, readMetrics } from './metrics.ts';
 import { type AdaptiveState, BODY_HISTORY, type RateHistory, type RateWindow } from './state.ts';
@@ -39,7 +40,12 @@ interface Point {
 }
 
 export type RateTimes = Record<string, { mono: number; wall: number }>;
-type RateSample = BodyThresholdSample & { rateTimes?: RateTimes; evaluatedAt?: { mono: number; wall: number } };
+type RateSample = BodyThresholdSample & {
+  rateTimes?: RateTimes;
+  evaluatedAt?: { mono: number; wall: number };
+  contextSession?: string;
+  contextSessions?: string[];
+};
 type EvaluatedWindow = RateWindow & { evaluationMono?: number };
 
 export function captureRateTimes(body: Body, mono: number, receivedWall: number, previous: RateTimes): RateTimes {
@@ -146,22 +152,36 @@ export class RateEvaluator implements BodyEvaluator {
     }
     const evaluation = (next as RateSample).evaluatedAt ?? { mono, wall: next.at };
     const metrics = readMetrics({ ...next, at: next.at + Math.max(0, evaluation.mono - mono) });
+    const contextSession = (next as RateSample).contextSession;
+    const sessions = (next as RateSample).contextSessions;
+    const storageKey = (key: string) => (key === 'context' && contextSession ? `context@${contextSession}` : key);
     const windows: Record<string, EvaluatedWindow> = {};
     for (const [k, w] of Object.entries(inHist?.windows ?? {})) {
-      if (metrics.has(k)) windows[k] = w; // missing metric → window dropped, latch retained
+      const owner = k.startsWith('context@') ? k.slice('context@'.length) : undefined;
+      if (
+        (owner !== undefined &&
+          (!sessions || sessions.includes(owner)) &&
+          (owner !== contextSession || metrics.has('context'))) ||
+        metrics.has(k)
+      )
+        windows[k] = w; // missing metric → window dropped, latch retained
     }
     const updated = new Map<string, EvaluatedWindow>();
     const windowFor = (key: string, metric: Metric): EvaluatedWindow => {
-      const done = updated.get(key);
+      const stored = storageKey(key);
+      const done = updated.get(stored);
       if (done) return done;
-      const old = windows[key];
+      const old = windows[stored];
       const stamp = (next as RateSample).rateTimes?.[key];
       const observedMono = stamp?.mono ?? mono;
       let pts: Point[];
       if (old) {
         pts = old.points.slice();
       } else {
-        const seed = Number.isFinite(prev.at) ? readMetrics(prev).get(key) : undefined;
+        const seed =
+          Number.isFinite(prev.at) && (key !== 'context' || (prev as RateSample).contextSession === contextSession)
+            ? readMetrics(prev).get(key)
+            : undefined;
         const prior = (prev as RateSample).rateTimes?.[key];
         const pMono = prior?.mono ?? prev.monotonicAt;
         pts =
@@ -180,18 +200,24 @@ export class RateEvaluator implements BodyEvaluator {
         lastMono: old ? Math.max(old.lastMono, observedMono) : observedMono,
         evaluationMono,
       };
-      updated.set(key, w);
+      updated.set(stored, w);
       return w;
     };
     // Per-stream latch (authoritative, metadata); `pub` keys are projections.
     const streamLatch: RateHistory['latch'] = { ...inHist?.latch };
+    if (sessions) {
+      for (const key of Object.keys(streamLatch)) {
+        const index = key.indexOf('@');
+        if (index >= 0 && !sessions.includes(key.slice(index + 1))) delete streamLatch[key];
+      }
+    }
     const signals: BodySignal[] = [];
     for (const rule of this.rules) {
       for (const key of this.metricKeys(rule, metrics)) {
         const metric = metrics.get(key) as Metric;
         const w = windowFor(key, metric);
         const pts = w.points.filter((p) => p.at >= (w.evaluationMono ?? evaluation.mono) - rule.windowMs);
-        const cached = !!windows[key] && w.lastMono === windows[key].lastMono;
+        const cached = !!windows[storageKey(key)] && w.lastMono === windows[storageKey(key)].lastMono;
         if (rule.maxEtaMs === undefined && rule.hardEtaMs === undefined && cached) continue;
         if (pts.length < 2) continue;
         const sig = this.step(rule, key, metric, pts, next, pub, streamLatch, evaluation, cached);
@@ -252,9 +278,12 @@ export class RateEvaluator implements BodyEvaluator {
       limit = this.liveLimit((rule.maxDelta ?? rule.maxSlope ?? rule.maxRatio) as number, rule.param);
     }
     const latchKey = rule.metric.endsWith(':*') ? `rate:${rule.id}:${key}` : `rate:${rule.id}`;
-    const was = streamLatch[latchKey] === 'warn';
-    const softKey = `${latchKey}:soft`;
-    const hardKey = `${latchKey}:hard`;
+    const contextSession = (next as RateSample).contextSession;
+    const suffix = key === 'context' && contextSession ? `@${contextSession}` : '';
+    const storedLatch = `${latchKey}${suffix}`;
+    const was = streamLatch[storedLatch] === 'warn';
+    const softKey = `${latchKey}:soft${suffix}`;
+    const hardKey = `${latchKey}:hard${suffix}`;
     const softWas = rule.hardEtaMs === undefined ? was : streamLatch[softKey] === 'warn';
     const hardWas = streamLatch[hardKey] === 'warn';
     const soft =
@@ -269,7 +298,7 @@ export class RateEvaluator implements BodyEvaluator {
       streamLatch[softKey] = soft ? 'warn' : 'normal';
       streamLatch[hardKey] = hard ? 'warn' : 'normal';
     }
-    streamLatch[latchKey] = active ? 'warn' : 'normal';
+    streamLatch[storedLatch] = active ? 'warn' : 'normal';
     pub[latchKey] = active ? 'warn' : 'normal';
     if (active === was && !(active && hard && !hardWas)) return undefined;
     const severity = active ? 'warn' : 'normal';
@@ -290,7 +319,17 @@ export class RateEvaluator implements BodyEvaluator {
       data.etaToFloorMs = data.timeToFloorMs = eta;
     }
     return {
-      id: `${next.source.id}:${latchKey}:${next.monotonicAt}:${severity}`,
+      id: `body.rate:${createHash('sha256')
+        .update(
+          JSON.stringify([
+            next.source.id,
+            latchKey,
+            next.monotonicAt,
+            severity,
+            key === 'context' ? contextSession : undefined,
+          ]),
+        )
+        .digest('hex')}`,
       kind: 'body.rate',
       at: evaluation.wall,
       source: next.source,

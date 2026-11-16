@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import type { DeliveryLevel } from '@asi/sense-types';
-import type { Bucket } from './buckets.ts';
+import { type Bucket, privateBucket } from './buckets.ts';
 import type { DeliveryIntent, SessionState } from './pipeline-types.ts';
 
 /** Collaborators the drain needs from the pipeline. */
@@ -108,22 +108,33 @@ export function retargetBuckets(
     entries.push(value);
     map.set(sessionId, entries);
   };
-  for (const bucket of pending.values()) bucket.sessionId = sessionId;
-  for (const [old, buckets] of ready) {
+  for (const bucket of pending.values()) if (!privateBucket(bucket)) bucket.sessionId = sessionId;
+  for (const [old, buckets] of [...ready]) {
     if (old === sessionId) continue;
     ready.delete(old);
     for (const bucket of buckets) {
+      if (privateBucket(bucket)) {
+        const retained = ready.get(old) ?? [];
+        retained.push(bucket);
+        ready.set(old, retained);
+        continue;
+      }
       bucket.sessionId = sessionId;
       if (restore(bucket)) pending.set(bucket.id, bucket);
       else append(ready, bucket);
     }
   }
-  for (const [old, entries] of batches) {
+  for (const [old, entries] of [...batches]) {
     if (old === sessionId) continue;
     batches.delete(old);
     for (const batch of entries) {
       const context: Bucket[] = [];
+      const retained: Bucket[] = [];
       for (const bucket of batch.buckets) {
+        if (privateBucket(bucket)) {
+          retained.push(bucket);
+          continue;
+        }
         bucket.sessionId = sessionId;
         if (restore(bucket)) pending.set(bucket.id, bucket);
         else context.push(bucket);
@@ -132,6 +143,12 @@ export function retargetBuckets(
         const next = build(sessionId, context, batch.intent.update.at);
         next.aliases = [...(batch.aliases ?? []), ...(batch.intent.deliveryId ? [batch.intent.deliveryId] : [])];
         append(batches, next);
+      }
+      if (retained.length) {
+        const next = retained.length === batch.buckets.length ? batch : build(old, retained, batch.intent.update.at);
+        const remaining = batches.get(old) ?? [];
+        remaining.push(next);
+        batches.set(old, remaining);
       }
     }
   }

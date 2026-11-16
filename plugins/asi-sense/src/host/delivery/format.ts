@@ -8,6 +8,7 @@ export interface FormatOptions {
    * @default true
    */
   includeWindowTitles?: boolean;
+  includeJobCommands?: boolean;
 }
 
 const WINDOW_KINDS: ReadonlySet<string> = new Set(['window.focused', 'window.title-changed']);
@@ -47,11 +48,29 @@ function durationMs(s: Signal): number | undefined {
   return undefined;
 }
 
-function changeLines(ch: EnvChange, includeTitles: boolean): string[] {
+function changeLines(ch: EnvChange, includeTitles: boolean, includeJobCommands: boolean): string[] {
   const s = ch.signal;
   let main: string;
+  const summary = s.data.jobSummary;
+  if (summary && typeof summary === 'object' && !Array.isArray(summary)) {
+    const { total, omitted, recent } = summary as Record<string, unknown>;
+    if (typeof total === 'number' && typeof omitted === 'number' && Array.isArray(recent)) {
+      return [
+        `jobs: ${total} events`,
+        ...recent.flatMap((item: unknown) => {
+          if (!item || typeof item !== 'object') return [];
+          const { id, kind, count, exitCode } = item as Record<string, unknown>;
+          if (typeof id !== 'string' || !['job.exited', 'job.started'].includes(String(kind))) return [];
+          return [
+            `job: \`${esc(id)}\` ${kind === 'job.exited' ? 'exited' : 'started'}${typeof exitCode === 'number' ? ` ${exitCode}` : ''}${typeof count === 'number' && count > 1 ? ` ×${count}` : ''}`,
+          ];
+        }),
+        ...(omitted > 0 ? [`另有 ${omitted} 个未列出`] : []),
+      ];
+    }
+  }
   if (s.kind === 'app.activated') {
-    main = `front-app: ${esc(str(s.data.name) || s.subject)}`;
+    main = `front-app: ${esc(typeof s.data.name === 'string' ? s.data.name : s.subject)}`;
     const prev = str(s.data.previousName);
     if (prev) main += ` (was: ${esc(prev)})`;
   } else if (WINDOW_KINDS.has(s.kind)) {
@@ -60,9 +79,11 @@ function changeLines(ch: EnvChange, includeTitles: boolean): string[] {
   } else if (s.kind === 'file.changed') {
     const path = str(s.data.path) || s.subject;
     main = `file: ${esc(path)} saved${ch.count > 1 ? ` ×${ch.count}` : ''}`;
+  } else if (s.kind === 'job.started') {
+    main = `job: \`${esc(str(s.data.id) || s.subject)}\` started`;
   } else if (s.kind === 'job.exited' || s.kind === 'process.exited') {
     const label = s.kind === 'job.exited' ? 'job' : 'process';
-    const cmd = str(s.data.command) || s.subject;
+    const cmd = includeJobCommands ? str(s.data.command) || s.subject : str(s.data.id) || label;
     main = `${label}: \`${esc(cmd)}\` exited`;
     if (typeof s.data.exitCode === 'number') main += ` ${s.data.exitCode}`;
     const dur = durationMs(s);
@@ -72,6 +93,28 @@ function changeLines(ch: EnvChange, includeTitles: boolean): string[] {
     const v = s.data.value;
     if (typeof v === 'number' && Number.isFinite(v)) main += ` ${v}`;
     else if (typeof v === 'string') main += ` ${esc(v)}`;
+  } else if (s.kind === 'body.rate' || s.kind === 'body.anomaly' || s.kind === 'file.burst') {
+    main = `${esc(s.kind)}: ${esc(s.subject)}`;
+    if (typeof s.data.ruleId === 'string') main += ` ruleId=${esc(s.data.ruleId)}`;
+    if (typeof s.data.severity === 'string') main += ` ${esc(s.data.severity)}`;
+    for (const key of [
+      'value',
+      'baseline',
+      'deviation',
+      'slope',
+      'delta',
+      'etaToFloorMs',
+      'windowMs',
+      'created',
+      'modified',
+      'deleted',
+      'externalDeleted',
+      'agentDeleted',
+    ]) {
+      const value = s.data[key];
+      if (typeof value === 'number' && Number.isFinite(value)) main += ` ${key}=${value}`;
+    }
+    if (s.data.externalDeletionExceeded === true) main += ' externalDeletionExceeded=true';
   } else if (s.kind === 'fact.updated') {
     // Internal seam: a focused-window fact update still carries a title —
     // hide it entirely when titles are disabled.
@@ -106,7 +149,7 @@ export function formatEnvUpdate(update: EnvUpdate, options: FormatOptions = {}):
   const includeTitles = options.includeWindowTitles ?? true;
   const changes = [...update.changes].sort((a, b) => a.signal.at - b.signal.at || (a.signal.id < b.signal.id ? -1 : 1));
   const lines = [`<env-update since="${esc(hhmmss(update.since))}" source="asi-sense">`];
-  for (const ch of changes) lines.push(...changeLines(ch, includeTitles));
+  for (const ch of changes) lines.push(...changeLines(ch, includeTitles, options.includeJobCommands ?? true));
   if (update.suppressed > 0) lines.push(`suppressed: ${update.suppressed}`);
   if ((update.alreadyInjected ?? 0) > 0) lines.push(`另有 ${update.alreadyInjected} 条已在上一步注入`);
   lines.push('</env-update>');

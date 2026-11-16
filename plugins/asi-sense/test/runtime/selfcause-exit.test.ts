@@ -51,7 +51,11 @@ function harness(options: SenseOptions = {}) {
     delivered,
     agent: (event: AgentEvent) => agent(event),
     tool: (event: ToolEvent) => tool(event),
-    job: (event: JobEvent) => job(event),
+    job: async (event: JobEvent) => {
+      const item = { sessionId: 's', ...event };
+      if (item.type === 'exited') await job({ ...item, type: 'started' });
+      await job(item);
+    },
     elapseMono: (ms: number) => {
       mono += ms;
     },
@@ -135,7 +139,7 @@ describe('tool exit self-cause', () => {
       cwd: '/workspace/repo',
       exitCode: 1,
     });
-    expect(h.runtime.events().find((e) => e.subject === 'background')).toMatchObject({
+    expect(h.runtime.events().find((e) => e.subject === 'background' && e.kind === 'job.exited')).toMatchObject({
       cause: 'unknown',
       level: 'wake',
     });
@@ -162,7 +166,7 @@ describe('tool exit self-cause', () => {
     await h.tool({ type: 'post-execute', sessionId: 's', toolCallId: 'shell' });
     await h.advance(delay);
     await h.job({ type: 'exited', id: 'same-pid', pid: 42, cwd: '/workspace/repo', exitCode: 1 });
-    expect(h.runtime.events().find((e) => e.subject === 'same-pid')).toMatchObject({
+    expect(h.runtime.events().find((e) => e.subject === 'same-pid' && e.kind === 'job.exited')).toMatchObject({
       cause,
       level,
       ...(cause === 'agent' ? { reason: 'self-caused' } : {}),
@@ -186,7 +190,10 @@ describe('tool exit self-cause', () => {
     await h.tool({ type: 'post-execute', sessionId: 's', toolCallId: 'shell', pid: 42 });
     await h.advance(delay);
     await h.job({ type: 'exited', id: 'same-pid', pid: 42, exitCode: 1 });
-    expect(h.runtime.events().find((e) => e.subject === 'same-pid')).toMatchObject({ cause, level });
+    expect(h.runtime.events().find((e) => e.subject === 'same-pid' && e.kind === 'job.exited')).toMatchObject({
+      cause,
+      level,
+    });
     await h.runtime.stop();
   });
 });

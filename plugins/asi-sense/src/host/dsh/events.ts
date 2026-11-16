@@ -68,7 +68,14 @@ export function awaitedJobCwd(event: RegistryJobEvent, tools: Iterable<ActiveToo
 
 export function mapJobEvent(event: RegistryJobEvent, cwd?: string): JobEvent | undefined {
   const { job } = event;
-  if (event.type === 'registered') return { type: 'started', id: job.id, command: job.label, at: job.startedAt };
+  if (event.type === 'registered')
+    return {
+      type: 'started',
+      id: job.id,
+      command: job.label,
+      at: job.startedAt,
+      ...(job.owner ? { sessionId: job.owner } : {}),
+    };
   if (event.type !== 'settled') return undefined;
   const match =
     !event.awaited && job.kind === 'bash' && job.status === 'completed'
@@ -78,6 +85,7 @@ export function mapJobEvent(event: RegistryJobEvent, cwd?: string): JobEvent | u
     type: 'exited',
     id: job.id,
     command: job.label,
+    ...(job.owner ? { sessionId: job.owner } : {}),
     ...(cwd !== undefined ? { cwd } : {}),
     ...(job.finishedAt !== undefined ? { at: job.finishedAt } : {}),
     ...(match ? { exitCode: Number(match[1]) } : {}),

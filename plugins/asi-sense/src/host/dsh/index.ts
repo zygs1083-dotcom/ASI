@@ -13,7 +13,16 @@ export { AsiSenseRemote } from './remote.ts';
 export type { JsonObject, JsonValue, WirePanelModel, WireSenseEvent, WireSenseRule, WireSignal } from './wire-types.ts';
 
 export const name = 'asi-sense';
-export const inject = ['agents', 'jobs', 'llm', 'sessionProjections', 'systemPrompt', 'tokenMeter', 'tools'];
+export const inject = [
+  'agents',
+  'jobs',
+  'llm',
+  'sessionProjections',
+  'sessions',
+  'systemPrompt',
+  'tokenMeter',
+  'tools',
+];
 
 export interface Config {
   storageRoot: string;

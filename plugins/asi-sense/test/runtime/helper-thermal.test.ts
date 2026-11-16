@@ -107,6 +107,10 @@ it('keeps repeated thermal readings fresh without extra events and expires after
   try {
     await runtime.start();
     await settle();
+    expect(runtime.state().self.permissions).toMatchObject({
+      status: 'ok',
+      value: { 辅助功能: 'granted', '其他权限（DSH 未提供）': 'unknown' },
+    });
     await sampleBody();
     await advance(1);
     child.send({ type: 'thermal', state: 'critical' });

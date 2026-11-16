@@ -37,6 +37,7 @@ export interface JobSummary {
   id: string
   name: string
   status: string
+  owner?: string
 }
 
 export interface Body {

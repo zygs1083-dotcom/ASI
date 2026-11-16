@@ -1,4 +1,4 @@
-import type { EnvUpdate, Signal, WatchRule } from '@asi/sense-types';
+import type { DeliveryLevel, EnvUpdate, Signal, WatchRule } from '@asi/sense-types';
 import {
   type Bucket,
   type BucketDetail,
@@ -6,7 +6,9 @@ import {
   bucketLevel,
   bucketSince,
   byChangeAtId,
+  privateBucket,
   upsertBucket,
+  upsertJobs,
 } from './buckets.ts';
 import {
   batchIntent,
@@ -42,6 +44,7 @@ export class DeliveryFailure extends Error {
  */
 export class BucketDrain {
   private readonly pending = new Map<number, Bucket>();
+  private readonly jobs = new Map<string, Bucket>();
   private readonly ready = new Map<string, Bucket[]>();
   private readonly batches = new Map<string, InjectBatch[]>();
   private readonly deliverer: DrainHooks['deliverer'];
@@ -87,9 +90,19 @@ export class BucketDrain {
   nextDeadline(): number | undefined {
     let min: number | undefined;
     for (const b of this.pending.values()) {
+      if (privateBucket(b) && !this.isCurrent()(b.sessionId)) continue;
+      if (b.jobs && !b.sealed && this.blockedJobs(b.sessionId, bucketLevel(b))) continue;
       if (min === undefined || b.deadline < min) min = b.deadline;
     }
     return min;
+  }
+  private blockedJobs(sessionId: string, level: DeliveryLevel): boolean {
+    const blocks = (bucket: Bucket) => bucket.jobs && bucketLevel(bucket) === level;
+    return (
+      [...this.pending.values()].some((bucket) => bucket.sessionId === sessionId && bucket.sealed && blocks(bucket)) ||
+      (this.ready.get(sessionId)?.some(blocks) ?? false) ||
+      (this.batches.get(sessionId)?.some((batch) => batch.buckets.some(blocks)) ?? false)
+    );
   }
   retarget(sessionId: string): void {
     if (!this.isCurrent()(sessionId)) return;
@@ -100,6 +113,31 @@ export class BucketDrain {
   }
   confirm(id: string): void {
     confirmBatch(this.batches, id);
+  }
+  discardPrivate(id: string, token?: string): void {
+    const matches = (bucket: Bucket) =>
+      bucket.sessionId === id &&
+      privateBucket(bucket) &&
+      (token === undefined ||
+        [...bucket.details.values()].every((detail) => detail.latest.data.sessionToken === token));
+    const jobBucket = this.jobs.get(id);
+    if (jobBucket && matches(jobBucket)) this.jobs.delete(id);
+    for (const [key, bucket] of this.pending) {
+      if (matches(bucket)) this.pending.delete(key);
+    }
+    const ready = this.ready.get(id)?.filter((bucket) => !matches(bucket));
+    if (ready?.length) this.ready.set(id, ready);
+    else this.ready.delete(id);
+    const batches = this.batches.get(id);
+    if (batches) {
+      for (const batch of [...batches]) {
+        const retained = batch.buckets.filter((bucket) => !matches(bucket));
+        if (!retained.length) batches.splice(batches.indexOf(batch), 1);
+        else if (retained.length !== batch.buckets.length)
+          batches.splice(batches.indexOf(batch), 1, this.buildInjectBatch(id, retained, batch.intent.update.at));
+      }
+      if (!batches.length) this.batches.delete(id);
+    }
   }
   suspend(id: string): InjectBatch[] {
     const batches = this.batches.get(id) ?? [];
@@ -124,6 +162,37 @@ export class BucketDrain {
     windowMs: number,
     count = 1,
   ): void {
+    if (
+      signal.source.id === 'dsh' &&
+      signal.kind.startsWith('job.') &&
+      typeof signal.data.sessionId === 'string' &&
+      typeof signal.data.sessionToken === 'string'
+    ) {
+      let bucket = this.jobs.get(sessionId);
+      if (
+        !bucket ||
+        bucket.sealed ||
+        this.pending.get(bucket.id) !== bucket ||
+        [...bucket.details.values()].some((detail) => detail.latest.data.sessionToken !== signal.data.sessionToken)
+      ) {
+        bucket = {
+          id: ++this.seq,
+          sessionId,
+          subject: signal.subject,
+          startedAt: now,
+          deadline: now + windowMs,
+          details: new Map(),
+        };
+        this.pending.set(bucket.id, bucket);
+        this.jobs.set(sessionId, bucket);
+      }
+      if (bucket.budgetSuppressed && bucketLevel(bucket) === 'context' && level === 'wake') {
+        bucket.startedAt = now;
+        bucket.deadline = now + windowMs;
+      }
+      upsertJobs(bucket, signal, level, rule, reason);
+      return;
+    }
     upsertBucket(this.pending, signal, sessionId, level, rule, reason, now, windowMs, () => (this.seq += 1));
     if (count > 1) {
       for (const bucket of this.pending.values()) {
@@ -154,6 +223,7 @@ export class BucketDrain {
     if (!current(sessionId)) return;
     for (const b of [...this.pending.values()]) {
       if (b.sessionId !== sessionId || b.sealed) continue;
+      if (b.jobs && this.blockedJobs(sessionId, bucketLevel(b))) continue;
       if (bucketLevel(b) === 'context') {
         this.pending.delete(b.id);
         this.list(this.ready, sessionId).push(b);
@@ -189,8 +259,9 @@ export class BucketDrain {
   /** Due buckets attempted independently; failures restore the sealed bucket for a same-payload retry. */
   private async attemptDue(now: number, errors: unknown[], current: (id: string) => boolean): Promise<void> {
     for (const b of [...this.pending.values()]) {
-      if (!current(b.sessionId)) break;
+      if (!current(b.sessionId)) continue;
       if (now < b.deadline) continue;
+      if (b.jobs && !b.sealed && this.blockedJobs(b.sessionId, bucketLevel(b))) continue;
       this.pending.delete(b.id);
       b.sealed = true;
       try {
@@ -229,9 +300,15 @@ export class BucketDrain {
           d.reason = 'wake-budget';
         }
       }
-      this.suppressedGroups++;
+      if (!b.budgetSuppressed) this.suppressedGroups++;
       if (b.frozenAt === undefined) {
-        this.list(this.ready, b.sessionId).push(b); // never attempted: aggregates
+        if (b.jobs && this.blockedJobs(b.sessionId, 'context')) {
+          b.budgetSuppressed = true;
+          b.sealed = false;
+          this.pending.set(b.id, b);
+        } else {
+          this.list(this.ready, b.sessionId).push(b); // never attempted: aggregates
+        }
       } else {
         // previously attempted wake: inject separately, keeping its
         // original display time and identity — never join a fresh batch
@@ -270,7 +347,9 @@ export class BucketDrain {
     const loose = this.ready.get(sessionId);
     if (loose !== undefined && loose.length > 0) {
       this.ready.delete(sessionId);
-      this.list(this.batches, sessionId).push(this.buildInjectBatch(sessionId, loose));
+      for (const group of [loose.filter(privateBucket), loose.filter((bucket) => !privateBucket(bucket))]) {
+        if (group.length) this.list(this.batches, sessionId).push(this.buildInjectBatch(sessionId, group));
+      }
     }
     const batches = this.batches.get(sessionId);
     if (batches === undefined) return;
@@ -283,7 +362,8 @@ export class BucketDrain {
       } catch (e) {
         if (!(e instanceof DeliveryFailure) || e.cause !== undefined)
           errors.push(e instanceof DeliveryFailure ? e.cause : e);
-        if (e instanceof DeliveryFailure && e.kind !== 'deferred') batches.splice(batches.indexOf(batch), 1);
+        if (e instanceof DeliveryFailure && e.kind !== 'deferred' && batches.includes(batch))
+          batches.splice(batches.indexOf(batch), 1);
         continue;
       }
       for (const b of batch.buckets) {
@@ -292,7 +372,7 @@ export class BucketDrain {
           b.splitFrom.alreadyInjected = (b.splitFrom.alreadyInjected ?? 0) + n;
         }
       }
-      batches.splice(batches.indexOf(batch), 1);
+      if (batches.includes(batch)) batches.splice(batches.indexOf(batch), 1);
     }
     if (batches.length === 0) this.batches.delete(sessionId);
   }

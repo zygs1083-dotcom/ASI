@@ -1,3 +1,6 @@
+import { createHash } from 'node:crypto';
+import os from 'node:os';
+import type { SenseState } from '@asi/sense-types';
 import { Context } from '@deepseek-ai/cordis';
 import type { Agent } from '@deepseek-ai/dsh-agent';
 import { ToolCallId } from '@deepseek-ai/dsh-llm';
@@ -8,31 +11,71 @@ import { executeToolFixture } from '@deepseek-ai/dsh-tool-testkit';
 import ToolsService from '@deepseek-ai/dsh-tools';
 import { describe, expect, it, onTestFinished, vi } from 'vitest';
 import { FileBurstDetector } from '../../src/host/body/burst.ts';
-import { formatEnvUpdate } from '../../src/host/delivery/format.ts';
+import { createDelivery } from '../../src/host/dsh/deliver.ts';
+import { modelOutput, modelRules, modelTune } from '../../src/host/dsh/tool-output.ts';
 import { registerSenseTools } from '../../src/host/dsh/tools.ts';
 import { createSenseRuntime } from '../../src/host/runtime/index.ts';
-import type { SensePorts } from '../../src/host/runtime/ports.ts';
+import type { AgentEvent, JobEvent, SensePorts, ToolEvent } from '../../src/host/runtime/ports.ts';
 import { StateStore } from '../../src/host/state/store.ts';
 
-async function fixture() {
+async function fixture(liveState = false, isolated = false) {
   const ctx = new Context();
   await ctx.plugin(SystemPrompt);
   await ctx.plugin(ToolsService);
   ctx.tools.setExecutor(new NativeToolExecutor(ctx));
+  let agentEvent: (event: AgentEvent) => Promise<void> = async () => {};
+  let toolEvent: (event: ToolEvent) => Promise<void> = async () => {};
+  let jobEvent: (event: JobEvent) => Promise<void> = async () => {};
   const ports: SensePorts = {
     clock: { wall: () => 1_000, mono: () => 1_000 },
     dsh: {
-      onAgentEvent: () => () => {},
-      onTool: () => () => {},
-      onJob: () => () => {},
+      onAgentEvent: (callback) => {
+        agentEvent = callback;
+        return () => {};
+      },
+      onTool: (callback) => {
+        toolEvent = callback;
+        return () => {};
+      },
+      onJob: (callback) => {
+        jobEvent = callback;
+        return () => {};
+      },
       deliver: async () => {},
-      tokenSnapshot: async () => undefined,
+      tokenSnapshot: async (session) =>
+        isolated
+          ? {
+              contextUsed: session === 'session-a' ? 11 : 22,
+              sessionUsage: { input: session === 'session-a' ? 11 : 22, output: 0, cacheRead: 0, cacheWrite: 0 },
+            }
+          : undefined,
     },
     storage: { load: async () => undefined, save: async () => {} },
     helper: { spawn: () => undefined },
     probe: { create: () => ({ onSample: () => () => {}, start: () => {}, stop: async () => {} }) },
     files: { watch: () => ({ close: () => {} }) },
   };
+  const jobs = [
+    { id: 'a-job', owner: 'session-a', command: 'private-a-command', status: 'running' as const, startedAt: 1 },
+    { id: 'b-job', owner: 'session-b', command: 'private-b-command', status: 'running' as const, startedAt: 2 },
+    { id: 'orphan', owner: undefined, command: 'private-orphan-command', status: 'running' as const, startedAt: 3 },
+  ];
+  Object.assign(ports.dsh, {
+    nowReadings: (session?: string) =>
+      isolated
+        ? {
+            'env.activeJobs': { value: jobs },
+            'self.activity': { value: session === 'session-a' ? 'tool' : 'thinking' },
+            'self.pending': { value: { inbox: session === 'session-a' ? 1 : 2, jobs: 1 } },
+            'self.tools': { value: [session === 'session-a' ? 'a-tool' : 'b-tool'] },
+            'env.where.model': {
+              value: { provider: session === 'session-a' ? 'provider-a' : 'provider-b', endpoint: '', local: true },
+            },
+          }
+        : { 'env.activeJobs': { value: jobs } },
+    modelJobs: (session: string) =>
+      jobs.filter((job) => job.owner === session).map(({ id, status, startedAt }) => ({ id, status, startedAt })),
+  });
   const live = createSenseRuntime(ports, { platform: 'linux' });
   await live.start();
   const state = new StateStore(() => 990).snapshot();
@@ -65,7 +108,7 @@ async function fixture() {
       },
     ],
   };
-  const off = registerSenseTools(ctx, runtime, ports.clock.wall);
+  const off = registerSenseTools(ctx, liveState ? live : runtime, ports.clock.wall);
   const id = SessionId('synthetic-tool-test');
   const agent: Agent = {
     id,
@@ -97,13 +140,19 @@ async function fixture() {
     await live.stop();
     await ctx.fiber.dispose();
   });
-  const call = (name: string, args: object, options: { agent?: boolean; signal?: AbortSignal } = {}) =>
+  const call = (
+    name: string,
+    args: object,
+    options: { agent?: boolean; signal?: AbortSignal; session?: string } = {},
+  ) =>
     executeToolFixture(ctx, {
       callId: ToolCallId(`call-${name}`),
       name,
       arguments: args,
       signal: options.signal ?? new AbortController().signal,
-      ...(options.agent === false ? {} : { agent }),
+      ...(options.agent === false
+        ? {}
+        : { agent: options.session ? { ...agent, id: SessionId(options.session) } : agent }),
     });
   return {
     ctx,
@@ -111,6 +160,9 @@ async function fixture() {
     state,
     call,
     off,
+    agentEvent: (event: AgentEvent) => agentEvent(event),
+    toolEvent: (event: ToolEvent) => toolEvent(event),
+    jobEvent: (event: JobEvent) => jobEvent(event),
     setTitles: (value: boolean) => (titles = value),
     setRefresh: (value: () => Promise<boolean>) => (refresh = value),
   };
@@ -141,7 +193,7 @@ describe('model-facing tools', () => {
       isError: false,
       value: {
         current: true,
-        app: { value: { name: 'Fixture App', bundleId: 'org.fixture.app', pid: 123, windowCount: 2 } },
+        app: { value: { name: 'Fixture App', pid: 123, windowCount: 2 } },
         window: { value: { title: 'Synthetic title' } },
         pid: { value: 123, status: 'ok' },
         windowCount: { value: 2, status: 'ok' },
@@ -165,6 +217,370 @@ describe('model-facing tools', () => {
     const hidden = await h.call('env_detail', { window: 'Synthetic title' });
     expect(hidden).toMatchObject({ isError: false, value: { match: 'unknown', window: { value: null } } });
     expect(JSON.stringify(hidden.value)).not.toContain('Synthetic title');
+  });
+
+  it('exposes stable permission and source keys to model tools', async () => {
+    const h = await fixture();
+    h.state.self.permissions.value = { 辅助功能: 'denied', '其他权限（DSH 未提供）': 'unknown' };
+    h.state.self.permissions.source = { id: 'helper.ax', api: 'accessibility', host: 'local' };
+    h.state.observation.sources['helper.ax'] = { status: 'denied', lastSignalAt: 990 };
+    h.state.observation.sources['helper.window'] = { status: 'unknown', lastSignalAt: 990 };
+    const state = await h.call('env_state', {});
+    expect(state.value).toMatchObject({
+      self: {
+        permissions: {
+          value: { accessibility: 'denied', other: 'unknown' },
+          source: { id: 'helper.ax', api: 'accessibility' },
+        },
+      },
+      observation: { sources: { 'helper.ax': { status: 'denied' }, 'helper.window': { status: 'unknown' } } },
+    });
+    expect((await h.call('env_detail', {})).value).toMatchObject({
+      sources: { 'helper.ax': { status: 'denied' }, 'helper.window': { status: 'unknown' } },
+    });
+  });
+
+  it('projects file and helper source identifiers stably regardless of source order', async () => {
+    const h = await fixture();
+    const hash = (id: string) => `files:r-${createHash('sha256').update(id).digest('hex').slice(0, 8)}`;
+    const sources = {
+      'files:ascii.rule-1': { status: 'unavailable' as const, lastSignalAt: 990 },
+      'files:/Users/example/private/work/project': { status: 'unavailable' as const, lastSignalAt: 989 },
+      'files:规则一': { status: 'denied' as const, lastSignalAt: 991 },
+      'files:规则二': { status: 'unknown' as const, lastSignalAt: 992 },
+      'helper.frontApp': { status: 'ok' as const, lastSignalAt: 993 },
+      'helper.focusedWindow': { status: 'unknown' as const, lastSignalAt: 994 },
+    };
+    const expected = {
+      [hash('ascii.rule-1')]: { status: 'unavailable' },
+      [hash('/Users/example/private/work/project')]: { status: 'unavailable' },
+      [hash('规则一')]: { status: 'denied' },
+      [hash('规则二')]: { status: 'unknown' },
+      'helper.frontApp': { status: 'ok' },
+      'helper.focusedWindow': { status: 'unknown' },
+    };
+    for (const entries of [Object.entries(sources), Object.entries(sources).reverse()]) {
+      h.state.observation.sources = Object.fromEntries(entries);
+      h.state.env.frontApp.source = { id: 'helper.frontApp', api: 'ndjson', host: 'local' };
+      h.state.env.focusedWindow.source = { id: 'helper.focusedWindow', api: 'ndjson', host: 'local' };
+      h.state.env.watchedPaths.source = { id: 'files:规则一', api: 'watch', host: 'local' };
+      const state = (await h.call('env_state', {})).value;
+      expect(state).toMatchObject({
+        observation: { sources: expected },
+        env: {
+          frontApp: { source: { id: 'helper.frontApp' } },
+          focusedWindow: { source: { id: 'helper.focusedWindow' } },
+          watchedPaths: { source: { id: hash('规则一') } },
+        },
+      });
+      expect((await h.call('env_detail', {})).value).toMatchObject({ sources: expected });
+      expect(JSON.stringify(state)).not.toContain('规则');
+      expect(JSON.stringify(state)).not.toContain('/Users/example/private/work/project');
+    }
+    expect(h.state.observation.sources).toHaveProperty('files:规则一');
+    const collision = {
+      'files:synthetic-rule-43351': { status: 'ok' as const, lastSignalAt: 995 },
+      'files:synthetic-rule-66854': { status: 'denied' as const, lastSignalAt: 991 },
+    };
+    expect(hash('synthetic-rule-43351')).toBe(hash('synthetic-rule-66854'));
+    for (const entries of [Object.entries(collision), Object.entries(collision).reverse()]) {
+      h.state.observation.sources = Object.fromEntries(entries);
+      const state = (await h.call('env_state', { section: 'observation' })).value;
+      expect(state).toMatchObject({
+        sources: { [hash('synthetic-rule-43351')]: { status: 'unknown', ambiguous: true } },
+      });
+      expect(JSON.stringify(state)).not.toContain(' (2)');
+    }
+  });
+
+  it('projects raw file source identifiers instead of exempting paths', () => {
+    const value = modelOutput({
+      observation: { sources: { 'files:/Users/example/private/work/project': { status: 'ok' } } },
+      source: { id: 'files:/Users/example/private/work/project', api: 'watch' },
+    });
+    expect(JSON.stringify(value)).not.toContain('/Users/example/private/work/project');
+  });
+
+  it('projects a file rule whose ID is the full watched path', async () => {
+    const h = await fixture();
+    const id = '/Users/example/private/work/project';
+    const hash = `files:r-${createHash('sha256').update(id).digest('hex').slice(0, 8)}`;
+    h.state.observation.sources[`files:${id}`] = { status: 'unavailable', lastSignalAt: 990 };
+    h.state.env.watchedPaths.source = { id: `files:${id}`, api: 'watch', host: 'local' };
+    const projectedRule = modelRules([
+      { id, match: { kind: 'file.changed', subject: id }, level: 'context', createdBy: 'user', approved: true },
+    ]);
+    expect(projectedRule).toMatchObject([{ id: '[redacted]', match: { subject: 'project' } }]);
+    const state = (await h.call('env_state', {})).value;
+    expect(state).toMatchObject({
+      observation: { sources: { [hash]: { status: 'unavailable' } } },
+      env: { watchedPaths: { source: { id: hash } } },
+    });
+    expect(JSON.stringify(state)).not.toContain(id);
+  });
+
+  it('hides a watched path used as a rule ID in the live file-source tool flow', async () => {
+    const h = await fixture(true);
+    const id = '/Users/example/private/work/project';
+    const hash = `files:r-${createHash('sha256').update(id).digest('hex').slice(0, 8)}`;
+    const rules = await h.call('env_watch', {
+      action: 'add',
+      rule: { id, match: { kind: 'file.changed', subject: id }, level: 'context' },
+    });
+    expect(rules.isError).toBe(false);
+    expect(rules.value).toContainEqual(
+      expect.objectContaining({ id: '[redacted]', match: { kind: 'file.changed', subject: 'project' } }),
+    );
+    expect(h.live.state().observation.sources[`files:${id}`]?.status).toBe('ok');
+    const state = await h.call('env_state', { section: 'observation' });
+    expect(state.value).toMatchObject({ sources: { [hash]: { status: 'ok' } } });
+    expect(JSON.stringify(state.value)).not.toContain(id);
+  });
+
+  it('keeps projected file hashes stable even when the host name occurs in the hash', async () => {
+    const hostname = vi.spyOn(os, 'hostname').mockReturnValue('a44b3008');
+    try {
+      const h = await fixture();
+      const id = '/Users/example/private/work/project';
+      const hash = `files:r-${createHash('sha256').update(id).digest('hex').slice(0, 8)}`;
+      h.state.observation.sources[`files:${id}`] = { status: 'unavailable', lastSignalAt: 990 };
+      h.state.env.watchedPaths.source = { id: `files:${id}`, api: 'watch', host: 'local' };
+      expect((await h.call('env_state', {})).value).toMatchObject({
+        observation: { sources: { [hash]: { status: 'unavailable' } } },
+        env: { watchedPaths: { source: { id: hash } } },
+      });
+    } finally {
+      hostname.mockRestore();
+    }
+  });
+
+  it('retains fixed source keys without exempting matching window titles from host redaction', async () => {
+    const hostname = vi.spyOn(os, 'hostname').mockReturnValue('helper');
+    try {
+      const h = await fixture();
+      h.state.self.permissions.value = { 辅助功能: 'granted', '其他权限（DSH 未提供）': 'unknown' };
+      h.state.self.permissions.source = { id: 'helper.ax', api: 'accessibility', host: 'local' };
+      h.state.observation.sources['helper.ax'] = { status: 'ok', lastSignalAt: 990 };
+      h.state.env.focusedWindow.value = { title: 'helper' };
+      expect((await h.call('env_state', {})).value).toMatchObject({
+        self: { permissions: { source: { id: 'helper.ax' }, value: { accessibility: 'granted', other: 'unknown' } } },
+        observation: { sources: { helper: { status: 'ok' }, 'helper.ax': { status: 'ok' } } },
+        env: { focusedWindow: { value: { title: '<host>' } } },
+      });
+      expect((await h.call('env_detail', { window: '<host>' })).value).toMatchObject({
+        current: true,
+        sources: { helper: { status: 'ok' }, 'helper.ax': { status: 'ok' } },
+      });
+    } finally {
+      hostname.mockRestore();
+    }
+  });
+
+  it('preserves bounded application names and matches the name visible to the model', async () => {
+    const h = await fixture();
+    if (!h.state.env.frontApp.value) throw new Error('fixture missing');
+    h.state.env.frontApp.value.name = 'Fixture (Preview)';
+    expect((await h.call('env_state', { section: 'env' })).value).toMatchObject({
+      frontApp: { value: { name: 'Fixture (Preview)' } },
+    });
+    expect((await h.call('env_detail', { app: 'Fixture (Preview)' })).value).toMatchObject({
+      current: true,
+      app: { value: { name: 'Fixture (Preview)' } },
+    });
+    expect((await h.call('env_detail', { app: 'org.fixture.app' })).value).toMatchObject({ current: true });
+    h.state.env.frontApp.value.name = `Fixture\n(App) /fixture/preview ${'x'.repeat(300)}`;
+    const env = (await h.call('env_state', { section: 'env' })).value as { frontApp: { value: { name: string } } };
+    const name = env.frontApp.value.name;
+    expect(name.startsWith('Fixture(App) /fixture/preview ')).toBe(true);
+    expect(Array.from(name).length).toBeLessThanOrEqual(256);
+    expect((await h.call('env_detail', { app: name })).value).toMatchObject({
+      current: true,
+      app: { value: { name } },
+    });
+  });
+
+  it('minimizes machine, endpoint, paths, and foreign job commands in model output', async () => {
+    const h = await fixture();
+    h.state.env.where.harness.value = { host: 'fixture-host.invalid', os: 'FixtureOS', pid: 123 };
+    h.state.env.where.observed.value = { host: 'fixture-host.invalid', userSession: 'fixture' };
+    h.state.env.where.toolExec.value = { host: 'fixture-host.invalid', cwd: '/private/fixture/work' };
+    h.state.env.where.model.value = {
+      provider: 'fixture-provider',
+      endpoint: 'https://fixture-host.invalid:443',
+      local: false,
+    };
+    h.state.self.activity.source.host = 'fixture-host.invalid';
+    h.state.env.frontApp.source.host = 'fixture-host.invalid';
+    h.state.env.watchedPaths.value = { '/private/fixture/project': { changes: 0, lastChange: 0 } };
+    h.state.env.activeJobs.value = [{ id: 'foreign', startedAt: 1, status: 'running', command: 'foreign-command' }];
+    const result = await h.call('env_state', {});
+    const text = JSON.stringify(result.value);
+    expect(text).not.toContain('fixture-host.invalid');
+    expect(text).not.toContain('/private/fixture');
+    expect(text).not.toContain('foreign-command');
+    expect(result.value).toMatchObject({
+      env: {
+        where: {
+          harness: { value: { os: 'FixtureOS' } },
+          model: { value: { provider: 'fixture-provider', local: false } },
+        },
+      },
+    });
+    expect(JSON.stringify((await h.call('env_detail', {})).value)).not.toContain('fixture-host.invalid');
+  });
+
+  it('projects consented titles and excludes arbitrary notes and colliding private paths', async () => {
+    const h = await fixture();
+    const title = 'open </private/fixture/report> ssh user@build-node:22 README.md';
+    const projected = 'open <report> ssh <host> README.md';
+    h.state.env.focusedWindow.value = { title };
+    if (!h.state.env.frontApp.value) throw new Error('fixture missing');
+    h.state.env.frontApp.value.bundleId = 'backup.example.invalid';
+    h.state.env.watchedPaths.value = {
+      '/private/a/project': { changes: 1, lastChange: 1 },
+      '/private/b/project': { changes: 2, lastChange: 2 },
+      '/': { changes: 3, lastChange: 3 },
+      '/private/a/__proto__': { changes: 4, lastChange: 4 },
+    };
+    const state = await h.call('env_state', { section: 'env' });
+    expect(state.value).toMatchObject({
+      focusedWindow: { value: { title: projected } },
+      watchedPaths: { value: { project: { changes: 1 }, 'project (2)': { changes: 2 }, '[path]': { changes: 3 } } },
+    });
+    expect(Object.hasOwn((state.value as unknown as SenseState['env']).watchedPaths.value ?? {}, '__proto__')).toBe(
+      true,
+    );
+    expect(JSON.stringify((state.value as unknown as SenseState['env']).frontApp)).not.toContain(
+      'backup.example.invalid',
+    );
+    expect((await h.call('env_detail', {})).value).toMatchObject({ window: { value: { title: projected } } });
+    expect((await h.call('env_detail', { window: projected })).value).toMatchObject({
+      current: true,
+      match: 'current',
+      window: { value: { title: projected } },
+      pid: { value: 123, status: 'ok' },
+      windowCount: { value: 2, status: 'ok' },
+      recentEvents: [{ kind: 'window.focused' }],
+    });
+    expect((await h.call('env_detail', { window: title })).value).toMatchObject({ match: 'not-current' });
+    const result = await h.call('env_watch', {
+      action: 'add',
+      rule: {
+        id: 'fixture-rule',
+        match: { kind: 'app.activated' },
+        level: 'record',
+        note: 'open </private/fixture/report> backup.example.invalid',
+      },
+    });
+    expect(JSON.stringify(result.value)).not.toContain('/private/fixture');
+    expect(JSON.stringify(result.value)).not.toContain('backup.example.invalid');
+    h.setTitles(false);
+    expect(JSON.stringify((await h.call('env_state', {})).value)).not.toContain(title);
+  });
+
+  it('hides a host with port and following path in both model tools', async () => {
+    const h = await fixture();
+    h.state.env.focusedWindow.value = { title: 'ssh build-node:22/tmp/report' };
+    expect((await h.call('env_state', { section: 'env' })).value).toMatchObject({
+      focusedWindow: { value: { title: 'ssh <host>' } },
+    });
+    expect((await h.call('env_detail', { window: 'ssh <host>' })).value).toMatchObject({
+      current: true,
+      window: { value: { title: 'ssh <host>' } },
+    });
+  });
+
+  it.each(['ssh user@服务器:22/tmp/report', 'ssh 服务器:22/tmp/report'])(
+    'hides Unicode hosts in both model tools: %s',
+    async (title) => {
+      const h = await fixture();
+      h.state.env.focusedWindow.value = { title };
+      expect((await h.call('env_state', { section: 'env' })).value).toMatchObject({
+        focusedWindow: { value: { title: 'ssh <host>' } },
+      });
+      expect((await h.call('env_detail', { window: 'ssh <host>' })).value).toMatchObject({
+        current: true,
+        window: { value: { title: 'ssh <host>' } },
+      });
+    },
+  );
+
+  it('isolates actual model state by caller and selects the local panel session', async () => {
+    const h = await fixture(true);
+    await h.agentEvent({ type: 'created', sessionId: 'session-a' });
+    await h.agentEvent({ type: 'created', sessionId: 'session-b' });
+    await h.agentEvent({ type: 'pre-step', sessionId: 'session-b' });
+    expect(JSON.stringify(h.live.state().env.activeJobs)).toContain('private-b-command');
+    expect(JSON.stringify(h.live.state().env.activeJobs)).toContain('private-orphan-command');
+    expect(JSON.stringify(h.live.state().env.activeJobs)).toContain('private-a-command');
+    for (const [session, own, foreign] of [
+      ['session-a', 'a-job', 'b-job'],
+      ['session-b', 'b-job', 'a-job'],
+    ]) {
+      const result = await h.call('env_state', { section: 'env' }, { session });
+      expect(result).toMatchObject({ isError: false, value: { activeJobs: { value: [{ id: own }] } } });
+      const text = JSON.stringify(result.value);
+      expect(text).not.toContain(foreign);
+      expect(text).not.toContain('orphan');
+      expect(text).not.toContain('private-');
+      expect(JSON.stringify((await h.call('env_detail', {}, { session })).value)).not.toContain('private-');
+    }
+  });
+
+  it('isolates interleaved session activity, pending, tools, jobs and tokens through the DSH tool boundary', async () => {
+    const h = await fixture(true, true);
+    const seen: { session?: string; used?: number; jobs: string[] }[] = [];
+    const off = h.live.subscribe((state) => {
+      seen.push({
+        session: h.live.currentSessionId(),
+        used: state.self.body.tokens.value?.contextUsed,
+        jobs: state.env.activeJobs.value?.map((job) => job.id) ?? [],
+      });
+    });
+    for (const sessionId of ['session-a', 'session-b']) {
+      await h.agentEvent({ type: 'created', sessionId });
+      await h.agentEvent({ type: 'pre-step', sessionId });
+      await h.toolEvent({ type: 'pre-execute', sessionId, toolCallId: `${sessionId}-call` });
+      await h.jobEvent({ type: 'started', id: `${sessionId}-job`, sessionId, command: `${sessionId}-private-command` });
+    }
+    await h.agentEvent({ type: 'pre-step', sessionId: 'session-a' });
+    await h.agentEvent({ type: 'post-step', sessionId: 'session-b' });
+    await h.jobEvent({ type: 'exited', id: 'orphan', command: 'orphan-private-command', exitCode: 1 });
+    expect(h.live.state().self.body.tokens.value?.contextUsed).toBe(11);
+    expect(h.live.state().env.activeJobs.value?.map((job) => job.id)).toEqual(['a-job', 'b-job', 'orphan']);
+    for (const item of seen) {
+      if (!item.session) continue;
+      const own = item.session === 'session-a' ? 'a' : 'b';
+      expect(item.used === undefined || item.used === (own === 'a' ? 11 : 22)).toBe(true);
+      expect(item.jobs.every((job) => ['a-job', 'b-job', 'orphan'].includes(job))).toBe(true);
+    }
+    off();
+    for (const [session, own, other, used, activity] of [
+      ['session-a', 'a', 'b', 11, 'tool'],
+      ['session-b', 'b', 'a', 22, 'thinking'],
+    ] as const) {
+      const result = await h.call('env_state', {}, { session });
+      expect(result).toMatchObject({
+        isError: false,
+        value: {
+          self: {
+            activity: { value: activity },
+            pending: { value: { inbox: own === 'a' ? 1 : 2, jobs: 1 } },
+            tools: { value: [`${own}-tool`] },
+            body: { tokens: { value: { contextUsed: used } } },
+          },
+          env: {
+            activeJobs: { value: [{ id: `${own}-job` }] },
+            where: { model: { value: { provider: `provider-${own}` } } },
+          },
+        },
+      });
+      const text = JSON.stringify(result.value);
+      expect(text).not.toContain(`${other}-job`);
+      expect(text).not.toContain(`provider-${other}`);
+      expect(text).not.toContain('private-command');
+      expect(JSON.stringify((await h.call('env_detail', {}, { session })).value)).not.toContain('private-command');
+    }
   });
 
   it('distinguishes denied and stale foreground details without inventing a count', async () => {
@@ -226,9 +642,32 @@ describe('model-facing tools', () => {
     if (!param || typeof param.value !== 'number') throw new Error('numeric tuning parameter missing');
     await h.live.actions.lockParam(param.key, true);
     const result = await h.call('body_tune', { param: param.key, to: param.value * 1.1, reason: 'fixture' });
-    expect(result).toMatchObject({ isError: false, value: { applied: false, change: { by: 'agent' } } });
+    expect(result).toMatchObject({
+      isError: false,
+      value: { applied: false, reason: 'param locked', change: { by: 'agent', param: param.key } },
+    });
     expect(h.live.body.tuner.get(param.key)).toBe(param.value);
     expect(h.live.body.tuner.logs.at(-1)).toMatchObject({ by: 'agent', status: 'rejected' });
+  });
+
+  it('preserves allowed runtime tuning parameters and level values without exposing arbitrary strings', async () => {
+    const h = await fixture();
+    for (const [param, to, from] of [
+      ['mergeWindowMs', 2500, 2000],
+      ['fileMergeWindowMs', 6000, 5000],
+      ['deliveryLevel.body.rate', 'record', 'context'],
+      ['deliveryLevel.body.anomaly', 'record', 'context'],
+      ['deliveryLevel.file.burst', 'context', 'wake'],
+    ] as const) {
+      expect(await h.call('body_tune', { param, to })).toMatchObject({
+        isError: false,
+        value: { applied: true, change: { param, from, to } },
+      });
+    }
+    expect(modelTune({ applied: true, change: { param: 'secret', from: '/private/file', to: 'secret' } })).toEqual({
+      applied: true,
+      change: { param: '[redacted]' },
+    });
   });
 
   it('round-trips a special-character file burst alert from formatted delivery to feedback', async () => {
@@ -251,14 +690,26 @@ describe('model-facing tools', () => {
     if (!alert) throw new Error('fixture alert missing');
     expect(await h.live.body.tuner.registerAlert(alert.id, 'file.burst', 'file.burst.maxDeleted')).toBe(true);
     alert.data.feedbackAvailable = true;
-    const text = formatEnvUpdate({
+    const update = {
       since: 1_000,
       at: 1_000,
       suppressed: 0,
-      changes: [{ signal: alert, count: 1, level: 'context' }],
-    });
+      changes: [{ signal: alert, count: 1, level: 'context' as const }],
+    };
+    const agent = { inject: vi.fn(), followup: vi.fn(), send: vi.fn() };
+    const deliver = createDelivery(
+      () => agent,
+      () => true,
+      async () => false,
+    );
+    await deliver('session-a', { kind: 'followup', sessionId: 'session-a', update });
+    const text = JSON.stringify(agent.followup.mock.calls).replaceAll('\\"', '"');
     const encoded = /alertId="([A-Za-z0-9_-]+)"/.exec(text)?.[1];
     expect(encoded).toBeDefined();
+    expect(text).toContain('feedbackAvailable="true"');
+    const decoded = Buffer.from(encoded as string, 'base64url').toString('utf8');
+    expect(decoded).toBe(alert.id);
+    expect(decoded).not.toContain('/fixture/');
     expect(await h.call('body_tune', { action: 'feedback', alertId: encoded, verdict: 'useful' })).toMatchObject({
       isError: false,
       value: { applied: true },
@@ -268,11 +719,11 @@ describe('model-facing tools', () => {
 
   it('bounds complete results and removes tool and prompt contributions on disposal', async () => {
     const h = await fixture();
-    if (!h.state.env.frontApp.value) throw new Error('fixture missing');
-    h.state.env.frontApp.value.name = '汉'.repeat(20_000);
+    h.state.env.focusedWindow.value = { title: '汉'.repeat(20_000) };
     const result = await h.call('env_state', { section: 'env' });
-    expect(result).toMatchObject({ isError: false, value: { truncated: true } });
+    expect(result).toMatchObject({ isError: false, value: { focusedWindow: { value: { title: '' } } } });
     expect(Buffer.byteLength(JSON.stringify(result.value), 'utf8')).toBeLessThan(32_768);
+    expect(modelOutput({ text: 'x '.repeat(17_000) })).toMatchObject({ truncated: true });
     expect((await h.ctx.systemPrompt.assemble()).sections.some((section) => section.name === 'asi-sense')).toBe(true);
     h.off();
     expect(h.ctx.tools.get('env_state')).toBeUndefined();

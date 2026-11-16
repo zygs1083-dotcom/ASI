@@ -30,6 +30,13 @@ function setup(model: SensePanelModel) {
 }
 
 describe('调参恢复与重置', () => {
+  it('向用户说明共享标题可能包含主机名', () => {
+    const { props } = setup(makeScenario('healthy'))
+    expect(screen.getByText('标题可能包含主机名等信息。')).toBeTruthy()
+    fireEvent.click(screen.getByRole('checkbox', { name: /窗口标题发给模型/ }))
+    expect(props.onToggleTitles).toHaveBeenCalledOnce()
+  })
+
   it('备份失败时显示原因、允许重试并阻止重置', async () => {
     const model = makeScenario('healthy')
     model.tuning = { parameters: [], log: [], disabled: { reason: 'restore-failed' }, backupError: { code: 'ENOSPC', stage: 'backup' } }

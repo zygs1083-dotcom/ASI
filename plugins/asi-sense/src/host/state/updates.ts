@@ -32,20 +32,25 @@ export function noteFile(state: SenseState, signal: Signal, defaultTtlMs: number
     fact.value && Object.getPrototypeOf(fact.value) === null
       ? fact.value
       : Object.assign(Object.create(null), fact.value);
-  const entry = map[path];
-  if (entry) delete map[path];
   let count = pathCounts.get(map) ?? Object.keys(map).length;
-  if (!entry) count++;
+  const c = num(signal.data.changes);
+  const configured = Array.isArray(signal.data.watchedPaths)
+    ? signal.data.watchedPaths.filter((item): item is string => typeof item === 'string')
+    : [];
+  for (const key of new Set([path, ...configured])) {
+    const entry = map[key];
+    if (entry) delete map[key];
+    else count++;
+    map[key] = {
+      lastChange: signal.at,
+      changes: (entry?.changes ?? 0) + (c !== undefined && c > 0 ? Math.floor(c) : 1),
+    };
+  }
   while (count > 5000) {
     delete map[Object.keys(map)[0] as string];
     count--;
   }
   pathCounts.set(map, count);
-  const c = num(signal.data.changes);
-  map[path] = {
-    lastChange: signal.at,
-    changes: (entry?.changes ?? 0) + (c !== undefined && c > 0 ? Math.floor(c) : 1),
-  };
   fact.value = map;
   fact.status = 'ok';
   fact.source = signal.source;

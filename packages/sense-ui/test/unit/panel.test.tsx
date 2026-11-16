@@ -337,7 +337,8 @@ describe('位置链', () => {
     expect(details.open).toBe(true)
     expect(details.textContent).toContain('demo-provider')
     expect(details.textContent).toContain('macOS 15.2')
-    expect(details.textContent).toContain('/demo/project')
+    expect(details.textContent).toContain('工作目录 project')
+    expect(details.textContent).not.toContain('/demo/project')
   })
 
   it('远端模型（local=false）不合并并标注异地', async () => {

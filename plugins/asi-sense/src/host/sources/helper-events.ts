@@ -41,6 +41,9 @@ export async function helperStatus(
   restarts: number,
   lastFailure?: string,
 ): Promise<void> {
+  if (status !== 'ok' && !attention.isStopped()) {
+    permissionUnknown(attention, at);
+  }
   await attention.accept({
     id: attention.id(),
     kind: 'source.status',
@@ -56,6 +59,25 @@ export async function helperStatus(
     },
   });
 }
+export function permissionUnknown(attention: RuntimeAttention, at: number): void {
+  if (attention.isStopped()) return;
+  attention.store.apply({
+    id: attention.id(),
+    kind: 'fact.updated',
+    at,
+    source: ax,
+    subject: 'self.permissions',
+    data: {
+      path: 'self.permissions',
+      value: null,
+      status: 'unknown',
+      reason: '辅助功能状态不可用',
+      ttlMs: 60_000,
+      preserveSourceStatus: true,
+    },
+  });
+  attention.changed();
+}
 export async function helperError(attention: RuntimeAttention, event: Message): Promise<string> {
   const code = typeof event.code === 'string' ? event.code : 'protocol-error';
   await attention.accept({
@@ -67,6 +89,24 @@ export async function helperError(attention: RuntimeAttention, event: Message): 
     data: { error: code, dropped: event.dropped, droppedTypes: event.droppedTypes },
   });
   return code;
+}
+export function permissionStatus(attention: RuntimeAttention, status: 'granted' | 'denied', at: number): void {
+  if (attention.isStopped()) return;
+  attention.store.apply({
+    id: attention.id(),
+    kind: 'fact.updated',
+    at,
+    source: ax,
+    subject: 'self.permissions',
+    data: {
+      path: 'self.permissions',
+      value: { 辅助功能: status, '其他权限（DSH 未提供）': 'unknown' },
+      status: 'ok',
+      ttlMs: 60_000,
+      preserveSourceStatus: true,
+    },
+  });
+  attention.changed();
 }
 export async function axStatus(
   attention: RuntimeAttention,

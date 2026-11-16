@@ -1,10 +1,11 @@
 import type { WatchRule } from '@asi/sense-types';
 import { createWatchRule, validateRule } from '../attention/rules.ts';
 import type { BodySource } from '../sources/body.ts';
+import type { DshSource } from '../sources/dsh.ts';
 import type { FileSource } from '../sources/files.ts';
 import type { HelperSource } from '../sources/helper.ts';
 import type { RuntimeAttention } from './attention.ts';
-import type { SenseActions, TuneRequest } from './ports.ts';
+import type { DshPort, SenseActions, TuneRequest } from './ports.ts';
 import type { Settings } from './settings.ts';
 
 export function pauseAction(
@@ -56,12 +57,24 @@ export function runtimeTools(
   check: () => void,
   titlesAllowed: () => boolean,
   changed: () => void,
+  dsh: DshPort,
+  dshSource: DshSource,
 ) {
   return {
     refreshDetail: () => helper.refreshDetail(),
-    envState: (section?: 'self' | 'env' | 'observation') => {
-      const state = attention.state();
+    envState: (section?: 'self' | 'env' | 'observation', sessionId?: string) => {
+      const state = dshSource.stateFor(sessionId ?? attention.currentSessionId(), attention.state());
       if (!titlesAllowed()) state.env.focusedWindow.value = null;
+      if (sessionId !== undefined) {
+        try {
+          if (!dshSource.hasSession(sessionId)) throw new Error('session unavailable');
+          if (!dsh.modelJobs) throw new Error('job source unavailable');
+          state.env.activeJobs.value = dsh.modelJobs(sessionId);
+        } catch {
+          state.env.activeJobs.value = null;
+          state.env.activeJobs.status = 'unavailable';
+        }
+      }
       return section ? state[section] : state;
     },
     envWatch: async (request: {

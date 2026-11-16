@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import type { DeliveryLevel, SenseState, Signal, SignalCause, SourceRef, WatchRule } from '@asi/sense-types';
+import { isSessionContext, isSessionOwned } from '../attention/buckets.ts';
 import { DeliveryFailure } from '../attention/drain.ts';
 import { injectOutcomes } from '../attention/drain-transfer.ts';
 import { AttentionPipeline, type SessionContext } from '../attention/pipeline.ts';
@@ -37,6 +38,7 @@ export class RuntimeAttention {
   private batchEntries?: EventLog;
   private readonly pending = new PendingContext(this.mark.bind(this), (id) => this.entries.some((e) => e.id === id));
   private readonly sessions = new Map<string, SessionContext>();
+  private readonly sessionTokens = new Map<string, string>();
   private readonly recent: string[] = [];
   private readonly inflight = new Set<Promise<void>>();
   private selected?: string;
@@ -76,6 +78,24 @@ export class RuntimeAttention {
         deliver: async (intent) => {
           if (this.stopped) throw new Error('stopped');
           const safe = structuredClone(intent);
+          safe.update.changes = safe.update.changes.filter(
+            ({ signal }) =>
+              (!isSessionContext(signal) && (signal.source.id !== 'dsh' || !signal.kind.startsWith('job.'))) ||
+              (signal.data.sessionId === intent.sessionId &&
+                typeof signal.data.sessionToken === 'string' &&
+                signal.data.sessionToken === this.sessionTokens.get(intent.sessionId)),
+          );
+          if (!safe.update.changes.length) throw new DeliveryFailure('exhausted');
+          for (const { signal } of safe.update.changes) {
+            if (isSessionContext(signal)) delete signal.data.sessionToken;
+            if (signal.source.id === 'dsh' && signal.kind.startsWith('job.')) {
+              signal.subject = typeof signal.data.id === 'string' ? signal.data.id : 'job';
+              delete signal.data.command;
+              delete signal.data.path;
+              delete signal.data.sessionId;
+              delete signal.data.sessionToken;
+            }
+          }
           if (!this.titlesAllowed()) {
             for (const change of safe.update.changes) {
               change.signal.data = withoutTitles(change.signal.data) as Signal['data'];
@@ -97,7 +117,11 @@ export class RuntimeAttention {
         },
       },
     });
-    this.offCommit = staged.onDeliveryCommitted?.((session, id) => this.pending.committed(session, id, this.pipeline));
+    this.offCommit = staged.onDeliveryCommitted?.((session, id) => {
+      void this.pending.committed(session, id, this.pipeline).then(() => {
+        if (!this.stopped) this.reschedule();
+      });
+    });
   }
 
   id(): string {
@@ -127,7 +151,16 @@ export class RuntimeAttention {
     return events;
   }
   current(): string | undefined {
+    return this.currentSessionId();
+  }
+  currentSessionId(): string | undefined {
     return this.selected;
+  }
+  sessionToken(id: string | undefined): string | undefined {
+    return id === undefined ? undefined : this.sessionTokens.get(id);
+  }
+  activeSessionTokens(): string[] {
+    return [...this.sessionTokens.values()];
   }
   feedback(id: string, verdict: 'useful' | 'noise'): void {
     const entry = this.entries.find((item) => item.id === id);
@@ -156,11 +189,15 @@ export class RuntimeAttention {
     return Promise.allSettled([...this.inflight, this.pending.settled()]).then(() => {});
   }
   create(id: string): void {
+    if (this.sessions.has(id)) this.pipeline.disposeSession(id, this.sessionTokens.get(id));
     this.sessions.set(id, { id, busy: false, userInitiated: false });
+    this.sessionTokens.set(id, randomUUID());
   }
   dispose(id: string): void {
+    const token = this.sessionTokens.get(id);
     this.sessions.delete(id);
-    this.pipeline.disposeSession(id);
+    this.sessionTokens.delete(id);
+    this.pipeline.disposeSession(id, token);
     this.pending.suspend(id, this.pipeline);
     const index = this.recent.indexOf(id);
     if (index >= 0) this.recent.splice(index, 1);
@@ -214,6 +251,45 @@ export class RuntimeAttention {
       typeof evaluated === 'number' && Number.isFinite(evaluated)
         ? evaluated
         : this.clock.mono() - Math.max(0, this.clock.wall() - signal.at);
+    const job = signal.source.id === 'dsh' && signal.kind.startsWith('job.');
+    if (isSessionOwned(signal) || job) {
+      const owner = typeof signal.data.sessionId === 'string' ? signal.data.sessionId : undefined;
+      const token = signal.data.sessionToken;
+      const session =
+        owner && typeof token === 'string' && token === this.sessionTokens.get(owner)
+          ? this.sessions.get(owner)
+          : undefined;
+      if (session) {
+        await this.pipeline.accept(
+          signal,
+          session,
+          (change) => {
+            this.log(change, mono);
+            this.reschedule();
+          },
+          () =>
+            !this.stopped &&
+            owner !== undefined &&
+            this.sessions.get(owner) === session &&
+            this.sessionTokens.get(owner) === token,
+        );
+      } else {
+        if (owner) {
+          this.log(
+            { signal, level: 'record', reason: signal.cause === 'agent' ? 'self-caused' : 'session-private' },
+            mono,
+          );
+          return;
+        }
+        await new Promise<void>((resolve) =>
+          this.store.apply(signal, () => {
+            this.log({ signal, level: 'record', reason: 'session-private' }, mono);
+            resolve();
+          }),
+        );
+      }
+      return;
+    }
     const session = this.selected && this.sessions.get(this.selected);
     if (!session) {
       const prior = this.store.snapshot().observation.sources[signal.source.id];

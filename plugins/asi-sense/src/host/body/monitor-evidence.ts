@@ -4,17 +4,19 @@ import { type AdaptiveState, BODY_HISTORY } from './state.ts';
 export function rateEvidence(
   state: AdaptiveState | undefined,
   rules: readonly RateRule[],
-  sample: { stream: string; mono: number; wall: number } | undefined,
+  sample: { stream: string; mono: number; wall: number; contextSession?: string } | undefined,
   metric: string,
 ) {
   const history = sample && state?.[BODY_HISTORY]?.[sample.stream]?.rate;
   const matching = rules.filter((rule) =>
     rule.metric.endsWith(':*') ? metric.startsWith(rule.metric.slice(0, -1)) : rule.metric === metric,
   );
-  const latchKey = (rule: RateRule) => (rule.metric.endsWith(':*') ? `rate:${rule.id}:${metric}` : `rate:${rule.id}`);
+  const suffix = metric === 'context' && sample?.contextSession ? `@${sample.contextSession}` : '';
+  const latchKey = (rule: RateRule) =>
+    `${rule.metric.endsWith(':*') ? `rate:${rule.id}:${metric}` : `rate:${rule.id}`}${suffix}`;
   const rule = matching.find((item) => history?.latch[latchKey(item)] === 'warn') ?? matching[0];
   const latched = !!rule && history?.latch[latchKey(rule)] === 'warn';
-  const window = history?.windows[metric];
+  const window = history?.windows[`${metric}${suffix}`];
   const evaluationMono =
     window && 'evaluationMono' in window && typeof window.evaluationMono === 'number'
       ? window.evaluationMono

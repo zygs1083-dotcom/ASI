@@ -18,7 +18,7 @@ export function serializeMonitor(
   const current = seed.clone();
   current.advance(clock());
   const latch: BodyThresholdState = {};
-  for (const k of Object.keys(latest ?? {})) latch[k] = (latest as AdaptiveState)[k];
+  for (const k of Object.keys(latest ?? {})) if (!k.startsWith('context@')) latch[k] = (latest as AdaptiveState)[k];
   return JSON.stringify({
     version: 1,
     disabled: tunerSnapshot === undefined ? (disabled ?? tuner?.tuningDisabled) : JSON.parse(tunerSnapshot).disabled,

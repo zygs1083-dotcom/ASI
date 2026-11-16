@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { posix } from 'node:path';
 import type { Signal } from '@asi/sense-types';
 import type { BodySignal } from './metrics.ts';
@@ -231,7 +232,9 @@ export class FileBurstDetector {
     cause?: 'agent',
   ): BodySignal {
     return {
-      id: `${src.source.id}:file.burst:${dir}:${src.at}:${src.id}:${level}`,
+      id: `file.burst:${createHash('sha256')
+        .update(JSON.stringify([src.source.id, dir, src.at, src.id, level]))
+        .digest('hex')}`,
       kind: 'file.burst',
       at: src.at,
       source: src.source,

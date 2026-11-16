@@ -10,6 +10,8 @@ import {
   helperStatus,
   type Message,
   object,
+  permissionStatus,
+  permissionUnknown,
   strip,
   validApp,
 } from './helper-events.ts';
@@ -25,6 +27,7 @@ export class HelperSource {
   private retry?: number;
   private readonly snapshots = new SnapshotBackoff();
   private deadline?: number;
+  private permissionDeadline?: number;
   private crashes: number[] = [];
   private session?: string;
   private gen = -1;
@@ -62,7 +65,7 @@ export class HelperSource {
   }
   nextDeadline(): number | undefined {
     const kill = [...this.children.values()].map((child) => child.killAt);
-    const due = [this.retry, this.deadline, this.snapshots.deadline, ...kill].filter(
+    const due = [this.retry, this.deadline, this.permissionDeadline, this.snapshots.deadline, ...kill].filter(
       (v): v is number => v !== undefined,
     );
     return due.length ? Math.min(...due) : undefined;
@@ -76,6 +79,10 @@ export class HelperSource {
       }
     }
     if (this.deadline !== undefined && now >= this.deadline) this.fail('handshake-timeout');
+    if (this.permissionDeadline !== undefined && now >= this.permissionDeadline) {
+      this.permissionDeadline = now + 30_000;
+      this.writer.write({ cmd: 'recheck-permissions' });
+    }
     if (this.snapshots.due(now)) this.requestSnapshot();
     if (this.retry !== undefined && now >= this.retry) {
       if (this.children.size) this.retry = now + 50;
@@ -136,6 +143,8 @@ export class HelperSource {
     this.retry = undefined;
     this.snapshots.reset();
     this.deadline = undefined;
+    this.permissionDeadline = undefined;
+    permissionUnknown(this.attention, this.clock.wall());
     this.child = undefined;
     this.finishSnapshot(false);
     this.writer.stop();
@@ -172,6 +181,7 @@ export class HelperSource {
     }
     if (!child) return void this.status('unavailable', 'not-installed');
     this.child = child;
+    this.permissionDeadline = undefined;
     this.session = undefined;
     this.gen = -1;
     this.titles = false;
@@ -245,10 +255,29 @@ export class HelperSource {
       const first = !this.session;
       this.session = raw.session;
       if (first) this.sendIntent();
+      this.permissionDeadline = this.clock.mono() + 30_000;
+      this.reschedule();
       this.recovery.delta(raw);
       const permissions = object(raw.permissions);
-      await axStatus(this.attention, permissions?.accessibility === 'granted' ? 'ok' : 'denied', raw.at as number);
-      if (!first && valid() && !this.paused()) this.requestSnapshot(true);
+      if (permissions?.accessibility === 'granted' || permissions?.accessibility === 'denied') {
+        const previous = this.attention.state().self.permissions.value?.辅助功能;
+        permissionStatus(this.attention, permissions.accessibility, raw.at as number);
+        if (
+          first ||
+          (previous !== permissions.accessibility &&
+            (permissions.accessibility === 'denied' ||
+              this.attention.state().observation.sources['helper.ax']?.status !== 'unsupported'))
+        )
+          await axStatus(this.attention, permissions.accessibility === 'granted' ? 'ok' : 'denied', raw.at as number);
+        if (
+          previous !== undefined &&
+          previous !== permissions.accessibility &&
+          valid() &&
+          !this.paused() &&
+          !recovery.degraded
+        )
+          this.requestSnapshot(true);
+      }
       return;
     }
     if (!this.session) throw new Error('missing hello');
@@ -277,6 +306,7 @@ export class HelperSource {
     if (raw.type === 'error') {
       if (!this.recovery.degraded) this.snapshots.reset();
       this.recovery.degraded = true;
+      permissionUnknown(this.attention, raw.at as number);
       markHelperFacts(this.attention, this.body, raw.at as number, ['frontApp', 'focusedWindow', 'thermal'], 'stale');
       const code = await helperError(this.attention, raw);
       if (!valid()) return;
@@ -295,6 +325,13 @@ export class HelperSource {
         this.requestSnapshot();
         this.finishSnapshot(false);
         return;
+      }
+      const permissions = object(raw.permissions);
+      if (
+        !recovery.dirty.has('permissions') &&
+        (permissions?.accessibility === 'granted' || permissions?.accessibility === 'denied')
+      ) {
+        permissionStatus(this.attention, permissions.accessibility, raw.at as number);
       }
       if (this.metadataSnapshot && !this.recovery.degraded) {
         metadataOnly = true;
@@ -367,6 +404,8 @@ export class HelperSource {
   }
   private restart(reason: string): void {
     this.deadline = undefined;
+    this.permissionDeadline = undefined;
+    permissionUnknown(this.attention, this.clock.wall());
     this.snapshots.reset();
     this.titles = false;
     this.lastFailure = reason;

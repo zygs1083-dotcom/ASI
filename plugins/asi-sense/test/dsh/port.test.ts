@@ -270,7 +270,7 @@ describe('DSH agent port', () => {
 });
 
 describe('uncommitted context routing', () => {
-  async function routing(wake = false, offline = 0) {
+  async function routing(wake = false, offline = 0, ownedContext = false) {
     const { ctx, agent: a, port } = await fixture();
     const bId = SessionId('synthetic-session-b');
     const b = { ...a, id: bId, session: Session.create(bId), send: vi.fn(), followup: vi.fn() };
@@ -282,7 +282,13 @@ describe('uncommitted context routing', () => {
       port,
       () => [
         { id: 'ctx', match: { kind: 'app.activated' }, level: 'context', createdBy: 'user', approved: true },
-        { id: 'wake', match: { kind: 'job.exited' }, level: 'wake', createdBy: 'user', approved: true },
+        {
+          id: 'wake',
+          match: { kind: 'job.exited' },
+          level: ownedContext ? 'context' : 'wake',
+          createdBy: 'user',
+          approved: true,
+        },
         { id: 'wake2', match: { kind: 'job.failed' }, level: 'wake', createdBy: 'user', approved: true },
       ],
       () => {},
@@ -357,6 +363,38 @@ describe('uncommitted context routing', () => {
     const event = h.b.session.append('user/message', message, { surfaceOp: 'append' });
     h.ctx.emit('session/event', h.b.session, event);
     expect((await h.step(h.a)).messages).toHaveLength(1);
+  });
+
+  it.each([false, true])('keeps a cancelled owned job context private after owner disposal=%s', async (dispose) => {
+    const h = await routing(true, 0, true);
+    await h.attention.accept({
+      ...sample,
+      id: 'owned-job',
+      kind: 'job.exited',
+      subject: 'fixture-command',
+      source: { id: 'dsh', api: 'events', host: 'local' },
+      data: {
+        id: 'owned-job',
+        sessionId: h.a.id,
+        sessionToken: h.attention.sessionToken(h.a.id),
+        command: 'fixture-command',
+        exitCode: 0,
+      },
+    });
+    expect((await h.cancel()).messages).toHaveLength(1);
+    if (dispose) await h.unregisterA();
+    expect((await h.step(h.b)).messages).toHaveLength(1);
+    if (!dispose) {
+      const decision = await h.step(h.a);
+      expect(decision.messages).toHaveLength(2);
+      const message = decision.messages[1];
+      if (!message) throw new Error('missing job context');
+      expect(JSON.stringify(message)).toContain('owned-job');
+      const event = h.a.session.append('user/message', message, { surfaceOp: 'append' });
+      h.ctx.emit('session/event', h.a.session, event);
+      expect((await h.step(h.a)).messages).toHaveLength(1);
+    }
+    expect(h.attention.events().some((item) => item.id === 'owned-job')).toBe(true);
   });
 
   it('retains an aborted staged context when its session is disposed', async () => {
@@ -534,7 +572,7 @@ describe('uncommitted context routing', () => {
     await h.step(h.b, undefined, false);
     expect(h.b.send).toHaveBeenCalledTimes(1);
     const message = vi.mocked(h.b.send).mock.calls[0]?.[0];
-    expect(JSON.stringify(message)).toContain('job: `group` exited');
+    expect(JSON.stringify(message)).toContain('job: `job` exited');
     expect(JSON.stringify(message)).toContain('job.failed');
     expect(h.attention.pipeline.suppressed).toBe(0);
   });
