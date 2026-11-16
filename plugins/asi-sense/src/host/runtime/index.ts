@@ -69,6 +69,14 @@ export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}
     },
     () => attention.recordTargetReset(),
     changed,
+    {
+      closed: async (id) => {
+        await attention.closeSession(id);
+        ports.dsh.selectDeliveryTarget?.(attention.currentSessionId());
+        dsh.targetChanged();
+      },
+      refreshed: (rows) => attention.availableSessions(rows.map((row) => row.id)),
+    },
   );
   const offStore = attention.store.subscribe((state) => {
     listeners.notify(dsh.stateFor(attention.currentSessionId(), state));

@@ -7,6 +7,7 @@ export function createSessionTarget(
   apply: (id: string | undefined) => Promise<void>,
   recordReset: () => void,
   changed: () => void,
+  lifecycle?: { closed: (id: string) => Promise<void>; refreshed: (rows: SessionRow[]) => void },
 ) {
   let rows: SessionRow[] = [];
   let selected: string | undefined;
@@ -28,6 +29,7 @@ export function createSessionTarget(
     const next = await port.listSessions();
     check();
     rows = next;
+    lifecycle?.refreshed(rows);
     unavailable = false;
   };
   const save = (id: string | undefined) => storage.save(key, JSON.stringify({ version: 1, sessionId: id ?? null }));
@@ -47,9 +49,13 @@ export function createSessionTarget(
       off = port.onSessionsChanged?.((closed) => {
         void enqueue(async () => {
           if (!active) return;
+          if (closed) await lifecycle?.closed(closed);
           if (selected && closed === selected) await reset();
           await refresh();
-          if (selected && !rows.some((row) => row.id === selected)) await reset();
+          if (selected && !rows.some((row) => row.id === selected)) {
+            await lifecycle?.closed(selected);
+            await reset();
+          }
           changed();
         }).catch(() => {
           if (active) {

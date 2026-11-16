@@ -40,6 +40,7 @@ export class RuntimeAttention {
   private readonly sessions = new Map<string, SessionContext>();
   private readonly sessionTokens = new Map<string, string>();
   private readonly recent: string[] = [];
+  private readonly closed = new Map<string, boolean>();
   private readonly inflight = new Set<Promise<void>>();
   private selected?: string;
   private pinned?: string;
@@ -181,7 +182,7 @@ export class RuntimeAttention {
     );
   }
   async setTarget(id: string | undefined): Promise<void> {
-    if (id && !this.sessions.has(id)) throw new Error('target session unavailable');
+    if (id && (!this.sessions.has(id) || this.closed.has(id))) throw new Error('target session unavailable');
     this.pinned = id;
     this.privateStep = undefined;
     this.selected = id ?? this.recent.at(-1);
@@ -193,6 +194,19 @@ export class RuntimeAttention {
     }
     this.reschedule();
     this.changed();
+  }
+  async closeSession(id: string): Promise<void> {
+    this.closed.set(id, false);
+    const index = this.recent.indexOf(id);
+    if (index >= 0) this.recent.splice(index, 1);
+    if (this.selected === id && this.pinned !== id) await this.setTarget(undefined);
+  }
+  availableSessions(ids: readonly string[]): void {
+    const available = new Set(ids);
+    for (const [id, absent] of this.closed) {
+      if (!available.has(id)) this.closed.set(id, true);
+      else if (absent) this.closed.delete(id);
+    }
   }
   sessionToken(id: string | undefined): string | undefined {
     return id === undefined ? undefined : this.sessionTokens.get(id);
@@ -248,7 +262,7 @@ export class RuntimeAttention {
     this.reschedule();
   }
   async preStep(id: string, userInitiated = false, drain = true): Promise<void> {
-    if (this.stopped) return;
+    if (this.stopped || this.closed.has(id)) return;
     const session = this.sessions.get(id);
     if (!session) return;
     const generation = ++this.selectionGeneration;

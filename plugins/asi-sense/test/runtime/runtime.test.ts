@@ -161,6 +161,52 @@ function harness(
 }
 
 describe('host runtime', () => {
+  it.each([
+    { pinned: true, other: true, expected: 'a' },
+    { pinned: false, other: true, expected: 'a' },
+    { pinned: true, other: false, expected: undefined },
+    { pinned: false, other: false, expected: undefined },
+  ])(
+    'removes an archived loaded session from automatic routing: $pinned / $other',
+    async ({ pinned, other, expected }) => {
+      const h = harness();
+      let notify: (closed?: string) => void = () => {};
+      let archived = false;
+      h.ports.dsh.listSessions = async () =>
+        [other ? 'a' : undefined, archived ? undefined : 'b']
+          .filter((id): id is string => id !== undefined)
+          .map((id) => ({ id, title: '', updatedAt: 1, running: false }));
+      h.ports.dsh.onSessionsChanged = (cb) => {
+        notify = cb;
+        return () => {};
+      };
+      await h.runtime.start();
+      if (other) {
+        await h.agent({ type: 'created', sessionId: 'a' });
+        await h.agent({ type: 'pre-step', sessionId: 'a' });
+        await h.agent({ type: 'post-step', sessionId: 'a' });
+      }
+      await h.agent({ type: 'created', sessionId: 'b' });
+      await h.agent({ type: 'pre-step', sessionId: 'b' });
+      await h.agent({ type: 'post-step', sessionId: 'b' });
+      if (pinned) await h.runtime.actions.selectTarget?.('b');
+      archived = true;
+      notify('b');
+      await vi.advanceTimersByTimeAsync(0);
+      expect(h.runtime.target()).toMatchObject({ mode: 'auto', ...(pinned ? { notice: true } : {}) });
+      expect(h.runtime.currentSessionId()).toBe(expected);
+      await h.agent({ type: 'pre-step', sessionId: 'b' });
+      expect(h.runtime.currentSessionId()).toBe(expected);
+      await h.file({ path: '/workspace/fixture', change: 'modify' });
+      await h.advance(5_000);
+      expect(h.delivered.map((intent) => intent.sessionId)).toEqual(expected ? [expected] : []);
+      expect(h.runtime.events().filter((event) => event.kind === 'delivery.target-unavailable')).toHaveLength(
+        pinned ? 1 : 0,
+      );
+      await h.runtime.stop();
+    },
+  );
+
   it('restores a selected delivery target and keeps it when another session pre-steps', async () => {
     const h = harness();
     const stored = new Map<string, string>();
