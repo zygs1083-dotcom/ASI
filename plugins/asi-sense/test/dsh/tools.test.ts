@@ -178,7 +178,11 @@ describe('model-facing tools', () => {
     const first = await h.call('env_state', { section: 'env' });
     expect(first).toMatchObject({
       isError: false,
-      value: { frontApp: { ageMs: 10 }, focusedWindow: { value: { title: 'Synthetic title' } } },
+      value: {
+        deliveryTarget: 'auto',
+        frontApp: { ageMs: 10 },
+        focusedWindow: { value: { title: 'Synthetic title' } },
+      },
     });
     h.setTitles(false);
     const redacted = await h.call('env_state', { section: 'env' });

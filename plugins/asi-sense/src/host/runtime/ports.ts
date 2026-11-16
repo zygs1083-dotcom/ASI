@@ -50,6 +50,7 @@ export interface DshPort {
   listSessions?(): Promise<SessionRow[]>;
   ensureSession?(id: string): Promise<void>;
   onSessionsChanged?(cb: (closed?: string) => void): Unsubscribe;
+  selectDeliveryTarget?(id: string | undefined): void;
   onAgentEvent(cb: (event: AgentEvent) => Promise<void>): Unsubscribe;
   onTool(cb: (event: ToolEvent) => Promise<void>): Unsubscribe;
   onJob(cb: (event: JobEvent) => Promise<void>): Unsubscribe;
@@ -92,8 +93,11 @@ export interface SenseOptions {
   intervalMs?: number;
   rules?: WatchRule[];
   selfCauseGraceMs?: number;
+  targetStorageKey?: string;
 }
 export interface SenseActions {
+  selectTarget?(id: string | undefined): Promise<void>;
+  dismissTargetNotice?(): Promise<void>;
   toggleRule(id: string, enabled: boolean): Promise<void>;
   confirmRule(id: string): Promise<void>;
   deleteRule(id: string): Promise<void>;

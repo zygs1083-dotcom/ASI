@@ -78,6 +78,8 @@ export function createChanges() {
 export function observableActions(actions: SenseActions, changed: () => void): SenseActions {
   const publish = <T>(task: Promise<T>): Promise<T> => task.finally(changed);
   return {
+    selectTarget: (id) => publish(actions.selectTarget?.(id) ?? Promise.reject(new Error('target unavailable'))),
+    dismissTargetNotice: () => publish(actions.dismissTargetNotice?.() ?? Promise.resolve()),
     toggleRule: (id, enabled) => publish(actions.toggleRule(id, enabled)),
     confirmRule: (id) => publish(actions.confirmRule(id)),
     deleteRule: (id) => publish(actions.deleteRule(id)),

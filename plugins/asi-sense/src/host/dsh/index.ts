@@ -1,5 +1,7 @@
+import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import type { Context } from '@deepseek-ai/cordis';
+import type {} from '@deepseek-ai/dsh-app-boot';
 import z from '@deepseek-ai/schemastery';
 import { createPresenter } from '../presenter/index.ts';
 import { createSenseRuntime } from '../runtime/index.ts';
@@ -17,6 +19,7 @@ export const inject = [
   'agents',
   'jobs',
   'llm',
+  'profileContext',
   'sessionController',
   'sessionProjections',
   'sessions',
@@ -43,9 +46,18 @@ export const Config: z<Config> = z.object({
 export async function apply(ctx: Context, config: Config): Promise<void> {
   const local = localPorts(ctx, config.storageRoot);
   const runtime = createSenseRuntime(
-    { ...local, dsh: createDshPort(ctx, () => runtime.rules.settings().sendTitles) },
+    {
+      ...local,
+      dsh: createDshPort(
+        ctx,
+        () => runtime.rules.settings().sendTitles,
+        undefined,
+        () => runtime.targetMode() === 'pinned',
+      ),
+    },
     {
       helperPath: config.helperPath ?? fileURLToPath(new URL('./asi-sense-helper', import.meta.url)),
+      targetStorageKey: `session-target-${createHash('sha256').update(ctx.profileContext.dir).digest('hex')}`,
       ...(config.intervalMs === undefined ? {} : { intervalMs: config.intervalMs }),
       ...(config.selfCauseGraceMs === undefined ? {} : { selfCauseGraceMs: config.selfCauseGraceMs }),
     },

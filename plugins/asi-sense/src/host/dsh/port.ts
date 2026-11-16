@@ -24,6 +24,7 @@ export function createDshPort(
   ctx: Context,
   sendTitles: () => boolean,
   mono: () => number = () => performance.now(),
+  pinned: () => boolean = () => false,
 ): DshPort & {
   onDeliveryCommitted(cb: (sessionId: string, id: string) => void): () => void;
   nowReadings(sessionId?: string): NowReadings;
@@ -36,6 +37,7 @@ export function createDshPort(
   const revisions = new WeakMap<Agent, number>();
   const waiting = new Map<string, { agent: Agent; tokens: Set<symbol> }>();
   let selected: string | undefined;
+  let selection = 0;
   const committed = new Set<(sessionId: string, id: string) => void>();
   const jobs = new JobEventCorrelator(activeTools);
   const accepted = ctx.sessionProjections.register({
@@ -77,6 +79,11 @@ export function createDshPort(
   };
   return {
     ...sessionCatalog(ctx),
+    selectDeliveryTarget(id) {
+      selected = id;
+      selection++;
+      deliver.select(id);
+    },
     nowReadings: (sessionId) =>
       nowReadings(
         ctx,
@@ -186,7 +193,6 @@ export function createDshPort(
     },
     onAgentEvent(cb) {
       const turns = new Map<string, { turn: number; user: boolean }>();
-      let selection = 0;
       const offCreated = ctx.on('agent/created', async ({ agent }) => {
         await cb({ type: 'created', sessionId: agent.id });
         return undefined;
@@ -215,7 +221,7 @@ export function createDshPort(
         if (decision.kind === 'reject' || payload.signal.aborted) return decision;
         const generation = ++selection;
         selected = payload.agent.id;
-        deliver.select(payload.agent.id);
+        if (!pinned()) deliver.select(payload.agent.id);
         const prior = turns.get(payload.agent.id);
         const user =
           prior?.turn === payload.turn

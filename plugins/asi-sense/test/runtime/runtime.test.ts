@@ -161,6 +161,29 @@ function harness(
 }
 
 describe('host runtime', () => {
+  it('restores a selected delivery target and keeps it when another session pre-steps', async () => {
+    const h = harness();
+    const stored = new Map<string, string>();
+    h.ports.storage.load = async (key) => stored.get(key);
+    h.ports.storage.save = async (key, value) => {
+      stored.set(key, value);
+    };
+    h.ports.dsh.listSessions = async () => [
+      { id: 'a', title: 'Fixture A', updatedAt: 1, running: false },
+      { id: 'b', title: 'Fixture B', updatedAt: 2, running: false },
+    ];
+    h.ports.dsh.ensureSession = async () => {};
+    await h.runtime.start();
+    await h.agent({ type: 'created', sessionId: 'a' });
+    await h.agent({ type: 'created', sessionId: 'b' });
+    await h.agent({ type: 'pre-step', sessionId: 'b' });
+    await h.runtime.actions.selectTarget?.('a');
+    await h.agent({ type: 'pre-step', sessionId: 'b' });
+    expect(h.runtime.currentSessionId()).toBe('a');
+    expect(h.runtime.target()).toMatchObject({ mode: 'pinned', sessionId: 'a' });
+    expect(stored.get('session-target')).toContain('"a"');
+    await h.runtime.stop();
+  });
   it('keeps pending token alerts with their source session and drops closed generations', async () => {
     const h = harness();
     const usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };

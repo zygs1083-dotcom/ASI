@@ -66,6 +66,7 @@
     "@deepseek-ai/dsh-agent": "0.2.2-rc.3",
     "@deepseek-ai/dsh-api-remotes": "0.2.2-rc.3",
     "@deepseek-ai/dsh-api-session-controller": "0.2.2-rc.3",
+    "@deepseek-ai/dsh-app-boot": "0.2.2-rc.3",
     "@deepseek-ai/dsh-client-locale": "0.2.2-rc.3",
     "@deepseek-ai/dsh-client-store": "0.2.2-rc.3",
     "@deepseek-ai/dsh-client-ui-layout": "0.2.2-rc.3",

@@ -131,6 +131,14 @@ export class DshSource {
   hasSession(session: string): boolean {
     return this.sessions.has(session);
   }
+  targetChanged(): void {
+    const session = this.attention.currentSessionId();
+    this.body.selectSession(session);
+    this.refresh(true);
+    if (session && !this.paused()) {
+      void this.body.tokens(session, () => this.active && this.attention.currentSessionId() === session);
+    }
+  }
   stateFor(session: string | undefined, state: SenseState): SenseState {
     const store = session === undefined ? undefined : this.sessions.get(session);
     const view = store ?? new StateStore(() => this.clock.wall());

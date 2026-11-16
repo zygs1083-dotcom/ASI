@@ -164,6 +164,22 @@ export class RuntimeAttention {
   targetMode(): 'auto' | 'pinned' {
     return this.pinned ? 'pinned' : 'auto';
   }
+  recordTargetReset(): void {
+    this.log(
+      {
+        signal: {
+          id: this.id(),
+          kind: 'delivery.target-unavailable',
+          at: this.clock.wall(),
+          source: { id: 'delivery', api: 'dsh', host: 'local' },
+          subject: 'delivery-target',
+          data: {},
+        },
+        level: 'record',
+      },
+      this.clock.mono(),
+    );
+  }
   async setTarget(id: string | undefined): Promise<void> {
     if (id && !this.sessions.has(id)) throw new Error('target session unavailable');
     this.pinned = id;
