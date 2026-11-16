@@ -7,7 +7,7 @@ import type { BodySignal } from './metrics.ts';
 import { rateEvidence } from './monitor-evidence.ts';
 import { serializeMonitor, validateSamples } from './monitor-snapshot.ts';
 import { autoEvaluator, MonitorView, type RateSample } from './monitor-view.ts';
-import { type BodyPersistence, PersistScheduler } from './persistence.ts';
+import { type BackupNotice, type BodyPersistence, PersistScheduler, validBackupNotice } from './persistence.ts';
 import { RateEvaluator, type RateRule } from './rate.ts';
 import { RebaselineManager, type RebaselineSuggestion } from './rebaseline.ts';
 import { defaultAnomalyRules, defaultRateRules, floorTable } from './rules.ts';
@@ -29,6 +29,7 @@ export interface BodyMonitorOptions {
   tuner?: Tuner;
   /** Combined tuner+baseline+state snapshot store (one file, atomic writes). */
   persistence?: BodyPersistence;
+  onTuningApplied?: (restored: boolean) => void;
   /** Options for the always-on built-in burst detector (e.g. watched `roots`). */
   fileBurst?: FileBurstOptions;
 }
@@ -58,6 +59,7 @@ export class BodyMonitor implements BodyEvaluator {
   private readonly anomalyRules?: readonly AnomalyRule[];
   private readonly burst: FileBurstDetector;
   private readonly persistence?: BodyPersistence;
+  private readonly onTuningApplied?: (restored: boolean) => void;
   private readonly scheduler?: PersistScheduler;
   private readonly rebaser?: RebaselineManager;
   private seed: Baseline;
@@ -68,6 +70,11 @@ export class BodyMonitor implements BodyEvaluator {
   private persistReady: boolean;
   /** Monitor-level kill switch, independent of a wired tuner. */
   tuningDisabled: 'restore-failed' | 'storage-failed' | undefined;
+  backupError?: { code: string; stage: 'backup' | 'save' };
+  backupNotice?: BackupNotice;
+  restoreKind?: BackupNotice['kind'];
+  private retrying?: Promise<void>;
+  private retryRequested = false;
 
   constructor(options: BodyMonitorOptions = {}) {
     this.contextSession = options.contextSession;
@@ -100,6 +107,7 @@ export class BodyMonitor implements BodyEvaluator {
       threshold: (p, f) => this.tuner?.number(p, f) ?? f,
     });
     this.persistence = options.persistence;
+    this.onTuningApplied = options.onTuningApplied;
     this.persistReady = options.persistence === undefined;
     if (options.persistence) {
       const save = options.persistence.save.bind(options.persistence);
@@ -128,6 +136,7 @@ export class BodyMonitor implements BodyEvaluator {
             publish();
             this.tuningDisabled = this.tuner?.tuningDisabled;
             if (stage) this.latest = this.rebaser?.publish(stage);
+            this.onTuningApplied?.(false);
           },
         );
       });
@@ -215,27 +224,84 @@ export class BodyMonitor implements BodyEvaluator {
     this.restored = true;
     if (!this.persistence) {
       await this.tuner?.restore();
+      this.onTuningApplied?.(true);
       return;
     }
     let data: string | undefined;
+    let loadError: unknown;
     try {
       data = await this.persistence.load();
-    } catch {
+    } catch (error) {
+      loadError = error;
       data = BAD;
     }
-    if (data !== undefined && typeof data !== 'string') data = BAD;
+    if (data === undefined && this.retryRequested) {
+      loadError = Object.assign(new Error('body snapshot missing during retry'), { code: 'SNAPSHOT_MISSING' });
+      data = BAD;
+    }
+    if (data !== undefined && typeof data !== 'string') {
+      loadError = new Error('invalid snapshot');
+      data = BAD;
+    }
     const fail = async () => {
       this.tuningDisabled = 'restore-failed';
       this.latest = undefined;
       if (this.tuner) this.tuner.restoreSnapshot(BAD); // sets its own flag too
       this.seed = new Baseline(this.baselineOptions()); // baseline reset
       this.rebuildAnomaly();
-      await this.persistence?.save(JSON.stringify({ version: 1, disabled: 'restore-failed' })).catch(() => {});
-      this.persistReady = true;
+      this.onTuningApplied?.(true);
+      let stage: 'backup' | 'save' = 'backup';
+      try {
+        if (loadError !== undefined) throw loadError;
+        const notice = await this.persistence?.onRestoreFailure?.();
+        if (notice && !validBackupNotice(notice)) {
+          throw Object.assign(new Error('invalid backup filename'), { code: 'INVALID_BACKUP_NAME' });
+        }
+        this.backupNotice = notice;
+        this.restoreKind = notice?.kind;
+        stage = 'save';
+        await this.persistence?.save(
+          JSON.stringify({
+            version: 1,
+            disabled: 'restore-failed',
+            ...(notice ? { backupNotice: notice, restoreKind: notice.kind } : {}),
+          }),
+        );
+        this.backupError = undefined;
+        this.persistReady = true;
+      } catch (error) {
+        const value = error && typeof error === 'object' && 'code' in error ? error.code : undefined;
+        const code =
+          typeof value === 'string' &&
+          [
+            'EACCES',
+            'EPERM',
+            'ENOSPC',
+            'EROFS',
+            'EIO',
+            'ENOENT',
+            'ENOTDIR',
+            'EEXIST',
+            'EMFILE',
+            'ENFILE',
+            'EDQUOT',
+            'BACKUP_UNAVAILABLE',
+            'SNAPSHOT_CHANGED',
+            'SNAPSHOT_MISSING',
+            'INVALID_BACKUP_NAME',
+          ].includes(value)
+            ? value
+            : 'unknown';
+        this.backupError = { code, stage };
+        this.persistence?.onBackupError?.(code);
+        return;
+      }
     };
     if (data === undefined) {
       this.tuner?.restoreSnapshot(undefined); // first install
+      this.backupError = undefined;
       this.persistReady = true;
+      this.onTuningApplied?.(true);
       return;
     }
     let d: Record<string, unknown> | undefined;
@@ -245,12 +311,30 @@ export class BodyMonitor implements BodyEvaluator {
     } catch {
       /* corrupt */
     }
+    if (
+      d?.version === 1 &&
+      d.disabled === 'restore-failed' &&
+      Object.keys(d).every((key) => ['version', 'disabled', 'backupNotice', 'restoreKind'].includes(key)) &&
+      (d.backupNotice === undefined || validBackupNotice(d.backupNotice)) &&
+      (d.restoreKind === undefined || d.restoreKind === 'corrupt' || d.restoreKind === 'unknown-version')
+    ) {
+      this.tuningDisabled = 'restore-failed';
+      this.tuner?.restoreSnapshot(BAD);
+      this.backupNotice = d.backupNotice as BackupNotice | undefined;
+      this.restoreKind = (d.restoreKind as BackupNotice['kind'] | undefined) ?? this.backupNotice?.kind;
+      this.backupError = undefined;
+      this.persistReady = true;
+      this.onTuningApplied?.(true);
+      return;
+    }
     // A v1 snapshot is REQUIRED to carry every field: baseline text, latch
     // and history records, and tuner text whenever a tuner is wired —
     // missing pieces are malformed input, never a silent first install.
     if (
       d?.version !== 1 ||
       (d.disabled !== undefined && d.disabled !== 'restore-failed' && d.disabled !== 'storage-failed') ||
+      (d.backupNotice !== undefined && !validBackupNotice(d.backupNotice)) ||
+      (d.restoreKind !== undefined && d.restoreKind !== 'corrupt' && d.restoreKind !== 'unknown-version') ||
       typeof d.baseline !== 'string' ||
       (this.tuner && typeof d.tuner !== 'string')
     ) {
@@ -269,11 +353,42 @@ export class BodyMonitor implements BodyEvaluator {
     const latch = validLatch(d.latch);
     if (history === undefined || latch === undefined) return fail();
     this.seed = b;
+    this.backupNotice = d.backupNotice as BackupNotice | undefined;
+    this.restoreKind = (d.restoreKind as BackupNotice['kind'] | undefined) ?? this.backupNotice?.kind;
     this.rebuildAnomaly();
     this.latest = { ...latch, [BODY_HISTORY]: history };
     if (this.rebaser && !this.rebaser.restore(d.rebaseline, this.latest)) return fail();
+    this.backupError = undefined;
     this.persistReady = true;
+    this.onTuningApplied?.(true);
     this.dirty();
+  }
+  retryBackup(): Promise<void> {
+    if (this.retrying) return this.retrying;
+    if (!this.backupError) return Promise.reject(new Error('monitor: backup retry unavailable'));
+    this.restored = false;
+    this.retryRequested = true;
+    this.retrying = this.restore()
+      .then(() => {
+        if (this.backupError) throw new Error(`monitor: ${this.backupError.stage} failed (${this.backupError.code})`);
+      })
+      .finally(() => {
+        this.retrying = undefined;
+        this.retryRequested = false;
+      });
+    return this.retrying;
+  }
+  async dismissBackup(): Promise<void> {
+    const persistence = this.persistence;
+    if (!this.backupNotice || !this.persistReady || !this.scheduler || !persistence) {
+      throw new Error('monitor: backup notice unavailable');
+    }
+    await this.scheduler.commit(
+      () => persistence.save(this.serialize(undefined, undefined, undefined, null)),
+      () => {
+        this.backupNotice = undefined;
+      },
+    );
   }
   /** Force-flushes the combined snapshot (no-op before restore). */
   async persist(): Promise<void> {
@@ -301,7 +416,22 @@ export class BodyMonitor implements BodyEvaluator {
       ? new AnomalyEvaluator(this.seed, this.anomalyRules, (p, f) => this.tuner?.number(p, f) ?? f)
       : undefined;
   }
-  private serialize(tunerSnapshot?: string, latest = this.latest, rebaseline = this.rebaser?.snapshot()): string {
-    return serializeMonitor(this.seed, this.clock, this.tuner, latest, this.tuningDisabled, tunerSnapshot, rebaseline);
+  private serialize(
+    tunerSnapshot?: string,
+    latest = this.latest,
+    rebaseline = this.rebaser?.snapshot(),
+    notice: BackupNotice | null | undefined = this.backupNotice,
+  ): string {
+    return serializeMonitor(
+      this.seed,
+      this.clock,
+      this.tuner,
+      latest,
+      this.tuningDisabled,
+      tunerSnapshot,
+      rebaseline,
+      notice ?? undefined,
+      this.restoreKind,
+    );
   }
 }

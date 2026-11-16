@@ -1,5 +1,6 @@
 import type { BodyThresholdSample, BodyThresholdState } from '@asi/sense-types';
 import type { Baseline } from './baseline.ts';
+import type { BackupNotice } from './persistence.ts';
 import { type AdaptiveState, BODY_HISTORY, serializeHistory } from './state.ts';
 import type { Tuner } from './tuner.ts';
 
@@ -11,6 +12,8 @@ export function serializeMonitor(
   disabled: 'restore-failed' | 'storage-failed' | undefined,
   tunerSnapshot?: string,
   rebaseline?: unknown,
+  backupNotice?: BackupNotice,
+  restoreKind?: BackupNotice['kind'],
 ): string {
   const current = seed.clone();
   current.advance(clock());
@@ -24,6 +27,8 @@ export function serializeMonitor(
     latch,
     history: serializeHistory(latest?.[BODY_HISTORY]),
     rebaseline,
+    ...(backupNotice ? { backupNotice } : {}),
+    ...(restoreKind ? { restoreKind } : {}),
   });
 }
 

@@ -1,9 +1,15 @@
 import { createHash } from 'node:crypto';
+import * as fs from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import type { Body, SenseState } from '@asi/sense-types';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { DeliveryFailure } from '../../src/host/attention/drain.ts';
+import { AttentionPipeline } from '../../src/host/attention/pipeline.ts';
 import { DEFAULT_RULES } from '../../src/host/attention/rules.ts';
 import { defaultBodyRules } from '../../src/host/body/index.ts';
+import { FileStoragePort } from '../../src/host/dsh/storage.ts';
+import { createPresenter } from '../../src/host/presenter/index.ts';
 import { createSenseRuntime } from '../../src/host/runtime/index.ts';
 import type {
   AgentEvent,
@@ -19,7 +25,7 @@ import { Settings } from '../../src/host/runtime/settings.ts';
 import { pauseAction } from '../../src/host/runtime/tools.ts';
 import type { NowReadings } from '../../src/host/sources/dsh.ts';
 import { TokenFacts } from '../../src/host/sources/token-facts.ts';
-import { f, mkBody } from '../body/helpers.ts';
+import { diskFact, f, mkBody } from '../body/helpers.ts';
 
 afterEach(() => vi.useRealTimers());
 
@@ -1692,6 +1698,49 @@ describe('host runtime', () => {
     await h.runtime.stop();
   });
 
+  it('delivers offline context at its original level after the agent lowers the rule', async () => {
+    const h = harness();
+    await h.runtime.start();
+    await h.agent({ type: 'created', sessionId: 'old' });
+    await h.agent({ type: 'pre-step', sessionId: 'old' });
+    let release!: () => void;
+    let started!: () => void;
+    const entered = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let blocked = false;
+    h.ports.storage.save = async (key) => {
+      if (key === 'body' && !blocked) {
+        blocked = true;
+        started();
+        await gate;
+      }
+    };
+    const tuning = h.runtime.tools.bodyTune({ param: 'deliveryLevel.body.rate', to: 'record' });
+    await entered;
+    await h.agent({ type: 'disposed', sessionId: 'old' });
+    const rss = (value: number) =>
+      mkBody({ harnessProcess: { ...f({ rss: value, cpu: 0, uptimeSec: 0 }), observedAt: Date.now() } });
+    await h.sample(rss(100));
+    await h.advance(1_000);
+    await h.sample(rss(200));
+    const alert = h.runtime.events().find((event) => event.kind === 'body.rate');
+    expect(alert).toMatchObject({ level: 'context' });
+    release();
+    expect(await tuning).toMatchObject({
+      applied: true,
+    });
+    await h.agent({ type: 'created', sessionId: 'new' });
+    await h.agent({ type: 'pre-step', sessionId: 'new' });
+    expect(h.delivered.flatMap((intent) => intent.update.changes)).toContainEqual(
+      expect.objectContaining({ level: 'context', signal: expect.objectContaining({ id: alert?.id }) }),
+    );
+    await h.runtime.stop();
+  });
+
   it('keeps confirmed tuning when an atomic save rejects and disables AI tuning', async () => {
     const h = harness();
     await h.runtime.start();
@@ -1703,6 +1752,132 @@ describe('host runtime', () => {
     h.failSave(false);
     await h.runtime.stop();
     expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('keeps displayed tuning and the actual pipeline equal through restore, retry, tuning, revert and reset', async () => {
+    const levels = vi.spyOn(AttentionPipeline.prototype, 'setDeliveryLevels');
+    let saved: string | undefined;
+    let failRead = false;
+    const storage = {
+      load: async (key: string) => {
+        if (key !== 'body') return undefined;
+        if (failRead) throw Object.assign(new Error('fixture'), { code: 'EACCES' });
+        return saved;
+      },
+      save: async (key: string, value: string) => {
+        if (key === 'body') saved = value;
+      },
+      backup: async () => 'body.json.bak-fixture',
+    };
+    const check = (h: ReturnType<typeof harness>) => {
+      const presenter = createPresenter(h.runtime, { clock: h.ports.clock });
+      const params = Object.fromEntries(presenter.snapshot().tuning.parameters.map((item) => [item.key, item.value]));
+      presenter.close();
+      const pipeline = levels.mock.contexts.at(-1) as AttentionPipeline;
+      const actual = pipeline as unknown as {
+        levels: Record<string, string>;
+        mergeWindowMs: number;
+        fileMergeWindowMs: number;
+      };
+      expect(actual.levels).toEqual({
+        'body.rate': params['deliveryLevel.body.rate'],
+        'body.anomaly': params['deliveryLevel.body.anomaly'],
+        'file.burst': params['deliveryLevel.file.burst'],
+      });
+      for (const kind of ['body.rate', 'body.anomaly', 'file.burst'] as const) {
+        const rule = pipeline.selectRule({
+          id: 'fixture',
+          kind,
+          at: Date.now(),
+          source: { id: 'fixture', api: 'fixture', host: 'local' },
+          subject: 'fixture',
+          data: { severity: 'warn', externalDeletionExceeded: true },
+        });
+        expect(rule?.level).toBe(params[`deliveryLevel.${kind}`]);
+      }
+      expect(actual.mergeWindowMs).toBe(params.mergeWindowMs);
+      expect(actual.fileMergeWindowMs).toBe(params.fileMergeWindowMs);
+    };
+    try {
+      const first = harness();
+      Object.assign(first.ports.storage, storage);
+      await first.runtime.start();
+      check(first);
+      for (const [param, to] of [
+        ['mergeWindowMs', 4_000],
+        ['fileMergeWindowMs', 10_000],
+        ['deliveryLevel.body.rate', 'record'],
+        ['deliveryLevel.body.anomaly', 'record'],
+      ] as const) {
+        expect(await first.runtime.tools.bodyTune({ param, to })).toMatchObject({ applied: true });
+        check(first);
+      }
+      await first.runtime.stop();
+
+      failRead = true;
+      const restored = harness();
+      Object.assign(restored.ports.storage, storage);
+      await restored.runtime.start();
+      expect(restored.runtime.body.monitor.backupError).toEqual({ code: 'EACCES', stage: 'backup' });
+      check(restored);
+      const mismatches: string[] = [];
+      const unwatch = restored.runtime.onChange(() => {
+        try {
+          check(restored);
+        } catch (error) {
+          mismatches.push(String(error));
+        }
+      });
+      expect(restored.runtime.body.tuner.get('deliveryLevel.file.burst')).toBe('context');
+      failRead = false;
+      await restored.runtime.actions.retryTuningBackup();
+      expect(restored.runtime.body.tuner.get('deliveryLevel.file.burst')).toBe('wake');
+      check(restored);
+      await restored.runtime.actions.deleteRule('files-wake');
+      await restored.runtime.tools.envWatch({
+        action: 'add',
+        rule: { id: 'context-files', match: { kind: 'file.changed', subject: '/workspace/**' }, level: 'context' },
+      });
+      await restored.agent({ type: 'created', sessionId: 's' });
+      await restored.agent({ type: 'pre-step', sessionId: 's' });
+      await restored.agent({ type: 'post-step', sessionId: 's' });
+      for (let i = 0; i < 51; i++) await restored.file({ path: `/workspace/${i}.ts`, change: 'delete' });
+      await restored.advance(4_000);
+      expect(restored.delivered).toContainEqual(
+        expect.objectContaining({
+          kind: 'followup',
+          update: expect.objectContaining({
+            changes: expect.arrayContaining([
+              expect.objectContaining({ signal: expect.objectContaining({ kind: 'file.burst' }) }),
+            ]),
+          }),
+        }),
+      );
+      const change = await restored.runtime.tools.bodyTune({ param: 'deliveryLevel.file.burst', to: 'context' });
+      expect(change).toMatchObject({ applied: true });
+      check(restored);
+      await restored.runtime.actions.revertTuning(change.change.id);
+      check(restored);
+      expect(mismatches).toEqual([]);
+      unwatch();
+      await restored.runtime.stop();
+
+      const normal = harness();
+      Object.assign(normal.ports.storage, storage);
+      await normal.runtime.start();
+      check(normal);
+      await normal.runtime.stop();
+      saved = '{broken';
+      const reset = harness();
+      Object.assign(reset.ports.storage, storage);
+      await reset.runtime.start();
+      check(reset);
+      await reset.runtime.actions.resetTuning();
+      check(reset);
+      await reset.runtime.stop();
+    } finally {
+      levels.mockRestore();
+    }
   });
 
   it('refreshes tokens at steps and five seconds, excludes fallback capacity from alerts and clears missing data', async () => {
@@ -1754,7 +1929,913 @@ describe('host runtime', () => {
   it('rejects unsupported tuning parameters explicitly', async () => {
     const h = harness();
     await h.runtime.start();
-    await expect(h.runtime.tools.bodyTune({ param: 'mergeWindowMs', to: 1_000 })).rejects.toThrow('unsupported-param');
+    await expect(h.runtime.tools.bodyTune({ param: 'not-a-parameter', to: 1_000 })).rejects.toThrow(
+      'unsupported-param',
+    );
+    await h.runtime.stop();
+  });
+
+  it('keeps the ten-minute ETA floor for direct and automatic noise tuning', async () => {
+    const h = harness();
+    await h.runtime.start();
+    const param = 'rate.context.maxEtaMs';
+    expect(await h.runtime.tools.bodyTune({ param, to: 300_000 })).toMatchObject({ applied: false });
+    for (let i = 0; i < 3; i++) {
+      const id = `eta-alert-${i}`;
+      await h.runtime.body.tuner.registerAlert(id, 'context-eta', param);
+      expect(await h.runtime.tools.bodyTune({ action: 'feedback', alertId: id, verdict: 'noise' })).toMatchObject({
+        applied: true,
+      });
+    }
+    expect(h.runtime.body.tuner.get(param)).toBe(600_000);
+    expect(await h.runtime.tools.bodyTune({ param, to: 900_000 })).toMatchObject({ applied: true });
+    expect(await h.runtime.tools.bodyTune({ param, to: 600_000 })).toMatchObject({
+      applied: false,
+      reason: 'safety: cannot loosen',
+    });
+    await h.runtime.stop();
+  });
+
+  it.each(['record', 'context'] as const)(
+    'delivers the ten-minute disk warning while a %s rate warning stays latched',
+    async (level) => {
+      const h = harness();
+      await h.runtime.start();
+      await h.agent({ type: 'created', sessionId: 's' });
+      await h.agent({ type: 'pre-step', sessionId: 's' });
+      await h.agent({ type: 'post-step', sessionId: 's' });
+      if (level === 'record') await h.runtime.tools.bodyTune({ param: 'deliveryLevel.body.rate', to: level });
+      const gib = 1024 ** 3;
+      const disk = (free: number) =>
+        mkBody({
+          disks: {
+            ...diskFact([{ mount: '/fixture', total: 500 * gib, free: free * gib, observedAt: Date.now() }]),
+            observedAt: Date.now(),
+          },
+        });
+      await h.sample(disk(88));
+      await h.advance(60_000);
+      await h.sample(disk(85));
+      expect(h.runtime.events().find((event) => event.subject === 'rate:disk-drop:disk:/fixture')).toMatchObject({
+        level,
+      });
+      for (let minute = 2; minute <= 10; minute++) {
+        await h.advance(60_000);
+        await h.sample(disk(88 - 3 * minute));
+      }
+      expect(h.runtime.events().filter((event) => event.subject === 'rate:disk-drop:disk:/fixture')).toHaveLength(1);
+      await h.advance(60_000);
+      await h.sample(disk(55));
+      await h.agent({ type: 'pre-step', sessionId: 's' });
+      expect(h.delivered.flatMap((intent) => intent.update.changes)).toContainEqual(
+        expect.objectContaining({
+          level: 'context',
+          signal: expect.objectContaining({
+            subject: 'rate:disk-drop:disk:/fixture',
+            data: expect.objectContaining({ timeToFloorMs: 600_000 }),
+          }),
+        }),
+      );
+      await h.advance(60_000);
+      await h.sample(disk(52));
+      expect(h.runtime.events().filter((event) => event.subject === 'rate:disk-drop:disk:/fixture')).toHaveLength(2);
+      await h.runtime.stop();
+    },
+  );
+
+  it('delivers the ten-minute context warning after a tuned twenty-minute warning stays latched', async () => {
+    const h = harness();
+    await h.runtime.start();
+    await h.runtime.tools.bodyTune({ param: 'deliveryLevel.body.rate', to: 'record' });
+    await h.runtime.tools.bodyTune({ param: 'rate.context.maxEtaMs', to: 900_000 });
+    await h.runtime.tools.bodyTune({ param: 'rate.context.maxEtaMs', to: 1_200_000 });
+    await h.agent({ type: 'created', sessionId: 's' });
+    const sample = async (minute: number) => {
+      h.token({
+        contextWindow: 25_000,
+        contextUsed: 4_000 + 1_000 * minute,
+        contextWindowSource: 'configured',
+        sessionUsage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      });
+      await h.agent({ type: 'pre-step', sessionId: 's' });
+      await h.sample();
+      await h.agent({ type: 'post-step', sessionId: 's' });
+    };
+    await sample(0);
+    for (let minute = 1; minute <= 11; minute++) {
+      await h.advance(60_000);
+      await sample(minute);
+      if (minute === 1) {
+        expect(h.runtime.events().find((event) => event.subject === 'rate:context-eta')).toMatchObject({
+          level: 'record',
+        });
+      }
+    }
+    await h.agent({ type: 'pre-step', sessionId: 's' });
+    expect(h.delivered.flatMap((intent) => intent.update.changes)).toContainEqual(
+      expect.objectContaining({
+        level: 'context',
+        signal: expect.objectContaining({
+          subject: 'rate:context-eta',
+          data: expect.objectContaining({ timeToFloorMs: 600_000 }),
+        }),
+      }),
+    );
+    await h.runtime.stop();
+  });
+
+  it.each(['context', 'record'] as const)(
+    'emits one context ETA warning at the ten-minute boundary when rate delivery is %s',
+    async (level) => {
+      const h = harness();
+      await h.runtime.start();
+      if (level === 'record') await h.runtime.tools.bodyTune({ param: 'deliveryLevel.body.rate', to: 'record' });
+      await h.agent({ type: 'created', sessionId: 's' });
+      const sample = async (minute: number) => {
+        h.token({
+          contextWindow: 25_000,
+          contextUsed: 4_000 + 1_000 * minute,
+          contextWindowSource: 'configured',
+          sessionUsage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        });
+        await h.agent({ type: 'pre-step', sessionId: 's' });
+        await h.sample();
+        await h.agent({ type: 'post-step', sessionId: 's' });
+      };
+      await sample(0);
+      for (let minute = 1; minute <= 11; minute++) {
+        await h.advance(60_000);
+        await sample(minute);
+      }
+      await h.agent({ type: 'pre-step', sessionId: 's' });
+      const warnings = h.runtime
+        .events()
+        .filter((event) => event.kind === 'body.rate' && event.subject.includes('context'));
+      expect(warnings).toHaveLength(1);
+      expect(warnings[0].level).toBe('context');
+      const changes = h.delivered
+        .flatMap((intent) => intent.update.changes)
+        .filter((change) => change.signal.kind === 'body.rate' && change.signal.subject.includes('context'));
+      expect(changes).toHaveLength(1);
+      expect(changes[0].level).toBe('context');
+      await h.runtime.stop();
+    },
+  );
+
+  it.each(['context', 'wake'] as const)(
+    'routes the single ten-minute context ETA warning through a custom %s rule',
+    async (level) => {
+      const h = harness(undefined, {
+        rules: [
+          ...DEFAULT_RULES,
+          ...defaultBodyRules(),
+          {
+            id: 'custom-context-eta',
+            match: { kind: 'body.rate', where: { ruleId: 'context-eta' } },
+            level,
+            createdBy: 'user',
+            approved: true,
+          },
+        ],
+      });
+      await h.runtime.start();
+      await h.runtime.actions.toggleRule('body-rate-warn', false);
+      await h.agent({ type: 'created', sessionId: 's' });
+      const sample = async (minute: number) => {
+        h.token({
+          contextWindow: 25_000,
+          contextUsed: 4_000 + 1_000 * minute,
+          contextWindowSource: 'configured',
+          sessionUsage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        });
+        await h.agent({ type: 'pre-step', sessionId: 's' });
+        await h.sample();
+        await h.agent({ type: 'post-step', sessionId: 's' });
+      };
+      await sample(0);
+      for (let minute = 1; minute <= 11; minute++) {
+        await h.advance(60_000);
+        await sample(minute);
+      }
+      await h.advance(2_000);
+      await h.agent({ type: 'pre-step', sessionId: 's' });
+      const warnings = h.runtime
+        .events()
+        .filter((event) => event.kind === 'body.rate' && event.subject.includes('context'));
+      expect(warnings).toHaveLength(1);
+      expect(warnings[0]).toMatchObject({ subject: 'rate:context-eta', level, ruleId: 'custom-context-eta' });
+      const changes = h.delivered
+        .flatMap((intent) => intent.update.changes)
+        .filter((change) => change.signal.kind === 'body.rate' && change.signal.subject.includes('context'));
+      expect(changes).toHaveLength(1);
+      expect(changes[0]).toMatchObject({ level, signal: { data: { ruleId: 'context-eta', timeToFloorMs: 600_000 } } });
+      await h.runtime.stop();
+    },
+  );
+
+  it.each(['context', 'wake'] as const)(
+    'routes the hard context boundary to a custom %s rule after an earlier tuned alert',
+    async (level) => {
+      const h = harness(undefined, {
+        rules: [
+          ...DEFAULT_RULES,
+          ...defaultBodyRules(),
+          {
+            id: 'custom-hard-context',
+            match: { kind: 'body.rate', where: { ruleId: 'context-eta', timeToFloorMs: { '<=': 600_000 } } },
+            level,
+            createdBy: 'user',
+            approved: true,
+          },
+        ],
+      });
+      await h.runtime.start();
+      await h.runtime.tools.bodyTune({ param: 'rate.context.maxEtaMs', to: 900_000 });
+      await h.runtime.tools.bodyTune({ param: 'rate.context.maxEtaMs', to: 1_200_000 });
+      await h.runtime.actions.toggleRule('body-rate-warn', false);
+      await h.agent({ type: 'created', sessionId: 's' });
+      for (let minute = 0; minute <= 11; minute++) {
+        if (minute) await h.advance(60_000);
+        h.token({
+          contextWindow: 25_000,
+          contextUsed: 4_000 + 1_000 * minute,
+          contextWindowSource: 'configured',
+          sessionUsage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        });
+        await h.agent({ type: 'pre-step', sessionId: 's' });
+        await h.sample();
+        await h.agent({ type: 'post-step', sessionId: 's' });
+      }
+      await h.advance(2_000);
+      await h.agent({ type: 'pre-step', sessionId: 's' });
+      const hardEvents = h.runtime
+        .events()
+        .filter((event) => event.kind === 'body.rate' && event.detail?.timeToFloorMs === 600_000);
+      expect(hardEvents).toHaveLength(1);
+      expect(hardEvents[0]).toMatchObject({ subject: 'rate:context-eta', ruleId: 'custom-hard-context', level });
+      const hardChanges = h.delivered
+        .flatMap((intent) => intent.update.changes)
+        .filter((change) => change.signal.data.timeToFloorMs === 600_000 && change.signal.kind === 'body.rate');
+      expect(hardChanges).toHaveLength(1);
+      expect(hardChanges[0]).toMatchObject({ level, signal: { data: { ruleId: 'context-eta' } } });
+      await h.runtime.stop();
+    },
+  );
+
+  it('emits one disk warning when the rate and ten-minute ETA thresholds coincide', async () => {
+    const h = harness();
+    await h.runtime.start();
+    await h.agent({ type: 'created', sessionId: 's' });
+    await h.agent({ type: 'pre-step', sessionId: 's' });
+    const gib = 1024 ** 3;
+    const disk = (free: number) =>
+      mkBody({
+        disks: {
+          ...diskFact([{ mount: '/fixture', total: 500 * gib, free: free * gib, observedAt: Date.now() }]),
+          observedAt: Date.now(),
+        },
+      });
+    await h.sample(disk(33));
+    await h.advance(60_000);
+    await h.sample(disk(30));
+    await h.agent({ type: 'pre-step', sessionId: 's' });
+    const warnings = h.runtime.events().filter((event) => event.kind === 'body.rate' && event.subject.includes('disk'));
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0].subject).toBe('rate:disk-drop:disk:/fixture');
+    await h.runtime.stop();
+  });
+
+  it('applies, guards and reverts merge windows and delivery levels', async () => {
+    const h = harness();
+    await h.runtime.start();
+    await h.agent({ type: 'created', sessionId: 's' });
+    await h.agent({ type: 'pre-step', sessionId: 's' });
+    await h.agent({ type: 'post-step', sessionId: 's' });
+    await h.job({ type: 'exited', id: 'pending', exitCode: 1 });
+    await h.advance(500);
+    const window = await h.runtime.tools.bodyTune({ param: 'mergeWindowMs', to: 1_000 });
+    expect(window).toMatchObject({ applied: true, change: { from: 2_000, to: 1_000 } });
+    await h.advance(500);
+    expect(h.delivered).toHaveLength(1);
+    expect(await h.runtime.tools.bodyTune({ param: 'fileMergeWindowMs', to: 999 })).toMatchObject({
+      applied: false,
+      reason: 'out of bounds',
+    });
+    expect(await h.runtime.tools.bodyTune({ param: 'fileMergeWindowMs', to: 60_001 })).toMatchObject({
+      applied: false,
+      reason: 'out of bounds',
+    });
+    expect(await h.runtime.tools.bodyTune({ param: 'fileMergeWindowMs', to: 10_001 })).toMatchObject({
+      applied: false,
+    });
+    expect(await h.runtime.tools.bodyTune({ param: 'fileMergeWindowMs', to: 10_000 })).toMatchObject({ applied: true });
+    expect(await h.runtime.tools.bodyTune({ param: 'deliveryLevel.body.rate', to: 'wake' })).toMatchObject({
+      applied: false,
+    });
+    expect(await h.runtime.tools.bodyTune({ param: 'deliveryLevel.body.rate', to: 'record' })).toMatchObject({
+      applied: true,
+    });
+    const burst = await h.runtime.tools.bodyTune({ param: 'deliveryLevel.file.burst', to: 'record' });
+    expect(burst).toMatchObject({
+      applied: true,
+    });
+    expect(await h.runtime.tools.bodyTune({ param: 'deliveryLevel.file.burst', to: 'wake' })).toMatchObject({
+      applied: false,
+    });
+    await h.runtime.actions.revertTuning(window.change.id);
+    expect(await h.runtime.actions.revertTuning(burst.change.id)).toMatchObject({ applied: true });
+    expect(h.runtime.body.tuner.get('deliveryLevel.file.burst')).toBe('wake');
+    for (let i = 0; i < 51; i++) await h.file({ path: `/workspace/${i}.ts`, change: 'delete' });
+    expect(h.runtime.events().find((event) => event.kind === 'file.burst')).toMatchObject({ level: 'wake' });
+    expect(h.runtime.body.tuner.get('mergeWindowMs')).toBe(2_000);
+    await h.runtime.stop();
+  });
+
+  it('restores tuning and migrates the exact previous whitelist without losing locks or quotas', async () => {
+    let saved: string | undefined;
+    const storage = {
+      load: async (key: string) => (key === 'body' ? saved : undefined),
+      save: async (key: string, value: string) => {
+        if (key === 'body') saved = value;
+      },
+    };
+    const first = harness();
+    Object.assign(first.ports.storage, storage);
+    await first.runtime.start();
+    await first.runtime.tools.bodyTune({ param: 'rate.rss.maxRatio', to: 0.6 });
+    await first.runtime.tools.bodyTune({ param: 'rate.rss.maxRatio', to: 0.7 });
+    await first.runtime.actions.lockParam('floor.disk.warn', true);
+    await first.runtime.stop();
+    if (!saved) throw new Error('missing snapshot');
+    const legacy = JSON.parse(saved);
+    legacy.version = 1;
+    const tuner = JSON.parse(legacy.tuner);
+    tuner.values = tuner.values.filter(
+      ([key]: [string, unknown]) =>
+        key !== 'mergeWindowMs' && key !== 'fileMergeWindowMs' && !key.startsWith('deliveryLevel.'),
+    );
+    legacy.tuner = JSON.stringify(tuner);
+    saved = JSON.stringify(legacy);
+    const restored = harness();
+    Object.assign(restored.ports.storage, storage);
+    await restored.runtime.start();
+    expect(restored.runtime.body.tuner.tuningDisabled).toBeUndefined();
+    expect(restored.runtime.body.tuner.get('mergeWindowMs')).toBe(2_000);
+    expect(restored.runtime.body.tuner.get('rate.rss.maxRatio')).toBe(0.7);
+    expect(await restored.runtime.tools.bodyTune({ param: 'rate.rss.maxRatio', to: 0.8 })).toMatchObject({
+      reason: 'hourly change limit',
+    });
+    expect(await restored.runtime.tools.bodyTune({ param: 'floor.disk.warn', to: 0.11 })).toMatchObject({
+      reason: 'param locked',
+    });
+    const applied = await restored.runtime.tools.bodyTune({ param: 'mergeWindowMs', to: 4_000 });
+    const level = await restored.runtime.tools.bodyTune({ param: 'deliveryLevel.body.rate', to: 'record' });
+    expect(applied.applied && level.applied).toBe(true);
+    await restored.runtime.stop();
+    const restarted = harness();
+    Object.assign(restarted.ports.storage, storage);
+    await restarted.runtime.start();
+    expect(restarted.runtime.body.tuner.get('mergeWindowMs')).toBe(4_000);
+    expect(restarted.runtime.body.tuner.get('deliveryLevel.body.rate')).toBe('record');
+    await restarted.agent({ type: 'created', sessionId: 'restored' });
+    await restarted.agent({ type: 'pre-step', sessionId: 'restored' });
+    await restarted.agent({ type: 'post-step', sessionId: 'restored' });
+    await restarted.job({ type: 'exited', id: 'restored-job', exitCode: 1 });
+    await restarted.advance(3_999);
+    expect(restarted.delivered).toHaveLength(0);
+    await restarted.advance(1);
+    expect(restarted.delivered).toHaveLength(1);
+    await restarted.runtime.actions.revertTuning(applied.change.id);
+    expect(restarted.runtime.body.tuner.get('mergeWindowMs')).toBe(2_000);
+    await restarted.runtime.stop();
+  });
+
+  it.each([false, true])(
+    'migrates a legacy ETA below the new floor (history only: %s) without losing state',
+    async (historyOnly) => {
+      let saved: string | undefined;
+      const storage = {
+        load: async (key: string) => (key === 'body' ? saved : undefined),
+        save: async (key: string, value: string) => {
+          if (key === 'body') saved = value;
+        },
+      };
+      const first = harness();
+      Object.assign(first.ports.storage, storage);
+      await first.runtime.start();
+      await first.sample(
+        mkBody({ cpu: { ...f({ usage: 0.42, perCore: [], load1: 0, load5: 0, load15: 0 }), observedAt: Date.now() } }),
+      );
+      await first.runtime.tools.bodyTune({ param: 'rate.rss.maxRatio', to: 0.6 });
+      await first.runtime.tools.bodyTune({ param: 'rate.rss.maxRatio', to: 0.7 });
+      await first.runtime.actions.lockParam('floor.disk.warn', true);
+      await first.runtime.stop();
+      if (!saved) throw new Error('missing snapshot');
+      const legacy = JSON.parse(saved);
+      const tuner = JSON.parse(legacy.tuner);
+      legacy.version = 1;
+      tuner.values = tuner.values.filter(
+        ([key]: [string, unknown]) =>
+          key !== 'mergeWindowMs' && key !== 'fileMergeWindowMs' && !key.startsWith('deliveryLevel.'),
+      );
+      const entry = (from: number, to: number) => ({
+        id: `${tuner.idPrefix}-${tuner.nextId++}`,
+        param: 'rate.context.maxEtaMs',
+        from,
+        to,
+        by: 'user',
+        reason: 'legacy user change',
+        at: Date.now(),
+        operation: 'propose',
+        status: 'applied',
+      });
+      const history = [entry(600_000, 300_000), ...(historyOnly ? [entry(300_000, 600_000)] : [])];
+      tuner.log.push(...history);
+      tuner.applied.push(...history);
+      tuner.values.find(([key]: [string, unknown]) => key === 'rate.context.maxEtaMs')[1] = historyOnly
+        ? 600_000
+        : 300_000;
+      legacy.tuner = JSON.stringify(tuner);
+      saved = JSON.stringify(legacy);
+      const restored = harness();
+      Object.assign(restored.ports.storage, storage);
+      await restored.runtime.start();
+      expect(restored.runtime.body.tuner.tuningDisabled).toBeUndefined();
+      expect(restored.runtime.body.tuner.get('rate.context.maxEtaMs')).toBe(600_000);
+      expect(restored.runtime.body.tuner.get('rate.rss.maxRatio')).toBe(0.7);
+      expect(restored.runtime.body.tuner.logs).toEqual(expect.arrayContaining(history));
+      const floorChanges = restored.runtime.body.tuner.logs.filter((entry) => entry.reason === '新版底线');
+      expect(floorChanges).toHaveLength(historyOnly ? 0 : 1);
+      if (!historyOnly) {
+        expect(floorChanges[0]).toMatchObject({ from: 300_000, to: 600_000, by: 'auto', status: 'applied' });
+        expect(restored.runtime.body.tuner.undoableChanges).not.toEqual(
+          expect.arrayContaining([expect.objectContaining({ id: floorChanges[0].id })]),
+        );
+        expect(await restored.runtime.actions.revertTuning(floorChanges[0].id)).toMatchObject({
+          applied: false,
+          reason: 'out of bounds',
+        });
+      }
+      expect(await restored.runtime.tools.bodyTune({ param: 'rate.rss.maxRatio', to: 0.8 })).toMatchObject({
+        reason: 'hourly change limit',
+      });
+      expect(await restored.runtime.tools.bodyTune({ param: 'floor.disk.warn', to: 0.11 })).toMatchObject({
+        reason: 'param locked',
+      });
+      await restored.runtime.stop();
+      if (!saved) throw new Error('missing migrated snapshot');
+      const migrated = JSON.parse(saved);
+      const migratedTuner = JSON.parse(migrated.tuner);
+      expect(migrated.baseline).toBe(legacy.baseline);
+      expect(migrated.history).toEqual(legacy.history);
+      expect(migrated.latch).toEqual(legacy.latch);
+      for (const [key, value] of tuner.values) {
+        expect(migratedTuner.values.find(([name]: [string, unknown]) => name === key)?.[1]).toBe(
+          key === 'rate.context.maxEtaMs' ? 600_000 : value,
+        );
+      }
+      expect(migratedTuner.locked).toEqual(tuner.locked);
+      expect(migratedTuner.log.slice(0, tuner.log.length)).toEqual(tuner.log);
+      expect(migratedTuner.applied.slice(0, tuner.applied.length)).toEqual(tuner.applied);
+      expect(migratedTuner.hour).toEqual(tuner.hour);
+      expect(migratedTuner.day).toEqual(tuner.day);
+      expect(migratedTuner.dayAll).toEqual(tuner.dayAll);
+      const restarted = harness();
+      Object.assign(restarted.ports.storage, storage);
+      await restarted.runtime.start();
+      expect(restarted.runtime.body.tuner.tuningDisabled).toBeUndefined();
+      expect(restarted.runtime.body.tuner.logs).toEqual(expect.arrayContaining(history));
+      expect(restarted.runtime.body.tuner.logs.filter((entry) => entry.reason === '新版底线')).toHaveLength(
+        historyOnly ? 0 : 1,
+      );
+      expect(restarted.runtime.body.tuner.get('rate.rss.maxRatio')).toBe(0.7);
+      await restarted.runtime.stop();
+    },
+  );
+
+  it('backs up an unrecognized v1 snapshot before falling back to safe defaults', async () => {
+    const root = await fs.mkdtemp(join(tmpdir(), 'asi-tuning-backup-'));
+    try {
+      const reportBackup = vi.fn();
+      const storage = new FileStoragePort(root, fs, () => {}, reportBackup);
+      const first = harness();
+      Object.assign(first.ports.storage, {
+        load: storage.load.bind(storage),
+        save: storage.save.bind(storage),
+        backup: (...args: [string, string]) => storage.backup(...args),
+      });
+      await first.runtime.start();
+      await first.runtime.tools.bodyTune({ param: 'rate.rss.maxRatio', to: 0.6 });
+      await first.runtime.stop();
+      const snapshot = JSON.parse((await storage.load('body')) as string);
+      snapshot.version = 1;
+      const original = JSON.stringify(snapshot);
+      await storage.save('body', original);
+      const restored = harness();
+      Object.assign(restored.ports.storage, first.ports.storage);
+      await restored.runtime.start();
+      expect(restored.runtime.body.tuner.tuningDisabled).toBe('restore-failed');
+      expect(restored.runtime.body.tuner.get('rate.rss.maxRatio')).toBe(0.5);
+      expect(restored.runtime.body.tuner.get('deliveryLevel.file.burst')).toBe('context');
+      const presenter = createPresenter(restored.runtime, { clock: restored.ports.clock });
+      expect(presenter.snapshot().tuning.disabled).toEqual({ reason: 'restore-failed' });
+      presenter.close();
+      const backups = (await fs.readdir(root)).filter((name) => name.startsWith('body.json.bak-'));
+      expect(backups).toHaveLength(1);
+      expect(await fs.readFile(join(root, backups[0]), 'utf8')).toBe(original);
+      expect((await fs.stat(join(root, backups[0]))).mode & 0o777).toBe(0o600);
+      expect(reportBackup).toHaveBeenCalledOnce();
+      await restored.runtime.stop();
+      const restarted = harness();
+      Object.assign(restarted.ports.storage, first.ports.storage);
+      await restarted.runtime.start();
+      expect(restarted.runtime.body.tuner.tuningDisabled).toBe('restore-failed');
+      expect((await fs.readdir(root)).filter((name) => name.startsWith('body.json.bak-'))).toHaveLength(1);
+      expect(reportBackup).toHaveBeenCalledOnce();
+      await restarted.runtime.actions.resetTuning();
+      expect(restarted.runtime.body.tuner.tuningDisabled).toBeUndefined();
+      await restarted.runtime.stop();
+      const reset = harness();
+      Object.assign(reset.ports.storage, first.ports.storage);
+      await reset.runtime.start();
+      expect(reset.runtime.body.tuner.tuningDisabled).toBeUndefined();
+      await reset.runtime.stop();
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('never overwrites an unrecognized snapshot when its backup fails', async () => {
+    let saved = '{"version":99}';
+    const original = saved;
+    let failed = true;
+    const report = vi.fn();
+    const h = harness();
+    Object.assign(h.ports.storage, {
+      load: async (key: string) => (key === 'body' ? saved : undefined),
+      save: async (key: string, value: string) => {
+        if (key === 'body') saved = value;
+      },
+      backup: async () => {
+        if (failed) throw Object.assign(new Error('private path'), { code: 'ENOSPC' });
+        expect(saved).toBe(original);
+        return 'body.json.bak-fixture';
+      },
+      reportBackupFailure: report,
+    });
+    await h.runtime.start();
+    const presenter = createPresenter(h.runtime, { clock: h.ports.clock });
+    expect(h.runtime.body.tuner.tuningDisabled).toBe('restore-failed');
+    expect(presenter.snapshot().tuning.backupError).toEqual({ code: 'ENOSPC', stage: 'backup' });
+    expect(report).toHaveBeenCalledWith('ENOSPC');
+    await expect(h.runtime.actions.resetTuning()).rejects.toThrow();
+    await expect(h.runtime.actions.retryTuningBackup()).rejects.toThrow();
+    expect(saved).toBe(original);
+    failed = false;
+    await h.runtime.actions.retryTuningBackup();
+    expect(presenter.snapshot().tuning.backupError).toBeUndefined();
+    expect(presenter.snapshot().tuning.backupNotice).toEqual({
+      kind: 'unknown-version',
+      fileName: 'body.json.bak-fixture',
+    });
+    await h.runtime.actions.resetTuning();
+    presenter.close();
+    await h.runtime.stop();
+    expect(saved).not.toBe(original);
+  });
+
+  it('shows a completed backup when marker saving fails and reuses it on retries and restart', async () => {
+    const root = await fs.mkdtemp(join(tmpdir(), 'asi-tuning-save-failed-'));
+    try {
+      const storage = new FileStoragePort(root, fs, () => {});
+      const original = '{"version":99}';
+      await storage.save('body', original);
+      let failSave = true;
+      const create = async () => {
+        const h = harness();
+        const port = new FileStoragePort(root, fs, () => {});
+        Object.assign(h.ports.storage, {
+          load: port.load.bind(port),
+          save: async (key: string, value: string) => {
+            if (key === 'body' && failSave) throw Object.assign(new Error('fixture'), { code: 'ENOSPC' });
+            await port.save(key, value);
+          },
+          backup: port.backup.bind(port),
+        });
+        await h.runtime.start();
+        return h;
+      };
+      const first = await create();
+      const presenter = createPresenter(first.runtime, { clock: first.ports.clock });
+      const notice = presenter.snapshot().tuning.backupNotice;
+      expect(notice).toEqual({ kind: 'unknown-version', fileName: expect.stringMatching(/^body\.json\.bak-/) });
+      if (!notice) throw new Error('missing backup notice');
+      expect(await fs.readFile(join(root, notice.fileName), 'utf8')).toBe(original);
+      expect((await fs.stat(join(root, notice.fileName))).mode & 0o777).toBe(0o600);
+      expect(presenter.snapshot().tuning.backupError).toEqual({ code: 'ENOSPC', stage: 'save' });
+      await expect(first.runtime.actions.resetTuning()).rejects.toThrow();
+      await expect(first.runtime.actions.retryTuningBackup()).rejects.toThrow();
+      expect(await storage.load('body')).toBe(original);
+      expect((await fs.readdir(root)).filter((name) => name.startsWith('body.json.bak-'))).toEqual([notice.fileName]);
+      presenter.close();
+      await first.runtime.stop();
+
+      const restarted = await create();
+      expect(restarted.runtime.body.monitor.backupNotice).toEqual(notice);
+      expect((await fs.readdir(root)).filter((name) => name.startsWith('body.json.bak-'))).toEqual([notice.fileName]);
+      failSave = false;
+      await restarted.runtime.actions.retryTuningBackup();
+      expect(restarted.runtime.body.monitor.backupNotice).toEqual(notice);
+      expect(restarted.runtime.body.monitor.backupError).toBeUndefined();
+      await restarted.runtime.actions.resetTuning();
+      await restarted.runtime.stop();
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('classifies supported but corrupt v1 and v2 snapshots separately from unknown versions', async () => {
+    let saved: string | undefined;
+    const storage = {
+      load: async (key: string) => (key === 'body' ? saved : undefined),
+      save: async (key: string, value: string) => {
+        if (key === 'body') saved = value;
+      },
+      backup: async () => 'body.json.bak-fixture',
+    };
+    const first = harness();
+    Object.assign(first.ports.storage, storage);
+    await first.runtime.start();
+    await first.runtime.stop();
+    if (!saved) throw new Error('missing snapshot');
+    const v2 = JSON.parse(saved);
+    const v1 = structuredClone(v2);
+    v1.version = 1;
+    const tuner = JSON.parse(v1.tuner);
+    tuner.values = tuner.values.filter(
+      ([key]: [string, unknown]) =>
+        key !== 'mergeWindowMs' && key !== 'fileMergeWindowMs' && !key.startsWith('deliveryLevel.'),
+    );
+    v1.tuner = JSON.stringify(tuner);
+    v1.baseline = 'invalid';
+    const fullV1 = { ...v2, version: 1 };
+    const corruptV2 = { ...v2, baseline: 'invalid' };
+    for (const [input, kind] of [
+      [v1, 'corrupt'],
+      [fullV1, 'corrupt'],
+      [corruptV2, 'corrupt'],
+      [{ version: 99 }, 'unknown-version'],
+    ] as const) {
+      saved = JSON.stringify(input);
+      const h = harness();
+      Object.assign(h.ports.storage, storage);
+      await h.runtime.start();
+      expect(h.runtime.body.monitor.backupNotice).toMatchObject({ kind });
+      await h.runtime.stop();
+    }
+  });
+
+  it.each([
+    ['corrupt', '{broken'],
+    ['unknown-version', '{"version":99}'],
+  ] as const)('keeps the %s backup notice until acknowledged across restarts', async (kind, original) => {
+    const root = await fs.mkdtemp(join(tmpdir(), 'asi-tuning-notice-'));
+    try {
+      const storage = new FileStoragePort(root, fs, () => {});
+      await storage.save('body', original);
+      const create = async () => {
+        const h = harness();
+        Object.assign(h.ports.storage, {
+          load: storage.load.bind(storage),
+          save: storage.save.bind(storage),
+          backup: storage.backup.bind(storage),
+        });
+        await h.runtime.start();
+        const presenter = createPresenter(h.runtime, { clock: h.ports.clock });
+        return { h, presenter };
+      };
+      const first = await create();
+      const notice = first.presenter.snapshot().tuning.backupNotice;
+      expect(notice).toEqual({ kind, fileName: expect.stringMatching(/^body\.json\.bak-/) });
+      if (!notice) throw new Error('missing backup notice');
+      expect(notice?.fileName).not.toContain('/');
+      expect(await fs.readFile(join(root, notice.fileName), 'utf8')).toBe(original);
+      first.presenter.close();
+      await first.h.runtime.stop();
+      const second = await create();
+      expect(second.presenter.snapshot().tuning.backupNotice).toEqual(notice);
+      await second.h.runtime.actions.dismissTuningBackup();
+      expect(second.presenter.snapshot().tuning.backupNotice).toBeUndefined();
+      expect(second.presenter.snapshot().tuning.restoreKind).toBe(kind);
+      second.presenter.close();
+      await second.h.runtime.stop();
+      const third = await create();
+      expect(third.presenter.snapshot().tuning.backupNotice).toBeUndefined();
+      expect(third.presenter.snapshot().tuning.restoreKind).toBe(kind);
+      third.presenter.close();
+      await third.h.runtime.stop();
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('blocks reset while a backup retry is pending and preserves the original until backup completes', async () => {
+    let saved = '{"version":99}';
+    let allow = false;
+    let finish!: () => void;
+    const h = harness();
+    Object.assign(h.ports.storage, {
+      load: async (key: string) => (key === 'body' ? saved : undefined),
+      save: async (key: string, value: string) => {
+        if (key === 'body') saved = value;
+      },
+      backup: async () => {
+        if (!allow) throw Object.assign(new Error('fixture'), { code: 'EACCES' });
+        await new Promise<void>((resolve) => {
+          finish = resolve;
+        });
+        expect(saved).toBe('{"version":99}');
+        return 'body.json.bak-fixture';
+      },
+    });
+    await h.runtime.start();
+    allow = true;
+    const retry = h.runtime.actions.retryTuningBackup();
+    await vi.waitFor(() => expect(finish).toBeDefined());
+    await expect(h.runtime.actions.resetTuning()).rejects.toThrow();
+    expect(saved).toBe('{"version":99}');
+    finish();
+    await retry;
+    await h.runtime.actions.resetTuning();
+    await h.runtime.stop();
+  });
+
+  it('stays disabled if the original disappears before a backup retry', async () => {
+    let saved: string | undefined = '{"version":99}';
+    const h = harness();
+    Object.assign(h.ports.storage, {
+      load: async (key: string) => (key === 'body' ? saved : undefined),
+      save: async (key: string, value: string) => {
+        if (key === 'body') saved = value;
+      },
+      backup: async () => {
+        throw Object.assign(new Error('fixture'), { code: 'EACCES' });
+      },
+    });
+    await h.runtime.start();
+    saved = undefined;
+    await expect(h.runtime.actions.retryTuningBackup()).rejects.toThrow();
+    expect(h.runtime.body.monitor.backupError).toEqual({ code: 'SNAPSHOT_MISSING', stage: 'backup' });
+    await expect(h.runtime.actions.resetTuning()).rejects.toThrow();
+    expect(saved).toBeUndefined();
+    await h.runtime.stop();
+  });
+
+  it('does not overwrite a replacement that appeared during backup', async () => {
+    let saved = '{"version":99}';
+    const backedUp: string[] = [];
+    const h = harness();
+    Object.assign(h.ports.storage, {
+      load: async (key: string) => (key === 'body' ? saved : undefined),
+      save: async (key: string, value: string) => {
+        if (key === 'body') saved = value;
+      },
+      backup: async (_key: string, original: string) => {
+        backedUp.push(original);
+        if (backedUp.length === 1) saved = '{"version":98}';
+        return 'body.json.bak-fixture';
+      },
+    });
+    await h.runtime.start();
+    expect(saved).toBe('{"version":98}');
+    expect(h.runtime.body.monitor.backupError).toEqual({ code: 'SNAPSHOT_CHANGED', stage: 'backup' });
+    await expect(h.runtime.actions.resetTuning()).rejects.toThrow();
+    await h.runtime.actions.retryTuningBackup();
+    expect(backedUp).toEqual(['{"version":99}', '{"version":98}']);
+    await h.runtime.stop();
+  });
+
+  it('does not lose a backup notice when acknowledging it fails', async () => {
+    let saved = '{"version":99}';
+    let failSave = false;
+    const h = harness();
+    Object.assign(h.ports.storage, {
+      load: async (key: string) => (key === 'body' ? saved : undefined),
+      save: async (key: string, value: string) => {
+        if (key === 'body' && failSave) throw new Error('fixture');
+        if (key === 'body') saved = value;
+      },
+      backup: async () => 'body.json.bak-fixture',
+    });
+    await h.runtime.start();
+    failSave = true;
+    await expect(h.runtime.actions.dismissTuningBackup()).rejects.toThrow();
+    expect(h.runtime.body.monitor.backupNotice).toEqual({ kind: 'unknown-version', fileName: 'body.json.bak-fixture' });
+    expect(JSON.parse(saved).backupNotice.fileName).toBe('body.json.bak-fixture');
+    failSave = false;
+    await h.runtime.actions.dismissTuningBackup();
+    await h.runtime.stop();
+  });
+
+  it('fails closed for incomplete legacy and partially migrated tuning snapshots', async () => {
+    let saved: string | undefined;
+    const storage = {
+      load: async (key: string) => (key === 'body' ? saved : undefined),
+      save: async (key: string, value: string) => {
+        if (key === 'body') saved = value;
+      },
+    };
+    const first = harness();
+    Object.assign(first.ports.storage, storage);
+    await first.runtime.start();
+    await first.runtime.stop();
+    if (!saved) throw new Error('missing snapshot');
+    const valid = saved;
+    for (const missing of ['rate.rss.maxRatio', 'fileMergeWindowMs']) {
+      const body = JSON.parse(valid);
+      const tuner = JSON.parse(body.tuner);
+      tuner.values = tuner.values.filter(([key]: [string, unknown]) => key !== missing);
+      body.tuner = JSON.stringify(tuner);
+      saved = JSON.stringify(body);
+      const restored = harness();
+      Object.assign(restored.ports.storage, storage);
+      await restored.runtime.start();
+      expect(restored.runtime.body.tuner.tuningDisabled).toBe('restore-failed');
+      await restored.runtime.stop();
+    }
+  });
+
+  it('rejects damaged or disguised snapshots without silently restoring wake', async () => {
+    let saved: string | undefined;
+    const storage = {
+      load: async (key: string) => (key === 'body' ? saved : undefined),
+      save: async (key: string, value: string) => {
+        if (key === 'body') saved = value;
+      },
+    };
+    const first = harness();
+    Object.assign(first.ports.storage, storage);
+    await first.runtime.start();
+    await first.runtime.tools.bodyTune({ param: 'deliveryLevel.file.burst', to: 'context' });
+    await first.advance(86_400_001);
+    await first.runtime.stop();
+    if (!saved) throw new Error('missing snapshot');
+    const valid = saved;
+    expect(JSON.parse(valid).version).toBe(2);
+    for (const damage of [
+      'missing-added',
+      'disguised-legacy',
+      'disguised-history-only',
+      'unknown-applied',
+      'bad-baseline',
+      'forged-wake',
+    ]) {
+      const snapshot = JSON.parse(valid);
+      const tuner = JSON.parse(snapshot.tuner);
+      if (damage === 'missing-added' || damage === 'disguised-legacy' || damage === 'disguised-history-only') {
+        tuner.values = tuner.values.filter(
+          ([key]: [string, unknown]) =>
+            key !== 'mergeWindowMs' && key !== 'fileMergeWindowMs' && !key.startsWith('deliveryLevel.'),
+        );
+        if (damage !== 'missing-added') snapshot.version = 1;
+        if (damage === 'disguised-history-only') tuner.applied = [];
+      }
+      if (damage === 'unknown-applied') {
+        tuner.applied[0].param = 'unknown-param';
+        tuner.log[0].param = 'unknown-param';
+      }
+      if (damage === 'bad-baseline') snapshot.baseline = 'broken';
+      if (damage === 'forged-wake') {
+        tuner.values.find(([key]: [string, unknown]) => key === 'deliveryLevel.file.burst')[1] = 'wake';
+      }
+      snapshot.tuner = JSON.stringify(tuner);
+      saved = JSON.stringify(snapshot);
+      const restored = harness();
+      Object.assign(restored.ports.storage, storage);
+      await restored.runtime.start();
+      expect(restored.runtime.body.tuner.tuningDisabled, damage).toBe('restore-failed');
+      expect(restored.runtime.body.tuner.get('deliveryLevel.file.burst'), damage).not.toBe('wake');
+      await expect(restored.runtime.tools.bodyTune({ param: 'rate.rss.maxRatio', to: 0.6 })).rejects.toThrow(
+        'restore-failed',
+      );
+      await restored.runtime.stop();
+    }
+  });
+
+  it('does not change the active deadline before a tuning save succeeds', async () => {
+    const h = harness();
+    await h.runtime.start();
+    await h.agent({ type: 'created', sessionId: 's' });
+    await h.agent({ type: 'pre-step', sessionId: 's' });
+    await h.agent({ type: 'post-step', sessionId: 's' });
+    await h.job({ type: 'exited', id: 'pending-save', exitCode: 1 });
+    h.failSave(true);
+    await expect(h.runtime.tools.bodyTune({ param: 'mergeWindowMs', to: 1_000 })).rejects.toThrow('uninstalled');
+    await h.advance(1_000);
+    expect(h.delivered).toHaveLength(0);
+    h.failSave(false);
+    await h.advance(1_000);
+    expect(h.delivered).toHaveLength(1);
     await h.runtime.stop();
   });
 
@@ -1982,6 +3063,82 @@ describe('host runtime', () => {
       .flatMap((intent) => intent.update.changes)
       .find((change) => change.signal.kind === 'body.rate');
     expect(alert?.signal.data.feedbackAvailable).toBe(false);
+    await h.runtime.stop();
+  });
+
+  it('publishes successful registration to a queued alert and the presenter', async () => {
+    const h = harness();
+    await h.runtime.start();
+    let release!: () => void;
+    const blocked = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const register = h.runtime.body.tuner.registerAlert.bind(h.runtime.body.tuner);
+    h.runtime.body.tuner.registerAlert = async (...args) => {
+      await blocked;
+      return register(...args);
+    };
+    const presenter = createPresenter(h.runtime, { clock: h.ports.clock });
+    const rss = (value: number) => ({ ...f({ rss: value, cpu: 0, uptimeSec: 1 }), observedAt: Date.now() });
+    await h.sample(mkBody({ harnessProcess: rss(100) }));
+    await h.advance(5_000);
+    await h.sample(mkBody({ harnessProcess: rss(200) }));
+    const alert = h.runtime.events().find((event) => event.kind === 'body.rate');
+    if (!alert) throw new Error('missing alert');
+    expect(
+      presenter.snapshot().events.find((event) => event.signal.id === alert.id)?.signal.data.feedbackAvailable,
+    ).toBe(false);
+    release();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(
+      presenter.snapshot().events.find((event) => event.signal.id === alert.id)?.signal.data.feedbackAvailable,
+    ).toBe(true);
+    await h.agent({ type: 'created', sessionId: 's' });
+    await h.agent({ type: 'pre-step', sessionId: 's' });
+    expect(
+      h.delivered.flatMap((intent) => intent.update.changes).find((change) => change.signal.id === alert.id)?.signal
+        .data.feedbackAvailable,
+    ).toBe(true);
+    expect(await h.runtime.tools.bodyTune({ action: 'feedback', alertId: alert.id, verdict: 'useful' })).toMatchObject({
+      applied: true,
+    });
+    expect(
+      presenter.snapshot().events.find((event) => event.signal.id === alert.id)?.signal.data.feedbackAvailable,
+    ).toBe(false);
+    presenter.close();
+    await h.runtime.stop();
+  });
+
+  it('does not rewrite a failed alert delivery when registration finishes later', async () => {
+    const h = harness();
+    const attempts: Parameters<DshPort['deliver']>[1][] = [];
+    h.ports.dsh.deliver = async (_session, intent) => {
+      attempts.push(structuredClone(intent));
+      if (attempts.length === 1) throw new Error('offline');
+    };
+    await h.runtime.start();
+    await h.agent({ type: 'created', sessionId: 's' });
+    await h.agent({ type: 'pre-step', sessionId: 's' });
+    let release!: () => void;
+    const blocked = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const register = h.runtime.body.tuner.registerAlert.bind(h.runtime.body.tuner);
+    h.runtime.body.tuner.registerAlert = async (...args) => {
+      await blocked;
+      return register(...args);
+    };
+    const rss = (value: number) => ({ ...f({ rss: value, cpu: 0, uptimeSec: 1 }), observedAt: Date.now() });
+    await h.sample(mkBody({ harnessProcess: rss(100) }));
+    await h.advance(5_000);
+    await h.sample(mkBody({ harnessProcess: rss(200) }));
+    await expect(h.agent({ type: 'pre-step', sessionId: 's' })).rejects.toThrow('offline');
+    expect(attempts[0]?.update.changes[0]?.signal.data.feedbackAvailable).toBe(false);
+    release();
+    await vi.advanceTimersByTimeAsync(0);
+    await h.advance(1_000);
+    await h.agent({ type: 'pre-step', sessionId: 's' });
+    expect(attempts[1]).toEqual(attempts[0]);
     await h.runtime.stop();
   });
 });

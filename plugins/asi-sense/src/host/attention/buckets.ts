@@ -45,8 +45,9 @@ export interface Bucket {
   subject: string;
   /** Monotonic receipt time of the first signal in this generation. */
   startedAt: number;
-  /** Monotonic completion deadline, `startedAt + window of first kind`. */
+  /** Monotonic deadline, shortened to the earlier first-kind window when reconfigured. */
   deadline: number;
+  fileWindow?: boolean;
   details: Map<string, BucketDetail>;
   /** Set at the first delivery attempt — no further merges or splits. */
   sealed?: boolean;
@@ -118,6 +119,7 @@ export function upsertBucket(
       subject: signal.subject,
       startedAt: now,
       deadline: now + windowMs,
+      fileWindow: signal.kind === 'file.changed',
       details: new Map(),
     };
     pending.set(b.id, b);

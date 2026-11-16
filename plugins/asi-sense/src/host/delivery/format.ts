@@ -92,6 +92,14 @@ function changeLines(ch: EnvChange, includeTitles: boolean, includeJobCommands: 
     main = `${esc(s.kind)}: ${esc(s.subject)}`;
   }
   if (ch.ruleId) main += ` [rule: ${esc(ch.ruleId)} → ${ch.level}]`;
+  if (typeof s.data.feedbackAvailable === 'boolean') {
+    const bytes = Buffer.from(s.id, 'utf8');
+    const available =
+      s.data.feedbackAvailable && bytes.length > 0 && bytes.length <= 256 && bytes.toString('utf8') === s.id;
+    main += available
+      ? ` alertId="${bytes.toString('base64url')}" feedbackAvailable="true"`
+      : ' feedbackAvailable="false"';
+  }
   const lines = [main];
   if (ch.note) lines.push(`note: ${esc(ch.note)}`);
   return lines;

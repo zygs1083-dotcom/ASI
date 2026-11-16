@@ -63,6 +63,27 @@ export class BucketDrain {
   get suppressed(): number {
     return this.suppressedGroups;
   }
+  setMergeWindows(mergeWindowMs: number, fileMergeWindowMs: number): void {
+    for (const bucket of this.pending.values()) {
+      if (!bucket.sealed) {
+        bucket.deadline = Math.min(
+          bucket.deadline,
+          bucket.startedAt + (bucket.fileWindow ? fileMergeWindowMs : mergeWindowMs),
+        );
+      }
+    }
+  }
+  refreshFeedback(available: (id: string) => boolean): void {
+    const update = (bucket: Bucket) => {
+      for (const detail of bucket.details.values()) {
+        if (typeof detail.latest.data.feedbackAvailable === 'boolean') {
+          detail.latest.data.feedbackAvailable = available(detail.latest.id);
+        }
+      }
+    };
+    for (const bucket of this.pending.values()) if (!bucket.sealed) update(bucket);
+    for (const buckets of this.ready.values()) for (const bucket of buckets) update(bucket);
+  }
   /** Earliest pending merge deadline — retained failures included; `undefined` when none. */
   nextDeadline(): number | undefined {
     let min: number | undefined;

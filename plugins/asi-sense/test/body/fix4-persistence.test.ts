@@ -82,7 +82,7 @@ describe('fix4 tuning guardrails', () => {
     await c.close();
   });
 
-  it('R1 reset replaces partially restored values and locks with defaults', async () => {
+  it('R1 rejects partially restored values and locks before user reset', async () => {
     const persistence = storage();
     let actor: 'user' | 'agent' = 'agent';
     const make = () => {
@@ -105,7 +105,7 @@ describe('fix4 tuning guardrails', () => {
     const b = make();
     await b.monitor.restore();
     expect(b.tuner.tuningDisabled).toBe('restore-failed');
-    expect(b.tuner.get('x')).toBe(11);
+    expect(b.tuner.get('x')).toBe(10);
     await b.tuner.resetTuning();
     expect(b.tuner.get('x')).toBe(10);
     expect(b.tuner.undoableChanges).toHaveLength(0);

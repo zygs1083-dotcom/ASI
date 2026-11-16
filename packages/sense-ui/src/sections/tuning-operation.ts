@@ -4,6 +4,8 @@ import type { SensePanelModel } from '../view-model'
 type Operation = { phase: 'pending' | 'waiting' | 'error' | 'unconfirmed'; label: string; timer?: ReturnType<typeof setTimeout> }
 
 function reflected(key: string, model: SensePanelModel): boolean {
+  if (key === 'retry-backup') return !model.tuning?.backupError
+  if (key === 'dismiss-backup') return !model.tuning?.backupNotice
   return key.startsWith('suggestion:')
     ? !model.tuning?.suggestions?.some((suggestion) => suggestion.id === key.slice(11))
     : !model.tuning?.disabled

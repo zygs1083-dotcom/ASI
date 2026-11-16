@@ -24,6 +24,7 @@ export type RateRule = {
   direction: 'up' | 'down';
   floor?: number;
   param?: string;
+  hardEtaMs?: number;
 } & (
   | { maxDelta: number; maxSlope?: never; maxRatio?: never; maxEtaMs?: never }
   | { maxSlope: number; maxDelta?: never; maxRatio?: never; maxEtaMs?: never }
@@ -80,6 +81,9 @@ function validate(rule: RateRule, seen: Set<string>): void {
   if (rule.direction !== 'up' && rule.direction !== 'down') throw bad('direction must be up|down');
   if (!Number.isFinite(rule.windowMs) || rule.windowMs <= 0) throw bad('windowMs must be positive and finite');
   if (rule.floor !== undefined && !Number.isFinite(rule.floor)) throw bad('floor must be finite');
+  if (rule.hardEtaMs !== undefined && (!Number.isFinite(rule.hardEtaMs) || rule.hardEtaMs <= 0)) {
+    throw bad('hardEtaMs must be positive and finite');
+  }
   const limits = LIMITS.filter((k) => rule[k] !== undefined);
   if (limits.length !== 1) throw bad(`exactly one of ${LIMITS.join('/')} is required`);
   const limit = rule[limits[0]] as number;
@@ -213,7 +217,7 @@ export class RateEvaluator implements BodyEvaluator {
         const w = windowFor(key, metric);
         const pts = w.points.filter((p) => p.at >= (w.evaluationMono ?? evaluation.mono) - rule.windowMs);
         const cached = !!windows[storageKey(key)] && w.lastMono === windows[storageKey(key)].lastMono;
-        if (rule.maxEtaMs === undefined && cached) continue;
+        if (rule.maxEtaMs === undefined && rule.hardEtaMs === undefined && cached) continue;
         if (pts.length < 2) continue;
         const sig = this.step(rule, key, metric, pts, next, pub, streamLatch, evaluation, cached);
         if (sig) signals.push(sig);
@@ -257,7 +261,7 @@ export class RateEvaluator implements BodyEvaluator {
     if (rule.maxEtaMs !== undefined) {
       // Inverted: danger rises as eta shrinks; eta = ∞ (stable/rising) → 0.
       magnitude = 1 / (eta ?? Number.POSITIVE_INFINITY);
-      limit = 1 / this.liveLimit(rule.maxEtaMs, rule.param);
+      limit = 1 / Math.max(rule.hardEtaMs ?? 0, this.liveLimit(rule.maxEtaMs, rule.param));
     } else {
       const measure =
         rule.maxDelta !== undefined
@@ -274,14 +278,28 @@ export class RateEvaluator implements BodyEvaluator {
     }
     const latchKey = rule.metric.endsWith(':*') ? `rate:${rule.id}:${key}` : `rate:${rule.id}`;
     const contextSession = (next as RateSample).contextSession;
-    const storedLatch = key === 'context' && contextSession ? `${latchKey}@${contextSession}` : latchKey;
+    const suffix = key === 'context' && contextSession ? `@${contextSession}` : '';
+    const storedLatch = `${latchKey}${suffix}`;
     const was = streamLatch[storedLatch] === 'warn';
-    const active =
+    const softKey = `${latchKey}:soft${suffix}`;
+    const hardKey = `${latchKey}:hard${suffix}`;
+    const softWas = rule.hardEtaMs === undefined ? was : streamLatch[softKey] === 'warn';
+    const hardWas = streamLatch[hardKey] === 'warn';
+    const soft =
       (rule.maxEtaMs !== undefined ? magnitude >= limit : magnitude > limit) ||
-      (was && (cached || magnitude >= limit * 0.8));
+      (softWas && (cached || magnitude >= limit * 0.8));
+    const hard =
+      rule.hardEtaMs !== undefined &&
+      ((eta !== undefined && eta <= rule.hardEtaMs) ||
+        (hardWas && (cached || (eta !== undefined && eta <= rule.hardEtaMs / 0.8))));
+    const active = soft || hard;
+    if (rule.hardEtaMs !== undefined) {
+      streamLatch[softKey] = soft ? 'warn' : 'normal';
+      streamLatch[hardKey] = hard ? 'warn' : 'normal';
+    }
     streamLatch[storedLatch] = active ? 'warn' : 'normal';
     pub[latchKey] = active ? 'warn' : 'normal';
-    if (active === was) return undefined;
+    if (active === was && !(active && hard && !hardWas)) return undefined;
     const severity = active ? 'warn' : 'normal';
     const data: Record<string, unknown> = {
       layer: 'rate',

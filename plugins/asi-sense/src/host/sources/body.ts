@@ -10,6 +10,7 @@ import {
   Tuner,
 } from '../body/index.ts';
 import { captureRateTimes, type RateTimes } from '../body/rate.ts';
+import { markTuningSnapshot, migrateTuningSnapshot } from '../body/tuning-migration.ts';
 import type { RuntimeAttention } from '../runtime/attention.ts';
 import type { FactExpiry } from '../runtime/expiry.ts';
 import type { Clock, DshPort, ProbeFactory, StoragePort, TokenSnapshot } from '../runtime/ports.ts';
@@ -19,7 +20,7 @@ const source = { id: 'body', api: 'probe', host: 'local' };
 const specs: Record<string, ParameterSpec> = {
   'rate.disk.maxDelta': { value: 2 * 1024 ** 3, min: 1, noiseDirection: 'up' },
   'rate.rss.maxRatio': { value: 0.5, min: 0.01, max: 10, noiseDirection: 'up' },
-  'rate.context.maxEtaMs': { value: 600_000, min: 1, noiseDirection: 'down' },
+  'rate.context.maxEtaMs': { value: 600_000, min: 600_000, tighten: 'up', noiseDirection: 'down' },
   'anomaly.cpu.sigma': { value: 3, min: 0.1, max: 20, noiseDirection: 'up' },
   'anomaly.memory.sigma': { value: 3, min: 0.1, max: 20, noiseDirection: 'up' },
   'anomaly.network.sigma': { value: 3, min: 0.1, max: 20, noiseDirection: 'up' },
@@ -34,6 +35,13 @@ const specs: Record<string, ParameterSpec> = {
       ]),
     ),
   ),
+};
+const attentionSpecs: Record<string, ParameterSpec> = {
+  mergeWindowMs: { value: 2_000, min: 1_000, max: 30_000 },
+  fileMergeWindowMs: { value: 5_000, min: 1_000, max: 60_000 },
+  'deliveryLevel.body.rate': { value: 'context', choices: ['record', 'context'] },
+  'deliveryLevel.body.anomaly': { value: 'context', choices: ['record', 'context'] },
+  'deliveryLevel.file.burst': { value: 'wake', choices: ['record', 'context', 'wake'] },
 };
 
 export class BodySource {
@@ -80,18 +88,54 @@ export class BodySource {
       },
       changed,
     );
-    this.tuner = new Tuner(specs, {
-      actor: () => this.identity.getStore() ?? 'agent',
-      clock: () => clock.mono(),
-      wallClock: () => clock.wall(),
-      onChange: changed,
-    });
+    const applyTuning = (restored = false) => {
+      this.syncAttention(restored ? 'user' : undefined);
+      changed();
+    };
+    this.tuner = new Tuner(
+      { ...specs, ...attentionSpecs },
+      {
+        actor: () => this.identity.getStore() ?? 'agent',
+        clock: () => clock.mono(),
+        wallClock: () => clock.wall(),
+        onChange: () => applyTuning(),
+      },
+    );
+    let originalSnapshot: string | undefined;
     this.monitor = new BodyMonitor({
       tuner: this.tuner,
       contextSession: () => attention.sessionToken(attention.currentSessionId()),
+      rateRules: defaultRateRules(),
       clock: () => clock.mono(),
       wallClock: () => clock.wall(),
-      persistence: { load: () => storage.load('body'), save: (value) => storage.save('body', value) },
+      onTuningApplied: applyTuning,
+      persistence: {
+        load: async () => {
+          originalSnapshot = await storage.load('body');
+          return migrateTuningSnapshot(originalSnapshot, specs, attentionSpecs, () => clock.wall());
+        },
+        onRestoreFailure: async () => {
+          if (originalSnapshot === undefined || !storage.backup) {
+            throw Object.assign(new Error('body snapshot backup unavailable'), { code: 'BACKUP_UNAVAILABLE' });
+          }
+          let kind: 'corrupt' | 'unknown-version' = 'corrupt';
+          try {
+            const value = JSON.parse(originalSnapshot);
+            if (value && typeof value === 'object' && 'version' in value && value.version !== 1 && value.version !== 2)
+              kind = 'unknown-version';
+          } catch {
+            kind = 'corrupt';
+          }
+          const fileName = await storage.backup('body', originalSnapshot);
+          // DSH has one writer per home; this check and the later save assume that boundary.
+          if ((await storage.load('body')) !== originalSnapshot) {
+            throw Object.assign(new Error('body snapshot changed after backup'), { code: 'SNAPSHOT_CHANGED' });
+          }
+          return { kind, fileName };
+        },
+        onBackupError: (code) => storage.reportBackupFailure?.(code),
+        save: (value) => storage.save('body', markTuningSnapshot(value)),
+      },
     });
   }
   async start(intervalMs: number): Promise<void> {
@@ -129,6 +173,21 @@ export class BodySource {
   }
   sync(): void {
     this.state = this.monitor.restoredState ?? this.state;
+  }
+  private syncAttention(actor: 'agent' | 'user' = this.identity.getStore() ?? 'agent'): void {
+    if (this.stopped) return;
+    const pipeline = this.attention.pipeline;
+    pipeline.setMergeWindows(this.tuner.number('mergeWindowMs', 2_000), this.tuner.number('fileMergeWindowMs', 5_000));
+    pipeline.setDeliveryLevels(
+      {
+        'body.rate': this.tuner.get('deliveryLevel.body.rate') as 'record' | 'context',
+        'body.anomaly': this.tuner.get('deliveryLevel.body.anomaly') as 'record' | 'context',
+        'file.burst': this.tuner.get('deliveryLevel.file.burst') as 'record' | 'context' | 'wake',
+      },
+      actor,
+    );
+    this.attention.refreshFeedback((id) => this.tuner.hasAlert(id));
+    this.attention.rescheduleDelivery();
   }
   sessionsChanged(present: boolean): void {
     this.tokenFacts.sessionsChanged(present);
@@ -276,7 +335,7 @@ export class BodySource {
     const commit: NonNullable<Parameters<typeof this.monitor.evaluateAuto>[3]> = (result, publish) => {
       this.state = result.state;
       this.previous = next;
-      signals = [...result.signals];
+      signals = result.signals;
       if (result.tuningError) {
         signals.push({
           id: this.attention.id(),
@@ -324,7 +383,7 @@ export class BodySource {
         : rules.find((rule) => rule.id === id)?.param;
     if (typeof id === 'string' && param && signal.data.severity !== 'normal' && signal.cause !== 'agent') {
       void this.tuner.registerAlert(signal.id, id, param).then(
-        () => this.changed(),
+        () => this.syncAttention(),
         () =>
           this.attention.accept({
             id: this.attention.id(),

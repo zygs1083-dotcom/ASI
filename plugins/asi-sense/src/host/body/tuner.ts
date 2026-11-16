@@ -85,6 +85,9 @@ export class Tuner {
   get(param: string): TuningValue | undefined {
     return this.store.values.get(param);
   }
+  hasAlert(id: string): boolean {
+    return !this.closed && this.store.restored && !this.store.disabled && this.store.alerts.has(id);
+  }
   parameters = () => parameters(this.store);
   /** Positive finite numeric value, else the caller's fallback. */
   number(param: string, fallback: number): number {
@@ -98,7 +101,17 @@ export class Tuner {
 
   get undoableChanges(): TuningLog[] {
     return this.store.applied
-      .filter((entry) => this.store.lastApplied.get(entry.param) === entry.id)
+      .filter((entry) => {
+        if (this.store.lastApplied.get(entry.param) !== entry.id) return false;
+        const spec = this.store.specs.get(entry.param);
+        return (
+          !spec ||
+          ((!spec.choices || spec.choices.includes(entry.from)) &&
+            (typeof entry.from !== 'number' ||
+              ((spec.min === undefined || entry.from >= spec.min) &&
+                (spec.max === undefined || entry.from <= spec.max))))
+        );
+      })
       .map((entry) => ({ ...entry }));
   }
 
@@ -202,6 +215,9 @@ export class Tuner {
     }
     const v = validateSnapshot(data, Object.fromEntries(this.store.specs));
     if (v === undefined || (v.disabled === 'restore-failed' && v.values.length === 0)) {
+      this.store.reset();
+      if (this.store.specs.get('deliveryLevel.file.burst')?.choices?.includes('context'))
+        this.store.values.set('deliveryLevel.file.burst', 'context');
       this.store.disabled = 'restore-failed';
       this.store.resetIds();
       this.store.restored = true;

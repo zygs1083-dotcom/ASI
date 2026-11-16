@@ -16,6 +16,8 @@ function fixture() {
     feedback: method(),
     resumeTuning: method(),
     resetTuning: method(),
+    retryTuningBackup: method(),
+    dismissTuningBackup: method(),
     acceptRebaseline: method(),
   };
   return { api, controller: createActions(api) };
@@ -71,11 +73,17 @@ describe('sidebar action boundary', () => {
   it.each([
     ['resumeTuning', 'onResumeTuning'],
     ['resetTuning', 'onResetTuning'],
+    ['retryTuningBackup', 'onRetryTuningBackup'],
+    ['dismissTuningBackup', 'onDismissTuningBackup'],
     ['acceptRebaseline', 'onAcceptRebaseline'],
   ] as const)('awaits %s and reports failures without setting the global error', async (method, callback) => {
     const { api, controller } = fixture();
-    const invoke = () =>
-      callback === 'onAcceptRebaseline' ? controller.actions[callback]('baseline') : controller.actions[callback]();
+    const invoke = () => {
+      if (callback === 'onAcceptRebaseline') return controller.actions[callback]('baseline');
+      const action = controller.actions[callback];
+      if (!action) throw new Error('missing action');
+      return action();
+    };
     await expect(invoke()).resolves.toBeUndefined();
     expect(api[method]).toHaveBeenCalledWith(...(method === 'acceptRebaseline' ? ['baseline'] : []));
     api[method].mockResolvedValueOnce({
