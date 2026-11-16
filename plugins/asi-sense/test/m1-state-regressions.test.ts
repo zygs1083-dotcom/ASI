@@ -3,7 +3,7 @@ import { describe, expect, it } from 'vitest';
 import { createWatchRule, matchesRule, validateRule } from '../src/host/attention/rules.ts';
 import { classifyCause, type ToolWindow } from '../src/host/attention/selfcause.ts';
 import { StateStore } from '../src/host/state/store.ts';
-import { FakeClock, pipe, SRC2, sess, sig } from './helpers.ts';
+import { FakeClock, pipe, SRC, SRC2, sess, sig } from './helpers.ts';
 
 describe('self-cause ancestry', () => {
   it('classifies shell children and grandchildren across concurrent tool windows', () => {
@@ -113,12 +113,26 @@ describe('rule boundary validation', () => {
 describe('job tracking', () => {
   let seq = 0;
   const started = (job: string, at: number, extra: Partial<Signal> = {}) =>
-    sig({ id: `st-${job}-${at}-${seq++}`, kind: 'job.started', at, subject: job, data: { command: job }, ...extra });
+    sig({
+      id: `st-${job}-${at}-${seq++}`,
+      kind: 'job.started',
+      at,
+      subject: job,
+      data: { command: job, sequence: at },
+      ...extra,
+    });
   const exited = (job: string, at: number, extra: Partial<Signal> = {}) =>
-    sig({ id: `ex-${job}-${at}-${seq++}`, kind: 'job.exited', at, subject: job, data: { exitCode: 0 }, ...extra });
+    sig({
+      id: `ex-${job}-${at}-${seq++}`,
+      kind: 'job.exited',
+      at,
+      subject: job,
+      data: { exitCode: 0, sequence: at },
+      ...extra,
+    });
   const ids = (st: StateStore) => (st.snapshot().env.activeJobs.value ?? []).map((j) => j.id);
   const factUpdate = (id: string, at: number, value: unknown) =>
-    sig({ id, kind: 'fact.updated', at, data: { path: 'env.activeJobs', value } });
+    sig({ id, kind: 'fact.updated', at, data: { path: 'env.activeJobs', value, sequence: at } });
 
   it('tracks interleaved jobs independently and retains exit tombstones', () => {
     const c = new FakeClock();
@@ -127,24 +141,24 @@ describe('job tracking', () => {
     st.apply(started('B', 10, { source: SRC2 }));
     st.apply(exited('A', 5)); // late exit removes only A
     expect(ids(st)).toEqual(['B']);
-    // a late independent start still joins; the aggregate keeps the newest
-    // event's observedAt AND source metadata while rebuilding the value
+    // a late independent start still joins; the aggregate records the last
+    // accepted event's observedAt AND source metadata while rebuilding the value
     st.apply(started('C', 3));
     expect(ids(st)).toEqual(['B', 'C']);
-    expect(st.snapshot().env.activeJobs.observedAt).toBe(10);
-    expect(st.snapshot().env.activeJobs.source).toEqual(SRC2);
+    expect(st.snapshot().env.activeJobs.observedAt).toBe(3);
+    expect(st.snapshot().env.activeJobs.source).toEqual(SRC);
     // a delayed start older than the exit cannot resurrect within retention
     st.apply(started('A', 2));
     expect(ids(st)).toEqual(['B', 'C']);
     // a stale exit after a newer start is ignored — the job stays running
-    st.apply(exited('B', 9));
+    st.apply(exited('B', 9, { source: SRC2 }));
     expect(ids(st)).toEqual(['B', 'C']);
-    // exit wins an equal timestamp over start; a distinct-id start at the
-    // same time hits the event-time guard, not dedup
+    // Equal sequences are not earlier; a later-received distinct start at the
+    // same sequence may reuse the job id.
     st.apply(started('D', 7));
     st.apply(exited('D', 7));
     st.apply(started('D', 7));
-    expect(ids(st)).toEqual(['B', 'C']);
+    expect(ids(st)).toEqual(['B', 'C', 'D']);
     // a genuinely newer start may reuse the id
     st.apply(started('D', 8));
     expect(ids(st)).toEqual(['B', 'C', 'D']);

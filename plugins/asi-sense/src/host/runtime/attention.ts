@@ -4,7 +4,9 @@ import { AttentionPipeline, type SessionContext } from '../attention/pipeline.ts
 import { isRuleApproved, selectRule } from '../attention/rules.ts';
 import { sourceObservation } from '../state/source-health.ts';
 import { StateStore } from '../state/store.ts';
+import { eventDetail } from './event-detail.ts';
 import type { FactExpiry } from './expiry.ts';
+import { PendingContext } from './pending-context.ts';
 import type { Clock, DshPort } from './ports.ts';
 
 export interface EventEntry {
@@ -24,37 +26,6 @@ export interface EventEntry {
 }
 export type EventLog = EventEntry[];
 
-const detailFields: Record<string, readonly string[]> = {
-  'body.rate': ['metric', 'windowMs', 'delta', 'slope', 'direction', 'timeToFloorMs', 'severity', 'ruleId'],
-  'body.anomaly': ['metric', 'value', 'baseline', 'deviation', 'k', 'confidence', 'dates', 'severity', 'ruleId'],
-  'file.burst': [
-    'directory',
-    'windowMs',
-    'created',
-    'modified',
-    'deleted',
-    'agentCreated',
-    'agentModified',
-    'agentDeleted',
-    'externalDeletionExceeded',
-  ],
-};
-
-function eventDetail(signal: Signal): EventEntry['detail'] {
-  const fields = detailFields[signal.kind];
-  if (!fields) return undefined;
-  return Object.fromEntries(
-    fields.flatMap((key) => {
-      const value = signal.data[key];
-      return typeof value === 'string' ||
-        typeof value === 'boolean' ||
-        (typeof value === 'number' && Number.isFinite(value))
-        ? [[key, value]]
-        : [];
-    }),
-  );
-}
-
 function withoutTitles(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(withoutTitles);
   if (!value || typeof value !== 'object') return value;
@@ -69,12 +40,12 @@ export class RuntimeAttention {
   readonly store: StateStore;
   readonly pipeline: AttentionPipeline;
   private readonly entries: EventLog = [];
-  private readonly pending = new Map<string, { signal: Signal; count: number }>();
-  private pendingEvicted = 0;
+  private readonly pending = new PendingContext();
   private readonly sessions = new Map<string, SessionContext>();
   private readonly recent: string[] = [];
   private readonly inflight = new Set<Promise<void>>();
   private selected?: string;
+  private selectionGeneration = 0;
   private sequence = 0;
   private stopped = false;
   private readonly prefix = randomUUID();
@@ -99,6 +70,11 @@ export class RuntimeAttention {
       rules: rules(),
       clock: () => clock.mono(),
       wallClock: () => clock.wall(),
+      isCurrent: () => {
+        const generation = this.selectionGeneration;
+        return (id) =>
+          !this.stopped && generation === this.selectionGeneration && this.selected === id && this.sessions.has(id);
+      },
       deliverer: {
         deliver: async (intent) => {
           if (this.stopped) throw new Error('stopped');
@@ -168,13 +144,18 @@ export class RuntimeAttention {
     this.pipeline.disposeSession(id);
     const index = this.recent.indexOf(id);
     if (index >= 0) this.recent.splice(index, 1);
-    if (this.selected === id) this.selected = this.recent.at(-1);
+    if (this.selected === id) {
+      this.selected = this.recent.at(-1);
+      this.selectionGeneration++;
+      if (this.selected) void this.pipeline.retarget(this.selected);
+    }
     this.reschedule();
   }
   async preStep(id: string, userInitiated = false, drain = true): Promise<void> {
     if (this.stopped) return;
     const session = this.sessions.get(id);
     if (!session) return;
+    const generation = ++this.selectionGeneration;
     this.selected = id;
     const index = this.recent.indexOf(id);
     if (index >= 0) this.recent.splice(index, 1);
@@ -184,11 +165,12 @@ export class RuntimeAttention {
     this.pipeline.setSession(session);
     if (!drain) return;
     await this.pipeline.retarget(id);
-    if (this.stopped || this.selected !== id) return;
-    for (const [key, entry] of this.pending) {
-      this.pending.delete(key);
-      await this.pipeline.acceptCount(entry.signal, session, entry.count);
-      if (this.stopped || this.selected !== id) return;
+    if (this.stopped || generation !== this.selectionGeneration || this.selected !== id) return;
+    let entry = this.pending.take();
+    while (entry) {
+      await this.pipeline.acceptCount(entry.signal, session, entry.count, entry.other);
+      if (this.stopped || generation !== this.selectionGeneration || this.selected !== id) return;
+      entry = this.pending.take();
     }
     try {
       await this.pipeline.preStep(id);
@@ -208,31 +190,39 @@ export class RuntimeAttention {
     const session = this.selected && this.sessions.get(this.selected);
     if (!session) {
       const prior = this.store.snapshot().observation.sources[signal.source.id];
-      this.store.apply(signal);
-      const rule = signal.cause === 'agent' ? undefined : selectRule(this.rules(), signal, this.clock.wall());
-      let level = rule?.level ?? 'record';
-      let reason = signal.cause === 'agent' ? 'self-caused' : undefined;
-      if (level === 'wake' && rule && !isRuleApproved(rule)) {
-        level = 'context';
-        reason = 'rule-pending-approval';
-      }
-      if (
-        (signal.kind === 'source.status' || signal.kind === 'source.error') &&
-        prior?.status === sourceObservation(signal).status
-      ) {
-        level = 'record';
-      }
-      if (level === 'wake') reason = 'no-session';
-      if (level === 'context') {
-        const key = JSON.stringify([signal.subject, signal.kind]);
-        const previous = this.pending.get(key);
-        if (!previous && this.pending.size >= 200) {
-          this.pending.delete(this.pending.keys().next().value as string);
-          reason = `pending-evicted:${++this.pendingEvicted}`;
-        }
-        this.pending.set(key, { signal, count: (previous?.count ?? 0) + 1 });
-      }
-      this.log({ signal, level, ruleId: rule?.id, reason });
+      await new Promise<void>((resolve, reject) =>
+        this.store.apply(signal, (result) => {
+          try {
+            if (result !== 'applied') {
+              this.log({ signal, level: 'record', reason: result === 'older' ? 'older-sequence' : 'duplicate' });
+              resolve();
+              return;
+            }
+            const rule = signal.cause === 'agent' ? undefined : selectRule(this.rules(), signal, this.clock.wall());
+            let level = rule?.level ?? 'record';
+            let reason = signal.cause === 'agent' ? 'self-caused' : undefined;
+            if (level === 'wake' && rule && !isRuleApproved(rule)) {
+              level = 'context';
+              reason = 'rule-pending-approval';
+            }
+            if (
+              (signal.kind === 'source.status' || signal.kind === 'source.error') &&
+              prior?.status === sourceObservation(signal).status
+            ) {
+              level = 'record';
+            }
+            if (level === 'wake') reason = 'no-session';
+            if (level === 'context') {
+              const evicted = this.pending.add(signal);
+              if (evicted !== undefined) reason = `pending-evicted:${evicted}`;
+            }
+            this.log({ signal, level, ruleId: rule?.id, reason });
+            resolve();
+          } catch (error) {
+            reject(error);
+          }
+        }),
+      );
       return;
     }
     const change = await this.pipeline.accept(signal, session);

@@ -20,7 +20,7 @@ export class FileSource {
   private active = false;
   private stopped = false;
   private tail = Promise.resolve();
-  private readonly dispatch = new Set<string>();
+  private readonly dispatch = new Map<string, Map<string, number>>();
   private clearDispatch?: ReturnType<typeof setImmediate>;
   constructor(
     private readonly watcher: FileWatcher,
@@ -55,7 +55,7 @@ export class FileSource {
         this.watches.set(
           missing,
           this.watcher.watch(missing, (event) => {
-            void this.accept(event).catch(() => {});
+            void this.accept(event, missing).catch(() => {});
           }),
         );
       }
@@ -70,17 +70,21 @@ export class FileSource {
     this.dispatch.clear();
     await this.refresh();
   }
-  private async accept(event: FileChange): Promise<void> {
+  private async accept(event: FileChange, root: string): Promise<void> {
     if (!this.active || this.paused() || !path.isAbsolute(event.path)) return;
     const key = JSON.stringify([path.normalize(event.path), event.change, event.at ?? this.clock.wall()]);
-    if (this.dispatch.has(key)) return;
-    this.dispatch.add(key);
+    const roots = this.dispatch.get(key) ?? new Map<string, number>();
+    const count = (roots.get(root) ?? 0) + 1;
+    const duplicate = [...roots].some(([other, seen]) => other !== root && seen >= count);
+    roots.set(root, count);
+    this.dispatch.set(key, roots);
     if (this.dispatch.size > 5000) this.dispatch.delete(this.dispatch.keys().next().value as string);
     if (!this.clearDispatch)
       this.clearDispatch = setImmediate(() => {
         this.clearDispatch = undefined;
         this.dispatch.clear();
       });
+    if (duplicate) return;
     const signal = this.dsh.classify({
       id: this.attention.id(),
       kind: 'file.changed',

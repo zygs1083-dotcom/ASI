@@ -24,6 +24,7 @@ export interface DrainHooks {
   clock: () => number;
   /** Wall clock, used only for the `EnvUpdate.at` display timestamp. */
   wallClock: () => number;
+  isCurrent?: () => (sessionId: string) => boolean;
 }
 
 function throwCollected(errors: unknown[], label: string): void {
@@ -57,6 +58,7 @@ export class BucketDrain {
   private readonly sessions: DrainHooks['sessions'];
   private readonly clock: () => number;
   private readonly wallClock: () => number;
+  private readonly isCurrent: () => (sessionId: string) => boolean;
   private seq = 0;
   private suppressedGroups = 0;
 
@@ -65,6 +67,7 @@ export class BucketDrain {
     this.sessions = hooks.sessions;
     this.clock = hooks.clock;
     this.wallClock = hooks.wallClock;
+    this.isCurrent = hooks.isCurrent ?? (() => () => true);
   }
 
   /** Cumulative count of wake groups suppressed by the budget. */
@@ -81,6 +84,7 @@ export class BucketDrain {
     return min;
   }
   retarget(sessionId: string): void {
+    if (!this.isCurrent()(sessionId)) return;
     this.suppressedGroups -= retargetBuckets(this.pending, this.ready, this.batches, sessionId, (id, buckets, at) =>
       this.buildInjectBatch(id, buckets, at),
     );
@@ -114,7 +118,7 @@ export class BucketDrain {
    */
   async due(now: number): Promise<void> {
     const errors: unknown[] = [];
-    await this.attemptDue(now, errors);
+    await this.attemptDue(now, errors, this.isCurrent());
     throwCollected(errors, 'delivery failed');
   }
 
@@ -125,6 +129,8 @@ export class BucketDrain {
    * session drain, and anything the due pass made ready injects too.
    */
   async preStep(sessionId: string, now: number): Promise<void> {
+    const current = this.isCurrent();
+    if (!current(sessionId)) return;
     for (const b of [...this.pending.values()]) {
       if (b.sessionId !== sessionId || b.sealed) continue;
       if (bucketLevel(b) === 'context') {
@@ -153,16 +159,17 @@ export class BucketDrain {
     }
     const errors: unknown[] = [];
     const attempted = new Set<InjectBatch>();
-    await this.attemptInject(sessionId, errors, attempted);
-    await this.attemptDue(now, errors);
+    if (current(sessionId)) await this.attemptInject(sessionId, errors, attempted, current);
+    if (current(sessionId)) await this.attemptDue(now, errors, current);
     // due-pass downgrades also inject THIS step; failed batches wait for the next
-    await this.attemptInject(sessionId, errors, attempted);
+    if (current(sessionId)) await this.attemptInject(sessionId, errors, attempted, current);
     throwCollected(errors, 'pre-step delivery failed');
   }
 
   /** Due buckets attempted independently; failures restore the sealed bucket for a same-payload retry. */
-  private async attemptDue(now: number, errors: unknown[]): Promise<void> {
+  private async attemptDue(now: number, errors: unknown[], current: (id: string) => boolean): Promise<void> {
     for (const b of [...this.pending.values()]) {
+      if (!current(b.sessionId)) break;
       if (now < b.deadline) continue;
       this.pending.delete(b.id);
       b.sealed = true;
@@ -232,7 +239,12 @@ export class BucketDrain {
    * Success marks split parents `alreadyInjected`; a rejection retains the
    * batch unchanged.
    */
-  private async attemptInject(sessionId: string, errors: unknown[], attempted: Set<InjectBatch>): Promise<void> {
+  private async attemptInject(
+    sessionId: string,
+    errors: unknown[],
+    attempted: Set<InjectBatch>,
+    current: (id: string) => boolean,
+  ): Promise<void> {
     const loose = this.ready.get(sessionId);
     if (loose !== undefined && loose.length > 0) {
       this.ready.delete(sessionId);
@@ -241,6 +253,7 @@ export class BucketDrain {
     const batches = this.batches.get(sessionId);
     if (batches === undefined) return;
     for (const batch of [...batches]) {
+      if (!current(sessionId)) break;
       if (attempted.has(batch)) continue;
       attempted.add(batch);
       try {

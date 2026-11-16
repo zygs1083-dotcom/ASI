@@ -88,19 +88,16 @@ and deterministic environment-update formatting.
   bucket is sealed: it retries whole, never split.
 - **Job tracking**: `StateStore(wallClock?, defaultTtlMs?, monotonicClock?)` — exit
   tombstones use the injected _monotonic_ clock over the half-open
-  `[receivedAt, receivedAt+600s)` window while fact TTL keeps the wall clock.
-  `env.activeJobs` reports order on a single `jobsFactAt` watermark — EVERY
-  accepted `fact.updated` for the path advances it, `unknown` included —
-  and a report older than it is dropped before touching fact, tracking or
-  tombstones. Job events are no watermark: a report older than individual
-  job events still merges per job id — a newer tombstone or running event
-  wins, the value rebuilds from merged tracking, and `null` clears only
-  when no newer running job survives. A non-unknown report also advances
-  `jobSnapshotAt`, below which `job.started` is ignored. An `unknown`
-  report marks **only** the status — value, provenance, freshness, jobs
-  and tombstones preserved — yet still moves `jobsFactAt`. A start arriving
-  after its tombstone prunes is an ordinary new event — still subject to
-  the watermark and signal-id dedup.
+  `[receivedAt, receivedAt+600s)` window. Live fact TTL uses monotonic
+  receipt time; explicit `snapshot(now)` remains a wall-time replay seam.
+  Samples, source health, file changes and job events use receipt order.
+  A safe integer `data.sequence` can identify an earlier sample only when
+  both observations have comparable sequences from the same source; wall
+  `at` is display metadata, not an ordering key. An `env.activeJobs`
+  snapshot merges with explicitly newer comparable per-job events, and an
+  `unknown` report changes only the status while advancing its report
+  sequence. Exit tombstones prevent earlier comparable events from resurrecting
+  jobs until pruning; an unsequenced later arrival is accepted.
 - **Self-cause**: a causal-kind signal inside a tool window's inclusive
   bounds is agent-caused when its `pid`, `ppid` or any `ancestors` entry
   equals `window.pid` (the shell pid — children and grandchildren match), or
@@ -148,7 +145,8 @@ model tools must use `tools` and cannot choose their own identity. Pausing
 stops collection and defers pending deliveries until resumed.
 
 The latest active session to issue `pre-step` is selected. Without one,
-context is retained for a subsequent `pre-step`, while wake is recorded with
+context is retained for a subsequent `pre-step` (200 subjects, at most 16
+kind groups per subject including `other`), while wake is recorded with
 `reason: 'no-session'`. Helper title events are stripped until the latest
 matching process-session/id/generation acknowledgement; queued deliveries
 are stripped again when titles are disabled. Five restarts per ten monotonic
@@ -158,6 +156,10 @@ existing state store deliberately normalizes that status to `unavailable`
 with the reason in `error`, and the event log retains the reason/count.
 Fallback token capacity remains visible with its source tag but is omitted
 from threshold and rate evaluations.
+Drains recheck the selected session after every delivery; unattempted and
+failed buckets migrate to the new session. Helper overflow marks helper
+facts stale; recovery applies all snapshot fields and concurrent deltas and
+keeps the source degraded if a required field is missing.
 
 `bodyTune` accepts only the parameters wired to `BodyMonitor`/`Tuner`:
 `floor.{disk,context,battery}.{warn,critical}`, `rate.disk.maxDelta`,
@@ -425,3 +427,11 @@ In `test/runtime/runtime.test.ts` unless otherwise noted:
 11. Alert feedback capacity and registration failure: `evicts the oldest unfeedbacked alert at capacity and records the eviction` (`test/body/tuner.test.ts`); `marks an alert non-feedbackable when registration returns false`.
 12. Helper error and recovery: `records helper output overflow, marks the source degraded and requests a snapshot`; `does not recover from a snapshot requested before output overflow` (`test/runtime/helper.test.ts`).
 13. Resource snapshot stability: `leaves no additional active timer or child process resources after stop` (`test/runtime/helper.test.ts`).
+
+## Host runtime re-review fixes → regression tests
+
+1. In-flight routing: `moves the due wake after an in-flight context delivery changes session`; `retains a failed wake and moves all later buckets before another delivery`; `invalidates an in-flight drain even if a disposed session id is reused` (`test/runtime/routing-rereview.test.ts`).
+2. Receipt ordering and monotonic TTL: `accepts new same-source samples after wall rollback and expires from receipt time`; `uses receipt order for job samples, job events and source health after wall rollback`; `does not advance a fact sequence on an invalid sample or compare different sources` (`test/store.test.ts`); `recognizes source-health transitions in receipt order after a wall-clock rollback` (`test/pipeline.test.ts`).
+3. Complete helper recovery: `retains thermal and app deltas during overflow recovery and rejects an older snapshot`; `keeps a missing snapshot field unknown and the helper degraded`; `applies critical thermal from a recovery snapshot and emits the critical alert` (`test/runtime/helper.test.ts`).
+4. Source-root file deduplication: `preserves same-root same-millisecond deletions while pairing overlapping copies`; `deduplicates one event delivered by overlapping watched roots` (`test/runtime/runtime.test.ts`).
+5. No-session subject capacity: `counts subjects rather than kinds when retaining 200 subjects`; `bounds per-subject kinds and merges excess into other` (`test/runtime/routing-rereview.test.ts`).

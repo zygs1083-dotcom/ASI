@@ -1,12 +1,12 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { performance } from 'node:perf_hooks';
 import type { DeliveryLevel, EnvChange, Signal, WatchRule } from '@asi/sense-types';
-import { sourceObservation } from '../state/source-health.ts';
 import type { StateStore } from '../state/store.ts';
 import { BucketDrain } from './drain.ts';
 import type { AttentionPipelineOptions, SessionContext, SessionState } from './pipeline-types.ts';
 import { DEFAULT_RULES, isRuleApproved, selectRule, validateRule } from './rules.ts';
 import { classifyCause } from './selfcause.ts';
+import { sourceMarkSeen } from './source-mark.ts';
 
 export type {
   AttentionPipelineOptions,
@@ -85,6 +85,7 @@ export class AttentionPipeline {
       sessions: this.sessions,
       clock: this.clock,
       wallClock: this.wallClock,
+      isCurrent: options.isCurrent,
     });
   }
 
@@ -149,17 +150,27 @@ export class AttentionPipeline {
   async accept(signal: Signal, session: SessionContext): Promise<EnvChange> {
     return this.process(signal, session, 1, true);
   }
-  async acceptCount(signal: Signal, session: SessionContext, count: number): Promise<EnvChange> {
-    return this.process(signal, session, count, false);
+  async acceptCount(signal: Signal, session: SessionContext, count: number, other = false): Promise<EnvChange> {
+    return this.process(signal, session, count, false, other);
   }
-  private async process(signal: Signal, session: SessionContext, count: number, apply: boolean): Promise<EnvChange> {
+  private async process(
+    signal: Signal,
+    session: SessionContext,
+    count: number,
+    apply: boolean,
+    other = false,
+  ): Promise<EnvChange> {
     const ev = structuredClone(signal);
     ev.cause = classifyCause(ev, session.toolWindows ?? []);
-    if (!apply) return this.intake(ev, session, this.clock(), count);
+    if (!apply) return this.intake(ev, session, this.clock(), count, other);
     return await new Promise<EnvChange>((resolve, reject) => {
-      this.store.apply(ev, () => {
+      this.store.apply(ev, (result) => {
         try {
-          resolve(this.intake(ev, session, this.clock(), count));
+          resolve(
+            result === 'older'
+              ? { signal: ev, count: 1, level: 'record', reason: 'older-sequence' }
+              : this.intake(ev, session, this.clock(), count),
+          );
         } catch (e) {
           reject(e);
         }
@@ -168,18 +179,19 @@ export class AttentionPipeline {
   }
 
   /** All mutable accept intake — runs inside the store's apply callback (FIFO). */
-  private intake(ev: Signal, session: SessionContext, now: number, count: number): EnvChange {
+  private intake(ev: Signal, session: SessionContext, now: number, count: number, other = false): EnvChange {
     const s = this.session(session.id);
     s.context = session;
     const change: EnvChange = { signal: ev, count: 1, level: 'record' };
     if (this.isDuplicate(s, ev.id)) {
       change.reason = 'duplicate';
     } else {
-      const repeatedStatus = this.sourceMarkSeen(s, ev);
+      const repeatedStatus = sourceMarkSeen(s, ev);
       if (ev.cause === 'agent') {
         change.reason = 'self-caused';
       } else {
         const rule = selectRule(this.rules, ev, this.wallClock());
+        if (other) ev.kind = 'other';
         let level: DeliveryLevel = rule?.level ?? 'record';
         let reason: string | undefined;
         if (level === 'wake' && rule && !isRuleApproved(rule)) {
@@ -258,6 +270,7 @@ export class AttentionPipeline {
         seenOrder: [],
         wakeTimes: [],
         srcStatus: new Map(),
+        srcSequence: new Map(),
       };
       this.sessions.set(id, s);
     }
@@ -270,20 +283,5 @@ export class AttentionPipeline {
     s.seenOrder.push(id);
     if (s.seenOrder.length > DEDUP_MAX) s.seenIds.delete(s.seenOrder.shift() as string);
     return false;
-  }
-
-  /**
-   * Updates the session's source mark on ANY nonduplicate signal via the
-   * shared {@link sourceObservation} normalization — an ordinary success is
-   * a recovery — and reports whether this signal is a stale/repeated status
-   * notification (event-time guard). Callers apply the verdict only to
-   * `source.status`/`source.error` kinds.
-   */
-  private sourceMarkSeen(s: SessionState, ev: Signal): boolean {
-    const prev = s.srcStatus.get(ev.source.id);
-    const next = sourceObservation(ev);
-    const seen = prev !== undefined && (ev.at < prev.lastSignalAt || prev.status === next.status);
-    if (!prev || ev.at >= prev.lastSignalAt) s.srcStatus.set(ev.source.id, next);
-    return seen;
   }
 }

@@ -2,9 +2,11 @@ import type { ChildProcessWithoutNullStreams } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import { readFileSync } from 'node:fs';
 import { PassThrough } from 'node:stream';
+import type { Body } from '@asi/sense-types';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createSenseRuntime } from '../../src/host/runtime/index.ts';
 import type { AgentEvent, DshPort, SensePorts } from '../../src/host/runtime/ports.ts';
+import { mkBody } from '../body/helpers.ts';
 
 const fixture = readFileSync(new URL('./fixtures/helper.ndjson', import.meta.url), 'utf8');
 
@@ -36,7 +38,12 @@ class FakeChild extends EventEmitter {
           this.commands.push(command);
           if (autoAck) this.ack(command);
         } else if (command.cmd === 'snapshot' && this.snapshotReply) {
-          this.send({ type: 'snapshot', frontApp: { name: 'ExampleApp', bundleId: 'example.app', pid: 123 } });
+          this.send({
+            type: 'snapshot',
+            frontApp: { name: 'ExampleApp', bundleId: 'example.app', pid: 123 },
+            focusedWindow: { status: 'ok', pid: 123 },
+            thermal: 'nominal',
+          });
         }
       }
     });
@@ -87,6 +94,8 @@ function setup(autoAck = true, stubborn = false, holdWrites = false) {
   vi.setSystemTime(1_700_000_000_000);
   let mono = 0;
   let agent: (event: AgentEvent) => Promise<void> = async () => {};
+  let sample: (body: Body) => void = () => {};
+  let snapshotReply = true;
   const children: FakeChild[] = [];
   const delivered: Parameters<DshPort['deliver']>[1][] = [];
   const ports: SensePorts = {
@@ -107,12 +116,22 @@ function setup(autoAck = true, stubborn = false, holdWrites = false) {
     helper: {
       spawn: () => {
         const child = new FakeChild(autoAck, stubborn, holdWrites);
+        child.snapshotReply = snapshotReply;
         children.push(child);
         queueMicrotask(() => child.emitFixture());
         return child as unknown as ChildProcessWithoutNullStreams;
       },
     },
-    probe: { create: () => ({ onSample: () => () => {}, start: () => {}, stop: async () => {} }) },
+    probe: {
+      create: () => ({
+        onSample: (cb) => {
+          sample = cb;
+          return () => {};
+        },
+        start: () => {},
+        stop: async () => {},
+      }),
+    },
     files: { watch: () => ({ close: () => {} }) },
   };
   const runtime = createSenseRuntime(ports, { platform: 'darwin', helperPath: '/fixture/helper' });
@@ -127,6 +146,16 @@ function setup(autoAck = true, stubborn = false, holdWrites = false) {
       await vi.advanceTimersByTimeAsync(ms);
     },
     settle: () => vi.advanceTimersByTimeAsync(0),
+    sample: async () => {
+      sample(mkBody());
+      await vi.advanceTimersByTimeAsync(0);
+    },
+    jumpWall: (ms: number) => {
+      vi.setSystemTime(Date.now() + ms);
+    },
+    snapshotReply: (value: boolean) => {
+      snapshotReply = value;
+    },
   };
 }
 
@@ -312,7 +341,12 @@ describe('helper protocol integration', () => {
       error: 'output_overflow',
     });
     expect(snapshots).toHaveLength(1);
-    child.send({ type: 'snapshot', frontApp: { name: 'ExampleApp', bundleId: 'example.app', pid: 123 } });
+    child.send({
+      type: 'snapshot',
+      frontApp: { name: 'ExampleApp', bundleId: 'example.app', pid: 123 },
+      focusedWindow: { status: 'ok', pid: 123 },
+      thermal: 'nominal',
+    });
     await h.settle();
     expect(h.runtime.state().observation.sources.helper?.status).toBe('ok');
     await h.runtime.stop();
@@ -338,9 +372,273 @@ describe('helper protocol integration', () => {
     await h.settle();
     expect(h.runtime.state().observation.sources.helper?.status).toBe('unavailable');
     expect(commands).toHaveLength(2);
-    child.send({ type: 'snapshot' });
+    child.send({
+      type: 'snapshot',
+      frontApp: { name: 'ExampleApp', bundleId: 'example.app', pid: 123 },
+      focusedWindow: { status: 'ok', pid: 123 },
+      thermal: 'nominal',
+    });
     await h.settle();
     expect(h.runtime.state().observation.sources.helper?.status).toBe('ok');
+    await h.runtime.stop();
+  });
+
+  it('retains thermal and app deltas during overflow recovery and rejects an older snapshot', async () => {
+    const h = setup();
+    await h.runtime.start();
+    await h.settle();
+    const child = h.children[0];
+    if (!child) throw new Error('missing helper');
+    child.snapshotReply = false;
+    child.send({ type: 'error', code: 'output_overflow', dropped: 1 });
+    await h.settle();
+    expect(h.runtime.state().env.frontApp.status).toBe('stale');
+    expect(h.runtime.state().self.body.thermal.status).toBe('stale');
+    child.send({ type: 'thermal', state: 'critical' });
+    child.send({ type: 'app.activated', name: 'NewApp', bundleId: 'new.app', pid: 234 });
+    await h.settle();
+    expect(h.runtime.state().self.body.thermal.value).toBe('critical');
+    expect(h.runtime.state().observation.sources.helper?.status).toBe('unavailable');
+    child.send({
+      type: 'snapshot',
+      frontApp: { name: 'OldApp', bundleId: 'old.app', pid: 123 },
+      focusedWindow: { status: 'ok', pid: 123, title: 'Old title' },
+      thermal: 'nominal',
+    });
+    await h.settle();
+    expect(h.runtime.state().self.body.thermal).toMatchObject({ status: 'ok', value: 'critical' });
+    expect(h.runtime.state().env.frontApp.value).toEqual({ name: 'NewApp', bundleId: 'new.app' });
+    expect(h.runtime.state().env.focusedWindow.value).toBeNull();
+    expect(h.runtime.state().observation.sources.helper?.status).toBe('ok');
+    await h.runtime.stop();
+  });
+
+  it('marks a known helper window stale immediately on overflow', async () => {
+    const h = setup();
+    await h.runtime.start();
+    await h.settle();
+    await h.runtime.actions.setSendTitles(true);
+    await h.settle();
+    const child = h.children[0];
+    if (!child) throw new Error('missing helper');
+    child.send({ type: 'window.focused', bundleId: 'example.app', title: 'Synthetic' });
+    await h.settle();
+    expect(h.runtime.state().env.focusedWindow.status).toBe('ok');
+    child.snapshotReply = false;
+    child.send({ type: 'error', code: 'output_overflow', dropped: 1 });
+    await h.settle();
+    expect(h.runtime.state().env.focusedWindow).toMatchObject({ status: 'stale', value: { title: 'Synthetic' } });
+    expect(h.runtime.state().observation.sources.helper?.status).toBe('unavailable');
+    await h.runtime.stop();
+  });
+
+  it('preserves a permission revocation received while the snapshot is in flight', async () => {
+    const h = setup();
+    await h.runtime.start();
+    await h.settle();
+    const child = h.children[0];
+    if (!child) throw new Error('missing helper');
+    child.snapshotReply = false;
+    child.send({ type: 'error', code: 'output_overflow', dropped: 1 });
+    await h.settle();
+    child.send({ type: 'hello', session: 'fixture-session', permissions: { accessibility: 'denied' } });
+    await h.settle();
+    child.send({
+      type: 'snapshot',
+      frontApp: { name: 'ExampleApp', bundleId: 'example.app', pid: 123 },
+      focusedWindow: { status: 'ok', pid: 123, title: 'Old title' },
+      thermal: 'critical',
+    });
+    await h.settle();
+    expect(h.runtime.state().env.focusedWindow).toMatchObject({ status: 'denied', value: null });
+    expect(h.runtime.state().observation.sources['helper.ax']?.status).toBe('denied');
+    await h.runtime.stop();
+  });
+
+  it('stays degraded across a helper restart until a complete recovery snapshot', async () => {
+    const h = setup();
+    await h.runtime.start();
+    await h.settle();
+    const child = h.children[0];
+    if (!child) throw new Error('missing helper');
+    child.snapshotReply = false;
+    h.snapshotReply(false);
+    child.send({ type: 'error', code: 'output_overflow', dropped: 1 });
+    await h.settle();
+    child.crash();
+    await h.advance(250);
+    const restarted = h.children[1];
+    if (!restarted) throw new Error('missing restarted helper');
+    expect(h.runtime.state().observation.sources.helper?.status).toBe('unavailable');
+    restarted.send({
+      type: 'snapshot',
+      frontApp: { name: 'ExampleApp', bundleId: 'example.app', pid: 123 },
+      focusedWindow: { status: 'unknown', pid: 123 },
+      thermal: 'critical',
+    });
+    await h.settle();
+    expect(h.runtime.state().observation.sources.helper?.status).toBe('ok');
+    expect(h.runtime.state().self.body.thermal).toMatchObject({ status: 'ok', value: 'critical' });
+    await h.runtime.stop();
+  });
+
+  it('keeps a missing snapshot field unknown and the helper degraded', async () => {
+    const h = setup();
+    await h.runtime.start();
+    await h.settle();
+    const child = h.children[0];
+    if (!child) throw new Error('missing helper');
+    child.snapshotReply = false;
+    child.send({ type: 'error', code: 'output_overflow', dropped: 1 });
+    await h.settle();
+    child.send({
+      type: 'snapshot',
+      frontApp: { name: 'ExampleApp', bundleId: 'example.app', pid: 123 },
+      focusedWindow: { status: 'unknown', pid: 123 },
+    });
+    await h.settle();
+    expect(h.runtime.state().self.body.thermal.status).toBe('unknown');
+    expect(h.runtime.state().observation.sources.helper?.status).toBe('unavailable');
+    await h.runtime.stop();
+  });
+
+  it('applies complete snapshot fields after an unusable incremental thermal event', async () => {
+    const h = setup();
+    await h.runtime.start();
+    await h.settle();
+    const child = h.children[0];
+    if (!child) throw new Error('missing helper');
+    child.snapshotReply = false;
+    child.send({ type: 'error', code: 'output_overflow', dropped: 1 });
+    await h.settle();
+    child.send({ type: 'thermal', state: 'unknown' });
+    await h.settle();
+    expect(h.runtime.state().self.body.thermal.status).toBe('unknown');
+    child.send({
+      type: 'snapshot',
+      frontApp: { name: 'ExampleApp', bundleId: 'example.app', pid: 123 },
+      focusedWindow: { status: 'unknown', pid: 123 },
+      thermal: 'critical',
+    });
+    await h.settle();
+    expect(h.runtime.state().self.body.thermal).toMatchObject({ status: 'ok', value: 'critical' });
+    expect(h.runtime.state().observation.sources.helper?.status).toBe('ok');
+    await h.runtime.stop();
+  });
+
+  it('does not let malformed app deltas or unknown windows override a complete snapshot', async () => {
+    const h = setup();
+    await h.runtime.start();
+    await h.settle();
+    const child = h.children[0];
+    if (!child) throw new Error('missing helper');
+    child.snapshotReply = false;
+    child.send({ type: 'error', code: 'output_overflow', dropped: 1 });
+    await h.settle();
+    child.send({ type: 'app.activated', bundleId: 'invalid.app' });
+    child.send({
+      type: 'snapshot',
+      frontApp: { name: 'ExampleApp', bundleId: 'example.app', pid: 123 },
+      focusedWindow: { status: 'unknown', pid: 123, title: 'Untrusted title' },
+      thermal: 'critical',
+    });
+    await h.settle();
+    expect(h.runtime.state().env.frontApp.value).toEqual({ name: 'ExampleApp', bundleId: 'example.app' });
+    expect(h.runtime.state().env.focusedWindow).toMatchObject({ status: 'unknown', value: null });
+    await h.runtime.stop();
+  });
+
+  it.each([
+    ['frontApp', 'env.frontApp'],
+    ['focusedWindow', 'env.focusedWindow'],
+    ['thermal', 'self.body.thermal'],
+  ])('marks missing snapshot field %s unknown without recovering the source', async (field, path) => {
+    const h = setup();
+    await h.runtime.start();
+    await h.settle();
+    const child = h.children[0];
+    if (!child) throw new Error('missing helper');
+    child.send({ type: 'window.focused', bundleId: 'example.app', title: 'Synthetic' });
+    await h.settle();
+    child.snapshotReply = false;
+    child.send({ type: 'error', code: 'output_overflow', dropped: 1 });
+    await h.settle();
+    const snapshot: Record<string, unknown> = {
+      type: 'snapshot',
+      frontApp: { name: 'ExampleApp', bundleId: 'example.app', pid: 123 },
+      focusedWindow: { status: 'ok', pid: 123, title: 'Synthetic' },
+      thermal: 'critical',
+    };
+    delete snapshot[field];
+    child.send(snapshot);
+    await h.settle();
+    expect(
+      path.split('.').reduce<unknown>((value, key) => (value as Record<string, unknown>)[key], h.runtime.state()),
+    ).toMatchObject({ status: 'unknown' });
+    expect(h.runtime.state().observation.sources.helper?.status).toBe('unavailable');
+    await h.runtime.stop();
+  });
+
+  it('applies critical thermal from a recovery snapshot and emits the critical alert', async () => {
+    const h = setup();
+    await h.runtime.start();
+    await h.settle();
+    await h.sample();
+    const child = h.children[0];
+    if (!child) throw new Error('missing helper');
+    child.snapshotReply = false;
+    child.send({ type: 'error', code: 'output_overflow', dropped: 1 });
+    await h.settle();
+    child.send({
+      type: 'snapshot',
+      frontApp: { name: 'ExampleApp', bundleId: 'example.app', pid: 123 },
+      focusedWindow: { status: 'unknown', pid: 123 },
+      thermal: 'critical',
+    });
+    await h.settle();
+    await h.advance(1);
+    await h.sample();
+    expect(h.runtime.state().self.body.thermal).toMatchObject({ status: 'ok', value: 'critical' });
+    expect(h.runtime.events()).toContainEqual(
+      expect.objectContaining({
+        kind: 'body.threshold',
+        subject: 'thermal',
+        level: 'wake',
+      }),
+    );
+    await h.runtime.stop();
+  });
+
+  it('does not refresh helper thermal TTL by replaying it in a probe sample', async () => {
+    const h = setup();
+    await h.runtime.start();
+    await h.settle();
+    await h.advance(59_999);
+    await h.sample();
+    expect(h.runtime.state().self.body.thermal.status).toBe('ok');
+    await h.advance(1);
+    await h.sample();
+    expect(h.runtime.state().self.body.thermal.status).toBe('stale');
+    await h.runtime.stop();
+  });
+
+  it('evaluates fresh thermal evidence after a wall-clock jump', async () => {
+    const h = setup();
+    await h.runtime.start();
+    await h.settle();
+    await h.sample();
+    h.children[0]?.send({ type: 'thermal', state: 'critical' });
+    await h.settle();
+    h.jumpWall(120_000);
+    await h.advance(1);
+    await h.sample();
+    expect(h.runtime.events()).toContainEqual(
+      expect.objectContaining({
+        kind: 'body.threshold',
+        subject: 'thermal',
+        level: 'wake',
+      }),
+    );
     await h.runtime.stop();
   });
 

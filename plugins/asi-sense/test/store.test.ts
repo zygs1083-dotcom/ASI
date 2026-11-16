@@ -25,6 +25,125 @@ describe('factStatusAt', () => {
 });
 
 describe('StateStore', () => {
+  it('accepts new same-source samples after wall rollback and expires from receipt time', () => {
+    const clock = new FakeClock();
+    clock.wall = 100_000;
+    const store = new StateStore(clock.wallTime, 1_000, clock.time);
+    const cpu = (id: string, usage: number, sequence?: number) =>
+      sig({
+        id,
+        kind: 'fact.updated',
+        at: clock.wall,
+        data: {
+          path: 'self.body.cpu',
+          value: { usage },
+          ttlMs: 1_000,
+          ...(sequence === undefined ? {} : { sequence }),
+        },
+      });
+    store.apply(cpu('first', 0.1));
+    clock.advance(500);
+    clock.jumpWall(-10_500);
+    store.apply(cpu('new', 0.9));
+    expect(store.snapshot().self.body.cpu).toMatchObject({ value: { usage: 0.9 }, observedAt: 90_000, status: 'ok' });
+    clock.advance(999);
+    expect(store.snapshot().self.body.cpu.status).toBe('ok');
+    clock.advance(1);
+    expect(store.snapshot().self.body.cpu.status).toBe('stale');
+    store.apply(cpu('seq-2', 0.8, 2));
+    store.apply(cpu('seq-1', 0.2, 1));
+    expect(store.snapshot().self.body.cpu.value).toMatchObject({ usage: 0.8 });
+  });
+
+  it('uses receipt order for job samples, job events and source health after wall rollback', () => {
+    const clock = new FakeClock();
+    clock.wall = 100_000;
+    const store = new StateStore(clock.wallTime, 1_000, clock.time);
+    store.apply(sig({ id: 'first', kind: 'fact.updated', at: 100_000, data: { path: 'env.activeJobs', value: [] } }));
+    clock.wall = 90_000;
+    clock.now = 500;
+    store.apply(sig({ id: 'started', kind: 'job.started', at: 90_000, subject: 'new-job' }));
+    expect(store.snapshot().env.activeJobs.value?.map((job) => job.id)).toEqual(['new-job']);
+    store.apply(
+      sig({
+        id: 'second',
+        kind: 'fact.updated',
+        at: 89_000,
+        data: {
+          path: 'env.activeJobs',
+          value: [{ id: 'sampled-job', status: 'running', startedAt: 89_000 }],
+        },
+      }),
+    );
+    expect(store.snapshot().env.activeJobs).toMatchObject({
+      value: [{ id: 'sampled-job' }],
+      observedAt: 89_000,
+      status: 'ok',
+    });
+    store.apply(sig({ id: 'source-error', kind: 'source.error', at: 88_000, data: { error: 'fixture' } }));
+    expect(store.snapshot().observation.sources.fs).toMatchObject({ status: 'unavailable', lastSignalAt: 88_000 });
+    clock.now += 1_000;
+    expect(store.snapshot().env.activeJobs.status).toBe('stale');
+  });
+
+  it('does not advance a fact sequence on an invalid sample or compare different sources', () => {
+    const store = storeAt(new FakeClock());
+    const update = (id: string, sequence: number, value?: number, source = SRC) =>
+      sig({
+        id,
+        kind: 'fact.updated',
+        at: 0,
+        source,
+        data: { path: 'self.body.cpu', sequence, ...(value === undefined ? {} : { value: { usage: value } }) },
+      });
+    store.apply(update('one', 1, 0.1));
+    store.apply(update('invalid', 99));
+    store.apply(update('two', 2, 0.9));
+    expect(store.snapshot().self.body.cpu.value).toMatchObject({ usage: 0.9 });
+    store.apply(update('other-source', 1, 0.5, { id: 'other', api: 'test', host: 'local' }));
+    expect(store.snapshot().self.body.cpu.value).toMatchObject({ usage: 0.5 });
+  });
+
+  it('does not refresh TTL or source health for an explicitly older job event', () => {
+    const clock = new FakeClock();
+    clock.wall = 100_000;
+    const store = new StateStore(clock.wallTime, 1_000, clock.time);
+    store.apply(sig({ id: 'new-job', kind: 'job.started', subject: 'job', at: clock.wall, data: { sequence: 10 } }));
+    store.apply(sig({ id: 'error', kind: 'source.error', at: clock.wall, data: { error: 'fixture' } }));
+    clock.now = 500;
+    store.apply(sig({ id: 'old-job', kind: 'job.started', subject: 'job', at: clock.wall, data: { sequence: 5 } }));
+    expect(store.snapshot().observation.sources.fs?.status).toBe('unavailable');
+    clock.now = 1_000;
+    expect(store.snapshot().env.activeJobs.status).toBe('stale');
+  });
+
+  it('retains comparable job snapshot sequences independently per source', () => {
+    const store = storeAt(new FakeClock());
+    const other = { id: 'other', api: 'test', host: 'local' };
+    store.apply(sig({ id: 'a10', kind: 'fact.updated', data: { path: 'env.activeJobs', value: [], sequence: 10 } }));
+    store.apply(
+      sig({
+        id: 'b1',
+        kind: 'fact.updated',
+        source: other,
+        data: { path: 'env.activeJobs', value: [], sequence: 1 },
+      }),
+    );
+    store.apply(sig({ id: 'old', kind: 'job.started', subject: 'job', data: { sequence: 9 } }));
+    expect(store.snapshot().env.activeJobs.value).toEqual([]);
+    store.apply(sig({ id: 'new', kind: 'job.started', subject: 'job', data: { sequence: 11 } }));
+    expect(store.snapshot().env.activeJobs.value?.map((job) => job.id)).toEqual(['job']);
+  });
+
+  it('compares per-job sequences from the same source across intervening sources', () => {
+    const store = storeAt(new FakeClock());
+    const other = { id: 'other', api: 'test', host: 'local' };
+    store.apply(sig({ id: 'a10', kind: 'job.started', subject: 'job', data: { sequence: 10 } }));
+    store.apply(sig({ id: 'b1', kind: 'job.started', subject: 'job', source: other, data: { sequence: 1 } }));
+    store.apply(sig({ id: 'a5', kind: 'job.exited', subject: 'job', data: { sequence: 5 } }));
+    expect(store.snapshot().env.activeJobs.value?.map((job) => job.id)).toEqual(['job']);
+  });
+
   it('uses monotonic receipt time for live TTL after wall-clock rollback', () => {
     const clock = new FakeClock();
     const store = new StateStore(clock.wallTime, 1_000, clock.time);
@@ -237,14 +356,14 @@ describe('StateStore', () => {
     expect(seen).toEqual(['A']);
   });
 
-  it('ignores out-of-order signals per fact but allows older distinct file paths', () => {
+  it('ignores earlier explicit sequences per fact but allows independent file paths', () => {
     const st = storeAt(new FakeClock());
-    st.apply(sig({ id: '1', kind: 'app.activated', at: 10, data: { name: 'New' } }));
-    st.apply(sig({ id: '2', kind: 'app.activated', at: 5, data: { name: 'Old' } }));
+    st.apply(sig({ id: '1', kind: 'app.activated', at: 10, data: { name: 'New', sequence: 10 } }));
+    st.apply(sig({ id: '2', kind: 'app.activated', at: 5, data: { name: 'Old', sequence: 5 } }));
     expect(st.snapshot().env.frontApp.value?.name).toBe('New');
-    st.apply(sig({ id: '3', kind: 'file.changed', at: 10, subject: '/r/a' }));
-    st.apply(sig({ id: '4', kind: 'file.changed', at: 8, subject: '/r/b' }));
-    st.apply(sig({ id: '5', kind: 'file.changed', at: 9, subject: '/r/a' }));
+    st.apply(sig({ id: '3', kind: 'file.changed', at: 10, subject: '/r/a', data: { sequence: 10 } }));
+    st.apply(sig({ id: '4', kind: 'file.changed', at: 8, subject: '/r/b', data: { sequence: 8 } }));
+    st.apply(sig({ id: '5', kind: 'file.changed', at: 9, subject: '/r/a', data: { sequence: 9 } }));
     const w = st.snapshot().env.watchedPaths.value ?? {};
     expect(w['/r/a']).toEqual({ lastChange: 10, changes: 1 });
     expect(w['/r/b']).toEqual({ lastChange: 8, changes: 1 });

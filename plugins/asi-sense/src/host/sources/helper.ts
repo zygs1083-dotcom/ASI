@@ -2,16 +2,8 @@ import type { ChildProcessWithoutNullStreams } from 'node:child_process';
 import type { RuntimeAttention } from '../runtime/attention.ts';
 import type { Clock, HelperSpawner } from '../runtime/ports.ts';
 import type { BodySource } from './body.ts';
-import {
-  axStatus,
-  clearWindow,
-  helperError,
-  helperEvent,
-  helperStatus,
-  type Message,
-  object,
-  strip,
-} from './helper-events.ts';
+import { axStatus, clearWindow, helperError, helperStatus, type Message, object, strip } from './helper-events.ts';
+import { applyHelperEvent, HelperRecovery, markHelperFacts } from './helper-recovery.ts';
 import { HelperWriter } from './helper-writer.ts';
 
 const HANDSHAKE_MS = 3_000;
@@ -32,9 +24,7 @@ export class HelperSource {
   private buffer = '';
   private readonly children = new Map<ChildProcessWithoutNullStreams, { done: Promise<void>; killAt?: number }>();
   private readonly writer = new HelperWriter((child) => this.fail('stdin-error', child));
-  private degraded = false;
-  private snapshotWaiting = false;
-  private recoverySnapshot = false;
+  private recovery = new HelperRecovery();
   private lastFailure?: string;
 
   constructor(
@@ -136,9 +126,7 @@ export class HelperSource {
     this.buffer = '';
     this.intent = undefined;
     this.writer.start(child);
-    this.degraded = false;
-    this.snapshotWaiting = false;
-    this.recoverySnapshot = false;
+    this.recovery = new HelperRecovery(this.recovery.degraded);
     this.deadline = this.clock.mono() + HANDSHAKE_MS;
     const done = new Promise<void>((resolve) => child.once('close', () => resolve()));
     this.children.set(child, { done });
@@ -201,6 +189,7 @@ export class HelperSource {
       const first = !this.session;
       this.session = raw.session;
       if (first) this.sendIntent();
+      this.recovery.delta(raw);
       const permissions = object(raw.permissions);
       await axStatus(this.attention, permissions?.accessibility === 'granted' ? 'ok' : 'denied', raw.at as number);
       return;
@@ -222,34 +211,33 @@ export class HelperSource {
         this.intent = undefined;
         this.deadline = undefined;
         this.reschedule();
-        if (!this.degraded) await this.status('ok', 'ready');
+        if (!this.recovery.degraded) await this.status('ok', 'ready');
         this.requestSnapshot();
       }
       return;
     }
     if (raw.type === 'error') {
-      this.degraded = true;
+      this.recovery.degraded = true;
+      markHelperFacts(this.attention, this.body, raw.at as number, ['frontApp', 'focusedWindow', 'thermal'], 'stale');
       const code = await helperError(this.attention, raw);
       if (code === 'privacy-generation-exhausted') throw new Error('privacy generation exhausted');
-      if (this.snapshotWaiting) this.recoverySnapshot = true;
+      if (this.recovery.waiting) this.recovery.obsolete = true;
       else this.requestSnapshot();
       return;
     }
     if (this.paused()) return;
     if (raw.type === 'snapshot') {
-      this.snapshotWaiting = false;
-      if (this.recoverySnapshot) {
-        this.recoverySnapshot = false;
+      this.recovery.waiting = false;
+      if (this.recovery.obsolete) {
+        this.recovery.obsolete = false;
         this.requestSnapshot();
         return;
       }
     }
-    if (this.degraded && raw.type !== 'snapshot') return;
-    await helperEvent((this.titles ? raw : strip(raw)) as Message, this.attention, this.body);
-    if (this.degraded && raw.type === 'snapshot') {
-      this.degraded = false;
+    if (
+      await applyHelperEvent(this.recovery, raw, (this.titles ? raw : strip(raw)) as Message, this.attention, this.body)
+    )
       await this.status('ok', 'snapshot');
-    }
   }
   private async status(status: 'ok' | 'unavailable' | 'error', reason: string): Promise<void> {
     await helperStatus(this.attention, this.clock.wall(), status, reason, this.crashes.length, this.lastFailure);
@@ -265,8 +253,7 @@ export class HelperSource {
     this.reschedule();
   }
   private requestSnapshot(): void {
-    if (this.snapshotWaiting) return;
-    this.snapshotWaiting = true;
+    if (!this.recovery.request()) return;
     this.writer.write({ cmd: 'snapshot' });
   }
   private fail(reason: string, expected = this.child): void {

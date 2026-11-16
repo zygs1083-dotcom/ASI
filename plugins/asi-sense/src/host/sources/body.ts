@@ -50,6 +50,7 @@ export class BodySource {
   private tokenGeneration = 0;
   private readonly tokenWork = new Set<Promise<void>>();
   private thermal?: Body['thermal'];
+  private thermalRecovering = false;
   private burstRoots = '';
   private detector = new FileBurstDetector();
 
@@ -135,11 +136,15 @@ export class BodySource {
     this.write('tokens', this.token);
     this.changed();
   }
-  setThermal(fact: Body['thermal']): void {
+  setThermal(fact: Body['thermal'], recovering = false): void {
     if (this.stopped) return;
     this.thermal = fact;
+    this.thermalRecovering = recovering;
     this.write('thermal', fact);
     this.changed();
+  }
+  finishThermalRecovery(): void {
+    this.thermalRecovering = false;
   }
   setRoots(roots: string[]): void {
     const ordered = [...roots].sort();
@@ -190,16 +195,23 @@ export class BodySource {
         value: fact.value,
         status: fact.status,
         ttlMs: fact.ttlMs,
+        ...(key === 'thermal' && this.thermalRecovering ? { preserveSourceStatus: true } : {}),
         ...('unavailableMounts' in fact ? { unavailableMounts: fact.unavailableMounts } : {}),
       },
     });
   }
   private async sample(body: Body, at: number, mono: number): Promise<void> {
     if (this.stopped || this.paused()) return;
-    if (this.token) body.tokens = this.token;
-    if (this.thermal) body.thermal = this.thermal;
-    for (const key of Object.keys(body) as (keyof Body)[]) this.write(key, body[key]);
+    const current = this.token || this.thermal ? this.attention.state().self.body : undefined;
+    if (this.token && current) body.tokens = current.tokens;
+    if (this.thermal && current) body.thermal = current.thermal;
+    for (const key of Object.keys(body) as (keyof Body)[]) {
+      if ((key === 'tokens' && this.token) || (key === 'thermal' && this.thermal)) continue;
+      this.write(key, body[key]);
+    }
     const evaluated = structuredClone(body);
+    if (this.token && evaluated.tokens.status === 'ok') evaluated.tokens.observedAt = at;
+    if (this.thermal && evaluated.thermal.status === 'ok') evaluated.thermal.observedAt = at;
     if (
       evaluated.tokens.value &&
       (this.tokenSource === 'fallback' ||

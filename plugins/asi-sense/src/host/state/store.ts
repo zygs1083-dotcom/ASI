@@ -2,11 +2,13 @@ import { performance } from 'node:perf_hooks';
 import type { Fact, FactStatus, JobSummary, SenseState, Signal } from '@asi/sense-types';
 import { FactExpiry } from './expiry.ts';
 import { FACT_PATHS, factAt, initialState, num, recomputeStatuses, str, ttlOf } from './facts.ts';
+import { FactOrdering } from './ordering.ts';
 import { FACT_STATUSES, sourceObservation } from './source-health.ts';
-import { type JobTrack, mergeJobs, noteFile } from './updates.ts';
+import { type JobTrack, jobOrder, mergeJobs, noteFile } from './updates.ts';
 
 const ACTIVITIES: ReadonlySet<string> = new Set(['idle', 'thinking', 'tool', 'waiting-user']);
 type Activity = 'idle' | 'thinking' | 'tool' | 'waiting-user';
+type ApplyResult = 'applied' | 'duplicate' | 'older';
 
 /**
  * In-memory fact table (DESIGN §2.2); the host feeds it signals and reads
@@ -15,12 +17,12 @@ type Activity = 'idle' | 'thinking' | 'tool' | 'waiting-user';
  * `env.watchedPaths[path]`, `job.*` → `env.activeJobs`, `agent.status` →
  * `self.activity`, `fact.updated` → trusted write to {@link FACT_PATHS},
  * `source.*` → `observation.sources`. Every signal also marks source health
- * via {@link sourceObservation}; ids dedup (last 1024); out-of-order input
- * is ignored per fact once observed; `data.ttlMs` overrides the TTL.
+ * via {@link sourceObservation}; ids dedup (last 1024); input is ordered
+ * by receipt unless it carries a comparable `data.sequence`; `data.ttlMs` overrides the TTL.
  *
  * Jobs track each id's latest event plus a {@link JOB_RETENTION_MS} exit
- * tombstone so out-of-order events cannot resurrect a job; `env.activeJobs`
- * rebuilds from tracking per accepted event while keeping the newest
+ * tombstone so explicitly older sequenced events cannot resurrect a job; `env.activeJobs`
+ * rebuilds from tracking per accepted event while keeping that
  * event's source/ttl/observedAt. `apply` deep-clones input, queues
  * reentrant calls, and emits one fixed snapshot cloned per listener —
  * listener exceptions are isolated and cannot starve the queue.
@@ -37,19 +39,16 @@ export class StateStore {
   private readonly seenIds = new Set<string>();
   private readonly seenOrder: string[] = [];
   private readonly jobs = new Map<string, JobTrack>();
-  private readonly queue: { signal: Signal; afterApply?: () => void }[] = [];
-  /** `signal.at` of the last accepted non-unknown `env.activeJobs` replacement. */
-  private jobSnapshotAt = Number.NEGATIVE_INFINITY;
   /**
-   * `signal.at` of the last accepted `env.activeJobs` report — EVERY accepted
-   * one advances it, `unknown` included; orders reports only, never job events.
+   * Comparable sequence watermarks for fact reports, including unknown
+   * reports; sources without sequences are ordered by receipt.
    */
-  private jobsFactAt = Number.NEGATIVE_INFINITY;
+  private readonly ordering = new FactOrdering();
   /**
-   * Newest `signal.at` of an accepted job event or non-unknown report —
-   * metadata ordering for {@link commitJobs} only; it never rejects input.
+   * Serialized signal intake preserves receipt order during reentrant
+   * subscriber and callback activity.
    */
-  private jobObservedAt = Number.NEGATIVE_INFINITY;
+  private readonly queue: { signal: Signal; afterApply?: (result: ApplyResult) => void }[] = [];
   private processing = false;
   /**
    * `monotonicClock` (never `Date.now`) drives job-tombstone retention.
@@ -75,7 +74,7 @@ export class StateStore {
    * fixed snapshots, then runs `afterApply` (even on a duplicate); its
    * errors are collected and the first rethrown after the queue drains.
    */
-  apply(signal: Signal, afterApply?: () => void): void {
+  apply(signal: Signal, afterApply?: (result: ApplyResult) => void): void {
     this.queue.push({ signal: structuredClone(signal), afterApply });
     if (this.processing) return;
     this.processing = true;
@@ -83,13 +82,15 @@ export class StateStore {
     try {
       let next = this.queue.shift();
       while (next !== undefined) {
-        if (!this.isDuplicate(next.signal.id)) {
-          this.applyOne(next.signal);
-          this.emit(next.signal);
-        }
+        const result = this.isDuplicate(next.signal.id)
+          ? 'duplicate'
+          : this.ordering.earlier(next.signal) || !this.applyOne(next.signal)
+            ? 'older'
+            : 'applied';
+        if (result === 'applied') this.emit(next.signal);
         if (next.afterApply !== undefined) {
           try {
-            next.afterApply();
+            next.afterApply(result);
           } catch (e) {
             errors.push(e);
           }
@@ -113,8 +114,7 @@ export class StateStore {
     this.listeners.add(listener);
     return () => this.listeners.delete(listener);
   }
-  private applyOne(s: Signal): void {
-    this.updateSource(s);
+  private applyOne(s: Signal): boolean {
     const d = s.data;
     switch (s.kind) {
       case 'app.activated':
@@ -128,10 +128,10 @@ export class StateStore {
         noteFile(this.state, s, this.defaultTtlMs);
         break;
       case 'job.started':
-        this.noteJobStart(s);
+        if (!this.noteJobStart(s)) return false;
         break;
       case 'job.exited':
-        this.noteJobExit(s);
+        if (!this.noteJobExit(s)) return false;
         break;
       case 'agent.status':
         if (typeof d.activity === 'string' && ACTIVITIES.has(d.activity)) {
@@ -144,6 +144,8 @@ export class StateStore {
       default:
         break;
     }
+    this.updateSource(s);
+    return true;
   }
   private isDuplicate(id: string): boolean {
     if (this.seenIds.has(id)) return true;
@@ -154,7 +156,6 @@ export class StateStore {
     }
     return false;
   }
-
   /**
    * One fixed snapshot per applied signal, cloned per listener so nobody can
    * corrupt another listener or the store. The listener set is iterated as
@@ -177,7 +178,6 @@ export class StateStore {
   private setFact<T>(fact: Fact<T>, value: T, signal: Signal): void {
     // Only a real (non-unknown) observation sets a freshness baseline: a
     // delayed first sample with at < constructor clock is still accepted.
-    if (fact.status !== 'unknown' && signal.at < fact.observedAt) return;
     fact.value = value;
     fact.status = 'ok';
     fact.source = signal.source;
@@ -193,38 +193,35 @@ export class StateStore {
   private pruneJobs(): void {
     const now = this.monotonic();
     for (const [id, track] of this.jobs) {
-      if (track.exited && now - track.receivedAt >= StateStore.JOB_RETENTION_MS) this.jobs.delete(id);
+      if (track.exited && now - track.receivedAt >= StateStore.JOB_RETENTION_MS) {
+        this.jobs.delete(id);
+        this.ordering.forgetJob(id);
+      }
     }
   }
 
   /**
    * Rebuilds `env.activeJobs` from tracking after an accepted job event.
-   * An older (but still accepted) event updates the value yet keeps the
-   * newest observation's source/ttl/observedAt metadata — freshness is
-   * judged against {@link jobObservedAt}, never reset by fact status.
+   * Each accepted event supplies the observation's source/ttl/observedAt;
+   * its wall timestamp does not order the observations.
    */
   private commitJobs(signal: Signal): void {
     const fact = this.state.env.activeJobs;
-    const newest = signal.at >= this.jobObservedAt;
     fact.value = [...this.jobs.values()].flatMap((track) => (track.exited || !track.job ? [] : [track.job]));
     fact.status = 'ok';
-    if (newest) {
-      fact.source = signal.source;
-      fact.observedAt = signal.at;
-      fact.ttlMs = ttlOf(signal.data.ttlMs, this.defaultTtlMs);
-      this.jobObservedAt = signal.at;
-    }
+    fact.source = signal.source;
+    fact.observedAt = signal.at;
+    fact.ttlMs = ttlOf(signal.data.ttlMs, this.defaultTtlMs);
   }
 
-  private noteJobStart(signal: Signal): void {
+  private noteJobStart(signal: Signal): boolean {
     this.pruneJobs();
     const id = this.jobId(signal);
-    const track = this.jobs.get(id);
-    // Older input is ignored, and at an equal timestamp the exit tombstone
-    // wins — only a genuinely newer start may reuse the id.
-    if (track && signal.at <= track.lastEventAt) return;
-    // pre-snapshot starts are ignored — the replacement answered for that time
-    if (signal.at < this.jobSnapshotAt) return;
+    // Explicitly earlier comparable input is ignored; without a sequence
+    // a later-received start may reuse the id.
+    if (this.ordering.earlierJob(signal)) return false;
+    // Explicitly pre-snapshot starts are ignored when their sequences are comparable.
+    if (this.ordering.earlierSnapshot(signal)) return false;
     const job: JobSummary = {
       id,
       startedAt: num(signal.data.startedAt) ?? signal.at,
@@ -233,18 +230,26 @@ export class StateStore {
     if (typeof signal.data.command === 'string') job.command = signal.data.command;
     const pid = num(signal.data.pid);
     if (pid !== undefined) job.pid = pid;
-    this.jobs.set(id, { lastEventAt: signal.at, exited: false, receivedAt: this.monotonic(), job });
+    this.jobs.set(id, {
+      order: jobOrder(signal),
+      exited: false,
+      receivedAt: this.monotonic(),
+      job,
+    });
+    this.ordering.recordJob(signal);
     this.commitJobs(signal);
+    return true;
   }
 
-  private noteJobExit(signal: Signal): void {
+  private noteJobExit(signal: Signal): boolean {
     this.pruneJobs();
     const id = this.jobId(signal);
-    const track = this.jobs.get(id);
-    // Exit wins equal timestamps over start; only an older exit is ignored.
-    if (track && signal.at < track.lastEventAt) return;
-    this.jobs.set(id, { lastEventAt: signal.at, exited: true, receivedAt: this.monotonic() });
+    // Only an explicitly earlier comparable exit is ignored.
+    if (this.ordering.earlierJob(signal) || this.ordering.earlierSnapshot(signal)) return false;
+    this.jobs.set(id, { order: jobOrder(signal), exited: true, receivedAt: this.monotonic() });
+    this.ordering.recordJob(signal);
     this.commitJobs(signal);
+    return true;
   }
 
   private applyFactUpdate(signal: Signal): void {
@@ -262,17 +267,15 @@ export class StateStore {
       return;
     const fact = factAt(this.state, path);
     if (path === 'env.activeJobs') {
-      // A report older than the newest accepted one is dropped before ANY
-      // mutation — fact, tracking, tombstones and the watermark untouched.
-      if (signal.at < this.jobsFactAt) return;
-      this.jobsFactAt = signal.at;
+      // Explicitly earlier comparable reports are dropped before ANY
+      // mutation by FactOrdering — fact, tracking and tombstones stay untouched.
       // An unknown report marks ONLY the status — value, provenance,
       // freshness, jobs and tombstones are all preserved.
       if (status === 'unknown') {
         fact.status = 'unknown';
         return;
       }
-    } else if (fact.status !== 'unknown' && signal.at < fact.observedAt) return;
+    }
     fact.value = value;
     fact.status = (status as FactStatus | undefined) ?? 'ok';
     fact.source = signal.source;
@@ -283,17 +286,15 @@ export class StateStore {
       else this.state.self.body.disks.unavailableMounts = unavailable as string[];
     }
     if (path === 'env.activeJobs') {
-      this.jobSnapshotAt = signal.at;
-      this.jobObservedAt = Math.max(this.jobObservedAt, signal.at);
+      this.ordering.snapshot(signal);
       this.pruneJobs();
-      mergeJobs(this.jobs, fact, value, signal.at, this.monotonic);
+      mergeJobs(this.jobs, fact, value, signal, this.monotonic);
     }
   }
 
   private updateSource(signal: Signal): void {
+    if (signal.data.preserveSourceStatus === true) return;
     const sources = this.state.observation.sources;
-    const cur = Object.hasOwn(sources, signal.source.id) ? sources[signal.source.id] : undefined;
-    if (cur && signal.at < cur.lastSignalAt) return;
     sources[signal.source.id] = sourceObservation(signal);
   }
 }

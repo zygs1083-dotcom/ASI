@@ -2,11 +2,21 @@ import type { Fact, JobSummary, SenseState, Signal } from '@asi/sense-types';
 import { num, ttlOf } from './facts.ts';
 
 const pathCounts = new WeakMap<object, number>();
+export type JobOrder = { source: string; sequence: number };
+export function jobOrder(signal: Signal): JobOrder | undefined {
+  const sequence = signal.data.sequence;
+  return typeof sequence === 'number' && Number.isSafeInteger(sequence)
+    ? { source: signal.source.id, sequence }
+    : undefined;
+}
+export function earlierJob(a: JobOrder | undefined, b: JobOrder | undefined): boolean {
+  return a !== undefined && b !== undefined && a.source === b.source && a.sequence < b.sequence;
+}
 
 /** Per-job event tracking: jobs are independent even inside one aggregate fact. */
 export interface JobTrack {
-  /** Latest accepted event time for this job; older/same-time input is ignored. */
-  lastEventAt: number;
+  /** Comparable sequence of the latest accepted observation, when available. */
+  order?: JobOrder;
   /** True once `job.exited` landed — an exit tombstone that outlives the value entry. */
   exited: boolean;
   /** Store-clock receipt of the latest accepted event (tombstone retention). */
@@ -23,7 +33,6 @@ export function noteFile(state: SenseState, signal: Signal, defaultTtlMs: number
       ? fact.value
       : Object.assign(Object.create(null), fact.value);
   const entry = map[path];
-  if (entry && signal.at < entry.lastChange) return;
   if (entry) delete map[path];
   let count = pathCounts.get(map) ?? Object.keys(map).length;
   if (!entry) count++;
@@ -37,11 +46,10 @@ export function noteFile(state: SenseState, signal: Signal, defaultTtlMs: number
     lastChange: signal.at,
     changes: (entry?.changes ?? 0) + (c !== undefined && c > 0 ? Math.floor(c) : 1),
   };
-  const observedAt = fact.status === 'unknown' ? signal.at : Math.max(fact.observedAt, signal.at);
   fact.value = map;
   fact.status = 'ok';
   fact.source = signal.source;
-  fact.observedAt = observedAt;
+  fact.observedAt = signal.at;
   fact.ttlMs = ttlOf(signal.data.ttlMs, defaultTtlMs);
 }
 
@@ -49,23 +57,23 @@ export function mergeJobs(
   jobs: Map<string, JobTrack>,
   fact: Fact<unknown>,
   value: unknown,
-  at: number,
+  signal: Signal,
   monotonic: () => number,
 ): void {
-  // Merge per job id, newer event wins: a report clears running tracks
-  // only at or below `at`, seeds listed jobs, rebuilds the value from
+  // Merge per job id: a report clears running tracks unless their comparable
+  // sequence is newer, seeds listed jobs, and rebuilds the value from
   // tracking; `null` survives only if no newer running job does.
   for (const [id, track] of jobs) {
-    if (!track.exited && track.lastEventAt <= at) jobs.delete(id);
+    if (!track.exited && !earlierJob(jobOrder(signal), track.order)) jobs.delete(id);
   }
   if (Array.isArray(value)) {
     for (const j of value as JobSummary[]) {
       if (!j || typeof j !== 'object' || typeof j.id !== 'string') continue;
       const track = jobs.get(j.id);
-      if (track && track.lastEventAt > at) continue; // a newer event wins
+      if (track && earlierJob(jobOrder(signal), track.order)) continue; // a newer event wins
       const running = j.status !== 'exited';
       jobs.set(j.id, {
-        lastEventAt: at,
+        order: jobOrder(signal),
         exited: !running,
         receivedAt: monotonic(),
         ...(running ? { job: j } : {}),

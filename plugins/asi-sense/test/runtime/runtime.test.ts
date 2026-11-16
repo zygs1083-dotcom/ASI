@@ -109,6 +109,7 @@ function harness(savedSettings?: string) {
       file(event);
       await vi.advanceTimersByTimeAsync(0);
     },
+    fileRaw: (event: FileChange) => file(event),
     failSave: (value: boolean) => {
       failSave = value;
     },
@@ -473,6 +474,42 @@ describe('host runtime', () => {
     await vi.advanceTimersByTimeAsync(0);
     expect(h.runtime.events().filter((event) => event.kind === 'file.changed')).toHaveLength(26);
     expect(h.runtime.events().filter((event) => event.kind === 'file.burst')).toHaveLength(0);
+    await h.runtime.stop();
+  });
+
+  it('preserves same-root same-millisecond deletions while pairing overlapping copies', async () => {
+    const h = harness();
+    const watches = new Map<string, (event: FileChange) => void>();
+    h.ports.files.watch = (path, cb) => {
+      watches.set(path, cb);
+      return {
+        close: () => {
+          watches.delete(path);
+        },
+      };
+    };
+    await h.runtime.start();
+    await h.runtime.tools.envWatch({
+      action: 'add',
+      rule: { id: 'nested', match: { kind: 'file.changed', subject: '/workspace/src/**' }, level: 'context' },
+    });
+    const event: FileChange = { path: '/workspace/src/synthetic.ts', change: 'delete', at: Date.now() };
+    watches.get('/workspace/')?.(event);
+    watches.get('/workspace/')?.(event);
+    watches.get('/workspace/src/')?.(event);
+    watches.get('/workspace/src/')?.(event);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(h.runtime.events().filter((item) => item.kind === 'file.changed')).toHaveLength(2);
+    expect(h.runtime.state().env.watchedPaths.value?.[event.path]?.changes).toBe(2);
+    await h.runtime.stop();
+  });
+
+  it('counts same-root same-millisecond deletions toward the burst threshold', async () => {
+    const h = harness();
+    await h.runtime.start();
+    for (let i = 0; i < 51; i++) h.fileRaw({ path: '/workspace/synthetic.ts', change: 'delete', at: Date.now() });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(h.runtime.events().find((item) => item.kind === 'file.burst')?.detail?.deleted).toBe(51);
     await h.runtime.stop();
   });
 
