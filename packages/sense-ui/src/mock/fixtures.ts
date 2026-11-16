@@ -8,6 +8,7 @@ import type {
   MetricKey,
   MetricPoint,
   SenseEvent,
+  SensePanelModel,
   SenseRule,
   SenseState,
   Signal,
@@ -191,6 +192,24 @@ export function makeEvent(
     reason: '默认记录规则',
     cause: 'user',
     ...rest,
+  }
+}
+
+/** 面板模型：默认空事件、默认规则、now=T0、默认历史与 insight。 */
+export function panelModel(
+  state: SenseState,
+  over: Partial<SensePanelModel> = {},
+): SensePanelModel {
+  return {
+    state,
+    events: over.events ?? [],
+    rules: over.rules ?? makeRules(),
+    paused: false,
+    sendTitles: true,
+    now: T0,
+    history: makeHistory(),
+    insights: makeInsights(),
+    ...over,
   }
 }
 

@@ -1,6 +1,6 @@
 /** 八个演示场景，供预览与 e2e 截图使用。 */
 
-import type { SenseEvent, SensePanelModel, SenseState } from '../view-model'
+import type { SenseEvent, SensePanelModel } from '../view-model'
 import {
   T0,
   denied,
@@ -10,10 +10,11 @@ import {
   makeEvent,
   makeHistory,
   makeInsights,
-  makeRules,
   makeState,
+  panelModel,
   series,
 } from './fixtures'
+import { contextAlmostFull, diskPartial, tokenFallback } from './scenarios-extra'
 
 export const SCENARIOS = [
   'healthy',
@@ -30,20 +31,6 @@ export const SCENARIOS = [
 
 export type ScenarioName = (typeof SCENARIOS)[number]
 
-function model(state: SenseState, over: Partial<SensePanelModel> = {}): SensePanelModel {
-  return {
-    state,
-    events: over.events ?? [],
-    rules: over.rules ?? makeRules(),
-    paused: false,
-    sendTitles: true,
-    now: T0,
-    history: makeHistory(),
-    insights: makeInsights(),
-    ...over,
-  }
-}
-
 function healthy(): SensePanelModel {
   const events = [
     makeEvent(1, { level: 'context', reason: '命中保存合并', ruleName: 'src 下文件保存' }),
@@ -51,7 +38,7 @@ function healthy(): SensePanelModel {
     makeEvent(3, { cause: 'agent', reason: 'Agent 工具写入', level: 'record' }),
     makeEvent(4, { level: 'wake', reason: '任务非 0 退出', ruleName: '测试失败时唤醒' }),
   ]
-  return model(makeState(), { events })
+  return panelModel(makeState(), { events })
 }
 
 function memoryPressure(): SensePanelModel {
@@ -60,23 +47,8 @@ function memoryPressure(): SensePanelModel {
     { total: 32e9, used: 29.1e9, pressure: 'warn', swapUsed: 3.2e9 },
     { api: 'vm_stat' },
   )
-  return model(makeState({ self: { ...makeState().self, body } }), {
+  return panelModel(makeState({ self: { ...makeState().self, body } }), {
     history: makeHistory({ memory: series(60, 5_000, (i) => 0.82 + 0.09 * Math.sin(i / 8)) }),
-  })
-}
-
-function contextAlmostFull(): SensePanelModel {
-  const body = makeBody()
-  body.tokens = fact({
-    contextWindow: 128_000,
-    contextWindowSource: 'catalog',
-    contextUsed: 118_500,
-    contextProjected: 124_000,
-    sessionUsage: { input: 410_000, output: 38_000, cacheRead: 290_000, cacheWrite: 21_000 },
-    compressionThreshold: 120_000,
-  })
-  return model(makeState({ self: { ...makeState().self, body } }), {
-    history: makeHistory({ tokens: series(60, 5_000, (i) => 90_000 + i * 470) }),
   })
 }
 
@@ -99,7 +71,7 @@ function permissionDenied(): SensePanelModel {
     lastSignalAt: T0 - 180_000,
     error: 'AX 订阅失败',
   }
-  return model(state)
+  return panelModel(state)
 }
 
 function busyEvents(): SensePanelModel {
@@ -122,13 +94,13 @@ function busyEvents(): SensePanelModel {
     if (n % 5 === 0) over.cause = 'agent'
     return makeEvent(n, over)
   })
-  return model(makeState(), { events })
+  return panelModel(makeState(), { events })
 }
 
 function desktopNoBattery(): SensePanelModel {
   const body = makeBody()
   body.battery = fact(null)
-  return model(makeState({ self: { ...makeState().self, body } }))
+  return panelModel(makeState({ self: { ...makeState().self, body } }))
 }
 
 /**
@@ -136,7 +108,7 @@ function desktopNoBattery(): SensePanelModel {
  * 因此趋势线不画 band（不虚构），来源标注只列 floor/rate。
  */
 function learning(): SensePanelModel {
-  return model(makeState(), {
+  return panelModel(makeState(), {
     learning: { status: 'learning', collectedMs: 0.37 * 86_400_000, targetMs: 86_400_000 },
     insights: {
       cpu: { sources: ['floor', 'rate'], triggered: [] },
@@ -192,7 +164,7 @@ function rapidChange(): SensePanelModel {
     }),
     makeEvent(4),
   ]
-  return model(makeState(), {
+  return panelModel(makeState(), {
     events,
     insights: makeInsights({
       'disk:/': {
@@ -266,45 +238,6 @@ const BUILDERS: Record<ScenarioName, () => SensePanelModel> = {
   'rapid-change': rapidChange,
   'token-fallback': tokenFallback,
   'disk-partial': diskPartial,
-}
-
-/** 卷级新鲜度混杂：根卷读数过期（保留值灰显）、/data 新鲜、网络盘挂起无法读取。 */
-function diskPartial(): SensePanelModel {
-  const state = makeState()
-  state.self.body.disks = {
-    ...fact(
-      [
-        {
-          mount: '/',
-          total: 460e9,
-          free: 175e9,
-          observedAt: T0 - 90_000,
-          ttlMs: 5_000,
-        },
-        { mount: '/data', total: 200e9, free: 160e9 },
-      ],
-      { api: 'diskstat' },
-    ),
-    unavailableMounts: ['/Volumes/network'],
-  }
-  return model(state, {
-    history: makeHistory({
-      disks: {
-        '/': series(60, 5_000, (i) => 0.62 + 0.005 * Math.sin(i / 20)),
-        '/data': series(60, 5_000, (i) => 0.2 + 0.004 * Math.sin(i / 20)),
-      },
-    }),
-  })
-}
-
-/** 上下文窗口容量来自回退估值：环/余量降饱和为「容量未确认」，无告警。 */
-function tokenFallback(): SensePanelModel {
-  const m = contextAlmostFull()
-  m.state.self.body.tokens = fact({
-    ...m.state.self.body.tokens.value!,
-    contextWindowSource: 'fallback',
-  })
-  return m
 }
 
 export function makeScenario(name: ScenarioName): SensePanelModel {
