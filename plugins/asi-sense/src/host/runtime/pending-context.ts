@@ -24,19 +24,27 @@ export class PendingContext {
   private readonly recentIds: { id: string; ids: string[] }[] = [];
   private transfers = Promise.resolve();
 
-  constructor(private readonly mark: (id: string, reason?: string, level?: DeliveryLevel) => void) {}
+  constructor(
+    private readonly mark: (id: string, reason?: string, level?: DeliveryLevel) => void,
+    private readonly retained: (id: string) => boolean = () => true,
+  ) {}
 
   stage(intent: DeliveryIntent): void {
     if (!intent.deliveryId) return;
     const key = JSON.stringify([intent.sessionId, intent.deliveryId]);
-    this.staged.set(
-      key,
-      injectOutcomes(intent).map((outcome) => ({
-        ...outcome,
-        ids: outcome.ids.flatMap((id) => this.merged.get(id) ?? [id]),
-      })),
-    );
-    if (this.staged.size > 1024) this.staged.delete(this.staged.keys().next().value as string);
+    const outcomes = injectOutcomes(intent);
+    for (const outcome of outcomes) {
+      outcome.ids = outcome.ids.flatMap((id) => this.merged.get(id) ?? [id]).filter(this.retained);
+    }
+    if (outcomes.some((outcome) => outcome.ids.length)) this.staged.set(key, outcomes);
+  }
+
+  forget(id: string | undefined): void {
+    if (id === undefined) return;
+    for (const [key, outcomes] of this.staged) {
+      for (const outcome of outcomes) outcome.ids = outcome.ids.filter((item) => item !== id);
+      if (outcomes.every((outcome) => !outcome.ids.length)) this.staged.delete(key);
+    }
   }
 
   committed(session: string, id: string, pipeline: AttentionPipeline): void {

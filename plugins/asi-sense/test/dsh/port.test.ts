@@ -8,6 +8,7 @@ import { createDshPort } from '../../src/host/dsh/port.ts';
 import { projectEvents } from '../../src/host/presenter/project.ts';
 import { RuntimeAttention } from '../../src/host/runtime/attention.ts';
 import { FactExpiry } from '../../src/host/runtime/expiry.ts';
+import { PendingContext } from '../../src/host/runtime/pending-context.ts';
 import type { AgentEvent } from '../../src/host/runtime/ports.ts';
 
 const update = {
@@ -585,5 +586,20 @@ describe('uncommitted context routing', () => {
     const event = h.a.session.append('user/message', message, { surfaceOp: 'append' });
     h.ctx.emit('session/event', h.a.session, event);
     expect(h.attention.events().every((item) => item.level === 'context')).toBe(true);
+  });
+
+  it('retains an outstanding outcome across more than 1024 unconfirmed transfers', async () => {
+    const h = await routing(true);
+    const mark = vi.fn();
+    const pending = new PendingContext(mark);
+    for (let i = 0; i < 1025; i++) {
+      pending.stage({ kind: 'inject', sessionId: `session-${i}`, deliveryId: `delivery-${i}`, update });
+    }
+    pending.committed('session-0', 'asi-sense:delivery-0', h.attention.pipeline);
+    expect(mark).toHaveBeenCalledWith('signal', undefined, 'context');
+    mark.mockClear();
+    pending.forget('signal');
+    pending.committed('session-1', 'asi-sense:delivery-1', h.attention.pipeline);
+    expect(mark).not.toHaveBeenCalled();
   });
 });

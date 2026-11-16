@@ -590,6 +590,7 @@ Agent-added rules are activated before saving, and failed activations are not sa
 ## DSH bundle fix-3 regressions
 
 1. Cross-session budget: `rechecks a cancelled budget downgrade for the target session after dispose=%s`; `restores all kinds of a budget-suppressed group as one target wake`; `keeps the budget downgrade when a disposed session is restored under the same id`.
-2. Deferred outcomes: `records confirmed inject outcomes, not cancelled or transferred attempts`; `confirms a transferred wake against an already-spent target budget`; `confirms every retained no-session context event in a merged inject`.
+2. Deferred outcomes: `records confirmed inject outcomes, not cancelled or transferred attempts`; `confirms a transferred wake against an already-spent target budget`; `confirms every retained no-session context event in a merged inject`; `retains an outstanding outcome across more than 1024 unconfirmed transfers`.
 
 All tests are in `test/dsh/port.test.ts`. A staged inject remains unreported as delivered until the adapter confirms its session message; confirmation publishes the actual outcome for all retained merged events.
+Outstanding attempt identities remain while their events are visible; repeated abandoned transfers can accumulate until those events leave the 200-entry log.

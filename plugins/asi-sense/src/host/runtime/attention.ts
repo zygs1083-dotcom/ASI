@@ -34,7 +34,7 @@ export class RuntimeAttention {
   readonly pipeline: AttentionPipeline;
   private readonly entries: EventLog = [];
   private batchEntries?: EventLog;
-  private readonly pending = new PendingContext((...args) => this.mark(...args));
+  private readonly pending = new PendingContext(this.mark.bind(this), (id) => this.entries.some((e) => e.id === id));
   private readonly sessions = new Map<string, SessionContext>();
   private readonly recent: string[] = [];
   private readonly inflight = new Set<Promise<void>>();
@@ -287,7 +287,7 @@ export class RuntimeAttention {
             },
           }),
     });
-    if (this.entries.length > 200) this.entries.shift();
+    if (this.entries.length > 200) this.pending.forget(this.entries.shift()?.id);
     this.changed();
   }
   private mark(id: string, reason?: string, level?: DeliveryLevel): void {
