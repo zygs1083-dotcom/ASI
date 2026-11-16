@@ -1,4 +1,4 @@
-import { effectiveDisks } from '@asi/sense-types'
+import { effectiveDisks } from '../disk-health'
 import type { ComponentProps } from 'react'
 import { useClock } from '../clock'
 import type { DisksFact } from '../view-model'

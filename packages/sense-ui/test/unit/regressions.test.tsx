@@ -34,6 +34,9 @@ function renderPanel(model: SensePanelModel, over: Partial<SensePanelProps> = {}
     onRevertTuning: vi.fn(),
     onLockParam: vi.fn(),
     onFeedback: vi.fn(),
+    onResumeTuning: vi.fn(async () => {}),
+    onResetTuning: vi.fn(async () => {}),
+    onAcceptRebaseline: vi.fn(async (_id: string) => {}),
     ...over,
   }
   const view = render(<SensePanel {...props} />)
@@ -433,7 +436,7 @@ describe('contextWindow 回退估值', () => {
 })
 
 describe('过期事实禁用当前推算', () => {
-  const staleOf = <T,>(value: T) => fact(value, { status: 'ok', ageMs: 120_000, ttlMs: 5_000 })
+  const staleOf = <T,>(value: T) => fact(value, { status: 'stale', ageMs: 120_000, ttlMs: 5_000 })
 
   it('stale 保留值标「上次读数」+ 已过期，禁用全部当前推算与明细 insight', async () => {
     const state = makeState()
@@ -441,7 +444,7 @@ describe('过期事实禁用当前推算', () => {
     state.self.body.battery = staleOf(state.self.body.battery.value!)
     state.self.body.cpu = fact(
       { usage: 0.3, perCore: [0.3], load1: 1, load5: 1, load15: 1 },
-      { status: 'ok', ageMs: 120_000, ttlMs: 5_000 },
+      { status: 'stale', ageMs: 120_000, ttlMs: 5_000 },
     )
     renderPanel({
       ...makeScenario('healthy'),
@@ -476,11 +479,11 @@ describe('过期事实禁用当前推算', () => {
         compressionThreshold: 115_200,
         contextGrowthPerMinute: 720,
       },
-      { status: 'ok', ageMs: 120_000, ttlMs: 5_000 },
+      { status: 'stale', ageMs: 120_000, ttlMs: 5_000 },
     )
     state.self.body.battery = fact(
       { percent: 12, charging: false, minutesLeft: 45 },
-      { status: 'ok', ageMs: 120_000, ttlMs: 5_000 },
+      { status: 'stale', ageMs: 120_000, ttlMs: 5_000 },
     )
     renderPanel({
       ...makeScenario('healthy'),
@@ -660,9 +663,9 @@ describe('磁贴渲染隔离', () => {
     expect(memReads).toBe(memBase)
   })
 
-  it('CPU TTL 过期强制重渲并显示过期；过期年龄随时钟独立前进', async () => {
+  it('宿主将 CPU 标过期时重渲；过期年龄随时钟独立前进', async () => {
     const m = makeScenario('healthy')
-    // age 4s / ttl 5s：T0 时 ok，T0+2s 时过期
+    // age 4s / ttl 5s：T0 时 ok，新帧由宿主标记过期
     m.state.self.body.cpu = fact(
       { usage: 0.3, perCore: [0.3, 0.4], load1: 1, load5: 1, load15: 1 },
       { ageMs: 4_000, ttlMs: 5_000 },
@@ -672,14 +675,17 @@ describe('磁贴渲染隔离', () => {
     const rr = (patch: Partial<SensePanelModel>) =>
       view.rerender(<SensePanel {...props} model={{ ...m, ...patch }} />)
     const base = spy.mock.calls.length
-    rr({ now: m.now + 2_000 })
+    const state = { ...m.state, self: { ...m.state.self, body: {
+      ...m.state.self.body, cpu: { ...m.state.self.body.cpu, status: 'stale' as const },
+    } } }
+    rr({ now: m.now + 2_000, state })
     expect(spy.mock.calls.length).toBeGreaterThan(base)
     const tile = document.querySelector('details[data-tile="cpu"]')!
     expect(tile.querySelector('summary')!.textContent).toContain('已过期')
     // 过期保留值：年龄随时钟前进，但不重渲整张卡（map 不再增长）
     const staleBase = spy.mock.calls.length
     expect(tile.querySelector('summary')!.textContent).toContain('6 秒前')
-    rr({ now: m.now + 3_000 })
+    rr({ now: m.now + 3_000, state })
     expect(tile.querySelector('summary')!.textContent).toContain('7 秒前')
     expect(spy.mock.calls.length).toBe(staleBase)
   })
@@ -800,7 +806,7 @@ describe('磁盘卷级新鲜度', () => {
   const partialDisks = () => ({
     ...disksFixture(
       [
-        { mount: '/', total: 460e9, free: 175e9, status: 'ok' as const, observedAt: T0 - 90_000, ttlMs: 5_000 },
+        { mount: '/', total: 460e9, free: 175e9, status: 'stale' as const, observedAt: T0 - 90_000, ttlMs: 5_000 },
         { mount: '/data', total: 200e9, free: 160e9 },
       ],
     ),
@@ -847,7 +853,7 @@ describe('磁盘卷级新鲜度', () => {
     const state = makeState()
     state.self.body.disks = disksFixture(
       [{ mount: '/', total: 460e9, free: 175e9 }],
-      { ageMs: 90_000, ttlMs: 5_000 },
+      { status: 'stale', ageMs: 90_000, ttlMs: 5_000 },
     )
     renderPanel({ ...makeScenario('healthy'), state })
     const summary = document.querySelector('details[data-tile="disks"] summary')!

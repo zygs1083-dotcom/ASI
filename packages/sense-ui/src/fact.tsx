@@ -1,5 +1,5 @@
 import { useMemo, type ReactNode } from 'react'
-import { effectiveDisks } from '@asi/sense-types'
+import { effectiveDisks } from './disk-health'
 import { useClock } from './clock'
 import { effectiveStatus } from './health'
 import { formatAge } from './format'

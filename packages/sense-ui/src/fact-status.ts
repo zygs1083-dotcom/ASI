@@ -1,13 +1,12 @@
-/** 事实有效状态与严重度聚合的纯函数；时间一律用传入的 now。 */
+/** 事实有效状态与严重度聚合的纯函数。 */
 
 import type { Fact, FactStatus, MetricInsight } from './view-model'
-import { factStatusAt } from '@asi/sense-types'
 
 export type Severity = 'good' | 'warn' | 'critical' | 'unknown'
 
-/** ok 但超过 TTL 视为 stale（由读取时计算）。 */
-export function effectiveStatus<T>(fact: Fact<T>, now: number): FactStatus {
-  return factStatusAt(fact, now)
+/** 状态由宿主或单调倒计时提供，不用墙钟重判。 */
+export function effectiveStatus<T>(fact: Fact<T>, _now: number): FactStatus {
+  return fact.status
 }
 
 export function isUsable<T>(fact: Fact<T>, now: number): boolean {

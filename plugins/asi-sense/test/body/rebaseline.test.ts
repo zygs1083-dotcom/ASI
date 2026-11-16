@@ -135,12 +135,30 @@ describe('user-confirmed rebaselining', () => {
         saved = data;
       },
     };
-    const baseline = new Baseline({ installedAt: MON10 - 2 * WEEK, timeZone: 'UTC', elapsedMs: 2 * WEEK });
+    const seed = new Baseline({ installedAt: MON10 - 2 * WEEK, timeZone: 'UTC', elapsedMs: 2 * WEEK });
     for (const week of [-2, -1]) {
-      for (let slot = 0; slot < 168; slot++) {
-        for (let i = 0; i < 4; i++) baseline.observe('cpu', 0.5, MON10 + week * WEEK + slot * hour + i);
-      }
+      for (let i = 0; i < 4; i++) seed.observe('cpu', 0.5, MON10 + week * WEEK + i);
     }
+    const snapshot = JSON.parse(seed.serialize()) as {
+      metrics: { cpu: ({ lastAt: number; dates: string[] } | null)[] };
+    };
+    const bucket = snapshot.metrics.cpu.find((entry) => entry !== null);
+    if (!bucket) throw new Error('missing seed bucket');
+    const localDate = (at: number) => {
+      const date = new Date(at);
+      return `${date.getUTCFullYear()}-${date.getUTCMonth() + 1}-${date.getUTCDate()}`;
+    };
+    for (let slot = 0; slot < 168; slot++) {
+      const at = MON10 + slot * hour;
+      const date = new Date(at);
+      snapshot.metrics.cpu[date.getUTCDay() * 24 + date.getUTCHours()] = {
+        ...bucket,
+        lastAt: at - WEEK + 3,
+        dates: [localDate(at - 2 * WEEK), localDate(at - WEEK)],
+      };
+    }
+    const baseline = Baseline.deserialize(JSON.stringify(snapshot), { timeZone: 'UTC' });
+    expect(baseline.restoreFailed).toBe(false);
     const tuner = new Tuner({}, { clock: () => mono, wallClock: () => wall });
     const monitor = new BodyMonitor({
       baseline,

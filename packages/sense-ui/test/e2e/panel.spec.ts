@@ -107,6 +107,11 @@ test.describe('场景 × 宽度 × 主题截图与无障碍', () => {
           await open(page, scenario, theme)
           await expectSectionsVisible(page)
           await expect(page.getByText(EXPECTED_COPY[scenario]).first()).toBeVisible()
+          if (scenario === 'permission-denied') {
+            const disks = tile(page, 'disks').locator('summary')
+            await expect(disks).toContainText('未知')
+            await expect(disks).not.toContainText('已过期')
+          }
           await expectNoOverflow(page)
           await axeCheck(page)
 

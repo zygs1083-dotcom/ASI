@@ -1,20 +1,25 @@
-import { useCallback, useState } from 'react'
+import { useCallback, useRef, useState } from 'react'
 import type { SensePanelProps } from './view-model'
 import { PauseIcon, ShieldIcon } from './icons'
 import { BodySection } from './sections/body'
 import { NowSection } from './sections/now'
 import { EventsSection } from './sections/events'
 import { RulesSection } from './sections/rules'
+import { useTuningOperations } from './sections/tuning-operation'
+import { useFreshModel } from './freshness'
+import rulesCss from './sections/rules.module.css'
 import css from './panel.module.css'
 
 /**
  * asi-sense 侧栏面板：纯 props 渲染。
- * 自身只持有：规则分区开合（默认收起）与「调整入口→调整日志」的内部联动，
+ * 自身持有：规则分区开合、危险调参操作状态与「调整入口→调整日志」的内部联动，
  * 不新增对外回调。
  */
 export function SensePanel(props: SensePanelProps) {
-  const { model } = props
+  const model = useFreshModel(props.model)
   const [rulesOpen, setRulesOpen] = useState(false)
+  const rulesSummary = useRef<HTMLElement>(null)
+  const operations = useTuningOperations(model)
   // 自增信号：每次点卡片「调整」+1，RulesSection 据此切到调整日志视图并聚焦
   const [tuningReq, setTuningReq] = useState(0)
   const openTuning = useCallback(() => {
@@ -37,6 +42,23 @@ export function SensePanel(props: SensePanelProps) {
           </span>
         )}
       </header>
+
+      <div className={css.notices}>
+        {Object.entries(operations.operations).map(([key, operation]) =>
+          (operation.phase === 'error' || operation.phase === 'unconfirmed') && (
+            <div key={key} className={rulesCss.notice} role="alert">
+              <span>{operation.label}{operation.phase === 'error' ? '失败，请重试' : '：未确认结果，请检查状态'}</span>
+              <button type="button" aria-label="关闭操作提示" onClick={(event) => {
+                const notice = event.currentTarget.parentElement
+                const neighbor = notice?.nextElementSibling ?? notice?.previousElementSibling
+                const target = neighbor?.querySelector('button') ?? rulesSummary.current
+                target?.focus()
+                operations.dismiss(key)
+              }}>关闭</button>
+            </div>
+          ),
+        )}
+      </div>
 
       <details open className={css.section}>
         <summary>身体</summary>
@@ -71,9 +93,9 @@ export function SensePanel(props: SensePanelProps) {
         className={css.section}
         onToggle={(e) => setRulesOpen(e.currentTarget.open)}
       >
-        <summary>规则</summary>
+        <summary ref={rulesSummary}>规则</summary>
         <div className={css.sectionBody}>
-          <RulesSection {...props} tuningReq={tuningReq} />
+          <RulesSection {...props} model={model} tuningReq={tuningReq} operations={operations} />
         </div>
       </details>
     </div>
