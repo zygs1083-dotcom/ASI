@@ -8,6 +8,7 @@ import { SessionId } from '@deepseek-ai/dsh-session';
 import type {} from '@deepseek-ai/dsh-session-projection';
 import type {} from '@deepseek-ai/dsh-token-meter';
 import type { ToolExecution } from '@deepseek-ai/dsh-tools';
+import { z } from 'zod';
 import type { DshPort, ToolEvent } from '../runtime/ports.ts';
 import { createDelivery } from './deliver.ts';
 import { type ActiveTool, JobEventCorrelator, mapToolEvent } from './events.ts';
@@ -15,11 +16,35 @@ import { tokenSnapshot } from './tokens.ts';
 
 const open = promisify(execFile);
 
-export function createDshPort(ctx: Context, sendTitles: () => boolean): DshPort {
+export function createDshPort(
+  ctx: Context,
+  sendTitles: () => boolean,
+): DshPort & {
+  onDeliveryCommitted(cb: (sessionId: string) => void): () => void;
+} {
   const resolve = (id: string): Agent | undefined => ctx.agents.get(SessionId(id));
   const activeTools = new Map<string, ActiveTool>();
+  const committed = new Set<(sessionId: string) => void>();
   const jobs = new JobEventCorrelator(activeTools);
-  const deliver = createDelivery(resolve, sendTitles);
+  const accepted = ctx.sessionProjections.register({
+    key: 'asiSenseDeliveries',
+    stateSchema: z.array(z.string()),
+    stateVersion: 1,
+    init: () => [],
+    apply: (ids, event) => {
+      const messages =
+        event.type === 'agent/inbox/spliced' ? event.data.inserted : event.type === 'user/message' ? [event.data] : [];
+      const added = messages.filter(
+        (message) => message.source.kind === 'environment' && message.id.startsWith('asi-sense:'),
+      );
+      return added.length ? [...ids, ...added.map((message) => message.id)] : ids;
+    },
+  });
+  const deliver = createDelivery(resolve, sendTitles, async (id, messageId) => {
+    const agent = resolve(id);
+    if (!agent) throw new Error('delivery session unavailable');
+    return (await accepted).stateOf(agent.session).includes(messageId);
+  });
   const warn = () => ctx.logger.warn('asi-sense event delivery failed');
   const call = <T>(cb: (event: T) => Promise<void>, event: T): void => {
     void cb(event).catch(warn);
@@ -39,6 +64,10 @@ export function createDshPort(ctx: Context, sendTitles: () => boolean): DshPort 
     );
   };
   return {
+    onDeliveryCommitted(cb) {
+      committed.add(cb);
+      return () => committed.delete(cb);
+    },
     onAgentEvent(cb) {
       const turns = new Map<string, { turn: number; user: boolean }>();
       const offCreated = ctx.on('agent/created', async ({ agent }) => {
@@ -47,9 +76,20 @@ export function createDshPort(ctx: Context, sendTitles: () => boolean): DshPort 
       });
       const offDisposed = ctx.on('agent/disposed', ({ agent }) => {
         turns.delete(agent.id);
+        deliver.clear(agent.id);
         call(cb, { type: 'disposed', sessionId: agent.id });
       });
+      const offSession = ctx.on('session/event', (session, event) => {
+        if (event.type === 'user/message' && event.data.source.kind === 'environment') {
+          deliver.acknowledge(session.id, event.data.id);
+          if (event.data.id.startsWith('asi-sense:')) {
+            for (const listener of committed) listener(session.id);
+          }
+        }
+      });
       const offStep = ctx.on('agent/pre-step', async (payload, next) => {
+        const decision = await next();
+        if (decision.kind === 'reject' || payload.signal.aborted) return decision;
         const prior = turns.get(payload.agent.id);
         const user =
           prior?.turn === payload.turn
@@ -61,7 +101,19 @@ export function createDshPort(ctx: Context, sendTitles: () => boolean): DshPort 
         } catch {
           warn();
         }
-        return next();
+        if (
+          payload.signal.aborted ||
+          (decision.messages.length === 0 && (payload.step === 1 || payload.messages.length > 0))
+        )
+          return decision;
+        try {
+          const messages = await deliver.messages(payload.agent.id);
+          if (payload.signal.aborted || messages.length === 0) return decision;
+          return { ...decision, messages: [...decision.messages, ...messages] };
+        } catch {
+          warn();
+          return decision;
+        }
       });
       const offStatus = ctx.on('agent/status', ({ agent, status }) => {
         if (status === 'idle') call(cb, { type: 'post-step', sessionId: agent.id });
@@ -70,6 +122,7 @@ export function createDshPort(ctx: Context, sendTitles: () => boolean): DshPort 
       return () => {
         offCreated();
         offDisposed();
+        offSession();
         offStep();
         offStatus();
         turns.clear();

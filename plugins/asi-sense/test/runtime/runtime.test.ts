@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import type { Body } from '@asi/sense-types';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { DeliveryFailure } from '../../src/host/attention/drain.ts';
 import { DEFAULT_RULES } from '../../src/host/attention/rules.ts';
 import { defaultBodyRules } from '../../src/host/body/index.ts';
 import { createSenseRuntime } from '../../src/host/runtime/index.ts';
@@ -134,6 +135,177 @@ function harness(savedSettings?: string, options: SenseOptions = {}) {
 }
 
 describe('host runtime', () => {
+  it('stops retrying after ten failures, reports degradation and recovers after a later delivery', async () => {
+    const h = harness();
+    let attempts = 0;
+    let failing = true;
+    h.ports.dsh.deliver = async () => {
+      attempts++;
+      if (failing) throw new Error('fixture failure');
+    };
+    await h.runtime.start();
+    await h.agent({ type: 'created', sessionId: 's' });
+    await h.agent({ type: 'pre-step', sessionId: 's', userInitiated: true });
+    await h.job({ type: 'exited', id: 'failed-job', exitCode: 1 });
+    await h.advance(2_000);
+    expect(attempts).toBe(1);
+    expect(h.runtime.state().observation.sources.delivery).toMatchObject({
+      status: 'unavailable',
+      error: '投递失败，正在重试（1 次）',
+    });
+    for (let i = 0; i < 9; i++) {
+      const delay = Math.min(1_000 * 2 ** i, 60_000);
+      await h.advance(delay - 1);
+      expect(attempts).toBe(i + 1);
+      await h.advance(1);
+      expect(attempts).toBe(i + 2);
+    }
+    expect(attempts).toBe(10);
+    expect(h.runtime.state().observation.sources.delivery).toMatchObject({
+      status: 'unavailable',
+      error: '投递失败，已暂停重试（10 次）',
+    });
+    await h.advance(120_000);
+    expect(attempts).toBe(10);
+    failing = false;
+    await h.job({ type: 'exited', id: 'later-job', exitCode: 1 });
+    await h.advance(2_000);
+    expect(attempts).toBe(11);
+    expect(h.runtime.state().observation.sources.delivery).toMatchObject({ status: 'ok' });
+    await h.runtime.stop();
+  });
+
+  it('resets the retry budget when the selected session changes', async () => {
+    const h = harness();
+    let attempts = 0;
+    h.ports.dsh.deliver = async () => {
+      attempts++;
+      throw new Error('fixture failure');
+    };
+    await h.runtime.start();
+    await h.agent({ type: 'created', sessionId: 'a' });
+    await h.agent({ type: 'created', sessionId: 'b' });
+    await h.agent({ type: 'pre-step', sessionId: 'a', userInitiated: true });
+    await h.job({ type: 'exited', id: 'failed-job', exitCode: 1 });
+    await h.advance(2_000);
+    await h.advance(1_000);
+    expect(attempts).toBe(2);
+    await h.agent({ type: 'pre-step', sessionId: 'b', userInitiated: true }).catch(() => {});
+    expect(attempts).toBe(3);
+    for (let i = 0; i < 9; i++) await h.advance(Math.min(1_000 * 2 ** i, 60_000));
+    expect(attempts).toBe(12);
+    expect(h.runtime.state().observation.sources.delivery).toMatchObject({
+      status: 'unavailable',
+      error: '投递失败，已暂停重试（10 次）',
+    });
+    await h.runtime.stop();
+  });
+
+  it('expires a retry after ten monotonic minutes even if fewer than ten attempts ran', async () => {
+    const h = harness();
+    let attempts = 0;
+    h.ports.dsh.deliver = async () => {
+      attempts++;
+      throw new Error('fixture failure');
+    };
+    await h.runtime.start();
+    await h.agent({ type: 'created', sessionId: 's' });
+    await h.agent({ type: 'pre-step', sessionId: 's' });
+    await h.job({ type: 'exited', id: 'failed-job', exitCode: 1 });
+    await h.advance(2_000);
+    await h.advance(600_000);
+    expect(attempts).toBe(1);
+    expect(h.runtime.state().observation.sources.delivery).toMatchObject({
+      status: 'unavailable',
+      error: '投递失败，已暂停重试（1 次）',
+    });
+    await h.runtime.stop();
+  });
+
+  it('records an unknown outcome without retrying it', async () => {
+    const h = harness();
+    let attempts = 0;
+    h.ports.dsh.deliver = async () => {
+      attempts++;
+      throw new DeliveryFailure('unknown', 0, new Error('fixture'));
+    };
+    await h.runtime.start();
+    await h.agent({ type: 'created', sessionId: 's' });
+    await h.agent({ type: 'pre-step', sessionId: 's' });
+    await h.job({ type: 'exited', id: 'failed-job', exitCode: 1 });
+    await h.advance(2_000);
+    await h.advance(120_000);
+    expect(attempts).toBe(1);
+    expect(h.runtime.events().some((event) => event.kind === 'delivery-unknown')).toBe(true);
+    expect(h.runtime.state().observation.sources.delivery).toMatchObject({
+      status: 'unavailable',
+      error: '投递结果未知，未重试',
+    });
+    await h.runtime.stop();
+  });
+
+  it('records an unknown in-flight outcome even when the selected session changes', async () => {
+    const h = harness();
+    let release!: () => void;
+    let entered!: () => void;
+    const pending = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const started = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    let attempts = 0;
+    h.ports.dsh.deliver = async () => {
+      attempts++;
+      entered();
+      await pending;
+      throw new DeliveryFailure('unknown', 0, new Error('fixture'));
+    };
+    await h.runtime.start();
+    await h.agent({ type: 'created', sessionId: 'a' });
+    await h.agent({ type: 'created', sessionId: 'b' });
+    await h.agent({ type: 'pre-step', sessionId: 'a' });
+    await h.job({ type: 'exited', id: 'completed-job', exitCode: 0 });
+    const old = h.agent({ type: 'pre-step', sessionId: 'a' }).catch(() => {});
+    await started;
+    const next = h.agent({ type: 'pre-step', sessionId: 'b' }).catch(() => {});
+    release();
+    await Promise.all([old, next]);
+    expect(attempts).toBe(1);
+    expect(h.runtime.events().some((event) => event.kind === 'delivery-unknown')).toBe(true);
+    expect(h.runtime.state().observation.sources.delivery?.status).toBe('unavailable');
+    await h.runtime.stop();
+  });
+
+  it('waits for a staged context message to commit before clearing degradation', async () => {
+    const h = harness();
+    let committed = (_sessionId: string) => {};
+    Object.assign(h.ports.dsh, {
+      onDeliveryCommitted: (cb: (sessionId: string) => void) => {
+        committed = cb;
+        return () => {};
+      },
+    });
+    let failing = true;
+    h.ports.dsh.deliver = async () => {
+      if (failing) throw new Error('fixture failure');
+    };
+    await h.runtime.start();
+    await h.agent({ type: 'created', sessionId: 's' });
+    await h.agent({ type: 'pre-step', sessionId: 's' });
+    await h.job({ type: 'exited', id: 'failed-job', exitCode: 1 });
+    await h.advance(2_000);
+    for (let i = 0; i < 9; i++) await h.advance(Math.min(1_000 * 2 ** i, 60_000));
+    failing = false;
+    await h.job({ type: 'exited', id: 'successful-job', exitCode: 0 });
+    await h.agent({ type: 'pre-step', sessionId: 's' });
+    expect(h.runtime.state().observation.sources.delivery?.status).toBe('unavailable');
+    committed('s');
+    await vi.advanceTimersByTimeAsync(0);
+    expect(h.runtime.state().observation.sources.delivery?.status).toBe('ok');
+    await h.runtime.stop();
+  });
+
   it('notifies once after a body sample commits battery and memory alerts', async () => {
     const h = harness();
     await h.runtime.start();

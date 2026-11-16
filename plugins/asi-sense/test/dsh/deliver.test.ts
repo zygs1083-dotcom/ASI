@@ -31,11 +31,19 @@ function intent(kind: 'inject' | 'followup' | 'send', deliveryId = 'one'): Deliv
 function fixture() {
   const agent = { inject: vi.fn(), followup: vi.fn(), send: vi.fn() };
   const getAgent = vi.fn((id: string) => (id === 'session-a' ? agent : undefined));
-  return { agent, getAgent, deliver: createDelivery(getAgent, () => true) };
+  return {
+    agent,
+    getAgent,
+    deliver: createDelivery(
+      getAgent,
+      () => true,
+      async () => false,
+    ),
+  };
 }
 
 describe('DSH environment delivery', () => {
-  it.each(['inject', 'followup', 'send'] as const)('uses the %s boundary with an environment message', async (kind) => {
+  it.each(['followup', 'send'] as const)('uses the %s boundary with an environment message', async (kind) => {
     const { agent, getAgent, deliver } = fixture();
     await deliver('session-a', intent(kind));
     expect(getAgent).toHaveBeenCalledWith('session-a');
@@ -51,6 +59,13 @@ describe('DSH environment delivery', () => {
       ],
     });
     if (kind === 'send') expect(call?.slice(1)).toEqual(['next-step', true]);
+  });
+
+  it('stages context for the current step without writing to the inbox', async () => {
+    const { agent, deliver } = fixture();
+    await deliver('session-a', intent('inject'));
+    expect(agent.inject).not.toHaveBeenCalled();
+    expect(await deliver.messages('session-a')).toMatchObject([{ source: { kind: 'environment' } }]);
   });
 
   it('rejects unknown or mismatched sessions rather than broadcasting', async () => {
@@ -70,11 +85,51 @@ describe('DSH environment delivery', () => {
     expect(agent.followup).toHaveBeenCalledTimes(2);
   });
 
+  it('reports an unknown outcome if acceptance cannot be checked after a throw', async () => {
+    const agent = {
+      inject: vi.fn(),
+      followup: vi.fn(() => {
+        throw new Error('after acceptance');
+      }),
+      send: vi.fn(),
+    };
+    const accepted = vi.fn().mockResolvedValueOnce(false).mockRejectedValueOnce(new Error('projection unavailable'));
+    const deliver = createDelivery(
+      () => agent,
+      () => true,
+      accepted,
+    );
+    await expect(deliver('session-a', intent('followup'))).rejects.toMatchObject({ kind: 'unknown' });
+    expect(agent.followup).toHaveBeenCalledTimes(1);
+  });
+
+  it('coalesces concurrent calls with the same delivery id', async () => {
+    let release!: () => void;
+    const barrier = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const agent = { inject: vi.fn(), followup: vi.fn(), send: vi.fn() };
+    const deliver = createDelivery(
+      () => agent,
+      () => true,
+      async () => {
+        await barrier;
+        return false;
+      },
+    );
+    const first = deliver('session-a', intent('followup'));
+    const second = deliver('session-a', intent('followup'));
+    release();
+    await Promise.all([first, second]);
+    expect(agent.followup).toHaveBeenCalledTimes(1);
+  });
+
   it('omits window events and their notes when titles are disabled', async () => {
     const agent = { inject: vi.fn(), followup: vi.fn(), send: vi.fn() };
     const deliver = createDelivery(
       () => agent,
       () => false,
+      async () => false,
     );
     const windowUpdate: EnvUpdate = {
       ...update,
@@ -95,6 +150,6 @@ describe('DSH environment delivery', () => {
       ],
     };
     await deliver('session-a', { ...intent('inject'), update: windowUpdate });
-    expect(JSON.stringify(agent.inject.mock.calls)).not.toContain('synthetic title');
+    expect(JSON.stringify(await deliver.messages('session-a'))).not.toContain('synthetic title');
   });
 });
