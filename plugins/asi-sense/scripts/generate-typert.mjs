@@ -1,4 +1,4 @@
-import { cp, mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
+import { cp, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -10,12 +10,22 @@ const protocol = dirname(fileURLToPath(import.meta.resolve('@deepseek-ai/dsh-typ
 const root = await mkdtemp(join(tmpdir(), 'asi-sense-typert-'));
 const staged = join(root, 'packages', 'asi-sense');
 const stagedProtocol = join(root, 'packages', 'typert-protocol');
+const manifest = JSON.parse(await readFile(join(pkg, 'package.json'), 'utf8'));
 
 try {
   await Promise.all([mkdir(staged, { recursive: true }), mkdir(stagedProtocol, { recursive: true })]);
   await Promise.all([
     cp(join(pkg, 'src'), join(staged, 'src'), { recursive: true }),
-    cp(join(pkg, 'package.json'), join(staged, 'package.json')),
+    writeFile(
+      join(staged, 'package.json'),
+      JSON.stringify({
+        ...manifest,
+        exports: {
+          ...manifest.exports,
+          '.': { ...manifest.exports['.'], types: './src/host/dsh/remote.ts' },
+        },
+      }),
+    ),
     cp(join(protocol, 'src'), join(stagedProtocol, 'src'), { recursive: true }),
     cp(join(protocol, 'package.json'), join(stagedProtocol, 'package.json')),
     cp(join(repo, 'tsconfig.base.json'), join(root, 'tsconfig.base.json')),
@@ -47,7 +57,7 @@ try {
       JSON.stringify({
         extends: '../../tsconfig.base.json',
         compilerOptions: { jsx: 'react-jsx', lib: ['ES2022', 'DOM', 'DOM.Iterable'], types: ['node'] },
-        include: ['src/host/dsh/index.ts', 'src/client/css.d.ts'],
+        files: ['src/host/dsh/remote.ts', 'src/host/dsh/wire-types.ts', 'src/client/css.d.ts'],
       }),
     ),
     writeFile(

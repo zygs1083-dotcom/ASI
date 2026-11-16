@@ -1,0 +1,93 @@
+import { randomUUID } from 'node:crypto';
+import { join } from 'node:path';
+import type { StoragePort } from '../runtime/ports.ts';
+
+interface StorageFile {
+  writeFile(value: string): Promise<void>;
+  sync(): Promise<void>;
+  close(): Promise<void>;
+}
+
+export interface StorageFileSystem {
+  mkdir(path: string, options: { recursive: true; mode: number }): Promise<unknown>;
+  open(path: string, flags: 'r' | 'wx', mode?: number): Promise<StorageFile>;
+  readFile(path: string, encoding: 'utf8'): Promise<string>;
+  rename(from: string, to: string): Promise<void>;
+  unlink(path: string): Promise<void>;
+}
+
+function missing(error: unknown): boolean {
+  return error instanceof Error && 'code' in error && error.code === 'ENOENT';
+}
+
+export class FileStoragePort implements StoragePort {
+  private tail = Promise.resolve();
+
+  constructor(
+    private readonly root: string,
+    private readonly fs: StorageFileSystem,
+    private readonly warn: () => void,
+  ) {}
+
+  private path(key: string): string {
+    if (!/^[a-z0-9][a-z0-9-]*$/u.test(key)) throw new TypeError('invalid storage key');
+    return join(this.root, `${key}.json`);
+  }
+
+  async load(key: string): Promise<string | undefined> {
+    const path = this.path(key);
+    await this.tail;
+    try {
+      return await this.fs.readFile(path, 'utf8');
+    } catch (error) {
+      if (missing(error)) return undefined;
+      throw error;
+    }
+  }
+
+  save(key: string, json: string): Promise<void> {
+    const write = this.tail.then(() => this.commit(key, json));
+    this.tail = write.catch(() => undefined);
+    return write;
+  }
+
+  private async commit(key: string, json: string): Promise<void> {
+    const target = this.path(key);
+    const temp = join(this.root, `.${key}.${randomUUID()}.tmp`);
+    let handle: StorageFile | undefined;
+    let created = false;
+    try {
+      await this.fs.mkdir(this.root, { recursive: true, mode: 0o700 });
+      handle = await this.fs.open(temp, 'wx', 0o600);
+      created = true;
+      await handle.writeFile(json);
+      await handle.sync();
+      await handle.close();
+      handle = undefined;
+      await this.fs.rename(temp, target);
+      created = false;
+    } catch (error) {
+      const failures: unknown[] = [error];
+      if (handle) await handle.close().catch((failure: unknown) => failures.push(failure));
+      if (created) {
+        await this.fs.unlink(temp).catch((failure: unknown) => {
+          if (!missing(failure)) failures.push(failure);
+        });
+      }
+      if (failures.length > 1) throw new AggregateError(failures, 'storage write and cleanup failed');
+      throw error;
+    }
+    try {
+      const directory = await this.fs.open(this.root, 'r');
+      try {
+        await directory.sync();
+      } finally {
+        await directory.close();
+      }
+    } catch {
+      await Promise.resolve()
+        .then(() => this.warn())
+        .catch(() => undefined);
+    }
+  }
+}
