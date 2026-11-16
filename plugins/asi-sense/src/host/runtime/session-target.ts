@@ -14,6 +14,11 @@ export function createSessionTarget(
   let notice = false;
   let unavailable = false;
   let active = false;
+  let loaded = false;
+  let applied = false;
+  let pendingClear = false;
+  let retryDelay = 1_000;
+  let timer: ReturnType<typeof setTimeout> | undefined;
   let off: (() => void) | undefined;
   let tail = Promise.resolve();
   const enqueue = (work: () => Promise<void>) => {
@@ -30,45 +35,42 @@ export function createSessionTarget(
     check();
     rows = next;
     lifecycle?.refreshed(rows);
-    unavailable = false;
   };
   const save = (id: string | undefined) => storage.save(key, JSON.stringify({ version: 1, sessionId: id ?? null }));
   const reset = async () => {
     selected = undefined;
+    applied = false;
     notice = true;
+    pendingClear = true;
     recordReset();
     changed();
-    const results = await Promise.allSettled([apply(undefined), save(undefined)]);
+    const results = await Promise.allSettled([
+      apply(undefined),
+      save(undefined).then(() => {
+        pendingClear = false;
+      }),
+    ]);
     const failed = results.find((result): result is PromiseRejectedResult => result.status === 'rejected');
     if (failed) throw failed.reason;
     check();
   };
-  return {
-    async start(): Promise<void> {
-      active = true;
-      off = port.onSessionsChanged?.((closed) => {
-        void enqueue(async () => {
-          if (!active) return;
-          if (closed) await lifecycle?.closed(closed);
-          if (selected && closed === selected) await reset();
-          await refresh();
-          if (selected && !rows.some((row) => row.id === selected)) {
-            await lifecycle?.closed(selected);
-            await reset();
-          }
-          changed();
-        }).catch(() => {
-          if (active) {
-            unavailable = true;
-            changed();
-          }
-        });
-      });
-      await enqueue(async () => {
-        await refresh();
-        const text = await storage.load(key);
-        check();
-        if (text === undefined) return;
+  const subscribe = () => {
+    if (off || !port.onSessionsChanged) return;
+    off = port.onSessionsChanged((closed) => {
+      void enqueue(async () => {
+        if (!active) return;
+        if (closed) await lifecycle?.closed(closed);
+        if (selected && closed === selected) await reset();
+        await recover();
+      }).catch(failed);
+    });
+  };
+  const recover = async () => {
+    subscribe();
+    if (!loaded) {
+      const text = await storage.load(key);
+      check();
+      if (text !== undefined) {
         const data: unknown = JSON.parse(text);
         if (
           !data ||
@@ -79,18 +81,61 @@ export function createSessionTarget(
           (data.sessionId !== null && typeof data.sessionId !== 'string')
         )
           throw new TypeError('invalid delivery target');
-        if (data.sessionId === null) return;
-        if (!rows.some((row) => row.id === data.sessionId)) {
-          await reset();
-          return;
+        selected = data.sessionId ?? undefined;
+      }
+      loaded = true;
+    }
+    if (pendingClear) {
+      await save(undefined);
+      check();
+      pendingClear = false;
+    }
+    await refresh();
+    if (selected && !rows.some((row) => row.id === selected)) {
+      await lifecycle?.closed(selected);
+      await reset();
+    } else if (selected && !applied) {
+      try {
+        await port.ensureSession?.(selected);
+      } catch (error) {
+        check();
+        if (typeof error !== 'object' || error === null || !('code' in error) || error.code !== 'session/not-found')
+          throw error;
+        await lifecycle?.closed(selected);
+        await reset();
+      }
+      check();
+      if (selected) {
+        try {
+          await apply(selected);
+        } catch (error) {
+          await apply(undefined);
+          throw error;
         }
-        await port.ensureSession?.(data.sessionId);
         check();
-        await apply(data.sessionId);
-        check();
-        selected = data.sessionId;
-      });
-      changed();
+        applied = true;
+      }
+    }
+    unavailable = false;
+    retryDelay = 1_000;
+    changed();
+  };
+  const failed = () => {
+    if (!active) return;
+    unavailable = true;
+    changed();
+    if (timer) return;
+    timer = setTimeout(() => {
+      timer = undefined;
+      void enqueue(recover).catch(failed);
+    }, retryDelay);
+    timer.unref?.();
+    retryDelay = Math.min(retryDelay * 2, 60_000);
+  };
+  return {
+    async start(): Promise<void> {
+      active = true;
+      await enqueue(recover).catch(failed);
     },
     select(id: string | undefined): Promise<void> {
       return enqueue(async () => {
@@ -114,6 +159,9 @@ export function createSessionTarget(
           throw error;
         }
         selected = id;
+        loaded = true;
+        applied = !!id;
+        pendingClear = false;
         notice = false;
         changed();
       });
@@ -134,6 +182,8 @@ export function createSessionTarget(
     settled: () => tail,
     async stop(): Promise<void> {
       active = false;
+      if (timer) clearTimeout(timer);
+      timer = undefined;
       off?.();
       await tail;
     },

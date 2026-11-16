@@ -161,6 +161,34 @@ function harness(
 }
 
 describe('host runtime', () => {
+  it('keeps running in automatic routing while a saved target is temporarily unavailable, then restores it', async () => {
+    const h = harness();
+    const saved = JSON.stringify({ version: 1, sessionId: 'a' });
+    let unavailable = true;
+    const writes: string[] = [];
+    h.ports.storage.load = async (key) => (key === 'session-target' ? saved : undefined);
+    h.ports.storage.save = async (key, value) => {
+      if (key === 'session-target') writes.push(value);
+    };
+    h.ports.dsh.listSessions = async () => ['a', 'b'].map((id) => ({ id, title: '', updatedAt: 1, running: false }));
+    h.ports.dsh.ensureSession = async (id) => {
+      if (unavailable) throw new Error('temporary failure');
+      await h.agent({ type: 'created', sessionId: id });
+    };
+    await expect(h.runtime.start()).resolves.toBeUndefined();
+    await h.agent({ type: 'created', sessionId: 'b' });
+    await h.agent({ type: 'pre-step', sessionId: 'b' });
+    expect(h.runtime.target()).toMatchObject({ mode: 'pinned', sessionId: 'a', unavailable: true });
+    expect(h.runtime.currentSessionId()).toBe('b');
+    expect(writes).toEqual([]);
+    unavailable = false;
+    await h.advance(1_000);
+    expect(h.runtime.target()).toMatchObject({ mode: 'pinned', sessionId: 'a' });
+    expect(h.runtime.currentSessionId()).toBe('a');
+    expect(writes).toEqual([]);
+    await h.runtime.stop();
+  });
+
   it('retries a non-target private wake without charging the budget twice', async () => {
     const h = harness(undefined, {
       rules: [{ id: 'failed-job', match: { kind: 'job.exited' }, level: 'wake', createdBy: 'user', approved: true }],
