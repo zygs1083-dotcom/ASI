@@ -129,6 +129,34 @@ function harness(savedSettings?: string) {
 }
 
 describe('host runtime', () => {
+  it('notifies once after a body sample commits battery and memory alerts', async () => {
+    const h = harness();
+    await h.runtime.start();
+    const body = (percent: number, pressure: 'normal' | 'critical') =>
+      mkBody({
+        battery: { ...f({ percent, charging: false }), observedAt: Date.now() },
+        memory: { ...f({ total: 100, used: 50, pressure, swapUsed: 0 }), observedAt: Date.now() },
+      });
+    await h.sample(body(80, 'normal'));
+    await h.advance(1_000);
+    const frames: string[][] = [];
+    h.runtime.onChange(() => {
+      throw new Error('subscriber failure');
+    });
+    h.runtime.onChange(() => {
+      frames.push(
+        h.runtime
+          .events()
+          .filter((event) => event.kind === 'body.threshold')
+          .map((event) => event.subject),
+      );
+    });
+    await h.sample(body(3, 'critical'));
+    expect(frames).toEqual([['battery', 'memory']]);
+    expect(h.runtime.body.monitor.restoredState).toMatchObject({ battery: 'critical', memory: 'critical' });
+    await h.runtime.stop();
+  });
+
   it('does not notify old or new change subscribers after stop', async () => {
     const h = harness();
     await h.runtime.start();

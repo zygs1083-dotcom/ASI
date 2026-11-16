@@ -45,7 +45,7 @@ export function createPresenter(
 ) {
   const { clock } = options;
   const intervals = { ...options.sampleIntervalsMs };
-  const history = createHistory();
+  const history = createHistory(intervals);
   const subscribers = new Set<Subscriber>();
   let cached: PresenterModel | undefined;
   let published: PresenterModel | undefined;
@@ -58,10 +58,11 @@ export function createPresenter(
     if (closed && cached) return cached;
     const now = clock.wall();
     const state = projectState(runtime);
-    const samples = history.update(runtime.state().self.body, now);
+    history.record(runtime.state().self.body, now, clock.mono());
+    const samples = history.snapshot(clock.mono());
     const entries = runtime.events();
     const settings = runtime.rules.settings();
-    const { insights, learning } = projectInsights(runtime, samples, history.rates, entries, clock, intervals);
+    const { insights, learning } = projectInsights(runtime, samples, clock, intervals);
     const next: PresenterModel = {
       state,
       history: samples,
@@ -114,7 +115,7 @@ export function createPresenter(
     timer = setTimeout(emit, Math.max(0, 500 - (clock.mono() - lastEmission)));
     timer.unref?.();
   }
-  const offState = runtime.subscribe((state) => history.update(state.self.body, clock.wall()));
+  const offState = runtime.subscribe((state) => history.record(state.self.body, clock.wall(), clock.mono()));
   const offChange = runtime.onChange(schedule);
   snapshot();
 

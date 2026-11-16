@@ -171,6 +171,18 @@ trusted-user feedback action accept alerts registered by the runtime. The
 body monitor's `evaluateAuto` and all tuning operations are awaited; tuning
 failures are surfaced without discarding confirmed state.
 
+The presenter keeps per-metric five-minute, interval-slotted ring buffers
+(at most 300 points) and projects rate ETA from the monitor's current
+monotonic evidence, not the bounded event log. A body sample notifies change
+subscribers once after its facts, latches and events commit.
+
+Presenter tuning entries expose `status` (`undoable`, `reverted`,
+`superseded`, `rejected`, or `other`) and `undoable`. Only an applied revert
+sets the existing UI `reverted` field; non-undoable and rejected entries carry
+a corresponding explanation in `reason`. The current sense-ui contract has
+no disable-undo field, so it may still show an undo button for those entries;
+the tuner rejects invalid or superseded IDs.
+
 ## M1 boundaries
 
 The M1 attention/state implementation remains unchanged: no persistence,

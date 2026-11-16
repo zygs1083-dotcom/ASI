@@ -3,8 +3,35 @@ import { createHistory } from '../../src/host/presenter/history.ts';
 import { diskFact, f, mkBody } from '../body/helpers.ts';
 
 describe('presenter history', () => {
+  it('bounds 10,000 high-frequency samples by interval and keeps the latest value per slot', () => {
+    const history = createHistory({ cpu: 100 });
+    const body = mkBody({ cpu: f({ usage: 0, perCore: [0], load1: 0, load5: 0, load15: 0 }) });
+    for (let at = 0; at < 10_000; at++) {
+      body.cpu.observedAt = at;
+      if (body.cpu.value) body.cpu.value.usage = at / 10_000;
+      history.record(body, at, at);
+    }
+    const first = history.snapshot(9_999);
+    expect(first.cpu).toHaveLength(100);
+    expect(first.cpu[0]).toEqual({ at: 99, value: 0.0099 });
+    expect(first.cpu.at(-1)).toEqual({ at: 9_999, value: 0.9999 });
+    expect(first.cpu.length).toBeLessThanOrEqual(300);
+    expect(history.snapshot(9_999).cpu).toBe(first.cpu);
+    for (let i = 0; i < 10_000; i++) {
+      const at = 10_000 + i * 10;
+      body.cpu.observedAt = at;
+      if (body.cpu.value) body.cpu.value.usage = (i % 100) / 100;
+      history.record(body, at, at);
+    }
+    const wrapped = history.snapshot(109_990);
+    expect(wrapped.cpu).toHaveLength(300);
+    expect(wrapped.cpu[0]?.at).toBe(80_090);
+    expect(wrapped.cpu.at(-1)?.at).toBe(109_990);
+    expect(first.cpu.at(-1)).toEqual({ at: 9_999, value: 0.9999 });
+  });
+
   it('maps fresh facts to their documented units and keeps unchanged series by reference', () => {
-    const history = createHistory();
+    const history = createHistory({ cpu: 1_000 });
     const body = mkBody({
       cpu: f({ usage: 0.4, perCore: [0.4], load1: 1, load5: 2, load15: 3 }),
       memory: f({ total: 200, used: 50, pressure: 'normal', swapUsed: 0 }),

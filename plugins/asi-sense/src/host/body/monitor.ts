@@ -4,6 +4,7 @@ import { AnomalyEvaluator, type AnomalyRule } from './anomaly.ts';
 import { Baseline, type BaselineOptions } from './baseline.ts';
 import { FileBurstDetector, type FileBurstOptions } from './burst.ts';
 import type { BodySignal } from './metrics.ts';
+import { rateEvidence } from './monitor-evidence.ts';
 import { serializeMonitor, validateSamples } from './monitor-snapshot.ts';
 import { type BodyPersistence, PersistScheduler } from './persistence.ts';
 import { RateEvaluator, type RateRule } from './rate.ts';
@@ -51,6 +52,8 @@ export class BodyMonitor implements BodyEvaluator {
   private readonly timeZone?: string;
   private readonly tuner?: Tuner;
   private readonly rate?: RateEvaluator;
+  private readonly rateRules: readonly RateRule[];
+  private rateSample?: { stream: string; mono: number; wall: number };
   private readonly anomalyRules?: readonly AnomalyRule[];
   private readonly burst: FileBurstDetector;
   private readonly persistence?: BodyPersistence;
@@ -76,6 +79,7 @@ export class BodyMonitor implements BodyEvaluator {
     this.timeZone = options.timeZone; // Absent override: Baseline uses the runtime zone.
     this.tuner = options.tuner;
     const rateRules = options.rateRules ?? defaultRateRules();
+    this.rateRules = rateRules.map((rule) => ({ ...rule }));
     this.anomalyRules = options.anomalyRules ?? defaultAnomalyRules();
     if (rateRules.length) {
       this.rate = new RateEvaluator(rateRules, (p, f) => this.tuner?.number(p, f) ?? f);
@@ -139,11 +143,11 @@ export class BodyMonitor implements BodyEvaluator {
     return this.rebaser?.suggestions ?? [];
   }
   parameters = () => this.tuner?.parameters() ?? [];
+  rateEvidence = (metric: string) => rateEvidence(this.latest, this.rateRules, this.rateSample, metric);
   acceptRebaseline(id: string) {
     if (!this.rebaser) return Promise.reject(new Error('monitor: persistent tuner required'));
     return this.rebaser.accept(id);
   }
-
   /** Current effective baseline for the anomaly layer (seed or latest fork). */
   get baseline(): Baseline {
     for (const h of Object.values(this.latest?.[BODY_HISTORY] ?? {})) {
@@ -151,12 +155,10 @@ export class BodyMonitor implements BodyEvaluator {
     }
     return this.seed;
   }
-
   /** Forwards one raw signal to the built-in burst detector. */
   accept(signal: Signal, receivedAt: number): BodySignal[] {
     return this.burst.accept(signal, receivedAt);
   }
-
   evaluate(prev: BodyThresholdSample, next: BodyThresholdSample, state: BodyThresholdState): BodyEvaluation {
     if (this.rebaser?.inTransaction) throw new Error('monitor: rebaseline in progress');
     this.rebaser?.onSynchronousSample();
@@ -167,7 +169,13 @@ export class BodyMonitor implements BodyEvaluator {
     for (const s of f.signals)
       signals.push({ ...s, layer: 'floor', data: { ...s.data, layer: 'floor' } } as BodySignal);
     if (this.rate) {
+      const prior = (state as AdaptiveState)[BODY_HISTORY]?.[n.source.id]?.rate?.lastMono;
       const r = this.rate.evaluate(p, n, acc);
+      if (
+        (prior === undefined || n.monotonicAt > prior) &&
+        (r.state as AdaptiveState)[BODY_HISTORY]?.[n.source.id]?.rate?.lastMono === n.monotonicAt
+      )
+        this.rateSample = { stream: n.source.id, mono: n.monotonicAt, wall: n.at };
       acc = r.state;
       signals.push(...r.signals);
     }
@@ -180,7 +188,6 @@ export class BodyMonitor implements BodyEvaluator {
     this.dirty();
     return { signals, state: acc };
   }
-
   evaluateAuto(
     prev: BodyThresholdSample,
     next: BodyThresholdSample,
@@ -190,7 +197,6 @@ export class BodyMonitor implements BodyEvaluator {
     validateSamples(prev, next);
     return this.rebaser.run(next, state, () => this.evaluate(prev, next, state));
   }
-
   /**
    * Loads the combined snapshot (tuner + seed baseline + latch/history).
    * First install (`undefined`) leaves the seed alone; ANY malformed piece
@@ -262,7 +268,6 @@ export class BodyMonitor implements BodyEvaluator {
     this.persistReady = true;
     this.dirty();
   }
-
   /** Force-flushes the combined snapshot (no-op before restore). */
   async persist(): Promise<void> {
     if (!this.persistReady) return;
@@ -270,7 +275,6 @@ export class BodyMonitor implements BodyEvaluator {
     await this.tuner?.persist();
     await this.scheduler?.flush();
   }
-
   /** Cancels the pending timer and flushes only after restore. */
   async close(): Promise<void> {
     if (this.persistReady) {
@@ -279,21 +283,17 @@ export class BodyMonitor implements BodyEvaluator {
       await this.scheduler?.close();
     } else this.scheduler?.cancel();
   }
-
   private dirty(): void {
     if (this.persistReady) this.scheduler?.schedule();
   }
-
   private baselineOptions(): BaselineOptions {
     return { clock: this.wallClock, timeZone: this.timeZone, monotonicAt: this.clock() };
   }
-
   private rebuildAnomaly(): void {
     this.anomaly = this.anomalyRules?.length
       ? new AnomalyEvaluator(this.seed, this.anomalyRules, (p, f) => this.tuner?.number(p, f) ?? f)
       : undefined;
   }
-
   private serialize(tunerSnapshot?: string, latest = this.latest, rebaseline = this.rebaser?.snapshot()): string {
     return serializeMonitor(this.seed, this.clock, this.tuner, latest, this.tuningDisabled, tunerSnapshot, rebaseline);
   }

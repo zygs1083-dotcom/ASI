@@ -1,11 +1,11 @@
-import type { SenseState, WatchRule } from '@asi/sense-types';
+import type { WatchRule } from '@asi/sense-types';
 import { BodySource } from '../sources/body.ts';
 import { DshSource } from '../sources/dsh.ts';
 import { FileSource } from '../sources/files.ts';
 import { HelperSource } from '../sources/helper.ts';
 import { boundedShutdown, guardActions } from './action-guard.ts';
 import { RuntimeAttention } from './attention.ts';
-import { createChanges, observableActions } from './changes.ts';
+import { createChanges, createStateListeners, observableActions, settleShutdown } from './changes.ts';
 import { FactExpiry } from './expiry.ts';
 import type { SenseActions, SenseOptions, SensePorts } from './ports.ts';
 import { Settings } from './settings.ts';
@@ -24,6 +24,7 @@ export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}
   let allowTitles = true;
   let titleIntent = 0;
   let paused = false;
+  const isPaused = () => paused;
   let timer: ReturnType<typeof setTimeout> | undefined;
   let nextToken = Number.POSITIVE_INFINITY;
   let retryAfter = 0;
@@ -46,33 +47,29 @@ export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}
     changed,
     expiry,
   );
-  const listeners = new Set<(state: SenseState) => void>();
-  const notify = (state: SenseState) => {
-    for (const listener of listeners) {
-      try {
-        listener(structuredClone(state));
-      } catch {}
-    }
-  };
+  const listeners = createStateListeners();
   const offStore = attention.store.subscribe((state) => {
-    notify(state);
+    listeners.notify(state);
     schedule();
   });
-  const body = new BodySource(ports.probe, ports.dsh, ports.storage, clock, attention, () => paused, changed);
-  const dsh = new DshSource(
+  const body = new BodySource(
+    ports.probe,
     ports.dsh,
+    ports.storage,
     clock,
     attention,
-    (id) => body.tokens(id),
-    () => paused,
+    isPaused,
+    changed,
+    changes.batch,
   );
+  const dsh = new DshSource(ports.dsh, clock, attention, body.tokens.bind(body), isPaused);
   const files = new FileSource(
     ports.files,
     clock,
     attention,
     dsh,
     () => settings.enabled(),
-    () => paused,
+    isPaused,
     (signal) => body.burst(signal),
     (roots) => body.setRoots(roots),
   );
@@ -84,7 +81,7 @@ export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}
     attention,
     body,
     schedule,
-    () => paused,
+    isPaused,
   );
   function schedule(): void {
     if (timer) clearTimeout(timer);
@@ -111,7 +108,7 @@ export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}
   async function tick(): Promise<void> {
     if (!running) return;
     if (expiry.expire()) {
-      notify(attention.state());
+      listeners.notify(attention.state());
       changed();
     }
     if (clock.mono() >= nextToken) {
@@ -245,7 +242,7 @@ export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}
     offStore();
     listeners.clear();
     changes.clear();
-    const work = Promise.allSettled([
+    const work = settleShutdown([
       deliveries,
       callbacks,
       guarded.wait(),
@@ -253,15 +250,7 @@ export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}
       helper.stop(),
       body.stop(),
       settings.close(),
-    ]).then((results) => {
-      const errors = results.filter((result): result is PromiseRejectedResult => result.status === 'rejected');
-      if (errors.length === 1) throw errors[0]?.reason;
-      if (errors.length > 1)
-        throw new AggregateError(
-          errors.map((result) => result.reason),
-          'runtime shutdown failed',
-        );
-    });
+    ]);
     stopping = boundedShutdown(work);
     return stopping;
   }
@@ -296,10 +285,7 @@ export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}
     },
     stop,
     state: () => attention.state(),
-    subscribe: (listener: (state: SenseState) => void) => {
-      listeners.add(listener);
-      return () => listeners.delete(listener);
-    },
+    subscribe: listeners.subscribe,
     onChange,
     events: () => attention.events(),
     rules: {

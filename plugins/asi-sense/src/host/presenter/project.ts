@@ -14,7 +14,11 @@ type Suggestion = {
   dates: number;
 };
 export type PresenterModel = Omit<SensePanelModel, 'tuning'> & {
-  tuning: TuningState & {
+  tuning: Omit<TuningState, 'log'> & {
+    log: (TuningState['log'][number] & {
+      status: 'undoable' | 'reverted' | 'superseded' | 'rejected' | 'other';
+      undoable: boolean;
+    })[];
     disabled?: { reason: 'storage-failed' | 'restore-failed' };
     suggestions: Suggestion[];
   };
@@ -135,6 +139,14 @@ export function projectEvents(entries: EventEntry[], sendTitles: boolean): Sense
 export function projectTuning(runtime: Runtime): PresenterModel['tuning'] {
   const { tuner, monitor } = runtime.body;
   const undoable = new Set(tuner.undoableChanges.map((entry) => entry.id));
+  const logs = tuner.logs;
+  const reverted = new Set(
+    logs
+      .filter(
+        (entry) => entry.status === 'applied' && entry.operation === 'revert' && entry.reason.startsWith('revert '),
+      )
+      .map((entry) => entry.reason.slice('revert '.length)),
+  );
   const disabled = tuner.tuningDisabled ?? monitor.tuningDisabled;
   const suggestions = monitor.rebaselineSuggestions.flatMap((item) => {
     const metric = suggestionMetric(item.metric);
@@ -161,16 +173,39 @@ export function projectTuning(runtime: Runtime): PresenterModel['tuning'] {
       locked: param.locked,
       source: param.source,
     })),
-    log: tuner.logs.map((entry) => ({
-      id: entry.id,
-      paramKey: entry.param,
-      previous: displayValue(entry.from),
-      next: displayValue(entry.to),
-      by: entry.by,
-      at: entry.at,
-      reason: entry.status === 'rejected' ? `${entry.reason} (${entry.rejectionReason ?? 'rejected'})` : entry.reason,
-      reverted: !undoable.has(entry.id),
-    })),
+    log: logs.map((entry) => {
+      const canUndo = undoable.has(entry.id);
+      const status =
+        entry.status === 'rejected'
+          ? 'rejected'
+          : reverted.has(entry.id)
+            ? 'reverted'
+            : canUndo
+              ? 'undoable'
+              : entry.operation === 'propose' || entry.operation === 'revert'
+                ? 'superseded'
+                : 'other';
+      const suffix =
+        status === 'rejected'
+          ? `已拒绝: ${entry.rejectionReason ?? 'rejected'}`
+          : status === 'superseded'
+            ? '已被覆盖，不可撤销'
+            : status === 'other'
+              ? '不可撤销'
+              : undefined;
+      return {
+        id: entry.id,
+        paramKey: entry.param,
+        previous: displayValue(entry.from),
+        next: displayValue(entry.to),
+        by: entry.by,
+        at: entry.at,
+        reason: suffix ? `${entry.reason} (${suffix})` : entry.reason,
+        status,
+        undoable: canUndo,
+        reverted: status === 'reverted',
+      };
+    }),
     ...(disabled ? { disabled: { reason: disabled } } : {}),
     suggestions,
   };

@@ -61,6 +61,7 @@ export class BodySource {
     private readonly attention: RuntimeAttention,
     private readonly paused: () => boolean,
     private readonly changed: () => void,
+    private readonly batch: <T>(work: () => T | Promise<T>) => Promise<T>,
   ) {
     this.probe = factory.create();
     this.tuner = new Tuner(specs, {
@@ -165,7 +166,15 @@ export class BodySource {
     await tokens;
   }
   private enqueue(work: () => Promise<void>): void {
-    const run = this.tail.then(work).finally(this.changed);
+    const run = this.tail.then(() =>
+      this.batch(async () => {
+        try {
+          await work();
+        } finally {
+          this.changed();
+        }
+      }),
+    );
     this.tail = run.catch(() => {});
   }
   private write(key: keyof Body, fact: Fact<unknown>): void {
@@ -191,7 +200,12 @@ export class BodySource {
     if (this.thermal) body.thermal = this.thermal;
     for (const key of Object.keys(body) as (keyof Body)[]) this.write(key, body[key]);
     const evaluated = structuredClone(body);
-    if (this.tokenSource === 'fallback' && evaluated.tokens.value) delete evaluated.tokens.value.contextWindow;
+    if (
+      evaluated.tokens.value &&
+      (this.tokenSource === 'fallback' ||
+        ('contextWindowSource' in evaluated.tokens.value && evaluated.tokens.value.contextWindowSource === 'fallback'))
+    )
+      delete evaluated.tokens.value.contextWindow;
     const next: BodyThresholdSample = { body: evaluated, at, monotonicAt: mono, source };
     this.sync();
     const result = await this.monitor.evaluateAuto(this.previous ?? next, next, this.state);

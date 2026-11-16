@@ -4,6 +4,7 @@ import type { SensePanelProps } from '@asi/sense-ui/model';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createPresenter } from '../../src/host/presenter/index.ts';
 import { createSenseRuntime } from '../../src/host/runtime/index.ts';
+import type { JobEvent } from '../../src/host/runtime/ports.ts';
 import { diskFact, f, mkBody } from '../body/helpers.ts';
 
 afterEach(() => vi.useRealTimers());
@@ -13,6 +14,7 @@ async function harness() {
   vi.setSystemTime(1_700_000_000_000);
   let mono = 0;
   let sample: (body: Body) => void = () => {};
+  let job: (event: JobEvent) => Promise<void> = async () => {};
   const clock = { wall: () => Date.now(), mono: () => mono };
   const runtime = createSenseRuntime(
     {
@@ -20,7 +22,10 @@ async function harness() {
       dsh: {
         onAgentEvent: () => () => {},
         onTool: () => () => {},
-        onJob: () => () => {},
+        onJob: (cb) => {
+          job = cb;
+          return () => {};
+        },
         deliver: async () => {},
         tokenSnapshot: async () => undefined,
       },
@@ -45,6 +50,7 @@ async function harness() {
   return {
     runtime,
     presenter,
+    job: (event: JobEvent) => job(event),
     advance: async (ms: number) => {
       mono += ms;
       await vi.advanceTimersByTimeAsync(ms);
@@ -57,6 +63,78 @@ async function harness() {
 }
 
 describe('presenter', () => {
+  it('requires three new rate points after an unavailable reading', async () => {
+    const h = await harness();
+    const gib = 1024 ** 3;
+    const disk = async (free: number) => {
+      const disks = diskFact([{ mount: '/', total: 100 * gib, free: free * gib, observedAt: Date.now() }]);
+      disks.observedAt = Date.now();
+      await h.sample(mkBody({ disks }));
+    };
+    await disk(80);
+    await h.advance(10_000);
+    await disk(76);
+    await h.advance(10_000);
+    await disk(75);
+    expect(h.presenter.snapshot().insights?.['disk:/']?.currentEta).toBeDefined();
+    await h.advance(10_000);
+    await h.sample(mkBody({ disks: diskFact(null, 'unavailable') }));
+    await h.advance(10_000);
+    await disk(74);
+    expect(h.presenter.snapshot().insights?.['disk:/']?.currentEta).toBeUndefined();
+    expect(h.runtime.body.monitor.rateEvidence('disk:/')).toMatchObject({
+      latched: true,
+      points: [{ value: 74 * gib }],
+    });
+    await h.advance(10_000);
+    await disk(72);
+    expect(h.presenter.snapshot().insights?.['disk:/']?.currentEta).toBeUndefined();
+    await h.advance(10_000);
+    await disk(70);
+    expect(h.presenter.snapshot().insights?.['disk:/']?.currentEta).toBeDefined();
+    h.presenter.close();
+    await h.runtime.stop();
+  });
+
+  it('keeps an active rate ETA after the triggering event is evicted', async () => {
+    const h = await harness();
+    const gib = 1024 ** 3;
+    for (const free of [80, 76, 75]) {
+      if (free !== 80) await h.advance(10_000);
+      const disks = diskFact([{ mount: '/', total: 100 * gib, free: free * gib, observedAt: Date.now() }]);
+      disks.observedAt = Date.now();
+      await h.sample(mkBody({ disks }));
+    }
+    for (let i = 0; i < 201; i++) await h.job({ type: 'exited', id: `job-${i}`, exitCode: 0 });
+    expect(h.runtime.events().some((event) => event.kind === 'body.rate')).toBe(false);
+    expect(h.presenter.snapshot().insights?.['disk:/']?.currentEta?.ratePerMinute).toBeCloseTo(-15 * gib, 3);
+    h.presenter.close();
+    await h.runtime.stop();
+  });
+
+  it.each([30_000, -30_000])('uses monotonic rate evidence across a %i ms wall clock jump', async (jump) => {
+    const h = await harness();
+    const gib = 1024 ** 3;
+    for (const [i, free] of [80, 76, 75].entries()) {
+      if (i) await h.advance(10_000);
+      if (i === 2) vi.setSystemTime(Date.now() + jump);
+      const disks = diskFact([{ mount: '/', total: 100 * gib, free: free * gib, observedAt: Date.now() }]);
+      disks.observedAt = Date.now();
+      await h.sample(mkBody({ disks }));
+    }
+    const eta = h.presenter.snapshot().insights?.['disk:/']?.currentEta;
+    expect(eta?.asOf).toBe(Date.now());
+    expect(eta?.ratePerMinute).toBeCloseTo(-15 * gib, 3);
+    expect(eta?.timeToThresholdMs).toBeCloseTo((70 / 15) * 60_000, 3);
+    const evidence = h.runtime.body.monitor.rateEvidence('disk:/');
+    expect(evidence).toMatchObject({ latched: true, asOf: Date.now(), ratePerMinute: -15 * gib });
+    expect(evidence.points.map((point) => point.mono)).toEqual([0, 10_000, 20_000]);
+    evidence.points[0].value = 0;
+    expect(h.runtime.body.monitor.rateEvidence('disk:/').points[0].value).toBe(80 * gib);
+    h.presenter.close();
+    await h.runtime.stop();
+  });
+
   it('shares throttled frames while retaining every new sample and reusing unchanged series', async () => {
     const h = await harness();
     const a = h.presenter.frames()[Symbol.asyncIterator]();
@@ -195,6 +273,50 @@ describe('presenter', () => {
       ['thermal', 'ordinal', 3, 7],
     ]);
     expect(tuning.suggestions[0]?.slotLabel).toBe('周一 14 时');
+    h.presenter.close();
+    await h.runtime.stop();
+  });
+
+  it('distinguishes reverted, superseded, rejected and undoable tuning entries', async () => {
+    const h = await harness();
+    const first = await h.runtime.tools.bodyTune({ param: 'rate.rss.maxRatio', to: 0.6 });
+    const second = await h.runtime.tools.bodyTune({ param: 'rate.rss.maxRatio', to: 0.7 });
+    const rejected = await h.runtime.tools.bodyTune({ param: 'rate.rss.maxRatio', to: 100 });
+    const before = h.presenter.snapshot().tuning.log;
+    expect(before.find((entry) => entry.id === first.change.id)).toMatchObject({
+      status: 'superseded',
+      undoable: false,
+      reverted: false,
+    });
+    expect(before.find((entry) => entry.id === second.change.id)).toMatchObject({
+      status: 'undoable',
+      undoable: true,
+      reverted: false,
+    });
+    expect(before.find((entry) => entry.id === rejected.change.id)).toMatchObject({
+      status: 'rejected',
+      undoable: false,
+      reverted: false,
+    });
+    await h.runtime.actions.revertTuning(first.change.id);
+    await h.runtime.actions.lockParam('rate.rss.maxRatio', true);
+    const attempts = h.presenter.snapshot().tuning.log;
+    expect(attempts.find((entry) => entry.id === first.change.id)).toMatchObject({
+      status: 'superseded',
+      reverted: false,
+    });
+    expect(attempts.at(-1)).toMatchObject({ status: 'other', undoable: false, reverted: false });
+    await h.runtime.actions.revertTuning(second.change.id);
+    const after = h.presenter.snapshot().tuning.log;
+    expect(after.find((entry) => entry.id === second.change.id)).toMatchObject({
+      status: 'reverted',
+      undoable: false,
+      reverted: true,
+    });
+    expect(after.find((entry) => entry.id === first.change.id)).toMatchObject({
+      status: 'superseded',
+      reverted: false,
+    });
     h.presenter.close();
     await h.runtime.stop();
   });

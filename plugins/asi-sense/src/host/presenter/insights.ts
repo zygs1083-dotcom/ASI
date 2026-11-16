@@ -1,6 +1,6 @@
 import { type Body, diskVolumeAt, factStatusAt } from '@asi/sense-types';
-import type { BodyHistory, MetricInsight, MetricKey, MetricPoint, ThresholdLayer } from '@asi/sense-ui/model';
-import type { Clock, EventEntry } from '../runtime/index.ts';
+import type { BodyHistory, MetricInsight, MetricKey, ThresholdLayer } from '@asi/sense-ui/model';
+import type { Clock } from '../runtime/index.ts';
 import type { Runtime } from './project.ts';
 
 const natural: Record<string, string> = {
@@ -75,38 +75,24 @@ function convert(key: MetricKey, value: number, body: Body): number | undefined 
 
 function etaFor(
   key: MetricKey,
-  entries: EventEntry[],
-  rates: ReadonlyMap<MetricKey, MetricPoint[]>,
+  monitor: Runtime['body']['monitor'],
   body: Body,
   interval: number,
 ): MetricInsight['currentEta'] {
   const metric = key.startsWith('disk:') ? key : natural[key];
-  const entry = [...entries].reverse().find((item) => item.kind === 'body.rate' && item.detail?.metric === metric);
-  if (entry?.detail?.severity !== 'warn') return undefined;
-  const last = rates.get(key)?.at(-1);
-  if (!last) return undefined;
-  const window = entry.detail.windowMs;
-  const windowMs = typeof window === 'number' && Number.isFinite(window) && window > 0 ? window : 60_000;
-  const points = rates.get(key)?.filter((point) => point.at >= last.at - windowMs) ?? [];
-  if (points.length < 3) return undefined;
-  const meanX = points.reduce((sum, point) => sum + (point.at - last.at), 0) / points.length;
-  const meanY = points.reduce((sum, point) => sum + point.value, 0) / points.length;
-  let sxx = 0;
-  let sxy = 0;
-  for (const point of points) {
-    const x = point.at - last.at - meanX;
-    sxx += x * x;
-    sxy += x * (point.value - meanY);
-  }
-  const loss = (-sxy / sxx) * 60_000;
-  if (!Number.isFinite(loss) || loss <= 0) return undefined;
+  if (!metric || (!key.startsWith('disk:') && key !== 'tokens')) return undefined;
+  const evidence = monitor.rateEvidence(metric);
+  const last = evidence.points.at(-1);
+  const loss = -(evidence.ratePerMinute ?? 0);
+  if (!evidence.latched || evidence.points.length < 3 || !last || evidence.asOf === undefined || loss <= 0)
+    return undefined;
   const total = key.startsWith('disk:') ? body.disks.value?.find((disk) => disk.mount === key.slice(5))?.total : 0;
   const floor = key === 'tokens' ? 0 : total !== undefined && total > 0 ? total * 0.05 : undefined;
   if (floor === undefined) return undefined;
   const timeToThresholdMs = (Math.max(0, last.value - floor) / loss) * 60_000;
   if (!Number.isFinite(timeToThresholdMs)) return undefined;
   return {
-    asOf: last.at,
+    asOf: evidence.asOf,
     sampleIntervalMs: interval,
     ratePerMinute: key === 'tokens' ? loss : -loss,
     timeToThresholdMs,
@@ -116,8 +102,6 @@ function etaFor(
 export function projectInsights(
   runtime: Runtime,
   history: BodyHistory,
-  rates: ReadonlyMap<MetricKey, MetricPoint[]>,
-  entries: EventEntry[],
   clock: Clock,
   intervals: Partial<Record<MetricKey, number>>,
 ): { insights: Partial<Record<MetricKey, MetricInsight>>; learning: SenseLearning } {
@@ -208,13 +192,7 @@ export function projectInsights(
     }
     const defaultInterval = disk ? 10_000 : key === 'battery' ? 30_000 : 2_000;
     const interval = intervals[key] ?? defaultInterval;
-    const eta = etaFor(
-      key,
-      entries,
-      rates,
-      body,
-      Number.isFinite(interval) && interval > 0 ? interval : defaultInterval,
-    );
+    const eta = etaFor(key, monitor, body, Number.isFinite(interval) && interval > 0 ? interval : defaultInterval);
     if (eta) item.currentEta = eta;
     insights[key] = item;
   }
