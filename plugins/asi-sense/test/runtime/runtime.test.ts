@@ -340,6 +340,54 @@ describe('host runtime', () => {
     if (!alert) throw new Error('missing body alert');
     const result = await h.runtime.tools.bodyTune({ action: 'feedback', alertId: alert.id, verdict: 'useful' });
     expect(result).toMatchObject({ applied: true });
+    expect(h.runtime.events().find((event) => event.id === alert.id)?.feedback).toBe('useful');
+    await h.runtime.stop();
+  });
+
+  it('publishes post-commit events, settings and tuning changes even while paused', async () => {
+    const h = harness();
+    await h.runtime.start();
+    const observed: { paused: boolean; locked: boolean; event: boolean }[] = [];
+    const off = h.runtime.onChange(() =>
+      observed.push({
+        paused: h.runtime.rules.settings().paused,
+        locked: h.runtime.body.tuner.parameters().find((item) => item.key === 'rate.rss.maxRatio')?.locked ?? false,
+        event: h.runtime.events().some((item) => item.kind === 'job.exited'),
+      }),
+    );
+    await h.job({ type: 'exited', id: 'synthetic', exitCode: 1 });
+    await h.advance(0);
+    expect(observed.at(-1)?.event).toBe(true);
+    await h.runtime.actions.pause(true);
+    await h.runtime.actions.lockParam('rate.rss.maxRatio', true);
+    await h.advance(0);
+    expect(observed.at(-1)).toMatchObject({ paused: true, locked: true });
+    expect(h.runtime.body.monitor.parameters().find((item) => item.key === 'rate.rss.maxRatio')).toMatchObject({
+      value: 0.5,
+      locked: true,
+      source: 'default',
+    });
+    off();
+    await h.runtime.stop();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('preserves a body event source and known numeric detail without arbitrary payload', async () => {
+    const h = harness();
+    await h.runtime.start();
+    const rss = (value: number) => ({
+      ...f({ rss: value, cpu: 0, uptimeSec: 1 }),
+      observedAt: Date.now(),
+    });
+    await h.sample(mkBody({ harnessProcess: rss(100) }));
+    await h.advance(5_000);
+    await h.sample(mkBody({ harnessProcess: rss(200) }));
+    const alert = h.runtime.events().find((event) => event.kind === 'body.rate');
+    expect(alert).toMatchObject({
+      source: { id: 'body', api: 'probe', host: 'local' },
+      detail: { metric: 'rss', delta: 100, windowMs: 300_000, slope: 20 },
+    });
+    expect(alert?.detail).not.toHaveProperty('title');
     await h.runtime.stop();
   });
 });

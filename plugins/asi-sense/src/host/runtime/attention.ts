@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import type { DeliveryLevel, SenseState, Signal, SignalCause, WatchRule } from '@asi/sense-types';
+import type { DeliveryLevel, SenseState, Signal, SignalCause, SourceRef, WatchRule } from '@asi/sense-types';
 import { AttentionPipeline, type SessionContext } from '../attention/pipeline.ts';
 import { isRuleApproved, selectRule } from '../attention/rules.ts';
 import { sourceObservation } from '../state/source-health.ts';
@@ -16,8 +16,43 @@ export interface EventEntry {
   cause?: SignalCause;
   at: number;
   restarts?: number;
+  source: SourceRef;
+  detail?: Record<string, string | number | boolean>;
+  currentEta?: { asOf: number; ratePerMinute: number; timeToThresholdMs?: number };
+  feedback?: 'useful' | 'noise';
 }
 export type EventLog = EventEntry[];
+
+const detailFields: Record<string, readonly string[]> = {
+  'body.rate': ['metric', 'windowMs', 'delta', 'slope', 'direction', 'timeToFloorMs', 'severity', 'ruleId'],
+  'body.anomaly': ['metric', 'value', 'baseline', 'deviation', 'k', 'confidence', 'dates', 'severity', 'ruleId'],
+  'file.burst': [
+    'directory',
+    'windowMs',
+    'created',
+    'modified',
+    'deleted',
+    'agentCreated',
+    'agentModified',
+    'agentDeleted',
+    'externalDeletionExceeded',
+  ],
+};
+
+function eventDetail(signal: Signal): EventEntry['detail'] {
+  const fields = detailFields[signal.kind];
+  if (!fields) return undefined;
+  return Object.fromEntries(
+    fields.flatMap((key) => {
+      const value = signal.data[key];
+      return typeof value === 'string' ||
+        typeof value === 'boolean' ||
+        (typeof value === 'number' && Number.isFinite(value))
+        ? [[key, value]]
+        : [];
+    }),
+  );
+}
 
 function withoutTitles(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(withoutTitles);
@@ -46,6 +81,7 @@ export class RuntimeAttention {
     private readonly rules: () => WatchRule[],
     private readonly reschedule: () => void,
     private readonly titlesAllowed: () => boolean,
+    readonly changed: () => void,
   ) {
     this.store = new StateStore(
       () => clock.wall(),
@@ -85,10 +121,27 @@ export class RuntimeAttention {
     return this.store.snapshot();
   }
   events(): EventLog {
-    return structuredClone(this.entries);
+    const events = structuredClone(this.entries);
+    if (!this.titlesAllowed()) {
+      for (const entry of events) {
+        if (!entry.kind.startsWith('window')) continue;
+        entry.subject = '';
+        delete entry.reason;
+        delete entry.ruleId;
+        delete entry.detail;
+      }
+    }
+    return events;
   }
   current(): string | undefined {
     return this.selected;
+  }
+  feedback(id: string, verdict: 'useful' | 'noise'): void {
+    const entry = this.entries.find((item) => item.id === id);
+    if (entry) {
+      entry.feedback = verdict;
+      this.changed();
+    }
   }
   create(id: string): void {
     this.sessions.set(id, { id, busy: false, userInitiated: false });
@@ -165,6 +218,9 @@ export class RuntimeAttention {
     const sourceReason =
       signal.kind === 'source.status' && typeof signal.data.reason === 'string' ? signal.data.reason : undefined;
     const restarts = typeof signal.data.restarts === 'number' ? signal.data.restarts : undefined;
+    const detail = eventDetail(signal);
+    const slope = signal.kind === 'body.rate' && typeof detail?.slope === 'number' ? detail.slope : undefined;
+    const eta = typeof detail?.timeToFloorMs === 'number' ? detail.timeToFloorMs : undefined;
     this.entries.push({
       id: signal.id,
       kind: signal.kind,
@@ -175,11 +231,26 @@ export class RuntimeAttention {
       reason: reason ?? sourceReason,
       cause: signal.cause,
       restarts,
+      source: { ...signal.source },
+      ...(detail ? { detail } : {}),
+      ...(slope === undefined
+        ? {}
+        : {
+            currentEta: {
+              asOf: signal.at,
+              ratePerMinute: slope * 60,
+              ...(eta === undefined ? {} : { timeToThresholdMs: eta }),
+            },
+          }),
     });
     if (this.entries.length > 200) this.entries.shift();
+    this.changed();
   }
   private mark(id: string, reason: string): void {
     const entry = this.entries.find((item) => item.id === id);
-    if (entry) entry.reason = reason;
+    if (entry) {
+      entry.reason = reason;
+      this.changed();
+    }
   }
 }

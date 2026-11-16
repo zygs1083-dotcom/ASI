@@ -59,12 +59,14 @@ export class BodySource {
     private readonly clock: Clock,
     private readonly attention: RuntimeAttention,
     private readonly paused: () => boolean,
+    private readonly changed: () => void,
   ) {
     this.probe = factory.create();
     this.tuner = new Tuner(specs, {
       actor: () => this.identity.getStore() ?? 'agent',
       clock: () => clock.mono(),
       wallClock: () => clock.wall(),
+      onChange: changed,
     });
     this.monitor = new BodyMonitor({
       tuner: this.tuner,
@@ -115,10 +117,12 @@ export class BodySource {
       ttlMs: 15_000,
     };
     this.write('tokens', this.token);
+    this.changed();
   }
   setThermal(fact: Body['thermal']): void {
     this.thermal = fact;
     this.write('thermal', fact);
+    this.changed();
   }
   setRoots(roots: string[]): void {
     const ordered = [...roots].sort();
@@ -142,7 +146,7 @@ export class BodySource {
     await this.monitor.close();
   }
   private enqueue(work: () => Promise<void>): void {
-    const run = this.tail.then(work);
+    const run = this.tail.then(work).finally(this.changed);
     this.tail = run.catch(() => {});
   }
   private write(key: keyof Body, fact: Fact<unknown>): void {

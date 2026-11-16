@@ -5,9 +5,9 @@ import { type TunerActor, TunerGuard, type TuningResult } from './tuner-guard.ts
 import { validateSnapshot } from './tuner-persist.ts';
 import { type AlertBinding, finiteNum, type ParameterSpec, type TuningLog, validateSpec } from './tuner-spec.ts';
 import { applySnapshot, resetTuner, serializeTuner, TunerStore } from './tuner-state.ts';
+import { parameters, safeNotify } from './tuner-view.ts';
 
 export type { AlertBinding, ParameterSpec, TunerActor, TuningLog, TuningResult };
-
 export interface TunerOptions {
   /** Host-supplied trusted actor: 'user' from the sidebar boundary, 'agent' otherwise. */
   actor?: () => TunerActor;
@@ -16,8 +16,8 @@ export interface TunerOptions {
   /** Wall ms for audit stamps + the freeze high-water mark; default Date.now. */
   wallClock?: () => number;
   persistence?: BodyPersistence;
+  onChange?: () => void;
 }
-
 /**
  * Guarded self-tuning (§2.2c `body_tune`). Callers never supply an actor —
  * the injected resolver decides, and anything it returns that is not a
@@ -39,6 +39,7 @@ export class Tuner {
   private readonly clock: () => number;
   private readonly wallClock: () => number;
   private readonly persistence?: BodyPersistence;
+  private readonly onChange: () => void;
   private readonly scheduler?: PersistScheduler;
   private commit?: (snapshot: () => string, publish: () => void, context?: unknown, result?: unknown) => Promise<void>;
   private rebaseHost?: { revertChange: (id: string) => Promise<TuningResult> };
@@ -46,7 +47,7 @@ export class Tuner {
   private closed = false;
 
   constructor(parameters: Record<string, ParameterSpec>, options: TunerOptions = {}) {
-    for (const k of ['actor', 'clock', 'wallClock'] as const) {
+    for (const k of ['actor', 'clock', 'wallClock', 'onChange'] as const) {
       if (options[k] !== undefined && typeof options[k] !== 'function') {
         throw new TypeError(`tuner: options.${k} must be a function`);
       }
@@ -56,6 +57,7 @@ export class Tuner {
     this.wallClock = options.wallClock ?? Date.now;
     this.store.restored = options.persistence === undefined;
     this.persistence = options.persistence;
+    this.onChange = safeNotify(options.onChange);
     if (options.persistence) {
       const save = options.persistence.save.bind(options.persistence);
       const scheduler = new PersistScheduler(
@@ -76,22 +78,19 @@ export class Tuner {
       this.store.values.set(name, s.value);
     }
   }
-
   /** Public kill switch: a failed restore disables AI tuning until explicit reset. */
   get tuningDisabled(): 'restore-failed' | 'storage-failed' | undefined {
     return this.store.disabled;
   }
-
   get(param: string): TuningValue | undefined {
     return this.store.values.get(param);
   }
-
+  parameters = () => parameters(this.store);
   /** Positive finite numeric value, else the caller's fallback. */
   number(param: string, fallback: number): number {
     const v = this.store.values.get(param);
     return typeof v === 'number' && finiteNum(v) && v > 0 ? v : fallback;
   }
-
   /** Display audit log (capped at 500); undoable changes are retained separately. */
   get logs(): TuningLog[] {
     return this.store.log.slice(-500).map((e) => ({ ...e }));
@@ -242,6 +241,7 @@ export class Tuner {
 
   disableStorage(): void {
     if (this.store.disabled !== 'restore-failed') this.store.disabled = 'storage-failed';
+    this.onChange();
   }
 
   private mutate<T>(
@@ -295,6 +295,6 @@ export class Tuner {
       () => {},
       () => {},
     );
-    return operation;
+    return operation.finally(this.onChange);
   }
 }

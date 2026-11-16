@@ -4,8 +4,9 @@ import { DshSource } from '../sources/dsh.ts';
 import { FileSource } from '../sources/files.ts';
 import { HelperSource } from '../sources/helper.ts';
 import { RuntimeAttention } from './attention.ts';
+import { createChanges, observableActions, tuningTool, watchTool } from './changes.ts';
 import { FactExpiry } from './expiry.ts';
-import type { SenseActions, SenseOptions, SensePorts, TuneRequest } from './ports.ts';
+import type { SenseActions, SenseOptions, SensePorts } from './ports.ts';
 import { Settings } from './settings.ts';
 
 export type { EventEntry, EventLog } from './attention.ts';
@@ -23,12 +24,14 @@ export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}
   let nextToken = Number.POSITIVE_INFINITY;
   let retryAfter = 0;
   let installed = settings.enabled().map((rule) => rule.id);
+  const { changed, subscribe: onChange, clear: clearChanges } = createChanges();
   const attention = new RuntimeAttention(
     clock,
     ports.dsh,
     () => settings.enabled(),
     schedule,
     () => allowTitles && helper.titlesEnabled(),
+    changed,
   );
   const expiry = new FactExpiry(clock);
   const listeners = new Set<(state: SenseState) => void>();
@@ -44,7 +47,7 @@ export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}
     notify(state);
     schedule();
   });
-  const body = new BodySource(ports.probe, ports.dsh, ports.storage, clock, attention, () => paused);
+  const body = new BodySource(ports.probe, ports.dsh, ports.storage, clock, attention, () => paused, changed);
   const dsh = new DshSource(
     ports.dsh,
     clock,
@@ -72,7 +75,6 @@ export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}
     schedule,
     () => paused,
   );
-
   function schedule(): void {
     if (timer) clearTimeout(timer);
     timer = undefined;
@@ -96,7 +98,10 @@ export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}
   }
   async function tick(): Promise<void> {
     if (!running) return;
-    if (expiry.expire()) notify(attention.state());
+    if (expiry.expire()) {
+      notify(attention.state());
+      changed();
+    }
     if (clock.mono() >= nextToken) {
       nextToken = clock.mono() + 5_000;
       const session = attention.current();
@@ -120,6 +125,7 @@ export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}
   async function update(change: Parameters<Settings['update']>[0]): Promise<void> {
     await settings.update(change);
     await syncRules();
+    changed();
   }
   function ruleChange(id: string, change: (rule: WatchRule) => void): Promise<void> {
     return update((draft) => {
@@ -166,6 +172,7 @@ export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}
       if (!enabled) {
         allowTitles = false;
         helper.setTitles(false);
+        changed();
       }
       await settings.update((draft) => {
         draft.sendTitles = enabled;
@@ -183,7 +190,12 @@ export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}
         return result;
       }),
     lockParam: (param, locked) => body.asUser(() => (locked ? body.tuner.lock(param) : body.tuner.unlock(param))),
-    feedback: (id, verdict) => body.asUser(() => body.tuner.feedback(id, verdict)),
+    feedback: (id, verdict) =>
+      body.asUser(async () => {
+        const result = await body.tuner.feedback(id, verdict);
+        if (result.applied) attention.feedback(id, verdict);
+        return result;
+      }),
     acceptRebaseline: (id) =>
       body.asUser(async () => {
         const result = await body.monitor.acceptRebaseline(id);
@@ -199,32 +211,8 @@ export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}
       if (!allowTitles) state.env.focusedWindow.value = null;
       return section ? state[section] : state;
     },
-    envWatch: async (request: {
-      action: 'list' | 'add' | 'remove';
-      rule?: Omit<WatchRule, 'approved' | 'createdBy'>;
-      id?: string;
-    }) => {
-      if ('param' in request) throw new Error('unsupported-param');
-      if (request.action === 'list') return settings.list();
-      if (request.action === 'add' && request.rule) {
-        await settings.add(request.rule);
-        await syncRules();
-        return settings.list();
-      }
-      if (request.action === 'remove' && request.id) {
-        const rule = settings.list().find((item) => item.id === request.id);
-        if (rule?.createdBy !== 'agent') throw new Error('only agent rules can be removed');
-        await actions.deleteRule(request.id);
-        return settings.list();
-      }
-      throw new TypeError('invalid env_watch request');
-    },
-    bodyTune: (request: TuneRequest) =>
-      'action' in request
-        ? body.tuner.feedback(request.alertId, request.verdict)
-        : body.tuner.get(request.param) === undefined
-          ? Promise.reject(new Error('unsupported-param'))
-          : body.tuner.propose(request),
+    envWatch: watchTool(settings, actions, syncRules, changed),
+    bodyTune: tuningTool(body.tuner, attention, changed),
   };
   function stop(): Promise<void> {
     if (!started) return Promise.resolve();
@@ -235,6 +223,7 @@ export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}
     dsh.stop();
     offStore();
     listeners.clear();
+    clearChanges();
     const work = Promise.allSettled([files.stop(), helper.stop(), body.stop(), settings.close()]).then((results) => {
       const errors = results.filter((result): result is PromiseRejectedResult => result.status === 'rejected');
       if (errors.length === 1) throw errors[0]?.reason;
@@ -275,6 +264,7 @@ export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}
         if (!paused) helper.start(settings.sendTitles);
         nextToken = clock.mono() + 5_000;
         schedule();
+        changed();
       } catch (error) {
         await stop().catch(() => {});
         throw error;
@@ -286,6 +276,7 @@ export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}
       listeners.add(listener);
       return () => listeners.delete(listener);
     },
+    onChange,
     events: () => attention.events(),
     rules: {
       list: () => settings.list(),
@@ -293,7 +284,7 @@ export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}
       settings: () => ({ paused, sendTitles: allowTitles }),
     },
     body: { monitor: body.monitor, tuner: body.tuner },
-    actions,
+    actions: observableActions(actions, changed),
     tools,
   };
 }

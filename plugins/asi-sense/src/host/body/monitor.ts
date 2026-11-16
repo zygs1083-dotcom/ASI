@@ -131,7 +131,6 @@ export class BodyMonitor implements BodyEvaluator {
       }
     }
   }
-
   /** The state to resume feeding back — restored snapshot or latest emitted. */
   get restoredState(): AdaptiveState | undefined {
     return this.latest;
@@ -139,6 +138,7 @@ export class BodyMonitor implements BodyEvaluator {
   get rebaselineSuggestions(): RebaselineSuggestion[] {
     return this.rebaser?.suggestions ?? [];
   }
+  parameters = () => this.tuner?.parameters() ?? [];
   acceptRebaseline(id: string) {
     if (!this.rebaser) return Promise.reject(new Error('monitor: persistent tuner required'));
     return this.rebaser.accept(id);

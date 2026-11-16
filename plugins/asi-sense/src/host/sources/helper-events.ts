@@ -27,6 +27,7 @@ export function clearWindow(attention: RuntimeAttention, at: number): void {
     subject: 'env.focusedWindow',
     data: { path: 'env.focusedWindow', value: null, status: 'unknown' },
   });
+  attention.changed();
 }
 export async function axStatus(
   attention: RuntimeAttention,
