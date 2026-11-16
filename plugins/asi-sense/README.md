@@ -98,10 +98,11 @@ and deterministic environment-update formatting.
   `unknown` report changes only the status while advancing its report
   sequence. Exit tombstones prevent earlier comparable events from resurrecting
   jobs until pruning; an unsequenced later arrival is accepted.
-- **Self-cause**: a causal-kind signal inside a tool window's inclusive
-  bounds is agent-caused when its `pid`, `ppid` or any `ancestors` entry
-  equals `window.pid` (the shell pid — children and grandchildren match), or
-  when its path lies under `window.cwd`.
+- **Self-cause**: a causal-kind signal during a tool window is agent-caused
+  when its `pid`, `ppid` or any `ancestors` entry equals the shell pid, or
+  when its path lies under `window.cwd`. After completion, only a job exit
+  with the same shell pid receives the job grace; descendants do not.
+  A failed tool's own post-execute result is always agent-caused.
 - **Rules**: `validateRule(input)` returns violations (`[]` = valid);
   constructor rules and `addRule` throw `TypeError` on invalid input and
   store defensive clones; `addRule` upserts by id; `removeRule(id)` returns
@@ -169,9 +170,14 @@ staged context to commit before clearing degradation.
 `createSenseRuntime` option, defaulting to 2000 ms; set it to 0 to disable the
 trailing grace. A file event under a tool's absolute cwd is self-caused when
 its monotonic receipt falls in `[pre, post + grace)`.
-This can also suppress user edits inside that cwd during the grace interval;
-paths outside it and job/process events receive no trailing grace. A delayed
-event arriving after the grace is not self-caused, regardless of its mtime.
+This can also suppress user edits inside that cwd during the grace interval.
+Job exit events from the DSH port with the same known shell pid receive the
+same half-open trailing grace; descendants, cwd-only matches and other
+job/process events do not. A delayed event arriving after the grace is not
+self-caused, regardless of its mtime. If either side lacks a pid, no
+post-completion job correlation is inferred from cwd or ancestry.
+The pinned DSH adapter currently supplies neither tool nor job pids, so this
+job correlation applies only when a port supplies both.
 The local watcher uses `lstat` mtime for adds/modifications when it is not
 older than watcher startup; otherwise (including deletes) it uses callback time.
 

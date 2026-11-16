@@ -177,7 +177,7 @@ describe('classifyCause', () => {
     expect(classifyCause(rel, [relWin])).toBe('unknown');
   });
 
-  it('limits trailing grace to cwd files and ignores old wall timestamps when receipt time is known', () => {
+  it('limits trailing grace to cwd files and same-pid job exits using receipt time', () => {
     const window: ToolWindow = { ...W, startedMono: 10, endedMono: 110 };
     const file = sig({ id: 'f', kind: 'file.changed', at: 2_200, subject: '/repo/a', cause: 'user' });
     expect(classifyReceived({ ...file, at: 150 }, [W], 2_000)).toBe('user');
@@ -188,8 +188,28 @@ describe('classifyCause', () => {
     expect(classifyCause({ ...file, at: 99 }, [window], 2_000, 2_110)).toBe('user');
     expect(classifyCause({ ...file, subject: '/repository/a', data: { pid: 42 } }, [window], 2_000, 111)).toBe('user');
     expect(classifyCause({ ...file, kind: 'job.exited', at: 201, data: { pid: 42 } }, [window], 2_000, 111)).toBe(
-      'user',
+      'agent',
     );
     expect(classifyCause({ ...file, at: 201 }, [window], 0, 111)).toBe('user');
+  });
+
+  it('does not extend descendant, cwd-only, started or process events beyond a tool window', () => {
+    const window: ToolWindow = { ...W, startedMono: 10, endedMono: 110 };
+    const event = sig({ id: 'j', kind: 'job.exited', at: 201, data: { pid: 43, ppid: 42, path: '/repo' } });
+    for (const receipt of [110, 111]) {
+      expect(classifyReceived(event, [window], 2_000, receipt)).toBe('unknown');
+      expect(classifyReceived({ ...event, data: { ancestors: [42], path: '/repo' } }, [window], 2_000, receipt)).toBe(
+        'unknown',
+      );
+    }
+    expect(classifyReceived({ ...event, kind: 'job.started', data: { pid: 42 } }, [window], 2_000, 111)).toBe(
+      'unknown',
+    );
+    expect(classifyReceived({ ...event, kind: 'process.exited', data: { pid: 42 } }, [window], 2_000, 111)).toBe(
+      'unknown',
+    );
+    expect(classifyReceived({ ...event, data: { pid: 42 } }, [window], 2_000, 2_109)).toBe('agent');
+    expect(classifyReceived({ ...event, data: { pid: 42 } }, [window], 2_000, 2_110)).toBe('unknown');
+    expect(classifyReceived({ ...event, data: { pid: 42 } }, [window], 0, 111)).toBe('unknown');
   });
 });

@@ -640,7 +640,7 @@ describe('host runtime', () => {
     await h.runtime.stop();
   });
 
-  it('uses monotonic receipt time despite a wall-clock rollback and does not extend job events', async () => {
+  it('uses monotonic receipt time despite a wall-clock rollback for file and same-pid job grace', async () => {
     const h = harness();
     await h.runtime.start();
     await h.agent({ type: 'created', sessionId: 's' });
@@ -658,8 +658,9 @@ describe('host runtime', () => {
     });
     await h.job({ type: 'exited', id: 'late-job', pid: 42, exitCode: 1, at: Date.now() + 10_000 });
     expect(h.runtime.events().find((entry) => entry.subject === 'late-job')).toMatchObject({
-      cause: 'unknown',
-      level: 'wake',
+      cause: 'agent',
+      level: 'record',
+      reason: 'self-caused',
     });
     await h.runtime.stop();
   });
