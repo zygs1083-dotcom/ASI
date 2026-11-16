@@ -197,7 +197,11 @@ export class RuntimeAttention {
   }
   async accept(signal: Signal): Promise<void> {
     if (this.stopped) return;
-    const mono = this.clock.mono() - Math.max(0, this.clock.wall() - signal.at);
+    const evaluated = signal.kind === 'body.rate' ? signal.data.evaluationMono : undefined;
+    const mono =
+      typeof evaluated === 'number' && Number.isFinite(evaluated)
+        ? evaluated
+        : this.clock.mono() - Math.max(0, this.clock.wall() - signal.at);
     const session = this.selected && this.sessions.get(this.selected);
     if (!session) {
       const prior = this.store.snapshot().observation.sources[signal.source.id];

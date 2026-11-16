@@ -39,6 +39,7 @@ interface Point {
 
 export type RateTimes = Record<string, { mono: number; wall: number }>;
 type RateSample = BodyThresholdSample & { rateTimes?: RateTimes; evaluatedAt?: { mono: number; wall: number } };
+type EvaluatedWindow = RateWindow & { evaluationMono?: number };
 
 export function captureRateTimes(body: Body, mono: number, receivedWall: number, previous: RateTimes): RateTimes {
   const next: RateTimes = {};
@@ -141,12 +142,12 @@ export class RateEvaluator implements BodyEvaluator {
     }
     const evaluation = (next as RateSample).evaluatedAt ?? { mono, wall: next.at };
     const metrics = readMetrics({ ...next, at: next.at + Math.max(0, evaluation.mono - mono) });
-    const windows: Record<string, RateWindow> = {};
+    const windows: Record<string, EvaluatedWindow> = {};
     for (const [k, w] of Object.entries(inHist?.windows ?? {})) {
       if (metrics.has(k)) windows[k] = w; // missing metric → window dropped, latch retained
     }
-    const updated = new Map<string, RateWindow>();
-    const windowFor = (key: string, metric: Metric): RateWindow => {
+    const updated = new Map<string, EvaluatedWindow>();
+    const windowFor = (key: string, metric: Metric): EvaluatedWindow => {
       const done = updated.get(key);
       if (done) return done;
       const old = windows[key];
@@ -164,11 +165,17 @@ export class RateEvaluator implements BodyEvaluator {
             ? [{ at: pMono, value: seed.value, ...(prior ? { wall: prior.wall } : {}) }]
             : [];
       }
-      if (!old || observedMono > old.lastMono) {
+      const fresh = !old || observedMono > old.lastMono;
+      if (fresh) {
         pts.push({ at: observedMono, value: metric.value, ...(stamp ? { wall: stamp.wall } : {}) });
       }
-      pts = pts.filter((p) => p.at >= evaluation.mono - this.retention(key));
-      const w: RateWindow = { points: pts, lastMono: old ? Math.max(old.lastMono, observedMono) : observedMono };
+      const evaluationMono = fresh ? evaluation.mono : (old.evaluationMono ?? old.lastMono);
+      pts = pts.filter((p) => p.at >= evaluationMono - this.retention(key));
+      const w: EvaluatedWindow = {
+        points: pts,
+        lastMono: old ? Math.max(old.lastMono, observedMono) : observedMono,
+        evaluationMono,
+      };
       updated.set(key, w);
       return w;
     };
@@ -179,10 +186,11 @@ export class RateEvaluator implements BodyEvaluator {
       for (const key of this.metricKeys(rule, metrics)) {
         const metric = metrics.get(key) as Metric;
         const w = windowFor(key, metric);
-        const pts = w.points.filter((p) => p.at >= evaluation.mono - rule.windowMs);
-        if (windows[key] && w.lastMono === windows[key].lastMono) continue;
+        const pts = w.points.filter((p) => p.at >= (w.evaluationMono ?? evaluation.mono) - rule.windowMs);
+        const cached = !!windows[key] && w.lastMono === windows[key].lastMono;
+        if (rule.maxEtaMs === undefined && cached) continue;
         if (pts.length < 2) continue;
-        const sig = this.step(rule, key, metric, pts, next, pub, streamLatch, evaluation);
+        const sig = this.step(rule, key, metric, pts, next, pub, streamLatch, evaluation, cached);
         if (sig) signals.push(sig);
       }
     }
@@ -207,6 +215,7 @@ export class RateEvaluator implements BodyEvaluator {
     pub: BodyThresholdState,
     streamLatch: Record<string, 'normal' | 'warn'>,
     evaluation: { mono: number; wall: number },
+    cached: boolean,
   ): BodySignal | undefined {
     const first = pts[0];
     const last = pts[pts.length - 1];
@@ -241,7 +250,8 @@ export class RateEvaluator implements BodyEvaluator {
     const latchKey = rule.metric.endsWith(':*') ? `rate:${rule.id}:${key}` : `rate:${rule.id}`;
     const was = streamLatch[latchKey] === 'warn';
     const active =
-      (rule.maxEtaMs !== undefined ? magnitude >= limit : magnitude > limit) || (was && magnitude >= limit * 0.8);
+      (rule.maxEtaMs !== undefined ? magnitude >= limit : magnitude > limit) ||
+      (was && (cached || magnitude >= limit * 0.8));
     streamLatch[latchKey] = active ? 'warn' : 'normal';
     pub[latchKey] = active ? 'warn' : 'normal';
     if (active === was) return undefined;
@@ -257,6 +267,7 @@ export class RateEvaluator implements BodyEvaluator {
       direction: rule.direction,
       evidenceAt: last.wall ?? next.at - (next.monotonicAt - last.at),
       evidenceMono: last.at,
+      evaluationMono: evaluation.mono,
     };
     if (eta !== undefined) {
       data.etaToFloorMs = data.timeToFloorMs = eta;

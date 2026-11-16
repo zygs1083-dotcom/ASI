@@ -56,7 +56,10 @@ function Panel(props: PanelProps) {
   const model = 'value' in snapshot ? snapshot.value : undefined;
   return h(
     'div',
-    { 'data-testid': 'asi-sense-panel' },
+    {
+      'data-testid': 'asi-sense-panel',
+      style: { display: 'flex', flexDirection: 'column', flex: 1, minWidth: 0, minHeight: 0 },
+    },
     snapshot.status === 'live'
       ? null
       : h('div', { role: snapshot.status === 'failed' ? 'alert' : 'status' }, props.t(snapshot.status)),

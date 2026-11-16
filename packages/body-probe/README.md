@@ -104,14 +104,15 @@ while it enforces `disksMs` internally (an injected `collectors.disks`
 keeps the whole-group outer cache instead).
 
 The returned `DisksFact` aggregates per-volume state without letting one bad
-mount veto the rest: the parent `status` is `ok` whenever at least one
-returned volume is fresh, `stale` only when every retained record is stale,
-and `unknown` when no records exist at all (`denied`/`unsupported` still come
-straight from collection failures). Parent `observedAt`/`ttlMs` are computed
-over **fresh volumes only** (oldest fresh `observedAt`, earliest fresh
+mount veto the rest: except for parent `denied`/`unsupported`, the parent
+`status` is `ok` when at least one volume is fresh, `stale` when none is
+fresh but at least one is stale, and `unknown` when neither is present
+(including mixed unavailable/unknown records). Parent `observedAt`/`ttlMs`
+are computed over **fresh volumes only** (oldest fresh `observedAt`, earliest fresh
 absolute expiry — matching the shared `DisksFact` contract in
-`@asi/sense-types`); they fall back to all records when no fresh volume
-remains. Per-volume `status`/`observedAt`/`ttlMs` are authoritative for that
+`@asi/sense-types`); with no fresh volumes they use stale volumes only, and
+with neither fresh nor stale volumes they retain the parent metadata.
+Per-volume `status`/`observedAt`/`ttlMs` are authoritative for that
 mount; volumes that never declared metadata inherit the parent's effective
 status. `unavailableMounts` always wins over a same-named record in `value`.
 `latest()` re-aggregates the disk parent between publications using the

@@ -76,6 +76,16 @@ export interface BodyEvaluation {
   partial?: boolean
 }
 
+export function eventMetricKey(metric: string): string {
+  switch (metric) {
+    case 'context': return 'tokens'
+    case 'rss': return 'processRss'
+    case 'network.rx': return 'networkRx'
+    case 'network.tx': return 'networkTx'
+    default: return metric
+  }
+}
+
 function unusable(): RowResult {
   return { severity: 'unknown', hidden: false }
 }

@@ -3,6 +3,39 @@ import { expect, type Locator, type Page } from '@playwright/test';
 const panelOnly =
   'body * { visibility: hidden !important } [data-testid="asi-sense-panel"], [data-testid="asi-sense-panel"] * { visibility: visible !important }';
 
+export async function checkPanelScroll(page: Page, panel: Locator): Promise<void> {
+  await page.setViewportSize({ width: 1440, height: 800 });
+  const scroller = panel.locator('[data-panel]');
+  await scroller.evaluate((element) => {
+    element.scrollTop = 0;
+  });
+  const box = await scroller.boundingBox();
+  if (!box) throw new Error('Panel scroll geometry is unavailable');
+  await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+  await page.mouse.wheel(0, 500);
+  await expect.poll(() => scroller.evaluate((element) => element.scrollTop)).toBeGreaterThan(0);
+  const dimensions = await scroller.evaluate((element) => {
+    element.scrollTop = element.scrollHeight;
+    const last = [...element.querySelectorAll('summary')].find((item) => item.textContent === '规则');
+    return {
+      clientHeight: element.clientHeight,
+      scrollHeight: element.scrollHeight,
+      clientWidth: element.clientWidth,
+      scrollWidth: element.scrollWidth,
+      scrollTop: element.scrollTop,
+      lastBottom: last?.getBoundingClientRect().bottom,
+      panelBottom: element.getBoundingClientRect().bottom,
+    };
+  });
+  console.log('DSH panel scroll at 1440x800:', JSON.stringify(dimensions));
+  expect(dimensions.scrollHeight).toBeGreaterThan(dimensions.clientHeight);
+  expect(dimensions.scrollWidth).toBeLessThanOrEqual(dimensions.clientWidth);
+  expect(dimensions.scrollTop).toBeGreaterThan(0);
+  if (dimensions.lastBottom === undefined) throw new Error('Rules section is missing');
+  expect(dimensions.lastBottom).toBeLessThanOrEqual(dimensions.panelBottom);
+  await page.setViewportSize({ width: 1440, height: 900 });
+}
+
 export async function screenshotDesktop(page: Page, panel: Locator, screenshot: string): Promise<void> {
   await panel.getByRole('heading', { name: '环境感知' }).scrollIntoViewIfNeeded();
   const box = await panel.boundingBox();
@@ -24,7 +57,29 @@ export async function screenshotDesktop(page: Page, panel: Locator, screenshot: 
   });
 }
 
-export async function checkResponsive(page: Page, panel: Locator, screenshot?: string): Promise<void> {
+export async function screenshotLocation(panel: Locator, screenshot: string): Promise<void> {
+  const location = panel.locator('[aria-label="位置链"]');
+  await location.scrollIntoViewIfNeeded();
+  expect(
+    await location.evaluate((element) =>
+      [...element.querySelectorAll<HTMLElement>('[class*="locNode"]')].every((node) =>
+        [...node.children].every((child) => {
+          const box = child.getBoundingClientRect();
+          const hit = document.elementFromPoint(box.left + 2, box.top + box.height / 2);
+          return hit !== null && child.contains(hit);
+        }),
+      ),
+    ),
+  ).toBe(true);
+  await location.screenshot({ path: screenshot });
+}
+
+export async function checkResponsive(
+  page: Page,
+  panel: Locator,
+  screenshot?: string,
+  locationScreenshot?: string,
+): Promise<void> {
   await page.setViewportSize({ width: 390, height: 844 });
   const collapse = page.getByRole('button', { name: 'Collapse sidebar' });
   const nav = page.locator('nav[aria-label="Global panels"]');
@@ -57,6 +112,7 @@ export async function checkResponsive(page: Page, panel: Locator, screenshot?: s
     if (!box || box.x < 0 || box.x + box.width > widths.viewport)
       throw new Error(`Responsive control clipped: ${name}`);
   }
+  if (locationScreenshot) await screenshotLocation(panel, locationScreenshot);
   const heading = panel.getByRole('heading', { name: '环境感知' });
   await heading.scrollIntoViewIfNeeded();
   expect(

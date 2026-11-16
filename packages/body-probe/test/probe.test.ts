@@ -142,6 +142,23 @@ describe('BodyProbe', () => {
     expect(probe.history()[0]!.body.disks).toEqual(original);
   });
 
+  it('aggregates mixed stale and unavailable volumes without letting unavailable metadata win', () => {
+    const at = Date.now();
+    const disks = {
+      kind: 'disks' as const,
+      status: 'ok' as const,
+      source: src('disks'),
+      observedAt: at,
+      ttlMs: 30_000,
+      value: [
+        { mount: '/stale', total: 100, free: 50, status: 'stale' as const, observedAt: at - 10_000, ttlMs: 10_000 },
+        { mount: '/missing', total: 100, free: 50, status: 'unavailable' as const, observedAt: at - 20_000, ttlMs: 1_000 },
+      ],
+    };
+    expect(fact.disksAt(disks, 0, at)).toMatchObject({ status: 'stale', observedAt: at - 10_000, ttlMs: 10_000 });
+    expect(fact.disksAt({ ...disks, value: [disks.value[1]!] }, 0, at).status).toBe('unknown');
+  });
+
   it('uses monotonic disk deadlines after wall-clock jumps', async () => {
     const t0 = Date.now();
     const collectors = baseCollectors();
