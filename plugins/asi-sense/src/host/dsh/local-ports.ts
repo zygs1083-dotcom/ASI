@@ -1,7 +1,7 @@
 import { spawn } from 'node:child_process';
-import { existsSync, lstatSync, watch } from 'node:fs';
+import { existsSync, lstatSync, statSync, watch } from 'node:fs';
 import * as fs from 'node:fs/promises';
-import { isAbsolute, relative, resolve, sep } from 'node:path';
+import { dirname, isAbsolute, relative, resolve, sep } from 'node:path';
 import { performance } from 'node:perf_hooks';
 import { BodyProbe } from '@asi/body-probe';
 import type { Context } from '@deepseek-ai/cordis';
@@ -17,25 +17,74 @@ export function localPorts(ctx: Context, storageRoot: string): Omit<SensePorts, 
     probe: { create: () => new BodyProbe() },
     files: {
       watch(root, callback) {
-        const base = resolve(root);
+        const target = resolve(root);
         const startedAt = Date.now();
-        const watcher = watch(base, { recursive: true }, (event, filename) => {
-          if (filename === null) return;
-          let at = Date.now();
-          const path = resolve(base, filename.toString());
-          const rel = relative(base, path);
-          if (rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel)) return;
-          const change = event === 'change' ? 'modify' : existsSync(path) ? 'add' : 'delete';
-          if (change !== 'delete') {
+        let watcher: ReturnType<typeof watch>;
+        let closed = false;
+        const fail = () => {
+          ctx.logger.warn('asi-sense file watcher failed');
+          const event = { path: target, change: 'modify' as const, watchError: true };
+          callback(event);
+        };
+        const inside = (parent: string, child: string) => {
+          const rel = relative(parent, child);
+          return rel !== '..' && !rel.startsWith(`..${sep}`) && !isAbsolute(rel);
+        };
+        const attach = () => {
+          let candidate = target;
+          for (;;) {
             try {
-              const mtime = lstatSync(path).mtimeMs;
-              if (Number.isFinite(mtime) && mtime >= startedAt) at = mtime;
-            } catch {}
+              const directory = statSync(candidate).isDirectory();
+              if (candidate !== target && !directory) {
+                candidate = dirname(candidate);
+                continue;
+              }
+              const base = candidate;
+              const next = watch(base, { recursive: true }, (event, filename) => {
+                if (closed || watcher !== next) return;
+                const path = !directory || filename === null ? base : resolve(base, filename.toString());
+                if (!inside(base, path)) return;
+                if (base !== target ? existsSync(target) : event === 'rename' && !existsSync(target)) {
+                  try {
+                    attach();
+                  } catch {
+                    fail();
+                  }
+                }
+                if (!inside(target, path) || filename === null) return;
+                let at = Date.now();
+                const change = event === 'change' ? 'modify' : existsSync(path) ? 'add' : 'delete';
+                if (change !== 'delete') {
+                  try {
+                    const mtime = lstatSync(path).mtimeMs;
+                    if (Number.isFinite(mtime) && mtime >= startedAt) at = mtime;
+                  } catch {}
+                }
+                callback({ path, change, at });
+              });
+              next.on('error', () => {
+                if (closed || watcher !== next) return;
+                fail();
+              });
+              const previous = watcher;
+              watcher = next;
+              previous?.close();
+              return;
+            } catch (error) {
+              const code = (error as NodeJS.ErrnoException).code;
+              const parent = dirname(candidate);
+              if ((code !== 'ENOENT' && code !== 'ENOTDIR') || parent === candidate) throw error;
+              candidate = parent;
+            }
           }
-          callback({ path, change, at });
-        });
-        watcher.on('error', () => ctx.logger.warn('asi-sense file watcher failed'));
-        return { close: () => watcher.close() };
+        };
+        attach();
+        return {
+          close: () => {
+            closed = true;
+            watcher.close();
+          },
+        };
       },
     },
   };

@@ -520,3 +520,18 @@ Regression tests:
 4. Disk aggregation and cache expiry: `aggregates disk parent from final volume deadlines after cached republishes` and `never revives an expired cached disk when its TTL metadata changes`.
 
 Tests are in `test/presenter/presenter.test.ts` unless otherwise noted. Rate signals retain their evaluation-time `at` and remaining ETA, alongside the observation `evidenceAt`; panel events project the evidence time to the display timeline, while current ETA remains anchored to the observation. Disk parent status and deadline reflect the final fresh-volume set; repeated cached volume timestamps cannot extend a volume's deadline. Collection-level `denied` and `unsupported` remain unchanged even with no volumes or an explicitly fresh volume, as covered by `preserves disk collection status %s with or without fresh volumes`.
+
+## DSH runtime regressions
+
+Pause and resume are serialized through resource changes and persistence; a failed
+save restores the preceding resource state. If rollback itself fails, further
+pause requests fail until restart rather than claiming an inconsistent state.
+File rules with an explicit subject require an absolute path. Missing roots are
+watched through their nearest existing directory, with unrelated events filtered,
+and switch to the root when it appears. A failing root reports `unavailable` as
+`files:<rule id>` without stopping other rules; a later rule refresh retries it.
+Agent-added rules are activated before saving, and failed activations are not saved.
+
+1. Pause ordering and failures: `serializes overlapping pause and resume transactions until resources and storage agree`; `recovers from a failed pause save before processing the next pause intent`; `restores the paused resources if saving a resume fails`; `rejects subsequent pause requests after rollback fails` (`test/runtime/runtime.test.ts`).
+2. Missing roots and restart: `watches the nearest existing ancestor, filters siblings, and switches when the target appears` (`test/dsh/local-ports.test.ts`); `restores a missing file root and observes it after creation and recreation`; `reports changes to an existing file root using the file path itself` (`test/dsh/file-restart.test.ts`).
+3. Rule isolation and commit: `isolates failed restored file rules and keeps other watches active`; `marks only the affected rule unavailable on an asynchronous watcher error`; `serializes a watcher error with later rule refresh and reports recovery`; `does not persist a file rule if validation or watch activation fails`; `does not save a newly staged rule when its watcher fails before commit`; `rechecks a staged watcher when its settings commit was queued`; `closes a staged watch when saving the new rule fails`; `closes staged watches when pausing during a pending rule save` (`test/runtime/runtime.test.ts`).

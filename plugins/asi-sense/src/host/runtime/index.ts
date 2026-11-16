@@ -9,7 +9,7 @@ import { createChanges, createStateListeners, observableActions, settleShutdown 
 import { FactExpiry } from './expiry.ts';
 import type { SenseActions, SenseOptions, SensePorts } from './ports.ts';
 import { Settings } from './settings.ts';
-import { runtimeTools } from './tools.ts';
+import { pauseAction, runtimeTools } from './tools.ts';
 
 export type { EventEntry, EventLog } from './attention.ts';
 export type * from './ports.ts';
@@ -159,28 +159,25 @@ export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}
         draft.rules = draft.rules.filter((rule) => rule.id !== id);
         draft.disabled = draft.disabled.filter((item) => item !== id);
       }),
-    pause: async (value) => {
-      const epoch = generation;
-      if (value && !paused) {
-        paused = true;
-        schedule();
-        await Promise.all([body.setPaused(true), files.refresh(), helper.stop()]);
-        check(epoch);
-      }
-      await settings.update((draft) => {
-        draft.paused = value;
-      });
-      check(epoch);
-      if (!value && paused) {
-        paused = false;
-        await body.setPaused(false);
-        check(epoch);
-        await files.refresh();
-        check(epoch);
-        helper.start(settings.sendTitles);
-        schedule();
-      }
-    },
+    pause: pauseAction(
+      settings,
+      isPaused,
+      async (value) => {
+        paused = value;
+        if (value) {
+          schedule();
+          await settleShutdown([body.setPaused(true), files.refresh(), helper.stop()]);
+        } else {
+          await body.setPaused(false);
+          check();
+          await files.refresh();
+          check();
+          helper.start(settings.sendTitles);
+          schedule();
+        }
+      },
+      check,
+    ),
     setSendTitles: async (enabled) => {
       const epoch = generation;
       const intent = ++titleIntent;
@@ -224,7 +221,7 @@ export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}
   };
   const guarded = guardActions(unguarded, () => generation, check);
   const actions = guarded.actions;
-  const tools = runtimeTools(attention, body, settings, actions, syncRules, check, () => allowTitles, changed);
+  const tools = runtimeTools(attention, body, settings, actions, files, syncRules, check, () => allowTitles, changed);
   function stop(): Promise<void> {
     if (stopping) return stopping;
     generation++;
