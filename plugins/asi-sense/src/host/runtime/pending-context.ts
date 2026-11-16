@@ -123,6 +123,16 @@ export class PendingContext {
     return evicted;
   }
 
+  refreshFeedback(available: (id: string) => boolean): void {
+    for (const kinds of this.subjects.values()) {
+      for (const entry of kinds.values()) {
+        const signal = entry.signal;
+        if (signal && typeof signal.data.feedbackAvailable === 'boolean')
+          signal.data.feedbackAvailable = available(signal.id);
+      }
+    }
+  }
+
   addBatch(batch: InjectBatch): void {
     for (const bucket of batch.buckets) {
       let kinds = this.subjects.get(bucket.subject);

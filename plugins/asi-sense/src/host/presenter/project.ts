@@ -138,7 +138,10 @@ export function projectEvents(
         at: evidenceAt ?? (entry.mono === undefined ? fromWall(entry.at) : at(entry.mono)),
         source: entry.source,
         subject: hidden ? '' : entry.subject,
-        data: evidenceAt === undefined ? {} : { evidenceAt },
+        data: {
+          ...(evidenceAt === undefined ? {} : { evidenceAt }),
+          ...(entry.feedbackAvailable === undefined ? {} : { feedbackAvailable: entry.feedbackAvailable }),
+        },
       },
       level:
         entry.reason === 'wake-budget' || entry.reason === 'no-session' || entry.reason === 'self-caused'

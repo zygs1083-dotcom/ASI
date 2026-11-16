@@ -14,6 +14,17 @@ function update(changes: EnvChange[], over: Partial<EnvUpdate> = {}): EnvUpdate 
 }
 
 describe('formatEnvUpdate', () => {
+  it('exposes a bounded escaped alert id only when feedback is available', () => {
+    const signal = sig({ id: 'alert<fixture>&"', kind: 'body.rate', at: T0, data: { feedbackAvailable: true } });
+    expect(formatEnvUpdate(update([change({ signal })]))).toContain(
+      'alertId="alert&lt;fixture&gt;&amp;&quot;" feedbackAvailable="true"',
+    );
+    signal.data.feedbackAvailable = false;
+    expect(formatEnvUpdate(update([change({ signal })]))).not.toContain('alertId=');
+    signal.id = 'x'.repeat(1_000);
+    signal.data.feedbackAvailable = true;
+    expect(formatEnvUpdate(update([change({ signal })]))).not.toContain('alertId=');
+  });
   it('renders a deterministic env-update block', () => {
     const u = update([
       change({

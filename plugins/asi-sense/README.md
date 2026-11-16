@@ -354,12 +354,21 @@ failed buckets migrate to the new session. Helper overflow marks helper
 facts stale; recovery applies all snapshot fields and concurrent deltas and
 keeps the source degraded if a required field is missing.
 
-`bodyTune` accepts only the parameters wired to `BodyMonitor`/`Tuner`:
+`bodyTune` accepts the parameters wired to `BodyMonitor`/`Tuner`:
 `floor.{disk,context,battery}.{warn,critical}`, `rate.disk.maxDelta`,
 `rate.rss.maxRatio`, `rate.context.maxEtaMs`, `anomaly.{cpu,memory,network}.sigma`,
-and `file.burst.{windowMs,maxChanges,maxDeleted}`. Unsupported parameters,
-including merge-window and delivery-level tuning, reject with
-`unsupported-param`; `envWatch` also rejects a tuning `param`. Rule changes
+`file.burst.{windowMs,maxChanges,maxDeleted}`, `mergeWindowMs` (1000–30000),
+`fileMergeWindowMs` (1000–60000), and `deliveryLevel.body.rate`,
+`deliveryLevel.body.anomaly`, `deliveryLevel.file.burst`. Window changes allow
+0.5–2 times the current value per AI operation; other numerical tuning retains
+the ±50% bound. Alert levels may be reduced to record or context but AI cannot
+raise them to wake. Built-in critical and imminent-exhaustion alerts are never
+downgraded, and separately approved user rules remain effective. Window changes
+shorten unattempted in-flight buckets to the earlier of their existing deadline
+and first receipt plus the new window, without extending or dropping them.
+Already attempted retries keep their deadline and payload; new buckets use the
+new window. Levels apply to subsequent signals, not already classified buckets.
+Unsupported parameters reject with `unsupported-param`; `envWatch` also rejects a tuning `param`. Rule changes
 remain available through `envWatch` with agent-proposed wake rules pending
 user approval. `bodyTune({ action: 'feedback', alertId, verdict })` and the
 trusted-user feedback action accept alerts registered by the runtime. The
@@ -649,10 +658,11 @@ republish and is not counted. Exposing per-metric acquisition generations or
 monotonic timestamps from body-probe is future work.
 
 Alert registration is persisted asynchronously after the alert is published.
-Its initial `feedbackAvailable` is conservatively `false`; queued and already
-delivered signals are not rewritten if registration later succeeds. Feedback
-is usable after successful registration, but the original signal does not
-reflect that later change; publishing updated availability is future work.
+Its initial `feedbackAvailable` is `false`; successful registration updates
+unattempted queued signals and the presenter, while already attempted deliveries
+retain their frozen payload. Registration failure, consumption and eviction
+leave feedback unavailable. Model updates include a bounded, escaped alert ID
+only when it can be used for feedback.
 
 Regression tests:
 

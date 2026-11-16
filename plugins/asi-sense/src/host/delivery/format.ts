@@ -82,6 +82,13 @@ function changeLines(ch: EnvChange, includeTitles: boolean): string[] {
     main = `${esc(s.kind)}: ${esc(s.subject)}`;
   }
   if (ch.ruleId) main += ` [rule: ${esc(ch.ruleId)} → ${ch.level}]`;
+  if (typeof s.data.feedbackAvailable === 'boolean') {
+    const available =
+      s.data.feedbackAvailable &&
+      Buffer.byteLength(s.id, 'utf8') <= 256 &&
+      [...s.id].every((char) => char >= ' ' && char !== '\x7f');
+    main += available ? ` alertId="${esc(s.id)}" feedbackAvailable="true"` : ' feedbackAvailable="false"';
+  }
   const lines = [main];
   if (ch.note) lines.push(`note: ${esc(ch.note)}`);
   return lines;

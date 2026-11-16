@@ -85,6 +85,9 @@ export class Tuner {
   get(param: string): TuningValue | undefined {
     return this.store.values.get(param);
   }
+  hasAlert(id: string): boolean {
+    return !this.closed && this.store.restored && !this.store.disabled && this.store.alerts.has(id);
+  }
   parameters = () => parameters(this.store);
   /** Positive finite numeric value, else the caller's fallback. */
   number(param: string, fallback: number): number {

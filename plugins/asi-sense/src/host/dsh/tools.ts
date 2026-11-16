@@ -98,11 +98,15 @@ export function createSenseTools(runtime: Runtime, now: () => number) {
     description:
       'Adjust an allowed monitoring parameter within safety limits, or mark an alert useful or noise. Locked parameters cannot be changed.',
     parameters: {
-      param: { type: 'string' },
+      param: {
+        type: 'string',
+        description:
+          'Parameter key, including mergeWindowMs, fileMergeWindowMs or deliveryLevel.<body.rate|body.anomaly|file.burst>.',
+      },
       to: { oneOf: [{ type: 'number' }, { type: 'string' }, { type: 'boolean' }] },
       reason: { type: 'string' },
       action: { type: 'string', enum: ['feedback'] },
-      alertId: { type: 'string' },
+      alertId: { type: 'string', description: 'Alert id from an environment update with feedbackAvailable=true.' },
       verdict: { type: 'string', enum: ['useful', 'noise'] },
     },
     output,

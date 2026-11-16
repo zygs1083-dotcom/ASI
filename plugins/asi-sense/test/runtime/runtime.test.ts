@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { DeliveryFailure } from '../../src/host/attention/drain.ts';
 import { DEFAULT_RULES } from '../../src/host/attention/rules.ts';
 import { defaultBodyRules } from '../../src/host/body/index.ts';
+import { createPresenter } from '../../src/host/presenter/index.ts';
 import { createSenseRuntime } from '../../src/host/runtime/index.ts';
 import type {
   AgentEvent,
@@ -1309,7 +1310,153 @@ describe('host runtime', () => {
   it('rejects unsupported tuning parameters explicitly', async () => {
     const h = harness();
     await h.runtime.start();
-    await expect(h.runtime.tools.bodyTune({ param: 'mergeWindowMs', to: 1_000 })).rejects.toThrow('unsupported-param');
+    await expect(h.runtime.tools.bodyTune({ param: 'not-a-parameter', to: 1_000 })).rejects.toThrow(
+      'unsupported-param',
+    );
+    await h.runtime.stop();
+  });
+
+  it('applies, guards and reverts merge windows and delivery levels', async () => {
+    const h = harness();
+    await h.runtime.start();
+    await h.agent({ type: 'created', sessionId: 's' });
+    await h.agent({ type: 'pre-step', sessionId: 's' });
+    await h.agent({ type: 'post-step', sessionId: 's' });
+    await h.job({ type: 'exited', id: 'pending', exitCode: 1 });
+    await h.advance(500);
+    const window = await h.runtime.tools.bodyTune({ param: 'mergeWindowMs', to: 1_000 });
+    expect(window).toMatchObject({ applied: true, change: { from: 2_000, to: 1_000 } });
+    await h.advance(500);
+    expect(h.delivered).toHaveLength(1);
+    expect(await h.runtime.tools.bodyTune({ param: 'fileMergeWindowMs', to: 999 })).toMatchObject({
+      applied: false,
+      reason: 'out of bounds',
+    });
+    expect(await h.runtime.tools.bodyTune({ param: 'fileMergeWindowMs', to: 60_001 })).toMatchObject({
+      applied: false,
+      reason: 'out of bounds',
+    });
+    expect(await h.runtime.tools.bodyTune({ param: 'fileMergeWindowMs', to: 10_001 })).toMatchObject({
+      applied: false,
+    });
+    expect(await h.runtime.tools.bodyTune({ param: 'fileMergeWindowMs', to: 10_000 })).toMatchObject({ applied: true });
+    expect(await h.runtime.tools.bodyTune({ param: 'deliveryLevel.body.rate', to: 'wake' })).toMatchObject({
+      applied: false,
+    });
+    expect(await h.runtime.tools.bodyTune({ param: 'deliveryLevel.body.rate', to: 'record' })).toMatchObject({
+      applied: true,
+    });
+    expect(await h.runtime.tools.bodyTune({ param: 'deliveryLevel.file.burst', to: 'record' })).toMatchObject({
+      applied: true,
+    });
+    expect(await h.runtime.tools.bodyTune({ param: 'deliveryLevel.file.burst', to: 'wake' })).toMatchObject({
+      applied: false,
+    });
+    await h.runtime.actions.revertTuning(window.change.id);
+    expect(h.runtime.body.tuner.get('mergeWindowMs')).toBe(2_000);
+    await h.runtime.stop();
+  });
+
+  it('restores tuning and migrates the exact previous whitelist without losing locks or quotas', async () => {
+    let saved: string | undefined;
+    const storage = {
+      load: async (key: string) => (key === 'body' ? saved : undefined),
+      save: async (key: string, value: string) => {
+        if (key === 'body') saved = value;
+      },
+    };
+    const first = harness();
+    Object.assign(first.ports.storage, storage);
+    await first.runtime.start();
+    await first.runtime.tools.bodyTune({ param: 'rate.rss.maxRatio', to: 0.6 });
+    await first.runtime.tools.bodyTune({ param: 'rate.rss.maxRatio', to: 0.7 });
+    await first.runtime.actions.lockParam('floor.disk.warn', true);
+    await first.runtime.stop();
+    if (!saved) throw new Error('missing snapshot');
+    const legacy = JSON.parse(saved);
+    const tuner = JSON.parse(legacy.tuner);
+    tuner.values = tuner.values.filter(
+      ([key]: [string, unknown]) =>
+        key !== 'mergeWindowMs' && key !== 'fileMergeWindowMs' && !key.startsWith('deliveryLevel.'),
+    );
+    legacy.tuner = JSON.stringify(tuner);
+    saved = JSON.stringify(legacy);
+    const restored = harness();
+    Object.assign(restored.ports.storage, storage);
+    await restored.runtime.start();
+    expect(restored.runtime.body.tuner.tuningDisabled).toBeUndefined();
+    expect(restored.runtime.body.tuner.get('mergeWindowMs')).toBe(2_000);
+    expect(restored.runtime.body.tuner.get('rate.rss.maxRatio')).toBe(0.7);
+    expect(await restored.runtime.tools.bodyTune({ param: 'rate.rss.maxRatio', to: 0.8 })).toMatchObject({
+      reason: 'hourly change limit',
+    });
+    expect(await restored.runtime.tools.bodyTune({ param: 'floor.disk.warn', to: 0.11 })).toMatchObject({
+      reason: 'param locked',
+    });
+    const applied = await restored.runtime.tools.bodyTune({ param: 'mergeWindowMs', to: 4_000 });
+    const level = await restored.runtime.tools.bodyTune({ param: 'deliveryLevel.body.rate', to: 'record' });
+    expect(applied.applied && level.applied).toBe(true);
+    await restored.runtime.stop();
+    const restarted = harness();
+    Object.assign(restarted.ports.storage, storage);
+    await restarted.runtime.start();
+    expect(restarted.runtime.body.tuner.get('mergeWindowMs')).toBe(4_000);
+    expect(restarted.runtime.body.tuner.get('deliveryLevel.body.rate')).toBe('record');
+    await restarted.agent({ type: 'created', sessionId: 'restored' });
+    await restarted.agent({ type: 'pre-step', sessionId: 'restored' });
+    await restarted.agent({ type: 'post-step', sessionId: 'restored' });
+    await restarted.job({ type: 'exited', id: 'restored-job', exitCode: 1 });
+    await restarted.advance(3_999);
+    expect(restarted.delivered).toHaveLength(0);
+    await restarted.advance(1);
+    expect(restarted.delivered).toHaveLength(1);
+    await restarted.runtime.actions.revertTuning(applied.change.id);
+    expect(restarted.runtime.body.tuner.get('mergeWindowMs')).toBe(2_000);
+    await restarted.runtime.stop();
+  });
+
+  it('fails closed for incomplete legacy and partially migrated tuning snapshots', async () => {
+    let saved: string | undefined;
+    const storage = {
+      load: async (key: string) => (key === 'body' ? saved : undefined),
+      save: async (key: string, value: string) => {
+        if (key === 'body') saved = value;
+      },
+    };
+    const first = harness();
+    Object.assign(first.ports.storage, storage);
+    await first.runtime.start();
+    await first.runtime.stop();
+    if (!saved) throw new Error('missing snapshot');
+    const valid = saved;
+    for (const missing of ['rate.rss.maxRatio', 'fileMergeWindowMs']) {
+      const body = JSON.parse(valid);
+      const tuner = JSON.parse(body.tuner);
+      tuner.values = tuner.values.filter(([key]: [string, unknown]) => key !== missing);
+      body.tuner = JSON.stringify(tuner);
+      saved = JSON.stringify(body);
+      const restored = harness();
+      Object.assign(restored.ports.storage, storage);
+      await restored.runtime.start();
+      expect(restored.runtime.body.tuner.tuningDisabled).toBe('restore-failed');
+      await restored.runtime.stop();
+    }
+  });
+
+  it('does not change the active deadline before a tuning save succeeds', async () => {
+    const h = harness();
+    await h.runtime.start();
+    await h.agent({ type: 'created', sessionId: 's' });
+    await h.agent({ type: 'pre-step', sessionId: 's' });
+    await h.agent({ type: 'post-step', sessionId: 's' });
+    await h.job({ type: 'exited', id: 'pending-save', exitCode: 1 });
+    h.failSave(true);
+    await expect(h.runtime.tools.bodyTune({ param: 'mergeWindowMs', to: 1_000 })).rejects.toThrow('uninstalled');
+    await h.advance(1_000);
+    expect(h.delivered).toHaveLength(0);
+    h.failSave(false);
+    await h.advance(1_000);
+    expect(h.delivered).toHaveLength(1);
     await h.runtime.stop();
   });
 
@@ -1537,6 +1684,82 @@ describe('host runtime', () => {
       .flatMap((intent) => intent.update.changes)
       .find((change) => change.signal.kind === 'body.rate');
     expect(alert?.signal.data.feedbackAvailable).toBe(false);
+    await h.runtime.stop();
+  });
+
+  it('publishes successful registration to a queued alert and the presenter', async () => {
+    const h = harness();
+    await h.runtime.start();
+    let release!: () => void;
+    const blocked = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const register = h.runtime.body.tuner.registerAlert.bind(h.runtime.body.tuner);
+    h.runtime.body.tuner.registerAlert = async (...args) => {
+      await blocked;
+      return register(...args);
+    };
+    const presenter = createPresenter(h.runtime, { clock: h.ports.clock });
+    const rss = (value: number) => ({ ...f({ rss: value, cpu: 0, uptimeSec: 1 }), observedAt: Date.now() });
+    await h.sample(mkBody({ harnessProcess: rss(100) }));
+    await h.advance(5_000);
+    await h.sample(mkBody({ harnessProcess: rss(200) }));
+    const alert = h.runtime.events().find((event) => event.kind === 'body.rate');
+    if (!alert) throw new Error('missing alert');
+    expect(
+      presenter.snapshot().events.find((event) => event.signal.id === alert.id)?.signal.data.feedbackAvailable,
+    ).toBe(false);
+    release();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(
+      presenter.snapshot().events.find((event) => event.signal.id === alert.id)?.signal.data.feedbackAvailable,
+    ).toBe(true);
+    await h.agent({ type: 'created', sessionId: 's' });
+    await h.agent({ type: 'pre-step', sessionId: 's' });
+    expect(
+      h.delivered.flatMap((intent) => intent.update.changes).find((change) => change.signal.id === alert.id)?.signal
+        .data.feedbackAvailable,
+    ).toBe(true);
+    expect(await h.runtime.tools.bodyTune({ action: 'feedback', alertId: alert.id, verdict: 'useful' })).toMatchObject({
+      applied: true,
+    });
+    expect(
+      presenter.snapshot().events.find((event) => event.signal.id === alert.id)?.signal.data.feedbackAvailable,
+    ).toBe(false);
+    presenter.close();
+    await h.runtime.stop();
+  });
+
+  it('does not rewrite a failed alert delivery when registration finishes later', async () => {
+    const h = harness();
+    const attempts: Parameters<DshPort['deliver']>[1][] = [];
+    h.ports.dsh.deliver = async (_session, intent) => {
+      attempts.push(structuredClone(intent));
+      if (attempts.length === 1) throw new Error('offline');
+    };
+    await h.runtime.start();
+    await h.agent({ type: 'created', sessionId: 's' });
+    await h.agent({ type: 'pre-step', sessionId: 's' });
+    let release!: () => void;
+    const blocked = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const register = h.runtime.body.tuner.registerAlert.bind(h.runtime.body.tuner);
+    h.runtime.body.tuner.registerAlert = async (...args) => {
+      await blocked;
+      return register(...args);
+    };
+    const rss = (value: number) => ({ ...f({ rss: value, cpu: 0, uptimeSec: 1 }), observedAt: Date.now() });
+    await h.sample(mkBody({ harnessProcess: rss(100) }));
+    await h.advance(5_000);
+    await h.sample(mkBody({ harnessProcess: rss(200) }));
+    await expect(h.agent({ type: 'pre-step', sessionId: 's' })).rejects.toThrow('offline');
+    expect(attempts[0]?.update.changes[0]?.signal.data.feedbackAvailable).toBe(false);
+    release();
+    await vi.advanceTimersByTimeAsync(0);
+    await h.advance(1_000);
+    await h.agent({ type: 'pre-step', sessionId: 's' });
+    expect(attempts[1]).toEqual(attempts[0]);
     await h.runtime.stop();
   });
 });

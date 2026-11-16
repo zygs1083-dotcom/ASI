@@ -54,9 +54,9 @@ export interface AttentionPipelineOptions {
    */
   wallClock?: () => number;
   rules?: WatchRule[];
-  /** Fixed merge window for non-file signals. @default 2000 */
+  /** Initial merge window for non-file signals. @default 2000 */
   mergeWindowMs?: number;
-  /** Fixed merge window for `file.changed`. @default 5000 */
+  /** Initial merge window for `file.changed`. @default 5000 */
   fileMergeWindowMs?: number;
 }
 

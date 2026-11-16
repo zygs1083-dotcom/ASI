@@ -5,9 +5,10 @@ import type { StateStore } from '../state/store.ts';
 import { BucketDrain } from './drain.ts';
 import type { InjectBatch } from './drain-transfer.ts';
 import type { AttentionPipelineOptions, SessionContext, SessionState } from './pipeline-types.ts';
-import { DEFAULT_RULES, isRuleApproved, selectRule, validateRule } from './rules.ts';
+import { DEFAULT_RULES, isRuleApproved, validateRule } from './rules.ts';
 import { classifyCause } from './selfcause.ts';
 import { sourceMarkSeen } from './source-mark.ts';
+import { type AlertLevels, tunedRule } from './tuning.ts';
 
 export type {
   AttentionPipelineOptions,
@@ -41,8 +42,9 @@ export class AttentionPipeline {
   private readonly clock: () => number;
   private readonly wallClock: () => number;
   private readonly rules: WatchRule[];
-  private readonly mergeWindowMs: number;
-  private readonly fileMergeWindowMs: number;
+  private mergeWindowMs: number;
+  private fileMergeWindowMs: number;
+  private levels: AlertLevels = { 'body.rate': 'context', 'body.anomaly': 'context', 'file.burst': 'wake' };
   private readonly sessions = new Map<string, SessionState>();
   private readonly disposed = new Map<string, number>();
   /**
@@ -91,6 +93,33 @@ export class AttentionPipeline {
   /** Cumulative count of wake groups suppressed by the budget. */
   get suppressed(): number {
     return this.drain.suppressed;
+  }
+  setMergeWindows(mergeWindowMs: number, fileMergeWindowMs: number): void {
+    if (
+      !Number.isFinite(mergeWindowMs) ||
+      mergeWindowMs <= 0 ||
+      !Number.isFinite(fileMergeWindowMs) ||
+      fileMergeWindowMs <= 0
+    )
+      throw new TypeError('merge windows must be positive finite numbers');
+    this.mergeWindowMs = mergeWindowMs;
+    this.fileMergeWindowMs = fileMergeWindowMs;
+    this.drain.setMergeWindows(mergeWindowMs, fileMergeWindowMs);
+  }
+  setDeliveryLevels(levels: AlertLevels): void {
+    if (
+      !['record', 'context'].includes(levels['body.rate']) ||
+      !['record', 'context'].includes(levels['body.anomaly']) ||
+      !['record', 'context', 'wake'].includes(levels['file.burst'])
+    )
+      throw new TypeError('invalid alert delivery levels');
+    this.levels = { ...levels };
+  }
+  selectRule(signal: Signal, rules: readonly WatchRule[] = this.rules): WatchRule | undefined {
+    return tunedRule(rules, signal, this.wallClock(), this.levels);
+  }
+  refreshFeedback(available: (id: string) => boolean): void {
+    this.drain.refreshFeedback(available);
   }
 
   /** Updates the latest context for a session (e.g. busy flag) without a signal. */
@@ -203,7 +232,7 @@ export class AttentionPipeline {
       if (ev.cause === 'agent') {
         change.reason = 'self-caused';
       } else {
-        const rule = selectRule(this.rules, ev, this.wallClock());
+        const rule = this.selectRule(ev);
         if (other) ev.kind = 'other';
         let level: DeliveryLevel = rule?.level ?? 'record';
         let reason: string | undefined;

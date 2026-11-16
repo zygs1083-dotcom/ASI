@@ -10,6 +10,7 @@ import {
   Tuner,
 } from '../body/index.ts';
 import { captureRateTimes, type RateTimes } from '../body/rate.ts';
+import { migrateTuningSnapshot } from '../body/tuning-migration.ts';
 import type { RuntimeAttention } from '../runtime/attention.ts';
 import type { FactExpiry } from '../runtime/expiry.ts';
 import type { Clock, DshPort, ProbeFactory, StoragePort } from '../runtime/ports.ts';
@@ -34,6 +35,13 @@ const specs: Record<string, ParameterSpec> = {
       ]),
     ),
   ),
+};
+const attentionSpecs: Record<string, ParameterSpec> = {
+  mergeWindowMs: { value: 2_000, min: 1_000, max: 30_000 },
+  fileMergeWindowMs: { value: 5_000, min: 1_000, max: 60_000 },
+  'deliveryLevel.body.rate': { value: 'context', choices: ['record', 'context'] },
+  'deliveryLevel.body.anomaly': { value: 'context', choices: ['record', 'context'] },
+  'deliveryLevel.file.burst': { value: 'wake', choices: ['record', 'context', 'wake'] },
 };
 
 export class BodySource {
@@ -73,17 +81,26 @@ export class BodySource {
       (fact) => this.write('tokens', fact),
       changed,
     );
-    this.tuner = new Tuner(specs, {
-      actor: () => this.identity.getStore() ?? 'agent',
-      clock: () => clock.mono(),
-      wallClock: () => clock.wall(),
-      onChange: changed,
-    });
+    this.tuner = new Tuner(
+      { ...specs, ...attentionSpecs },
+      {
+        actor: () => this.identity.getStore() ?? 'agent',
+        clock: () => clock.mono(),
+        wallClock: () => clock.wall(),
+        onChange: () => {
+          this.syncAttention();
+          changed();
+        },
+      },
+    );
     this.monitor = new BodyMonitor({
       tuner: this.tuner,
       clock: () => clock.mono(),
       wallClock: () => clock.wall(),
-      persistence: { load: () => storage.load('body'), save: (value) => storage.save('body', value) },
+      persistence: {
+        load: async () => migrateTuningSnapshot(await storage.load('body'), specs, attentionSpecs),
+        save: (value) => storage.save('body', value),
+      },
     });
   }
   async start(intervalMs: number): Promise<void> {
@@ -92,6 +109,7 @@ export class BodySource {
       await this.monitor.close();
       return;
     }
+    this.syncAttention();
     this.state = this.monitor.restoredState ?? {};
     this.off = this.probe.onSample((body) => {
       const at = this.clock.wall();
@@ -116,6 +134,18 @@ export class BodySource {
   }
   sync(): void {
     this.state = this.monitor.restoredState ?? this.state;
+  }
+  private syncAttention(): void {
+    if (this.stopped) return;
+    const pipeline = this.attention.pipeline;
+    pipeline.setMergeWindows(this.tuner.number('mergeWindowMs', 2_000), this.tuner.number('fileMergeWindowMs', 5_000));
+    pipeline.setDeliveryLevels({
+      'body.rate': this.tuner.get('deliveryLevel.body.rate') as 'record' | 'context',
+      'body.anomaly': this.tuner.get('deliveryLevel.body.anomaly') as 'record' | 'context',
+      'file.burst': this.tuner.get('deliveryLevel.file.burst') as 'record' | 'context' | 'wake',
+    });
+    this.attention.refreshFeedback((id) => this.tuner.hasAlert(id));
+    this.attention.rescheduleDelivery();
   }
   sessionsChanged(present: boolean): void {
     this.tokenFacts.sessionsChanged(present);
@@ -268,7 +298,7 @@ export class BodySource {
         : rules.find((rule) => rule.id === id)?.param;
     if (typeof id === 'string' && param && signal.data.severity !== 'normal' && signal.cause !== 'agent') {
       void this.tuner.registerAlert(signal.id, id, param).then(
-        () => this.changed(),
+        () => this.syncAttention(),
         () =>
           this.attention.accept({
             id: this.attention.id(),
