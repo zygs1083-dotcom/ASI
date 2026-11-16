@@ -34,6 +34,9 @@ function renderPanel(model: SensePanelModel, over: Partial<SensePanelProps> = {}
     onRevertTuning: vi.fn(),
     onLockParam: vi.fn(),
     onFeedback: vi.fn(),
+    onResumeTuning: vi.fn(async () => {}),
+    onResetTuning: vi.fn(async () => {}),
+    onAcceptRebaseline: vi.fn(async (_id: string) => {}),
     ...over,
   }
   const view = render(<SensePanel {...props} />)

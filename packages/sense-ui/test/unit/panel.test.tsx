@@ -27,6 +27,9 @@ function makeProps(model: SensePanelModel, over: Partial<SensePanelProps> = {}) 
     onRevertTuning: vi.fn(),
     onLockParam: vi.fn(),
     onFeedback: vi.fn(),
+    onResumeTuning: vi.fn(async () => {}),
+    onResetTuning: vi.fn(async () => {}),
+    onAcceptRebaseline: vi.fn(async (_id: string) => {}),
     ...over,
   }
   return props

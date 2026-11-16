@@ -62,7 +62,7 @@ export function App() {
           >
             {SCENARIOS.map((s) => (
               <option key={s} value={s}>
-                {s}
+                {s === 'rebaseline-suggested' ? '重新基线建议' : s}
               </option>
             ))}
           </select>
@@ -136,6 +136,7 @@ export function App() {
               return {
                 ...m,
                 tuning: {
+                  ...m.tuning,
                   parameters: m.tuning.parameters.map((p) =>
                     p.key === entry.paramKey ? { ...p, value: entry.previous } : p,
                   ),
@@ -155,6 +156,30 @@ export function App() {
               ),
             }))
             act(`反馈${value === 'useful' ? '有用' : '噪音'} ${signalId}`)
+          }}
+          onResumeTuning={async () => {
+            setModel((m) => ({
+              ...m,
+              tuning: m.tuning && { ...m.tuning, disabled: undefined },
+            }))
+            act('恢复 AI 调参')
+          }}
+          onResetTuning={async () => {
+            setModel((m) => ({
+              ...m,
+              tuning: m.tuning && { parameters: [], log: [] },
+            }))
+            act('重置调参')
+          }}
+          onAcceptRebaseline={async (id) => {
+            setModel((m) => ({
+              ...m,
+              tuning: m.tuning && {
+                ...m.tuning,
+                suggestions: m.tuning.suggestions?.filter((s) => s.id !== id),
+              },
+            }))
+            act(`确认重新基线 ${id}`)
           }}
         />
       </main>

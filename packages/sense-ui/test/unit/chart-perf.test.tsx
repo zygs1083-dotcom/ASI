@@ -34,6 +34,9 @@ function makeProps(model: SensePanelModel): SensePanelProps {
     onRevertTuning: vi.fn(),
     onLockParam: vi.fn(),
     onFeedback: vi.fn(),
+    onResumeTuning: vi.fn(async () => {}),
+    onResetTuning: vi.fn(async () => {}),
+    onAcceptRebaseline: vi.fn(async (_id: string) => {}),
   }
 }
 
