@@ -9,6 +9,7 @@ import {
   upsertBucket,
 } from './buckets.ts';
 import {
+  batchIntent,
   confirmBatch,
   type DrainHooks,
   deliveryId,
@@ -85,10 +86,11 @@ export class BucketDrain {
     return batches;
   }
   restore(sessionId: string, batch: InjectBatch): void {
-    const next = this.buildInjectBatch(sessionId, batch.buckets, batch.intent.update.at);
+    const old = batch.intent.sessionId;
+    const next = this.buildInjectBatch(old, batch.buckets, batch.intent.update.at);
     next.aliases = [...(batch.aliases ?? []), ...(batch.intent.deliveryId ? [batch.intent.deliveryId] : [])];
-    for (const bucket of next.buckets) bucket.sessionId = sessionId;
-    this.list(this.batches, sessionId).push(next);
+    this.list(this.batches, old).push(next);
+    if (old !== sessionId) this.retarget(sessionId);
   }
   /** Enqueues one classified signal into its session+subject merge window. */
   enqueue(
@@ -229,7 +231,7 @@ export class BucketDrain {
       intent = { kind: 'followup', sessionId: b.sessionId, update };
     }
     intent.deliveryId = deliveryId(b.sessionId, [b]);
-    await this.deliverer.deliver(structuredClone(intent));
+    await this.deliverer.deliver(batchIntent({ buckets: [b], intent }));
     s?.wakeTimes.push(this.clock());
   }
   /**
@@ -256,7 +258,7 @@ export class BucketDrain {
       if (attempted.has(batch)) continue;
       attempted.add(batch);
       try {
-        await this.deliverer.deliver(structuredClone(batch.intent));
+        await this.deliverer.deliver(batchIntent(batch));
       } catch (e) {
         if (!(e instanceof DeliveryFailure) || e.cause !== undefined)
           errors.push(e instanceof DeliveryFailure ? e.cause : e);

@@ -5,6 +5,7 @@ import { Session, SessionId } from '@deepseek-ai/dsh-session';
 import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection';
 import { describe, expect, it, onTestFinished, vi } from 'vitest';
 import { createDshPort } from '../../src/host/dsh/port.ts';
+import { projectEvents } from '../../src/host/presenter/project.ts';
 import { RuntimeAttention } from '../../src/host/runtime/attention.ts';
 import { FactExpiry } from '../../src/host/runtime/expiry.ts';
 import type { AgentEvent } from '../../src/host/runtime/ports.ts';
@@ -268,18 +269,24 @@ describe('DSH agent port', () => {
 });
 
 describe('uncommitted context routing', () => {
-  async function routing() {
+  async function routing(wake = false, offline = 0) {
     const { ctx, agent: a, port } = await fixture();
     const bId = SessionId('synthetic-session-b');
-    const b = { ...a, id: bId, session: Session.create(bId) };
-    const clock = { wall: () => 1000, mono: () => 1000 };
+    const b = { ...a, id: bId, session: Session.create(bId), send: vi.fn(), followup: vi.fn() };
+    let now = 1000;
+    const clock = { wall: () => now, mono: () => now };
+    const changed = vi.fn();
     const attention = new RuntimeAttention(
       clock,
       port,
-      () => [{ id: 'ctx', match: { kind: 'app.activated' }, level: 'context', createdBy: 'user', approved: true }],
+      () => [
+        { id: 'ctx', match: { kind: 'app.activated' }, level: 'context', createdBy: 'user', approved: true },
+        { id: 'wake', match: { kind: 'job.exited' }, level: 'wake', createdBy: 'user', approved: true },
+        { id: 'wake2', match: { kind: 'job.failed' }, level: 'wake', createdBy: 'user', approved: true },
+      ],
       () => {},
       () => true,
-      () => {},
+      changed,
       new FactExpiry(clock),
     );
     let abort: AbortController | undefined;
@@ -292,6 +299,7 @@ describe('uncommitted context routing', () => {
         abort = undefined;
       }
     });
+    for (let i = 1; i <= offline; i++) await attention.accept({ ...sample, id: `offline-${i}` });
     const unregisterA = await ctx.agents.register(a);
     const unregisterB = await ctx.agents.register(b);
     onTestFinished(async () => {
@@ -301,13 +309,13 @@ describe('uncommitted context routing', () => {
       await unregisterB();
     });
     const user = createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text: 'fixture' }] });
-    const step = async (agent: Agent, controller = new AbortController()) => {
+    const step = async (agent: Agent, controller = new AbortController(), userInitiated = true) => {
       const decision = await agentEvents(ctx, agent).waterfall(
         'agent/pre-step',
         {
           turn: 1,
           step: 1,
-          messages: [user],
+          messages: userInitiated ? [user] : [],
           signal: controller.signal,
           modelSelection: { provider: 'x', model: 'x' },
         },
@@ -316,18 +324,23 @@ describe('uncommitted context routing', () => {
       if (decision.kind !== 'enter') throw new Error('expected an entered step');
       return decision;
     };
-    await step(a);
-    await attention.accept(sample);
+    const initial = await step(a);
+    if (!wake) await attention.accept(sample);
     return {
       ctx,
       a,
       b,
       attention,
+      changed,
       step,
-      cancel: async () => {
+      initial,
+      advance: (ms: number) => {
+        now += ms;
+      },
+      cancel: async (agent: Agent = a) => {
         const controller = new AbortController();
         abort = controller;
-        return step(a, controller);
+        return step(agent, controller, false);
       },
       unregisterA,
     };
@@ -359,8 +372,10 @@ describe('uncommitted context routing', () => {
     await h.unregisterA();
     const message = result.messages[1];
     if (!message) throw new Error('missing context message');
+    expect(h.attention.events().find((item) => item.id === sample.id)?.level).toBe('record');
     const event = h.a.session.append('user/message', message, { surfaceOp: 'append' });
     h.ctx.emit('session/event', h.a.session, event);
+    expect(h.attention.events().find((item) => item.id === sample.id)?.level).toBe('context');
     expect((await h.step(h.b)).messages).toHaveLength(1);
   });
 
@@ -383,5 +398,192 @@ describe('uncommitted context routing', () => {
     await h.cancel();
     await h.unregisterA();
     expect((await h.step(h.b)).messages).toHaveLength(201);
+  });
+
+  it.each([false, true])(
+    'rechecks a cancelled budget downgrade for the target session after dispose=%s',
+    async (dispose) => {
+      const h = await routing(true);
+      const wake = (id: string) => ({ ...sample, id, kind: 'job.exited', subject: id });
+      h.attention.postStep(h.a.id);
+      await h.attention.accept(wake('first'));
+      h.advance(2000);
+      await h.attention.flush();
+      expect(h.a.followup).toHaveBeenCalledTimes(1);
+      await h.attention.accept(wake('second'));
+      h.advance(2000);
+      await h.attention.flush();
+      expect(h.attention.pipeline.suppressed).toBe(1);
+      expect((await h.cancel()).messages).toHaveLength(1);
+      if (dispose) await h.unregisterA();
+      const next = await h.step(h.b, undefined, false);
+      expect(next.messages).toHaveLength(1);
+      expect(h.b.send).toHaveBeenCalledTimes(1);
+      expect(h.attention.events().find((entry) => entry.id === 'second')).toMatchObject({ reason: 'agent-busy' });
+      expect(h.attention.pipeline.suppressed).toBe(0);
+      await h.attention.accept(wake('third'));
+      h.advance(2000);
+      await h.attention.flush();
+      expect(h.attention.pipeline.suppressed).toBe(1);
+      expect((await h.step(h.b, undefined, false)).messages).toHaveLength(2);
+    },
+  );
+
+  it('records confirmed inject outcomes, not cancelled or transferred attempts', async () => {
+    const h = await routing(true);
+    const wake = (id: string) => ({ ...sample, id, kind: 'job.exited', subject: id });
+    const projected = (id: string) =>
+      projectEvents(
+        h.attention.events(),
+        true,
+        (at) => at,
+        (at) => at,
+      ).find((event) => event.signal.id === id);
+    const commit = (agent: Agent, message: Awaited<ReturnType<typeof h.step>>['messages'][number] | undefined) => {
+      if (!message) throw new Error('missing staged message');
+      const event = agent.session.append('user/message', message, { surfaceOp: 'append' });
+      h.ctx.emit('session/event', agent.session, event);
+    };
+    h.attention.postStep(h.a.id);
+    await h.attention.accept(wake('first'));
+    h.advance(2000);
+    await h.attention.flush();
+    await h.attention.accept(wake('suppressed'));
+    await h.attention.accept({ ...wake('suppressed-merged'), subject: 'suppressed' });
+    h.advance(2000);
+    await h.attention.flush();
+    expect((await h.cancel()).messages).toHaveLength(1);
+    expect(projected('suppressed')).toMatchObject({ level: 'record', reason: '' });
+    const staged = await h.step(h.a, undefined, false);
+    expect(projected('suppressed')).toMatchObject({ level: 'record', reason: '' });
+    h.changed.mockClear();
+    commit(h.a, staged.messages[1]);
+    expect(projected('suppressed')).toMatchObject({ level: 'suppressed', reason: 'wake-budget' });
+    expect(projected('suppressed-merged')).toMatchObject({ level: 'suppressed', reason: 'wake-budget' });
+    expect(h.changed).toHaveBeenCalled();
+
+    await h.attention.accept({ ...sample, id: 'context' });
+    await h.attention.accept({ ...sample, id: 'context-merged' });
+    expect(projected('context')?.level).not.toBe('context');
+    expect(projected('context-merged')?.level).not.toBe('context');
+    expect((await h.cancel()).messages).toHaveLength(1);
+    expect(projected('context')?.level).not.toBe('context');
+    const transferred = await h.step(h.b, undefined, false);
+    expect(projected('context')?.level).not.toBe('context');
+    h.changed.mockClear();
+    commit(h.b, transferred.messages[1]);
+    expect(projected('context')).toMatchObject({ level: 'context' });
+    expect(projected('context-merged')).toMatchObject({ level: 'context' });
+    expect(h.changed).toHaveBeenCalled();
+  });
+
+  it('confirms a transferred wake against an already-spent target budget', async () => {
+    const h = await routing(true);
+    const wake = (id: string) => ({ ...sample, id, kind: 'job.exited', subject: id });
+    await h.step(h.b, undefined, false);
+    h.attention.postStep(h.b.id);
+    await h.attention.accept(wake('budget-b'));
+    h.advance(2000);
+    await h.attention.flush();
+    await h.step(h.a, undefined, false);
+    h.attention.postStep(h.a.id);
+    await h.attention.accept(wake('budget-a'));
+    h.advance(2000);
+    await h.attention.flush();
+    await h.attention.accept(wake('transferred'));
+    h.advance(2000);
+    await h.attention.flush();
+    await h.cancel();
+    await h.unregisterA();
+    const staged = await h.step(h.b, undefined, false);
+    expect(staged.messages).toHaveLength(2);
+    expect(h.attention.pipeline.suppressed).toBe(1);
+    expect(h.attention.events().find((entry) => entry.id === 'transferred')).toMatchObject({ level: 'record' });
+    h.changed.mockClear();
+    const message = staged.messages[1];
+    if (!message) throw new Error('missing staged message');
+    const event = h.b.session.append('user/message', message, { surfaceOp: 'append' });
+    h.ctx.emit('session/event', h.b.session, event);
+    const projected = projectEvents(
+      h.attention.events(),
+      true,
+      (at) => at,
+      (at) => at,
+    );
+    expect(projected.find((item) => item.signal.id === 'transferred')).toMatchObject({
+      level: 'suppressed',
+      reason: 'wake-budget',
+    });
+    expect(h.changed).toHaveBeenCalled();
+  });
+
+  it('restores all kinds of a budget-suppressed group as one target wake', async () => {
+    const h = await routing(true);
+    h.attention.postStep(h.a.id);
+    await h.attention.accept({ ...sample, id: 'first', kind: 'job.exited' });
+    h.advance(2000);
+    await h.attention.flush();
+    await h.attention.accept({ ...sample, id: 'second', kind: 'job.exited', subject: 'group' });
+    await h.attention.accept({ ...sample, id: 'third', kind: 'job.failed', subject: 'group' });
+    h.advance(2000);
+    await h.attention.flush();
+    expect(h.attention.pipeline.suppressed).toBe(1);
+    await h.cancel();
+    await h.unregisterA();
+    await h.step(h.b, undefined, false);
+    expect(h.b.send).toHaveBeenCalledTimes(1);
+    const message = vi.mocked(h.b.send).mock.calls[0]?.[0];
+    expect(JSON.stringify(message)).toContain('job: `group` exited');
+    expect(JSON.stringify(message)).toContain('job.failed');
+    expect(h.attention.pipeline.suppressed).toBe(0);
+  });
+
+  it('keeps the budget downgrade when a disposed session is restored under the same id', async () => {
+    const h = await routing(true);
+    h.attention.postStep(h.a.id);
+    await h.attention.accept({ ...sample, id: 'first', kind: 'job.exited' });
+    h.advance(2000);
+    await h.attention.flush();
+    await h.attention.accept({ ...sample, id: 'second', kind: 'job.exited' });
+    h.advance(2000);
+    await h.attention.flush();
+    await h.cancel();
+    await h.unregisterA();
+    const unregister = await h.ctx.agents.register(h.a);
+    onTestFinished(unregister);
+    const result = await h.step(h.a, undefined, false);
+    expect(result.messages).toHaveLength(2);
+    expect(h.a.followup).toHaveBeenCalledTimes(1);
+    expect(h.a.send).not.toHaveBeenCalled();
+    expect(h.attention.pipeline.suppressed).toBe(1);
+    const message = result.messages[1];
+    if (!message) throw new Error('missing staged message');
+    const event = h.a.session.append('user/message', message, { surfaceOp: 'append' });
+    h.ctx.emit('session/event', h.a.session, event);
+    expect(h.attention.events().find((item) => item.id === 'second')).toMatchObject({ reason: 'wake-budget' });
+  });
+
+  it('confirms every retained no-session context event in a merged inject', async () => {
+    const h = await routing(true, 2);
+    for (const id of ['offline-1', 'offline-2']) {
+      expect(h.attention.events().find((item) => item.id === id)?.level).toBe('record');
+    }
+    const message = h.initial.messages[1];
+    if (!message) throw new Error('missing staged message');
+    const event = h.a.session.append('user/message', message, { surfaceOp: 'append' });
+    h.ctx.emit('session/event', h.a.session, event);
+    for (const id of ['offline-1', 'offline-2']) {
+      expect(h.attention.events().find((item) => item.id === id)?.level).toBe('context');
+    }
+  });
+
+  it('bounds retained merged identities to the 200 visible events', async () => {
+    const h = await routing(true, 205);
+    expect(h.attention.events()).toHaveLength(200);
+    const message = h.initial.messages[1];
+    if (!message) throw new Error('missing staged message');
+    const event = h.a.session.append('user/message', message, { surfaceOp: 'append' });
+    h.ctx.emit('session/event', h.a.session, event);
+    expect(h.attention.events().every((item) => item.level === 'context')).toBe(true);
   });
 });

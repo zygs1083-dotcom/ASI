@@ -586,3 +586,10 @@ Agent-added rules are activated before saving, and failed activations are not sa
 1. Pause ordering and failures: `serializes overlapping pause and resume transactions until resources and storage agree`; `recovers from a failed pause save before processing the next pause intent`; `restores the paused resources if saving a resume fails`; `rejects subsequent pause requests after rollback fails` (`test/runtime/runtime.test.ts`).
 2. Missing roots and restart: `watches the nearest existing ancestor, filters siblings, and switches when the target appears` (`test/dsh/local-ports.test.ts`); `restores a missing file root and observes it after creation and recreation`; `reports changes to an existing file root using the file path itself` (`test/dsh/file-restart.test.ts`).
 3. Rule isolation and commit: `isolates failed restored file rules and keeps other watches active`; `marks only the affected rule unavailable on an asynchronous watcher error`; `serializes a watcher error with later rule refresh and reports recovery`; `does not persist a file rule if validation or watch activation fails`; `does not save a newly staged rule when its watcher fails before commit`; `rechecks a staged watcher when its settings commit was queued`; `closes a staged watch when saving the new rule fails`; `closes staged watches when pausing during a pending rule save` (`test/runtime/runtime.test.ts`).
+
+## DSH bundle fix-3 regressions
+
+1. Cross-session budget: `rechecks a cancelled budget downgrade for the target session after dispose=%s`; `restores all kinds of a budget-suppressed group as one target wake`; `keeps the budget downgrade when a disposed session is restored under the same id`.
+2. Deferred outcomes: `records confirmed inject outcomes, not cancelled or transferred attempts`; `confirms a transferred wake against an already-spent target budget`; `confirms every retained no-session context event in a merged inject`.
+
+All tests are in `test/dsh/port.test.ts`. A staged inject remains unreported as delivered until the adapter confirms its session message; confirmation publishes the actual outcome for all retained merged events.

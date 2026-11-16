@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import type { DeliveryLevel, SenseState, Signal, SignalCause, SourceRef, WatchRule } from '@asi/sense-types';
 import { DeliveryFailure } from '../attention/drain.ts';
+import { injectOutcomes } from '../attention/drain-transfer.ts';
 import { AttentionPipeline, type SessionContext } from '../attention/pipeline.ts';
 import { isRuleApproved, selectRule } from '../attention/rules.ts';
 import { sourceObservation } from '../state/source-health.ts';
@@ -33,7 +34,7 @@ export class RuntimeAttention {
   readonly pipeline: AttentionPipeline;
   private readonly entries: EventLog = [];
   private batchEntries?: EventLog;
-  private readonly pending = new PendingContext();
+  private readonly pending = new PendingContext((...args) => this.mark(...args));
   private readonly sessions = new Map<string, SessionContext>();
   private readonly recent: string[] = [];
   private readonly inflight = new Set<Promise<void>>();
@@ -79,6 +80,7 @@ export class RuntimeAttention {
               change.signal.data = withoutTitles(change.signal.data) as Signal['data'];
             }
           }
+          if (intent.kind === 'inject' && this.offCommit) this.pending.stage(intent);
           const delivery = dsh.deliver(intent.sessionId, safe);
           this.inflight.add(delivery);
           try {
@@ -88,13 +90,13 @@ export class RuntimeAttention {
           }
           if (intent.kind === 'inject' && staged.onDeliveryCommitted) throw new DeliveryFailure('deferred');
           if (this.stopped) return;
-          for (const change of intent.update.changes) {
-            if (change.reason) this.mark(change.signal.id, change.reason);
+          for (const outcome of injectOutcomes(intent)) {
+            for (const id of outcome.ids) this.mark(id, outcome.reason, outcome.level);
           }
         },
       },
     });
-    this.offCommit = staged.onDeliveryCommitted?.((_session, id) => this.pending.committed(id, this.pipeline));
+    this.offCommit = staged.onDeliveryCommitted?.((session, id) => this.pending.committed(session, id, this.pipeline));
   }
 
   id(): string {
@@ -268,7 +270,7 @@ export class RuntimeAttention {
       subject: signal.subject,
       at: signal.at,
       mono,
-      level,
+      level: this.offCommit && level !== 'record' && reason !== 'no-session' ? 'record' : level,
       ruleId,
       reason: reason ?? sourceReason,
       cause: signal.cause,
@@ -288,11 +290,11 @@ export class RuntimeAttention {
     if (this.entries.length > 200) this.entries.shift();
     this.changed();
   }
-  private mark(id: string, reason: string): void {
+  private mark(id: string, reason?: string, level?: DeliveryLevel): void {
     const entry = this.entries.find((item) => item.id === id);
-    if (entry) {
-      entry.reason = reason;
-      this.changed();
-    }
+    if (!entry) return;
+    if (reason !== undefined) entry.reason = reason;
+    if (level !== undefined) entry.level = level;
+    this.changed();
   }
 }

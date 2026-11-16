@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import type { DeliveryLevel } from '@asi/sense-types';
 import type { Bucket } from './buckets.ts';
 import type { DeliveryIntent, SessionState } from './pipeline-types.ts';
 
@@ -34,6 +35,36 @@ export interface InjectBatch {
   buckets: Bucket[];
   intent: DeliveryIntent;
   aliases?: string[];
+}
+
+export type InjectOutcome = { ids: string[]; level: DeliveryLevel; reason?: string };
+const outcomes = new WeakMap<DeliveryIntent, InjectOutcome[]>();
+
+export function batchIntent(batch: InjectBatch): DeliveryIntent {
+  const intent = structuredClone(batch.intent);
+  const reasons = new Map(intent.update.changes.map((change) => [change.signal.id, change.reason]));
+  outcomes.set(
+    intent,
+    batch.buckets.flatMap((bucket) =>
+      [...bucket.details.values()].map((detail) => ({
+        ids: [...detail.ids],
+        level: detail.level,
+        reason: reasons.get(detail.latest.id),
+      })),
+    ),
+  );
+  return intent;
+}
+
+export function injectOutcomes(intent: DeliveryIntent): InjectOutcome[] {
+  return (
+    outcomes.get(intent) ??
+    intent.update.changes.map((change) => ({
+      ids: [change.signal.id],
+      level: change.level,
+      reason: change.reason,
+    }))
+  );
 }
 
 export function confirmBatch(batches: Map<string, InjectBatch[]>, id: string): void {
