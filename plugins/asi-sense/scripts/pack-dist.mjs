@@ -16,6 +16,7 @@ const stage = join(temp, 'package');
 
 try {
   await mkdir(join(stage, 'lib'), { recursive: true });
+  await mkdir(join(stage, 'scripts'));
   for (const file of ['index.js', 'client.js', 'typert.host.js', 'asi-sense-helper']) {
     await copyFile(join(pkg, 'lib', file), join(stage, 'lib', file));
   }
@@ -26,6 +27,9 @@ try {
   await Promise.all([
     copyFile(join(pkg, 'cordis.patch.yml'), join(stage, 'cordis.patch.yml')),
     copyFile(join(pkg, 'README.md'), join(stage, 'README.md')),
+    copyFile(join(pkg, 'scripts/dsh.sh'), join(stage, 'scripts/dsh.sh')).then(() =>
+      chmod(join(stage, 'scripts/dsh.sh'), 0o755),
+    ),
     writeFile(
       join(stage, 'package.json'),
       `${JSON.stringify(
@@ -41,7 +45,14 @@ try {
             './typert': './lib/typert.host.js',
             './package.json': './package.json',
           },
-          files: ['lib/index.js', 'lib/client.js', 'lib/typert.host.js', 'lib/asi-sense-helper', 'cordis.patch.yml'],
+          files: [
+            'lib/index.js',
+            'lib/client.js',
+            'lib/typert.host.js',
+            'lib/asi-sense-helper',
+            'cordis.patch.yml',
+            'scripts/dsh.sh',
+          ],
           dsh: manifest.dsh,
           peerDependencies: manifest.peerDependencies,
         },

@@ -8,40 +8,84 @@ and deterministic environment-update formatting.
 ### 前置条件
 
 - Apple Silicon Mac，macOS 13 或更新版本；本项目在 macOS 15.7.7 上验收。
-- DSH `0.2.2-rc.3`（commit `39163dd30f703a79079e2d2446545cff3c453738`）及其 `dsh` 命令；Node `^22.12.0 || ^24.0.0 || >=26.0.0` 和 pnpm。构建还需要 Swift 和 Apple Command Line Tools。
-- 插件安装到指定的 DSH profile。以下示例使用 `web` profile；如果使用其他 profile，替换所有命令中的 `web`。
+- Node `^22.12.0 || ^24.0.0 || >=26.0.0`、pnpm、Swift 和 Apple Command Line Tools。
+- DSH `0.2.2-rc.3`：可以安装[官方 npm 包](https://github.com/deepseek-ai/deepseek-harness#run-from-npm)，或使用已构建的[官方源码](https://github.com/deepseek-ai/deepseek-harness#run-from-source)，固定 commit `39163dd30f703a79079e2d2446545cff3c453738`。
 
-### 构建和安装
+官方包安装方式：
+
+```sh
+npm install --global @deepseek-ai/dsh@0.2.2-rc.3
+dsh --version
+```
+
+或者，首次源码安装（`$HOME/deepseek-harness-asi` 必须不存在）：
+
+```sh
+export DSH_ROOT="$HOME/deepseek-harness-asi"
+git clone https://github.com/deepseek-ai/deepseek-harness.git "$DSH_ROOT"
+git -C "$DSH_ROOT" checkout --detach 39163dd30f703a79079e2d2446545cff3c453738
+pnpm --dir "$DSH_ROOT" install
+pnpm --dir "$DSH_ROOT" run build
+```
+
+已有匹配版本的已构建源码时，只需在本终端设置 `DSH_ROOT` 为该检出目录：
+
+```sh
+export DSH_ROOT="/path/to/deepseek-harness"
+git -C "$DSH_ROOT" rev-parse HEAD
+```
+
+确认输出为上述 commit。后续命令需在同一终端执行。启动脚本优先使用 PATH 中的 `dsh`，并严格检查版本；若版本不匹配会报错，不会退回源码。没有 `dsh` 时使用 `DSH_ROOT` 的 `tsx/esm` 和 CLI 源码，并检查运行版本。脚本设置 `TSX_TSCONFIG_PATH=$DSH_ROOT/tsconfig.json`（设置了 `DSH_ROOT` 时）和 `DSH_TELEMETRY_DISABLED=1`，不自行设置 `DSH_HOME`。
+
+### 构建、隔离和安装
 
 在 ASI 仓库根目录执行：
 
 ```sh
+export ASI_ROOT="$PWD"
 pnpm install --frozen-lockfile
 pnpm --filter asi-sense pack:dist
+export DSH_LAUNCHER="$ASI_ROOT/plugins/asi-sense/scripts/dsh.sh"
+export DSH_HOME="$(mktemp -d "${TMPDIR:-/tmp}/asi-sense-dsh.XXXXXX")"
+node -e 'require("node:fs").writeFileSync(process.env.DSH_HOME + "/workspace.json", JSON.stringify([{id:"workspace-controller",config:{documentsDirectory:process.env.DSH_HOME}}]))'
+"$DSH_LAUNCHER" --profile asi-dev --from-default-profile web --dump-config
+"$DSH_LAUNCHER" plugin --profile asi-dev add "$ASI_ROOT/plugins/asi-sense/dist/asi-sense-0.0.0.tgz"
 ```
 
-产物是 `plugins/asi-sense/dist/asi-sense-0.0.0.tgz`（文件名中的版本取自包的 `version`）。将它复制到目标机器，在产物所在目录执行：
+这里为本次安装新建独立 `DSH_HOME` 并从 `web` 模板初始化 `asi-dev` profile，不影响已有 DSH profile 数据。`workspace.json` 让首次启动的默认工作区也位于独立 home 内，而不是共享的 Documents 目录；启动时必须加上该 patch。示例 home 位于系统临时目录，可能被系统清理；需要长期保留数据时，将 `mktemp` 的模板改为持久目录中的新路径。后续每次操作同一 profile 时都要使用同一个 `DSH_HOME`；不要重复执行 `--from-default-profile`，它会重新初始化 profile。
+
+产物是 `plugins/asi-sense/dist/asi-sense-0.0.0.tgz`（文件名中的版本取自包的 `version`）。安装后保留该文件，profile 的依赖指向它。启动脚本也随 tarball 的 `package/scripts/dsh.sh` 分发：打包它是为了把产物复制到其他机器时仍可使用同一启动方式；上面的命令使用仓库中的副本。
+
+### 启动
+
+在设置了上述变量的终端中运行：
 
 ```sh
-dsh plugin --profile web add ./asi-sense-0.0.0.tgz
-dsh --profile web
+"$DSH_LAUNCHER" --profile asi-dev --patch "$DSH_HOME/workspace.json" --no-open --host 127.0.0.1 --port 0
 ```
 
-启动后打开侧栏的 **Environment sense**。固定版 DSH 的 `apps/cli/src/plugin.ts:65-98` 将 `plugin` 参数交给 profile 包管理器，`packages/boot/plugin-manager/src/install-spec.ts:30-31,70-76` 识别 `.tgz`，官方 `docs/user/develop/basic/publish.zh.md:412-415` 也说明 tarball 安装。产物包含已打包的 host、client 和 `./typert`、配置 patch、已签名的 arm64 helper 及 README；不包含源码、测试或 workspace 依赖。Host 的 `./typert` 是 DSH 自动发现的入口（`packages/typert/loader/src/index.ts:2-12,39-40`），client 由 DSH 按 `./client` 加载（`packages/client/modules/src/index.ts:206`）。`@asi/*` 和 host 的 zod 已打包；client 的 React、zod 和声明的 `@deepseek-ai/*` peer 由 DSH 提供，不另设第三方运行时依赖。pnpm 可能报告 peer 警告。
+在浏览器打开终端输出的本地地址，打开侧栏的 **环境感知**（英文界面为 **Environment sense**）；按 Ctrl-C 停止 DSH。固定版 DSH 的 `apps/cli/src/plugin.ts:65-98` 将 `plugin` 参数交给 profile 包管理器，`packages/boot/plugin-manager/src/install-spec.ts:30-31,70-76` 识别 `.tgz`，官方 `docs/user/develop/basic/publish.zh.md:412-415` 也说明 tarball 安装。产物包含已打包的 host、client 和 `./typert`、配置 patch、已签名的 arm64 helper、启动脚本及 README；不包含源码、测试或 workspace 依赖。Host 的 `./typert` 是 DSH 自动发现的入口（`packages/typert/loader/src/index.ts:2-12,39-40`），client 由 DSH 按 `./client` 加载（`packages/client/modules/src/index.ts:206`）。`@asi/*` 和 host 的 zod 已打包；client 的 React、zod 和声明的 `@deepseek-ai/*` peer 由 DSH 提供，不另设第三方运行时依赖。pnpm 可能报告 peer 警告。
 
 `engines.dsh` 固定为 `0.2.2-rc.3`。DSH 安装 tarball 后检查兼容性：不满足时拒绝安装，恢复 profile manifest、锁文件并尝试恢复 node_modules；已经安装但不兼容的 bundle 在启动时被跳过。DSH 允许用户在明确接受崩溃或数据损坏风险后，对精确的插件版本和 DSH 版本授权豁免；推荐改用匹配版本，而非豁免。依据：`packages/boot/plugin-manager/src/operations.ts:496-565`、`packages/boot/app-boot/src/profile.ts:671-705`。
 
 ### 辅助功能授权
 
-helper 不主动弹出授权对话框，也不需要屏幕录制权限。窗口信息显示「无权限」时可点击侧栏的「授权」，或打开 macOS **系统设置 → 隐私与安全性 → 辅助功能**，在列表中启用启动 DSH 的应用（例如终端或 DSH Desktop）；必要时用「+」添加该应用。授权后重启 DSH 并重新打开侧栏。如果重新构建或更换 ad-hoc 签名的 helper 后权限失效，请重新检查授权。
+helper 不主动弹出授权对话框，也不需要屏幕录制权限。窗口信息显示「无权限」时可点击侧栏的「授权」，或打开 macOS **系统设置 → 隐私与安全性 → 辅助功能**，在列表中启用启动 DSH 的应用（例如终端或 DSH Desktop）；必要时用「+」添加该应用。授权后用 Ctrl-C 停止并重启 DSH，然后重新打开侧栏：
+
+```sh
+"$DSH_LAUNCHER" --profile asi-dev --patch "$DSH_HOME/workspace.json" --no-open --host 127.0.0.1 --port 0
+```
+
+如果重新构建或更换 ad-hoc 签名的 helper 后权限失效，请重新检查授权。
 
 ### 卸载
 
 ```sh
-dsh plugin --profile web remove asi-sense
+"$DSH_LAUNCHER" plugin --profile asi-dev remove asi-sense
+"$DSH_LAUNCHER" --profile asi-dev --patch "$DSH_HOME/workspace.json" --no-open --host 127.0.0.1 --port 0
 ```
 
-重启对应 profile 后插件不再加载；卸载不会自动删除保存在 DSH home 的本地设置和数据。
+先用 Ctrl-C 停止正在运行的 DSH，再执行上面两条命令；重启后插件不再加载，用 Ctrl-C 停止。卸载不会自动删除保存在 DSH home 的本地设置和数据。
 
 ### 隐私
 
