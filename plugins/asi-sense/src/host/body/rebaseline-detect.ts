@@ -3,7 +3,15 @@ import type { AnomalyRule } from './anomaly.ts';
 import { BASELINE_MIN_COUNT, BASELINE_MIN_DATES } from './baseline.ts';
 import { formatter, slotOf } from './baseline-time.ts';
 import { type BodySignal, readMetrics } from './metrics.ts';
-import { type Candidate, candidateId, expired, keyOf, ready, record } from './rebaseline-candidate.ts';
+import {
+  type Candidate,
+  candidateId,
+  expired,
+  keyOf,
+  ready,
+  record,
+  suggestionExpired,
+} from './rebaseline-candidate.ts';
 import { type AdaptiveState, BODY_HISTORY } from './state.ts';
 
 export function detectCandidates(
@@ -17,7 +25,10 @@ export function detectCandidates(
   const elapsed = state[BODY_HISTORY]?.[next.source.id]?.anomaly?.baseline?.elapsed;
   if (elapsed !== undefined) {
     for (const [key, candidate] of candidates) {
-      if (candidate.stream === next.source.id && !candidate.suggested && expired(candidate, elapsed, next.at))
+      if (
+        candidate.stream === next.source.id &&
+        (candidate.suggested ? suggestionExpired(candidate, elapsed, next.at) : expired(candidate, elapsed, next.at))
+      )
         candidates.delete(key);
     }
   }

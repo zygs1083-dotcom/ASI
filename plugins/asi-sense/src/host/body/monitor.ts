@@ -102,7 +102,7 @@ export class BodyMonitor implements BodyEvaluator {
         this.clock,
         10_000,
         async () => {
-          this.tuningDisabled = 'storage-failed';
+          if (this.tuningDisabled !== 'restore-failed') this.tuningDisabled = 'storage-failed';
           this.tuner?.disableStorage();
           await save(this.serialize()).catch(() => {});
         },
@@ -125,7 +125,10 @@ export class BodyMonitor implements BodyEvaluator {
           },
         );
       });
-      if (this.tuner) this.rebaser = new RebaselineManager(this.tuner, this.anomalyRules ?? [], () => this.latest);
+      if (this.tuner) {
+        const { clock, wallClock } = this;
+        this.rebaser = new RebaselineManager(this.tuner, this.anomalyRules ?? [], () => this.latest, clock, wallClock);
+      }
     }
   }
 

@@ -38,7 +38,7 @@ export function restoreProgress(
       const candidate = validate(item);
       const baseline = candidate && state[BODY_HISTORY]?.[candidate.stream]?.anomaly?.baseline;
       if (!candidate || !baseline) return undefined;
-      if ((candidate.days.at(-1)?.elapsed ?? 0) > baseline.elapsed) return undefined;
+      if ((candidate.evidenceElapsed ?? candidate.days.at(-1)?.elapsed ?? 0) > baseline.elapsed) return undefined;
       if (!rules.some((r) => r.metric === candidate.metric)) continue;
       const key = keyOf(candidate.stream, candidate.metric, candidate.slot);
       if (candidates.has(key)) return undefined;

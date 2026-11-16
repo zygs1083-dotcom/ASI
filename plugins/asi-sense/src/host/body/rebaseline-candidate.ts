@@ -25,6 +25,7 @@ export interface Candidate {
   lastMono?: number;
   suggested?: boolean;
   latest?: RecentSample;
+  evidenceElapsed?: number;
 }
 
 const DAY = 86_400_000;
@@ -39,6 +40,35 @@ export const sampleCount = (c: Candidate): number => c.days.reduce((sum, day) =>
 export const ready = (c: Candidate): boolean => c.days.length >= 3 && sampleCount(c) >= 8;
 export const expired = (c: Candidate, elapsed: number, wall: number): boolean =>
   elapsed - c.days[0].elapsed > 21 * DAY || wall - c.days[0].samples[0].at > 21 * DAY || wall < c.days[0].samples[0].at;
+export const suggestionExpired = (c: Candidate, elapsed: number, wall: number): boolean => {
+  const last = c.days[c.days.length - 1];
+  const at = last.samples[last.samples.length - 1].at;
+  return (
+    !finite(wall) ||
+    !finite(elapsed) ||
+    wall < at ||
+    wall - at >= 7 * DAY ||
+    elapsed - (c.evidenceElapsed ?? last.elapsed) >= 7 * DAY
+  );
+};
+
+export function pruneSuggestions(
+  candidates: Map<string, Candidate>,
+  state: AdaptiveState | undefined,
+  mono: number,
+  wall: number,
+): void {
+  for (const [key, candidate] of candidates) {
+    if (!candidate.suggested) continue;
+    const baseline = state?.[BODY_HISTORY]?.[candidate.stream]?.anomaly?.baseline?.clone();
+    if (!baseline || !finite(mono)) {
+      candidates.delete(key);
+      continue;
+    }
+    baseline.advance(mono);
+    if (suggestionExpired(candidate, baseline.elapsed, wall)) candidates.delete(key);
+  }
+}
 
 export interface MetricState {
   latch: Record<string, 'normal' | 'warn'>;
@@ -113,6 +143,7 @@ export function record(
   }
   day.samples.push(sample);
   if (day.samples.length > 16) day.samples.shift();
+  candidate.evidenceElapsed = elapsed;
   return true;
 }
 
@@ -152,7 +183,8 @@ export function validate(raw: unknown): Candidate | undefined {
     !Array.isArray(c.days) ||
     c.days.length < 1 ||
     c.days.length > 3 ||
-    (c.suggested !== undefined && typeof c.suggested !== 'boolean')
+    (c.suggested !== undefined && typeof c.suggested !== 'boolean') ||
+    (c.evidenceElapsed !== undefined && (!finite(c.evidenceElapsed) || c.evidenceElapsed < 0))
   )
     return undefined;
   const days: RecentDay[] = [];
@@ -213,7 +245,10 @@ export function validate(raw: unknown): Candidate | undefined {
     days,
     suggested: c.suggested as boolean | undefined,
     latest,
+    evidenceElapsed: c.evidenceElapsed as number | undefined,
   };
+  if (candidate.evidenceElapsed !== undefined && candidate.evidenceElapsed < days[days.length - 1].elapsed)
+    return undefined;
   if (
     candidate.suggested &&
     (!ready(candidate) || expired(candidate, days.at(-1)?.elapsed ?? 0, days.at(-1)?.samples.at(-1)?.at ?? 0))

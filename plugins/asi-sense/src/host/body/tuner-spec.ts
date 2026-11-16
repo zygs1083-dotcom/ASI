@@ -2,7 +2,7 @@ import type { TuningChange, TuningValue } from '@asi/sense-types';
 
 /** Audit record: a tuning attempt plus its outcome (DESIGN §2.2c). */
 export type TuningLog = TuningChange & {
-  operation: 'propose' | 'revert' | 'feedback' | 'lock' | 'unlock';
+  operation: 'propose' | 'revert' | 'feedback' | 'lock' | 'unlock' | 'reset';
   status: 'applied' | 'rejected';
   rejectionReason?: string;
   kind?: 'rebaseline';
@@ -33,7 +33,7 @@ export const HOURLY_CAP = 2;
 export const DAILY_CAP = 6;
 export const GLOBAL_DAILY_CAP = 24;
 export const VALID_BY = ['user', 'agent', 'auto'] as const;
-export const VALID_OPS = ['propose', 'revert', 'feedback', 'lock', 'unlock'] as const;
+export const VALID_OPS = ['propose', 'revert', 'feedback', 'lock', 'unlock', 'reset'] as const;
 
 /** Known safety floors (DESIGN §2.2c): AI may only ever tighten these. */
 const KNOWN_FLOOR = /^(disk|context|battery)(\.(warn|critical))?$/;

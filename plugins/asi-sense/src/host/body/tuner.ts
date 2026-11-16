@@ -4,7 +4,7 @@ import { feedback, register } from './tuner-feedback.ts';
 import { type TunerActor, TunerGuard, type TuningResult } from './tuner-guard.ts';
 import { validateSnapshot } from './tuner-persist.ts';
 import { type AlertBinding, finiteNum, type ParameterSpec, type TuningLog, validateSpec } from './tuner-spec.ts';
-import { applySnapshot, serializeTuner, TunerStore } from './tuner-state.ts';
+import { applySnapshot, resetTuner, serializeTuner, TunerStore } from './tuner-state.ts';
 
 export type { AlertBinding, ParameterSpec, TunerActor, TuningLog, TuningResult };
 
@@ -77,7 +77,7 @@ export class Tuner {
     }
   }
 
-  /** Public kill switch: a failed restore disables AI tuning permanently. */
+  /** Public kill switch: a failed restore disables AI tuning until explicit reset. */
   get tuningDisabled(): 'restore-failed' | 'storage-failed' | undefined {
     return this.store.disabled;
   }
@@ -143,6 +143,10 @@ export class Tuner {
     if (this.actor() !== 'user') throw new Error('tuner: resume requires trusted user');
     if (this.store.disabled !== 'storage-failed') throw new Error('tuner: storage recovery unavailable');
     await this.mutate((store) => store.resume(), undefined, 'user', true);
+  }
+  async resetTuning(): Promise<void> {
+    if (this.actor() !== 'user') throw new Error('tuner: reset requires trusted user');
+    await this.mutate(resetTuner, undefined, 'user', true);
   }
 
   setRebaselineHost(host: { revertChange: (id: string) => Promise<TuningResult> }): void {
@@ -237,7 +241,7 @@ export class Tuner {
   }
 
   disableStorage(): void {
-    this.store.disabled = 'storage-failed';
+    if (this.store.disabled !== 'restore-failed') this.store.disabled = 'storage-failed';
   }
 
   private mutate<T>(
@@ -252,7 +256,7 @@ export class Tuner {
       if (!this.commit) throw new Error('tuner: persistence required');
       if (this.store.disabled && !recovery) throw new Error(`tuner: tuning disabled: ${this.store.disabled}`);
       if (!finiteNum(this.clock()) || !finiteNum(this.wallClock())) throw new TypeError('tuner: clocks must be finite');
-      const staged = this.store.clone();
+      const staged = this.store.clone(this.clock(), this.wallClock());
       const guard = new TunerGuard(staged, {
         actor: () => identity,
         mono: this.clock,
@@ -261,6 +265,7 @@ export class Tuner {
       });
       const result = action(staged, guard);
       if (result === false || (result && typeof result === 'object' && 'applied' in result && !result.applied)) {
+        this.store.retainWindowState(staged);
         if (result !== false) this.store.appendLog((result as TuningResult).change);
         return result;
       }

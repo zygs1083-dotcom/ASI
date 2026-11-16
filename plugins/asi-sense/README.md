@@ -155,7 +155,10 @@ model requests, watches files or delivers attention intents.
   and at least eight alert samples yields one context-level `body.anomaly`
   with `data.type === 'rebaseline-suggestion'`; missing samples do not interrupt
   the candidate, but a non-alert reading in that bucket does. Incomplete
-  candidates expire after 21 days. Suggestions are available through
+  candidates expire after 21 days; generated suggestions expire 7 days after
+  their last evidence, including without new samples or across restart.
+  Display, restore, and acceptance all clear expired suggestions; a wall clock
+  before the last evidence also expires them. Suggestions are available through
   `monitor.rebaselineSuggestions`; they never replace buckets automatically.
   The pure synchronous `evaluate` seam clears existing suggestion evidence and
   does not collect new evidence.
@@ -167,7 +170,7 @@ Construct `new Tuner(whitelist, { actor, clock, wallClock })`; `actor()` is a
 **trusted host resolver**, defaulting to `agent`. Only authenticated sidebar
 user calls may resolve to `user`; never forward a tool's `by`/`actor` field
 into that resolver. `propose({ param, to, reason })`, `lock`, `unlock`,
-`revert(id)`, `feedback`, `resumeTuning()` and `monitor.acceptRebaseline(id)`
+`revert(id)`, `feedback`, `resumeTuning()`, `resetTuning()` and `monitor.acceptRebaseline(id)`
 do not accept caller-declared identity.
 
 Every `floor.*` spec needs a finite numeric value and `tighten: 'up'|'down'`;
@@ -180,7 +183,8 @@ only users can lock/unlock or loosen floors. User revert also bypasses a
 lock; agent revert uses the same AI guards. Superseded IDs cannot be reverted.
 The 500-entry display log is separate from retained applied/undo history.
 Rejected attempts stay in memory only, do not write or consume durable IDs,
-and disappear on restart. Applied history retains 30 days or 200 changes,
+and disappear on restart; quota clock freeze/catch-up state is retained in
+memory and included in the next successful snapshot. Applied history retains 30 days or 200 changes,
 whichever is greater, plus every currently undoable change.
 `tuner.undoableChanges` lists the currently reversible changes, including
 accepted rebaselines. Only a trusted user may call
@@ -210,13 +214,14 @@ changes, locks, budgets and undo records are saved before they become visible
 or return success. Non-critical baseline statistics may coalesce to 10-second
 saves. `persist()` explicitly flushes, and shutdown must await `monitor.close()`
 (or standalone `tuner.close()`). Any save failure rejects its caller where
-applicable and disables tuning with `tuningDisabled === 'storage-failed'`.
+applicable and disables tuning with `tuningDisabled === 'storage-failed'`,
+unless the stronger `restore-failed` reason is already present.
 The core makes one best-effort write of the last confirmed state with a
 disabled marker; if that write also fails, a crash leaves the previous snapshot
 intact and the rejected change absent. When a disabled snapshot is restored,
-AI stays disabled until a trusted user calls and awaits `tuner.resumeTuning()`;
-the marker is removed only after a successful save. The host must surface the
-failure and recovery status to the user.
+AI stays disabled until a trusted user calls and awaits `tuner.resumeTuning()`
+for `storage-failed`; the marker is removed only after a successful save.
+The host must surface the failure and recovery status to the user.
 Legacy automatic-rebaseline undo snapshots without the former metric latch and
 streak fail closed; the host must explicitly repair or reset those snapshots.
 
@@ -224,8 +229,12 @@ Malformed/unknown-version/non-finite snapshots fail closed:
 `tuningDisabled === 'restore-failed'` is exposed for the sidebar, baseline
 learning resets, AI stays disabled across restarts and IDs get a new random
 prefix. No automatic "fresh start" can clear quota/lock protection.
-Repairing/resetting damaged storage is an explicit host recovery operation,
-not an agent tool.
+Only an authenticated user may call and await `tuner.resetTuning()` to clear a
+`restore-failed` marker: this irreversibly discards tuner values, locks, quota
+windows and prior tuner history, starts from declared defaults and writes a
+user reset audit record atomically. A failed reset leaves tuning disabled.
+The sidebar must request a second explicit confirmation before calling it;
+sidebar wiring is deferred to M4. Never expose reset as an agent tool.
 
 Use injected monotonic milliseconds (default `performance.now()`) for rate
 windows, quotas, accumulated installation age and save throttling; all samples

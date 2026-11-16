@@ -10,6 +10,7 @@ import {
   keyOf,
   metricState,
   paramOf,
+  pruneSuggestions,
   sampleCount,
   withBaseline,
   withMetricState,
@@ -63,6 +64,8 @@ export class RebaselineManager {
     private readonly tuner: Tuner,
     private readonly rules: readonly AnomalyRule[],
     private readonly current: () => AdaptiveState | undefined,
+    private readonly clock: () => number,
+    private readonly wallClock: () => number,
   ) {
     tuner.setRebaselineHost(this);
   }
@@ -86,6 +89,7 @@ export class RebaselineManager {
   }
 
   snapshot(): RebaselineSnapshot {
+    pruneSuggestions(this.candidates, this.current(), this.clock(), this.wallClock());
     return {
       candidates: [...this.candidates.values()].map(({ lastMono: _lastMono, ...candidate }) => candidate),
       undos: this.undos.map((entry) => ({ ...entry })),
@@ -138,11 +142,13 @@ export class RebaselineManager {
     if (!restored) return false;
     this.candidates = restored.candidates;
     this.undos = restored.undos;
+    pruneSuggestions(this.candidates, state, this.clock(), this.wallClock());
     return true;
   }
 
   get suggestions(): RebaselineSuggestion[] {
     const state = this.current();
+    pruneSuggestions(this.candidates, state, this.clock(), this.wallClock());
     return [...this.candidates.values()].flatMap((candidate) => {
       const baseline = state?.[BODY_HISTORY]?.[candidate.stream]?.anomaly?.baseline;
       const old = baseline?.bucket(candidate.metric, candidate.slot);
@@ -164,6 +170,7 @@ export class RebaselineManager {
 
   accept(id: string): Promise<TuningResult> {
     return this.enqueue(async () => {
+      pruneSuggestions(this.candidates, this.current(), this.clock(), this.wallClock());
       const candidate = [...this.candidates.values()].find((entry) => entry.suggested && candidateId(entry) === id);
       const state = this.current();
       const baseline = candidate && state?.[BODY_HISTORY]?.[candidate.stream]?.anomaly?.baseline;

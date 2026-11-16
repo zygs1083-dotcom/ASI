@@ -65,11 +65,86 @@ async function fixture(metric: 'cpu' | 'memory' = 'cpu') {
     setActor: (value: typeof actor) => {
       actor = value;
     },
+    setTime: (at: number) => {
+      wall = at;
+      mono = at - START;
+    },
+    setClocks: (at: number, monotonic: number) => {
+      wall = at;
+      mono = monotonic;
+    },
     state: () => state,
   };
 }
 
 describe('user-confirmed rebaseline', () => {
+  it.each(['display', 'confirm', 'restore', 'missing sample'])(
+    'R3 expires a suggestion seven days after its last evidence on %s',
+    async (path) => {
+      const f = await fixture();
+      for (let week = 0; week < 3; week++) {
+        for (let i = 0; i < 8; i++) await f.feed(START + week * WEEK + i * 60_000, 0.99);
+      }
+      const id = f.monitor.rebaselineSuggestions[0].id;
+      await f.monitor.persist();
+      const lastEvidence = START + 2 * WEEK;
+      f.setTime(lastEvidence + 7 * DAY - 1);
+      expect(f.monitor.rebaselineSuggestions.map((item) => item.id)).toContain(id);
+      f.setTime(lastEvidence + 7 * DAY);
+      f.setActor('user');
+      if (path === 'confirm') {
+        await expect(f.monitor.acceptRebaseline(id)).rejects.toThrow('expired');
+      } else if (path === 'restore') {
+        const restored = f.make();
+        await restored.monitor.restore();
+        expect(restored.tuner.tuningDisabled).toBeUndefined();
+        expect(restored.monitor.rebaselineSuggestions).toHaveLength(0);
+        await expect(restored.monitor.acceptRebaseline(id)).rejects.toThrow('expired');
+        await restored.monitor.close();
+      } else {
+        if (path === 'missing sample') await f.feed(lastEvidence + 7 * DAY, undefined);
+        expect(f.monitor.rebaselineSuggestions).toHaveLength(0);
+        await f.monitor.persist();
+        expect(JSON.parse(f.snapshot() ?? '{}').rebaseline.candidates).toHaveLength(0);
+      }
+      await f.monitor.close();
+    },
+  );
+
+  it('R3 expires suggestions by monotonic age even when wall time has stopped', async () => {
+    const f = await fixture();
+    for (let week = 0; week < 3; week++) {
+      for (let i = 0; i < 8; i++) await f.feed(START + week * WEEK + i * 60_000, 0.99);
+    }
+    expect(f.monitor.rebaselineSuggestions).toHaveLength(1);
+    f.setClocks(START + 2 * WEEK + 7 * 60_000, 3 * WEEK);
+    expect(f.monitor.rebaselineSuggestions).toHaveLength(0);
+    await f.monitor.close();
+  });
+
+  it('R3 uses the last evidence sample, not the first sample of its date', async () => {
+    const f = await fixture();
+    for (let i = 0; i < 4; i++) await f.feed(START + i * 60_000, 0.99);
+    for (let i = 0; i < 2; i++) await f.feed(START + WEEK + i * 60_000, 0.99);
+    let lastEvidence = 0;
+    for (let i = 0; i < 8; i++) {
+      lastEvidence = START + 2 * WEEK + i * 60_000;
+      await f.feed(lastEvidence, 0.99);
+      if (f.monitor.rebaselineSuggestions.length) break;
+    }
+    expect(lastEvidence).toBeGreaterThan(START + 2 * WEEK);
+    await f.monitor.persist();
+    f.setTime(lastEvidence + 7 * DAY - 1);
+    expect(f.monitor.rebaselineSuggestions).toHaveLength(1);
+    const restored = f.make();
+    await restored.monitor.restore();
+    expect(restored.monitor.rebaselineSuggestions).toHaveLength(1);
+    f.setTime(lastEvidence + 7 * DAY);
+    expect(restored.monitor.rebaselineSuggestions).toHaveLength(0);
+    await restored.monitor.close();
+    await f.monitor.close();
+  });
+
   it('N3: three weeks of 90% memory creates one context suggestion without normalizing a leak', async () => {
     const f = await fixture('memory');
     const signals = [];
@@ -249,5 +324,29 @@ describe('user-confirmed rebaseline', () => {
     await restored.monitor.restore();
     expect(restored.tuner.tuningDisabled).toBe('restore-failed');
     await restored.monitor.close();
+  });
+
+  it('R1 reset discards partially restored tuner and rebaseline history after a corrupted undo', async () => {
+    const f = await fixture();
+    for (let week = 0; week < 3; week++) {
+      for (let i = 0; i < 8; i++) await f.feed(START + week * WEEK + i * 60_000, 0.99);
+    }
+    f.setActor('user');
+    await f.monitor.acceptRebaseline(f.monitor.rebaselineSuggestions[0].id);
+    await f.monitor.close();
+    const snapshot = JSON.parse(f.snapshot() ?? '{}');
+    delete snapshot.rebaseline.undos[0].previous;
+    f.overwrite(JSON.stringify(snapshot));
+    const restored = f.make();
+    await restored.monitor.restore();
+    expect(restored.tuner.tuningDisabled).toBe('restore-failed');
+    await restored.tuner.resetTuning();
+    expect(restored.tuner.undoableChanges).toHaveLength(0);
+    await restored.monitor.close();
+    const again = f.make();
+    await again.monitor.restore();
+    expect(again.tuner.tuningDisabled).toBeUndefined();
+    expect(again.tuner.logs.at(-1)).toMatchObject({ by: 'user', operation: 'reset' });
+    await again.monitor.close();
   });
 });

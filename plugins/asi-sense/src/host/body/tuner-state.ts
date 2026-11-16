@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import type { TuningValue } from '@asi/sense-types';
+import type { TunerGuard } from './tuner-guard.ts';
 import type { ValidatedState } from './tuner-persist.ts';
 import {
   type AlertBinding,
@@ -52,12 +53,31 @@ export class TunerStore {
   private restoredW?: RestoredWindows;
   private thawMono?: number;
 
-  clone(): TunerStore {
-    return Object.assign(new TunerStore(), structuredClone({ ...this }));
+  clone(now: number, wall: number): TunerStore {
+    if (!finiteNum(now) || !finiteNum(wall)) throw new TypeError('tuner: clocks must be finite');
+    const copy = Object.assign(new TunerStore(), structuredClone({ ...this }));
+    copy.syncWindows(now, wall);
+    return copy;
   }
 
   resume(): void {
     this.disabled = undefined;
+  }
+
+  reset(): void {
+    const fresh = new TunerStore();
+    for (const [name, spec] of this.specs) {
+      fresh.specs.set(name, spec);
+      fresh.values.set(name, spec.value);
+    }
+    fresh.restored = true;
+    Object.assign(this, fresh);
+  }
+
+  retainWindowState(staged: TunerStore): void {
+    this.restoredW = staged.restoredW;
+    this.thawMono = staged.thawMono;
+    this.wallHighwater = staged.wallHighwater;
   }
 
   pruneApplied(wall: number): void {
@@ -185,6 +205,21 @@ export class TunerStore {
     this.wallHighwater = s.wallHighwater;
     this.thawMono = finiteNum(wall) && wall >= s.wallHighwater && finiteNum(now) ? now : undefined;
   }
+}
+
+export function resetTuner(store: TunerStore, guard: TunerGuard): void {
+  if (store.disabled !== 'restore-failed') throw new Error('tuner: reset unavailable');
+  store.reset();
+  guard.audit({
+    param: 'tuning',
+    from: 'restore-failed',
+    to: 'defaults',
+    by: 'user',
+    reason: 'user: reset tuning',
+    at: guard.auditAt(),
+    operation: 'reset',
+    status: 'applied',
+  });
 }
 
 /** Full v2 snapshot text, including confirmed state when tuning is disabled. */
