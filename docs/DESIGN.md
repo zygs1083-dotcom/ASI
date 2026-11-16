@@ -250,6 +250,7 @@ note: 测试失败时看日志并决定是否提醒我
    - `StoragePort`：`load(key)`/`save(key, json)`，save reject ⇔ 未安装（§2.2c 持久化提交语义）。
    - `HelperSpawner`、`ProbeFactory`、`FileWatcher`、`Clock{wall(), mono()}`：测试用假实现。
    - 会话选择（§7.3 首版）：投给最近一次 pre-step 的活跃会话；无会话时 context 留桶、wake 记录为 suppressed(no-session)。
+   - 存储实现（2026-11-16）：DSH `storage-json` 的 atomic 写在 rename 之后还会因目录 fsync 失败而 reject，且 storage-domain 在 reject 时回滚内存，不满足"reject ⇔ 未安装"。因此安全关键快照不用 `ctx.storageDomain`，由插件自带 FileStoragePort：tmp → fsync(file) → rename（最后可失败步骤）→ fsync(dir)（失败只记日志）。
 2. **presenter**（`src/host/presenter/**`）：把 runtime 公开读接口投影为 `SensePanelModel`（`@asi/sense-ui` 的类型，type-only import），含 5 分钟历史环形缓冲（按 `sampleIntervalsMs` 各序列独立）、insights、learning、tuning、events（最近 200 条，含等级与抑制原因）、rules。输出 `frames(): AsyncIterable<SensePanelModel>`，节流 ≥500ms，同引用复用未变部分。
 3. **actions**：`SenseActions`（全部由宿主以 `user` 身份调用，来源只能是侧栏 Remote 调用）：`toggleRule/confirmRule/deleteRule/pause/setSendTitles/openPermissionSettings/revertTuning/lockParam/feedback/acceptRebaseline/resumeTuning/resetTuning`。模型工具（`env_state/env_watch/env_detail/body_tune`）以 `agent` 身份走同一 runtime，不经 `SenseActions`。
 4. **dsh**（`src/host/dsh/**`、`src/client/**`、包清单）：唯一 import DSH/Cordis 的层——实现 DshPort/StoragePort（`ctx.storageDomain`）、`TypertRemoteService`（`frames` 为 stream，actions 为 unary）、工具与系统提示段、客户端侧栏挂载 `SensePanel`。
