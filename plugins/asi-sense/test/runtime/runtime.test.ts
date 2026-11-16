@@ -561,6 +561,115 @@ describe('host runtime', () => {
     await h.runtime.stop();
   });
 
+  it.each([0, 1])('retains an owned job exit %i received while another session is selected', async (exitCode) => {
+    const h = harness();
+    await h.runtime.start();
+    for (const sessionId of ['a', 'b']) await h.agent({ type: 'created', sessionId });
+    await h.agent({ type: 'pre-step', sessionId: 'b' });
+    await h.job({ type: 'exited', id: 'owned-job', sessionId: 'a', command: 'fixture-command', exitCode });
+    await h.advance(3_000);
+    expect(h.delivered.flatMap((intent) => intent.update.changes)).not.toContainEqual(
+      expect.objectContaining({ signal: expect.objectContaining({ subject: 'owned-job' }) }),
+    );
+    await h.agent({ type: 'pre-step', sessionId: 'a' });
+    await h.advance(3_000);
+    await h.agent({ type: 'pre-step', sessionId: 'a' });
+    const jobs = h.delivered.flatMap((intent) =>
+      intent.update.changes
+        .filter(({ signal }) => signal.subject === 'owned-job')
+        .map((change) => ({ sessionId: intent.sessionId, kind: intent.kind, level: change.level })),
+    );
+    expect(jobs).toEqual([
+      { sessionId: 'a', kind: exitCode === 0 ? 'inject' : 'send', level: exitCode === 0 ? 'context' : 'wake' },
+    ]);
+    expect(JSON.stringify(h.delivered)).not.toContain('fixture-command');
+    await h.runtime.stop();
+  });
+
+  it('retains a live owner job when no session has yet been selected', async () => {
+    const h = harness();
+    await h.runtime.start();
+    await h.agent({ type: 'created', sessionId: 'a' });
+    await h.job({ type: 'exited', id: 'owned-job', sessionId: 'a', command: 'fixture-command', exitCode: 1 });
+    await h.advance(3_000);
+    expect(h.delivered).toHaveLength(0);
+    await h.agent({ type: 'pre-step', sessionId: 'a' });
+    expect(h.delivered).toContainEqual(
+      expect.objectContaining({
+        sessionId: 'a',
+        kind: 'send',
+        update: expect.objectContaining({
+          changes: expect.arrayContaining([
+            expect.objectContaining({ level: 'wake', signal: expect.objectContaining({ subject: 'owned-job' }) }),
+          ]),
+        }),
+      }),
+    );
+    await h.runtime.stop();
+  });
+
+  it.each([0, 1])('retains owned job exit %i across a switch during the merge window', async (exitCode) => {
+    const h = harness();
+    await h.runtime.start();
+    for (const sessionId of ['a', 'b']) await h.agent({ type: 'created', sessionId });
+    await h.agent({ type: 'pre-step', sessionId: 'a' });
+    await h.job({ type: 'exited', id: 'owned-job', sessionId: 'a', command: 'fixture-command', exitCode });
+    await h.agent({ type: 'pre-step', sessionId: 'b' });
+    await h.advance(3_000);
+    expect(h.delivered.flatMap((intent) => intent.update.changes)).not.toContainEqual(
+      expect.objectContaining({ signal: expect.objectContaining({ subject: 'owned-job' }) }),
+    );
+    await h.agent({ type: 'pre-step', sessionId: 'a' });
+    await h.agent({ type: 'pre-step', sessionId: 'a' });
+    const jobs = h.delivered.flatMap((intent) =>
+      intent.update.changes
+        .filter(({ signal }) => signal.subject === 'owned-job')
+        .map((change) => ({ sessionId: intent.sessionId, kind: intent.kind, level: change.level })),
+    );
+    expect(jobs).toEqual([
+      { sessionId: 'a', kind: exitCode === 0 ? 'inject' : 'send', level: exitCode === 0 ? 'context' : 'wake' },
+    ]);
+    await h.runtime.stop();
+  });
+
+  it('discards a foreign-target owned job when its owner closes and retains its local log', async () => {
+    const h = harness();
+    await h.runtime.start();
+    for (const sessionId of ['a', 'b']) await h.agent({ type: 'created', sessionId });
+    await h.agent({ type: 'pre-step', sessionId: 'b' });
+    await h.job({ type: 'exited', id: 'old-job', sessionId: 'a', command: 'fixture-command', exitCode: 1 });
+    await h.agent({ type: 'disposed', sessionId: 'a' });
+    await h.agent({ type: 'created', sessionId: 'a' });
+    await h.agent({ type: 'pre-step', sessionId: 'a' });
+    await h.advance(3_000);
+    expect(JSON.stringify(h.delivered)).not.toContain('old-job');
+    expect(h.runtime.events().some((event) => event.subject === 'fixture-command')).toBe(true);
+    await h.runtime.stop();
+  });
+
+  it('applies the owner wake budget to a job that waits behind another session', async () => {
+    const h = harness();
+    await h.runtime.start();
+    for (const sessionId of ['a', 'b']) await h.agent({ type: 'created', sessionId });
+    await h.agent({ type: 'pre-step', sessionId: 'a' });
+    await h.job({ type: 'exited', id: 'first-job', sessionId: 'a', command: 'fixture-first', exitCode: 1 });
+    await h.advance(3_000);
+    await h.agent({ type: 'pre-step', sessionId: 'b' });
+    await h.job({ type: 'exited', id: 'second-job', sessionId: 'a', command: 'fixture-second', exitCode: 1 });
+    await h.advance(3_000);
+    await h.agent({ type: 'pre-step', sessionId: 'a' });
+    const second = h.delivered.filter((intent) =>
+      intent.update.changes.some(({ signal }) => signal.subject === 'second-job'),
+    );
+    expect(second).toHaveLength(1);
+    expect(second[0]).toMatchObject({
+      sessionId: 'a',
+      kind: 'inject',
+      update: { changes: [expect.objectContaining({ level: 'context', reason: 'wake-budget' })] },
+    });
+    await h.runtime.stop();
+  });
+
   it('does not transfer an old job to a recreated session with the same id', async () => {
     const h = harness();
     await h.runtime.start();

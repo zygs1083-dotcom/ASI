@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import type { DeliveryLevel, SenseState, Signal, SignalCause, SourceRef, WatchRule } from '@asi/sense-types';
-import { isSessionContext } from '../attention/buckets.ts';
+import { isSessionContext, isSessionOwned } from '../attention/buckets.ts';
 import { DeliveryFailure } from '../attention/drain.ts';
 import { injectOutcomes } from '../attention/drain-transfer.ts';
 import { AttentionPipeline, type SessionContext } from '../attention/pipeline.ts';
@@ -247,7 +247,11 @@ export class RuntimeAttention {
       typeof evaluated === 'number' && Number.isFinite(evaluated)
         ? evaluated
         : this.clock.mono() - Math.max(0, this.clock.wall() - signal.at);
-    if (isSessionContext(signal)) {
+    const job = signal.source.id === 'dsh' && signal.kind.startsWith('job.');
+    if (job && typeof signal.data.sessionId === 'string') {
+      signal.data.sessionToken = this.sessionTokens.get(signal.data.sessionId);
+    }
+    if (isSessionOwned(signal) || job) {
       const owner = typeof signal.data.sessionId === 'string' ? signal.data.sessionId : undefined;
       const token = signal.data.sessionToken;
       const session =
@@ -268,22 +272,6 @@ export class RuntimeAttention {
         );
       }
       return;
-    }
-    if (
-      signal.source.id === 'dsh' &&
-      signal.kind.startsWith('job.') &&
-      (!signal.data.sessionId || signal.data.sessionId !== this.currentSessionId())
-    ) {
-      await new Promise<void>((resolve) =>
-        this.store.apply(signal, () => {
-          this.log({ signal, level: 'record', reason: 'session-private' }, mono);
-          resolve();
-        }),
-      );
-      return;
-    }
-    if (signal.source.id === 'dsh' && signal.kind.startsWith('job.')) {
-      signal.data.sessionToken = this.sessionTokens.get(signal.data.sessionId as string);
     }
     const session = this.selected && this.sessions.get(this.selected);
     if (!session) {

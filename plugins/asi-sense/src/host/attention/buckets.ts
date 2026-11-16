@@ -8,8 +8,15 @@ export function isSessionContext(signal: Signal): boolean {
   );
 }
 
+export function isSessionOwned(signal: Signal): boolean {
+  return (
+    isSessionContext(signal) ||
+    (signal.source.id === 'dsh' && signal.kind.startsWith('job.') && typeof signal.data.sessionId === 'string')
+  );
+}
+
 export function privateBucket(bucket: Bucket): boolean {
-  return [...bucket.details.values()].some((detail) => isSessionContext(detail.latest));
+  return [...bucket.details.values()].some((detail) => isSessionOwned(detail.latest));
 }
 
 /**
@@ -101,8 +108,8 @@ export function upsertBucket(
       !candidate.sealed &&
       candidate.sessionId === sessionId &&
       candidate.subject === signal.subject &&
-      privateBucket(candidate) === isSessionContext(signal) &&
-      (!isSessionContext(signal) ||
+      privateBucket(candidate) === isSessionOwned(signal) &&
+      (!isSessionOwned(signal) ||
         [...candidate.details.values()].every(
           (detail) => detail.latest.data.sessionToken === signal.data.sessionToken,
         )) &&
