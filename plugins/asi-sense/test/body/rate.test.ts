@@ -1,3 +1,4 @@
+import assert from 'node:assert/strict';
 import type { BodyThresholdState, Signal } from '@asi/sense-types';
 import { describe, expect, it } from 'vitest';
 import { RateEvaluator, type RateRule } from '../../src/host/body/rate.ts';
@@ -116,6 +117,18 @@ describe('RateEvaluator wildcard metrics', () => {
 });
 
 describe('RateEvaluator monotonic ordering + purity', () => {
+  it('uses distinct signal IDs for repeated warnings after wall-clock rollback', () => {
+    const { outs } = run(ev([deltaRule()]), [
+      [1000, 0, 0],
+      [1001, 100, 20],
+      [1002, 200, 0],
+      [1001, 300, 20],
+    ]);
+    const warnings = outs.flat().filter((signal) => signal.data.severity === 'warn');
+    expect(warnings).toHaveLength(2);
+    expect(warnings[0]?.id).not.toBe(warnings[1]?.id);
+  });
+
   it('measures windows on monotonic stamps, not chaotic wall times', () => {
     // RSS wall: 0, 1000, 3601000, 2000 — mono: 0,1000,2000,3000.
     const e = ev([deltaRule()]);
@@ -151,7 +164,7 @@ describe('RateEvaluator monotonic ordering + purity', () => {
     expect(retry.signals).toHaveLength(0);
     // Backward + nonfinite stamps are ignored too.
     expect(e.evaluate(n1, sample(rssBody(50), 2, undefined, 500), state).signals).toHaveLength(0);
-    expect(e.evaluate(n1, sample(rssBody(50), 3, undefined, Number.NaN), state).signals).toHaveLength(0);
+    expect(() => e.evaluate(n1, sample(rssBody(50), 3, undefined, Number.NaN), state)).toThrow(TypeError);
   });
 
   it('produces identical output for identical inputs (no hidden mutation)', () => {
@@ -190,14 +203,16 @@ describe('RateEvaluator monotonic ordering + purity', () => {
     const b1 = sampleSrc(SRC2, rssBody(1), 1, 500);
     const r2 = e.evaluate(b0, b1, state); // stream B normal — must NOT inherit A's warn
     expect(r2.signals).toHaveLength(0);
-    const hB = (r2.state as AdaptiveState)[BODY_HISTORY]!.ax!.rate!;
+    const hB = (r2.state as AdaptiveState)[BODY_HISTORY]?.ax?.rate;
+    assert(hB);
     expect(hB.latch['rate:r']).toBe('normal');
     // B then breaches — its own streak, not suppressed by A's latch.
     const b2 = sampleSrc(SRC2, rssBody(50), 2, 1500);
     const r3 = e.evaluate(b1, b2, r2.state);
     expect(r3.signals[0]?.data.severity).toBe('warn');
     // And A's latch is still authoritative in A's metadata.
-    const hA = (r3.state as AdaptiveState)[BODY_HISTORY]!.fs!.rate!;
+    const hA = (r3.state as AdaptiveState)[BODY_HISTORY]?.fs?.rate;
+    assert(hA);
     expect(hA.latch['rate:r']).toBe('warn');
   });
 
@@ -212,7 +227,8 @@ describe('RateEvaluator monotonic ordering + purity', () => {
     // rss missing entirely → window dropped, no fabricated recovery signal.
     const r2 = e.evaluate(prev, sample(cpuBody(0.5), 2, undefined, 2000), state);
     expect(r2.signals).toHaveLength(0);
-    const hist = (r2.state as AdaptiveState)[BODY_HISTORY]!.fs!.rate!;
+    const hist = (r2.state as AdaptiveState)[BODY_HISTORY]?.fs?.rate;
+    assert(hist);
     expect(hist.windows.rss).toBeUndefined();
     expect(hist.latch['rate:r']).toBe('warn'); // latch retained
   });

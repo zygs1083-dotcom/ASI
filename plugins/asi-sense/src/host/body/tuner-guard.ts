@@ -192,7 +192,7 @@ export class TunerGuard {
   ): string | null {
     if (!finiteNum(now)) return 'nonfinite clock';
     if (!this.store.restored) return 'restore pending';
-    if (this.store.disabled) return 'tuning disabled: restore-failed';
+    if (this.store.disabled) return `tuning disabled: ${this.store.disabled}`;
     if (typeof to === 'number' && typeof current === 'number') {
       if (current === 0 || Math.abs(to - current) > Math.abs(current) * 0.5) return 'exceeds ±50%';
       if (spec.tighten === 'up' && to < current) return 'safety: cannot loosen';

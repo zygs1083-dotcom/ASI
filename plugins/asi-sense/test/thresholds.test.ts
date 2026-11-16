@@ -29,7 +29,7 @@ function mkBody(over: Partial<Body> = {}): Body {
 }
 
 function sample(body: Body, at: number, state?: BodyThresholdSample['state']): BodyThresholdSample {
-  return { body, at, source: SRC, ...(state ? { state } : {}) };
+  return { body, at, source: SRC, monotonicAt: at, ...(state ? { state } : {}) };
 }
 
 const disks = (free: number, total = 100) => mkBody({ disks: f([{ mount: '/', total, free }]) });

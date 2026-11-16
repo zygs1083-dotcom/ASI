@@ -4,6 +4,7 @@ import { AttentionPipeline, type DeliveryIntent } from '../src/host/attention/pi
 import { DEFAULT_RULES } from '../src/host/attention/rules.ts';
 import { BodyMonitor, defaultBodyRules } from '../src/host/body/index.ts';
 import { StateStore } from '../src/host/state/store.ts';
+import { regressionCases } from './eval-body.cases.ts';
 import { DAY, disturbances, type Frame, HOUR, ROOT, SEEDS, START, trace } from './eval-body.data.ts';
 
 type Counts = { detector: number[]; delivery: number[] };
@@ -129,7 +130,7 @@ class Replay {
       assert.deepEqual(this.monitor.baseline.read('cpu', frame.wall), before, 'abnormal CPU must not train baseline');
       if (frame.sample.body.cpu.value) this.sustainedSamples++;
     }
-    const signals = [...result.signals, ...frame.files.flatMap((s) => this.monitor.accept(s))];
+    const signals = [...result.signals, ...frame.files.flatMap((s) => this.monitor.accept(s, frame.elapsed))];
     if (!measured) return;
     const cpu = disturbances.find((d) => d.name === 'CPU anomaly');
     if (this.injections && cpu && frame.elapsed >= cpu.start && frame.elapsed < cpu.start + cpu.duration) {
@@ -258,5 +259,6 @@ console.log('\nPASS: 3 seeds x 2 cohorts x 7 daily detector/delivery assertions;
 console.log(
   'Additional two-hour sustained CPU scenario: >=100 valid samples/seed, every before/after baseline identical.',
 );
+regressionCases();
 console.log('\nLimits: bounded synthetic workloads, not arbitrary real workloads; 14-day training is not scored.');
 console.log(`Clock fixtures start ${new Date(START).toISOString()}; each measured cohort spans ${(7 * DAY) / HOUR}h.`);

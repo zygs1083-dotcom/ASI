@@ -62,15 +62,19 @@ export class AnomalyEvaluator implements BodyEvaluator {
   }
 
   evaluate(_prev: BodyThresholdSample, next: BodyThresholdSample, state: BodyThresholdState): BodyEvaluation {
+    if (!Number.isFinite(_prev.monotonicAt) || !Number.isFinite(next.monotonicAt)) {
+      throw new TypeError('anomaly: monotonicAt must be finite');
+    }
     const pub: BodyThresholdState = { ...state };
     const streamId = next.source.id;
     const inHist = (state as AdaptiveState)[BODY_HISTORY]?.[streamId]?.anomaly;
-    if (!Number.isFinite(next.at) || (inHist?.lastAt !== undefined && next.at <= inHist.lastAt)) {
+    if (!Number.isFinite(next.at) || (inHist?.lastAt !== undefined && next.monotonicAt <= inHist.lastAt)) {
       return { signals: [], state: pub };
     }
-    const baseline = inHist?.baseline ?? this.seed;
+    const baseline = (inHist?.baseline ?? this.seed).clone();
+    baseline.advance(next.monotonicAt);
     const metrics = readMetrics(next);
-    const gated = baseline.mature(next.at);
+    const gated = baseline.mature(next.monotonicAt);
     const signals: BodySignal[] = [];
     const streaks: Record<string, number> = {};
     // Per-stream latch (authoritative); `pub` keys are last-writer projections.
@@ -84,7 +88,9 @@ export class AnomalyEvaluator implements BodyEvaluator {
       const stat = metric ? baseline.read(rule.metric, next.at) : undefined;
       const eligible = stat !== undefined && stat.count >= BASELINE_MIN_COUNT && stat.dates >= BASELINE_MIN_DATES;
       if (!metric || !stat || !gated || !eligible) {
-        streaks[rule.id] = 0; // no evidence: streak cleared, latch kept
+        const previous = inHist?.streaks[rule.id] ?? 0;
+        streaks[rule.id] = metric ? previous : 0; // no evidence: streak cleared, latch kept
+        if (metric && (previous > 0 || streamLatch[key] === 'warn')) contaminating.add(rule.metric);
         continue;
       }
       const resolved = rule.param !== undefined ? this.threshold(rule.param, rule.sigma) : rule.sigma;
@@ -101,7 +107,7 @@ export class AnomalyEvaluator implements BodyEvaluator {
       if (active === was) continue;
       const severity = active ? 'warn' : 'normal';
       signals.push({
-        id: `${next.source.id}:baseline:${rule.id}:${next.at}:${severity}`,
+        id: `${next.source.id}:baseline:${rule.id}:${next.monotonicAt}:${severity}`,
         kind: 'body.anomaly',
         at: next.at,
         source: next.source,
@@ -123,12 +129,12 @@ export class AnomalyEvaluator implements BodyEvaluator {
     }
     // Train on every valid non-contaminating reading, once per accepted
     // sample — on a fork, never the seed or the caller's baseline.
-    let trained = baseline;
+    const trained = baseline;
     if (metrics.size > contaminating.size) {
-      trained = baseline.clone();
-      for (const [name, m] of metrics) if (!contaminating.has(name)) trained.observe(name, m.value, next.at);
+      for (const [name, m] of metrics)
+        if (!contaminating.has(name)) trained.observe(name, m.value, next.at, next.monotonicAt);
     }
-    const anomaly = { lastAt: next.at, streaks, latch: streamLatch, baseline: trained };
+    const anomaly = { lastAt: next.monotonicAt, streaks, latch: streamLatch, baseline: trained };
     const stream = { ...(state as AdaptiveState)[BODY_HISTORY]?.[streamId], anomaly };
     const hist = { ...(state as AdaptiveState)[BODY_HISTORY], [streamId]: stream };
     const out: AdaptiveState = { ...pub, [BODY_HISTORY]: hist };

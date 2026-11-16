@@ -1,4 +1,4 @@
-import type { BodyThresholdState } from '@asi/sense-types';
+import type { BodyThresholdState, ThresholdSeverity } from '@asi/sense-types';
 import { Baseline, type BaselineOptions } from './baseline.ts';
 
 /**
@@ -32,7 +32,7 @@ export interface RateHistory {
 }
 
 export interface AnomalyHistory {
-  /** Last accepted wall sample stamp (ordering gate, survives restarts). */
+  /** Last accepted monotonic sample stamp (ordering gate, reset on restart). */
   lastAt?: number;
   streaks: Record<string, number>;
   /** Per-stream rule latches (`baseline:<id>`), projected into public keys. */
@@ -52,14 +52,26 @@ export type BodyHistory = Record<string, BodyStreamHistory>;
 /** Caller-threaded evaluator state: M1 latch record plus symbol metadata. */
 export type AdaptiveState = BodyThresholdState & { [BODY_HISTORY]?: BodyHistory };
 
+/** Strict latch validation: known keys→severities only. */
+export function validLatch(v: unknown): BodyThresholdState | undefined {
+  if (v === null || typeof v !== 'object' || Array.isArray(v)) return undefined;
+  const out: BodyThresholdState = {};
+  const sev: readonly ThresholdSeverity[] = ['normal', 'warn', 'critical'];
+  for (const [k, s] of Object.entries(v)) {
+    if (typeof k !== 'string' || !sev.includes(s as ThresholdSeverity)) return undefined;
+    out[k] = s as ThresholdSeverity;
+  }
+  return out;
+}
+
 const isRec = (v: unknown): v is Record<string, unknown> => v !== null && typeof v === 'object' && !Array.isArray(v);
 const isNum = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v);
 const isCount = (v: unknown): v is number => Number.isSafeInteger(v) && (v as number) >= 0;
 
 /**
  * Snapshot-safe projection of {@link BodyHistory}: per stream only the
- * anomaly streaks, ordering stamp and serialized baseline are durable.
- * Monotonic rate windows are intentionally dropped — a monotonic stamp is
+ * anomaly streaks, latches and serialized baseline are durable.
+ * Monotonic ordering stamps and windows are intentionally dropped — a stamp is
  * meaningless across processes, so rate history always restarts cold.
  */
 export function serializeHistory(history: BodyHistory | undefined): Record<string, unknown> {
@@ -68,7 +80,6 @@ export function serializeHistory(history: BodyHistory | undefined): Record<strin
     const a = h.anomaly;
     if (!a) continue;
     const entry: Record<string, unknown> = { streaks: { ...a.streaks }, latch: { ...a.latch } };
-    if (a.lastAt !== undefined) entry.lastAt = a.lastAt;
     if (a.baseline) entry.baseline = a.baseline.serialize();
     out[stream] = entry;
   }
@@ -106,7 +117,7 @@ export function parseHistory(v: unknown, options: BaselineOptions): BodyHistory 
       if (baseline.restoreFailed) return undefined;
     }
     out[stream] = {
-      anomaly: { ...(isNum(raw.lastAt) ? { lastAt: raw.lastAt } : {}), streaks, latch, baseline },
+      anomaly: { streaks, latch, baseline },
     };
   }
   return out;

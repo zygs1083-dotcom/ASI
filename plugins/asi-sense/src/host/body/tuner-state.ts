@@ -38,12 +38,16 @@ export class TunerStore {
   nextId = 1;
   wallHighwater = 0;
   restored = false;
-  disabled: 'restore-failed' | undefined;
+  disabled: 'restore-failed' | 'storage-failed' | undefined;
   private hour = new Map<string, number[]>();
   private day = new Map<string, number[]>();
   private dayAll: number[] = [];
   private restoredW?: RestoredWindows;
   private thawMono?: number;
+
+  clone(): TunerStore {
+    return Object.assign(new TunerStore(), structuredClone({ ...this }));
+  }
 
   /** Fresh ID lineage after a failed restore — old IDs can never collide. */
   resetIds(): void {

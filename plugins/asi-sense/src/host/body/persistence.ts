@@ -14,8 +14,8 @@ export interface BodyPersistence {
  * `intervalMs`, the snapshot is produced at execution time (never the text
  * staged at schedule time), writes are serialized so they cannot overlap,
  * and the timer is `unref`ed so it cannot hold the process open. Failures
- * from timer-driven writes go to `onError`; a {@link flush} write rejects
- * to its own caller instead (still without breaking the queue). A flush is
+ * go to `onError`; a {@link flush} write also rejects to its own caller
+ * (still without breaking the queue). A flush is
  * always allowed — it is the shutdown path.
  */
 export class PersistScheduler {
@@ -48,19 +48,26 @@ export class PersistScheduler {
         this.saving = false;
         if (this.dirty) this.schedule();
       };
-      void this.enqueue(true).then(finished, finished);
+      void this.enqueue().then(finished, finished);
     }, wait);
     this.timer.unref?.();
   }
 
   /** Serial writer: runs after the previous write settled — never overlaps. */
-  private enqueue(report: boolean): Promise<void> {
+  private enqueue(save = this.save): Promise<void> {
     const p = this.tail.then(async () => {
       this.lastRun = this.clock();
-      await this.save();
+      await save();
     });
-    this.tail = report ? p.catch((err) => this.onError?.(err)) : p.catch(() => {});
+    this.tail = p.catch((err) => this.onError?.(err));
     return p;
+  }
+
+  commit(save: () => Promise<void>, publish: () => void): Promise<void> {
+    return this.enqueue(async () => {
+      await save();
+      publish();
+    });
   }
 
   /** Forces a write now (cancels any pending coalesced one). */
@@ -70,7 +77,7 @@ export class PersistScheduler {
       clearTimeout(this.timer);
       this.timer = undefined;
     }
-    return this.enqueue(false);
+    return this.enqueue();
   }
 
   /** Cancels the pending write AND the timer without flushing (pre-restore shutdown). */

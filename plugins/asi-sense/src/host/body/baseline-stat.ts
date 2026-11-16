@@ -4,6 +4,7 @@ export interface Bucket {
   mad: number;
   count: number;
   lastAt: number;
+  zone?: string;
   dates: Set<string>;
   warmup?: number[];
 }

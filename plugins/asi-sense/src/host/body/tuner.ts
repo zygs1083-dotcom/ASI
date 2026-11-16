@@ -1,5 +1,6 @@
 import type { TuningValue } from '@asi/sense-types';
 import { type BodyPersistence, PersistScheduler } from './persistence.ts';
+import { feedback } from './tuner-feedback.ts';
 import { type TunerActor, TunerGuard, type TuningResult } from './tuner-guard.ts';
 import { validateSnapshot } from './tuner-persist.ts';
 import {
@@ -40,12 +41,15 @@ export interface TunerOptions {
  * restart cannot unlock.
  */
 export class Tuner {
-  private readonly store = new TunerStore();
-  private readonly guard: TunerGuard;
+  private store = new TunerStore();
+  private readonly actor: () => TunerActor;
   private readonly clock: () => number;
   private readonly wallClock: () => number;
   private readonly persistence?: BodyPersistence;
   private readonly scheduler?: PersistScheduler;
+  private commit?: (snapshot: () => string, publish: () => void) => Promise<void>;
+  private tail: Promise<void> = Promise.resolve();
+  private closed = false;
 
   constructor(parameters: Record<string, ParameterSpec>, options: TunerOptions = {}) {
     for (const k of ['actor', 'clock', 'wallClock'] as const) {
@@ -53,21 +57,22 @@ export class Tuner {
         throw new TypeError(`tuner: options.${k} must be a function`);
       }
     }
-    const actorFn = options.actor ?? (() => 'agent' as const);
+    this.actor = options.actor ?? (() => 'agent' as const);
     this.clock = options.clock ?? (() => performance.now());
     this.wallClock = options.wallClock ?? Date.now;
     this.store.restored = options.persistence === undefined;
     this.persistence = options.persistence;
     if (options.persistence) {
       const save = options.persistence.save.bind(options.persistence);
-      this.scheduler = new PersistScheduler(() => save(this.serialize()), this.clock);
+      const scheduler = new PersistScheduler(
+        () => save(this.serialize()),
+        this.clock,
+        10_000,
+        () => this.disableStorage(),
+      );
+      this.scheduler = scheduler;
+      this.commit = (snapshot, publish) => scheduler.commit(() => save(snapshot()), publish);
     }
-    this.guard = new TunerGuard(this.store, {
-      actor: actorFn,
-      mono: this.clock,
-      wall: this.wallClock,
-      onChange: () => this.schedule(),
-    });
     for (const [name, spec] of Object.entries(parameters)) {
       const s = validateSpec(name, spec);
       this.store.specs.set(name, s);
@@ -76,7 +81,7 @@ export class Tuner {
   }
 
   /** Public kill switch: a failed restore disables AI tuning permanently. */
-  get tuningDisabled(): 'restore-failed' | undefined {
+  get tuningDisabled(): 'restore-failed' | 'storage-failed' | undefined {
     return this.store.disabled;
   }
 
@@ -95,24 +100,34 @@ export class Tuner {
     return this.store.log.map((e) => ({ ...e }));
   }
 
-  propose(req: { param: string; to: TuningValue; reason?: string }): TuningResult {
-    return this.guard.attempt('propose', req.param, req.to, String(req.reason ?? ''));
+  get undoableChanges(): TuningLog[] {
+    return this.store.applied
+      .filter((entry) => this.store.lastApplied.get(entry.param) === entry.id)
+      .map((entry) => ({ ...entry }));
   }
 
-  lock(param: string): TuningResult {
-    return this.guard.setLock(param, true);
+  propose(req: { param: string; to: TuningValue; reason?: string }): Promise<TuningResult> {
+    return this.mutate((_store, guard) => guard.attempt('propose', req.param, req.to, String(req.reason ?? '')));
   }
 
-  unlock(param: string): TuningResult {
-    return this.guard.setLock(param, false);
+  lock(param: string): Promise<TuningResult> {
+    return this.mutate((_store, guard) => guard.setLock(param, true));
+  }
+
+  unlock(param: string): Promise<TuningResult> {
+    return this.mutate((_store, guard) => guard.setLock(param, false));
   }
 
   /** Inverse of an applied change; stale IDs (ABA included) are rejected. */
-  revert(changeId: string): TuningResult {
-    return this.guard.revert(changeId);
+  revert(changeId: string): Promise<TuningResult> {
+    return this.mutate((_store, guard) => guard.revert(changeId));
   }
 
-  registerAlert(alertId: string, ruleId: string, param: string): boolean {
+  registerAlert(alertId: string, ruleId: string, param: string): Promise<boolean> {
+    return this.mutate((store) => this.register(store, alertId, ruleId, param));
+  }
+
+  private register(store: TunerStore, alertId: string, ruleId: string, param: string): boolean {
     if (
       typeof alertId !== 'string' ||
       alertId === '' ||
@@ -120,75 +135,19 @@ export class Tuner {
       ruleId === '' ||
       !finiteNum(this.clock()) ||
       !finiteNum(this.wallClock()) ||
-      !this.store.specs.has(param) ||
-      this.store.alerts.has(alertId) ||
-      this.store.alerts.size >= ALERT_CAP
+      !store.specs.has(param) ||
+      store.alerts.has(alertId) ||
+      store.alerts.size >= ALERT_CAP
     ) {
       return false;
     }
-    this.store.alerts.set(alertId, { ruleId, param });
-    this.schedule();
+    store.alerts.set(alertId, { ruleId, param });
     return true;
   }
 
   /** Consumes an alert registration once; three noise streaks auto-tune. */
-  feedback(alertId: string, verdict: 'useful' | 'noise'): TuningResult {
-    const by = this.guard.actor() ?? 'agent';
-    const binding = this.store.alerts.get(alertId);
-    const badClock = !finiteNum(this.clock()) || !finiteNum(this.wallClock());
-    if (!binding || (verdict !== 'useful' && verdict !== 'noise') || badClock) {
-      return this.guard.audit({
-        param: binding?.param ?? '',
-        from: '',
-        to: '',
-        by,
-        reason: `feedback ${String(verdict)}`,
-        at: this.guard.auditAt(),
-        operation: 'feedback',
-        status: 'rejected',
-        rejectionReason: badClock ? 'nonfinite clock' : 'unknown or consumed alert',
-      });
-    }
-    this.store.alerts.delete(alertId);
-    const result = this.guard.audit({
-      param: binding.param,
-      from: verdict,
-      to: verdict,
-      by,
-      reason: `feedback ${verdict} on ${alertId}`,
-      at: this.guard.auditAt(),
-      operation: 'feedback',
-      status: 'applied',
-    });
-    const streak = verdict === 'useful' ? 0 : (this.store.noise.get(binding.ruleId) ?? 0) + 1;
-    this.store.noise.set(binding.ruleId, streak);
-    if (streak < 3) return result;
-    this.store.noise.set(binding.ruleId, 0);
-    const spec = this.store.specs.get(binding.param);
-    const current = this.store.values.get(binding.param);
-    const dir = spec?.noiseDirection;
-    if (dir && typeof current === 'number' && finiteNum(current)) {
-      this.guard.attempt(
-        'propose',
-        binding.param,
-        current * (dir === 'up' ? 1.25 : 0.8),
-        `auto: 3 consecutive noise on ${binding.ruleId}`,
-        'auto',
-      );
-    } else {
-      this.guard.audit({
-        param: binding.param,
-        from: current ?? '',
-        to: current ?? '',
-        by: 'auto',
-        reason: `auto: no noise policy for ${binding.param}`,
-        at: this.guard.auditAt(),
-        operation: 'propose',
-        status: 'rejected',
-        rejectionReason: 'no noise policy',
-      });
-    }
-    return result;
+  feedback(alertId: string, verdict: 'useful' | 'noise'): Promise<TuningResult> {
+    return this.mutate((store, guard) => feedback(store, guard, this.clock, this.wallClock, alertId, verdict));
   }
 
   serialize(): string {
@@ -242,27 +201,66 @@ export class Tuner {
   }
 
   /** Force-flushes the current snapshot (no-op before restore/without persistence). */
-  persist(): Promise<void> {
-    return this.store.restored && this.scheduler ? this.scheduler.flush() : Promise.resolve();
+  async persist(): Promise<void> {
+    await this.tail;
+    if (this.store.restored) await this.scheduler?.flush();
   }
 
   /** Cancels the pending write + timer, then flushes — even before restore. */
   async close(): Promise<void> {
+    this.closed = true;
+    await this.tail;
     if (this.store.restored) await this.scheduler?.close();
     else this.scheduler?.cancel();
   }
 
-  /** Host hook (e.g. a BodyMonitor managing a combined store): fires on
-   *  every post-restore mutation even without own persistence. */
-  setOnChange(fn: (() => void) | undefined): void {
-    this.onChanged = fn;
+  setCommit(fn: (snapshot: () => string, publish: () => void) => Promise<void>): void {
+    if (this.persistence) throw new TypeError('tuner: combined and standalone persistence cannot be mixed');
+    this.commit = fn;
   }
 
-  private onChanged?: () => void;
+  disableStorage(): void {
+    this.store.disabled = 'storage-failed';
+  }
 
-  private schedule(): void {
-    if (!this.store.restored) return;
-    this.scheduler?.schedule();
-    this.onChanged?.();
+  private mutate<T>(action: (store: TunerStore, guard: TunerGuard) => T): Promise<T> {
+    if (this.closed) return Promise.reject(new Error('tuner: closed'));
+    const actor = this.actor();
+    const operation = this.tail.then(async () => {
+      if (!this.store.restored) throw new Error('tuner: restore pending');
+      if (!this.commit) throw new Error('tuner: persistence required');
+      if (this.store.disabled) throw new Error(`tuner: tuning disabled: ${this.store.disabled}`);
+      if (!finiteNum(this.clock()) || !finiteNum(this.wallClock())) throw new TypeError('tuner: clocks must be finite');
+      const staged = this.store.clone();
+      const guard = new TunerGuard(staged, {
+        actor: () => actor,
+        mono: this.clock,
+        wall: this.wallClock,
+        onChange: () => {},
+      });
+      const result = action(staged, guard);
+      try {
+        await this.commit(
+          () => {
+            const mono = this.clock();
+            const wall = this.wallClock();
+            if (!finiteNum(mono) || !finiteNum(wall)) throw new TypeError('tuner: clocks must be finite');
+            return serializeTuner(staged, mono, wall);
+          },
+          () => {
+            this.store = staged;
+          },
+        );
+      } catch (err) {
+        this.disableStorage();
+        throw err;
+      }
+      return result;
+    });
+    this.tail = operation.then(
+      () => {},
+      () => {},
+    );
+    return operation;
   }
 }

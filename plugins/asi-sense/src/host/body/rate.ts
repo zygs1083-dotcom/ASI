@@ -101,9 +101,12 @@ export class RateEvaluator implements BodyEvaluator {
   }
 
   evaluate(prev: BodyThresholdSample, next: BodyThresholdSample, state: BodyThresholdState): BodyEvaluation {
+    if (!Number.isFinite(prev.monotonicAt) || !Number.isFinite(next.monotonicAt)) {
+      throw new TypeError('rate: monotonicAt must be finite');
+    }
     const pub: BodyThresholdState = { ...state };
     const inHist = (state as AdaptiveState)[BODY_HISTORY]?.[next.source.id]?.rate;
-    const mono = next.monotonicAt ?? next.at; // logical-replay fallback — never live wall time
+    const mono = next.monotonicAt; // logical-replay fallback — never live wall time
     if (!Number.isFinite(mono) || (inHist?.lastMono !== undefined && mono <= inHist.lastMono)) {
       return { signals: [], state: pub };
     }
@@ -122,7 +125,7 @@ export class RateEvaluator implements BodyEvaluator {
         pts = old.points.slice();
       } else {
         const seed = Number.isFinite(prev.at) ? readMetrics(prev).get(key) : undefined;
-        const pMono = prev.monotonicAt ?? prev.at;
+        const pMono = prev.monotonicAt;
         pts = seed && Number.isFinite(pMono) && pMono < mono ? [{ at: pMono as number, value: seed.value }] : [];
       }
       pts.push({ at: mono, value: metric.value });
@@ -214,7 +217,7 @@ export class RateEvaluator implements BodyEvaluator {
       data.etaToFloorMs = data.timeToFloorMs = eta;
     }
     return {
-      id: `${next.source.id}:${latchKey}:${next.at}:${severity}`,
+      id: `${next.source.id}:${latchKey}:${next.monotonicAt}:${severity}`,
       kind: 'body.rate',
       at: next.at,
       source: next.source,

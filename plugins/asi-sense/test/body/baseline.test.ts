@@ -6,7 +6,8 @@ const HOUR = 3_600_000;
 const MON10 = Date.UTC(2026, 0, 5, 10); // Monday 2026-01-05 10:00 UTC
 const MON10W2 = Date.UTC(2026, 0, 12, 10); // next Monday, same week slot
 const NY = 'America/New_York';
-const mk = (opts: Record<string, unknown> = {}) => new Baseline({ timeZone: 'UTC', installedAt: 0, ...opts });
+const mk = (opts: Record<string, unknown> = {}) =>
+  new Baseline({ timeZone: 'UTC', installedAt: 0, elapsedMs: 14 * DAY, ...opts });
 
 const observeN = (b: Baseline, metric: string, value: number, ats: readonly number[]) => {
   for (const at of ats) b.observe(metric, value, at);
@@ -32,7 +33,7 @@ describe('Baseline buckets', () => {
   });
 
   it('rejects nonfinite values/timestamps and ignores out-of-order observations', () => {
-    expect(() => mk({ clock: () => Number.NaN }).learningProgress).toThrow(TypeError);
+    expect(() => mk({ monotonicAt: Number.NaN })).toThrow(TypeError);
     const b = mk();
     b.observe('cpu', 0.5, MON10);
     b.observe('cpu', Number.NaN, MON10 + 1);
@@ -43,7 +44,7 @@ describe('Baseline buckets', () => {
   });
 
   it('gates maturity on 24 FULL hours from installedAt', () => {
-    const b = new Baseline({ timeZone: 'UTC', installedAt: MON10 });
+    const b = new Baseline({ timeZone: 'UTC', installedAt: MON10, monotonicAt: MON10 });
     expect(b.mature(MON10 + DAY - 1)).toBe(false);
     expect(b.mature(MON10 + DAY)).toBe(true);
     expect(b.mature(Number.NaN)).toBe(false);
@@ -51,12 +52,15 @@ describe('Baseline buckets', () => {
 
   it('reaches learningProgress 100 only after 24 full hours', () => {
     let now = MON10;
-    const b = new Baseline({ timeZone: 'UTC', installedAt: MON10, clock: () => now });
+    const b = new Baseline({ timeZone: 'UTC', installedAt: MON10, monotonicAt: now });
     now = MON10 + HOUR * 12;
+    b.advance(now);
     expect(b.learningProgress).toBe(50);
     now = MON10 + DAY - 1;
+    b.advance(now);
     expect(b.learningProgress).toBeLessThan(100);
     now = MON10 + DAY;
+    b.advance(now);
     expect(b.learningProgress).toBe(100);
   });
 
@@ -72,7 +76,7 @@ describe('Baseline buckets', () => {
 
 describe('Baseline serialization (v2)', () => {
   it('round-trips buckets, dates, installedAt and timezone', () => {
-    const b = new Baseline({ timeZone: NY, installedAt: MON10 });
+    const b = new Baseline({ timeZone: NY, installedAt: MON10, elapsedMs: 14 * DAY });
     observeN(b, 'cpu', 0.5, [MON10, MON10W2]);
     const r = Baseline.deserialize(b.serialize(), { timeZone: NY });
     expect(r.restoreFailed).toBe(false);
@@ -81,11 +85,11 @@ describe('Baseline serialization (v2)', () => {
     expect(r.read('cpu', MON10)).toMatchObject({ count: 2, dates: 2 });
   });
 
-  it('adopts the persisted zone when the host gives no override', () => {
+  it('uses the runtime zone when the host gives no override', () => {
     const b = new Baseline({ timeZone: 'UTC', installedAt: MON10 });
     b.observe('cpu', 0.5, MON10);
     const r = Baseline.deserialize(b.serialize());
-    expect(r.timeZone).toBe('UTC');
+    expect(r.timeZone).toBe(Intl.DateTimeFormat().resolvedOptions().timeZone);
   });
 
   it.each([
@@ -127,6 +131,29 @@ describe('Baseline serialization (v2)', () => {
 });
 
 describe('Baseline local timezone + DST', () => {
+  it('uses the current timezone during a run and after restore without migrating slots', () => {
+    const old = process.env.TZ;
+    try {
+      process.env.TZ = 'UTC';
+      const b = new Baseline({ installedAt: 0 });
+      b.observe('cpu', 0.5, MON10);
+      const utcSnapshot = b.serialize();
+      process.env.TZ = 'America/New_York';
+      expect(b.timeZone).toBe('America/New_York');
+      expect(b.read('cpu', MON10)).toBeUndefined();
+      expect(b.read('cpu', MON10 + 5 * HOUR)?.count).toBe(1);
+      const restored = Baseline.deserialize(utcSnapshot);
+      expect(restored.timeZone).toBe('America/New_York');
+      expect(restored.read('cpu', MON10 + 5 * HOUR)?.count).toBe(1);
+      const resaved = Baseline.deserialize(b.serialize());
+      expect(resaved.restoreFailed).toBe(false);
+      expect(resaved.read('cpu', MON10 + 5 * HOUR)?.count).toBe(1);
+    } finally {
+      if (old === undefined) delete process.env.TZ;
+      else process.env.TZ = old;
+    }
+  });
+
   const FALL = {
     edt0130: Date.UTC(2026, 10, 1, 5, 30), // 2026-11-01 01:30 EDT
     est0130: Date.UTC(2026, 10, 1, 6, 30), // 2026-11-01 01:30 EST (repeated hour)
@@ -139,7 +166,7 @@ describe('Baseline local timezone + DST', () => {
   };
 
   it('coalesces the repeated fall-back hour into one Sun-01 bucket', () => {
-    const b = new Baseline({ timeZone: NY, installedAt: 0 });
+    const b = new Baseline({ timeZone: NY, installedAt: 0, elapsedMs: 14 * DAY });
     b.observe('cpu', 0.5, FALL.edt0130);
     b.observe('cpu', 0.6, FALL.est0130);
     const stat = b.read('cpu', FALL.est0130 + 1);
@@ -157,7 +184,7 @@ describe('Baseline local timezone + DST', () => {
   });
 
   it('keeps 09:00 in its own slot across the DST switch', () => {
-    const b = new Baseline({ timeZone: NY, installedAt: 0 });
+    const b = new Baseline({ timeZone: NY, installedAt: 0, elapsedMs: 14 * DAY });
     const before = Date.UTC(2026, 2, 7, 14, 0); // Sat 09:00 EST
     const after = Date.UTC(2026, 2, 14, 13, 0); // Sat 09:00 EDT (next week)
     b.observe('cpu', 0.5, before);

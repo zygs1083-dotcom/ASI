@@ -1,3 +1,4 @@
+import assert from 'node:assert/strict';
 import type { BodyThresholdState, Signal } from '@asi/sense-types';
 import { describe, expect, it } from 'vitest';
 import { AnomalyEvaluator, type AnomalyRule } from '../../src/host/body/anomaly.ts';
@@ -19,8 +20,8 @@ const rule = (over: Partial<AnomalyRule> = {}): AnomalyRule => ({ id: 'cpu', met
  * Trains `cpu` to mean ~0.5 with `perDate` samples on TWO local dates per
  * requested hour slot (same weekday/hour in week 1 and week 2).
  */
-function trained(hours: readonly number[], perDate = 8, value = 0.5): Baseline {
-  const b = new Baseline({ timeZone: TZ, installedAt: INSTALL });
+function trained(hours: readonly number[], perDate = 8, value = 0.5, elapsedMs = 14 * DAY): Baseline {
+  const b = new Baseline({ timeZone: TZ, installedAt: INSTALL, elapsedMs });
   for (const h of hours) {
     for (const wk of [0, WEEK]) {
       const t = SLOT10 + h * HOUR + wk;
@@ -48,7 +49,7 @@ const feed = (e: AnomalyEvaluator, state: BodyThresholdState, frames: [number, n
 
 describe('AnomalyEvaluator gating', () => {
   it('never fires at 8 hours even with an eligible bucket', () => {
-    const b = trained([-2]);
+    const b = trained([-2], 8, 0.5, 0);
     const e = mk(b);
     // The 08:00 bucket is eligible, but installation age is only eight hours.
     const { outs } = feed(e, {}, [
@@ -85,6 +86,49 @@ describe('AnomalyEvaluator gating', () => {
 });
 
 describe('AnomalyEvaluator streak + latch', () => {
+  it('uses distinct signal IDs for repeated warnings after wall-clock rollback', () => {
+    const e = mk(trained([0]));
+    let state: BodyThresholdState = {};
+    let prev = sample(cpuBody(0.5), EVAL, undefined, 0);
+    const warnings = [];
+    for (const [wall, mono, value] of [
+      [EVAL + 1, 1, 0.99],
+      [EVAL + 2, 2, 0.99],
+      [EVAL + 3, 3, 0.99],
+      [EVAL + 4, 4, 0.5],
+      [EVAL + 1, 5, 0.99],
+      [EVAL + 2, 6, 0.99],
+      [EVAL + 3, 7, 0.99],
+    ]) {
+      const next = sample(cpuBody(value), wall, undefined, mono);
+      const result = e.evaluate(prev, next, state);
+      warnings.push(...result.signals.filter((signal) => signal.data.severity === 'warn'));
+      state = result.state;
+      prev = next;
+    }
+    expect(warnings).toHaveLength(2);
+    expect(warnings[0]?.id).not.toBe(warnings[1]?.id);
+  });
+
+  it('detects real anomalies during wall-clock forward and rollback when receipt time increases', () => {
+    const e = mk(trained([0]));
+    let state: BodyThresholdState = {};
+    let prev = sample(cpuBody(0.5), EVAL, undefined, 0);
+    for (const [wall, mono, value] of [
+      [EVAL, 1, 0.5],
+      [EVAL + 3 * HOUR, 2, 0.5],
+      [EVAL + 1, 3, 0.99],
+      [EVAL + 2, 4, 0.99],
+      [EVAL + 3, 5, 0.99],
+    ]) {
+      const next = sample(cpuBody(value), wall, undefined, mono);
+      const result = e.evaluate(prev, next, state);
+      state = result.state;
+      prev = next;
+      if (mono === 5) expect(result.signals[0]?.data.severity).toBe('warn');
+    }
+  });
+
   it('warns on the 3rd consecutive breach and recovers once', () => {
     const e = mk(trained([0]));
     const { outs, state } = feed(e, {}, [
@@ -110,12 +154,14 @@ describe('AnomalyEvaluator streak + latch', () => {
       [EVAL + 120, 0.99],
     ]);
     expect(r1.outs[2]?.[0]?.data.severity).toBe('warn');
-    const hist = (r1.state as AdaptiveState)[BODY_HISTORY]!.fs!.anomaly!;
+    const hist = (r1.state as AdaptiveState)[BODY_HISTORY]?.fs?.anomaly;
+    assert(hist);
     expect(hist.streaks.cpu).toBe(3);
     // Sample with no cpu metric: streak resets, latch retained, no recovery emitted.
     const r2 = e.evaluate(sample(cpuBody(0.99), EVAL + 180), sample(mkBody({ cpu: blank() }), EVAL + 240), r1.state);
     expect(r2.signals).toHaveLength(0);
-    const hist2 = (r2.state as AdaptiveState)[BODY_HISTORY]!.fs!.anomaly!;
+    const hist2 = (r2.state as AdaptiveState)[BODY_HISTORY]?.fs?.anomaly;
+    assert(hist2);
     expect(hist2.streaks.cpu).toBe(0);
     expect(hist2.latch['baseline:cpu']).toBe('warn');
   });
@@ -141,9 +187,22 @@ describe('AnomalyEvaluator streak + latch', () => {
 });
 
 describe('AnomalyEvaluator contamination + purity', () => {
+  it.each([2, 3])('does not train an empty next hour during %i pending/warn samples', (count) => {
+    const e = mk(trained([0]));
+    const start = EVAL + 57 * 60_000;
+    const frames: [number, number][] = Array.from({ length: count }, (_, i) => [start + i * 60_000, 0.99]);
+    frames.push([EVAL + HOUR, 0.99]);
+    const { state } = feed(e, {}, frames);
+    const baseline = (state as AdaptiveState)[BODY_HISTORY]?.fs?.anomaly?.baseline;
+    expect(baseline?.read('cpu', EVAL + HOUR)).toBeUndefined();
+    const recovered = feed(e, state, [[EVAL + WEEK, 0.5]]);
+    const after = (recovered.state as AdaptiveState)[BODY_HISTORY]?.fs?.anomaly?.baseline;
+    expect(after?.read('cpu', EVAL + WEEK)?.count).toBe(17);
+  });
+
   it('detects a sustained .99 CPU anomaly on the 3rd frame (eval regression)', () => {
     // Fixture matching the eval finding: count 79, 2 dates, mean ~.51, scale ~.135.
-    const b = new Baseline({ timeZone: TZ, installedAt: INSTALL, minScale: { cpu: 0.135 } });
+    const b = new Baseline({ timeZone: TZ, installedAt: INSTALL, elapsedMs: 14 * DAY, minScale: { cpu: 0.135 } });
     for (const wk of [0, WEEK]) for (let i = 0; i < 40; i++) b.observe('cpu', 0.51, SLOT10 + wk + i);
     const stat = b.read('cpu', EVAL);
     expect(stat?.count).toBe(80);
@@ -171,16 +230,17 @@ describe('AnomalyEvaluator contamination + purity', () => {
     const { outs, state } = feed(e, {}, frames);
     const warned = outs.flat().filter((s) => s.data.severity === 'warn');
     expect(warned).toHaveLength(1); // one warn transition, sustained
-    const trainedB = (state as AdaptiveState)[BODY_HISTORY]!.fs!.anomaly!.baseline!;
+    const trainedB = (state as AdaptiveState)[BODY_HISTORY]?.fs?.anomaly?.baseline;
+    assert(trainedB);
     expect(trainedB.read('cpu', EVAL)?.mean).toBe(before[0]);
     expect(trainedB.read('cpu', EVAL + HOUR)?.mean).toBe(before[1]);
     expect(trainedB.read('cpu', EVAL + 2 * HOUR)?.mean).toBe(before[2]);
     // …while NORMAL samples still train (a fresh slot-13 bucket here; the
     // seed baseline itself stays untouched).
-    const r = feed(e, state, [[EVAL + 3 * HOUR, 0.5]]);
-    const afterNormal = (r.state as AdaptiveState)[BODY_HISTORY]!.fs!.anomaly!.baseline!;
-    expect(afterNormal.read('cpu', EVAL + 3 * HOUR)?.count).toBe(1);
-    expect(afterNormal.read('cpu', EVAL)?.count).toBe(16);
+    const r = feed(e, state, [[EVAL + WEEK, 0.5]]);
+    const afterNormal = (r.state as AdaptiveState)[BODY_HISTORY]?.fs?.anomaly?.baseline;
+    assert(afterNormal);
+    expect(afterNormal.read('cpu', EVAL)?.count).toBe(17);
     expect(b.read('cpu', EVAL)?.count).toBe(16); // seed immutable
   });
 
@@ -211,9 +271,10 @@ describe('AnomalyEvaluator contamination + purity', () => {
     const a2 = e.evaluate(sample(cpuBody(0.99), EVAL + 60), sample(cpuBody(0.99), EVAL + 120), st);
     expect(a2.signals[0]?.data.severity).toBe('warn');
     // Outliers can share the immutable seed; their latches/streaks cannot.
-    const hB = (a2.state as AdaptiveState)[BODY_HISTORY]!.ax!.anomaly!;
-    const hA = (a2.state as AdaptiveState)[BODY_HISTORY]!.fs!.anomaly!;
-    expect(hB.baseline?.serialize()).toBe(hA.baseline?.serialize());
+    const hB = (a2.state as AdaptiveState)[BODY_HISTORY]?.ax?.anomaly;
+    const hA = (a2.state as AdaptiveState)[BODY_HISTORY]?.fs?.anomaly;
+    assert(hB && hA);
+    expect(hB.baseline?.read('cpu', EVAL)?.mean).toBe(hA.baseline?.read('cpu', EVAL)?.mean);
     expect(hB.latch['baseline:cpu']).toBe('normal');
   });
 });

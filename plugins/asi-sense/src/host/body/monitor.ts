@@ -1,11 +1,4 @@
-import type {
-  BodyEvaluation,
-  BodyEvaluator,
-  BodyThresholdSample,
-  BodyThresholdState,
-  Signal,
-  ThresholdSeverity,
-} from '@asi/sense-types';
+import type { BodyEvaluation, BodyEvaluator, BodyThresholdSample, BodyThresholdState, Signal } from '@asi/sense-types';
 import { FloorEvaluator } from '../attention/thresholds.ts';
 import { AnomalyEvaluator, type AnomalyRule } from './anomaly.ts';
 import { Baseline, type BaselineOptions } from './baseline.ts';
@@ -14,11 +7,11 @@ import type { BodySignal } from './metrics.ts';
 import { type BodyPersistence, PersistScheduler } from './persistence.ts';
 import { RateEvaluator, type RateRule } from './rate.ts';
 import { defaultAnomalyRules, defaultRateRules, floorTable } from './rules.ts';
-import { type AdaptiveState, BODY_HISTORY, parseHistory, serializeHistory } from './state.ts';
+import { type AdaptiveState, BODY_HISTORY, parseHistory, serializeHistory, validLatch } from './state.ts';
 import type { Tuner } from './tuner.ts';
 
 export interface BodyMonitorOptions {
-  /** Injected MONOTONIC clock; stamped onto samples as `monotonicAt`. */
+  /** Injected MONOTONIC clock for installation and persistence bookkeeping. */
   clock?: () => number;
   /** Wall clock for the baseline seed + persistence bookkeeping. */
   wallClock?: () => number;
@@ -44,9 +37,9 @@ const BAD = '\x00invalid';
  * tighten), {@link RateEvaluator} on monotonic windows, {@link AnomalyEvaluator}
  * on the seeded baseline, and a built-in {@link FileBurstDetector} fed by
  * {@link accept} so file deletions can never slip through unmonitored.
- * Samples are stamped with the injected monotonic clock (a supplied
- * `monotonicAt` is respected); `prev`'s stamp derives from the wall gap
- * capped at the largest rule window. Adaptive state lives in caller-threaded
+ * Samples must carry monotonic receipt times supplied by the host.
+ * Wall time is used only for local buckets and signal display.
+ * Adaptive state lives in caller-threaded
  * {@link BODY_HISTORY} metadata; the monitor keeps the latest returned state
  * for persistence only, never for detection.
  */
@@ -60,7 +53,6 @@ export class BodyMonitor implements BodyEvaluator {
   private readonly burst: FileBurstDetector;
   private readonly persistence?: BodyPersistence;
   private readonly scheduler?: PersistScheduler;
-  private readonly maxRateWindow: number;
   private seed: Baseline;
   private anomaly?: AnomalyEvaluator;
   private latest?: AdaptiveState;
@@ -68,7 +60,7 @@ export class BodyMonitor implements BodyEvaluator {
   /** Saves stay blocked until {@link restore} settles — never overwrite the stored snapshot first. */
   private persistReady: boolean;
   /** Monitor-level kill switch, independent of a wired tuner. */
-  tuningDisabled: 'restore-failed' | undefined;
+  tuningDisabled: 'restore-failed' | 'storage-failed' | undefined;
 
   constructor(options: BodyMonitorOptions = {}) {
     for (const k of ['clock', 'wallClock'] as const) {
@@ -78,17 +70,21 @@ export class BodyMonitor implements BodyEvaluator {
     }
     this.clock = options.clock ?? (() => performance.now());
     this.wallClock = options.wallClock ?? Date.now;
-    this.timeZone = options.timeZone; // Absent override: Baseline adopts its persisted zone.
+    this.timeZone = options.timeZone; // Absent override: Baseline uses the runtime zone.
     this.tuner = options.tuner;
     const rateRules = options.rateRules ?? defaultRateRules();
     this.anomalyRules = options.anomalyRules ?? defaultAnomalyRules();
-    this.maxRateWindow = rateRules.reduce((m, r) => Math.max(m, r.windowMs), 0);
     if (rateRules.length) {
       this.rate = new RateEvaluator(rateRules, (p, f) => this.tuner?.number(p, f) ?? f);
     }
     this.seed =
       options.baseline ??
-      new Baseline({ clock: this.wallClock, installedAt: this.wallClock(), timeZone: this.timeZone });
+      new Baseline({
+        clock: this.wallClock,
+        installedAt: this.wallClock(),
+        timeZone: this.timeZone,
+        monotonicAt: this.clock(),
+      });
     this.rebuildAnomaly();
     this.burst = new FileBurstDetector({
       ...(options.fileBurst ?? {}),
@@ -98,12 +94,28 @@ export class BodyMonitor implements BodyEvaluator {
     this.persistReady = options.persistence === undefined;
     if (options.persistence) {
       const save = options.persistence.save.bind(options.persistence);
-      this.scheduler = new PersistScheduler(() => save(this.serialize()), this.clock);
+      this.scheduler = new PersistScheduler(
+        () => save(this.serialize()),
+        this.clock,
+        10_000,
+        () => {
+          this.tuningDisabled = 'storage-failed';
+          this.tuner?.disableStorage();
+        },
+      );
       // With a combined store the tuner's AI is blocked from CONSTRUCTION
-      // until restore(), and every post-restore tuner mutation dirties the
+      // until restore(), and every post-restore tuner mutation commits the
       // combined snapshot even without a body evaluate in between.
       this.tuner?.expectRestore();
-      this.tuner?.setOnChange(() => this.dirty());
+      this.tuner?.setCommit((snapshot, publish) => {
+        if (!this.persistReady || !this.scheduler) return Promise.reject(new Error('monitor: restore pending'));
+        return this.scheduler
+          .commit(() => save(this.serialize(snapshot())), publish)
+          .catch((error) => {
+            this.tuningDisabled = 'storage-failed';
+            throw error;
+          });
+      });
     }
   }
 
@@ -121,12 +133,12 @@ export class BodyMonitor implements BodyEvaluator {
   }
 
   /** Forwards one raw signal to the built-in burst detector. */
-  accept(signal: Signal): BodySignal[] {
-    return this.burst.accept(signal);
+  accept(signal: Signal, receivedAt: number): BodySignal[] {
+    return this.burst.accept(signal, receivedAt);
   }
 
   evaluate(prev: BodyThresholdSample, next: BodyThresholdSample, state: BodyThresholdState): BodyEvaluation {
-    const [p, n] = this.stamp(prev, next);
+    const [p, n] = this.validateSamples(prev, next);
     const f = new FloorEvaluator(floorTable(this.tuner)).evaluate(p, n, state);
     let acc = f.state;
     const signals: Signal[] = [];
@@ -191,8 +203,7 @@ export class BodyMonitor implements BodyEvaluator {
     // and history records, and tuner text whenever a tuner is wired —
     // missing pieces are malformed input, never a silent first install.
     if (
-      !d ||
-      d.version !== 1 ||
+      d?.version !== 1 ||
       d.disabled === 'restore-failed' ||
       typeof d.baseline !== 'string' ||
       (this.tuner && typeof d.tuner !== 'string')
@@ -223,14 +234,18 @@ export class BodyMonitor implements BodyEvaluator {
   }
 
   /** Force-flushes the combined snapshot (no-op before restore). */
-  persist(): Promise<void> {
-    return this.persistReady && this.scheduler ? this.scheduler.flush() : Promise.resolve();
+  async persist(): Promise<void> {
+    if (!this.persistReady) return;
+    await this.tuner?.persist();
+    await this.scheduler?.flush();
   }
 
-  /** Cancels the pending write + timer, then flushes — even before restore. */
+  /** Cancels the pending timer and flushes only after restore. */
   async close(): Promise<void> {
-    if (this.persistReady) await this.scheduler?.close();
-    else this.scheduler?.cancel();
+    if (this.persistReady) {
+      await this.tuner?.close();
+      await this.scheduler?.close();
+    } else this.scheduler?.cancel();
   }
 
   private dirty(): void {
@@ -238,7 +253,7 @@ export class BodyMonitor implements BodyEvaluator {
   }
 
   private baselineOptions(): BaselineOptions {
-    return { clock: this.wallClock, timeZone: this.timeZone };
+    return { clock: this.wallClock, timeZone: this.timeZone, monotonicAt: this.clock() };
   }
 
   private rebuildAnomaly(): void {
@@ -247,47 +262,34 @@ export class BodyMonitor implements BodyEvaluator {
       : undefined;
   }
 
-  private serialize(): string {
+  private serialize(tunerSnapshot?: string): string {
     const latest = this.latest;
+    const seed = this.seed.clone();
+    seed.advance(this.clock());
     const latch: BodyThresholdState = {};
     for (const k of Object.keys(latest ?? {})) latch[k] = (latest as AdaptiveState)[k];
     return JSON.stringify({
       version: 1,
       disabled: this.tuningDisabled ?? this.tuner?.tuningDisabled,
-      tuner: this.tuner?.serialize(),
-      baseline: this.seed.serialize(),
+      tuner: tunerSnapshot ?? this.tuner?.serialize(),
+      baseline: seed.serialize(),
       latch,
       history: serializeHistory(latest?.[BODY_HISTORY]),
     });
   }
 
-  /** Stamps monotonic times; a supplied `monotonicAt` is always respected. */
-  private stamp(prev: BodyThresholdSample, next: BodyThresholdSample): [BodyThresholdSample, BodyThresholdSample] {
-    const nextMono = next.monotonicAt ?? this.clock();
-    if (!Number.isFinite(nextMono) || !Number.isFinite(next.at) || !Number.isFinite(this.wallClock())) {
+  /** Requires finite monotonic receipt times on both samples. */
+  private validateSamples(
+    prev: BodyThresholdSample,
+    next: BodyThresholdSample,
+  ): [BodyThresholdSample, BodyThresholdSample] {
+    if (!Number.isFinite(prev.monotonicAt) || !Number.isFinite(next.monotonicAt) || !Number.isFinite(next.at)) {
       throw new TypeError('monitor: clocks must be finite');
     }
-    const gap = Number.isFinite(next.at - prev.at) ? Math.max(0, next.at - prev.at) : 0;
-    const prevMono = prev.monotonicAt ?? nextMono - Math.min(gap, this.maxRateWindow);
-    return [
-      { ...prev, monotonicAt: prevMono },
-      { ...next, monotonicAt: nextMono },
-    ];
+    return [prev, next];
   }
 
   private tagFloor(s: Signal): BodySignal {
     return { ...s, layer: 'floor', data: { ...s.data, layer: 'floor' } };
   }
-}
-
-/** Strict latch validation: known keys→severities only. */
-function validLatch(v: unknown): BodyThresholdState | undefined {
-  if (v === null || typeof v !== 'object' || Array.isArray(v)) return undefined;
-  const out: BodyThresholdState = {};
-  const sev: readonly ThresholdSeverity[] = ['normal', 'warn', 'critical'];
-  for (const [k, s] of Object.entries(v)) {
-    if (typeof k !== 'string' || !sev.includes(s as ThresholdSeverity)) return undefined;
-    out[k] = s as ThresholdSeverity;
-  }
-  return out;
 }

@@ -33,8 +33,8 @@ export function sample(
     body,
     at,
     source: SRC,
+    monotonicAt: monotonicAt ?? at,
     ...(state ? { state } : {}),
-    ...(monotonicAt !== undefined ? { monotonicAt } : {}),
   };
 }
 

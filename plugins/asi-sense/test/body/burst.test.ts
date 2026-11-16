@@ -1,5 +1,6 @@
+import type { Signal } from '@asi/sense-types';
 import { describe, expect, it } from 'vitest';
-import { FileBurstDetector } from '../../src/host/body/burst.ts';
+import { FileBurstDetector as Detector } from '../../src/host/body/burst.ts';
 import { fileChanged } from './helpers.ts';
 
 let seq = 0;
@@ -9,11 +10,24 @@ const del = (at: number, path: string, cause?: 'agent') => ev(at, path, 'delete'
 const add = (at: number, path: string, cause?: 'agent') => ev(at, path, 'add', cause);
 const mod = (at: number, path: string, cause?: 'agent') => ev(at, path, 'modify', cause);
 
+class FileBurstDetector extends Detector {
+  accept(signal: Signal, receivedAt = signal.at) {
+    return super.accept(signal, receivedAt);
+  }
+}
+
 describe('FileBurstDetector per-directory windows', () => {
+  it('requires a finite monotonic receipt time at the detector seam', () => {
+    const detector = new Detector();
+    const signal = del(0, '/w/x');
+    expect(() => detector.accept(signal, undefined as unknown as number)).toThrow(TypeError);
+    expect(() => detector.accept(signal, Number.NaN)).toThrow(TypeError);
+  });
+
   it('counts each directory on its own watermark — /a@0 /b@2000 /a@10,20', () => {
     const d = new FileBurstDetector({ windowMs: 1000, maxDeleted: 2 });
     expect(d.accept(del(0, '/a/x'))).toHaveLength(0);
-    expect(d.accept(del(2000, '/b/y'))).toHaveLength(0); // /b starts its own window
+    expect(d.accept(del(2000, '/b/y'), 1)).toHaveLength(0); // /b starts its own window
     expect(d.accept(del(10, '/a/y'))).toHaveLength(0);
     const out = d.accept(del(20, '/a/z')); // /a third external delete > 2 → wake
     expect(out).toHaveLength(1);
@@ -31,7 +45,7 @@ describe('FileBurstDetector per-directory windows', () => {
     d.accept(del(10, '/a/y'));
     // A far-future /b event must NOT prune /a's pending window — and a fresh
     // /a event at the same late stamp does.
-    expect(d.accept(del(60_000, '/b/z'))).toHaveLength(0);
+    expect(d.accept(del(60_000, '/b/z'), 20)).toHaveLength(0);
     expect(d.accept(del(60_000, '/a/q'))).toHaveLength(0); // window emptied first → 1 delete only
     d.accept(del(60_500, '/a/r'));
     const out = d.accept(del(61_000, '/a/s')); // q@60000 kept at cutoff → 3 > 2
@@ -49,6 +63,34 @@ describe('FileBurstDetector per-directory windows', () => {
 });
 
 describe('FileBurstDetector external vs agent counts', () => {
+  it('detects 51 deletes after a wall-clock jump and rollback using receipt time', () => {
+    const d = new FileBurstDetector();
+    d.accept(add(10_000_000, '/w/a'), 0);
+    const out = [];
+    for (let i = 0; i < 51; i++) out.push(...d.accept(del(i, `/w/${i}`), i + 1));
+    expect(out.at(-1)?.data.externalDeletionExceeded).toBe(true);
+  });
+
+  it('reclaims one-off directories and caps active directories', () => {
+    const d = new FileBurstDetector();
+    for (let i = 0; i < 1000; i++) d.accept(add(i * 120_000, `/w${i}/x`));
+    const dirs = (d as unknown as { dirs: Map<string, unknown> }).dirs;
+    expect(dirs.size).toBeLessThanOrEqual(1);
+    for (let i = 0; i < 1100; i++) d.accept(add(200_000_000 + i, `/active${i}/x`));
+    expect(dirs.size).toBeLessThanOrEqual(1024);
+    expect(dirs.has('/active0')).toBe(false);
+  });
+
+  it('emits a deletion upgrade after total external changes already crossed', () => {
+    const d = new FileBurstDetector();
+    const output = [];
+    for (let i = 0; i < 101; i++) output.push(...d.accept(add(i, `/w/a${i}`)));
+    for (let i = 0; i < 51; i++) output.push(...d.accept(del(101 + i, `/w/d${i}`)));
+    expect(output).toHaveLength(2);
+    expect(output[0]?.data.externalDeletionExceeded).toBe(false);
+    expect(output[1]?.data.externalDeletionExceeded).toBe(true);
+  });
+
   it('counts agent add/modify/delete separately; pure agent crossings never wake', () => {
     const d = new FileBurstDetector({ windowMs: 60_000, maxChanges: 2, maxDeleted: 50 });
     expect(d.accept(add(0, '/w/a', 'agent'))).toHaveLength(0);
