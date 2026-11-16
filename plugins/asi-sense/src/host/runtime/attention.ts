@@ -4,6 +4,7 @@ import { AttentionPipeline, type SessionContext } from '../attention/pipeline.ts
 import { isRuleApproved, selectRule } from '../attention/rules.ts';
 import { sourceObservation } from '../state/source-health.ts';
 import { StateStore } from '../state/store.ts';
+import type { FactExpiry } from './expiry.ts';
 import type { Clock, DshPort } from './ports.ts';
 
 export interface EventEntry {
@@ -68,11 +69,14 @@ export class RuntimeAttention {
   readonly store: StateStore;
   readonly pipeline: AttentionPipeline;
   private readonly entries: EventLog = [];
-  private readonly pending: Signal[] = [];
+  private readonly pending = new Map<string, { signal: Signal; count: number }>();
+  private pendingEvicted = 0;
   private readonly sessions = new Map<string, SessionContext>();
   private readonly recent: string[] = [];
+  private readonly inflight = new Set<Promise<void>>();
   private selected?: string;
   private sequence = 0;
+  private stopped = false;
   private readonly prefix = randomUUID();
 
   constructor(
@@ -82,11 +86,13 @@ export class RuntimeAttention {
     private readonly reschedule: () => void,
     private readonly titlesAllowed: () => boolean,
     readonly changed: () => void,
+    expiry: FactExpiry,
   ) {
     this.store = new StateStore(
       () => clock.wall(),
       60_000,
       () => clock.mono(),
+      (state, signal) => expiry.snapshot(state, signal),
     );
     this.pipeline = new AttentionPipeline({
       store: this.store,
@@ -95,17 +101,21 @@ export class RuntimeAttention {
       wallClock: () => clock.wall(),
       deliverer: {
         deliver: async (intent) => {
-          if (!this.selected) {
-            for (const change of intent.update.changes) this.mark(change.signal.id, 'no-session');
-            return;
-          }
-          const safe = structuredClone({ ...intent, sessionId: this.selected });
+          if (this.stopped) throw new Error('stopped');
+          const safe = structuredClone(intent);
           if (!this.titlesAllowed()) {
             for (const change of safe.update.changes) {
               change.signal.data = withoutTitles(change.signal.data) as Signal['data'];
             }
           }
-          await dsh.deliver(this.selected, safe);
+          const delivery = dsh.deliver(intent.sessionId, safe);
+          this.inflight.add(delivery);
+          try {
+            await delivery;
+          } finally {
+            this.inflight.delete(delivery);
+          }
+          if (this.stopped) return;
           for (const change of intent.update.changes) {
             if (change.reason) this.mark(change.signal.id, change.reason);
           }
@@ -143,16 +153,26 @@ export class RuntimeAttention {
       this.changed();
     }
   }
+  isStopped(): boolean {
+    return this.stopped;
+  }
+  stop(): Promise<void> {
+    this.stopped = true;
+    return Promise.allSettled([...this.inflight]).then(() => {});
+  }
   create(id: string): void {
     this.sessions.set(id, { id, busy: false, userInitiated: false });
   }
   dispose(id: string): void {
     this.sessions.delete(id);
+    this.pipeline.disposeSession(id);
     const index = this.recent.indexOf(id);
     if (index >= 0) this.recent.splice(index, 1);
     if (this.selected === id) this.selected = this.recent.at(-1);
+    this.reschedule();
   }
   async preStep(id: string, userInitiated = false, drain = true): Promise<void> {
+    if (this.stopped) return;
     const session = this.sessions.get(id);
     if (!session) return;
     this.selected = id;
@@ -163,7 +183,13 @@ export class RuntimeAttention {
     session.userInitiated = userInitiated;
     this.pipeline.setSession(session);
     if (!drain) return;
-    for (const signal of this.pending.splice(0)) await this.pipeline.accept(signal, session);
+    await this.pipeline.retarget(id);
+    if (this.stopped || this.selected !== id) return;
+    for (const [key, entry] of this.pending) {
+      this.pending.delete(key);
+      await this.pipeline.acceptCount(entry.signal, session, entry.count);
+      if (this.stopped || this.selected !== id) return;
+    }
     try {
       await this.pipeline.preStep(id);
     } finally {
@@ -178,6 +204,7 @@ export class RuntimeAttention {
     this.pipeline.setSession(session);
   }
   async accept(signal: Signal): Promise<void> {
+    if (this.stopped) return;
     const session = this.selected && this.sessions.get(this.selected);
     if (!session) {
       const prior = this.store.snapshot().observation.sources[signal.source.id];
@@ -197,7 +224,13 @@ export class RuntimeAttention {
       }
       if (level === 'wake') reason = 'no-session';
       if (level === 'context') {
-        this.pending.push(signal);
+        const key = JSON.stringify([signal.subject, signal.kind]);
+        const previous = this.pending.get(key);
+        if (!previous && this.pending.size >= 200) {
+          this.pending.delete(this.pending.keys().next().value as string);
+          reason = `pending-evicted:${++this.pendingEvicted}`;
+        }
+        this.pending.set(key, { signal, count: (previous?.count ?? 0) + 1 });
       }
       this.log({ signal, level, ruleId: rule?.id, reason });
       return;
@@ -208,7 +241,11 @@ export class RuntimeAttention {
   }
   async flush(): Promise<void> {
     try {
-      await this.pipeline.flush();
+      this.pipeline.pruneSessions();
+      if (this.selected) {
+        await this.pipeline.retarget(this.selected);
+        if (!this.stopped && this.selected) await this.pipeline.flush();
+      }
     } finally {
       this.reschedule();
     }
@@ -216,7 +253,11 @@ export class RuntimeAttention {
   private log(change: { signal: Signal; level: DeliveryLevel; ruleId?: string; reason?: string }): void {
     const { signal, level, ruleId, reason } = change;
     const sourceReason =
-      signal.kind === 'source.status' && typeof signal.data.reason === 'string' ? signal.data.reason : undefined;
+      signal.kind === 'source.status' && typeof signal.data.reason === 'string'
+        ? signal.data.reason
+        : signal.kind === 'source.error' && typeof signal.data.error === 'string'
+          ? `${signal.data.error}${typeof signal.data.dropped === 'number' ? ` (dropped=${signal.data.dropped})` : ''}`
+          : undefined;
     const restarts = typeof signal.data.restarts === 'number' ? signal.data.restarts : undefined;
     const detail = eventDetail(signal);
     const slope = signal.kind === 'body.rate' && typeof detail?.slope === 'number' ? detail.slope : undefined;

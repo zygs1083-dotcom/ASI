@@ -18,6 +18,8 @@ export interface ToolEvent {
   sessionId: string;
   toolCallId: string;
   pid?: number;
+  ppid?: number;
+  ancestors?: number[];
   cwd?: string;
   exitCode?: number;
   command?: string;
@@ -28,6 +30,9 @@ export interface JobEvent {
   id: string;
   command?: string;
   pid?: number;
+  ppid?: number;
+  ancestors?: number[];
+  cwd?: string;
   exitCode?: number;
   at?: number;
 }

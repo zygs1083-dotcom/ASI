@@ -1,39 +1,20 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { performance } from 'node:perf_hooks';
-import type { DeliveryLevel, EnvChange, EnvUpdate, Signal, SourceObservation, WatchRule } from '@asi/sense-types';
+import type { DeliveryLevel, EnvChange, Signal, WatchRule } from '@asi/sense-types';
 import { sourceObservation } from '../state/source-health.ts';
 import type { StateStore } from '../state/store.ts';
 import { BucketDrain } from './drain.ts';
+import type { AttentionPipelineOptions, SessionContext, SessionState } from './pipeline-types.ts';
 import { DEFAULT_RULES, isRuleApproved, selectRule, validateRule } from './rules.ts';
-import { classifyCause, type ToolWindow } from './selfcause.ts';
+import { classifyCause } from './selfcause.ts';
 
-/** Per-session delivery context supplied by the host. */
-export interface SessionContext {
-  id: string;
-  busy: boolean;
-  /** True when the active turn was initiated by the user. */
-  userInitiated: boolean;
-  /** Agent tool-execution windows used for self-cause classification. */
-  toolWindows?: ToolWindow[];
-}
-
-/**
- * A delivery instruction for the host adapter (M3 implements the transports).
- * `sessionId` routes the intent back to the session that produced it.
- * `deliveryId` is the stable SHA-256 idempotency key the host dedups
- * at-least-once deliveries by (README).
- */
-export type DeliveryIntent =
-  | { kind: 'inject'; sessionId: string; update: EnvUpdate; deliveryId?: string }
-  | { kind: 'followup'; sessionId: string; update: EnvUpdate; deliveryId?: string }
-  | {
-      kind: 'send';
-      sessionId: string;
-      target: 'next-step';
-      wakeup: true;
-      update: EnvUpdate;
-      deliveryId?: string;
-    };
+export type {
+  AttentionPipelineOptions,
+  Deliverer,
+  DeliveryIntent,
+  SessionContext,
+  SessionState,
+} from './pipeline-types.ts';
 
 /** Thrown for flush/preStep calls in an active delivery's async context. */
 export class ReentrantDeliveryError extends Error {
@@ -41,45 +22,6 @@ export class ReentrantDeliveryError extends Error {
     super('flush/preStep reject during an active adapter.deliver (awaited or not): return or reject instead');
     this.name = 'ReentrantDeliveryError';
   }
-}
-
-/**
- * Sink for delivery intents. The returned promise is awaited before any
- * bucket is dropped or the wake budget charged; a rejection retains the
- * queued input and propagates to the caller. While a delivery is in flight
- * every `flush`/`preStep` call inside its async context rejects with
- * {@link ReentrantDeliveryError}; work it schedules for later runs free.
- */
-export interface Deliverer {
-  deliver(intent: DeliveryIntent): Promise<void>;
-}
-
-/** Options for {@link AttentionPipeline}. */
-export interface AttentionPipelineOptions {
-  store: StateStore;
-  deliverer: Deliverer;
-  /** Injected MONOTONIC time for merge deadlines and the wake budget. */
-  clock?: () => number;
-  /**
-   * Wall clock used only for rule expiry and `EnvUpdate.at` display.
-   * `Signal.at` and `ToolWindow` bounds remain event wall timestamps.
-   */
-  wallClock?: () => number;
-  rules?: WatchRule[];
-  /** Fixed merge window for non-file signals. @default 2000 */
-  mergeWindowMs?: number;
-  /** Fixed merge window for `file.changed`. @default 5000 */
-  fileMergeWindowMs?: number;
-}
-
-export interface SessionState {
-  context: SessionContext;
-  seenIds: Set<string>;
-  seenOrder: string[];
-  /** Charged wake deliveries as monotonic timestamps. */
-  wakeTimes: number[];
-  /** Per-session last source-health mark: `source.id` → observation. */
-  srcStatus: Map<string, SourceObservation>;
 }
 
 const DEDUP_MAX = 1024;
@@ -103,6 +45,7 @@ export class AttentionPipeline {
   private readonly mergeWindowMs: number;
   private readonly fileMergeWindowMs: number;
   private readonly sessions = new Map<string, SessionState>();
+  private readonly disposed = new Map<string, number>();
   /**
    * Per-delivery token: `active` is true only while THAT delivery is in
    * flight, so work scheduled inside it (a `setImmediate` callback, a
@@ -152,7 +95,25 @@ export class AttentionPipeline {
 
   /** Updates the latest context for a session (e.g. busy flag) without a signal. */
   setSession(session: SessionContext): void {
+    this.disposed.delete(session.id);
     this.session(session.id).context = session;
+  }
+  disposeSession(id: string): void {
+    if (this.sessions.has(id)) this.disposed.set(id, this.clock() + 600_000);
+  }
+  retentionDeadline(): number | undefined {
+    return this.disposed.size ? Math.min(...this.disposed.values()) : undefined;
+  }
+  pruneSessions(): void {
+    for (const [id, at] of this.disposed) {
+      if (at <= this.clock()) {
+        this.disposed.delete(id);
+        this.sessions.delete(id);
+      }
+    }
+  }
+  retarget(sessionId: string): Promise<void> {
+    return this.enqueueDrain(async () => this.drain.retarget(sessionId));
   }
 
   /**
@@ -186,12 +147,19 @@ export class AttentionPipeline {
    * awaited — inside an in-flight `deliver` it still completes.
    */
   async accept(signal: Signal, session: SessionContext): Promise<EnvChange> {
+    return this.process(signal, session, 1, true);
+  }
+  async acceptCount(signal: Signal, session: SessionContext, count: number): Promise<EnvChange> {
+    return this.process(signal, session, count, false);
+  }
+  private async process(signal: Signal, session: SessionContext, count: number, apply: boolean): Promise<EnvChange> {
     const ev = structuredClone(signal);
     ev.cause = classifyCause(ev, session.toolWindows ?? []);
+    if (!apply) return this.intake(ev, session, this.clock(), count);
     return await new Promise<EnvChange>((resolve, reject) => {
       this.store.apply(ev, () => {
         try {
-          resolve(this.intake(ev, session, this.clock()));
+          resolve(this.intake(ev, session, this.clock(), count));
         } catch (e) {
           reject(e);
         }
@@ -200,7 +168,7 @@ export class AttentionPipeline {
   }
 
   /** All mutable accept intake — runs inside the store's apply callback (FIFO). */
-  private intake(ev: Signal, session: SessionContext, now: number): EnvChange {
+  private intake(ev: Signal, session: SessionContext, now: number, count: number): EnvChange {
     const s = this.session(session.id);
     s.context = session;
     const change: EnvChange = { signal: ev, count: 1, level: 'record' };
@@ -229,7 +197,7 @@ export class AttentionPipeline {
         if (reason !== undefined) change.reason = reason;
         if (level !== 'record') {
           const win = ev.kind === 'file.changed' ? this.fileMergeWindowMs : this.mergeWindowMs;
-          this.drain.enqueue(ev, session.id, level, rule, reason, now, win);
+          this.drain.enqueue(ev, session.id, level, rule, reason, now, win, count);
         }
       }
     }

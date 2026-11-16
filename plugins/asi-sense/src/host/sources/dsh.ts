@@ -8,6 +8,8 @@ const source = { id: 'dsh', api: 'events', host: 'local' };
 export class DshSource {
   private readonly windows = new Map<string, ToolWindow>();
   private readonly off: Unsubscribe[] = [];
+  private active = false;
+  private readonly inflight = new Set<Promise<void>>();
   constructor(
     private readonly port: DshPort,
     private readonly clock: Clock,
@@ -16,13 +18,26 @@ export class DshSource {
     private readonly paused: () => boolean,
   ) {}
   start(): void {
-    this.off.push(this.port.onAgentEvent((event) => this.agent(event)));
-    this.off.push(this.port.onTool((event) => this.tool(event)));
-    this.off.push(this.port.onJob((event) => this.job(event)));
+    this.active = true;
+    this.off.push(this.port.onAgentEvent((event) => this.track(() => this.agent(event))));
+    this.off.push(this.port.onTool((event) => this.track(() => this.tool(event))));
+    this.off.push(this.port.onJob((event) => this.track(() => this.job(event))));
   }
-  stop(): void {
+  stop(): Promise<void> {
+    this.active = false;
     for (const off of this.off.splice(0)) off();
     this.windows.clear();
+    return Promise.allSettled([...this.inflight]).then(() => {});
+  }
+  private track(work: () => Promise<void>): Promise<void> {
+    if (!this.active) return Promise.resolve();
+    const result = work();
+    this.inflight.add(result);
+    void result.then(
+      () => this.inflight.delete(result),
+      () => this.inflight.delete(result),
+    );
+    return result;
   }
   classify(signal: Signal): Signal {
     return { ...signal, cause: classifyCause(signal, [...this.windows.values()]) };
@@ -32,7 +47,7 @@ export class DshSource {
     if (event.type === 'disposed') this.attention.dispose(event.sessionId);
     if (event.type === 'pre-step') {
       if (!this.paused()) await this.tokens(event.sessionId);
-      await this.attention.preStep(event.sessionId, event.userInitiated, !this.paused());
+      if (this.active) await this.attention.preStep(event.sessionId, event.userInitiated, !this.paused());
     }
     if (event.type === 'post-step') {
       this.attention.postStep(event.sessionId);
@@ -50,25 +65,45 @@ export class DshSource {
     const window = this.windows.get(key);
     if (window) window.endedAt = at;
     if (!this.paused() && event.exitCode !== undefined && event.exitCode !== 0) {
-      await this.attention.accept({
-        id: this.attention.id(),
-        kind: 'job.exited',
-        at,
-        source,
-        subject: event.command ?? event.toolCallId,
-        data: { id: event.toolCallId, command: event.command, pid: event.pid, exitCode: event.exitCode },
-      });
+      await this.attention.accept(
+        this.classify({
+          id: this.attention.id(),
+          kind: 'job.exited',
+          at,
+          source,
+          subject: event.command ?? event.toolCallId,
+          data: {
+            id: event.toolCallId,
+            command: event.command,
+            pid: event.pid ?? window?.pid,
+            ppid: event.ppid,
+            ancestors: event.ancestors,
+            path: event.cwd ?? window?.cwd,
+            exitCode: event.exitCode,
+          },
+        }),
+      );
     }
   }
   private async job(event: JobEvent): Promise<void> {
     if (this.paused()) return;
-    await this.attention.accept({
-      id: this.attention.id(),
-      kind: `job.${event.type}`,
-      at: event.at ?? this.clock.wall(),
-      source,
-      subject: event.command ?? event.id,
-      data: { id: event.id, command: event.command, pid: event.pid, exitCode: event.exitCode },
-    });
+    await this.attention.accept(
+      this.classify({
+        id: this.attention.id(),
+        kind: `job.${event.type}`,
+        at: event.at ?? this.clock.wall(),
+        source,
+        subject: event.command ?? event.id,
+        data: {
+          id: event.id,
+          command: event.command,
+          pid: event.pid,
+          ppid: event.ppid,
+          ancestors: event.ancestors,
+          path: event.cwd,
+          exitCode: event.exitCode,
+        },
+      }),
+    );
   }
 }

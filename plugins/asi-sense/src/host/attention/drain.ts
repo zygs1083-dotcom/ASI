@@ -9,6 +9,7 @@ import {
   byChangeAtId,
   upsertBucket,
 } from './buckets.ts';
+import { type InjectBatch, retargetBuckets } from './drain-transfer.ts';
 import type { DeliveryIntent, SessionState } from './pipeline.ts';
 
 const WAKE_WINDOW_MS = 600_000;
@@ -23,12 +24,6 @@ export interface DrainHooks {
   clock: () => number;
   /** Wall clock, used only for the `EnvUpdate.at` display timestamp. */
   wallClock: () => number;
-}
-
-/** A frozen inject delivery: the built intent retries verbatim on failure. */
-interface InjectBatch {
-  buckets: Bucket[];
-  intent: DeliveryIntent;
 }
 
 function throwCollected(errors: unknown[], label: string): void {
@@ -85,6 +80,11 @@ export class BucketDrain {
     }
     return min;
   }
+  retarget(sessionId: string): void {
+    this.suppressedGroups -= retargetBuckets(this.pending, this.ready, this.batches, sessionId, (id, buckets, at) =>
+      this.buildInjectBatch(id, buckets, at),
+    );
+  }
 
   /** Enqueues one classified signal into its session+subject merge window. */
   enqueue(
@@ -95,8 +95,16 @@ export class BucketDrain {
     reason: string | undefined,
     now: number,
     windowMs: number,
+    count = 1,
   ): void {
     upsertBucket(this.pending, signal, sessionId, level, rule, reason, now, windowMs, () => (this.seq += 1));
+    if (count > 1) {
+      for (const bucket of this.pending.values()) {
+        for (const detail of bucket.details.values()) {
+          if (detail.ids.includes(signal.id)) detail.count += count - 1;
+        }
+      }
+    }
   }
 
   /**

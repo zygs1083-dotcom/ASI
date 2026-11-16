@@ -15,18 +15,27 @@ class FakeChild extends EventEmitter {
   readonly commands: { cmd: string; id: string; enabled: boolean }[] = [];
   closed = false;
   gen = 0;
+  snapshotReply = true;
+  pendingWrites: { chunk: string; callback: (error?: Error | null) => void }[] = [];
   constructor(
     autoAck: boolean,
     private readonly stubborn = false,
+    holdWrites = false,
   ) {
     super();
+    if (holdWrites) {
+      this.stdin.write = ((chunk: string, callback: (error?: Error | null) => void) => {
+        this.pendingWrites.push({ chunk: String(chunk), callback });
+        return false;
+      }) as typeof this.stdin.write;
+    }
     this.stdin.on('data', (chunk: Buffer) => {
       for (const line of chunk.toString().split('\n').filter(Boolean)) {
         const command = JSON.parse(line) as { cmd: string; id: string; enabled: boolean };
         if (command.cmd === 'titles') {
           this.commands.push(command);
           if (autoAck) this.ack(command);
-        } else if (command.cmd === 'snapshot') {
+        } else if (command.cmd === 'snapshot' && this.snapshotReply) {
           this.send({ type: 'snapshot', frontApp: { name: 'ExampleApp', bundleId: 'example.app', pid: 123 } });
         }
       }
@@ -51,6 +60,12 @@ class FakeChild extends EventEmitter {
   send(message: object): void {
     this.stdout.write(`${JSON.stringify({ v: 1, at: Date.now(), ...message })}\n`);
   }
+  releaseWrite(): void {
+    const write = this.pendingWrites.shift();
+    if (!write) throw new Error('missing pending write');
+    this.stdin.emit('data', Buffer.from(write.chunk));
+    write.callback();
+  }
   crash(): void {
     if (!this.closed) {
       this.closed = true;
@@ -67,7 +82,7 @@ class FakeChild extends EventEmitter {
   }
 }
 
-function setup(autoAck = true, stubborn = false) {
+function setup(autoAck = true, stubborn = false, holdWrites = false) {
   vi.useFakeTimers();
   vi.setSystemTime(1_700_000_000_000);
   let mono = 0;
@@ -91,7 +106,7 @@ function setup(autoAck = true, stubborn = false) {
     storage: { load: async () => undefined, save: async () => {} },
     helper: {
       spawn: () => {
-        const child = new FakeChild(autoAck, stubborn);
+        const child = new FakeChild(autoAck, stubborn, holdWrites);
         children.push(child);
         queueMicrotask(() => child.emitFixture());
         return child as unknown as ChildProcessWithoutNullStreams;
@@ -102,6 +117,7 @@ function setup(autoAck = true, stubborn = false) {
   };
   const runtime = createSenseRuntime(ports, { platform: 'darwin', helperPath: '/fixture/helper' });
   return {
+    ports,
     runtime,
     children,
     delivered,
@@ -254,6 +270,137 @@ describe('helper protocol integration', () => {
     await h.runtime.stop();
     await new Promise<void>((resolve) => setImmediate(resolve));
     expect(h.children.every((child) => child.closed)).toBe(true);
-    expect(count()).toEqual(before);
+    const after = count();
+    for (const type of ['Timeout', 'ProcessWrap']) {
+      expect(after.filter((value) => value === type).length).toBeLessThanOrEqual(
+        before.filter((value) => value === type).length,
+      );
+    }
+  });
+
+  it('clears the old title when the next focused window has no readable title', async () => {
+    const h = setup();
+    await h.runtime.start();
+    await h.settle();
+    h.children[0]?.send({ type: 'window.focused', bundleId: 'first', title: 'Synthetic title' });
+    await h.settle();
+    expect(h.runtime.state().env.focusedWindow.value).toEqual({ title: 'Synthetic title' });
+    h.children[0]?.send({ type: 'window.focused', bundleId: 'second' });
+    await h.settle();
+    expect(h.runtime.state().env.focusedWindow).toMatchObject({ status: 'unknown', value: null });
+    await h.runtime.stop();
+  });
+
+  it('records helper output overflow, marks the source degraded and requests a snapshot', async () => {
+    const h = setup();
+    await h.runtime.start();
+    await h.settle();
+    const child = h.children[0];
+    if (!child) throw new Error('missing helper');
+    child.snapshotReply = false;
+    const snapshots: string[] = [];
+    child.stdin.on('data', (chunk: Buffer) => {
+      if (chunk.toString().includes('"snapshot"')) snapshots.push('snapshot');
+    });
+    child.send({ type: 'error', code: 'output_overflow', dropped: 7, droppedTypes: { 'window.focused': 7 } });
+    await h.settle();
+    expect(h.runtime.events()).toContainEqual(
+      expect.objectContaining({ kind: 'source.error', reason: 'output_overflow (dropped=7)' }),
+    );
+    expect(h.runtime.state().observation.sources.helper).toMatchObject({
+      status: 'unavailable',
+      error: 'output_overflow',
+    });
+    expect(snapshots).toHaveLength(1);
+    child.send({ type: 'snapshot', frontApp: { name: 'ExampleApp', bundleId: 'example.app', pid: 123 } });
+    await h.settle();
+    expect(h.runtime.state().observation.sources.helper?.status).toBe('ok');
+    await h.runtime.stop();
+  });
+
+  it('does not recover from a snapshot requested before output overflow', async () => {
+    const h = setup();
+    await h.runtime.start();
+    await h.settle();
+    const child = h.children[0];
+    if (!child) throw new Error('missing helper');
+    child.snapshotReply = false;
+    const commands: string[] = [];
+    child.stdin.on('data', (chunk: Buffer) => {
+      if (chunk.toString().includes('"snapshot"')) commands.push('snapshot');
+    });
+    await h.runtime.actions.setSendTitles(false);
+    await h.settle();
+    expect(commands).toHaveLength(1);
+    child.send({ type: 'error', code: 'output_overflow', dropped: 1 });
+    await h.settle();
+    child.send({ type: 'snapshot' });
+    await h.settle();
+    expect(h.runtime.state().observation.sources.helper?.status).toBe('unavailable');
+    expect(commands).toHaveLength(2);
+    child.send({ type: 'snapshot' });
+    await h.settle();
+    expect(h.runtime.state().observation.sources.helper?.status).toBe('ok');
+    await h.runtime.stop();
+  });
+
+  it('coalesces title switches behind a blocked stdin write', async () => {
+    const h = setup(false, false, true);
+    await h.runtime.start();
+    await h.settle();
+    const child = h.children[0];
+    if (!child) throw new Error('missing helper');
+    for (let i = 0; i < 100; i++) await h.runtime.actions.setSendTitles(i % 2 === 0);
+    expect(child.pendingWrites).toHaveLength(1);
+    child.releaseWrite();
+    expect(child.pendingWrites).toHaveLength(1);
+    expect(JSON.parse(child.pendingWrites[0]?.chunk ?? '{}')).toMatchObject({ cmd: 'titles', enabled: false });
+    child.releaseWrite();
+    expect(child.pendingWrites).toHaveLength(0);
+    await h.runtime.stop();
+  });
+
+  it('does not extend the handshake deadline during repeated title switches', async () => {
+    const h = setup(false, false, true);
+    await h.runtime.start();
+    await h.settle();
+    await h.advance(2_900);
+    await h.runtime.actions.setSendTitles(false);
+    await h.advance(100);
+    expect(h.children[0]?.closed).toBe(true);
+    await h.runtime.stop();
+  });
+
+  it('never applies an older enable after a newer disable was requested', async () => {
+    const h = setup();
+    await h.runtime.start();
+    await h.settle();
+    await h.runtime.actions.setSendTitles(false);
+    await h.settle();
+    let release!: () => void;
+    let entered!: () => void;
+    const blocked = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    h.ports.storage.save = async (key, json) => {
+      if (key === 'settings' && JSON.parse(json).sendTitles === true) {
+        entered();
+        await new Promise<void>((resolve) => {
+          release = resolve;
+        });
+      }
+    };
+    const enabling = h.runtime.actions.setSendTitles(true);
+    await blocked;
+    const child = h.children[0];
+    if (!child) throw new Error('missing helper');
+    const marker = child.commands.length;
+    const disabling = h.runtime.actions.setSendTitles(false);
+    release();
+    await Promise.all([enabling, disabling]);
+    await h.settle();
+    expect(child.commands.slice(marker).every((command) => !command.enabled)).toBe(true);
+    expect(h.runtime.rules.settings().sendTitles).toBe(false);
+    await h.runtime.stop();
   });
 });

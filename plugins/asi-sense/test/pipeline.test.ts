@@ -6,6 +6,22 @@ const file = (id: string, at: number, subject = '/w/a.ts', extra: Partial<Signal
   sig({ id, kind: 'file.changed', at, subject, ...extra });
 
 describe('AttentionPipeline merging', () => {
+  it('reclaims disposed session state after ten minutes of monotonic time', () => {
+    const c = new FakeClock();
+    const { pipeline } = pipe(c);
+    const sessions = (pipeline as unknown as { sessions: Map<string, unknown> }).sessions;
+    for (let i = 0; i < 300; i++) {
+      pipeline.setSession(sess({ id: `disposed-${i}` }));
+      pipeline.disposeSession(`disposed-${i}`);
+    }
+    pipeline.setSession(sess({ id: 'live' }));
+    c.advance(599_999);
+    pipeline.pruneSessions();
+    expect(sessions.size).toBe(301);
+    c.advance(1);
+    pipeline.pruneSessions();
+    expect([...sessions.keys()]).toEqual(['live']);
+  });
   it('merges repeated file saves (count=3) into an early pre-step inject', async () => {
     const c = new FakeClock();
     const { intents, pipeline } = pipe(c);

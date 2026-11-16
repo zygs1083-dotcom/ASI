@@ -48,6 +48,7 @@ export class BodySource {
   private token?: Fact<NonNullable<Body['tokens']['value']>>;
   private tokenSource?: TokenSnapshot['contextWindowSource'];
   private tokenGeneration = 0;
+  private readonly tokenWork = new Set<Promise<void>>();
   private thermal?: Body['thermal'];
   private burstRoots = '';
   private detector = new FileBurstDetector();
@@ -77,6 +78,10 @@ export class BodySource {
   }
   async start(intervalMs: number): Promise<void> {
     await this.monitor.restore();
+    if (this.stopped) {
+      await this.monitor.close();
+      return;
+    }
     this.state = this.monitor.restoredState ?? {};
     this.off = this.probe.onSample((body) => {
       const at = this.clock.wall();
@@ -102,7 +107,17 @@ export class BodySource {
   sync(): void {
     this.state = this.monitor.restoredState ?? this.state;
   }
-  async tokens(session: string): Promise<void> {
+  tokens(session: string): Promise<void> {
+    if (this.stopped) return Promise.resolve();
+    const work = this.readTokens(session);
+    this.tokenWork.add(work);
+    void work.then(
+      () => this.tokenWork.delete(work),
+      () => this.tokenWork.delete(work),
+    );
+    return work;
+  }
+  private async readTokens(session: string): Promise<void> {
     const generation = ++this.tokenGeneration;
     const snapshot = await Promise.resolve()
       .then(() => this.dsh.tokenSnapshot(session))
@@ -120,6 +135,7 @@ export class BodySource {
     this.changed();
   }
   setThermal(fact: Body['thermal']): void {
+    if (this.stopped) return;
     this.thermal = fact;
     this.write('thermal', fact);
     this.changed();
@@ -135,21 +151,25 @@ export class BodySource {
     });
   }
   async burst(signal: Signal): Promise<void> {
+    if (this.stopped) return;
     for (const burst of this.detector.accept(signal, this.clock.mono())) await this.publish(burst);
   }
   async stop(): Promise<void> {
     this.stopped = true;
+    const tokens = Promise.allSettled([...this.tokenWork]);
     this.off?.();
     if (this.sampling) await this.probe.stop();
     this.sampling = false;
     await this.tail;
     await this.monitor.close();
+    await tokens;
   }
   private enqueue(work: () => Promise<void>): void {
     const run = this.tail.then(work).finally(this.changed);
     this.tail = run.catch(() => {});
   }
   private write(key: keyof Body, fact: Fact<unknown>): void {
+    if (this.stopped) return;
     this.attention.store.apply({
       id: this.attention.id(),
       kind: 'fact.updated',
@@ -190,6 +210,7 @@ export class BodySource {
     for (const signal of result.signals) await this.publish(signal);
   }
   private async publish(signal: Signal): Promise<void> {
+    if (this.stopped) return;
     const id = signal.data.ruleId;
     const rules = [...defaultRateRules(), ...defaultAnomalyRules()];
     const param =
@@ -199,8 +220,9 @@ export class BodySource {
           : 'file.burst.maxChanges'
         : rules.find((rule) => rule.id === id)?.param;
     if (typeof id === 'string' && param && signal.data.severity !== 'normal' && signal.cause !== 'agent') {
+      signal.data.feedbackAvailable = false;
       try {
-        await this.tuner.registerAlert(signal.id, id, param);
+        signal.data.feedbackAvailable = await this.tuner.registerAlert(signal.id, id, param);
       } catch {
         await this.attention.accept({
           id: this.attention.id(),

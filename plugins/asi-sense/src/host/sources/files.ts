@@ -18,6 +18,10 @@ function root(pattern: string): string | undefined {
 export class FileSource {
   private readonly watches = new Map<string, { close(): void | Promise<void> }>();
   private active = false;
+  private stopped = false;
+  private tail = Promise.resolve();
+  private readonly dispatch = new Set<string>();
+  private clearDispatch?: ReturnType<typeof setImmediate>;
   constructor(
     private readonly watcher: FileWatcher,
     private readonly clock: Clock,
@@ -28,36 +32,55 @@ export class FileSource {
     private readonly burst: (signal: Signal) => Promise<void>,
     private readonly setRoots: (roots: string[]) => void,
   ) {}
-  async refresh(): Promise<void> {
-    this.active = !this.paused();
-    const patterns = (this.paused() ? [] : this.rules())
+  private roots(): Set<string> {
+    const patterns = (this.stopped || this.paused() ? [] : this.rules())
       .filter((r) => r.match.kind === 'file.changed' && r.match.subject)
       .map((r) => r.match.subject as string);
-    const roots = new Set(patterns.map(root).filter((value): value is string => value !== undefined));
-    this.setRoots([...roots]);
-    for (const [watched, handle] of this.watches) {
-      if (!roots.has(watched)) {
-        this.watches.delete(watched);
-        await handle.close();
-      }
-    }
-    for (const watched of roots) {
-      if (!this.watches.has(watched))
+    return new Set(patterns.map(root).filter((value): value is string => value !== undefined));
+  }
+  refresh(): Promise<void> {
+    const run = this.tail.then(async () => {
+      for (;;) {
+        this.active = !this.stopped && !this.paused();
+        const roots = this.roots();
+        this.setRoots([...roots]);
+        const obsolete = [...this.watches].find(([watched]) => !roots.has(watched));
+        if (obsolete) {
+          this.watches.delete(obsolete[0]);
+          await obsolete[1].close();
+          continue;
+        }
+        const missing = [...roots].find((watched) => !this.watches.has(watched));
+        if (!missing) break;
         this.watches.set(
-          watched,
-          this.watcher.watch(watched, (event) => {
+          missing,
+          this.watcher.watch(missing, (event) => {
             void this.accept(event).catch(() => {});
           }),
         );
-    }
+      }
+    });
+    this.tail = run.catch(() => {});
+    return run;
   }
   async stop(): Promise<void> {
+    this.stopped = true;
     this.active = false;
-    await Promise.all([...this.watches.values()].map((handle) => handle.close()));
-    this.watches.clear();
+    if (this.clearDispatch) clearImmediate(this.clearDispatch);
+    this.dispatch.clear();
+    await this.refresh();
   }
   private async accept(event: FileChange): Promise<void> {
     if (!this.active || this.paused() || !path.isAbsolute(event.path)) return;
+    const key = JSON.stringify([path.normalize(event.path), event.change, event.at ?? this.clock.wall()]);
+    if (this.dispatch.has(key)) return;
+    this.dispatch.add(key);
+    if (this.dispatch.size > 5000) this.dispatch.delete(this.dispatch.keys().next().value as string);
+    if (!this.clearDispatch)
+      this.clearDispatch = setImmediate(() => {
+        this.clearDispatch = undefined;
+        this.dispatch.clear();
+      });
     const signal = this.dsh.classify({
       id: this.attention.id(),
       kind: 'file.changed',

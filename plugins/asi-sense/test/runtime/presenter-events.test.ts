@@ -1,5 +1,6 @@
 import { expect, it, vi } from 'vitest';
 import { RuntimeAttention } from '../../src/host/runtime/attention.ts';
+import { FactExpiry } from '../../src/host/runtime/expiry.ts';
 
 it('redacts old and new window events when title sharing is disabled', async () => {
   let titles = true;
@@ -16,6 +17,7 @@ it('redacts old and new window events when title sharing is disabled', async () 
     () => {},
     () => titles,
     vi.fn(),
+    new FactExpiry({ wall: () => 100, mono: () => 0 }),
   );
   await attention.accept({
     id: 'a',
