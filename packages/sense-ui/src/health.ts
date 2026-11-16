@@ -1,8 +1,7 @@
 /** 身体各项指标的阈值与聚合健康度。全部纯函数，时间一律用传入的 now。 */
 
 import type { Body, Fact, MetricInsight, MetricKey } from './view-model'
-import { effectiveDisks } from '@asi/sense-types'
-import { diskSeverity, diskUsable, diskValid } from './disk-health'
+import { diskSeverity, diskUsable, diskValid, effectiveDisks } from './disk-health'
 import {
   effectiveSeverity,
   effectiveStatus,

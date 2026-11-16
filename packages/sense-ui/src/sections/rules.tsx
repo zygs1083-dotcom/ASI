@@ -150,6 +150,8 @@ function TuningView({
             </span>
             {e.reverted ? (
               <span className={css.reverted}>已撤销</span>
+            ) : e.undoable === false ? (
+              <span className={css.reverted}>不可撤销</span>
             ) : (
               <button type="button" onClick={() => onRevertTuning(e.id)}>
                 撤销

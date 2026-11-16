@@ -6,6 +6,7 @@ import { NowSection } from './sections/now'
 import { EventsSection } from './sections/events'
 import { RulesSection } from './sections/rules'
 import { useTuningOperations } from './sections/tuning-operation'
+import { useFreshModel } from './freshness'
 import rulesCss from './sections/rules.module.css'
 import css from './panel.module.css'
 
@@ -15,7 +16,7 @@ import css from './panel.module.css'
  * 不新增对外回调。
  */
 export function SensePanel(props: SensePanelProps) {
-  const { model } = props
+  const model = useFreshModel(props.model)
   const [rulesOpen, setRulesOpen] = useState(false)
   const rulesSummary = useRef<HTMLElement>(null)
   const operations = useTuningOperations(model)
@@ -94,7 +95,7 @@ export function SensePanel(props: SensePanelProps) {
       >
         <summary ref={rulesSummary}>规则</summary>
         <div className={css.sectionBody}>
-          <RulesSection {...props} tuningReq={tuningReq} operations={operations} />
+          <RulesSection {...props} model={model} tuningReq={tuningReq} operations={operations} />
         </div>
       </details>
     </div>
