@@ -7,7 +7,7 @@ stdin/stdout; the host plugin spawns it and owns its lifecycle. It observes:
 - app activate / launch / terminate - `NSWorkspace`
 - focused window + title changes - `AXObserver` (needs Accessibility)
 - sleep / wake / session / screen lock - `NSWorkspace` + `DistributedNotificationCenter`
-- thermal state - `ProcessInfo.thermalState`
+- thermal state - `ProcessInfo.thermalState` on change and every 30 seconds while running
 
 It never screenshots or reads window contents - at most the focused window and
 its `AXTitle` - and writes no files; titles can be disabled at runtime.

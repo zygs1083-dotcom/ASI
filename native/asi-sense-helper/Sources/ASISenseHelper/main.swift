@@ -18,6 +18,7 @@ final class HelperRuntime {
   private var session: AXSession<SystemAXBackend>!
   private var workspaceTokens: [NSObjectProtocol] = []
   private var centerTokens: [(NotificationCenter, NSObjectProtocol)] = []
+  private var thermalTimer: DispatchSourceTimer?
   private var stopping = false
 
   func start() {
@@ -43,6 +44,11 @@ final class HelperRuntime {
     emitHello()
     emitThermal()
     registerObservers()
+    let timer = DispatchSource.makeTimerSource(queue: .main)
+    timer.schedule(deadline: .now() + .seconds(30), repeating: .seconds(30), leeway: .seconds(1))
+    timer.setEventHandler { [weak self] in self?.emitThermal() }
+    timer.resume()
+    thermalTimer = timer
     channel.start()
     if let app = NSWorkspace.shared.frontmostApplication {
       session.activate(pid: app.processIdentifier, bundleId: app.bundleIdentifier ?? "")
@@ -153,6 +159,8 @@ final class HelperRuntime {
     guard !stopping else { return }
     if !drainAll { exitDeadline.arm() }
     stopping = true
+    thermalTimer?.cancel()
+    thermalTimer = nil
     channel.stopInput()
     for token in workspaceTokens { NSWorkspace.shared.notificationCenter.removeObserver(token) }
     for (center, token) in centerTokens { center.removeObserver(token) }
