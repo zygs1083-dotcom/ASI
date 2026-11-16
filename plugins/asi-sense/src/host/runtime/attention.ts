@@ -42,6 +42,8 @@ export class RuntimeAttention {
   private readonly recent: string[] = [];
   private readonly inflight = new Set<Promise<void>>();
   private selected?: string;
+  private pinned?: string;
+  private privateStep?: string;
   private selectionGeneration = 0;
   private sequence = 0;
   private stopped = false;
@@ -72,7 +74,10 @@ export class RuntimeAttention {
       isCurrent: () => {
         const generation = this.selectionGeneration;
         return (id) =>
-          !this.stopped && generation === this.selectionGeneration && this.selected === id && this.sessions.has(id);
+          !this.stopped &&
+          generation === this.selectionGeneration &&
+          (this.selected === id || this.privateStep === id) &&
+          this.sessions.has(id);
       },
       deliverer: {
         deliver: async (intent) => {
@@ -156,6 +161,23 @@ export class RuntimeAttention {
   currentSessionId(): string | undefined {
     return this.selected;
   }
+  targetMode(): 'auto' | 'pinned' {
+    return this.pinned ? 'pinned' : 'auto';
+  }
+  async setTarget(id: string | undefined): Promise<void> {
+    if (id && !this.sessions.has(id)) throw new Error('target session unavailable');
+    this.pinned = id;
+    this.privateStep = undefined;
+    this.selected = id ?? this.recent.at(-1);
+    const generation = ++this.selectionGeneration;
+    if (this.selected) {
+      const session = this.sessions.get(this.selected);
+      if (session) this.pipeline.setSession(session);
+      await this.transfer(this.selected, generation);
+    }
+    this.reschedule();
+    this.changed();
+  }
   sessionToken(id: string | undefined): string | undefined {
     return id === undefined ? undefined : this.sessionTokens.get(id);
   }
@@ -201,6 +223,7 @@ export class RuntimeAttention {
     this.pending.suspend(id, this.pipeline);
     const index = this.recent.indexOf(id);
     if (index >= 0) this.recent.splice(index, 1);
+    if (this.pinned === id) this.pinned = undefined;
     if (this.selected === id) {
       this.selected = this.recent.at(-1);
       this.selectionGeneration++;
@@ -213,29 +236,42 @@ export class RuntimeAttention {
     const session = this.sessions.get(id);
     if (!session) return;
     const generation = ++this.selectionGeneration;
-    this.selected = id;
     const index = this.recent.indexOf(id);
     if (index >= 0) this.recent.splice(index, 1);
     this.recent.push(id);
+    this.selected = this.pinned ?? id;
+    this.privateStep = this.selected === id ? undefined : id;
     session.busy = true;
     session.userInitiated = userInitiated;
     this.pipeline.setSession(session);
-    if (!drain) return;
+    if (!drain) {
+      this.privateStep = undefined;
+      return;
+    }
+    const selected = this.selected;
+    if (!(await this.transfer(selected, generation))) return;
+    try {
+      await this.pipeline.preStep(id);
+    } finally {
+      if (generation === this.selectionGeneration) this.privateStep = undefined;
+      this.reschedule();
+    }
+  }
+  private async transfer(id: string, generation: number): Promise<boolean> {
     await this.pending.settled();
+    if (this.stopped || generation !== this.selectionGeneration || this.selected !== id) return false;
     await this.pipeline.retarget(id);
-    if (this.stopped || generation !== this.selectionGeneration || this.selected !== id) return;
+    if (this.stopped || generation !== this.selectionGeneration || this.selected !== id) return false;
+    const session = this.sessions.get(id);
+    if (!session) return false;
     let entry = this.pending.take();
     while (entry) {
       if ('batch' in entry) await this.pipeline.restore(id, entry.batch);
       else await this.pipeline.acceptCount(entry.signal, session, entry.count, entry.other, entry.classification);
-      if (this.stopped || generation !== this.selectionGeneration || this.selected !== id) return;
+      if (this.stopped || generation !== this.selectionGeneration || this.selected !== id) return false;
       entry = this.pending.take();
     }
-    try {
-      await this.pipeline.preStep(id);
-    } finally {
-      this.reschedule();
-    }
+    return true;
   }
   postStep(id: string): void {
     const session = this.sessions.get(id);

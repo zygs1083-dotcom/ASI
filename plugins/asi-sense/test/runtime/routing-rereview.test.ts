@@ -62,6 +62,52 @@ function harness(failFirst: boolean, configuredRules = rules, blockFirst = true,
 }
 
 describe('in-flight session ownership', () => {
+  it('keeps a pinned target across other pre-steps and transfers unowned buckets only once', async () => {
+    const h = harness(false, rules, false);
+    h.attention.create('a');
+    h.attention.create('b');
+    await h.attention.preStep('a');
+    await h.attention.accept(signal('global', 'wake'));
+    await h.attention.setTarget('b');
+    await h.attention.preStep('a');
+    expect(h.attention.currentSessionId()).toBe('b');
+    h.advance();
+    await h.attention.flush();
+    expect(h.delivered.map((intent) => [intent.sessionId, intent.update.changes[0]?.signal.id])).toEqual([
+      ['b', 'global'],
+    ]);
+    await h.attention.setTarget(undefined);
+    expect(h.attention.currentSessionId()).toBe('a');
+    await h.attention.flush();
+    expect(h.delivered).toHaveLength(1);
+    await h.attention.stop();
+  });
+
+  it('delivers a session-owned job only to its owner even when another target is pinned', async () => {
+    const h = harness(
+      false,
+      [{ id: 'jobs', match: { kind: 'job.exited' }, level: 'wake', createdBy: 'user', approved: true }],
+      false,
+    );
+    h.attention.create('a');
+    h.attention.create('b');
+    await h.attention.preStep('a');
+    await h.attention.setTarget('b');
+    await h.attention.accept({
+      id: 'owned',
+      kind: 'job.exited',
+      at: 0,
+      subject: 'fixture-job',
+      source: { id: 'dsh', api: 'events', host: 'local' },
+      data: { id: 'fixture-job', sessionId: 'a', sessionToken: h.attention.sessionToken('a'), exitCode: 1 },
+    });
+    h.advance();
+    await h.attention.preStep('a');
+    expect(h.attention.currentSessionId()).toBe('b');
+    expect(h.delivered).toHaveLength(1);
+    expect(h.delivered[0]?.sessionId).toBe('a');
+    await h.attention.stop();
+  });
   it('does not apply a queued job after its owner is disposed and recreated reentrantly', async () => {
     const h = harness(
       false,
