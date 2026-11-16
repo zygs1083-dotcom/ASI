@@ -1,6 +1,30 @@
 import type { TunerGuard, TuningResult } from './tuner-guard.ts';
-import { finiteNum } from './tuner-spec.ts';
+import { ALERT_CAP, finiteNum } from './tuner-spec.ts';
 import type { TunerStore } from './tuner-state.ts';
+
+export function register(
+  store: TunerStore,
+  clock: () => number,
+  wallClock: () => number,
+  alertId: string,
+  ruleId: string,
+  param: string,
+): boolean {
+  if (
+    typeof alertId !== 'string' ||
+    alertId === '' ||
+    typeof ruleId !== 'string' ||
+    ruleId === '' ||
+    !finiteNum(clock()) ||
+    !finiteNum(wallClock()) ||
+    !store.specs.has(param) ||
+    store.alerts.has(alertId) ||
+    store.alerts.size >= ALERT_CAP
+  )
+    return false;
+  store.alerts.set(alertId, { ruleId, param });
+  return true;
+}
 
 /** Consumes an alert registration once; three noise streaks auto-tune. */
 export function feedback(

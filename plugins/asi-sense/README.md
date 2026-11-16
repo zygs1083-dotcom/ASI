@@ -125,7 +125,7 @@ model requests, watches files or delivers attention intents.
 - `new BodyMonitor()` installs disk loss (>2GiB/60s), RSS growth (>50%/5min),
   context exhaustion (ETA <=10min) and external file deletion (>50/60s).
   The first three use body samples; pass `file.changed` signals to
-  `monitor.accept(signal)` for the fourth. Configure `fileBurst.roots` to
+  `monitor.accept(signal, monotonicAt)` for the fourth. Configure `fileBurst.roots` to
   aggregate a watched tree's scattered subdirectories; absent roots, each
   directory has its own independent watermark/window.
 - Baseline and CPU/memory/network anomaly detection are assembled by default.
@@ -139,14 +139,24 @@ model requests, watches files or delivers attention intents.
 - `rateRules` and `anomalyRules` explicitly replace their respective defaults;
   `[]` deliberately disables that adaptive layer. Fixed safety floors remain
   active. An injected `baseline` is an immutable seed, forked in caller state.
-  `timeZone` defaults to the runtime's resolved IANA zone; repeated DST hours
-  share a bucket and skipped hours create none. The zone is persisted.
+  `timeZone` defaults to the current runtime IANA zone; repeated DST hours
+  share a bucket and skipped hours create none. A runtime zone change affects
+  subsequent lookups without migrating stored buckets.
 - Evaluator state belongs to the caller. Thread `result.state` into the next
   `evaluate(prev, next, state)`; histories, streaks and per-source latches live
   under the enumerable `BODY_HISTORY` symbol. Keep that symbol when copying
   state (object spread does); JSON persistence uses the dedicated monitor
   snapshot instead. Retry a failed evaluation with its original input state.
   After restore, resume with `monitor.restoredState ?? {}`.
+- For durable automatic rebaselining, wire a tuner and combined persistence,
+  then await `monitor.evaluateAuto(prev, next, state)` for each sample. Thread
+  the exact returned state into the next call; stale concurrent state is
+  rejected. Three distinct alerting dates in one bucket, separated by elapsed
+  monotonic days, trigger a budgeted `auto` change using recent readings.
+  Floor and rate rules remain active. The pure synchronous `evaluate` seam
+  does not schedule automatic changes. If an automatic save fails, the result
+  contains `tuningError` alongside any floor/rate signals; deliver those
+  signals and surface the error rather than discarding the sample.
 
 ### Trusted Tuning Boundary
 
@@ -165,6 +175,10 @@ those AI limits but retain whitelist/type/bounds checks and audit records;
 only users can lock/unlock or loosen floors. User revert also bypasses a
 lock; agent revert uses the same AI guards. Superseded IDs cannot be reverted.
 The 500-entry display log is separate from retained applied/undo history.
+`tuner.undoableChanges` lists the currently reversible changes, including
+automatic rebaselines. Await `tuner.revert(id)` for a sidebar undo, then
+resume sampling from `monitor.restoredState`. Only a trusted user may undo
+a rebaseline.
 
 ### Persistence And Clocks
 
@@ -177,24 +191,25 @@ latches, tuner values, locks, audits, quota windows and ID lineage. Do not
 also configure a separate tuner store when the monitor owns the combined one.
 
 Always `await monitor.restore()` before use (or `tuner.restore()` standalone).
-AI and automatic saving stay blocked before restore. Mutations coalesce saves
-to at most once per 10s; `persist()` explicitly flushes, and shutdown must
-`await monitor.close()` (or standalone `tuner.close()`). These explicit flushes
-are exempt from throttling. Save failures from explicit flushes reject for
-host retry; the host must also monitor its storage adapter's background errors.
+AI and automatic saving stay blocked before restore. Tuner mutations are
+asynchronous and require a persistence port; always await them. Critical
+changes, locks, budgets and undo records are saved before they become visible
+or return success. Non-critical baseline statistics may coalesce to 10-second
+saves. `persist()` explicitly flushes, and shutdown must await `monitor.close()`
+(or standalone `tuner.close()`). Any save failure rejects its caller where
+applicable and disables tuning with `tuningDisabled === 'storage-failed'`.
 
 Malformed/unknown-version/non-finite snapshots fail closed:
 `tuningDisabled === 'restore-failed'` is exposed for the sidebar, baseline
 learning resets, AI stays disabled across restarts and IDs get a new random
-prefix. No automatic "fresh start" can clear quota/lock protection. A trusted
-user may still tune; repairing/resetting damaged storage is an explicit host
-recovery operation, not an agent tool.
+prefix. No automatic "fresh start" can clear quota/lock protection.
+Repairing/resetting damaged storage is an explicit host recovery operation,
+not an agent tool.
 
 Use injected monotonic milliseconds (default `performance.now()`) for rate
-windows, quotas and save throttling; live samples should carry `monotonicAt`.
-Standalone evaluator `at` fallback is for deterministic logical replay only.
-Wall time (default `Date.now()`) serves audit display, installation age and
-local weekly buckets; non-finite inputs are rejected. Restart recovery
+windows, quotas, accumulated installation age and save throttling; all samples
+must carry a finite `monotonicAt`. Wall time (default `Date.now()`) serves
+audit display and local weekly buckets; non-finite inputs are rejected. Restart recovery
 persists remaining quota durations plus a wall high-water mark: downtime,
 including forward wall jumps, never expires saved budgets. A wall rollback
 freezes AI as fully used until wall time catches up, then remaining windows

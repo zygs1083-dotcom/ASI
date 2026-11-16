@@ -162,7 +162,8 @@ export function validateSnapshot(json: string, parameters: Record<string, Parame
       if (!list || !uniqueKeys(list)) return undefined;
       const out: [string, number[]][] = [];
       for (const [k, ts] of list) {
-        const r = typeof k === 'string' && specs.has(k) ? remainings(ts, windowMs, cap) : undefined;
+        const known = typeof k === 'string' && (specs.has(k) || /^baseline:[\w-]+:[\w-]+:\d{1,3}$/.test(k));
+        const r = known ? remainings(ts, windowMs, cap) : undefined;
         if (!r) return undefined;
         out.push([k as string, r]);
       }

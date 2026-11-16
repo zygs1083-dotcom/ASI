@@ -4,10 +4,12 @@ import { AnomalyEvaluator, type AnomalyRule } from './anomaly.ts';
 import { Baseline, type BaselineOptions } from './baseline.ts';
 import { FileBurstDetector, type FileBurstOptions } from './burst.ts';
 import type { BodySignal } from './metrics.ts';
+import { serializeMonitor, validateSamples } from './monitor-snapshot.ts';
 import { type BodyPersistence, PersistScheduler } from './persistence.ts';
 import { RateEvaluator, type RateRule } from './rate.ts';
+import { type AutomaticBodyEvaluation, RebaselineManager } from './rebaseline.ts';
 import { defaultAnomalyRules, defaultRateRules, floorTable } from './rules.ts';
-import { type AdaptiveState, BODY_HISTORY, parseHistory, serializeHistory, validLatch } from './state.ts';
+import { type AdaptiveState, BODY_HISTORY, parseHistory, validLatch } from './state.ts';
 import type { Tuner } from './tuner.ts';
 
 export interface BodyMonitorOptions {
@@ -53,6 +55,7 @@ export class BodyMonitor implements BodyEvaluator {
   private readonly burst: FileBurstDetector;
   private readonly persistence?: BodyPersistence;
   private readonly scheduler?: PersistScheduler;
+  private readonly rebaser?: RebaselineManager;
   private seed: Baseline;
   private anomaly?: AnomalyEvaluator;
   private latest?: AdaptiveState;
@@ -107,15 +110,25 @@ export class BodyMonitor implements BodyEvaluator {
       // until restore(), and every post-restore tuner mutation commits the
       // combined snapshot even without a body evaluate in between.
       this.tuner?.expectRestore();
-      this.tuner?.setCommit((snapshot, publish) => {
+      this.tuner?.setCommit((snapshot, publish, context, result) => {
         if (!this.persistReady || !this.scheduler) return Promise.reject(new Error('monitor: restore pending'));
+        const stage = context === undefined ? undefined : this.rebaser?.stage(context, result);
+        if (context !== undefined && !stage)
+          return Promise.reject(new Error('monitor: invalid rebaseline transaction'));
         return this.scheduler
-          .commit(() => save(this.serialize(snapshot())), publish)
+          .commit(
+            () => save(this.serialize(snapshot(), stage?.state, stage?.snapshot)),
+            () => {
+              publish();
+              if (stage) this.latest = this.rebaser?.publish(stage);
+            },
+          )
           .catch((error) => {
             this.tuningDisabled = 'storage-failed';
             throw error;
           });
       });
+      if (this.tuner) this.rebaser = new RebaselineManager(this.tuner, this.anomalyRules ?? [], () => this.latest);
     }
   }
 
@@ -138,11 +151,14 @@ export class BodyMonitor implements BodyEvaluator {
   }
 
   evaluate(prev: BodyThresholdSample, next: BodyThresholdSample, state: BodyThresholdState): BodyEvaluation {
-    const [p, n] = this.validateSamples(prev, next);
+    if (this.rebaser?.inTransaction) throw new Error('monitor: rebaseline in progress');
+    this.rebaser?.onSynchronousSample();
+    const [p, n] = validateSamples(prev, next);
     const f = new FloorEvaluator(floorTable(this.tuner)).evaluate(p, n, state);
     let acc = f.state;
     const signals: Signal[] = [];
-    for (const s of f.signals) signals.push(this.tagFloor(s));
+    for (const s of f.signals)
+      signals.push({ ...s, layer: 'floor', data: { ...s.data, layer: 'floor' } } as BodySignal);
     if (this.rate) {
       const r = this.rate.evaluate(p, n, acc);
       acc = r.state;
@@ -156,6 +172,16 @@ export class BodyMonitor implements BodyEvaluator {
     this.latest = acc as AdaptiveState;
     this.dirty();
     return { signals, state: acc };
+  }
+
+  evaluateAuto(
+    prev: BodyThresholdSample,
+    next: BodyThresholdSample,
+    state: BodyThresholdState,
+  ): Promise<AutomaticBodyEvaluation> {
+    if (!this.rebaser) return Promise.reject(new Error('monitor: automatic rebaseline requires persistent tuner'));
+    validateSamples(prev, next);
+    return this.rebaser.run(next, state, () => this.evaluate(prev, next, state));
   }
 
   /**
@@ -229,6 +255,7 @@ export class BodyMonitor implements BodyEvaluator {
     this.seed = b;
     this.rebuildAnomaly();
     this.latest = { ...latch, [BODY_HISTORY]: history };
+    if (this.rebaser && !this.rebaser.restore(d.rebaseline, this.latest)) return fail();
     this.persistReady = true;
     this.dirty();
   }
@@ -236,6 +263,7 @@ export class BodyMonitor implements BodyEvaluator {
   /** Force-flushes the combined snapshot (no-op before restore). */
   async persist(): Promise<void> {
     if (!this.persistReady) return;
+    await this.rebaser?.settle();
     await this.tuner?.persist();
     await this.scheduler?.flush();
   }
@@ -243,6 +271,7 @@ export class BodyMonitor implements BodyEvaluator {
   /** Cancels the pending timer and flushes only after restore. */
   async close(): Promise<void> {
     if (this.persistReady) {
+      await this.rebaser?.settle();
       await this.tuner?.close();
       await this.scheduler?.close();
     } else this.scheduler?.cancel();
@@ -262,34 +291,7 @@ export class BodyMonitor implements BodyEvaluator {
       : undefined;
   }
 
-  private serialize(tunerSnapshot?: string): string {
-    const latest = this.latest;
-    const seed = this.seed.clone();
-    seed.advance(this.clock());
-    const latch: BodyThresholdState = {};
-    for (const k of Object.keys(latest ?? {})) latch[k] = (latest as AdaptiveState)[k];
-    return JSON.stringify({
-      version: 1,
-      disabled: this.tuningDisabled ?? this.tuner?.tuningDisabled,
-      tuner: tunerSnapshot ?? this.tuner?.serialize(),
-      baseline: seed.serialize(),
-      latch,
-      history: serializeHistory(latest?.[BODY_HISTORY]),
-    });
-  }
-
-  /** Requires finite monotonic receipt times on both samples. */
-  private validateSamples(
-    prev: BodyThresholdSample,
-    next: BodyThresholdSample,
-  ): [BodyThresholdSample, BodyThresholdSample] {
-    if (!Number.isFinite(prev.monotonicAt) || !Number.isFinite(next.monotonicAt) || !Number.isFinite(next.at)) {
-      throw new TypeError('monitor: clocks must be finite');
-    }
-    return [prev, next];
-  }
-
-  private tagFloor(s: Signal): BodySignal {
-    return { ...s, layer: 'floor', data: { ...s.data, layer: 'floor' } };
+  private serialize(tunerSnapshot?: string, latest = this.latest, rebaseline = this.rebaser?.snapshot()): string {
+    return serializeMonitor(this.seed, this.clock, this.tuner, latest, this.tuningDisabled, tunerSnapshot, rebaseline);
   }
 }

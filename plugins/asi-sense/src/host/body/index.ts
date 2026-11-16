@@ -12,6 +12,7 @@ export { type BodySignal, readMetrics } from './metrics.ts';
 export { BodyMonitor, type BodyMonitorOptions } from './monitor.ts';
 export { type BodyPersistence, PersistScheduler } from './persistence.ts';
 export { RateEvaluator, type RateRule } from './rate.ts';
+export type { AutomaticBodyEvaluation } from './rebaseline.ts';
 export { defaultAnomalyRules, defaultBodyRules, defaultRateRules } from './rules.ts';
 export {
   type AdaptiveState,

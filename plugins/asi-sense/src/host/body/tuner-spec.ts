@@ -5,6 +5,7 @@ export type TuningLog = TuningChange & {
   operation: 'propose' | 'revert' | 'feedback' | 'lock' | 'unlock';
   status: 'applied' | 'rejected';
   rejectionReason?: string;
+  kind?: 'rebaseline';
 };
 
 /** Whitelist entry: declared value plus the guard contract for a parameter. */
@@ -104,6 +105,7 @@ export const isLogEntry = (e: unknown): e is TuningLog => {
     (typeof l.to !== 'number' || finiteNum(l.to)) &&
     finiteNum(l.at) &&
     typeof l.reason === 'string' &&
+    (l.kind === undefined || l.kind === 'rebaseline') &&
     (l.rejectionReason === undefined || typeof l.rejectionReason === 'string') &&
     (VALID_BY as readonly string[]).includes(l.by) &&
     (VALID_OPS as readonly string[]).includes(l.operation) &&

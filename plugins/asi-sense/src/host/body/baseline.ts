@@ -151,6 +151,25 @@ export class Baseline {
     if (this.lastMono === undefined || monotonicAt > this.lastMono) this.lastMono = monotonicAt;
   }
 
+  get elapsed(): number {
+    return this.elapsedMs;
+  }
+
+  scaleMinimum(metric: string): number {
+    return this.minFor(metric);
+  }
+
+  bucket(metric: string, slot: number): Bucket | undefined {
+    const b = this.buckets.get(metric)?.[slot];
+    return b ? { ...b, dates: new Set(b.dates), warmup: b.warmup && [...b.warmup] } : undefined;
+  }
+
+  replace(metric: string, slot: number, bucket: Bucket): void {
+    const arr = this.buckets.get(metric);
+    if (!arr?.[slot]) throw new TypeError('baseline: missing rebaseline bucket');
+    arr[slot] = { ...bucket, dates: new Set(bucket.dates), warmup: bucket.warmup && [...bucket.warmup] };
+  }
+
   private minFor(metric: string): number {
     const own = this.minScale.get(metric);
     if (own !== undefined) return own;

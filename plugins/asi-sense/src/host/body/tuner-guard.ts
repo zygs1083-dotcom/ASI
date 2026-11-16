@@ -181,6 +181,49 @@ export class TunerGuard {
     });
   }
 
+  rebaseline(param: string, from: number, to: number, undoId?: string): TuningResult {
+    const now = this.deps.mono();
+    const wall = this.deps.wall();
+    const actor = undoId ? this.actor() : 'auto';
+    const prior = undoId ? this.store.applied.find((entry) => entry.id === undoId) : undefined;
+    let why: string | undefined;
+    if (!Number.isFinite(now) || !Number.isFinite(wall) || !Number.isFinite(from) || !Number.isFinite(to)) {
+      why = 'nonfinite';
+    } else if (undoId && actor !== 'user') {
+      why = 'rebaseline revert requires trusted user';
+    } else if (undoId && (!prior || prior.param !== param || this.store.lastApplied.get(param) !== undoId)) {
+      why = 'stale rebaseline';
+    } else if (!undoId) {
+      if (this.store.specs.has(param)) why = 'rebaseline parameter conflicts with whitelist';
+      else if (this.store.syncWindows(now, wall)) why = 'frozen: wall clock behind saved highwater';
+      else {
+        const [hour, day, all] = this.store.counts(param, now);
+        if (hour >= HOURLY_CAP) why = 'hourly change limit';
+        else if (day >= DAILY_CAP) why = 'daily change limit';
+        else if (all >= GLOBAL_DAILY_CAP) why = 'global daily change limit';
+      }
+    }
+    if (wall > this.store.wallHighwater) this.store.wallHighwater = wall;
+    const result = this.audit({
+      param,
+      from,
+      to,
+      by: actor ?? 'agent',
+      reason: undoId ? `revert ${undoId}` : 'auto: sustained new workload',
+      at: this.auditAt(),
+      operation: undoId ? 'revert' : 'propose',
+      status: why ? 'rejected' : 'applied',
+      kind: 'rebaseline',
+      ...(why ? { rejectionReason: why } : {}),
+    });
+    if (!why) {
+      if (!undoId) this.store.recordChange(param, now);
+      this.store.applied.push({ ...result.change });
+      this.store.lastApplied.set(param, result.change.id);
+    }
+    return result;
+  }
+
   /** AI-only guards; the whitelist ran before this and the lock before that. */
   private aiGuard(
     param: string,

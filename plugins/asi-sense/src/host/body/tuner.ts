@@ -1,16 +1,9 @@
 import type { TuningValue } from '@asi/sense-types';
 import { type BodyPersistence, PersistScheduler } from './persistence.ts';
-import { feedback } from './tuner-feedback.ts';
+import { feedback, register } from './tuner-feedback.ts';
 import { type TunerActor, TunerGuard, type TuningResult } from './tuner-guard.ts';
 import { validateSnapshot } from './tuner-persist.ts';
-import {
-  ALERT_CAP,
-  type AlertBinding,
-  finiteNum,
-  type ParameterSpec,
-  type TuningLog,
-  validateSpec,
-} from './tuner-spec.ts';
+import { type AlertBinding, finiteNum, type ParameterSpec, type TuningLog, validateSpec } from './tuner-spec.ts';
 import { applySnapshot, serializeTuner, TunerStore } from './tuner-state.ts';
 
 export type { AlertBinding, ParameterSpec, TunerActor, TuningLog, TuningResult };
@@ -47,7 +40,8 @@ export class Tuner {
   private readonly wallClock: () => number;
   private readonly persistence?: BodyPersistence;
   private readonly scheduler?: PersistScheduler;
-  private commit?: (snapshot: () => string, publish: () => void) => Promise<void>;
+  private commit?: (snapshot: () => string, publish: () => void, context?: unknown, result?: unknown) => Promise<void>;
+  private rebaseHost?: { revertChange: (id: string) => Promise<TuningResult> };
   private tail: Promise<void> = Promise.resolve();
   private closed = false;
 
@@ -120,34 +114,45 @@ export class Tuner {
 
   /** Inverse of an applied change; stale IDs (ABA included) are rejected. */
   revert(changeId: string): Promise<TuningResult> {
+    const prior = this.store.applied.find((entry) => entry.id === changeId);
+    if (prior?.kind === 'rebaseline' && this.rebaseHost) {
+      const actor = this.actor();
+      if (actor === 'user') return this.rebaseHost.revertChange(changeId);
+      return this.mutate(
+        (_store, guard) => guard.rebaseline(prior.param, Number(prior.to), Number(prior.from), changeId),
+        undefined,
+        actor,
+      );
+    }
     return this.mutate((_store, guard) => guard.revert(changeId));
   }
 
   registerAlert(alertId: string, ruleId: string, param: string): Promise<boolean> {
-    return this.mutate((store) => this.register(store, alertId, ruleId, param));
-  }
-
-  private register(store: TunerStore, alertId: string, ruleId: string, param: string): boolean {
-    if (
-      typeof alertId !== 'string' ||
-      alertId === '' ||
-      typeof ruleId !== 'string' ||
-      ruleId === '' ||
-      !finiteNum(this.clock()) ||
-      !finiteNum(this.wallClock()) ||
-      !store.specs.has(param) ||
-      store.alerts.has(alertId) ||
-      store.alerts.size >= ALERT_CAP
-    ) {
-      return false;
-    }
-    store.alerts.set(alertId, { ruleId, param });
-    return true;
+    return this.mutate((store) => register(store, this.clock, this.wallClock, alertId, ruleId, param));
   }
 
   /** Consumes an alert registration once; three noise streaks auto-tune. */
   feedback(alertId: string, verdict: 'useful' | 'noise'): Promise<TuningResult> {
     return this.mutate((store, guard) => feedback(store, guard, this.clock, this.wallClock, alertId, verdict));
+  }
+
+  setRebaselineHost(host: { revertChange: (id: string) => Promise<TuningResult> }): void {
+    if (this.persistence || !this.commit || this.rebaseHost) throw new TypeError('tuner: invalid rebaseline host');
+    this.rebaseHost = host;
+  }
+
+  rebaseline(
+    host: object,
+    param: string,
+    from: number,
+    to: number,
+    context: unknown,
+    undoId?: string,
+  ): Promise<TuningResult> {
+    if (host !== this.rebaseHost || !/^baseline:[\w-]+:[\w-]+:\d{1,3}$/.test(param)) {
+      return Promise.reject(new TypeError('tuner: invalid rebaseline request'));
+    }
+    return this.mutate((_store, guard) => guard.rebaseline(param, from, to, undoId), context);
   }
 
   serialize(): string {
@@ -214,7 +219,9 @@ export class Tuner {
     else this.scheduler?.cancel();
   }
 
-  setCommit(fn: (snapshot: () => string, publish: () => void) => Promise<void>): void {
+  setCommit(
+    fn: (snapshot: () => string, publish: () => void, context?: unknown, result?: unknown) => Promise<void>,
+  ): void {
     if (this.persistence) throw new TypeError('tuner: combined and standalone persistence cannot be mixed');
     this.commit = fn;
   }
@@ -223,9 +230,12 @@ export class Tuner {
     this.store.disabled = 'storage-failed';
   }
 
-  private mutate<T>(action: (store: TunerStore, guard: TunerGuard) => T): Promise<T> {
+  private mutate<T>(
+    action: (store: TunerStore, guard: TunerGuard) => T,
+    context?: unknown,
+    identity = this.actor(),
+  ): Promise<T> {
     if (this.closed) return Promise.reject(new Error('tuner: closed'));
-    const actor = this.actor();
     const operation = this.tail.then(async () => {
       if (!this.store.restored) throw new Error('tuner: restore pending');
       if (!this.commit) throw new Error('tuner: persistence required');
@@ -233,7 +243,7 @@ export class Tuner {
       if (!finiteNum(this.clock()) || !finiteNum(this.wallClock())) throw new TypeError('tuner: clocks must be finite');
       const staged = this.store.clone();
       const guard = new TunerGuard(staged, {
-        actor: () => actor,
+        actor: () => identity,
         mono: this.clock,
         wall: this.wallClock,
         onChange: () => {},
@@ -251,6 +261,8 @@ export class Tuner {
           () => {
             this.store = staged;
           },
+          context,
+          result,
         );
       } catch (err) {
         this.disableStorage();
