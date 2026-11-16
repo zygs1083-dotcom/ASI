@@ -1,6 +1,8 @@
+import { decoratorPlugin } from '@deepseek-ai/dsh-typert-generator/tsdown';
 import { defineConfig } from 'vitest/config';
 
 export default defineConfig({
+  plugins: [{ ...decoratorPlugin(), enforce: 'pre' }],
   test: {
     maxWorkers: 2,
     coverage: {

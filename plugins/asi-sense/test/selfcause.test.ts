@@ -1,8 +1,20 @@
+import type { Signal } from '@asi/sense-types';
 import { describe, expect, it } from 'vitest';
-import { classifyCause, type ToolWindow } from '../src/host/attention/selfcause.ts';
+import { classifyCause as classifyReceived, type ToolWindow } from '../src/host/attention/selfcause.ts';
 import { sig } from './helpers.ts';
 
 const W: ToolWindow = { startedAt: 100, endedAt: 200, cwd: '/repo', pid: 42 };
+const classifyCause = (signal: Signal, windows: ToolWindow[], grace = 0, receipt = signal.at) =>
+  classifyReceived(
+    signal,
+    windows.map((window) => ({
+      ...window,
+      startedMono: window.startedMono ?? window.startedAt,
+      endedMono: window.endedMono ?? window.endedAt,
+    })),
+    grace || (receipt === signal.at ? 1 : 0),
+    receipt,
+  );
 
 describe('classifyCause', () => {
   it('marks file.changed under an active tool cwd as agent', () => {
@@ -163,5 +175,21 @@ describe('classifyCause', () => {
     expect(classifyCause(rel, [W])).toBe('unknown');
     const relWin: ToolWindow = { startedAt: 0, cwd: 'repo/sub' };
     expect(classifyCause(rel, [relWin])).toBe('unknown');
+  });
+
+  it('limits trailing grace to cwd files and ignores old wall timestamps when receipt time is known', () => {
+    const window: ToolWindow = { ...W, startedMono: 10, endedMono: 110 };
+    const file = sig({ id: 'f', kind: 'file.changed', at: 2_200, subject: '/repo/a', cause: 'user' });
+    expect(classifyReceived({ ...file, at: 150 }, [W], 2_000)).toBe('user');
+    expect(classifyCause(file, [window], 2_000, 2_110)).toBe('user');
+    expect(classifyCause(file, [window], 2_000, 2_109)).toBe('agent');
+    expect(classifyCause({ ...file, at: 2_199 }, [window], 2_000, 2_110)).toBe('user');
+    expect(classifyCause({ ...file, at: 150 }, [window], 2_000, 9_000)).toBe('user');
+    expect(classifyCause({ ...file, at: 99 }, [window], 2_000, 2_110)).toBe('user');
+    expect(classifyCause({ ...file, subject: '/repository/a', data: { pid: 42 } }, [window], 2_000, 111)).toBe('user');
+    expect(classifyCause({ ...file, kind: 'job.exited', at: 201, data: { pid: 42 } }, [window], 2_000, 111)).toBe(
+      'user',
+    );
+    expect(classifyCause({ ...file, at: 201 }, [window], 0, 111)).toBe('user');
   });
 });

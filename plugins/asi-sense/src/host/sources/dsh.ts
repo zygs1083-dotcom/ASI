@@ -18,6 +18,7 @@ export class DshSource {
     private readonly attention: RuntimeAttention,
     private readonly tokens: (session: string, valid?: () => boolean) => Promise<void>,
     private readonly paused: () => boolean,
+    private readonly selfCauseGraceMs = 2_000,
   ) {}
   start(): void {
     this.active = true;
@@ -43,7 +44,10 @@ export class DshSource {
     return result;
   }
   classify(signal: Signal): Signal {
-    return { ...signal, cause: classifyCause(signal, [...this.windows.values()]) };
+    return {
+      ...signal,
+      cause: classifyCause(signal, [...this.windows.values()], this.selfCauseGraceMs, this.clock.mono()),
+    };
   }
   private async agent(event: AgentEvent): Promise<void> {
     if (event.type === 'created') {
@@ -72,12 +76,15 @@ export class DshSource {
     const key = `${event.sessionId}:${event.toolCallId}`;
     const at = event.at ?? this.clock.wall();
     if (event.type === 'pre-execute') {
-      this.windows.set(key, { startedAt: at, cwd: event.cwd, pid: event.pid });
+      this.windows.set(key, { startedAt: at, startedMono: this.clock.mono(), cwd: event.cwd, pid: event.pid });
       if (this.windows.size > 1024) this.windows.delete(this.windows.keys().next().value as string);
       return;
     }
     const window = this.windows.get(key);
-    if (window) window.endedAt = at;
+    if (window) {
+      window.endedAt = at;
+      window.endedMono = this.clock.mono();
+    }
     if (!this.paused() && event.exitCode !== undefined && event.exitCode !== 0) {
       await this.attention.accept(
         this.classify({

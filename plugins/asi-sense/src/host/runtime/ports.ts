@@ -78,6 +78,7 @@ export interface SenseOptions {
   helperPath?: string;
   intervalMs?: number;
   rules?: WatchRule[];
+  selfCauseGraceMs?: number;
 }
 export interface SenseActions {
   toggleRule(id: string, enabled: boolean): Promise<void>;

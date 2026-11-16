@@ -1,4 +1,3 @@
-import { createHash } from 'node:crypto';
 import type { EnvUpdate, Signal, WatchRule } from '@asi/sense-types';
 import {
   type Bucket,
@@ -9,38 +8,29 @@ import {
   byChangeAtId,
   upsertBucket,
 } from './buckets.ts';
-import { type InjectBatch, retargetBuckets } from './drain-transfer.ts';
-import type { DeliveryIntent, SessionState } from './pipeline.ts';
+import {
+  batchIntent,
+  confirmBatch,
+  type DrainHooks,
+  deliveryId,
+  type InjectBatch,
+  retargetBuckets,
+  throwCollected,
+} from './drain-transfer.ts';
+import type { DeliveryIntent } from './pipeline.ts';
 
 const WAKE_WINDOW_MS = 600_000;
 const WAKE_MAX = 3;
 const WAKE_MIN_GAP_MS = 60_000;
-
-/** Collaborators the drain needs from the pipeline. */
-export interface DrainHooks {
-  deliverer: { deliver(intent: DeliveryIntent): Promise<void> };
-  sessions: Map<string, SessionState>;
-  /** Monotonic clock for wake-budget checks and charges. */
-  clock: () => number;
-  /** Wall clock, used only for the `EnvUpdate.at` display timestamp. */
-  wallClock: () => number;
-  isCurrent?: () => (sessionId: string) => boolean;
+export class DeliveryFailure extends Error {
+  constructor(
+    readonly kind: 'deferred' | 'exhausted' | 'unknown',
+    readonly retryAt = 0,
+    cause?: unknown,
+  ) {
+    super(`delivery ${kind}`, cause === undefined ? undefined : { cause });
+  }
 }
-
-function throwCollected(errors: unknown[], label: string): void {
-  // raw rejections propagate unchanged — even an empty AggregateError
-  if (errors.length === 1) throw errors[0];
-  if (errors.length > 1) throw new AggregateError(errors, label);
-}
-
-/** Idempotency key: session + SORTED original signal ids — same payload ⇒ same id on retry. */
-function deliveryId(sessionId: string, buckets: Bucket[]): string {
-  const ids = buckets.flatMap((b) => [...b.details.values()].flatMap((d) => d.ids)).sort();
-  return createHash('sha256')
-    .update(JSON.stringify([sessionId, ids]))
-    .digest('hex');
-}
-
 /**
  * Merge buckets (pending) plus the ready context queue, delivered through
  * the host's deliverer. Attempts are independent and isolated: a bucket is
@@ -61,7 +51,6 @@ export class BucketDrain {
   private readonly isCurrent: () => (sessionId: string) => boolean;
   private seq = 0;
   private suppressedGroups = 0;
-
   constructor(hooks: DrainHooks) {
     this.deliverer = hooks.deliverer;
     this.sessions = hooks.sessions;
@@ -69,12 +58,10 @@ export class BucketDrain {
     this.wallClock = hooks.wallClock;
     this.isCurrent = hooks.isCurrent ?? (() => () => true);
   }
-
   /** Cumulative count of wake groups suppressed by the budget. */
   get suppressed(): number {
     return this.suppressedGroups;
   }
-
   /** Earliest pending merge deadline — retained failures included; `undefined` when none. */
   nextDeadline(): number | undefined {
     let min: number | undefined;
@@ -85,11 +72,26 @@ export class BucketDrain {
   }
   retarget(sessionId: string): void {
     if (!this.isCurrent()(sessionId)) return;
+    for (const b of this.pending.values()) if (b.sessionId !== sessionId && b.sealed) b.deadline = this.clock();
     this.suppressedGroups -= retargetBuckets(this.pending, this.ready, this.batches, sessionId, (id, buckets, at) =>
       this.buildInjectBatch(id, buckets, at),
     );
   }
-
+  confirm(id: string): void {
+    confirmBatch(this.batches, id);
+  }
+  suspend(id: string): InjectBatch[] {
+    const batches = this.batches.get(id) ?? [];
+    this.batches.delete(id);
+    return batches;
+  }
+  restore(sessionId: string, batch: InjectBatch): void {
+    const old = batch.intent.sessionId;
+    const next = this.buildInjectBatch(old, batch.buckets, batch.intent.update.at);
+    next.aliases = [...(batch.aliases ?? []), ...(batch.intent.deliveryId ? [batch.intent.deliveryId] : [])];
+    this.list(this.batches, old).push(next);
+    if (old !== sessionId) this.retarget(sessionId);
+  }
   /** Enqueues one classified signal into its session+subject merge window. */
   enqueue(
     signal: Signal,
@@ -110,7 +112,6 @@ export class BucketDrain {
       }
     }
   }
-
   /**
    * Completes every bucket whose monotonic deadline passed (`now` is the
    * caller's due cutoff, not the budget clock). Successful completions are
@@ -121,7 +122,6 @@ export class BucketDrain {
     await this.attemptDue(now, errors, this.isCurrent());
     throwCollected(errors, 'delivery failed');
   }
-
   /**
    * Pre-step drain (DESIGN §2.3): the session's context ships FIRST — pure
    * context groups close early and context details split out of still-open
@@ -165,7 +165,6 @@ export class BucketDrain {
     if (current(sessionId)) await this.attemptInject(sessionId, errors, attempted, current);
     throwCollected(errors, 'pre-step delivery failed');
   }
-
   /** Due buckets attempted independently; failures restore the sealed bucket for a same-payload retry. */
   private async attemptDue(now: number, errors: unknown[], current: (id: string) => boolean): Promise<void> {
     for (const b of [...this.pending.values()]) {
@@ -176,12 +175,15 @@ export class BucketDrain {
       try {
         await this.complete(b);
       } catch (e) {
-        errors.push(e);
-        this.pending.set(b.id, b); // sealed: retry only, never a merge target
+        if (!(e instanceof DeliveryFailure) || e.cause !== undefined)
+          errors.push(e instanceof DeliveryFailure ? e.cause : e);
+        if (!(e instanceof DeliveryFailure) || e.kind === 'deferred') {
+          if (e instanceof DeliveryFailure) b.deadline = e.retryAt;
+          this.pending.set(b.id, b); // sealed: retry only, never a merge target
+        }
       }
     }
   }
-
   /**
    * Completes one due bucket: context groups go to the ready queue; wake
    * groups check the per-session budget on a fresh monotonic sample — the
@@ -229,10 +231,9 @@ export class BucketDrain {
       intent = { kind: 'followup', sessionId: b.sessionId, update };
     }
     intent.deliveryId = deliveryId(b.sessionId, [b]);
-    await this.deliverer.deliver(structuredClone(intent));
+    await this.deliverer.deliver(batchIntent({ buckets: [b], intent }));
     s?.wakeTimes.push(this.clock());
   }
-
   /**
    * Freezes loose ready buckets into a fresh batch, then attempts every
    * frozen batch in order, skipping batches already tried this step.
@@ -257,9 +258,11 @@ export class BucketDrain {
       if (attempted.has(batch)) continue;
       attempted.add(batch);
       try {
-        await this.deliverer.deliver(structuredClone(batch.intent));
+        await this.deliverer.deliver(batchIntent(batch));
       } catch (e) {
-        errors.push(e);
+        if (!(e instanceof DeliveryFailure) || e.cause !== undefined)
+          errors.push(e instanceof DeliveryFailure ? e.cause : e);
+        if (e instanceof DeliveryFailure && e.kind !== 'deferred') batches.splice(batches.indexOf(batch), 1);
         continue;
       }
       for (const b of batch.buckets) {
@@ -272,7 +275,6 @@ export class BucketDrain {
     }
     if (batches.length === 0) this.batches.delete(sessionId);
   }
-
   /** Builds the immutable inject intent: sorted changes, earliest `since`,
    * suppressed-group count, summed `alreadyInjected`, stable `deliveryId`. */
   private buildInjectBatch(sessionId: string, buckets: Bucket[], at?: number): InjectBatch {
@@ -287,7 +289,6 @@ export class BucketDrain {
     if (alreadyInjected > 0) update.alreadyInjected = alreadyInjected;
     return { buckets, intent: { kind: 'inject', sessionId, update, deliveryId: deliveryId(sessionId, buckets) } };
   }
-
   private list<T>(map: Map<string, T[]>, sessionId: string): T[] {
     let list = map.get(sessionId);
     if (!list) {

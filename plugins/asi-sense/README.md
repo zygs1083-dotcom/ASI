@@ -133,6 +133,88 @@ owns the concrete ports declared in `runtime/ports.ts`:
   drive runtime scheduling, merge windows and helper retries. The probe and
   body persistence retain their own internal sampling/save timers.
 
+The DSH adapter adds context to the accepted `agent/pre-step` decision, not
+the already-claimed inbox. DSH logs the admitted messages in the current step;
+context is retained in memory if that step is canceled before admission and
+the title setting is checked again when it is formatted. Staged context is not
+durable across a process restart before admission.
+
+Wake deliveries use a message id derived from the delivery id. A session
+projection records both inbox insertions and admitted messages, including
+messages already claimed, so an accepted call that throws is not repeated.
+If acceptance cannot be determined, a `delivery-unknown` event is recorded
+and the delivery is not retried. The projection retains accepted ids for the
+session lifetime and therefore grows with delivered messages.
+
+Failed runtime deliveries retry after 1, 2, 4 seconds and so on, capped at
+60 seconds, for at most ten attempts or ten monotonic minutes. Context retries
+wait for a pre-step; wake retries use the host timer. The `delivery` source
+reports failures and their retry count, then reports that retries have stopped
+at the limit. Exhausted deliveries are recorded without another wake. The
+source returns to ok after a later delivery succeeds. The retry budget resets
+on session selection changes; a staged context clears degradation only after
+DSH records it in the session.
+
+Regression tests: `adds context to the claimed step and reconstructs it without
+another inbox entry`, `retains staged context if cancellation prevents admission,
+then admits it on the next step`, `does not enqueue twice after a message is
+accepted, claimed and the call throws`, `stops retrying after ten failures,
+reports degradation and recovers after a later delivery`, `expires a retry
+after ten monotonic minutes even if fewer than ten attempts ran`, and `resets
+the retry budget when the selected session changes`. Additional regressions
+cover concurrent identical deliveries, unknown outcomes, and waiting for
+staged context to commit before clearing degradation.
+
+`selfCauseGraceMs` is an optional DSH plugin configuration and
+`createSenseRuntime` option, defaulting to 2000 ms; set it to 0 to disable the
+trailing grace. A file event under a tool's absolute cwd is self-caused when
+its monotonic receipt falls in `[pre, post + grace)`.
+This can also suppress user edits inside that cwd during the grace interval;
+paths outside it and job/process events receive no trailing grace. A delayed
+event arriving after the grace is not self-caused, regardless of its mtime.
+The local watcher uses `lstat` mtime for adds/modifications when it is not
+older than watcher startup; otherwise (including deletes) it uses callback time.
+
+The DSH adapter implements `storage` with its own `FileStoragePort`, not
+`storageDomain`: it writes and syncs a temporary file, atomically renames it,
+then attempts to sync the containing directory. Failures before rename reject
+and clean up the temporary file; a directory-sync failure after rename is
+logged without rejecting the already-installed snapshot. DSH's
+`storage-json/src/atomic.ts` instead propagates directory-sync failures after
+rename, so its rejection does not imply that the old snapshot is still installed.
+
+`env_detail` returns local structured facts and source status without invoking
+computer-use or reading window contents. The current runtime projection does
+not expose the foreground PID or window count, so those fields are explicitly
+reported as unknown.
+
+To run the isolated real-DSH check, set `DSH_ROOT` to a read-only DSH checkout
+and run `pnpm --filter asi-sense e2e:dsh`. The fixture uses a private temporary
+profile, disables title sharing and caps model requests at six per run. Profiles
+are removed even when initialization or execution fails. Real observations are
+used only for assertions and are never photographed.
+Set `ASI_E2E_NO_MODEL=1` for sidebar, responsive layout and cleanup checks
+without model requests. Add `ASI_E2E_SYNTHETIC=1` to replace the host plugin
+with a fabricated frame and save panel-only screenshots under
+`/tmp/asi-sense-e2e-shots/`; this mode never starts body-probe or the helper.
+On macOS, delayed filesystem notifications are handled
+using the monotonic receipt time and trailing grace described above;
+notifications arriving after the grace can still cause a wake.
+
+DSH bundle regressions: `marks the old frame stale on carrier loss, accepts a
+new baseline and cancels on dispose`; `cancels while waiting for a replacement
+baseline`; `shows disconnected facts and independently fresh disk volumes as
+stale without altering the baseline`; `uses invented observations and replaces
+the real host entry before plugin installation`; `removes the profile after
+%s`; `removes the actual fixture profile when DSH initialization fails`; and
+`terminates and waits for a stubborn child after its parent has exited`.
+
+For the dangerous-action sidebar check, build the bundle and run
+`DSH_ROOT=/path/to/dsh pnpm --filter asi-sense exec tsx test/dsh/danger-e2e.ts`.
+It uses a synthetic runtime with isolated storage, blocks model requests, checks
+resume pending/persistence and reset confirmation focus, and removes its
+temporary profile and cropped screenshots on exit.
+
 `start()` restores before starting sources and may be called once. `stop()`
 closes subscriptions, watchers, probe, helper and timers, then waits for
 pending body/settings saves; it rejects on a shutdown timeout (950 ms) or
@@ -277,7 +359,7 @@ The host owns local access control and **atomic temp-file + rename writes**.
 snapshot was not installed; rename must be the last step that can reject.
 Report any post-rename directory fsync or
 other errors separately, never by rejecting `save`.
-M3 will connect the port to DSH `storageDomain`. Pass the port to the monitor
+Pass the plugin-owned file port to the monitor
 for one versioned snapshot containing baseline, installation time, zone,
 latches, tuner values, locks, audits, quota windows and ID lineage. Do not
 also configure a separate tuner store when the monitor owns the combined one.
@@ -488,3 +570,27 @@ Regression tests:
 4. Disk aggregation and cache expiry: `aggregates disk parent from final volume deadlines after cached republishes` and `never revives an expired cached disk when its TTL metadata changes`.
 
 Tests are in `test/presenter/presenter.test.ts` unless otherwise noted. Rate signals retain their evaluation-time `at` and remaining ETA, alongside the observation `evidenceAt`; panel events project the evidence time to the display timeline, while current ETA remains anchored to the observation. Disk parent status and deadline reflect the final fresh-volume set; repeated cached volume timestamps cannot extend a volume's deadline. Collection-level `denied` and `unsupported` remain unchanged even with no volumes or an explicitly fresh volume, as covered by `preserves disk collection status %s with or without fresh volumes`.
+
+## DSH runtime regressions
+
+Pause and resume are serialized through resource changes and persistence; a failed
+save restores the preceding resource state. If rollback itself fails, further
+pause requests fail until restart rather than claiming an inconsistent state.
+File rules with an explicit subject require an absolute path. Missing roots are
+watched through their nearest existing directory, with unrelated events filtered.
+Directories are watched directly; single-file roots are watched through their
+parent so atomic replacements remain observable. A failing root reports `unavailable` as
+`files:<rule id>` without stopping other rules; a later rule refresh retries it.
+Agent-added rules are activated before saving, and failed activations are not saved.
+
+1. Pause ordering and failures: `serializes overlapping pause and resume transactions until resources and storage agree`; `recovers from a failed pause save before processing the next pause intent`; `restores the paused resources if saving a resume fails`; `rejects subsequent pause requests after rollback fails` (`test/runtime/runtime.test.ts`).
+2. Missing roots and restart: `watches the nearest existing ancestor, filters siblings, and switches when the target appears` (`test/dsh/local-ports.test.ts`); `restores a missing file root and observes it after creation and recreation`; `reports changes to an existing file root using the file path itself` (`test/dsh/file-restart.test.ts`).
+3. Rule isolation and commit: `isolates failed restored file rules and keeps other watches active`; `marks only the affected rule unavailable on an asynchronous watcher error`; `serializes a watcher error with later rule refresh and reports recovery`; `does not persist a file rule if validation or watch activation fails`; `does not save a newly staged rule when its watcher fails before commit`; `rechecks a staged watcher when its settings commit was queued`; `closes a staged watch when saving the new rule fails`; `closes staged watches when pausing during a pending rule save` (`test/runtime/runtime.test.ts`).
+
+## DSH bundle fix-3 regressions
+
+1. Cross-session budget: `rechecks a cancelled budget downgrade for the target session after dispose=%s`; `restores all kinds of a budget-suppressed group as one target wake`; `keeps the budget downgrade when a disposed session is restored under the same id`.
+2. Deferred outcomes: `records confirmed inject outcomes, not cancelled or transferred attempts`; `confirms a transferred wake against an already-spent target budget`; `confirms every retained no-session context event in a merged inject`; `retains an outstanding outcome across more than 1024 unconfirmed transfers`.
+
+All tests are in `test/dsh/port.test.ts`. A staged inject remains unreported as delivered until the adapter confirms its session message; confirmation publishes the actual outcome for all retained merged events.
+Outstanding attempt identities remain while their events are visible; repeated abandoned transfers can accumulate until those events leave the 200-entry log.

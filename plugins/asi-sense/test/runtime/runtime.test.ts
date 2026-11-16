@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import type { Body } from '@asi/sense-types';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { DeliveryFailure } from '../../src/host/attention/drain.ts';
 import { DEFAULT_RULES } from '../../src/host/attention/rules.ts';
 import { defaultBodyRules } from '../../src/host/body/index.ts';
 import { createSenseRuntime } from '../../src/host/runtime/index.ts';
@@ -9,15 +10,18 @@ import type {
   DshPort,
   FileChange,
   JobEvent,
+  SenseOptions,
   SensePorts,
   TokenSnapshot,
   ToolEvent,
 } from '../../src/host/runtime/ports.ts';
+import { Settings } from '../../src/host/runtime/settings.ts';
+import { pauseAction } from '../../src/host/runtime/tools.ts';
 import { f, mkBody } from '../body/helpers.ts';
 
 afterEach(() => vi.useRealTimers());
 
-function harness(savedSettings?: string) {
+function harness(savedSettings?: string, options: SenseOptions = {}) {
   vi.useFakeTimers();
   vi.setSystemTime(1_700_000_000_000);
   let mono = 0;
@@ -97,6 +101,7 @@ function harness(savedSettings?: string) {
         approved: true,
       },
     ],
+    ...options,
   });
   return {
     ports,
@@ -130,6 +135,177 @@ function harness(savedSettings?: string) {
 }
 
 describe('host runtime', () => {
+  it('stops retrying after ten failures, reports degradation and recovers after a later delivery', async () => {
+    const h = harness();
+    let attempts = 0;
+    let failing = true;
+    h.ports.dsh.deliver = async () => {
+      attempts++;
+      if (failing) throw new Error('fixture failure');
+    };
+    await h.runtime.start();
+    await h.agent({ type: 'created', sessionId: 's' });
+    await h.agent({ type: 'pre-step', sessionId: 's', userInitiated: true });
+    await h.job({ type: 'exited', id: 'failed-job', exitCode: 1 });
+    await h.advance(2_000);
+    expect(attempts).toBe(1);
+    expect(h.runtime.state().observation.sources.delivery).toMatchObject({
+      status: 'unavailable',
+      error: '投递失败，正在重试（1 次）',
+    });
+    for (let i = 0; i < 9; i++) {
+      const delay = Math.min(1_000 * 2 ** i, 60_000);
+      await h.advance(delay - 1);
+      expect(attempts).toBe(i + 1);
+      await h.advance(1);
+      expect(attempts).toBe(i + 2);
+    }
+    expect(attempts).toBe(10);
+    expect(h.runtime.state().observation.sources.delivery).toMatchObject({
+      status: 'unavailable',
+      error: '投递失败，已暂停重试（10 次）',
+    });
+    await h.advance(120_000);
+    expect(attempts).toBe(10);
+    failing = false;
+    await h.job({ type: 'exited', id: 'later-job', exitCode: 1 });
+    await h.advance(2_000);
+    expect(attempts).toBe(11);
+    expect(h.runtime.state().observation.sources.delivery).toMatchObject({ status: 'ok' });
+    await h.runtime.stop();
+  });
+
+  it('resets the retry budget when the selected session changes', async () => {
+    const h = harness();
+    let attempts = 0;
+    h.ports.dsh.deliver = async () => {
+      attempts++;
+      throw new Error('fixture failure');
+    };
+    await h.runtime.start();
+    await h.agent({ type: 'created', sessionId: 'a' });
+    await h.agent({ type: 'created', sessionId: 'b' });
+    await h.agent({ type: 'pre-step', sessionId: 'a', userInitiated: true });
+    await h.job({ type: 'exited', id: 'failed-job', exitCode: 1 });
+    await h.advance(2_000);
+    await h.advance(1_000);
+    expect(attempts).toBe(2);
+    await h.agent({ type: 'pre-step', sessionId: 'b', userInitiated: true }).catch(() => {});
+    expect(attempts).toBe(3);
+    for (let i = 0; i < 9; i++) await h.advance(Math.min(1_000 * 2 ** i, 60_000));
+    expect(attempts).toBe(12);
+    expect(h.runtime.state().observation.sources.delivery).toMatchObject({
+      status: 'unavailable',
+      error: '投递失败，已暂停重试（10 次）',
+    });
+    await h.runtime.stop();
+  });
+
+  it('expires a retry after ten monotonic minutes even if fewer than ten attempts ran', async () => {
+    const h = harness();
+    let attempts = 0;
+    h.ports.dsh.deliver = async () => {
+      attempts++;
+      throw new Error('fixture failure');
+    };
+    await h.runtime.start();
+    await h.agent({ type: 'created', sessionId: 's' });
+    await h.agent({ type: 'pre-step', sessionId: 's' });
+    await h.job({ type: 'exited', id: 'failed-job', exitCode: 1 });
+    await h.advance(2_000);
+    await h.advance(600_000);
+    expect(attempts).toBe(1);
+    expect(h.runtime.state().observation.sources.delivery).toMatchObject({
+      status: 'unavailable',
+      error: '投递失败，已暂停重试（1 次）',
+    });
+    await h.runtime.stop();
+  });
+
+  it('records an unknown outcome without retrying it', async () => {
+    const h = harness();
+    let attempts = 0;
+    h.ports.dsh.deliver = async () => {
+      attempts++;
+      throw new DeliveryFailure('unknown', 0, new Error('fixture'));
+    };
+    await h.runtime.start();
+    await h.agent({ type: 'created', sessionId: 's' });
+    await h.agent({ type: 'pre-step', sessionId: 's' });
+    await h.job({ type: 'exited', id: 'failed-job', exitCode: 1 });
+    await h.advance(2_000);
+    await h.advance(120_000);
+    expect(attempts).toBe(1);
+    expect(h.runtime.events().some((event) => event.kind === 'delivery-unknown')).toBe(true);
+    expect(h.runtime.state().observation.sources.delivery).toMatchObject({
+      status: 'unavailable',
+      error: '投递结果未知，未重试',
+    });
+    await h.runtime.stop();
+  });
+
+  it('records an unknown in-flight outcome even when the selected session changes', async () => {
+    const h = harness();
+    let release!: () => void;
+    let entered!: () => void;
+    const pending = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const started = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    let attempts = 0;
+    h.ports.dsh.deliver = async () => {
+      attempts++;
+      entered();
+      await pending;
+      throw new DeliveryFailure('unknown', 0, new Error('fixture'));
+    };
+    await h.runtime.start();
+    await h.agent({ type: 'created', sessionId: 'a' });
+    await h.agent({ type: 'created', sessionId: 'b' });
+    await h.agent({ type: 'pre-step', sessionId: 'a' });
+    await h.job({ type: 'exited', id: 'completed-job', exitCode: 0 });
+    const old = h.agent({ type: 'pre-step', sessionId: 'a' }).catch(() => {});
+    await started;
+    const next = h.agent({ type: 'pre-step', sessionId: 'b' }).catch(() => {});
+    release();
+    await Promise.all([old, next]);
+    expect(attempts).toBe(1);
+    expect(h.runtime.events().some((event) => event.kind === 'delivery-unknown')).toBe(true);
+    expect(h.runtime.state().observation.sources.delivery?.status).toBe('unavailable');
+    await h.runtime.stop();
+  });
+
+  it('waits for a staged context message to commit before clearing degradation', async () => {
+    const h = harness();
+    let committed = (_sessionId: string) => {};
+    Object.assign(h.ports.dsh, {
+      onDeliveryCommitted: (cb: (sessionId: string) => void) => {
+        committed = cb;
+        return () => {};
+      },
+    });
+    let failing = true;
+    h.ports.dsh.deliver = async () => {
+      if (failing) throw new Error('fixture failure');
+    };
+    await h.runtime.start();
+    await h.agent({ type: 'created', sessionId: 's' });
+    await h.agent({ type: 'pre-step', sessionId: 's' });
+    await h.job({ type: 'exited', id: 'failed-job', exitCode: 1 });
+    await h.advance(2_000);
+    for (let i = 0; i < 9; i++) await h.advance(Math.min(1_000 * 2 ** i, 60_000));
+    failing = false;
+    await h.job({ type: 'exited', id: 'successful-job', exitCode: 0 });
+    await h.agent({ type: 'pre-step', sessionId: 's' });
+    expect(h.runtime.state().observation.sources.delivery?.status).toBe('unavailable');
+    committed('s');
+    await vi.advanceTimersByTimeAsync(0);
+    expect(h.runtime.state().observation.sources.delivery?.status).toBe('ok');
+    await h.runtime.stop();
+  });
+
   it('notifies once after a body sample commits battery and memory alerts', async () => {
     const h = harness();
     await h.runtime.start();
@@ -434,6 +610,86 @@ describe('host runtime', () => {
     await h.runtime.stop();
   });
 
+  it.each([
+    { delay: 300, path: '/workspace/repo/a', agent: true },
+    { delay: 1_500, path: '/workspace/repo/a', agent: true },
+    { delay: 1_999, path: '/workspace/repo/a', agent: true },
+    { delay: 2_000, path: '/workspace/repo/a', agent: false },
+    { delay: 2_500, path: '/workspace/repo/a', agent: false },
+    { delay: 300, path: '/workspace/other/a', agent: false },
+    { delay: 2_500, path: '/workspace/repo/a', agent: false, oldMtime: true },
+  ])('classifies a file callback after $delay ms at $path (agent=$agent)', async (scenario) => {
+    const h = harness();
+    await h.runtime.start();
+    await h.agent({ type: 'created', sessionId: 's' });
+    await h.agent({ type: 'pre-step', sessionId: 's' });
+    await h.agent({ type: 'post-step', sessionId: 's' });
+    await h.tool({ type: 'pre-execute', sessionId: 's', toolCallId: 't', cwd: '/workspace/repo' });
+    await h.advance(50);
+    const mtime = Date.now();
+    await h.advance(50);
+    await h.tool({ type: 'post-execute', sessionId: 's', toolCallId: 't' });
+    await h.advance(scenario.delay);
+    await h.file({ path: scenario.path, change: 'modify', ...(scenario.oldMtime ? { at: mtime } : {}) });
+    const event = h.runtime.events().find((entry) => entry.kind === 'file.changed');
+    expect(event).toMatchObject(
+      scenario.agent ? { cause: 'agent', level: 'record', reason: 'self-caused' } : { cause: 'unknown', level: 'wake' },
+    );
+    await h.advance(5_001);
+    expect(h.delivered.map((intent) => intent.kind)).toEqual(scenario.agent ? [] : ['followup']);
+    await h.runtime.stop();
+  });
+
+  it('uses monotonic receipt time despite a wall-clock rollback and does not extend job events', async () => {
+    const h = harness();
+    await h.runtime.start();
+    await h.agent({ type: 'created', sessionId: 's' });
+    await h.agent({ type: 'pre-step', sessionId: 's' });
+    await h.agent({ type: 'post-step', sessionId: 's' });
+    await h.tool({ type: 'pre-execute', sessionId: 's', toolCallId: 't', pid: 42, cwd: '/workspace/repo' });
+    await h.advance(100);
+    await h.tool({ type: 'post-execute', sessionId: 's', toolCallId: 't' });
+    vi.setSystemTime(Date.now() - 10_000);
+    await h.advance(300);
+    await h.file({ path: '/workspace/repo/a', change: 'modify' });
+    expect(h.runtime.events().find((entry) => entry.kind === 'file.changed')).toMatchObject({
+      cause: 'agent',
+      level: 'record',
+    });
+    await h.job({ type: 'exited', id: 'late-job', pid: 42, exitCode: 1, at: Date.now() + 10_000 });
+    expect(h.runtime.events().find((entry) => entry.subject === 'late-job')).toMatchObject({
+      cause: 'unknown',
+      level: 'wake',
+    });
+    await h.runtime.stop();
+  });
+
+  it.each([
+    { grace: 500, delay: 499, cause: 'agent', level: 'record' },
+    { grace: 500, delay: 500, cause: 'unknown', level: 'wake' },
+    { grace: 0, delay: 1, cause: 'unknown', level: 'wake' },
+  ])('honors a configured $grace ms grace at $delay ms', async ({ grace, delay, cause, level }) => {
+    const h = harness(undefined, { selfCauseGraceMs: grace });
+    await h.runtime.start();
+    await h.agent({ type: 'created', sessionId: 's' });
+    await h.agent({ type: 'pre-step', sessionId: 's' });
+    await h.agent({ type: 'post-step', sessionId: 's' });
+    await h.tool({ type: 'pre-execute', sessionId: 's', toolCallId: 't', cwd: '/workspace/repo' });
+    await h.advance(100);
+    await h.tool({ type: 'post-execute', sessionId: 's', toolCallId: 't' });
+    await h.advance(delay);
+    await h.file({ path: '/workspace/repo/a', change: 'modify' });
+    expect(h.runtime.events().find((entry) => entry.kind === 'file.changed')).toMatchObject({
+      cause,
+      level,
+    });
+    await h.runtime.stop();
+  });
+
+  it.each([-1, Number.NaN, Number.POSITIVE_INFINITY])('rejects invalid self-cause grace %s', (selfCauseGraceMs) => {
+    expect(() => harness(undefined, { selfCauseGraceMs })).toThrow('selfCauseGraceMs');
+  });
+
   it('notifies stale at the monotonic deadline after wall clock rollback', async () => {
     const h = harness();
     const frames: string[] = [];
@@ -531,6 +787,277 @@ describe('host runtime', () => {
     release();
     await Promise.all([first, second]);
     expect([...watched]).toEqual([]);
+    await h.runtime.stop();
+  });
+
+  it('isolates failed restored file rules and keeps other watches active', async () => {
+    const rules = [
+      {
+        id: 'bad',
+        match: { kind: 'file.changed', subject: '/bad/**' },
+        level: 'context',
+        createdBy: 'user',
+        approved: true,
+      },
+      {
+        id: 'good',
+        match: { kind: 'file.changed', subject: '/good/**' },
+        level: 'context',
+        createdBy: 'user',
+        approved: true,
+      },
+    ] as const;
+    const h = harness(JSON.stringify({ version: 1, paused: false, sendTitles: true, rules, disabled: [] }));
+    let good: ((event: FileChange) => void) | undefined;
+    h.ports.files.watch = (path, callback) => {
+      if (path === '/bad/') throw new Error('synthetic watch failure');
+      good = callback;
+      return { close: () => {} };
+    };
+    await h.runtime.start();
+    expect(h.runtime.state().observation.sources['files:bad']?.status).toBe('unavailable');
+    expect(h.runtime.state().observation.sources['files:good']?.status).toBe('ok');
+    good?.({ path: '/good/synthetic.txt', change: 'add' });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(h.runtime.state().env.watchedPaths.value?.['/good/synthetic.txt']?.changes).toBe(1);
+    expect(h.runtime.state().observation.sources['files:bad']?.status).toBe('unavailable');
+    await h.runtime.stop();
+  });
+
+  it('marks only the affected rule unavailable on an asynchronous watcher error', async () => {
+    const h = harness();
+    const callbacks = new Map<string, (event: FileChange) => void>();
+    const closed = new Set<string>();
+    h.ports.files.watch = (path, callback) => {
+      callbacks.set(path, callback);
+      return {
+        close: () => {
+          closed.add(path);
+        },
+      };
+    };
+    await h.runtime.start();
+    await h.runtime.tools.envWatch({
+      action: 'add',
+      rule: { id: 'other', match: { kind: 'file.changed', subject: '/other/**' }, level: 'context' },
+    });
+    const error = { path: '/other', change: 'modify' as const, watchError: true };
+    callbacks.get('/other/')?.(error);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(closed.has('/other/')).toBe(true);
+    expect(h.runtime.state().observation.sources['files:other']?.status).toBe('unavailable');
+    expect(h.runtime.state().observation.sources['files:files-wake']?.status).toBe('ok');
+    callbacks.get('/workspace/')?.({ path: '/workspace/synthetic.txt', change: 'add' });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(h.runtime.state().env.watchedPaths.value?.['/workspace/synthetic.txt']?.changes).toBe(1);
+    await h.runtime.stop();
+  });
+
+  it('serializes a watcher error with later rule refresh and reports recovery', async () => {
+    const h = harness();
+    let callback: ((event: FileChange) => void) | undefined;
+    let release!: () => void;
+    let entered!: () => void;
+    const closing = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    const barrier = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let first = true;
+    h.ports.files.watch = (path, emit) => {
+      if (path === '/workspace/') callback = emit;
+      return {
+        close: async () => {
+          if (path === '/workspace/' && first) {
+            first = false;
+            entered();
+            await barrier;
+          }
+        },
+      };
+    };
+    await h.runtime.start();
+    const error = { path: '/workspace', change: 'modify' as const, watchError: true };
+    callback?.(error);
+    await closing;
+    const add = h.runtime.tools.envWatch({
+      action: 'add',
+      rule: { id: 'other', match: { kind: 'file.changed', subject: '/other/**' }, level: 'context' },
+    });
+    release();
+    await add;
+    expect(h.runtime.state().observation.sources['files:files-wake']?.status).toBe('ok');
+    await h.runtime.stop();
+  });
+
+  it('does not persist a file rule if validation or watch activation fails', async () => {
+    const h = harness();
+    let settingsWrites = 0;
+    h.ports.storage.save = async (key) => {
+      if (key === 'settings') settingsWrites++;
+    };
+    h.ports.files.watch = (path) => {
+      if (path === '/bad/') throw new Error('synthetic watch failure');
+      return { close: () => {} };
+    };
+    await h.runtime.start();
+    await expect(
+      h.runtime.tools.envWatch({
+        action: 'add',
+        rule: { id: 'relative', match: { kind: 'file.changed', subject: 'relative/**' }, level: 'context' },
+      }),
+    ).rejects.toThrow();
+    await expect(
+      h.runtime.tools.envWatch({
+        action: 'add',
+        rule: { id: 'bad', match: { kind: 'file.changed', subject: '/bad/**' }, level: 'context' },
+      }),
+    ).rejects.toThrow('synthetic watch failure');
+    expect(settingsWrites).toBe(0);
+    expect(h.runtime.rules.list().some((rule) => rule.id === 'relative' || rule.id === 'bad')).toBe(false);
+    await h.runtime.stop();
+  });
+
+  it('does not save a newly staged rule when its watcher fails before commit', async () => {
+    const h = harness();
+    let settingsWrites = 0;
+    h.ports.storage.save = async (key) => {
+      if (key === 'settings') settingsWrites++;
+    };
+    h.ports.files.watch = (path, callback) => {
+      if (path === '/bad/') {
+        const event = { path: '/bad', change: 'modify' as const, watchError: true };
+        void Promise.resolve().then(() => callback(event));
+      }
+      return { close: () => {} };
+    };
+    await h.runtime.start();
+    await expect(
+      h.runtime.tools.envWatch({
+        action: 'add',
+        rule: { id: 'bad', match: { kind: 'file.changed', subject: '/bad/**' }, level: 'context' },
+      }),
+    ).rejects.toThrow();
+    expect(settingsWrites).toBe(0);
+    expect(h.runtime.rules.list().some((rule) => rule.id === 'bad')).toBe(false);
+    await h.runtime.stop();
+  });
+
+  it('rechecks a staged watcher when its settings commit was queued', async () => {
+    const h = harness();
+    let release!: () => void;
+    let entered!: () => void;
+    let watching!: () => void;
+    let callback: ((event: FileChange) => void) | undefined;
+    const saving = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    const ready = new Promise<void>((resolve) => {
+      watching = resolve;
+    });
+    const barrier = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let writes = 0;
+    h.ports.storage.save = async (key) => {
+      if (key === 'settings') {
+        writes++;
+        entered();
+        await barrier;
+      }
+    };
+    h.ports.files.watch = (path, emit) => {
+      if (path === '/bad/') {
+        callback = emit;
+        watching();
+      }
+      return { close: () => {} };
+    };
+    await h.runtime.start();
+    const titles = h.runtime.actions.setSendTitles(false);
+    await saving;
+    const add = h.runtime.tools.envWatch({
+      action: 'add',
+      rule: { id: 'bad', match: { kind: 'file.changed', subject: '/bad/**' }, level: 'context' },
+    });
+    const rejected = expect(add).rejects.toThrow('file watch activation failed');
+    await ready;
+    const error = { path: '/bad', change: 'modify' as const, watchError: true };
+    callback?.(error);
+    release();
+    await titles;
+    await rejected;
+    expect(writes).toBe(1);
+    expect(h.runtime.rules.list().some((rule) => rule.id === 'bad')).toBe(false);
+    await h.runtime.stop();
+  });
+
+  it('closes a staged watch when saving the new rule fails', async () => {
+    const h = harness();
+    const watched = new Set<string>();
+    h.ports.files.watch = (path) => {
+      watched.add(path);
+      return {
+        close: () => {
+          watched.delete(path);
+        },
+      };
+    };
+    await h.runtime.start();
+    h.failSave(true);
+    await expect(
+      h.runtime.tools.envWatch({
+        action: 'add',
+        rule: { id: 'new', match: { kind: 'file.changed', subject: '/new/**' }, level: 'context' },
+      }),
+    ).rejects.toThrow('uninstalled');
+    expect(watched.has('/new/')).toBe(false);
+    expect(h.runtime.rules.list().some((rule) => rule.id === 'new')).toBe(false);
+    h.failSave(false);
+    await h.runtime.stop();
+    expect(watched.size).toBe(0);
+  });
+
+  it('closes staged watches when pausing during a pending rule save', async () => {
+    const h = harness();
+    const watched = new Set<string>();
+    let release!: () => void;
+    let entered!: () => void;
+    const saving = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    const barrier = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    h.ports.files.watch = (path) => {
+      watched.add(path);
+      return {
+        close: () => {
+          watched.delete(path);
+        },
+      };
+    };
+    h.ports.storage.save = async (key, value) => {
+      if (key === 'settings' && JSON.parse(value).rules.some((rule: { id: string }) => rule.id === 'new')) {
+        entered();
+        await barrier;
+      }
+    };
+    await h.runtime.start();
+    const add = h.runtime.tools.envWatch({
+      action: 'add',
+      rule: { id: 'new', match: { kind: 'file.changed', subject: '/new/**' }, level: 'context' },
+    });
+    await saving;
+    const pause = h.runtime.actions.pause(true);
+    await Promise.resolve();
+    release();
+    await Promise.all([add, pause]);
+    expect(h.runtime.rules.settings().paused).toBe(true);
+    expect(watched.size).toBe(0);
+    await h.runtime.actions.pause(false);
+    expect([...watched].sort()).toEqual(['/new/', '/workspace/']);
     await h.runtime.stop();
   });
 
@@ -786,6 +1313,106 @@ describe('host runtime', () => {
     expect(h.delivered.map((intent) => intent.kind)).toEqual(['followup']);
     await h.runtime.stop();
     expect(h.probeCount()).toBe(0);
+  });
+
+  it('serializes overlapping pause and resume transactions until resources and storage agree', async () => {
+    const h = harness();
+    let release!: () => void;
+    const barrier = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let closeStarted = false;
+    let activeWatches = 0;
+    let persisted = false;
+    h.ports.files.watch = () => {
+      activeWatches++;
+      return {
+        close: async () => {
+          closeStarted = true;
+          await barrier;
+          activeWatches--;
+        },
+      };
+    };
+    h.ports.storage.save = async (key, value) => {
+      if (key === 'settings') persisted = JSON.parse(value).paused;
+    };
+    await h.runtime.start();
+    const pause = h.runtime.actions.pause(true);
+    while (!closeStarted) await Promise.resolve();
+    let secondFinished = false;
+    const secondPause = h.runtime.actions.pause(true).then(() => {
+      secondFinished = true;
+    });
+    const resume = h.runtime.actions.pause(false);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(secondFinished).toBe(false);
+    expect(h.probeCount()).toBe(0);
+    release();
+    await Promise.all([pause, secondPause, resume]);
+    expect(h.runtime.rules.settings().paused).toBe(false);
+    expect(persisted).toBe(false);
+    expect(h.probeCount()).toBe(1);
+    expect(activeWatches).toBe(1);
+    await h.runtime.stop();
+    expect(activeWatches).toBe(0);
+  });
+
+  it('recovers from a failed pause save before processing the next pause intent', async () => {
+    const h = harness();
+    let fail = true;
+    let persisted = false;
+    h.ports.storage.save = async (key, value) => {
+      if (key !== 'settings') return;
+      if (fail) {
+        fail = false;
+        throw new Error('uninstalled');
+      }
+      persisted = JSON.parse(value).paused;
+    };
+    await h.runtime.start();
+    const pause = h.runtime.actions.pause(true);
+    const resume = h.runtime.actions.pause(false);
+    await expect(pause).rejects.toThrow('uninstalled');
+    await resume;
+    expect(h.runtime.rules.settings().paused).toBe(false);
+    expect(persisted).toBe(false);
+    expect(h.probeCount()).toBe(1);
+    expect(h.watcherCount()).toBe(1);
+    await h.runtime.stop();
+  });
+
+  it('restores the paused resources if saving a resume fails', async () => {
+    const h = harness();
+    await h.runtime.start();
+    await h.runtime.actions.pause(true);
+    h.failSave(true);
+    await expect(h.runtime.actions.pause(false)).rejects.toThrow('uninstalled');
+    expect(h.runtime.rules.settings().paused).toBe(true);
+    expect(h.probeCount()).toBe(0);
+    expect(h.watcherCount()).toBe(0);
+    h.failSave(false);
+    await h.runtime.actions.pause(false);
+    expect(h.probeCount()).toBe(1);
+    expect(h.watcherCount()).toBe(1);
+    await h.runtime.stop();
+  });
+
+  it('rejects subsequent pause requests after rollback fails', async () => {
+    const settings = new Settings({ load: async () => undefined, save: async () => {} }, []);
+    let paused = false;
+    const pause = pauseAction(
+      settings,
+      () => paused,
+      async (value) => {
+        paused = value;
+        throw new Error('synthetic resource failure');
+      },
+      () => {},
+    );
+    await expect(pause(true)).rejects.toThrow('pause failed and rollback failed');
+    await expect(pause(false)).rejects.toThrow('pause state unavailable');
   });
 
   it('notifies state subscribers at the earliest fact TTL deadline', async () => {

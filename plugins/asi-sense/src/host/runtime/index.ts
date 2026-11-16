@@ -6,14 +6,20 @@ import { HelperSource } from '../sources/helper.ts';
 import { boundedShutdown, guardActions } from './action-guard.ts';
 import { RuntimeAttention } from './attention.ts';
 import { createChanges, createStateListeners, observableActions, settleShutdown } from './changes.ts';
+import { deliveryRetry } from './delivery-retry.ts';
 import { FactExpiry } from './expiry.ts';
 import type { SenseActions, SenseOptions, SensePorts } from './ports.ts';
 import { Settings } from './settings.ts';
-import { runtimeTools } from './tools.ts';
+import { pauseAction, runtimeTools } from './tools.ts';
 
 export type { EventEntry, EventLog } from './attention.ts';
 export type * from './ports.ts';
 export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}) {
+  if (
+    options.selfCauseGraceMs !== undefined &&
+    (!Number.isFinite(options.selfCauseGraceMs) || options.selfCauseGraceMs < 0)
+  )
+    throw new TypeError('selfCauseGraceMs must be a non-negative finite number');
   const { clock } = ports;
   const settings = new Settings(ports.storage, options.rules);
   let running = false;
@@ -37,9 +43,10 @@ export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}
     if (stopping || epoch !== generation) throw new Error('stopped');
   };
   const expiry = new FactExpiry(clock);
+  const deliveryPort = deliveryRetry(ports.dsh, clock, () => attention);
   const attention = new RuntimeAttention(
     clock,
-    ports.dsh,
+    deliveryPort,
     () => settings.enabled(),
     schedule,
     () => allowTitles && helper.titlesEnabled(),
@@ -52,7 +59,7 @@ export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}
     schedule();
   });
   const body = new BodySource(ports.probe, ports.dsh, ports.storage, clock, attention, expiry, isPaused, changed);
-  const dsh = new DshSource(ports.dsh, clock, attention, body.tokens.bind(body), isPaused);
+  const dsh = new DshSource(deliveryPort, clock, attention, body.tokens.bind(body), isPaused, options.selfCauseGraceMs);
   const files = new FileSource(
     ports.files,
     clock,
@@ -154,28 +161,25 @@ export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}
         draft.rules = draft.rules.filter((rule) => rule.id !== id);
         draft.disabled = draft.disabled.filter((item) => item !== id);
       }),
-    pause: async (value) => {
-      const epoch = generation;
-      if (value && !paused) {
-        paused = true;
-        schedule();
-        await Promise.all([body.setPaused(true), files.refresh(), helper.stop()]);
-        check(epoch);
-      }
-      await settings.update((draft) => {
-        draft.paused = value;
-      });
-      check(epoch);
-      if (!value && paused) {
-        paused = false;
-        await body.setPaused(false);
-        check(epoch);
-        await files.refresh();
-        check(epoch);
-        helper.start(settings.sendTitles);
-        schedule();
-      }
-    },
+    pause: pauseAction(
+      settings,
+      isPaused,
+      async (value) => {
+        paused = value;
+        if (value) {
+          schedule();
+          await settleShutdown([body.setPaused(true), files.refresh(), helper.stop()]);
+        } else {
+          await body.setPaused(false);
+          check();
+          await files.refresh();
+          check();
+          helper.start(settings.sendTitles);
+          schedule();
+        }
+      },
+      check,
+    ),
     setSendTitles: async (enabled) => {
       const epoch = generation;
       const intent = ++titleIntent;
@@ -219,7 +223,7 @@ export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}
   };
   const guarded = guardActions(unguarded, () => generation, check);
   const actions = guarded.actions;
-  const tools = runtimeTools(attention, body, settings, actions, syncRules, check, () => allowTitles, changed);
+  const tools = runtimeTools(attention, body, settings, actions, files, syncRules, check, () => allowTitles, changed);
   function stop(): Promise<void> {
     if (stopping) return stopping;
     generation++;
