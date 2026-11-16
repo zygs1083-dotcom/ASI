@@ -1,0 +1,292 @@
+import { type ChildProcess, spawn, spawnSync } from 'node:child_process';
+import { access, mkdtemp, readFile, realpath } from 'node:fs/promises';
+import { createRequire } from 'node:module';
+import { tmpdir } from 'node:os';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { type Browser, chromium, expect, type Page } from '@playwright/test';
+import { setup } from './e2e-setup.ts';
+import {
+  bashCommands,
+  delay,
+  emptyResponse,
+  envFollowups,
+  envInjections,
+  envMessages,
+  events,
+  run,
+  stop,
+  waitFor,
+  webUrl,
+} from './e2e-support.ts';
+import { checkResponsive } from './e2e-ui.ts';
+
+const pkg = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+const dshRoot = process.env.DSH_ROOT;
+if (!dshRoot) throw new Error('Set DSH_ROOT to the read-only DeepSeek Harness source checkout');
+const dsh = resolve(dshRoot);
+const cli = join(dsh, 'apps/cli/src/bin.ts');
+const picker = join(dsh, 'apps/web/tests/pin-browse-picker.overlay.yml');
+await Promise.all([access(cli), access(picker)]);
+const tsx = createRequire(join(dsh, 'package.json')).resolve('tsx/esm');
+const args = ['--import', tsx, cli];
+const root = await realpath(await mkdtemp(join(tmpdir(), 'asi-sense-dsh-e2e-')));
+const home = join(root, 'home');
+const workspace = join(root, 'deepseek-harness/default-workspace');
+const counter = join(root, 'model-requests.txt');
+const budgetReady = join(root, 'budget-ready.txt');
+const services = join(root, 'service-status.json');
+const sessionRoot = join(home, 'sessions');
+const helper = join(pkg, 'lib/asi-sense-helper');
+const screenshot = join(root, 'asi-sense.png');
+const limit = process.env.ASI_E2E_NO_MODEL === '1' ? 0 : Number(process.env.ASI_E2E_MODEL_BUDGET ?? '6');
+if (!Number.isInteger(limit) || limit < 0 || limit > 6) throw new Error('Invalid E2E model request budget');
+const env = {
+  ...process.env,
+  DSH_HOME: home,
+  DSH_TELEMETRY_DISABLED: '1',
+  ASI_MAGPIE_PLACEHOLDER: 'magpie',
+  TSX_TSCONFIG_PATH: join(dsh, 'tsconfig.json'),
+};
+const fixtureFile = join(workspace, 'agent-created.txt');
+const overlay = await setup({ root, home, workspace, sessionRoot, counter, budgetReady, services, limit });
+
+function helperPids(): string[] {
+  const result = spawnSync('pgrep', ['-f', helper], { encoding: 'utf8' });
+  if (result.status !== 0 && result.status !== 1) throw new Error('pgrep failed');
+  return result.stdout.trim().split('\n').filter(Boolean);
+}
+async function count(): Promise<number> {
+  const text = await readFile(counter, 'utf8').catch(() => '');
+  return text.split('\n').filter(Boolean).length;
+}
+async function prompt(page: Page, text: string): Promise<void> {
+  await page.locator('[contenteditable="true"]').first().fill(text);
+  await page.getByRole('button', { name: 'Send message', exact: true }).first().click();
+}
+
+let server: ChildProcess | undefined;
+let browser: Browser | undefined;
+let phase = 'profile setup';
+try {
+  if (helperPids().length) throw new Error('An ASI helper from this worktree is already running');
+  await run(
+    process.execPath,
+    [...args, '--profile', 'asi-dev', '--from-default-profile', 'web', '--dump-config'],
+    workspace,
+    env,
+  );
+  await run(process.execPath, [...args, 'plugin', '--profile', 'asi-dev', 'add', pkg], workspace, env);
+  await run(
+    process.execPath,
+    [...args, 'plugin', '--profile', 'asi-dev', 'add', join(pkg, 'test/dsh/budget-plugin')],
+    workspace,
+    env,
+  );
+  phase = 'DSH startup';
+  server = spawn(
+    process.execPath,
+    [
+      ...args,
+      '--profile',
+      'asi-dev',
+      '--patch',
+      picker,
+      '--patch',
+      overlay,
+      '--no-open',
+      '--host',
+      '127.0.0.1',
+      '--port',
+      '0',
+    ],
+    { cwd: workspace, env, detached: true, stdio: ['ignore', 'pipe', 'pipe'] },
+  );
+  const url = await webUrl(server);
+  server.stdout?.resume();
+  server.stderr?.resume();
+  await waitFor(
+    async () =>
+      (await access(budgetReady).then(
+        () => true,
+        () => false,
+      )) || undefined,
+    10_000,
+    'request budget',
+  );
+  await waitFor(
+    async () => {
+      const pids = helperPids();
+      return pids.length ? pids : undefined;
+    },
+    20_000,
+    'helper startup',
+  );
+  browser = await chromium.launch({ headless: true });
+  const context = await browser.newContext({ viewport: { width: 1440, height: 900 } });
+  const chat = await context.newPage();
+  const panelPage = await context.newPage();
+  let browserErrors = 0;
+  for (const page of [chat, panelPage]) page.on('pageerror', () => browserErrors++);
+  phase = 'sidebar and privacy';
+  await chat.goto(url);
+  const notice = chat.getByRole('button', { name: 'Continue', exact: true });
+  if (
+    await notice.waitFor({ state: 'visible', timeout: 5000 }).then(
+      () => true,
+      () => false,
+    )
+  )
+    await notice.click();
+  const editor = chat.locator('[contenteditable="true"]').first();
+  if (
+    !(await editor.waitFor({ state: 'visible', timeout: 10_000 }).then(
+      () => true,
+      () => false,
+    ))
+  ) {
+    await chat.getByRole('button', { name: 'Choose workspace', exact: true }).click();
+    const addWorkspace = chat.getByRole('menuitem', { name: 'Add workspace…' });
+    if (await addWorkspace.isVisible()) await addWorkspace.click();
+    const pickerDialog = chat.getByRole('dialog', { name: 'Select Workspace Directory' });
+    await pickerDialog.getByRole('button', { name: 'Edit path' }).click();
+    const pathInput = pickerDialog.getByRole('textbox', { name: 'Edit path' });
+    await pathInput.fill(workspace);
+    await pathInput.press('Enter');
+    if (
+      !(await pathInput.waitFor({ state: 'hidden', timeout: 10_000 }).then(
+        () => true,
+        () => false,
+      ))
+    ) {
+      const alert = await pickerDialog.getByRole('alert').allTextContents();
+      throw new Error(`Workspace picker could not open the test directory: ${alert.join('; ')}`);
+    }
+    await pickerDialog.getByRole('button', { name: 'Open', exact: true }).click();
+  }
+  await expect(editor).toBeVisible();
+  await expect(chat.getByRole('button', { name: 'Send message', exact: true }).first()).toBeVisible();
+  await panelPage.goto(url);
+  const otherNotice = panelPage.getByRole('button', { name: 'Continue', exact: true });
+  if (
+    await otherNotice.waitFor({ state: 'visible', timeout: 3000 }).then(
+      () => true,
+      () => false,
+    )
+  )
+    await otherNotice.click();
+  await panelPage.getByRole('button', { name: 'Environment sense', exact: true }).first().click();
+  const panel = panelPage.getByTestId('asi-sense-panel');
+  await expect(panel.getByRole('heading', { name: '环境感知' })).toBeVisible();
+  await panel.locator('summary').filter({ hasText: '规则' }).click();
+  await expect(panel.getByLabel('窗口标题发给模型')).not.toBeChecked();
+  for (const metric of ['cpu', 'memory', 'disks']) {
+    await expect(panel.locator(`[data-tile="${metric}"]`)).toContainText(/\d/, { timeout: 25_000 });
+  }
+  if (process.env.ASI_E2E_NO_MODEL !== '1' && process.env.ASI_E2E_ONLY_BACKGROUND !== '1') {
+    phase = 'agent self-caused failure and file write';
+    await prompt(
+      chat,
+      `Use the bash tool for exactly two separate calls: run the foreground command false; then run the foreground command printf test > agent-created.txt in the session working directory. Do not call other tools or retry. When done reply READY.`,
+    );
+    await waitFor(
+      async () => {
+        const log = await events(sessionRoot);
+        const empty = emptyResponse(log);
+        if (empty !== undefined) throw new Error(`Gateway EMPTY_RESPONSE: ${empty}`);
+        const commands = bashCommands(log);
+        const fileExists = await access(fixtureFile).then(
+          () => true,
+          () => false,
+        );
+        return commands.some((command) => command.trim() === 'false') &&
+          commands.some((command) => command.includes('agent-created.txt')) &&
+          fileExists &&
+          log.some((event) => event.type === 'turn/end')
+          ? log
+          : undefined;
+      },
+      120_000,
+      'agent shell and file operations',
+    );
+    await delay(3000);
+    const first = await events(sessionRoot);
+    expect(envFollowups(first)).toHaveLength(0);
+    expect(envInjections(first)).toHaveLength(0);
+    expect(envMessages(first)).toHaveLength(0);
+    const failedShell = panel
+      .locator('li[data-level]')
+      .filter({ hasText: 'false' })
+      .filter({ hasText: 'self-caused' })
+      .filter({ hasText: 'Agent 自己引起' });
+    await expect(failedShell.first()).toHaveCount(1, { timeout: 10_000 });
+    await expect(
+      panel
+        .locator('li[data-level]')
+        .filter({ hasText: 'agent-created.txt' })
+        .filter({ hasText: 'self-caused' })
+        .filter({ hasText: 'Agent 自己引起' })
+        .first(),
+    ).toHaveCount(1, { timeout: 10_000 });
+  }
+  if (process.env.ASI_E2E_NO_MODEL !== '1' && process.env.ASI_E2E_ONLY_SELF !== '1') {
+    const baseline = envMessages(await events(sessionRoot)).length;
+    phase = 'background failure wake';
+    await prompt(
+      chat,
+      'Use the bash tool once with command `sleep 20; exit 1` and run_in_background set to true. Do not wait for it or call other tools. Reply READY immediately. When an environment update arrives, reply ACK without calling any tools.',
+    );
+    const log = await waitFor(
+      async () => {
+        const current = await events(sessionRoot);
+        return envMessages(current).length && envFollowups(current).length ? current : undefined;
+      },
+      120_000,
+      'environment follow-up',
+    );
+    expect(bashCommands(log).some((command) => command.includes('sleep 20') && command.includes('exit 1'))).toBe(true);
+    expect(envMessages(log)).toHaveLength(baseline + 1);
+    expect(envFollowups(log)).toHaveLength(1);
+    await delay(4000);
+    const final = await events(sessionRoot);
+    expect(envMessages(final)).toHaveLength(baseline + 1);
+    expect(envFollowups(final)).toHaveLength(1);
+    await expect(panel.locator('[data-tile="tokens"]')).toContainText(/\d/, { timeout: 20_000 });
+  }
+  await panel.getByRole('heading', { name: '环境感知' }).scrollIntoViewIfNeeded();
+  const boxes = await Promise.all(
+    ['cpu', 'memory', 'disks', 'tokens'].map((metric) => panel.locator(`[data-tile="${metric}"]`).boundingBox()),
+  );
+  if (boxes.some((box) => box === null)) throw new Error('Metric card geometry is unavailable');
+  const bottom = Math.ceil(Math.max(...boxes.map((box) => (box ? box.y + box.height : 0))) + 8);
+  if (bottom > 900) throw new Error('Metric cards do not fit in the screenshot viewport');
+  await panelPage.screenshot({ path: screenshot, clip: { x: 0, y: 0, width: 1440, height: bottom } });
+  await checkResponsive(panelPage, panel, join(root, 'asi-sense-mobile.png'));
+  expect(browserErrors).toBe(0);
+  expect(await count()).toBeLessThanOrEqual(limit);
+  console.log(`Model request upper bound: ${await count()}/${limit}`);
+  console.log(`Privacy-safe screenshot: ${screenshot}`);
+  console.log(`Durable test profile: ${root}`);
+} catch (error) {
+  console.error(
+    `DSH e2e failed during ${phase}; model request upper bound ${await count()}/${limit}; artifacts ${root}`,
+  );
+  const serviceStatus = await readFile(services, 'utf8').catch(() => '');
+  if (serviceStatus) console.error(`DSH services: ${serviceStatus}`);
+  throw error;
+} finally {
+  const cleanup = await Promise.allSettled([
+    browser?.close() ?? Promise.resolve(),
+    server ? stop(server) : Promise.resolve(),
+  ]);
+  if (cleanup.some((result) => result.status === 'rejected')) {
+    console.error('DSH or browser cleanup failed');
+    process.exitCode = 1;
+  }
+  const remaining = helperPids();
+  console.log(`pgrep owned helper after stop: ${remaining.length ? remaining.join(' ') : '(none)'}`);
+  if (remaining.length) {
+    console.error('Owned helper process remained after DSH shutdown');
+    process.exitCode = 1;
+  }
+}

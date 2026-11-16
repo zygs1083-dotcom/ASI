@@ -31,13 +31,42 @@ interface JobView {
   id: string;
   kind: string;
   label: string;
+  owner?: string;
   status: string;
   detail?: string;
   startedAt: number;
   finishedAt?: number;
 }
 
-export function mapJobEvent(event: { type: string; job: JobView; awaited?: boolean }): JobEvent | undefined {
+interface RegistryJobEvent {
+  type: string;
+  job: JobView;
+  awaited?: boolean;
+}
+
+export interface ActiveTool {
+  sessionId: string;
+  name: string;
+  cwd?: string;
+  command?: string;
+  jobId?: string;
+  waitsForJob?: boolean;
+}
+
+export function awaitedJobCwd(event: RegistryJobEvent, tools: Iterable<ActiveTool>): string | undefined {
+  if (event.type !== 'settled' || !event.awaited || !event.job.owner) return undefined;
+  for (const tool of tools) {
+    if (tool.sessionId !== event.job.owner || !tool.cwd) continue;
+    if (
+      (tool.name === 'bash' && event.job.kind === 'bash' && tool.command === event.job.label) ||
+      (tool.name === 'job_output' && tool.waitsForJob && tool.jobId === event.job.id)
+    )
+      return tool.cwd;
+  }
+  return undefined;
+}
+
+export function mapJobEvent(event: RegistryJobEvent, cwd?: string): JobEvent | undefined {
   const { job } = event;
   if (event.type === 'registered') return { type: 'started', id: job.id, command: job.label, at: job.startedAt };
   if (event.type !== 'settled') return undefined;
@@ -49,7 +78,34 @@ export function mapJobEvent(event: { type: string; job: JobView; awaited?: boole
     type: 'exited',
     id: job.id,
     command: job.label,
+    ...(cwd !== undefined ? { cwd } : {}),
     ...(job.finishedAt !== undefined ? { at: job.finishedAt } : {}),
     ...(match ? { exitCode: Number(match[1]) } : {}),
   };
+}
+
+export class JobEventCorrelator {
+  private readonly origins = new Map<string, string>();
+
+  constructor(private readonly tools: ReadonlyMap<string, ActiveTool>) {}
+
+  map(event: RegistryJobEvent): JobEvent | undefined {
+    if (event.type === 'registered' && event.job.kind === 'bash' && event.job.owner) {
+      const matches = [...this.tools].filter(
+        ([, tool]) => tool.sessionId === event.job.owner && tool.name === 'bash' && tool.command === event.job.label,
+      );
+      if (matches.length === 1) this.origins.set(event.job.id, matches[0][0]);
+    }
+    const origin = this.origins.get(event.job.id);
+    const eligible = [...this.tools]
+      .filter(([key, tool]) => tool.name !== 'bash' || key === origin)
+      .map(([, tool]) => tool);
+    const result = mapJobEvent(event, awaitedJobCwd(event, eligible));
+    if (event.type === 'settled' || event.type === 'removed') this.origins.delete(event.job.id);
+    return result;
+  }
+
+  clear(): void {
+    this.origins.clear();
+  }
 }

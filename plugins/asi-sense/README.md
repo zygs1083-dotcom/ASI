@@ -133,6 +133,28 @@ owns the concrete ports declared in `runtime/ports.ts`:
   drive runtime scheduling, merge windows and helper retries. The probe and
   body persistence retain their own internal sampling/save timers.
 
+The DSH adapter implements `storage` with its own `FileStoragePort`, not
+`storageDomain`: it writes and syncs a temporary file, atomically renames it,
+then attempts to sync the containing directory. Failures before rename reject
+and clean up the temporary file; a directory-sync failure after rename is
+logged without rejecting the already-installed snapshot. DSH's
+`storage-json/src/atomic.ts` instead propagates directory-sync failures after
+rename, so its rejection does not imply that the old snapshot is still installed.
+
+`env_detail` returns local structured facts and source status without invoking
+computer-use or reading window contents. The current runtime projection does
+not expose the foreground PID or window count, so those fields are explicitly
+reported as unknown.
+
+To run the isolated real-DSH check, set `DSH_ROOT` to a read-only DSH checkout
+and run `pnpm --filter asi-sense e2e:dsh`. The fixture uses a private temporary
+profile, disables title sharing and caps model requests at six per run.
+Set `ASI_E2E_NO_MODEL=1` for the sidebar, responsive layout and cleanup checks
+without model requests. On macOS, a delayed filesystem notification for an
+agent's own file write can arrive after the tool window closes and cause an
+unintended wake; this remains a known limitation pending the separate
+filesystem-timestamp and trailing-grace repair.
+
 `start()` restores before starting sources and may be called once. `stop()`
 closes subscriptions, watchers, probe, helper and timers, then waits for
 pending body/settings saves; it rejects on a shutdown timeout (950 ms) or
@@ -277,7 +299,7 @@ The host owns local access control and **atomic temp-file + rename writes**.
 snapshot was not installed; rename must be the last step that can reject.
 Report any post-rename directory fsync or
 other errors separately, never by rejecting `save`.
-M3 will connect the port to DSH `storageDomain`. Pass the port to the monitor
+Pass the plugin-owned file port to the monitor
 for one versioned snapshot containing baseline, installation time, zone,
 latches, tuner values, locks, audits, quota windows and ID lineage. Do not
 also configure a separate tuner store when the monitor owns the combined one.

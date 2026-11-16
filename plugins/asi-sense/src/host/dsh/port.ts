@@ -10,13 +10,15 @@ import type {} from '@deepseek-ai/dsh-token-meter';
 import type { ToolExecution } from '@deepseek-ai/dsh-tools';
 import type { DshPort, ToolEvent } from '../runtime/ports.ts';
 import { createDelivery } from './deliver.ts';
-import { mapJobEvent, mapToolEvent } from './events.ts';
+import { type ActiveTool, JobEventCorrelator, mapToolEvent } from './events.ts';
 import { tokenSnapshot } from './tokens.ts';
 
 const open = promisify(execFile);
 
 export function createDshPort(ctx: Context, sendTitles: () => boolean): DshPort {
   const resolve = (id: string): Agent | undefined => ctx.agents.get(SessionId(id));
+  const activeTools = new Map<string, ActiveTool>();
+  const jobs = new JobEventCorrelator(activeTools);
   const deliver = createDelivery(resolve, sendTitles);
   const warn = () => ctx.logger.warn('asi-sense event delivery failed');
   const call = <T>(cb: (event: T) => Promise<void>, event: T): void => {
@@ -77,6 +79,19 @@ export function createDshPort(ctx: Context, sendTitles: () => boolean): DshPort 
       const offPre = ctx.on('tools/pre-execute', async (exec, next) => {
         const event = tool('pre-execute', exec);
         if (event) {
+          const args = exec.arguments;
+          activeTools.set(`${event.sessionId}:${event.toolCallId}`, {
+            sessionId: event.sessionId,
+            name: exec.name,
+            cwd: event.cwd,
+            command: event.command,
+            ...(typeof args === 'object' && args !== null && 'id' in args && typeof args.id === 'string'
+              ? { jobId: args.id }
+              : {}),
+            ...(typeof args === 'object' && args !== null && 'wait' in args && args.wait === true
+              ? { waitsForJob: true }
+              : {}),
+          });
           try {
             await cb(event);
           } catch {
@@ -87,19 +102,27 @@ export function createDshPort(ctx: Context, sendTitles: () => boolean): DshPort 
       });
       const offResult = ctx.on('tools/result', (exec, result) => {
         const event = tool('post-execute', exec, result.value);
-        if (event) call(cb, event);
+        if (event) {
+          activeTools.delete(`${event.sessionId}:${event.toolCallId}`);
+          call(cb, event);
+        }
       });
       return () => {
         offPre();
         offResult();
+        activeTools.clear();
       };
     },
     onJob(cb) {
-      return ctx.jobs.events.subscribe({ owners: 'all' }, (event) => {
+      const off = ctx.jobs.events.subscribe({ owners: 'all' }, (event) => {
         if (event.type === 'output') return;
-        const mapped = mapJobEvent(event);
+        const mapped = jobs.map(event);
         if (mapped) call(cb, mapped);
       });
+      return () => {
+        off();
+        jobs.clear();
+      };
     },
     deliver,
     async tokenSnapshot(sessionId) {

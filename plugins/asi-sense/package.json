@@ -96,6 +96,7 @@
   "scripts": {
     "build": "pnpm run typecheck && node scripts/build.mjs",
     "check": "pnpm run typecheck && pnpm exec biome check . && pnpm test",
+    "e2e:dsh": "pnpm run build && tsx scripts/e2e-dsh.ts",
     "generate": "node scripts/generate-typert.mjs",
     "typecheck": "pnpm run generate && tsc -p tsconfig.json",
     "test": "vitest run",
