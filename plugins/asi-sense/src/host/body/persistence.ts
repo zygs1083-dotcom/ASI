@@ -9,7 +9,23 @@
 export interface BodyPersistence {
   load(): Promise<string | undefined>;
   save(data: string): Promise<void>;
-  onRestoreFailure?(): Promise<void>;
+  onRestoreFailure?(): Promise<BackupNotice | undefined>;
+  onBackupError?(code: string): void;
+}
+
+export interface BackupNotice {
+  kind: 'corrupt' | 'unknown-version';
+  fileName: string;
+}
+
+export function validBackupNotice(value: unknown): value is BackupNotice {
+  if (!value || typeof value !== 'object') return false;
+  const notice = value as Record<string, unknown>;
+  return (
+    (notice.kind === 'corrupt' || notice.kind === 'unknown-version') &&
+    typeof notice.fileName === 'string' &&
+    /^body\.json\.bak-[a-z0-9-]{1,100}$/i.test(notice.fileName)
+  );
 }
 
 /**

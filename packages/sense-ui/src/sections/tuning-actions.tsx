@@ -6,7 +6,62 @@ import css from './rules.module.css'
 
 type Suggestion = NonNullable<TuningState['suggestions']>[number]
 
-function ConfirmAction({ label, confirmLabel, message, onConfirm, describedBy, operation, onOpen, onClose }: {
+export const defaultTuningCopy: NonNullable<SensePanelProps['tuningCopy']> = {
+  backupFailed: '调参数据无法备份：',
+  saveFailed: '无法保存调参恢复状态：',
+  permission: '权限不足',
+  noSpace: '磁盘空间不足',
+  readOnly: '文件系统只读',
+  snapshotChanged: '原始数据已变化',
+  backupUnavailable: '备份功能不可用',
+  unknown: '未知原因',
+  retry: '重试',
+  reset: '重置调参',
+  backupCorrupt: '已将损坏的调参数据备份为 ',
+  backupUnknown: '已将无法识别版本的调参数据备份为 ',
+  restored: '，已恢复默认',
+  dismissBackup: '关闭备份提示',
+  restoreUnknown: '保存的调参数据版本无法识别，AI 调参已停用',
+  restoreCorrupt: '保存的调参数据损坏，AI 调参已停用',
+  confirmReset: '确认重置',
+  cancel: '取消',
+  resetMessage: '将丢弃已保存的调参、锁定和调整记录，所有参数恢复默认值，基线重新学习',
+  processing: '处理中',
+  actionFailed: '失败，请重试',
+  actionUnconfirmed: '：未确认结果，请检查状态',
+}
+
+export function TuningBackupStatus({ model, onRetryTuningBackup, onDismissTuningBackup, tuningCopy, operations }: Pick<
+  SensePanelProps, 'model' | 'onRetryTuningBackup' | 'onDismissTuningBackup' | 'tuningCopy'
+> & { operations: TuningOperations }) {
+  const copy = tuningCopy ?? defaultTuningCopy
+  const error = model.tuning?.backupError
+  const notice = model.tuning?.backupNotice
+  const retry = operations.operations['retry-backup']
+  const dismiss = operations.operations['dismiss-backup']
+  const busy = (operation?: { phase: string }) => operation?.phase === 'pending' || operation?.phase === 'waiting'
+  const reason = error && (
+    ['EACCES', 'EPERM'].includes(error.code) ? copy.permission :
+      error.code === 'ENOSPC' ? copy.noSpace :
+        error.code === 'EROFS' ? copy.readOnly :
+          ['SNAPSHOT_CHANGED', 'SNAPSHOT_MISSING'].includes(error.code) ? copy.snapshotChanged :
+            error.code === 'BACKUP_UNAVAILABLE' ? copy.backupUnavailable : copy.unknown
+  )
+  return (
+    <>
+      {error && <div className={css.notice} role="status">
+        <span className={css.backupText}>{error.stage === 'backup' ? copy.backupFailed : copy.saveFailed}{reason}{error.code !== 'unknown' ? ` (${error.code})` : ''}</span>
+        <button type="button" disabled={!onRetryTuningBackup || busy(retry)} onClick={() => onRetryTuningBackup && operations.run('retry-backup', onRetryTuningBackup, copy.retry)}>{copy.retry}</button>
+      </div>}
+      {notice && <div className={css.notice} role="status">
+        <span className={css.backupText}>{notice.kind === 'corrupt' ? copy.backupCorrupt : copy.backupUnknown}{notice.fileName}{copy.restored}</span>
+        <button type="button" disabled={!onDismissTuningBackup || busy(dismiss)} onClick={() => onDismissTuningBackup && operations.run('dismiss-backup', onDismissTuningBackup, copy.dismissBackup)}>{copy.dismissBackup}</button>
+      </div>}
+    </>
+  )
+}
+
+function ConfirmAction({ label, confirmLabel, message, onConfirm, describedBy, operation, onOpen, onClose, cancelLabel = '取消', processing = '处理中' }: {
   label: string
   confirmLabel: string
   message: string
@@ -15,6 +70,8 @@ function ConfirmAction({ label, confirmLabel, message, onConfirm, describedBy, o
   operation?: { phase: 'pending' | 'waiting' | 'error' | 'unconfirmed' }
   onOpen?: () => void
   onClose?: () => void
+  cancelLabel?: string
+  processing?: string
 }) {
   const [open, setOpen] = useState(false)
   const messageId = useId()
@@ -35,7 +92,7 @@ function ConfirmAction({ label, confirmLabel, message, onConfirm, describedBy, o
         if (open) cancel.current?.focus()
         else { setOpen(true); onOpen?.() }
       }}>
-        {busy ? `${label} · 处理中` : label}
+        {busy ? `${label} · ${processing}` : label}
       </button>
       {open && (
         <div className={css.confirmation} role="alertdialog" aria-label={label} aria-describedby={messageId}>
@@ -44,7 +101,7 @@ function ConfirmAction({ label, confirmLabel, message, onConfirm, describedBy, o
             <button type="button" aria-describedby={[describedBy, messageId].filter(Boolean).join(' ')} onClick={() => { close(); onConfirm() }}>
               {confirmLabel}
             </button>
-            <button ref={cancel} type="button" aria-describedby={[describedBy, messageId].filter(Boolean).join(' ')} onClick={close}>取消</button>
+            <button ref={cancel} type="button" aria-describedby={[describedBy, messageId].filter(Boolean).join(' ')} onClick={close}>{cancelLabel}</button>
           </div>
         </div>
       )}
@@ -52,12 +109,13 @@ function ConfirmAction({ label, confirmLabel, message, onConfirm, describedBy, o
   )
 }
 
-export function TuningDisabled({ model, onResumeTuning, onResetTuning, operations }: Pick<
-  SensePanelProps, 'model' | 'onResumeTuning' | 'onResetTuning'
+export function TuningDisabled({ model, onResumeTuning, onResetTuning, tuningCopy, operations }: Pick<
+  SensePanelProps, 'model' | 'onResumeTuning' | 'onResetTuning' | 'tuningCopy'
 > & { operations: TuningOperations }) {
   const reason = model.tuning?.disabled?.reason
   const resume = operations.operations.resume
   const busy = resume?.phase === 'pending' || resume?.phase === 'waiting'
+  const copy = tuningCopy ?? defaultTuningCopy
   if (!reason) return null
   return (
     <div className={css.notice} role="status">
@@ -70,14 +128,16 @@ export function TuningDisabled({ model, onResumeTuning, onResetTuning, operation
         </>
       ) : (
         <>
-          <span>保存的调参数据损坏，AI 调参已停用</span>
-          <ConfirmAction
-            label="重置调参"
-            confirmLabel="确认重置"
-            message="将丢弃已保存的调参、锁定和调整记录，所有参数恢复默认值，基线重新学习"
+          {!model.tuning?.backupError && <span>{(model.tuning?.restoreKind ?? model.tuning?.backupNotice?.kind) === 'unknown-version' ? copy.restoreUnknown : copy.restoreCorrupt}</span>}
+          {model.tuning?.backupError ? <button type="button" disabled>{copy.reset}</button> : <ConfirmAction
+            label={copy.reset}
+            confirmLabel={copy.confirmReset}
+            message={copy.resetMessage}
+            cancelLabel={copy.cancel}
+            processing={copy.processing}
             operation={operations.operations.reset}
-            onConfirm={() => operations.run('reset', onResetTuning, '重置调参')}
-          />
+            onConfirm={() => operations.run('reset', onResetTuning, copy.reset)}
+          />}
         </>
       )}
     </div>

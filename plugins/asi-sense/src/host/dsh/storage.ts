@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 import type { StoragePort } from '../runtime/ports.ts';
 
 interface StorageFile {
@@ -29,6 +29,7 @@ export class FileStoragePort implements StoragePort {
     private readonly fs: StorageFileSystem,
     private readonly warn: () => void,
     private readonly backupNotice: () => void = () => {},
+    readonly reportBackupFailure: (code: string) => void = () => {},
   ) {}
 
   private path(key: string): string {
@@ -53,11 +54,13 @@ export class FileStoragePort implements StoragePort {
     return write;
   }
 
-  backup(key: string, original: string): Promise<void> {
+  backup(key: string, original: string): Promise<string> {
     const write = this.tail.then(async () => {
       const target = this.path(key);
       const bytes = await this.fs.readFile(target);
-      if (Buffer.from(bytes).toString('utf8') !== original) throw new Error('storage snapshot changed before backup');
+      if (Buffer.from(bytes).toString('utf8') !== original) {
+        throw Object.assign(new Error('storage snapshot changed before backup'), { code: 'SNAPSHOT_CHANGED' });
+      }
       const path = `${target}.bak-${Date.now()}-${randomUUID()}`;
       let handle: StorageFile | undefined;
       let created = false;
@@ -79,12 +82,16 @@ export class FileStoragePort implements StoragePort {
         await Promise.resolve()
           .then(() => this.backupNotice())
           .catch(() => undefined);
+        return basename(path);
       } finally {
         if (handle) await handle.close().catch(() => {});
         if (created && !complete) await this.fs.unlink(path).catch(() => {});
       }
     });
-    this.tail = write.catch(() => undefined);
+    this.tail = write.then(
+      () => undefined,
+      () => undefined,
+    );
     return write;
   }
 

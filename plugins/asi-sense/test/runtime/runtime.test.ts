@@ -1411,7 +1411,7 @@ describe('host runtime', () => {
         await h.advance(60_000);
         await h.sample(disk(88 - 3 * minute));
       }
-      expect(h.runtime.events().filter((event) => event.subject === 'rate:disk-eta:disk:/fixture')).toHaveLength(0);
+      expect(h.runtime.events().filter((event) => event.subject === 'rate:disk-drop:disk:/fixture')).toHaveLength(1);
       await h.advance(60_000);
       await h.sample(disk(55));
       await h.agent({ type: 'pre-step', sessionId: 's' });
@@ -1419,14 +1419,14 @@ describe('host runtime', () => {
         expect.objectContaining({
           level: 'context',
           signal: expect.objectContaining({
-            subject: 'rate:disk-eta:disk:/fixture',
+            subject: 'rate:disk-drop:disk:/fixture',
             data: expect.objectContaining({ timeToFloorMs: 600_000 }),
           }),
         }),
       );
       await h.advance(60_000);
       await h.sample(disk(52));
-      expect(h.runtime.events().filter((event) => event.subject === 'rate:disk-eta:disk:/fixture')).toHaveLength(1);
+      expect(h.runtime.events().filter((event) => event.subject === 'rate:disk-drop:disk:/fixture')).toHaveLength(2);
       await h.runtime.stop();
     },
   );
@@ -1453,13 +1453,18 @@ describe('host runtime', () => {
     for (let minute = 1; minute <= 11; minute++) {
       await h.advance(60_000);
       await sample(minute);
+      if (minute === 1) {
+        expect(h.runtime.events().find((event) => event.subject === 'rate:context-eta')).toMatchObject({
+          level: 'record',
+        });
+      }
     }
     await h.agent({ type: 'pre-step', sessionId: 's' });
     expect(h.delivered.flatMap((intent) => intent.update.changes)).toContainEqual(
       expect.objectContaining({
         level: 'context',
         signal: expect.objectContaining({
-          subject: 'rate:context-critical-eta',
+          subject: 'rate:context-eta',
           data: expect.objectContaining({ timeToFloorMs: 600_000 }),
         }),
       }),
@@ -1504,6 +1509,129 @@ describe('host runtime', () => {
       await h.runtime.stop();
     },
   );
+
+  it.each(['context', 'wake'] as const)(
+    'routes the single ten-minute context ETA warning through a custom %s rule',
+    async (level) => {
+      const h = harness(undefined, {
+        rules: [
+          ...DEFAULT_RULES,
+          ...defaultBodyRules(),
+          {
+            id: 'custom-context-eta',
+            match: { kind: 'body.rate', where: { ruleId: 'context-eta' } },
+            level,
+            createdBy: 'user',
+            approved: true,
+          },
+        ],
+      });
+      await h.runtime.start();
+      await h.runtime.actions.toggleRule('body-rate-warn', false);
+      await h.agent({ type: 'created', sessionId: 's' });
+      const sample = async (minute: number) => {
+        h.token({
+          contextWindow: 25_000,
+          contextUsed: 4_000 + 1_000 * minute,
+          contextWindowSource: 'configured',
+          sessionUsage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        });
+        await h.agent({ type: 'pre-step', sessionId: 's' });
+        await h.sample();
+        await h.agent({ type: 'post-step', sessionId: 's' });
+      };
+      await sample(0);
+      for (let minute = 1; minute <= 11; minute++) {
+        await h.advance(60_000);
+        await sample(minute);
+      }
+      await h.advance(2_000);
+      await h.agent({ type: 'pre-step', sessionId: 's' });
+      const warnings = h.runtime
+        .events()
+        .filter((event) => event.kind === 'body.rate' && event.subject.includes('context'));
+      expect(warnings).toHaveLength(1);
+      expect(warnings[0]).toMatchObject({ subject: 'rate:context-eta', level, ruleId: 'custom-context-eta' });
+      const changes = h.delivered
+        .flatMap((intent) => intent.update.changes)
+        .filter((change) => change.signal.kind === 'body.rate' && change.signal.subject.includes('context'));
+      expect(changes).toHaveLength(1);
+      expect(changes[0]).toMatchObject({ level, signal: { data: { ruleId: 'context-eta', timeToFloorMs: 600_000 } } });
+      await h.runtime.stop();
+    },
+  );
+
+  it.each(['context', 'wake'] as const)(
+    'routes the hard context boundary to a custom %s rule after an earlier tuned alert',
+    async (level) => {
+      const h = harness(undefined, {
+        rules: [
+          ...DEFAULT_RULES,
+          ...defaultBodyRules(),
+          {
+            id: 'custom-hard-context',
+            match: { kind: 'body.rate', where: { ruleId: 'context-eta', timeToFloorMs: { '<=': 600_000 } } },
+            level,
+            createdBy: 'user',
+            approved: true,
+          },
+        ],
+      });
+      await h.runtime.start();
+      await h.runtime.tools.bodyTune({ param: 'rate.context.maxEtaMs', to: 900_000 });
+      await h.runtime.tools.bodyTune({ param: 'rate.context.maxEtaMs', to: 1_200_000 });
+      await h.runtime.actions.toggleRule('body-rate-warn', false);
+      await h.agent({ type: 'created', sessionId: 's' });
+      for (let minute = 0; minute <= 11; minute++) {
+        if (minute) await h.advance(60_000);
+        h.token({
+          contextWindow: 25_000,
+          contextUsed: 4_000 + 1_000 * minute,
+          contextWindowSource: 'configured',
+          sessionUsage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        });
+        await h.agent({ type: 'pre-step', sessionId: 's' });
+        await h.sample();
+        await h.agent({ type: 'post-step', sessionId: 's' });
+      }
+      await h.advance(2_000);
+      await h.agent({ type: 'pre-step', sessionId: 's' });
+      const hardEvents = h.runtime
+        .events()
+        .filter((event) => event.kind === 'body.rate' && event.detail?.timeToFloorMs === 600_000);
+      expect(hardEvents).toHaveLength(1);
+      expect(hardEvents[0]).toMatchObject({ subject: 'rate:context-eta', ruleId: 'custom-hard-context', level });
+      const hardChanges = h.delivered
+        .flatMap((intent) => intent.update.changes)
+        .filter((change) => change.signal.data.timeToFloorMs === 600_000 && change.signal.kind === 'body.rate');
+      expect(hardChanges).toHaveLength(1);
+      expect(hardChanges[0]).toMatchObject({ level, signal: { data: { ruleId: 'context-eta' } } });
+      await h.runtime.stop();
+    },
+  );
+
+  it('emits one disk warning when the rate and ten-minute ETA thresholds coincide', async () => {
+    const h = harness();
+    await h.runtime.start();
+    await h.agent({ type: 'created', sessionId: 's' });
+    await h.agent({ type: 'pre-step', sessionId: 's' });
+    const gib = 1024 ** 3;
+    const disk = (free: number) =>
+      mkBody({
+        disks: {
+          ...diskFact([{ mount: '/fixture', total: 500 * gib, free: free * gib, observedAt: Date.now() }]),
+          observedAt: Date.now(),
+        },
+      });
+    await h.sample(disk(33));
+    await h.advance(60_000);
+    await h.sample(disk(30));
+    await h.agent({ type: 'pre-step', sessionId: 's' });
+    const warnings = h.runtime.events().filter((event) => event.kind === 'body.rate' && event.subject.includes('disk'));
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0].subject).toBe('rate:disk-drop:disk:/fixture');
+    await h.runtime.stop();
+  });
 
   it('applies, guards and reverts merge windows and delivery levels', async () => {
     const h = harness();
@@ -1768,6 +1896,8 @@ describe('host runtime', () => {
   it('never overwrites an unrecognized snapshot when its backup fails', async () => {
     let saved = '{"version":99}';
     const original = saved;
+    let failed = true;
+    const report = vi.fn();
     const h = harness();
     Object.assign(h.ports.storage, {
       load: async (key: string) => (key === 'body' ? saved : undefined),
@@ -1775,14 +1905,173 @@ describe('host runtime', () => {
         if (key === 'body') saved = value;
       },
       backup: async () => {
-        throw new Error('backup failed');
+        if (failed) throw Object.assign(new Error('private path'), { code: 'ENOSPC' });
+        expect(saved).toBe(original);
+        return 'body.json.bak-fixture';
+      },
+      reportBackupFailure: report,
+    });
+    await h.runtime.start();
+    const presenter = createPresenter(h.runtime, { clock: h.ports.clock });
+    expect(h.runtime.body.tuner.tuningDisabled).toBe('restore-failed');
+    expect(presenter.snapshot().tuning.backupError).toEqual({ code: 'ENOSPC', stage: 'backup' });
+    expect(report).toHaveBeenCalledWith('ENOSPC');
+    await expect(h.runtime.actions.resetTuning()).rejects.toThrow();
+    await expect(h.runtime.actions.retryTuningBackup()).rejects.toThrow();
+    expect(saved).toBe(original);
+    failed = false;
+    await h.runtime.actions.retryTuningBackup();
+    expect(presenter.snapshot().tuning.backupError).toBeUndefined();
+    expect(presenter.snapshot().tuning.backupNotice).toEqual({
+      kind: 'unknown-version',
+      fileName: 'body.json.bak-fixture',
+    });
+    await h.runtime.actions.resetTuning();
+    presenter.close();
+    await h.runtime.stop();
+    expect(saved).not.toBe(original);
+  });
+
+  it.each([
+    ['corrupt', '{broken'],
+    ['unknown-version', '{"version":99}'],
+  ] as const)('keeps the %s backup notice until acknowledged across restarts', async (kind, original) => {
+    const root = await fs.mkdtemp(join(tmpdir(), 'asi-tuning-notice-'));
+    try {
+      const storage = new FileStoragePort(root, fs, () => {});
+      await storage.save('body', original);
+      const create = async () => {
+        const h = harness();
+        Object.assign(h.ports.storage, {
+          load: storage.load.bind(storage),
+          save: storage.save.bind(storage),
+          backup: storage.backup.bind(storage),
+        });
+        await h.runtime.start();
+        const presenter = createPresenter(h.runtime, { clock: h.ports.clock });
+        return { h, presenter };
+      };
+      const first = await create();
+      const notice = first.presenter.snapshot().tuning.backupNotice;
+      expect(notice).toEqual({ kind, fileName: expect.stringMatching(/^body\.json\.bak-/) });
+      if (!notice) throw new Error('missing backup notice');
+      expect(notice?.fileName).not.toContain('/');
+      expect(await fs.readFile(join(root, notice.fileName), 'utf8')).toBe(original);
+      first.presenter.close();
+      await first.h.runtime.stop();
+      const second = await create();
+      expect(second.presenter.snapshot().tuning.backupNotice).toEqual(notice);
+      await second.h.runtime.actions.dismissTuningBackup();
+      expect(second.presenter.snapshot().tuning.backupNotice).toBeUndefined();
+      expect(second.presenter.snapshot().tuning.restoreKind).toBe(kind);
+      second.presenter.close();
+      await second.h.runtime.stop();
+      const third = await create();
+      expect(third.presenter.snapshot().tuning.backupNotice).toBeUndefined();
+      expect(third.presenter.snapshot().tuning.restoreKind).toBe(kind);
+      third.presenter.close();
+      await third.h.runtime.stop();
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('blocks reset while a backup retry is pending and preserves the original until backup completes', async () => {
+    let saved = '{"version":99}';
+    let allow = false;
+    let finish!: () => void;
+    const h = harness();
+    Object.assign(h.ports.storage, {
+      load: async (key: string) => (key === 'body' ? saved : undefined),
+      save: async (key: string, value: string) => {
+        if (key === 'body') saved = value;
+      },
+      backup: async () => {
+        if (!allow) throw Object.assign(new Error('fixture'), { code: 'EACCES' });
+        await new Promise<void>((resolve) => {
+          finish = resolve;
+        });
+        expect(saved).toBe('{"version":99}');
+        return 'body.json.bak-fixture';
       },
     });
     await h.runtime.start();
-    expect(h.runtime.body.tuner.tuningDisabled).toBe('restore-failed');
+    allow = true;
+    const retry = h.runtime.actions.retryTuningBackup();
+    await vi.waitFor(() => expect(finish).toBeDefined());
     await expect(h.runtime.actions.resetTuning()).rejects.toThrow();
+    expect(saved).toBe('{"version":99}');
+    finish();
+    await retry;
+    await h.runtime.actions.resetTuning();
     await h.runtime.stop();
-    expect(saved).toBe(original);
+  });
+
+  it('stays disabled if the original disappears before a backup retry', async () => {
+    let saved: string | undefined = '{"version":99}';
+    const h = harness();
+    Object.assign(h.ports.storage, {
+      load: async (key: string) => (key === 'body' ? saved : undefined),
+      save: async (key: string, value: string) => {
+        if (key === 'body') saved = value;
+      },
+      backup: async () => {
+        throw Object.assign(new Error('fixture'), { code: 'EACCES' });
+      },
+    });
+    await h.runtime.start();
+    saved = undefined;
+    await expect(h.runtime.actions.retryTuningBackup()).rejects.toThrow();
+    expect(h.runtime.body.monitor.backupError).toEqual({ code: 'SNAPSHOT_MISSING', stage: 'backup' });
+    await expect(h.runtime.actions.resetTuning()).rejects.toThrow();
+    expect(saved).toBeUndefined();
+    await h.runtime.stop();
+  });
+
+  it('does not overwrite a replacement that appeared during backup', async () => {
+    let saved = '{"version":99}';
+    const backedUp: string[] = [];
+    const h = harness();
+    Object.assign(h.ports.storage, {
+      load: async (key: string) => (key === 'body' ? saved : undefined),
+      save: async (key: string, value: string) => {
+        if (key === 'body') saved = value;
+      },
+      backup: async (_key: string, original: string) => {
+        backedUp.push(original);
+        if (backedUp.length === 1) saved = '{"version":98}';
+        return 'body.json.bak-fixture';
+      },
+    });
+    await h.runtime.start();
+    expect(saved).toBe('{"version":98}');
+    expect(h.runtime.body.monitor.backupError).toEqual({ code: 'SNAPSHOT_CHANGED', stage: 'backup' });
+    await expect(h.runtime.actions.resetTuning()).rejects.toThrow();
+    await h.runtime.actions.retryTuningBackup();
+    expect(backedUp).toEqual(['{"version":99}', '{"version":98}']);
+    await h.runtime.stop();
+  });
+
+  it('does not lose a backup notice when acknowledging it fails', async () => {
+    let saved = '{"version":99}';
+    let failSave = false;
+    const h = harness();
+    Object.assign(h.ports.storage, {
+      load: async (key: string) => (key === 'body' ? saved : undefined),
+      save: async (key: string, value: string) => {
+        if (key === 'body' && failSave) throw new Error('fixture');
+        if (key === 'body') saved = value;
+      },
+      backup: async () => 'body.json.bak-fixture',
+    });
+    await h.runtime.start();
+    failSave = true;
+    await expect(h.runtime.actions.dismissTuningBackup()).rejects.toThrow();
+    expect(h.runtime.body.monitor.backupNotice).toEqual({ kind: 'unknown-version', fileName: 'body.json.bak-fixture' });
+    expect(JSON.parse(saved).backupNotice.fileName).toBe('body.json.bak-fixture');
+    failSave = false;
+    await h.runtime.actions.dismissTuningBackup();
+    await h.runtime.stop();
   });
 
   it('fails closed for incomplete legacy and partially migrated tuning snapshots', async () => {

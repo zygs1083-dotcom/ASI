@@ -3,6 +3,7 @@ import { act, cleanup, fireEvent, render, renderHook, screen, within } from '@te
 import { SensePanel } from '../../src/SensePanel'
 import { makeScenario } from '../../src/mock/scenarios'
 import { useTuningOperations } from '../../src/sections/tuning-operation'
+import { defaultTuningCopy } from '../../src/sections/tuning-actions'
 import type { SensePanelModel, SensePanelProps } from '../../src/view-model'
 
 afterEach(cleanup)
@@ -29,6 +30,66 @@ function setup(model: SensePanelModel) {
 }
 
 describe('调参恢复与重置', () => {
+  it('备份失败时显示原因、允许重试并阻止重置', async () => {
+    const model = makeScenario('healthy')
+    model.tuning = { parameters: [], log: [], disabled: { reason: 'restore-failed' }, backupError: { code: 'ENOSPC', stage: 'backup' } }
+    const retry = vi.fn(async () => {})
+    const { props, view } = setup(model)
+    view.rerender(<SensePanel {...props} onRetryTuningBackup={retry} />)
+    expect(screen.getByText(/调参数据无法备份：磁盘空间不足/)).toBeTruthy()
+    expect((screen.getByRole('button', { name: '重置调参' }) as HTMLButtonElement).disabled).toBe(true)
+    fireEvent.click(screen.getByRole('button', { name: '重试' }))
+    expect(retry).toHaveBeenCalledOnce()
+    expect(props.onResetTuning).not.toHaveBeenCalled()
+    await act(async () => {})
+  })
+
+  it.each([
+    ['corrupt', '已将损坏的调参数据备份为 body.json.bak-example，已恢复默认'],
+    ['unknown-version', '已将无法识别版本的调参数据备份为 body.json.bak-example，已恢复默认'],
+  ] as const)('显示并关闭 %s 备份提示', async (kind, text) => {
+    const model = makeScenario('healthy')
+    model.tuning = { parameters: [], log: [], backupNotice: { kind, fileName: 'body.json.bak-example' } }
+    const dismiss = vi.fn(async () => {})
+    const { props, view } = setup(model)
+    view.rerender(<SensePanel {...props} onDismissTuningBackup={dismiss} />)
+    expect(screen.getByText(text)).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: '关闭备份提示' }))
+    expect(dismiss).toHaveBeenCalledOnce()
+    await act(async () => {})
+  })
+
+  it('长备份文件名在窄侧栏内换行', () => {
+    const model = makeScenario('healthy')
+    model.tuning = { parameters: [], log: [], backupNotice: { kind: 'corrupt', fileName: 'body.json.bak-1700000000000-11111111-2222-3333-4444-555555555555' } }
+    const { view } = setup(model)
+    view.container.style.width = '280px'
+    const text = screen.getByText(/已将损坏的调参数据备份为/)
+    const notice = text.parentElement!
+    expect(notice.scrollWidth).toBeLessThanOrEqual(notice.clientWidth)
+  })
+
+  it.each(['corrupt', 'unknown-version'] as const)('以英文区分 %s 备份和错误状态', async (kind) => {
+    const model = makeScenario('healthy')
+    const english = {
+      ...defaultTuningCopy, backupFailed: 'Unable to back up tuning data: ', noSpace: 'Not enough disk space',
+      retry: 'Retry', reset: 'Reset tuning', backupCorrupt: 'Corrupt tuning data was backed up as ',
+      backupUnknown: 'Tuning data with an unrecognized version was backed up as ', restored: '; defaults restored',
+      dismissBackup: 'Dismiss backup notice', restoreUnknown: 'Unrecognized version', restoreCorrupt: 'Corrupt data',
+    }
+    model.tuning = { parameters: [], log: [], disabled: { reason: 'restore-failed' }, backupError: { code: 'ENOSPC', stage: 'backup' } }
+    const { props, view } = setup(model)
+    view.rerender(<SensePanel {...props} tuningCopy={english} onRetryTuningBackup={async () => {}} />)
+    expect(screen.getByText('Unable to back up tuning data: Not enough disk space (ENOSPC)')).toBeTruthy()
+    expect((screen.getByRole('button', { name: 'Reset tuning' }) as HTMLButtonElement).disabled).toBe(true)
+    view.rerender(<SensePanel {...props} tuningCopy={english} onDismissTuningBackup={async () => {}} model={{
+      ...model, tuning: { parameters: [], log: [], disabled: { reason: 'restore-failed' }, backupNotice: { kind, fileName: 'body.json.bak-example' } },
+    }} />)
+    const prefix = kind === 'corrupt' ? english.backupCorrupt : english.backupUnknown
+    expect(screen.getByText(`${prefix}body.json.bak-example; defaults restored`)).toBeTruthy()
+    await act(async () => {})
+  })
+
   it('保存失败显示恢复入口，直接调用恢复回调', async () => {
     const model = makeScenario('healthy')
     model.tuning = { parameters: [], log: [], disabled: { reason: 'storage-failed' } }

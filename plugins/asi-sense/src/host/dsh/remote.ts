@@ -111,4 +111,14 @@ export class AsiSenseRemote extends TypertRemoteService {
   async resetTuning(): Promise<void> {
     await this.userAction(() => this.actions.resetTuning());
   }
+
+  @Remote
+  async retryTuningBackup(): Promise<void> {
+    await this.userAction(() => this.actions.retryTuningBackup());
+  }
+
+  @Remote
+  async dismissTuningBackup(): Promise<void> {
+    await this.userAction(() => this.actions.dismissTuningBackup());
+  }
 }

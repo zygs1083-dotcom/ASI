@@ -20,7 +20,6 @@ export type PresenterModel = Omit<SensePanelModel, 'tuning'> & {
       status: 'undoable' | 'reverted' | 'superseded' | 'rejected' | 'other';
       undoable: boolean;
     })[];
-    disabled?: { reason: 'storage-failed' | 'restore-failed' };
     suggestions: Suggestion[];
   };
 };
@@ -227,6 +226,9 @@ export function projectTuning(runtime: Runtime, time: (key: string, at: number) 
       };
     }),
     ...(disabled ? { disabled: { reason: disabled } } : {}),
+    ...(monitor.backupError ? { backupError: monitor.backupError } : {}),
+    ...(monitor.backupNotice ? { backupNotice: monitor.backupNotice } : {}),
+    ...(monitor.restoreKind ? { restoreKind: monitor.restoreKind } : {}),
     suggestions,
   };
 }

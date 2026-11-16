@@ -50,7 +50,8 @@ export interface DshPort {
 export interface StoragePort {
   load(key: string): Promise<string | undefined>;
   save(key: string, json: string): Promise<void>;
-  backup?(key: string, original: string): Promise<void>;
+  backup?(key: string, original: string): Promise<string>;
+  reportBackupFailure?(code: string): void;
 }
 export interface HelperSpawner {
   spawn(path: string): ChildProcessWithoutNullStreams | undefined;
@@ -94,6 +95,8 @@ export interface SenseActions {
   acceptRebaseline(id: string): Promise<unknown>;
   resumeTuning(): Promise<void>;
   resetTuning(): Promise<void>;
+  retryTuningBackup(): Promise<void>;
+  dismissTuningBackup(): Promise<void>;
 }
 export type TuneRequest =
   | { param: string; to: TuningValue; reason?: string }

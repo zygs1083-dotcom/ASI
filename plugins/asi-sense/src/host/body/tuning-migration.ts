@@ -1,3 +1,4 @@
+import { validBackupNotice } from './persistence.ts';
 import { validateSnapshot } from './tuner-persist.ts';
 import type { ParameterSpec } from './tuner-spec.ts';
 
@@ -41,7 +42,13 @@ function validApplied(entries: ReturnType<typeof validateSnapshot>, specs: Recor
 
 export function markTuningSnapshot(text: string): string {
   const monitor = JSON.parse(text);
-  if (monitor.disabled === 'restore-failed') return JSON.stringify({ version: 2, disabled: 'restore-failed' });
+  if (monitor.disabled === 'restore-failed')
+    return JSON.stringify({
+      version: 2,
+      disabled: 'restore-failed',
+      ...(monitor.backupNotice ? { backupNotice: monitor.backupNotice } : {}),
+      ...(monitor.restoreKind ? { restoreKind: monitor.restoreKind } : {}),
+    });
   monitor.version = 2;
   return JSON.stringify(monitor);
 }
@@ -58,9 +65,18 @@ export function migrateTuningSnapshot(
     if (
       (monitor?.version === 1 || monitor?.version === 2) &&
       monitor.disabled === 'restore-failed' &&
-      Object.keys(monitor).length === 2
+      Object.keys(monitor).every((key) => ['version', 'disabled', 'backupNotice', 'restoreKind'].includes(key)) &&
+      (monitor.backupNotice === undefined || validBackupNotice(monitor.backupNotice)) &&
+      (monitor.restoreKind === undefined ||
+        monitor.restoreKind === 'corrupt' ||
+        monitor.restoreKind === 'unknown-version')
     )
-      return JSON.stringify({ version: 1, disabled: 'restore-failed' });
+      return JSON.stringify({
+        version: 1,
+        disabled: 'restore-failed',
+        ...(monitor.backupNotice ? { backupNotice: monitor.backupNotice } : {}),
+        ...(monitor.restoreKind ? { restoreKind: monitor.restoreKind } : {}),
+      });
     if ((monitor?.version !== 1 && monitor?.version !== 2) || typeof monitor.tuner !== 'string') return invalid;
     const tuner = JSON.parse(monitor.tuner);
     const legacy = {

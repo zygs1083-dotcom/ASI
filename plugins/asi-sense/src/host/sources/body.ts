@@ -96,18 +96,7 @@ export class BodySource {
     let originalSnapshot: string | undefined;
     this.monitor = new BodyMonitor({
       tuner: this.tuner,
-      rateRules: [
-        ...defaultRateRules(),
-        { id: 'disk-eta', metric: 'disk:*', windowMs: 60_000, direction: 'down', maxEtaMs: 600_000 },
-        {
-          id: 'context-critical-eta',
-          metric: 'context',
-          windowMs: 300_000,
-          direction: 'down',
-          maxEtaMs: 600_000,
-          floor: 0,
-        },
-      ],
+      rateRules: defaultRateRules(),
       clock: () => clock.mono(),
       wallClock: () => clock.wall(),
       persistence: {
@@ -116,9 +105,23 @@ export class BodySource {
           return migrateTuningSnapshot(originalSnapshot, specs, attentionSpecs, () => clock.wall());
         },
         onRestoreFailure: async () => {
-          if (originalSnapshot === undefined || !storage.backup) throw new Error('body snapshot backup unavailable');
-          await storage.backup('body', originalSnapshot);
+          if (originalSnapshot === undefined || !storage.backup) {
+            throw Object.assign(new Error('body snapshot backup unavailable'), { code: 'BACKUP_UNAVAILABLE' });
+          }
+          let kind: 'corrupt' | 'unknown-version' = 'corrupt';
+          try {
+            const value = JSON.parse(originalSnapshot);
+            if (value && typeof value === 'object' && value.version !== 2) kind = 'unknown-version';
+          } catch {
+            kind = 'corrupt';
+          }
+          const fileName = await storage.backup('body', originalSnapshot);
+          if ((await storage.load('body')) !== originalSnapshot) {
+            throw Object.assign(new Error('body snapshot changed after backup'), { code: 'SNAPSHOT_CHANGED' });
+          }
+          return { kind, fileName };
         },
+        onBackupError: (code) => storage.reportBackupFailure?.(code),
         save: (value) => storage.save('body', markTuningSnapshot(value)),
       },
     });
@@ -280,18 +283,7 @@ export class BodySource {
     const commit: NonNullable<Parameters<typeof this.monitor.evaluateAuto>[3]> = (result, publish) => {
       this.state = result.state;
       this.previous = next;
-      const contextWarning = result.signals.some(
-        (signal) =>
-          signal.kind === 'body.rate' && signal.data.ruleId === 'context-eta' && signal.data.severity === 'warn',
-      );
-      signals = result.signals.filter(
-        (signal) =>
-          !(
-            signal.kind === 'body.rate' &&
-            (signal.data.ruleId === 'disk-eta' || signal.data.ruleId === 'context-critical-eta') &&
-            (signal.data.severity === 'normal' || (signal.data.ruleId === 'context-critical-eta' && contextWarning))
-          ),
-      );
+      signals = result.signals;
       if (result.tuningError) {
         signals.push({
           id: this.attention.id(),

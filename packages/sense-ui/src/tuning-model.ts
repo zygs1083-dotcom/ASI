@@ -24,6 +24,9 @@ export interface TuningState {
   parameters: TuningParam[]
   log: TuningEntry[]
   disabled?: { reason: 'storage-failed' | 'restore-failed' }
+  backupError?: { code: string; stage: 'backup' | 'save' }
+  backupNotice?: { kind: 'corrupt' | 'unknown-version'; fileName: string }
+  restoreKind?: 'corrupt' | 'unknown-version'
   suggestions?: {
     id: string
     metric: MetricKey

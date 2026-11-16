@@ -23,7 +23,8 @@ export function tunedRule(
     signal.data.severity === 'critical' ||
     (kind === 'body.rate' &&
       signal.data.severity === 'warn' &&
-      (signal.data.ruleId === 'context-eta' || (typeof eta === 'number' && Number.isFinite(eta) && eta <= 600_000)));
+      ((typeof eta === 'number' && Number.isFinite(eta) && eta <= 600_000) ||
+        (signal.data.ruleId === 'context-eta' && (typeof eta !== 'number' || !Number.isFinite(eta)))));
   if (!target || protectedAlert) return selectRule(items, signal, now);
   return selectRule(
     items.map((rule) =>
