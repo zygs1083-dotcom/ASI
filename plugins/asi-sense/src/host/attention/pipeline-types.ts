@@ -46,6 +46,7 @@ export interface AttentionPipelineOptions {
   store: StateStore;
   deliverer: Deliverer;
   isCurrent?: () => (sessionId: string) => boolean;
+  isWakeOwner?: (sessionId: string) => boolean;
   /** Injected MONOTONIC time for merge deadlines and the wake budget. */
   clock?: () => number;
   /**

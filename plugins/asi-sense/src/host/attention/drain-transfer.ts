@@ -12,6 +12,7 @@ export interface DrainHooks {
   /** Wall clock, used only for the `EnvUpdate.at` display timestamp. */
   wallClock: () => number;
   isCurrent?: () => (sessionId: string) => boolean;
+  isWakeOwner?: (sessionId: string) => boolean;
 }
 
 function throwCollected(errors: unknown[], label: string): void {

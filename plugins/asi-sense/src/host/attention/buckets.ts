@@ -115,9 +115,10 @@ export function upsertBucket(
       candidate.subject === signal.subject &&
       privateBucket(candidate) === isSessionOwned(signal) &&
       (!isSessionOwned(signal) ||
-        [...candidate.details.values()].every(
-          (detail) => detail.latest.data.sessionToken === signal.data.sessionToken,
-        )) &&
+        (bucketLevel(candidate) === level &&
+          [...candidate.details.values()].every(
+            (detail) => detail.latest.data.sessionToken === signal.data.sessionToken,
+          ))) &&
       candidate.deadline > now
     ) {
       b = candidate;

@@ -161,6 +161,55 @@ function harness(
 }
 
 describe('host runtime', () => {
+  it('retries a non-target private wake without charging the budget twice', async () => {
+    const h = harness(undefined, {
+      rules: [{ id: 'failed-job', match: { kind: 'job.exited' }, level: 'wake', createdBy: 'user', approved: true }],
+    });
+    const attempts: string[] = [];
+    h.ports.dsh.listSessions = async () => ['a', 'b'].map((id) => ({ id, title: '', updatedAt: 1, running: false }));
+    h.ports.dsh.deliver = async (id) => {
+      attempts.push(id);
+      if (attempts.length === 1) throw new Error('temporary failure');
+    };
+    await h.runtime.start();
+    for (const sessionId of ['a', 'b']) {
+      await h.agent({ type: 'created', sessionId });
+      await h.agent({ type: 'pre-step', sessionId });
+      await h.agent({ type: 'post-step', sessionId });
+    }
+    await h.runtime.actions.selectTarget?.('b');
+    await h.jobRaw({ type: 'started', id: 'fixture-job', sessionId: 'a' });
+    await h.jobRaw({ type: 'exited', id: 'fixture-job', sessionId: 'a', exitCode: 1 });
+    await h.advance(2_000);
+    expect(attempts).toEqual(['a']);
+    await h.advance(1_000);
+    expect(attempts).toEqual(['a', 'a']);
+    await h.advance(10_000);
+    expect(attempts).toEqual(['a', 'a']);
+    await h.runtime.stop();
+  });
+
+  it.each([true, false])('wakes an idle non-target job owner with pinned=%s', async (pinned) => {
+    const h = harness(undefined, {
+      rules: [{ id: 'failed-job', match: { kind: 'job.exited' }, level: 'wake', createdBy: 'user', approved: true }],
+    });
+    h.ports.dsh.listSessions = async () => ['a', 'b'].map((id) => ({ id, title: '', updatedAt: 1, running: false }));
+    await h.runtime.start();
+    for (const sessionId of ['a', 'b']) {
+      await h.agent({ type: 'created', sessionId });
+      await h.agent({ type: 'pre-step', sessionId });
+      await h.agent({ type: 'post-step', sessionId });
+    }
+    if (pinned) await h.runtime.actions.selectTarget?.('b');
+    await h.jobRaw({ type: 'started', id: 'fixture-job', sessionId: 'a' });
+    await h.jobRaw({ type: 'exited', id: 'fixture-job', sessionId: 'a', exitCode: 1 });
+    await h.advance(2_000);
+    await h.advance(5_000);
+    expect(h.runtime.currentSessionId()).toBe('b');
+    expect(h.delivered.map((intent) => [intent.sessionId, intent.kind])).toEqual([['a', 'followup']]);
+    await h.runtime.stop();
+  });
+
   it.each([
     { pinned: true, other: true, expected: 'a' },
     { pinned: false, other: true, expected: 'a' },
@@ -647,9 +696,12 @@ describe('host runtime', () => {
     await h.agent({ type: 'pre-step', sessionId: 'b' });
     await h.job({ type: 'exited', id: 'owned-job', sessionId: 'a', command: 'fixture-command', exitCode });
     await h.advance(3_000);
-    expect(h.delivered.flatMap((intent) => intent.update.changes)).not.toContainEqual(
-      expect.objectContaining({ signal: expect.objectContaining({ subject: 'owned-job' }) }),
-    );
+    const initial = h.delivered.flatMap((intent) => intent.update.changes);
+    if (exitCode === 0)
+      expect(initial).not.toContainEqual(
+        expect.objectContaining({ signal: expect.objectContaining({ subject: 'owned-job' }) }),
+      );
+    else expect(h.delivered).toMatchObject([{ sessionId: 'a', kind: 'followup' }]);
     await h.agent({ type: 'pre-step', sessionId: 'a' });
     await h.advance(3_000);
     await h.agent({ type: 'pre-step', sessionId: 'a' });
@@ -659,24 +711,22 @@ describe('host runtime', () => {
         .map((change) => ({ sessionId: intent.sessionId, kind: intent.kind, level: change.level })),
     );
     expect(jobs).toEqual([
-      { sessionId: 'a', kind: exitCode === 0 ? 'inject' : 'send', level: exitCode === 0 ? 'context' : 'wake' },
+      { sessionId: 'a', kind: exitCode === 0 ? 'inject' : 'followup', level: exitCode === 0 ? 'context' : 'wake' },
     ]);
     expect(JSON.stringify(h.delivered)).not.toContain('fixture-command');
     await h.runtime.stop();
   });
 
-  it('retains a live owner job when no session has yet been selected', async () => {
+  it('wakes a live owner job when no session has yet been selected', async () => {
     const h = harness();
     await h.runtime.start();
     await h.agent({ type: 'created', sessionId: 'a' });
     await h.job({ type: 'exited', id: 'owned-job', sessionId: 'a', command: 'fixture-command', exitCode: 1 });
     await h.advance(3_000);
-    expect(h.delivered).toHaveLength(0);
-    await h.agent({ type: 'pre-step', sessionId: 'a' });
     expect(h.delivered).toContainEqual(
       expect.objectContaining({
         sessionId: 'a',
-        kind: 'send',
+        kind: 'followup',
         update: expect.objectContaining({
           changes: expect.arrayContaining([
             expect.objectContaining({ level: 'wake', signal: expect.objectContaining({ subject: 'owned-job' }) }),
@@ -695,9 +745,11 @@ describe('host runtime', () => {
     await h.job({ type: 'exited', id: 'owned-job', sessionId: 'a', command: 'fixture-command', exitCode });
     await h.agent({ type: 'pre-step', sessionId: 'b' });
     await h.advance(3_000);
-    expect(h.delivered.flatMap((intent) => intent.update.changes)).not.toContainEqual(
-      expect.objectContaining({ signal: expect.objectContaining({ subject: 'owned-job' }) }),
-    );
+    if (exitCode === 0)
+      expect(h.delivered.flatMap((intent) => intent.update.changes)).not.toContainEqual(
+        expect.objectContaining({ signal: expect.objectContaining({ subject: 'owned-job' }) }),
+      );
+    else expect(h.delivered).toMatchObject([{ sessionId: 'a', kind: 'send' }]);
     await h.agent({ type: 'pre-step', sessionId: 'a' });
     await h.agent({ type: 'pre-step', sessionId: 'a' });
     const jobs = h.delivered.flatMap((intent) =>
@@ -802,10 +854,8 @@ describe('host runtime', () => {
     await h.jobRaw({ type: 'started', id: 'owned-job', sessionId: 'a' });
     await h.jobRaw({ type: 'exited', id: 'owned-job', sessionId: 'b', exitCode: 1 });
     await h.advance(3_000);
-    expect(h.delivered).toHaveLength(0);
-    await h.agent({ type: 'pre-step', sessionId: 'a' });
     expect(h.delivered).toMatchObject([
-      { sessionId: 'a', update: { changes: [{ signal: { subject: 'owned-job' } }] } },
+      { sessionId: 'a', kind: 'followup', update: { changes: [{ signal: { subject: 'owned-job' } }] } },
     ]);
     await h.runtime.stop();
   });

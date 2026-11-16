@@ -106,7 +106,7 @@ export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}
     if (timer) clearTimeout(timer);
     timer = undefined;
     if (!running) return;
-    const due = paused || !attention.current() ? undefined : attention.pipeline.nextDeadline();
+    const due = paused ? undefined : attention.pipeline.nextDeadline();
     const deadline = Math.min(
       due === undefined ? Infinity : Math.max(due, retryAfter),
       helper.nextDeadline() ?? Infinity,

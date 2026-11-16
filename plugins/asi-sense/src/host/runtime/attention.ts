@@ -80,6 +80,7 @@ export class RuntimeAttention {
           (this.selected === id || this.privateStep === id) &&
           this.sessions.has(id);
       },
+      isWakeOwner: (id) => !this.stopped && this.sessions.has(id) && !this.closed.has(id),
       deliverer: {
         deliver: async (intent) => {
           if (this.stopped) throw new Error('stopped');
@@ -158,6 +159,9 @@ export class RuntimeAttention {
   }
   current(): string | undefined {
     return this.currentSessionId();
+  }
+  hasSession(id: string): boolean {
+    return !this.stopped && this.sessions.has(id) && !this.closed.has(id);
   }
   currentSessionId(): string | undefined {
     return this.selected;
@@ -402,10 +406,8 @@ export class RuntimeAttention {
   async flush(): Promise<void> {
     try {
       this.pipeline.pruneSessions();
-      if (this.selected) {
-        await this.pipeline.retarget(this.selected);
-        if (!this.stopped && this.selected) await this.pipeline.flush();
-      }
+      if (this.selected) await this.pipeline.retarget(this.selected);
+      if (!this.stopped) await this.pipeline.flush();
     } finally {
       this.reschedule();
     }

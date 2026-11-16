@@ -52,6 +52,7 @@ export class BucketDrain {
   private readonly clock: () => number;
   private readonly wallClock: () => number;
   private readonly isCurrent: () => (sessionId: string) => boolean;
+  private readonly isWakeOwner: (sessionId: string) => boolean;
   private seq = 0;
   private suppressedGroups = 0;
   constructor(hooks: DrainHooks) {
@@ -60,6 +61,7 @@ export class BucketDrain {
     this.clock = hooks.clock;
     this.wallClock = hooks.wallClock;
     this.isCurrent = hooks.isCurrent ?? (() => () => true);
+    this.isWakeOwner = hooks.isWakeOwner ?? (() => false);
   }
   /** Cumulative count of wake groups suppressed by the budget. */
   get suppressed(): number {
@@ -90,11 +92,17 @@ export class BucketDrain {
   nextDeadline(): number | undefined {
     let min: number | undefined;
     for (const b of this.pending.values()) {
-      if (privateBucket(b) && !this.isCurrent()(b.sessionId)) continue;
+      if (privateBucket(b) && !this.eligible(b, this.isCurrent())) continue;
       if (b.jobs && !b.sealed && this.blockedJobs(b.sessionId, bucketLevel(b))) continue;
       if (min === undefined || b.deadline < min) min = b.deadline;
     }
     return min;
+  }
+  private eligible(bucket: Bucket, current: (id: string) => boolean): boolean {
+    return (
+      current(bucket.sessionId) ||
+      (privateBucket(bucket) && bucketLevel(bucket) === 'wake' && this.isWakeOwner(bucket.sessionId))
+    );
   }
   private blockedJobs(sessionId: string, level: DeliveryLevel): boolean {
     const blocks = (bucket: Bucket) => bucket.jobs && bucketLevel(bucket) === level;
@@ -120,8 +128,7 @@ export class BucketDrain {
       privateBucket(bucket) &&
       (token === undefined ||
         [...bucket.details.values()].every((detail) => detail.latest.data.sessionToken === token));
-    const jobBucket = this.jobs.get(id);
-    if (jobBucket && matches(jobBucket)) this.jobs.delete(id);
+    for (const [key, bucket] of this.jobs) if (matches(bucket)) this.jobs.delete(key);
     for (const [key, bucket] of this.pending) {
       if (matches(bucket)) this.pending.delete(key);
     }
@@ -168,7 +175,8 @@ export class BucketDrain {
       typeof signal.data.sessionId === 'string' &&
       typeof signal.data.sessionToken === 'string'
     ) {
-      let bucket = this.jobs.get(sessionId);
+      const key = JSON.stringify([sessionId, level]);
+      let bucket = this.jobs.get(key);
       if (
         !bucket ||
         bucket.sealed ||
@@ -184,7 +192,7 @@ export class BucketDrain {
           details: new Map(),
         };
         this.pending.set(bucket.id, bucket);
-        this.jobs.set(sessionId, bucket);
+        this.jobs.set(key, bucket);
       }
       if (bucket.budgetSuppressed && bucketLevel(bucket) === 'context' && level === 'wake') {
         bucket.startedAt = now;
@@ -259,7 +267,7 @@ export class BucketDrain {
   /** Due buckets attempted independently; failures restore the sealed bucket for a same-payload retry. */
   private async attemptDue(now: number, errors: unknown[], current: (id: string) => boolean): Promise<void> {
     for (const b of [...this.pending.values()]) {
-      if (!current(b.sessionId)) continue;
+      if (!this.eligible(b, current)) continue;
       if (now < b.deadline) continue;
       if (b.jobs && !b.sealed && this.blockedJobs(b.sessionId, bucketLevel(b))) continue;
       this.pending.delete(b.id);
