@@ -84,6 +84,7 @@ export class DshSource {
     if (window) {
       window.endedAt = at;
       window.endedMono = this.clock.mono();
+      window.pid ??= event.pid;
     }
     if (!this.paused() && event.exitCode !== undefined && event.exitCode !== 0) {
       await this.attention.accept(
@@ -93,6 +94,7 @@ export class DshSource {
           at,
           source,
           subject: event.command ?? event.toolCallId,
+          cause: 'agent',
           data: {
             id: event.toolCallId,
             command: event.command,

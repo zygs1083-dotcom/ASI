@@ -56,8 +56,8 @@ function relatedToShell(signal: Signal, shellPid: number): boolean {
  * (path-boundary safe: `/repo` does not match `/repository`). Concurrent or
  * nested windows are handled by checking every window. An explicit
  * `cause: 'agent'` is always preserved; `user`/`unknown` are upgraded to
- * `agent` on match, never downgraded. File paths under cwd also match within
- * optional trailing grace by monotonic receipt.
+ * `agent` on match, never downgraded. File paths under cwd and same-pid job
+ * exits also match within optional trailing grace by monotonic receipt.
  */
 export function classifyCause(
   signal: Signal,
@@ -71,11 +71,14 @@ export function classifyCause(
   for (const w of toolWindows) {
     const p = signalPath(signal);
     if (receivedMono === undefined || w.startedMono === undefined || receivedMono < w.startedMono) continue;
-    if (
-      w.endedMono !== undefined &&
-      (signal.kind === 'file.changed' ? receivedMono >= w.endedMono + graceMs : receivedMono > w.endedMono)
-    )
-      continue;
+    if (w.endedMono !== undefined) {
+      if (signal.kind === 'file.changed') {
+        if (receivedMono >= w.endedMono + graceMs) continue;
+      } else if (signal.kind === 'job.exited' && receivedMono >= w.endedMono) {
+        if (w.pid !== undefined && signal.data.pid === w.pid && receivedMono < w.endedMono + graceMs) return 'agent';
+        continue;
+      } else if (receivedMono > w.endedMono) continue;
+    }
     if (signal.kind === 'file.changed') {
       if (w.cwd !== undefined && p !== undefined && underDir(w.cwd, p)) return 'agent';
       continue;
