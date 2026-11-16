@@ -39,7 +39,8 @@
     "lib/typert.remote-client.js",
     "lib/typert.remote-client.d.ts",
     "lib/typert.remote-client.d.ts.map",
-    "cordis.patch.yml"
+    "cordis.patch.yml",
+    "scripts/dsh.sh"
   ],
   "dsh": {
     "bundle": {
