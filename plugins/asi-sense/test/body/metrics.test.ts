@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { readMetrics } from '../../src/host/body/metrics.ts';
-import { battBody, blank, ctxBody, diskBody, f, mkBody, rssBody, sample } from './helpers.ts';
+import { battBody, blank, ctxBody, diskBody, diskFact, f, mkBody, rssBody, sample } from './helpers.ts';
 
 const at = 1000;
 
@@ -11,7 +11,7 @@ describe('readMetrics', () => {
         mkBody({
           cpu: f({ usage: 0.5, perCore: [0.5], load1: 0, load5: 0, load15: 0 }),
           memory: f({ total: 200, used: 50, pressure: 'normal', swapUsed: 0 }),
-          disks: f([{ mount: '/', total: 1000, free: 300 }]),
+          disks: diskFact([{ mount: '/', total: 1000, free: 300 }]),
           battery: f({ percent: 40, charging: false }),
           network: f({ online: true, rxBps: 10, txBps: 20 }),
           harnessProcess: f({ rss: 1024, cpu: 0, uptimeSec: 5 }),
@@ -61,13 +61,28 @@ describe('readMetrics', () => {
       sample(
         mkBody({
           memory: f({ total: Number.POSITIVE_INFINITY, used: 1, pressure: 'normal', swapUsed: 0 }),
-          disks: f([{ mount: '/', total: Number.POSITIVE_INFINITY, free: 10 }]),
+          disks: diskFact([{ mount: '/', total: Number.POSITIVE_INFINITY, free: 10 }]),
         }),
         at,
       ),
     );
     expect(inf.has('memory')).toBe(false);
     expect(inf.has('disk:/')).toBe(false);
+  });
+
+  it('reads only effective fresh volumes, even when the parent status differs', () => {
+    const disks = diskFact(
+      [
+        { mount: '/fresh', total: 1000, free: 500, status: 'ok', observedAt: 800, ttlMs: 500 },
+        { mount: '/stale', total: 1000, free: 100, status: 'stale' },
+        { mount: '/expired', total: 1000, free: 200, status: 'ok', observedAt: 0, ttlMs: 1000 },
+        { mount: '/unreadable', total: 1000, free: 300, status: 'ok' },
+      ],
+      'stale',
+    );
+    disks.unavailableMounts = ['/unreadable'];
+    const metrics = readMetrics(sample(mkBody({ disks }), 1000));
+    expect([...metrics]).toEqual([['disk:/fresh', { value: 500, floor: 50 }]]);
   });
 
   it('uses actual context usage only; negative remaining is a valid reading', () => {

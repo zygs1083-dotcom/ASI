@@ -27,6 +27,12 @@
   padding-bottom: 0;
 }
 
+/* 卷级过期读数：整块去色变灰（同 .factStale），明示非当前值。 */
+.metricBlock[data-status='stale'] {
+  color: var(--dsw-alias-label-secondary, #61666b);
+  filter: grayscale(1);
+}
+
 .metricBlock[data-sev='warn'] .metricHead {
   color: var(--sev-warn-ink);
 }
@@ -42,6 +48,12 @@
   gap: var(--sense-gap, 6px);
   font-size: var(--sense-fs-s);
   font-variant-numeric: tabular-nums;
+}
+
+/* 指标名压在图上方：不透明侧栏底，避免与图上沿重叠时不可读。 */
+.metricName {
+  background: var(--dsw-specific-sidebar-fill, #f9fafb);
+  border-radius: 2px;
 }
 
 .metricRows {

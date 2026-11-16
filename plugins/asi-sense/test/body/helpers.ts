@@ -1,8 +1,24 @@
-import type { Body, BodyThresholdSample, Fact, FactStatus, Signal, SourceRef } from '@asi/sense-types';
+import type {
+  Body,
+  BodyThresholdSample,
+  DisksFact,
+  DiskVolume,
+  Fact,
+  FactStatus,
+  Signal,
+  SourceRef,
+} from '@asi/sense-types';
 import { SRC } from '../helpers.ts';
 
 export function f<T>(value: T | null, status: FactStatus = 'ok'): Fact<T> {
   return { value, status, source: SRC, observedAt: 0, ttlMs: 60_000 };
+}
+
+export function diskFact(value: DiskVolume[] | null, status: FactStatus = 'ok'): DisksFact {
+  return {
+    ...f(value?.map((volume) => ({ observedAt: 0, ttlMs: 60_000, ...volume })) ?? null, status),
+    kind: 'disks',
+  };
 }
 
 export const blank = (status: FactStatus = 'unknown'): Fact<never> => f<never>(null, status);
@@ -13,7 +29,7 @@ export function mkBody(over: Partial<Body> = {}): Body {
   return {
     cpu: blank(),
     memory: blank(),
-    disks: blank(),
+    disks: diskFact(null, 'unknown'),
     battery: blank(),
     thermal: blank(),
     network: blank(),
@@ -46,6 +62,7 @@ export function freshSample(
   mono?: number,
 ): BodyThresholdSample {
   const fresh = Object.fromEntries(Object.entries(body).map(([k, fact]) => [k, { ...fact, observedAt: at }])) as Body;
+  fresh.disks.value = fresh.disks.value?.map((volume) => ({ ...volume, observedAt: at })) ?? null;
   return sample(fresh, at, state, mono);
 }
 
@@ -57,7 +74,8 @@ export function sampleSrc(source: SourceRef, body: Body, at: number, monotonicAt
 export const cpuBody = (usage: number) =>
   mkBody({ cpu: f({ usage, perCore: [usage], load1: 0, load5: 0, load15: 0 }) });
 export const rssBody = (rss: number) => mkBody({ harnessProcess: f({ rss, cpu: 0, uptimeSec: 0 }) });
-export const diskBody = (free: number, total = 1000, mount = '/') => mkBody({ disks: f([{ mount, total, free }]) });
+export const diskBody = (free: number, total = 1000, mount = '/') =>
+  mkBody({ disks: diskFact([{ mount, total, free }]) });
 export const ctxBody = (window: number, used?: number) =>
   mkBody({
     tokens: f({

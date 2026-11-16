@@ -4,7 +4,7 @@ import { Baseline } from '../../src/host/body/baseline.ts';
 import type { BodySignal } from '../../src/host/body/metrics.ts';
 import { BodyMonitor } from '../../src/host/body/monitor.ts';
 import { Tuner } from '../../src/host/body/tuner.ts';
-import { cpuBody, diskBody, f, freshSample, mkBody, rssBody, sample } from './helpers.ts';
+import { cpuBody, diskBody, diskFact, f, freshSample, mkBody, rssBody, sample } from './helpers.ts';
 
 const now = 0;
 const rssRule = {
@@ -17,7 +17,7 @@ const rssRule = {
 } as const;
 const both = (free: number, rss: number) =>
   mkBody({
-    disks: f([{ mount: '/', total: 1000, free }]),
+    disks: diskFact([{ mount: '/', total: 1000, free }]),
     harnessProcess: f({ rss, cpu: 0, uptimeSec: 0 }),
   });
 
@@ -58,6 +58,61 @@ describe('BodyMonitor', () => {
     const rate = sigs.find((s) => s.kind === 'body.rate');
     expect(rate?.layer).toBe('rate');
     expect(rate?.data.severity).toBe('warn'); // rss 0→20 > 10
+  });
+
+  it('excludes stale and unreadable volumes from learning and rate windows', () => {
+    const m = new BodyMonitor({
+      clock: () => 0,
+      wallClock: () => 0,
+      timeZone: 'UTC',
+      rateRules: [{ id: 'disk', metric: 'disk:*', windowMs: 60_000, direction: 'down', maxDelta: 100 }],
+    });
+    const first = sample(
+      mkBody({
+        disks: diskFact([
+          { mount: '/fresh', total: 1000, free: 800 },
+          { mount: '/stale', total: 1000, free: 800 },
+        ]),
+      }),
+      0,
+      undefined,
+      0,
+    );
+    const seeded = m.evaluate(first, first, {});
+    expect(m.baseline.read('disk:/stale', 0)?.count).toBe(1);
+    const disks = diskFact([
+      { mount: '/fresh', total: 1000, free: 600, status: 'ok' },
+      { mount: '/stale', total: 1000, free: 100, status: 'stale' },
+      { mount: '/expired', total: 1000, free: 100, status: 'ok', observedAt: 0, ttlMs: 1000 },
+      { mount: '/unreadable', total: 1000, free: 100, status: 'ok' },
+    ]);
+    disks.unavailableMounts = ['/unreadable'];
+    const mixed = sample(mkBody({ disks }), 1000, undefined, 1000);
+    const result = m.evaluate(first, mixed, seeded.state);
+    expect(result.signals.filter((signal) => signal.kind === 'body.rate').map((signal) => signal.data.metric)).toEqual([
+      'disk:/fresh',
+    ]);
+    expect(m.baseline.read('disk:/fresh', 1000)?.count).toBe(2);
+    expect(m.baseline.read('disk:/stale', 1000)?.count).toBe(1);
+    expect(m.baseline.read('disk:/expired', 1000)).toBeUndefined();
+    expect(m.baseline.read('disk:/unreadable', 1000)).toBeUndefined();
+
+    const recovered = sample(
+      mkBody({
+        disks: diskFact([
+          { mount: '/fresh', total: 1000, free: 600 },
+          { mount: '/stale', total: 1000, free: 100 },
+        ]),
+      }),
+      2000,
+      undefined,
+      2000,
+    );
+    const after = m.evaluate(mixed, recovered, result.state);
+    expect(
+      after.signals.filter((signal) => signal.kind === 'body.rate' && signal.data.metric === 'disk:/stale'),
+    ).toEqual([]);
+    expect(m.baseline.read('disk:/stale', 2000)?.count).toBe(2);
   });
 
   it('applies tuner rate limits immediately', async () => {

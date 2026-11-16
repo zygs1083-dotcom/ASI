@@ -2,12 +2,15 @@
 
 import type {
   BodyHistory,
+  DisksFact,
+  DiskVolume,
   Fact,
   FactStatus,
   MetricInsight,
   MetricKey,
   MetricPoint,
   SenseEvent,
+  SensePanelModel,
   SenseRule,
   SenseState,
   Signal,
@@ -35,6 +38,10 @@ export function fact<T>(
 /** 无值的事实（denied/unavailable/unsupported/unknown/stale-null），T 由赋值上下文推断。 */
 export function emptyFact<T>(status: FactStatus, reason?: string): Fact<T> {
   return fact<T>(null, { status, reason })
+}
+
+export function disksFixture(value: DiskVolume[] | null, opts: Parameters<typeof fact>[1] = {}): DisksFact {
+  return { ...fact(value, opts), kind: 'disks' }
 }
 
 export const denied = <T>(reason: string): Fact<T> => emptyFact<T>('denied', reason)
@@ -102,7 +109,7 @@ export function makeBody(): SenseState['self']['body'] {
       swapUsed: 0.4e9,
       breakdown: { app: 11e9, wired: 5e9, compressed: 3.4e9, cached: 4e9 },
     }),
-    disks: fact([
+    disks: disksFixture([
       { mount: '/', total: 460e9, free: 175e9 },
       { mount: '/demo/vol', total: 120e9, free: 72e9 },
     ]),
@@ -191,6 +198,24 @@ export function makeEvent(
     reason: '默认记录规则',
     cause: 'user',
     ...rest,
+  }
+}
+
+/** 面板模型：默认空事件、默认规则、now=T0、默认历史与 insight。 */
+export function panelModel(
+  state: SenseState,
+  over: Partial<SensePanelModel> = {},
+): SensePanelModel {
+  return {
+    state,
+    events: over.events ?? [],
+    rules: over.rules ?? makeRules(),
+    paused: false,
+    sendTitles: true,
+    now: T0,
+    history: makeHistory(),
+    insights: makeInsights(),
+    ...over,
   }
 }
 

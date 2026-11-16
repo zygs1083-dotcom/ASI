@@ -1,4 +1,4 @@
-import type { ReactNode } from 'react'
+import { useState, type ReactNode } from 'react'
 import { FactMeta, FactValue } from '../fact'
 import { formatClock } from '../format'
 import { effectiveStatus, isUsable, type Severity } from '../health'
@@ -44,7 +44,8 @@ export interface TileProps {
 /**
  * 指标卡片：原生 details/summary 折叠。
  * summary 内只有静态内容（数值/图），交互控件一律放 detail。
- * 展开时卡片跨满整行宽。
+ * 展开时卡片跨满整行宽。detail 仅在打开时挂载（收起不付出明细渲染开销），
+ * 开合状态由原生 toggle 事件镜像，不反向控制 open 属性。
  */
 export function Tile({
   tileKey,
@@ -55,12 +56,14 @@ export function Tile({
   detail,
   children,
 }: TileProps) {
+  const [open, setOpen] = useState(false)
   return (
     <details
       className={css.tile}
       data-tile={tileKey}
       data-sev={sev}
       data-span2={span2 || undefined}
+      onToggle={(e) => setOpen(e.currentTarget.open)}
     >
       <summary className={css.tileSummary}>
         <span className={css.tileHead}>
@@ -90,7 +93,9 @@ export function Tile({
         </span>
         {children}
       </summary>
-      {detail != null && <div className={dcss.tileDetail}>{detail}</div>}
+      {open && detail != null && (
+        <div className={dcss.tileDetail}>{detail}</div>
+      )}
     </details>
   )
 }
@@ -108,6 +113,11 @@ export interface DetailMetric {
   severity?: Severity
   /** tokens 的动态窗口（默认底线按窗口计算）。 */
   tokenWindow?: number
+  /**
+   * 指标自己的事实（如磁盘按挂载点各算新鲜度）；缺省沿用卡片父事实，
+   * 用于表头/消毒判定。
+   */
+  fact?: Fact<unknown>
 }
 
 /** 最近一次匹配指标的触发事件：忽略未来/非法时间戳（历史更早的事件仍算）。 */
@@ -147,24 +157,35 @@ function MetricBlock({
   events: SenseEvent[]
   head: HeadText
 }) {
-  const chart = chartThresholds(m.key, m.insight, m.tokenWindow)
+  // 只有当前读数才画阈值线：stale/none 不再生成默认显示底线
+  //（历史保留值上重画「当前」阈值会伪装成新鲜投影）。
+  const chart =
+    head === 'current'
+      ? chartThresholds(m.key, m.insight, m.tokenWindow)
+      : { lines: [] }
   const layers = (ls: ThresholdLayer[]) =>
     ls.length ? ls.map((l) => LAYER_TEXT[l]).join(' / ') : '未触发'
   const lastEvent = latestTriggerEvent(m.key, events, now)
   const missingSev =
     (m.insight?.triggered?.length ?? 0) > 0 && !m.insight?.severity
   return (
-    <div className={dcss.metricBlock} data-metric={m.key} data-sev={m.severity}>
+    <div
+      className={dcss.metricBlock}
+      data-metric={m.key}
+      data-sev={m.severity}
+      data-status={head === 'stale' ? 'stale' : undefined}
+    >
       <div className={dcss.metricHead}>
-        <span>{m.label}</span>
+        <span className={dcss.metricName}>{m.label}</span>
         <span>
           {HEAD_PREFIX[head]}
           {m.valueText ?? '未提供'}
           {m.badge ? <em className={dcss.badge}>{m.badge}</em> : null}
+          {m.fact ? <FactMeta fact={m.fact} now={now} /> : null}
         </span>
       </div>
       <Sparkline
-        expanded
+        metric={m.key} expanded
         points={m.points}
         now={now}
         label={m.label}
@@ -218,11 +239,13 @@ export function TileDetail({
   extra?: ReactNode
 }) {
   const usable = isUsable(fact, now)
-  const head: HeadText = usable
-    ? 'current'
-    : effectiveStatus(fact, now) === 'stale' && fact.value !== null
-      ? 'stale'
-      : 'none'
+  const headOf = (f: Fact<unknown>): HeadText =>
+    isUsable(f, now)
+      ? 'current'
+      : effectiveStatus(f, now) === 'stale' && f.value !== null
+        ? 'stale'
+        : 'none'
+  const head = headOf(fact)
   return (
     <>
       <div className={dcss.detailFact}>
@@ -234,26 +257,32 @@ export function TileDetail({
           {() => null}
         </FactValue>
       </div>
-      {metrics.map((m) => (
-        <MetricBlock
-          key={m.key}
-          m={
-            usable
-              ? m
-              : {
-                  ...m,
-                  insight: undefined,
-                  badge: undefined,
-                  tokenWindow: undefined,
-                  // 非 stale 的不可用（denied/unavailable…）连保留值也不进明细
-                  valueText: head === 'none' ? undefined : m.valueText,
-                }
-          }
-          now={now}
-          events={events}
-          head={head}
-        />
-      ))}
+      {metrics.map((m) => {
+        // 指标自带事实（磁盘卷）时按自身新鲜度判定；否则沿用父事实
+        const mf = m.fact ?? fact
+        const mHead = m.fact ? headOf(mf) : head
+        const mUsable = m.fact ? mHead === 'current' : usable
+        return (
+          <MetricBlock
+            key={m.key}
+            m={
+              mUsable
+                ? m
+                : {
+                    ...m,
+                    insight: undefined,
+                    badge: undefined,
+                    tokenWindow: undefined,
+                    // 非 stale 的不可用（denied/unavailable…）连保留值也不进明细
+                    valueText: mHead === 'none' ? undefined : m.valueText,
+                  }
+            }
+            now={now}
+            events={events}
+            head={mHead}
+          />
+        )
+      })}
       {extra}
       <div className={dcss.detailMeta}>
         <span>

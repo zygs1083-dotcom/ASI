@@ -77,7 +77,7 @@ function reading(
   const body: Body = {
     cpu: fact(index % 53 === 0 ? null : { usage: cpu, perCore: [cpu], load1: cpu, load5: cpu, load15: cpu }),
     memory: fact({ total: 16 * GIB, used: 5 * GIB, pressure: 'normal', swapUsed: 0 }),
-    disks: fact([{ mount: '/', total: 100 * GIB, free }]),
+    disks: { ...fact([{ mount: '/', total: 100 * GIB, free, observedAt: wall, ttlMs: 2 * MINUTE }]), kind: 'disks' },
     battery: fact(null),
     thermal: fact('nominal'),
     network: fact({ online: true, rxBps: 40_000 + 20_000 * jitter(), txBps: 8_000 + 4_000 * jitter() }),

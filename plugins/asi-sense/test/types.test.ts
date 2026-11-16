@@ -1,4 +1,4 @@
-import type { Signal, TuningChange, TypedSignal } from '@asi/sense-types';
+import { type DisksFact, factStatusAt, type Signal, type TuningChange, type TypedSignal } from '@asi/sense-types';
 import { describe, expect, it } from 'vitest';
 import { SRC, sig } from './helpers.ts';
 
@@ -56,6 +56,11 @@ const bad: TypedSignal<'body.rate'> = { ...rate, data: anomaly.data };
 // @ts-expect-error a union of kinds must still correlate the payload with its kind
 const badUnion: TypedSignal<'body.rate' | 'file.burst'> = { ...rate, data: burst.data };
 
+function rejectDiskFact(disks: DisksFact): void {
+  // @ts-expect-error disk facts must use disksStatusAt
+  factStatusAt(disks, 0);
+}
+
 describe('extension signal data types', () => {
   it('typed signals remain plain Signals', () => {
     const asSignals: Signal[] = [rate, anomaly, burst];
@@ -64,5 +69,6 @@ describe('extension signal data types', () => {
     expect(bad.kind).toBe('body.rate');
     expect(badUnion.kind).toBe('body.rate');
     expect(sig({ id: 'x', kind: 'body.rate' }).kind).toBe('body.rate');
+    expect(rejectDiskFact).toBeTypeOf('function');
   });
 });

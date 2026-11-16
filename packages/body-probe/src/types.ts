@@ -1,49 +1,20 @@
-// 合并后改为从 @asi/sense-types 导入（见 docs/DESIGN.md §2.2 / §2.2b）
-// Until packages/sense-types exists, Fact and Body are kept verbatim from the
-// design document here; only SourceRef is local to this package.
+// 共享契约在 @asi/sense-types（docs/DESIGN.md §2.2 / §2.2b）；本包只保留
+// memory.cached 这一处本机扩投影和 TokenSource 接口。
 
-export interface SourceRef {
-  id: string;   // 事实来源标识，例如 body-probe.memory
-  api: string;  // 具体使用的系统接口，例如 /usr/bin/vm_stat
-  host: string; // 采集所在主机 os.hostname()
-}
+import type { Body as SharedBody, Fact } from '@asi/sense-types';
 
-export interface Fact<T> {
-  value: T | null;
-  status: 'ok' | 'stale' | 'denied' | 'unsupported' | 'unavailable' | 'unknown';
-  source: SourceRef;       // 来自哪个接口
-  observedAt: number;      // 什么时候获取
-  ttlMs: number;           // 多久后视为过期（stale 由读取时计算，不靠定时器）
-  unavailableMounts?: string[]; // disks: queried paths with no successful reading yet
-}
+export type {
+  DiskVolume,
+  DisksFact,
+  Fact,
+  FactStatus,
+  SourceRef,
+} from '@asi/sense-types';
 
-// One entry of the disks fact value: total/free are bytes; the optional
-// status/observedAt/ttlMs let a single hung volume degrade alone.
-export interface DiskVolume {
-  mount: string;
-  total: number;
-  free: number;
-  status?: 'ok' | 'stale';
-  observedAt?: number;
-  ttlMs?: number;
-}
-
-export interface Body {
-  cpu: Fact<{ usage: number /* 0..1 */; perCore: number[]; load1: number; load5: number; load15: number }>;
-  memory: Fact<{ total: number; used: number; cached?: number; pressure: 'normal' | 'warn' | 'critical'; swapUsed: number }>;
-  disks: Fact<DiskVolume[]>;   // 至少根卷 + 工作目录所在卷
-  battery: Fact<{ percent: number; charging: boolean; minutesLeft?: number } | null>;  // 台式机为 null
-  thermal: Fact<'nominal' | 'fair' | 'serious' | 'critical'>;           // ProcessInfo.thermalState，经 helper
-  network: Fact<{ online: boolean; rxBps: number; txBps: number }>;
-  harnessProcess: Fact<{ rss: number; cpu: number; uptimeSec: number }>; // DSH 自身进程
-  tokens: Fact<{
-    contextWindow?: number;      // ctx.llm.resolveModelInfo().context 或 contextPressure.contextWindow
-    contextUsed?: number;        // ctx.tokenMeter.contextPressure(session).pressureTokens
-    contextProjected?: number;   // projectedTokens：下一次请求的规模
-    sessionUsage: { input: number; output: number; cacheRead: number; cacheWrite: number };  // tokenUsage 投影
-    balance?: { amount: number; currency: string; source: string };  // 提供方余额，只有提供方有接口时（如 DeepSeek 官方 /user/balance）
-  }>;
-}
+export type Body = Omit<SharedBody, 'memory'> & {
+  // vm_stat 额外给出 cached files 字节数；插件契约之外的本机扩展字段
+  memory: Fact<NonNullable<SharedBody['memory']['value']> & { cached?: number }>;
+};
 
 export type CpuValue = NonNullable<Body['cpu']['value']>;
 export type MemoryValue = NonNullable<Body['memory']['value']>;
@@ -54,8 +25,6 @@ export type NetworkValue = NonNullable<Body['network']['value']>;
 export type ProcessValue = NonNullable<Body['harnessProcess']['value']>;
 export type TokensValue = NonNullable<Body['tokens']['value']>;
 export type BalanceValue = NonNullable<TokensValue['balance']>;
-
-export type FactStatus = Fact<unknown>['status'];
 
 export interface TokenSource {
   read(): Promise<Fact<Body['tokens']['value']>>;

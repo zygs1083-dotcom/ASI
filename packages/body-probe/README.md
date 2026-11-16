@@ -1,12 +1,16 @@
 # @asi/body-probe
 
 Periodic sampler for the "body vitals" facts in `docs/DESIGN.md` §2.2b, used
-by `asi-sense` to fill `self.body`.
+by `asi-sense` to fill `self.body`. Fact/disk contract types come from
+`@asi/sense-types` (`workspace:*`) and are re-exported from
+`src/types.ts` — consumers may import `Fact`, `FactStatus`, `SourceRef`,
+`DiskVolume`, `DisksFact` and `Body` from either package; only the UI- or
+probe-local extensions (e.g. memory `cached`) are declared here.
 
 ```ts
 import { BodyProbe } from '@asi/body-probe';
 
-const probe = new BodyProbe();          // optional: (collectors, { now, wall })
+const probe = new BodyProbe();          // optional: (collectors, { now, wall, platform })
 const off = probe.onSample((body) => { /* render gauges */ });
 probe.start({ intervalMs: 2000 });          // immediate tick, then every 2s
 // probe.start({ intervalMs: 2000, cadence: { memoryMs: 10_000 } }); // cadence override
@@ -34,12 +38,16 @@ and seconds. `disks.mount` is the queried path (`/` or resolved cwd; statfs
 reports no mountpoint name). Each disk volume also carries optional
 `status: 'ok' | 'stale'`, `observedAt` and `ttlMs`; volumes that never
 succeeded are omitted from `value` (no fabricated numbers) and listed in the
-fact's `unavailableMounts`. `thermal` is a placeholder `unavailable` — real
+fact's `unavailableMounts`. The shared optional `status` field accepts any
+`FactStatus`, including availability failures from other producers.
+`thermal` is a placeholder `unavailable` — real
 data is owned by the asi-sense helper. `tokens` is `unavailable` without an
 injected `TokenSource`.
 
 Formulas: `memory.used = (max(0, anonymous - purgeable) + wired + compressor-occupied) * pageSize`,
 `memory.cached = (file-backed + purgeable) * pageSize` (vm_stat fields).
+Simultaneously-due pressure and swap reads share one `sysctl -n <keys>` process,
+each keeping its own cache period.
 
 Cadence: `start({ cadence })` accepts a `Partial<SamplingCadence>`
 (`memoryMs`, `networkMs`, `disksMs`, `batteryMs`, `pressureMs`, `swapMs`,
@@ -92,6 +100,34 @@ per-volume period (`ttlMs/3`) elapses; equal `stat.dev` volumes dedup with
 releasing locks, and the BodyProbe default calls the sampler every tick
 while it enforces `disksMs` internally (an injected `collectors.disks`
 keeps the whole-group outer cache instead).
+
+The returned `DisksFact` aggregates per-volume state without letting one bad
+mount veto the rest: the parent `status` is `ok` whenever at least one
+returned volume is fresh, `stale` only when every retained record is stale,
+and `unknown` when no records exist at all (`denied`/`unsupported` still come
+straight from collection failures). Parent `observedAt`/`ttlMs` are computed
+over **fresh volumes only** (oldest fresh `observedAt`, earliest fresh
+absolute expiry — matching the shared `DisksFact` contract in
+`@asi/sense-types`); they fall back to all records when no fresh volume
+remains. Per-volume `status`/`observedAt`/`ttlMs` are authoritative for that
+mount; volumes that never declared metadata inherit the parent's effective
+status. `unavailableMounts` always wins over a same-named record in `value`.
+`latest()` re-aggregates the disk parent between publications using the
+remaining monotonic deadlines; TTL expires at the deadline itself. After a
+wall-clock jump, its returned disk TTLs express those deadlines against the
+current wall clock while retaining the original observation timestamps.
+`DisksFact` carries `kind: 'disks'`; use `disksStatusAt(disks, now)` for
+its aggregate status or `effectiveDisks(disks, now)` for per-volume
+freshness. A `null` or empty value is `unknown` for `ok`, `stale`,
+`unavailable`, and `unknown`; `denied` and `unsupported` retain their
+status so consumers can guide authorization or explain missing support.
+
+```ts
+import { disksStatusAt, effectiveDisks } from '@asi/sense-types';
+const status = disksStatusAt(body.disks, now);
+const volumes = effectiveDisks(body.disks, now).value;
+```
+
 `collectDisks` remains the standalone sequential helper: it checks its
 `AbortSignal` before every `stat`/`statfs`.
 
@@ -114,7 +150,8 @@ credentials), bounded at 1s, TTL 10min, first `balance_infos` entry.
 ## Commands
 
 ```sh
-pnpm install --ignore-workspace
+pnpm install                              # at the workspace root (links @asi/sense-types)
+cd packages/body-probe
 pnpm typecheck && pnpm test && pnpm check
 pnpm smoke   # 60s; total CPU including children must be <= 0.6%
 ```
@@ -128,12 +165,12 @@ Memory output uses GiB (2^30 bytes); Activity Monitor labels these units GB.
 
 ## Packaging (transitional)
 
-Until a root `pnpm-workspace.yaml` exists, the package pins
-`packageManager: "pnpm@10.24.0"` (auto-downloaded into the pnpm cache, not a
-global install) and approves esbuild's install script via
-`pnpm.onlyBuiltDependencies` in `package.json`. On merge the coordinator
-removes the child `packageManager` pin and moves build approval to the root
-workspace file.
+A root `pnpm-workspace.yaml` now exists and this package consumes
+`@asi/sense-types` via `workspace:*`. esbuild's install script is approved at
+the root (`allowBuilds: esbuild: true`); the child `package.json` still pins
+`packageManager: "pnpm@10.24.0"` and `pnpm.onlyBuiltDependencies` from the
+standalone era — safe to drop alongside `.npmrc` once the coordinator
+confirms nothing else needs the pin.
 
 The local `.npmrc` contains only `manage-package-manager-versions=true` so
 the `packageManager` pin is honored even where the machine's global pnpm

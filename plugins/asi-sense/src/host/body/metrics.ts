@@ -1,5 +1,5 @@
 import type { BodyThresholdSample, Fact, Signal } from '@asi/sense-types';
-import { factStatusAt } from '@asi/sense-types';
+import { effectiveDisks, factStatusAt } from '@asi/sense-types';
 
 /** A signal emitted by a body evaluator; `layer` names the §2.2c tier. */
 export type BodySignal = Signal & { layer: 'floor' | 'rate' | 'baseline' };
@@ -39,8 +39,8 @@ export function readMetrics(sample: BodyThresholdSample): Map<string, Metric> {
   if (mem && finite(mem.total) && mem.total > 0 && inRange(mem.used, 0, mem.total)) {
     out.set('memory', { value: mem.used / mem.total });
   }
-  for (const d of okFact(body.disks, at) ?? []) {
-    if (finite(d.total) && d.total > 0 && inRange(d.free, 0, d.total)) {
+  for (const d of effectiveDisks(body.disks, at).value ?? []) {
+    if (d.status === 'ok' && finite(d.total) && d.total > 0 && inRange(d.free, 0, d.total)) {
       out.set(`disk:${d.mount}`, { value: d.free, floor: d.total * 0.05 });
     }
   }

@@ -4,6 +4,14 @@
  * tests as raw TypeScript source (private workspace package).
  */
 
+import type { Body } from './body.js';
+import { ttlStatusAt } from './freshness.js';
+
+export type { Body } from './body.js';
+export type { DisksFact, DiskVolume } from './disks.js';
+export { disksStatusAt, diskVolumeAt, effectiveDisks } from './disks.js';
+export { ttlStatusAt } from './freshness.js';
+
 /** Identifies a signal/fact producer: which source, via which API, on which host. */
 export interface SourceRef {
   id: string;
@@ -25,12 +33,11 @@ export interface Fact<T> {
 
 /**
  * Computes the effective status of a fact at `now`.
- * Only `ok` can become `stale` (when `now >= observedAt + ttlMs`); every
- * non-`ok` status is preserved as stored.
+ * `ok` facts become stale at `now >= observedAt + ttlMs`.
+ * Disk facts use `disksStatusAt` instead.
  */
-export function factStatusAt(fact: Fact<unknown>, now: number): FactStatus {
-  if (fact.status !== 'ok') return fact.status;
-  return now >= fact.observedAt + fact.ttlMs ? 'stale' : 'ok';
+export function factStatusAt(fact: Fact<unknown> & { kind?: never }, now: number): FactStatus {
+  return ttlStatusAt(fact, now);
 }
 
 /** Who caused a signal, for self-cause suppression. */
@@ -65,45 +72,6 @@ export interface JobSummary {
   pid?: number;
   status: 'running' | 'exited';
   exitCode?: number;
-}
-
-/** Agent "body vitals" facts (DESIGN §2.2b). */
-export interface Body {
-  cpu: Fact<{
-    usage: number;
-    perCore: number[];
-    load1: number;
-    load5: number;
-    load15: number;
-  }>;
-  memory: Fact<{
-    total: number;
-    used: number;
-    pressure: 'normal' | 'warn' | 'critical';
-    swapUsed: number;
-  }>;
-  disks: Fact<Array<{ mount: string; total: number; free: number }>>;
-  /** `null` value on desktops without a battery. */
-  battery: Fact<{
-    percent: number;
-    charging: boolean;
-    minutesLeft?: number;
-  } | null>;
-  thermal: Fact<'nominal' | 'fair' | 'serious' | 'critical'>;
-  network: Fact<{ online: boolean; rxBps: number; txBps: number }>;
-  harnessProcess: Fact<{ rss: number; cpu: number; uptimeSec: number }>;
-  tokens: Fact<{
-    contextWindow?: number;
-    contextUsed?: number;
-    contextProjected?: number;
-    sessionUsage: {
-      input: number;
-      output: number;
-      cacheRead: number;
-      cacheWrite: number;
-    };
-    balance?: { amount: number; currency: string; source: string };
-  }>;
 }
 
 /** The agent's own state. */

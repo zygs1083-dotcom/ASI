@@ -93,14 +93,23 @@
   line-height: 12px;
   font-variant-numeric: tabular-nums;
   color: var(--dsw-alias-label-secondary, #61666b);
+  border-radius: 2px;
+  padding: 0 2px;
+  pointer-events: none;
+}
+
+/* y 轴极值标签：不透明侧栏底色，盖住曲线保证可读（不用半透明混色）。 */
+.axisYMax,
+.axisYMin {
+  background: var(--dsw-specific-sidebar-fill, #f9fafb);
+}
+
+.thrLabel {
   background: color-mix(
     in srgb,
     var(--dsw-specific-sidebar-fill, #f9fafb) 72%,
     transparent
   );
-  border-radius: 2px;
-  padding: 0 2px;
-  pointer-events: none;
 }
 
 .axisYMax {

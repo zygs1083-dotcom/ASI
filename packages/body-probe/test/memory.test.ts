@@ -10,8 +10,13 @@ const run =
   (vmStat: string, pressure: string, swap: string): RunFn =>
   async (file, args = []) => {
     if (file.endsWith('vm_stat')) return vmStat;
-    if (args.includes('kern.memorystatus_vm_pressure_level')) return pressure;
-    if (args.includes('vm.swapusage')) return swap;
+    if (file.endsWith('sysctl')) {
+      return args.slice(1).map((key) => {
+        if (key === 'kern.memorystatus_vm_pressure_level') return pressure.trimEnd();
+        if (key === 'vm.swapusage') return swap.trimEnd();
+        throw new Error(`unexpected sysctl key ${key}`);
+      }).join('\n');
+    }
     throw new Error(`unexpected command ${file} ${args.join(' ')}`);
   };
 
@@ -111,12 +116,14 @@ describe('MemorySampler', () => {
     let fail = true;
     const runFn: RunFn = async (file, args = []) => {
       if (file.endsWith('vm_stat')) return fx('vm_stat.txt');
-      if (args.includes('vm.swapusage')) {
-        calls += 1;
-        if (fail) throw new Error('swap down');
-        return fx('swapusage.txt');
-      }
-      return '1\n';
+      if (args.includes('vm.swapusage')) calls += 1;
+      return args.slice(1).map((key) => {
+        if (key === 'vm.swapusage') {
+          if (fail) throw new Error('swap down');
+          return fx('swapusage.txt').trimEnd();
+        }
+        return '1';
+      }).join('\n');
     };
     const s = new MemorySampler({ platform: 'darwin', run: runFn, now: () => t });
     expect((await s.sample()).status).toBe('unavailable');
@@ -134,12 +141,14 @@ describe('MemorySampler', () => {
     let t = 0, calls = 0, fail = true;
     const runFn: RunFn = async (file, args = []) => {
       if (file.endsWith('vm_stat')) return fx('vm_stat.txt');
-      if (args.includes('kern.memorystatus_vm_pressure_level')) {
-        calls += 1;
-        if (fail) throw new Error('pressure down');
-        return '1\n';
-      }
-      return fx('swapusage.txt');
+      if (args.includes('kern.memorystatus_vm_pressure_level')) calls += 1;
+      return args.slice(1).map((key) => {
+        if (key === 'kern.memorystatus_vm_pressure_level') {
+          if (fail) throw new Error('pressure down');
+          return '1';
+        }
+        return fx('swapusage.txt').trimEnd();
+      }).join('\n');
     };
     const s = new MemorySampler({ platform: 'darwin', run: runFn, now: () => t });
     expect((await s.sample()).status).toBe('unavailable'); // rejected: not cached
@@ -189,11 +198,10 @@ describe('MemorySampler', () => {
     let pressureCalls = 0;
     const runFn: RunFn = async (file, args = []) => {
       if (file.endsWith('vm_stat')) return fx('vm_stat.txt');
-      if (args.includes('kern.memorystatus_vm_pressure_level')) {
-        pressureCalls += 1;
-        return '1\n';
-      }
-      return fx('swapusage.txt');
+      if (args.includes('kern.memorystatus_vm_pressure_level')) pressureCalls += 1;
+      return args.slice(1).map((key) =>
+        key === 'kern.memorystatus_vm_pressure_level' ? '1' : fx('swapusage.txt').trimEnd(),
+      ).join('\n');
     };
     const s = new MemorySampler({ platform: 'darwin', run: runFn, now: () => mono });
     const periods = { pressureMs: 60_000, swapMs: 60_000 };
@@ -226,5 +234,39 @@ describe('MemorySampler', () => {
     const f = await s.sample();
     expect(f.status).toBe('unavailable');
     expect(runSpy).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    [{ pressureMs: 5000, swapMs: 30_000 }, 'kern.memorystatus_vm_pressure_level'],
+    [{ pressureMs: 30_000, swapMs: 5000 }, 'vm.swapusage'],
+  ] as const)('batches simultaneous uncached sysctl OIDs into one call: %j', async (periods, shortKey) => {
+    let t = 0;
+    const calls: string[][] = [];
+    const signals: (AbortSignal | undefined)[] = [];
+    const runFn: RunFn = async (file, args = [], signal) => {
+      if (file.endsWith('vm_stat')) return fx('vm_stat.txt');
+      calls.push([...args]);
+      signals.push(signal);
+      return args.slice(1).map((key) =>
+        key === 'vm.swapusage' ? fx('swapusage.txt') : '1',
+      ).join('\n');
+    };
+    const s = new MemorySampler({ platform: 'darwin', run: runFn, now: () => t });
+    const controller = new AbortController();
+    const both = ['-n', 'kern.memorystatus_vm_pressure_level', 'vm.swapusage'];
+    t = 0;
+    expect((await s.sample(6000, controller.signal, periods)).status).toBe('ok');
+    expect(calls).toEqual([both]);
+    t = 6000;
+    expect((await s.sample(6000, controller.signal, periods)).status).toBe('ok');
+    expect(calls.at(-1)).toEqual(['-n', shortKey]);
+    t = 7000;
+    expect((await s.sample(6000, controller.signal, periods)).status).toBe('ok');
+    expect(calls).toHaveLength(2);
+    t = 30_000;
+    expect((await s.sample(6000, controller.signal, periods)).status).toBe('ok');
+    expect(calls.at(-1)).toEqual(both);
+    expect(signals).toHaveLength(3);
+    expect(signals.every((sig) => sig === controller.signal)).toBe(true);
   });
 });

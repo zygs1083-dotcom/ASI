@@ -149,7 +149,7 @@ function TokenSummary({
           <TokenRing
             used={v.contextUsed!}
             total={v.contextWindow!}
-            threshold={v.compressionThreshold}
+            threshold={fresh ? v.compressionThreshold : undefined}
             size={92}
             unconfirmed={!confirmed}
           />
@@ -167,12 +167,14 @@ function TokenSummary({
                 {formatPercent(Math.max(0, left! / v.contextWindow!))}）
               </span>
             )}
-            <span className={css.tileSub}>
-              预计下次{' '}
-              {v.contextProjected != null
-                ? formatTokens(v.contextProjected)
-                : '未提供'}
-            </span>
+            {fresh && (
+              <span className={css.tileSub}>
+                预计下次{' '}
+                {v.contextProjected != null
+                  ? formatTokens(v.contextProjected)
+                  : '未提供'}
+              </span>
+            )}
             {fillMin != null && (
               <span className={css.tileSub}>
                 按当前速度约 {fillMin} 分钟填满
@@ -187,13 +189,14 @@ function TokenSummary({
         本会话 输入 {formatTokens(input)} · 输出 {formatTokens(output)} ·
         缓存命中率 {input > 0 ? formatPercent(cacheRead / input) : '暂无输入'}
       </span>
-      {hasContext && confirmed && (
+      {hasContext && confirmed && fresh && (
         <span className={css.tileSub}>
           <CompressionDistance v={v} />
         </span>
       )}
       <BalanceLine v={v} />
       <Sparkline
+        metric="tokens"
         points={model.history.tokens}
         now={now}
         label="上下文占用"

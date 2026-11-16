@@ -1,56 +1,21 @@
 /** CPU / 内存 指标卡片（温控/电池见 tiles-extra）。 */
 
-import { memo, type ReactNode } from 'react'
 import { FactStatusText } from '../fact'
 import {
   formatBytes,
   formatLoad,
   formatPercent,
 } from '../format'
-import { isUsable, type BodyRowKey } from '../health'
+import { isUsable } from '../health'
 import { Sparkline } from '../sparkline'
 import { chartThresholds } from '../thresholds'
 import { CpuIcon, MemoryIcon } from '../icons'
-import type { SensePanelModel, SensePanelProps } from '../view-model'
 import { Tile, TileDetail } from './tile'
+import { memoTile, type MetricTileProps } from './tile-memo'
 import css from './body.module.css'
 
-export interface TileCtx {
-  model: SensePanelProps['model']
-  onAdjust?: () => void
-  onOpenPermissionSettings: () => void
-}
-
-type Rows = ReturnType<typeof import('../health').evaluateBody>['rows']
-
-export interface MetricTileProps {
-  model: SensePanelModel
-  rows: Rows
-  ctx: TileCtx
-}
-
-// 指标卡片 memo：仅自身事实/相关引用、行严重度、now/events、回调变化才重渲。
-export function memoTile(
-  key: BodyRowKey,
-  deps: (m: SensePanelModel) => readonly unknown[],
-  C: (p: MetricTileProps) => ReactNode,
-) {
-  return memo(C, (a, b) => {
-    if (
-      a.model.now !== b.model.now ||
-      a.model.events !== b.model.events ||
-      a.rows[key].severity !== b.rows[key].severity ||
-      a.rows[key].hidden !== b.rows[key].hidden ||
-      a.ctx.onAdjust !== b.ctx.onAdjust ||
-      a.ctx.onOpenPermissionSettings !== b.ctx.onOpenPermissionSettings
-    ) {
-      return false
-    }
-    const da = deps(a.model)
-    const db = deps(b.model)
-    return da.length === db.length && da.every((d, i) => d === db[i])
-  })
-}
+export { memoTile } from './tile-memo'
+export type { MetricTileProps, TileCtx } from './tile-memo'
 
 const PRESSURE_TEXT = {
   normal: '压力正常',
@@ -118,6 +83,7 @@ export const CpuTile = memoTile(
               {formatLoad(val.load15)}
             </span>
             <Sparkline
+              metric="cpu"
               points={model.history.cpu}
               now={now}
               label="CPU 使用率"
@@ -225,6 +191,7 @@ export const MemoryTile = memoTile(
               </span>
             )}
             <Sparkline
+              metric="memory"
               points={model.history.memory}
               now={now}
               label="内存占用"

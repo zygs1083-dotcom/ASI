@@ -2,20 +2,10 @@ import { performance } from 'node:perf_hooks';
 import type { Fact, FactStatus, JobSummary, SenseState, Signal } from '@asi/sense-types';
 import { FACT_PATHS, factAt, initialState, num, recomputeStatuses, str, ttlOf } from './facts.ts';
 import { FACT_STATUSES, sourceObservation } from './source-health.ts';
+import { type JobTrack, mergeJobs, noteFile } from './updates.ts';
 
 const ACTIVITIES: ReadonlySet<string> = new Set(['idle', 'thinking', 'tool', 'waiting-user']);
 type Activity = 'idle' | 'thinking' | 'tool' | 'waiting-user';
-
-/** Per-job event tracking: jobs are independent even inside one aggregate fact. */
-interface JobTrack {
-  /** Latest accepted event time for this job; older/same-time input is ignored. */
-  lastEventAt: number;
-  /** True once `job.exited` landed — an exit tombstone that outlives the value entry. */
-  exited: boolean;
-  /** Store-clock receipt of the latest accepted event (tombstone retention). */
-  receivedAt: number;
-  job?: JobSummary;
-}
 
 /**
  * In-memory fact table (DESIGN §2.2); the host feeds it signals and reads
@@ -134,7 +124,7 @@ export class StateStore {
         this.setFact(this.state.env.focusedWindow, { title: str(d.title) }, s);
         break;
       case 'file.changed':
-        this.noteFile(s);
+        noteFile(this.state, s, this.defaultTtlMs);
         break;
       case 'job.started':
         this.noteJobStart(s);
@@ -197,26 +187,6 @@ export class StateStore {
 
   private jobId(signal: Signal): string {
     return typeof signal.data.id === 'string' ? signal.data.id : signal.subject;
-  }
-
-  private noteFile(signal: Signal): void {
-    const fact = this.state.env.watchedPaths;
-    const path = typeof signal.data.path === 'string' ? signal.data.path : signal.subject;
-    // Null-prototype map: '__proto__'/'constructor' paths write safely.
-    const map: Record<string, { lastChange: number; changes: number }> = Object.assign(Object.create(null), fact.value);
-    const entry = map[path];
-    if (entry && signal.at < entry.lastChange) return;
-    const c = num(signal.data.changes);
-    map[path] = {
-      lastChange: signal.at,
-      changes: (entry?.changes ?? 0) + (c !== undefined && c > 0 ? Math.floor(c) : 1),
-    };
-    const observedAt = fact.status === 'unknown' ? signal.at : Math.max(fact.observedAt, signal.at);
-    fact.value = map;
-    fact.status = 'ok';
-    fact.source = signal.source;
-    fact.observedAt = observedAt;
-    fact.ttlMs = ttlOf(signal.data.ttlMs, this.defaultTtlMs);
   }
 
   /** Drops exit tombstones past the retention window (monotonic clock). */
@@ -283,6 +253,13 @@ export class StateStore {
     // An absent `value` must not clobber a known fact with undefined.
     if (!Object.hasOwn(signal.data, 'value')) return;
     if (status !== undefined && (typeof status !== 'string' || !FACT_STATUSES.has(status))) return;
+    const unavailable = signal.data.unavailableMounts;
+    if (
+      path === 'self.body.disks' &&
+      unavailable !== undefined &&
+      (!Array.isArray(unavailable) || !unavailable.every((mount) => typeof mount === 'string'))
+    )
+      return;
     const fact = factAt(this.state, path);
     if (path === 'env.activeJobs') {
       // A report older than the newest accepted one is dropped before ANY
@@ -301,34 +278,15 @@ export class StateStore {
     fact.source = signal.source;
     fact.observedAt = signal.at;
     fact.ttlMs = ttlOf(signal.data.ttlMs, this.defaultTtlMs);
+    if (path === 'self.body.disks') {
+      if (unavailable === undefined) delete this.state.self.body.disks.unavailableMounts;
+      else this.state.self.body.disks.unavailableMounts = unavailable as string[];
+    }
     if (path === 'env.activeJobs') {
       this.jobSnapshotAt = signal.at;
       this.jobObservedAt = Math.max(this.jobObservedAt, signal.at);
-      // Merge per job id, newer event wins: a report clears running tracks
-      // only at or below `at`, seeds listed jobs, rebuilds the value from
-      // tracking; `null` survives only if no newer running job does.
       this.pruneJobs();
-      for (const [id, track] of this.jobs) {
-        if (!track.exited && track.lastEventAt <= signal.at) this.jobs.delete(id);
-      }
-      if (Array.isArray(value)) {
-        for (const j of value as JobSummary[]) {
-          if (!j || typeof j !== 'object' || typeof j.id !== 'string') continue;
-          const track = this.jobs.get(j.id);
-          if (track && track.lastEventAt > signal.at) continue; // a newer event wins
-          const running = j.status !== 'exited';
-          this.jobs.set(j.id, {
-            lastEventAt: signal.at,
-            exited: !running,
-            receivedAt: this.monotonic(),
-            ...(running ? { job: j } : {}),
-          });
-        }
-      }
-      const running = [...this.jobs.values()].flatMap((t) => (t.exited || !t.job ? [] : [t.job]));
-      // the merged tracking is authoritative except a bare non-array report
-      // (null) whose surviving newer running tracks keep it an array
-      if (Array.isArray(value) || running.length > 0) fact.value = running;
+      mergeJobs(this.jobs, fact, value, signal.at, this.monotonic);
     }
   }
 

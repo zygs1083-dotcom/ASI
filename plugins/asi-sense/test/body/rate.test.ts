@@ -4,7 +4,17 @@ import { describe, expect, it } from 'vitest';
 import { RateEvaluator, type RateRule } from '../../src/host/body/rate.ts';
 import { type AdaptiveState, BODY_HISTORY } from '../../src/host/body/state.ts';
 import { SRC } from '../helpers.ts';
-import { cpuBody, ctxBody, diskBody, f, mkBody, rssBody, SRC2, freshSample as sample, sampleSrc } from './helpers.ts';
+import {
+  cpuBody,
+  ctxBody,
+  diskBody,
+  diskFact,
+  mkBody,
+  rssBody,
+  SRC2,
+  freshSample as sample,
+  sampleSrc,
+} from './helpers.ts';
 
 const deltaRule = (over: Partial<RateRule> = {}): RateRule =>
   ({
@@ -101,7 +111,7 @@ describe('RateEvaluator wildcard metrics', () => {
     const e = ev([{ id: 'd', metric: 'disk:*', windowMs: 60_000, direction: 'down', maxDelta: 100 }]);
     const both = (a: number, b: number) =>
       mkBody({
-        disks: f([
+        disks: diskFact([
           { mount: '/', total: 1000, free: a },
           { mount: '/v', total: 1000, free: b },
         ]),

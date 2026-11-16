@@ -2,6 +2,7 @@ import { defineConfig } from 'vitest/config'
 
 export default defineConfig({
   esbuild: { jsx: 'automatic' },
+  define: { 'import.meta.env.ASI_PERF_STRICT': JSON.stringify(process.env.ASI_PERF_STRICT ?? '') },
   test: {
     globals: true,
     include: ['test/unit/**/*.test.{ts,tsx}'],

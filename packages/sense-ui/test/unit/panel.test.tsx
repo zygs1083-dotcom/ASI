@@ -1,5 +1,12 @@
 import { describe, expect, it, vi } from 'vitest'
-import { cleanup, fireEvent, render, screen, within } from '@testing-library/react'
+import {
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from '@testing-library/react'
 import { afterEach } from 'vitest'
 import { SensePanel } from '../../src/SensePanel'
 import type { SensePanelProps, SensePanelModel } from '../../src/view-model'
@@ -38,16 +45,20 @@ function openSection(name: string): HTMLDetailsElement {
   return details
 }
 
-function openTile(key: string): HTMLDetailsElement {
+async function openTile(key: string): Promise<HTMLDetailsElement> {
   const details = document.querySelector<HTMLDetailsElement>(
     `details[data-tile="${key}"]`,
   )!
   if (!details.open) fireEvent.click(details.querySelector('summary')!)
+  // toggle 事件由浏览器按任务派发，detail 懒挂载需等下一轮渲染
+  await waitFor(() =>
+    expect(details.querySelector('[class*="tileDetail"]')).toBeTruthy(),
+  )
   return details
 }
 
 describe('结构与分区', () => {
-  it('身体/现在/事件流默认展开，规则默认收起', () => {
+  it('身体/现在/事件流默认展开，规则默认收起', async () => {
     renderPanel(makeScenario('healthy'))
     expect(screen.getByText('环境感知')).toBeTruthy()
     for (const name of ['身体', '现在', '事件流']) {
@@ -59,7 +70,7 @@ describe('结构与分区', () => {
     expect(rules.open).toBe(false)
   })
 
-  it('summary 点击可折叠/展开（含规则分区）', () => {
+  it('summary 点击可折叠/展开（含规则分区）', async () => {
     renderPanel(makeScenario('healthy'))
     const summary = screen.getByText('事件流', { selector: 'summary' })
     const details = summary.closest('details')!
@@ -74,7 +85,7 @@ describe('结构与分区', () => {
     expect(rulesDetails.open).toBe(false)
   })
 
-  it('监护概览给出严重度词与整句评估', () => {
+  it('监护概览给出严重度词与整句评估', async () => {
     const { view } = renderPanel(makeScenario('healthy'))
     expect(screen.getByText('状态良好')).toBeTruthy()
     expect(document.querySelector('[class*="monitor"]')!.getAttribute('data-sev')).toBe('good')
@@ -87,33 +98,33 @@ describe('结构与分区', () => {
     expect(screen.getByText('数据待补全')).toBeTruthy()
   })
 
-  it('rapid-change 有磁盘投影时优先警示行显示见底时间', () => {
+  it('rapid-change 有磁盘投影时优先警示行显示见底时间', async () => {
     renderPanel(makeScenario('rapid-change'))
     expect(screen.getByText('磁盘 9 分钟后见底')).toBeTruthy()
   })
 })
 
 describe('事实状态呈现', () => {
-  it('denied 显示原因与授权按钮', () => {
+  it('denied 显示原因与授权按钮', async () => {
     const { props } = renderPanel(makeScenario('permission-denied'))
     const buttons = screen.getAllByText('授权')
     fireEvent.click(buttons[0]!)
     expect(props.onOpenPermissionSettings).toHaveBeenCalledOnce()
   })
 
-  it('stale 显示保留值与过期标记', () => {
+  it('stale 显示保留值与过期标记', async () => {
     renderPanel(makeScenario('permission-denied'))
     expect(screen.getAllByText(/已过期/).length).toBeGreaterThan(0)
   })
 
-  it('余额缺失显示说明而不是 0', () => {
+  it('余额缺失显示说明而不是 0', async () => {
     const model = makeScenario('context-almost-full')
     renderPanel(model)
     expect(screen.getByText(/提供方未提供余额接口/)).toBeTruthy()
     expect(screen.queryByText(/^0$/)).toBeNull()
   })
 
-  it('上下文缺数据时明示不可用与未提供项，不按 0 渲染', () => {
+  it('上下文缺数据时明示不可用与未提供项，不按 0 渲染', async () => {
     const state = makeState()
     state.self.body.tokens = fact({
       sessionUsage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 },
@@ -126,12 +137,12 @@ describe('事实状态呈现', () => {
     expect(screen.queryByText(/^0$/)).toBeNull()
   })
 
-  it('台式机电池 null 时隐藏电池卡片', () => {
+  it('台式机电池 null 时隐藏电池卡片', async () => {
     renderPanel(makeScenario('desktop-no-battery'))
     expect(document.querySelector('details[data-tile="battery"]')).toBeNull()
   })
 
-  it('电池 denied 时渲染状态而非隐藏', () => {
+  it('电池 denied 时渲染状态而非隐藏', async () => {
     const state = makeState()
     state.self.body.battery = fact(null, { status: 'denied', reason: '未授权电池信息' })
     renderPanel({ ...makeScenario('healthy'), state })
@@ -141,7 +152,7 @@ describe('事实状态呈现', () => {
 })
 
 describe('指标卡片布局与折叠', () => {
-  it('Token 卡片跨两列，其余卡片单列；全部初始收起', () => {
+  it('Token 卡片跨两列，其余卡片单列；全部初始收起', async () => {
     renderPanel(makeScenario('healthy'))
     const token = document.querySelector('details[data-tile="tokens"]')!
     expect(token.getAttribute('data-span2')).toBe('true')
@@ -151,9 +162,9 @@ describe('指标卡片布局与折叠', () => {
     }
   })
 
-  it('展开的卡片跨整行，明细里才有来源与阈值行', () => {
+  it('展开的卡片跨整行，明细里才有来源与阈值行', async () => {
     renderPanel(makeScenario('healthy'))
-    const details = openTile('cpu')
+    const details = await openTile('cpu')
     expect(details.open).toBe(true)
     const scoped = within(details)
     expect(scoped.getByText(/来源/)).toBeTruthy()
@@ -162,9 +173,9 @@ describe('指标卡片布局与折叠', () => {
     expect(scoped.getByText('基线')).toBeTruthy()
   })
 
-  it('卡片「调整」入口打开规则分区并聚焦调整日志', () => {
+  it('卡片「调整」入口打开规则分区并聚焦调整日志', async () => {
     renderPanel(makeScenario('rapid-change'))
-    const details = openTile('memory')
+    const details = await openTile('memory')
     fireEvent.click(within(details).getByText('调整'))
     const rules = screen.getByText('规则', { selector: 'summary' }).closest('details')!
     expect(rules.open).toBe(true)
@@ -172,13 +183,13 @@ describe('指标卡片布局与折叠', () => {
     expect((document.activeElement as HTMLElement).textContent).toContain('采样间隔')
   })
 
-  it('告警卡片有文字严重度标签，不只靠颜色', () => {
+  it('告警卡片有文字严重度标签，不只靠颜色', async () => {
     renderPanel(makeScenario('memory-pressure'))
     const mem = document.querySelector('details[data-tile="memory"]')!
     expect(within(mem as HTMLElement).getByText('注意')).toBeTruthy()
   })
 
-  it('无内存细分时只画 used/free 单段并在明细明示未提供', () => {
+  it('无内存细分时只画 used/free 单段并在明细明示未提供', async () => {
     const state = makeState()
     const mem = { ...state.self.body.memory.value! }
     delete mem.breakdown
@@ -186,19 +197,19 @@ describe('指标卡片布局与折叠', () => {
     renderPanel({ ...makeScenario('healthy'), state })
     const strip = document.querySelector('details[data-tile="memory"] [class*="memStrip"]')!
     expect(strip.children).toHaveLength(1)
-    const details = openTile('memory')
+    const details = await openTile('memory')
     expect(within(details).getByText('内存细分未提供')).toBeTruthy()
   })
 
-  it('有内存细分时按 App/联动/压缩/缓存 四段渲染', () => {
+  it('有内存细分时按 App/联动/压缩/缓存 四段渲染', async () => {
     renderPanel(makeScenario('healthy'))
     const strip = document.querySelector('details[data-tile="memory"] [class*="memStrip"]')!
     expect(strip.children).toHaveLength(4)
-    const details = openTile('memory')
+    const details = await openTile('memory')
     expect(within(details).getByText(/App .*联动.*压缩.*缓存/)).toBeTruthy()
   })
 
-  it('contextProjected 缺失显示未提供，增速缺失不估算填满', () => {
+  it('contextProjected 缺失显示未提供，增速缺失不估算填满', async () => {
     const state = makeState()
     const t = { ...state.self.body.tokens.value! }
     delete t.contextProjected
@@ -209,7 +220,7 @@ describe('指标卡片布局与折叠', () => {
     expect(document.body.textContent).not.toContain('按当前速度')
   })
 
-  it('contextGrowthPerMinute 提供时在摘要估算填满分钟数', () => {
+  it('contextGrowthPerMinute 提供时在摘要估算填满分钟数', async () => {
     renderPanel(makeScenario('healthy'))
     // (128000-46200)/720 ≈ 113.6 → 约 114 分钟，摘要直接可见、明细不重复
     expect(screen.getByText(/按当前速度约 114 分钟填满/)).toBeTruthy()
@@ -220,7 +231,7 @@ describe('指标卡片布局与折叠', () => {
 })
 
 describe('窗口标题隐私', () => {
-  it('sendTitles=false 时标题不进入 DOM，事件主体也被遮盖', () => {
+  it('sendTitles=false 时标题不进入 DOM，事件主体也被遮盖', async () => {
     const model = { ...makeScenario('healthy'), sendTitles: false }
     renderPanel(model)
     expect(screen.getByText('标题已隐藏')).toBeTruthy()
@@ -228,14 +239,14 @@ describe('窗口标题隐私', () => {
     expect(screen.getAllByText('窗口标题已隐藏').length).toBeGreaterThan(0)
   })
 
-  it('sendTitles=true 时正常显示标题', () => {
+  it('sendTitles=true 时正常显示标题', async () => {
     renderPanel(makeScenario('healthy'))
     expect(document.body.textContent).toContain('demo.ts — project')
   })
 })
 
 describe('位置链', () => {
-  it('全部同主机时合并显示并可展开原始明细', () => {
+  it('全部同主机时合并显示并可展开原始明细', async () => {
     renderPanel(makeScenario('healthy'))
     const summary = screen.getByText('全部在 demo-host')
     const details = summary.closest('details')!
@@ -246,7 +257,7 @@ describe('位置链', () => {
     expect(details.textContent).toContain('/demo/project')
   })
 
-  it('远端模型（local=false）不合并并标注异地', () => {
+  it('远端模型（local=false）不合并并标注异地', async () => {
     const state = makeState()
     state.env.where.model = fact({
       provider: 'remote-provider',
@@ -259,7 +270,7 @@ describe('位置链', () => {
     expect(screen.getAllByText('异地').length).toBeGreaterThan(0)
   })
 
-  it('工具执行处主机不同也不合并', () => {
+  it('工具执行处主机不同也不合并', async () => {
     const state = makeState()
     state.env.where.toolExec = fact({ host: 'build-node', cwd: '/demo/project' })
     renderPanel({ ...makeScenario('healthy'), state })
@@ -270,7 +281,7 @@ describe('位置链', () => {
 })
 
 describe('事件流', () => {
-  it('超过 200 截断、每页 10 条、可翻页', () => {
+  it('超过 200 截断、每页 10 条、可翻页', async () => {
     renderPanel(makeScenario('busy-events'))
     expect(screen.getByText(/最新 200 条/)).toBeTruthy()
     expect(screen.getByText(/第 1\/20 页/)).toBeTruthy()
@@ -281,7 +292,7 @@ describe('事件流', () => {
     expect(screen.getByText(/第 1\/20 页/)).toBeTruthy()
   })
 
-  it('输入骤减时分页被钳位', () => {
+  it('输入骤减时分页被钳位', async () => {
     const { props, view } = renderPanel(makeScenario('busy-events'))
     fireEvent.click(screen.getByText('下一页'))
     expect(screen.getByText(/第 2\/20 页/)).toBeTruthy()
@@ -291,7 +302,7 @@ describe('事件流', () => {
     expect(screen.getByText(/第 1\/1 页/)).toBeTruthy()
   })
 
-  it('按分钟分组：组标题有分钟时刻/条数/唤醒数', () => {
+  it('按分钟分组：组标题有分钟时刻/条数/唤醒数', async () => {
     renderPanel(makeScenario('rapid-change'))
     // 4 条事件同分钟 → 一个组，含 2 次唤醒
     const summary = screen.getByText('4 条事件')
@@ -299,7 +310,7 @@ describe('事件流', () => {
     expect(screen.getByText('2 次唤醒')).toBeTruthy()
   })
 
-  it('含唤醒的组默认展开，普通多事件组默认收起', () => {
+  it('含唤醒的组默认展开，普通多事件组默认收起', async () => {
     const m = makeScenario('healthy')
     const boundary = Math.floor(T0 / 60_000) * 60_000
     // 三条同分钟普通事件（minute -2）→ 收起组
@@ -330,7 +341,7 @@ describe('事件流', () => {
     expect(first).toBe(wakeGroup)
   })
 
-  it('单条事件直接渲染不进分组', () => {
+  it('单条事件直接渲染不进分组', async () => {
     const m = makeScenario('healthy')
     m.events = [makeEvent(31)]
     renderPanel(m)
@@ -338,7 +349,7 @@ describe('事件流', () => {
     expect(document.querySelectorAll('li[class*="event"]')).toHaveLength(1)
   })
 
-  it('等级、合并计数与自因标注', () => {
+  it('等级、合并计数与自因标注', async () => {
     renderPanel(makeScenario('busy-events'))
     expect(screen.getAllByText('注入').length).toBeGreaterThan(0)
     expect(screen.getAllByText(/×3/).length).toBeGreaterThan(0)
@@ -351,7 +362,7 @@ describe('事件流', () => {
 })
 
 describe('规则与开关', () => {
-  it('待确认唤醒规则只有 确认/拒绝', () => {
+  it('待确认唤醒规则只有 确认/拒绝', async () => {
     const { props } = renderPanel(makeScenario('healthy'))
     openSection('规则')
     expect(screen.getByText('待确认')).toBeTruthy()
@@ -361,7 +372,7 @@ describe('规则与开关', () => {
     expect(props.onDeleteRule).toHaveBeenCalledWith('rule-pending')
   })
 
-  it('普通规则启停与删除', () => {
+  it('普通规则启停与删除', async () => {
     const { props } = renderPanel(makeScenario('healthy'))
     openSection('规则')
     const enableBox = screen.getAllByRole('checkbox').find(
@@ -374,7 +385,7 @@ describe('规则与开关', () => {
     expect(props.onDeleteRule).toHaveBeenCalled()
   })
 
-  it('暂停感知与标题开关回调', () => {
+  it('暂停感知与标题开关回调', async () => {
     const { props } = renderPanel(makeScenario('healthy'))
     openSection('规则')
     fireEvent.click(screen.getByText('暂停感知').closest('label')!.querySelector('input')!)
@@ -387,18 +398,18 @@ describe('规则与开关', () => {
 })
 
 describe('基线学习与阈值来源', () => {
-  it('learning 场景显示 37% 学习进度（progress 元素）', () => {
+  it('learning 场景显示 37% 学习进度（progress 元素）', async () => {
     renderPanel(makeScenario('learning'))
     expect(screen.getByText(/基线学习 37% · 学习中/)).toBeTruthy()
     expect(document.querySelector('progress')).toBeTruthy()
   })
 
-  it('learning strip 仅在学习状态出现', () => {
+  it('learning strip 仅在学习状态出现', async () => {
     renderPanel(makeScenario('healthy'))
     expect(screen.queryByText(/基线学习/)).toBeNull()
   })
 
-  it('learning.status=ready 时同样不显示学习条', () => {
+  it('learning.status=ready 时同样不显示学习条', async () => {
     const m = {
       ...makeScenario('healthy'),
       learning: {
@@ -412,30 +423,31 @@ describe('基线学习与阈值来源', () => {
     expect(document.querySelector('progress')).toBeNull()
   })
 
-  it('学习期无基线带（不虚构 band），未提供层明示未提供', () => {
+  it('学习期无基线带（不虚构 band），未提供层明示未提供', async () => {
     renderPanel(makeScenario('learning'))
     expect(document.querySelectorAll('[data-baseline]')).toHaveLength(0)
-    openTile('cpu')
+    await openTile('cpu')
     expect(screen.getAllByText(/显示底线/).length).toBeGreaterThan(0)
     expect(screen.getAllByText('未提供').length).toBeGreaterThan(0)
   })
 
-  it('healthy 场景提供基线带并有无障碍文案', () => {
+  it('healthy 场景提供基线带并有无障碍文案', async () => {
     renderPanel(makeScenario('healthy'))
     expect(document.querySelectorAll('[data-baseline]').length).toBeGreaterThan(0)
     expect(document.body.textContent).toContain('基线区间')
+    await openTile('cpu')
     expect(screen.getAllByText(/未触发/).length).toBeGreaterThan(0)
   })
 
-  it('rapid-change 触发的层在明细里标注出来', () => {
+  it('rapid-change 触发的层在明细里标注出来', async () => {
     renderPanel(makeScenario('rapid-change'))
-    openTile('disks')
+    await openTile('disks')
     expect(screen.getAllByText(/变化率 · 最近触发/).length).toBeGreaterThan(0)
   })
 })
 
 describe('Token 展示', () => {
-  it('剩余上下文与缓存命中率', () => {
+  it('剩余上下文与缓存命中率', async () => {
     renderPanel(makeScenario('healthy'))
     // 128_000 - 46_200 = 81_800
     expect(screen.getByText(/剩余 81.8k/)).toBeTruthy()
@@ -443,7 +455,7 @@ describe('Token 展示', () => {
     expect(screen.getByText(/缓存命中率 63%/)).toBeTruthy()
   })
 
-  it('balanceStatus=unavailable 时不泄露金额', () => {
+  it('balanceStatus=unavailable 时不泄露金额', async () => {
     const state = makeState()
     state.self.body.tokens = fact({
       contextWindow: 128_000,
@@ -458,7 +470,7 @@ describe('Token 展示', () => {
     expect(document.body.textContent).not.toContain('99.9')
   })
 
-  it('balanceStatus=denied 时授权按钮在展开明细里', () => {
+  it('balanceStatus=denied 时授权按钮在展开明细里', async () => {
     const state = makeState()
     state.self.body.tokens = fact({
       sessionUsage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
@@ -467,13 +479,13 @@ describe('Token 展示', () => {
     })
     const { props } = renderPanel({ ...makeScenario('healthy'), state })
     expect(screen.getByText(/余额无权限/)).toBeTruthy()
-    const details = openTile('tokens')
+    const details = await openTile('tokens')
     const btn = within(details).getByText('授权')
     fireEvent.click(btn)
     expect(props.onOpenPermissionSettings).toHaveBeenCalled()
   })
 
-  it('压缩阈值措辞：已达 / 预计触发 / 按下次请求距离', () => {
+  it('压缩阈值措辞：已达 / 预计触发 / 按下次请求距离', async () => {
     const base = {
       contextWindow: 128_000,
       sessionUsage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
@@ -499,7 +511,7 @@ describe('Token 展示', () => {
 })
 
 describe('调整日志与反馈', () => {
-  it('调整日志视图：参数锁、记录、撤销', () => {
+  it('调整日志视图：参数锁、记录、撤销', async () => {
     const { props } = renderPanel(makeScenario('rapid-change'))
     openSection('规则')
     fireEvent.click(screen.getByRole('button', { name: '调整日志' }))
@@ -520,7 +532,7 @@ describe('调整日志与反馈', () => {
     expect(props.onRevertTuning).toHaveBeenCalled()
   })
 
-  it('告警事件提供 有用/噪音 图标反馈并回报 signal.id', () => {
+  it('告警事件提供 有用/噪音 图标反馈并回报 signal.id', async () => {
     const { props } = renderPanel(makeScenario('rapid-change'))
     fireEvent.click(screen.getAllByRole('button', { name: '有用' })[0]!)
     expect(props.onFeedback).toHaveBeenCalledWith('sig-1', 'useful')
@@ -528,7 +540,7 @@ describe('调整日志与反馈', () => {
     expect(props.onFeedback).toHaveBeenCalledWith('sig-1', 'noise')
   })
 
-  it('普通 record 事件不显示反馈按钮', () => {
+  it('普通 record 事件不显示反馈按钮', async () => {
     const model = { ...makeScenario('healthy'), events: [makeEvent(9)] }
     renderPanel(model)
     expect(screen.queryByRole('button', { name: '有用' })).toBeNull()
@@ -537,7 +549,7 @@ describe('调整日志与反馈', () => {
 })
 
 describe('窗口类事件隐私', () => {
-  it('sendTitles=false 时 reason/ruleName/detail 中的标题不进入 DOM', () => {
+  it('sendTitles=false 时 reason/ruleName/detail 中的标题不进入 DOM', async () => {
     const model = { ...makeScenario('healthy'), sendTitles: false }
     model.events = [
       makeEvent(1, {
@@ -563,7 +575,7 @@ describe('窗口类事件隐私', () => {
 })
 
 describe('过期事实秒级年龄', () => {
-  it('stale 显示 N 秒前而非分钟', () => {
+  it('stale 显示 N 秒前而非分钟', async () => {
     const state = makeState()
     state.self.body.cpu = fact(
       { usage: 0.3, perCore: [], load1: 0, load5: 0, load15: 0 },
@@ -573,14 +585,14 @@ describe('过期事实秒级年龄', () => {
     expect(screen.getAllByText(/120 秒前/).length).toBeGreaterThan(0)
   })
 
-  it('新鲜事实不显示「刚刚」占位文字', () => {
+  it('新鲜事实不显示「刚刚」占位文字', async () => {
     renderPanel(makeScenario('healthy'))
     expect(screen.queryByText('刚刚')).toBeNull()
   })
 })
 
 describe('告警明细与磁盘严重度', () => {
-  it('sendTitles=false 时 body/file 类告警明细仍完整显示', () => {
+  it('sendTitles=false 时 body/file 类告警明细仍完整显示', async () => {
     renderPanel({ ...makeScenario('rapid-change'), sendTitles: false })
     expect(screen.getAllByText('磁盘 /').length).toBeGreaterThan(0)
     expect(screen.getAllByText('网络下行').length).toBeGreaterThan(0)
@@ -589,9 +601,9 @@ describe('告警明细与磁盘严重度', () => {
     expect(screen.getByText(/删除 70 · 过量删除/)).toBeTruthy()
   })
 
-  it('每个盘按自身 insight 严重度着色，行级标签不重复', () => {
+  it('每个盘按自身 insight 严重度着色，行级标签不重复', async () => {
     renderPanel(makeScenario('rapid-change'))
-    const tile = document.querySelector('details[data-tile="disks"]')!
+    const tile = await openTile('disks')
     // 行级最多一个严重度标签
     expect(tile.querySelectorAll('summary [class*="sevTag"]')).toHaveLength(1)
     // 每挂载点各自严重度
@@ -603,7 +615,7 @@ describe('告警明细与磁盘严重度', () => {
 })
 
 describe('余额状态权威', () => {
-  it('denied 且金额缺失时仍显示原因与授权按钮', () => {
+  it('denied 且金额缺失时仍显示原因与授权按钮', async () => {
     const state = makeState()
     state.self.body.tokens = fact({
       sessionUsage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
@@ -612,13 +624,13 @@ describe('余额状态权威', () => {
     })
     const { props } = renderPanel({ ...makeScenario('healthy'), state })
     expect(screen.getByText(/余额无权限（未授权账单接口）/)).toBeTruthy()
-    const details = openTile('tokens')
+    const details = await openTile('tokens')
     fireEvent.click(within(details).getByText('授权'))
     expect(props.onOpenPermissionSettings).toHaveBeenCalled()
     expect(document.body.textContent).not.toContain('余额 0')
   })
 
-  it('unavailable 且金额缺失时显示原因不显示占位零', () => {
+  it('unavailable 且金额缺失时显示原因不显示占位零', async () => {
     const state = makeState()
     state.self.body.tokens = fact({
       sessionUsage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
