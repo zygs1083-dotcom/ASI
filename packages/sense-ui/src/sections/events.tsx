@@ -202,7 +202,7 @@ export function EventsSection({
   return (
     <>
       <div className={css.streamMeta}>
-        最新 {newest.length} 条（上限 {MAX_EVENTS}） · 第 {current + 1}/{totalPages} 页
+        最新 {newest.length} 条（上限 {MAX_EVENTS}） · 第 {current + 1}/{totalPages} 页 · 时间：事件发生时间（变化率为评估时间）；变化率预计从事件时间起算
       </div>
       {pageItems.length === 0 && <div className={css.empty}>暂无事件</div>}
       <ul className={css.list}>

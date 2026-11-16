@@ -424,10 +424,17 @@ model requests, watches files or delivers attention intents.
   with `data.type === 'rebaseline-suggestion'`; missing samples do not interrupt
   the candidate, but a non-alert reading in that bucket does. Incomplete
   candidates expire after 21 days; generated suggestions expire 7 days after
-  their last evidence, including without new samples or across restart.
+  their last evidence using wall time or accumulated monotonic sample age.
   Display, restore, and acceptance all clear expired suggestions; a wall clock
   before the last evidence also expires them. Suggestions are available through
   `monitor.rebaselineSuggestions`; they never replace buckets automatically.
+  Display and acceptance calculate monotonic age without updating the saved
+  per-stream baseline age. Even a clean shutdown can therefore lose elapsed
+  time since the last adaptive sample. If wall time stops, a restart can leave
+  a suggestion available beyond seven real days, especially with repeated
+  restarts.
+  This trade-off avoids continuous persistence solely for the expiration timer;
+  user confirmation is still required before changing the baseline.
   The pure synchronous `evaluate` seam clears existing suggestion evidence and
   does not collect new evidence.
   Floor and rate rules remain active.
@@ -680,7 +687,7 @@ Regression tests:
 3. Evaluation-time ETA: `uses elapsed monotonic time for delayed context ETA alerts and event details`, `evaluates ETA when a received sample waits before publication`, and `clamps an already elapsed observation ETA to zero at evaluation` (`test/body/rate.test.ts`).
 4. Disk aggregation and cache expiry: `aggregates disk parent from final volume deadlines after cached republishes` and `never revives an expired cached disk when its TTL metadata changes`.
 
-Tests are in `test/presenter/presenter.test.ts` unless otherwise noted. Rate signals retain their evaluation-time `at` and remaining ETA, alongside the observation `evidenceAt`; panel events project the evidence time to the display timeline, while current ETA remains anchored to the observation. Disk parent status and deadline reflect the final fresh-volume set; repeated cached volume timestamps cannot extend a volume's deadline. Collection-level `denied` and `unsupported` remain unchanged even with no volumes or an explicitly fresh volume, as covered by `preserves disk collection status %s with or without fresh volumes`.
+Tests are in `test/presenter/presenter.test.ts` unless otherwise noted. Rate signals retain their evaluation-time `at` and remaining ETA, alongside the observation `evidenceAt`; panel events project the evaluation time to the display timeline, while current ETA remains anchored to the observation. Disk parent status and deadline reflect the final fresh-volume set; repeated cached volume timestamps cannot extend a volume's deadline. Collection-level `denied` and `unsupported` remain unchanged even with no volumes or an explicitly fresh volume, as covered by `preserves disk collection status %s with or without fresh volumes`.
 
 ## DSH runtime regressions
 
