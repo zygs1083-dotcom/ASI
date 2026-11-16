@@ -159,11 +159,24 @@ reported as unknown.
 
 To run the isolated real-DSH check, set `DSH_ROOT` to a read-only DSH checkout
 and run `pnpm --filter asi-sense e2e:dsh`. The fixture uses a private temporary
-profile, disables title sharing and caps model requests at six per run.
-Set `ASI_E2E_NO_MODEL=1` for the sidebar, responsive layout and cleanup checks
-without model requests. On macOS, delayed filesystem notifications are handled
+profile, disables title sharing and caps model requests at six per run. Profiles
+are removed even when initialization or execution fails. Real observations are
+used only for assertions and are never photographed.
+Set `ASI_E2E_NO_MODEL=1` for sidebar, responsive layout and cleanup checks
+without model requests. Add `ASI_E2E_SYNTHETIC=1` to replace the host plugin
+with a fabricated frame and save panel-only screenshots under
+`/tmp/asi-sense-e2e-shots/`; this mode never starts body-probe or the helper.
+On macOS, delayed filesystem notifications are handled
 using the mtime and trailing grace described above; notifications without
 in-window timestamps that arrive after the grace can still cause a wake.
+
+DSH bundle regressions: `marks the old frame stale on carrier loss, accepts a
+new baseline and cancels on dispose`; `cancels while waiting for a replacement
+baseline`; `shows disconnected facts and independently fresh disk volumes as
+stale without altering the baseline`; `uses invented observations and replaces
+the real host entry before plugin installation`; `removes the profile after
+%s`; `removes the actual fixture profile when DSH initialization fails`; and
+`terminates and waits for a stubborn child after its parent has exited`.
 
 `start()` restores before starting sources and may be called once. `stop()`
 closes subscriptions, watchers, probe, helper and timers, then waits for

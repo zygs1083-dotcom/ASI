@@ -1,6 +1,18 @@
 import { type ChildProcess, spawn } from 'node:child_process';
-import { readdir, readFile } from 'node:fs/promises';
+import { mkdtemp, readdir, readFile, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+
+export async function temporaryProfile() {
+  const root = await mkdtemp(join(tmpdir(), 'asi-sense-dsh-e2e-'));
+  return {
+    root,
+    async [Symbol.asyncDispose]() {
+      await rm(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
+      console.log('Temporary profile removed: yes');
+    },
+  };
+}
 
 export async function run(executable: string, args: string[], cwd: string, env: NodeJS.ProcessEnv): Promise<void> {
   const child = spawn(executable, args, { cwd, env, stdio: 'ignore' });
@@ -38,22 +50,30 @@ export async function webUrl(child: ChildProcess): Promise<string> {
   });
 }
 
-export async function stop(child: ChildProcess): Promise<void> {
-  if (child.exitCode !== null || child.signalCode !== null) return;
-  const done = new Promise<void>((resolve) => child.once('exit', () => resolve()));
-  child.kill('SIGTERM');
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const timedOut = await Promise.race([
-    done.then(() => false),
-    new Promise<true>((resolve) => {
-      timer = setTimeout(() => resolve(true), 10_000);
-    }),
-  ]);
-  if (timer) clearTimeout(timer);
-  if (timedOut && child.pid) {
-    process.kill(-child.pid, 'SIGKILL');
-    await done;
-    throw new Error('DSH did not shut down gracefully');
+export async function stop(child: ChildProcess, graceMs = 10_000): Promise<void> {
+  if (!child.pid) return;
+  const group = -child.pid;
+  const signal = (value: NodeJS.Signals | 0): boolean => {
+    try {
+      process.kill(group, value);
+      return true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ESRCH') return false;
+      throw error;
+    }
+  };
+  const wait = async (timeoutMs: number) => {
+    const deadline = performance.now() + timeoutMs;
+    while (signal(0)) {
+      if (performance.now() >= deadline) return false;
+      await delay(50);
+    }
+    return true;
+  };
+  signal('SIGTERM');
+  if (!(await wait(graceMs))) {
+    signal('SIGKILL');
+    if (!(await wait(5000))) throw new Error('DSH process group did not exit after SIGKILL');
   }
 }
 

@@ -1,7 +1,6 @@
 import { type ChildProcess, spawn, spawnSync } from 'node:child_process';
-import { access, mkdtemp, readFile, realpath } from 'node:fs/promises';
+import { access, mkdir, mkdtemp, readFile, realpath } from 'node:fs/promises';
 import { createRequire } from 'node:module';
-import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { type Browser, chromium, expect, type Page } from '@playwright/test';
@@ -16,12 +15,15 @@ import {
   events,
   run,
   stop,
+  temporaryProfile,
   waitFor,
   webUrl,
 } from './e2e-support.ts';
-import { checkResponsive } from './e2e-ui.ts';
+import { syntheticBundle } from './e2e-synthetic.ts';
+import { checkResponsive, screenshotDesktop } from './e2e-ui.ts';
 
 const pkg = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+await using profile = await temporaryProfile();
 const dshRoot = process.env.DSH_ROOT;
 if (!dshRoot) throw new Error('Set DSH_ROOT to the read-only DeepSeek Harness source checkout');
 const dsh = resolve(dshRoot);
@@ -30,7 +32,7 @@ const picker = join(dsh, 'apps/web/tests/pin-browse-picker.overlay.yml');
 await Promise.all([access(cli), access(picker)]);
 const tsx = createRequire(join(dsh, 'package.json')).resolve('tsx/esm');
 const args = ['--import', tsx, cli];
-const root = await realpath(await mkdtemp(join(tmpdir(), 'asi-sense-dsh-e2e-')));
+const root = await realpath(profile.root);
 const home = join(root, 'home');
 const workspace = join(root, 'deepseek-harness/default-workspace');
 const counter = join(root, 'model-requests.txt');
@@ -38,7 +40,8 @@ const budgetReady = join(root, 'budget-ready.txt');
 const services = join(root, 'service-status.json');
 const sessionRoot = join(home, 'sessions');
 const helper = join(pkg, 'lib/asi-sense-helper');
-const screenshot = join(root, 'asi-sense.png');
+const synthetic = process.env.ASI_E2E_SYNTHETIC === '1';
+if (synthetic && process.env.ASI_E2E_NO_MODEL !== '1') throw new Error('Synthetic mode requires ASI_E2E_NO_MODEL=1');
 const limit = process.env.ASI_E2E_NO_MODEL === '1' ? 0 : Number(process.env.ASI_E2E_MODEL_BUDGET ?? '6');
 if (!Number.isInteger(limit) || limit < 0 || limit > 6) throw new Error('Invalid E2E model request budget');
 const env = {
@@ -49,7 +52,6 @@ const env = {
   TSX_TSCONFIG_PATH: join(dsh, 'tsconfig.json'),
 };
 const fixtureFile = join(workspace, 'agent-created.txt');
-const overlay = await setup({ root, home, workspace, sessionRoot, counter, budgetReady, services, limit });
 
 function helperPids(): string[] {
   const result = spawnSync('pgrep', ['-f', helper], { encoding: 'utf8' });
@@ -70,13 +72,15 @@ let browser: Browser | undefined;
 let phase = 'profile setup';
 try {
   if (helperPids().length) throw new Error('An ASI helper from this worktree is already running');
+  const overlay = await setup({ root, home, workspace, sessionRoot, counter, budgetReady, services, limit });
+  const bundle = synthetic ? await syntheticBundle(root, pkg) : pkg;
   await run(
     process.execPath,
     [...args, '--profile', 'asi-dev', '--from-default-profile', 'web', '--dump-config'],
     workspace,
     env,
   );
-  await run(process.execPath, [...args, 'plugin', '--profile', 'asi-dev', 'add', pkg], workspace, env);
+  await run(process.execPath, [...args, 'plugin', '--profile', 'asi-dev', 'add', bundle], workspace, env);
   await run(
     process.execPath,
     [...args, 'plugin', '--profile', 'asi-dev', 'add', join(pkg, 'test/dsh/budget-plugin')],
@@ -114,14 +118,16 @@ try {
     10_000,
     'request budget',
   );
-  await waitFor(
-    async () => {
-      const pids = helperPids();
-      return pids.length ? pids : undefined;
-    },
-    20_000,
-    'helper startup',
-  );
+  if (!synthetic) {
+    await waitFor(
+      async () => {
+        const pids = helperPids();
+        return pids.length ? pids : undefined;
+      },
+      20_000,
+      'helper startup',
+    );
+  }
   browser = await chromium.launch({ headless: true });
   const context = await browser.newContext({ viewport: { width: 1440, height: 900 } });
   const chat = await context.newPage();
@@ -253,24 +259,21 @@ try {
     expect(envFollowups(final)).toHaveLength(1);
     await expect(panel.locator('[data-tile="tokens"]')).toContainText(/\d/, { timeout: 20_000 });
   }
-  await panel.getByRole('heading', { name: '环境感知' }).scrollIntoViewIfNeeded();
-  const boxes = await Promise.all(
-    ['cpu', 'memory', 'disks', 'tokens'].map((metric) => panel.locator(`[data-tile="${metric}"]`).boundingBox()),
-  );
-  if (boxes.some((box) => box === null)) throw new Error('Metric card geometry is unavailable');
-  const bottom = Math.ceil(Math.max(...boxes.map((box) => (box ? box.y + box.height : 0))) + 8);
-  if (bottom > 900) throw new Error('Metric cards do not fit in the screenshot viewport');
-  await panelPage.screenshot({ path: screenshot, clip: { x: 0, y: 0, width: 1440, height: bottom } });
-  await checkResponsive(panelPage, panel, join(root, 'asi-sense-mobile.png'));
+  let shots: string | undefined;
+  if (synthetic) {
+    if (helperPids().length) throw new Error('Synthetic mode unexpectedly started a helper');
+    await mkdir('/tmp/asi-sense-e2e-shots', { recursive: true, mode: 0o700 });
+    shots = await mkdtemp('/tmp/asi-sense-e2e-shots/run-');
+    await screenshotDesktop(panelPage, panel, join(shots, 'asi-sense.png'));
+  }
+  await checkResponsive(panelPage, panel, shots ? join(shots, 'asi-sense-mobile.png') : undefined);
   expect(browserErrors).toBe(0);
   expect(await count()).toBeLessThanOrEqual(limit);
   console.log(`Model request upper bound: ${await count()}/${limit}`);
-  console.log(`Privacy-safe screenshot: ${screenshot}`);
-  console.log(`Durable test profile: ${root}`);
+  if (shots)
+    console.log(`Synthetic screenshots: ${join(shots, 'asi-sense.png')} ${join(shots, 'asi-sense-mobile.png')}`);
 } catch (error) {
-  console.error(
-    `DSH e2e failed during ${phase}; model request upper bound ${await count()}/${limit}; artifacts ${root}`,
-  );
+  console.error(`DSH e2e failed during ${phase}; model request upper bound ${await count()}/${limit}`);
   const serviceStatus = await readFile(services, 'utf8').catch(() => '');
   if (serviceStatus) console.error(`DSH services: ${serviceStatus}`);
   throw error;
