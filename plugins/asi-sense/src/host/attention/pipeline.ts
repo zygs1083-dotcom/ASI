@@ -1,13 +1,13 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { performance } from 'node:perf_hooks';
-import type { DeliveryLevel, EnvChange, Signal, WatchRule } from '@asi/sense-types';
+import type { EnvChange, Signal, WatchRule } from '@asi/sense-types';
 import type { StateStore } from '../state/store.ts';
 import { BucketDrain } from './drain.ts';
 import type { InjectBatch } from './drain-transfer.ts';
+import { intake } from './intake.ts';
 import type { AttentionPipelineOptions, SessionContext, SessionState } from './pipeline-types.ts';
-import { DEFAULT_RULES, isRuleApproved, selectRule, validateRule } from './rules.ts';
+import { DEFAULT_RULES, validateRule } from './rules.ts';
 import { classifyCause } from './selfcause.ts';
-import { sourceMarkSeen } from './source-mark.ts';
 
 export type {
   AttentionPipelineOptions,
@@ -24,7 +24,6 @@ export class ReentrantDeliveryError extends Error {
   }
 }
 
-const DEDUP_MAX = 1024;
 /**
  * Host-driven pipeline (DESIGN §2.3): no internal timers — `accept` is
  * intake only; the host calls {@link flush} at {@link nextDeadline} and
@@ -191,42 +190,20 @@ export class AttentionPipeline {
     });
   }
 
-  /** All mutable accept intake — runs inside the store's apply callback (FIFO). */
   private intake(ev: Signal, session: SessionContext, now: number, count: number, other = false): EnvChange {
-    const s = this.session(session.id);
-    s.context = session;
-    const change: EnvChange = { signal: ev, count: 1, level: 'record' };
-    if (this.isDuplicate(s, ev.id)) {
-      change.reason = 'duplicate';
-    } else {
-      const repeatedStatus = sourceMarkSeen(s, ev);
-      if (ev.cause === 'agent') {
-        change.reason = 'self-caused';
-      } else {
-        const rule = selectRule(this.rules, ev, this.wallClock());
-        if (other) ev.kind = 'other';
-        let level: DeliveryLevel = rule?.level ?? 'record';
-        let reason: string | undefined;
-        if (level === 'wake' && rule && !isRuleApproved(rule)) {
-          level = 'context';
-          reason = 'rule-pending-approval';
-        }
-        if ((ev.kind === 'source.status' || ev.kind === 'source.error') && repeatedStatus) {
-          level = 'record';
-        }
-        change.level = level;
-        if (rule) {
-          change.ruleId = rule.id;
-          if (rule.note !== undefined) change.note = rule.note;
-        }
-        if (reason !== undefined) change.reason = reason;
-        if (level !== 'record') {
-          const win = ev.kind === 'file.changed' ? this.fileMergeWindowMs : this.mergeWindowMs;
-          this.drain.enqueue(ev, session.id, level, rule, reason, now, win, count);
-        }
-      }
-    }
-    return structuredClone(change);
+    return intake(
+      this.session(session.id),
+      ev,
+      session,
+      now,
+      count,
+      other,
+      this.rules,
+      () => this.wallClock(),
+      this.drain,
+      this.mergeWindowMs,
+      this.fileMergeWindowMs,
+    );
   }
 
   /** Earliest pending merge deadline (monotonic) or `undefined` — the host's flush-timer hint. */
@@ -288,13 +265,5 @@ export class AttentionPipeline {
       this.sessions.set(id, s);
     }
     return s;
-  }
-
-  private isDuplicate(s: SessionState, id: string): boolean {
-    if (s.seenIds.has(id)) return true;
-    s.seenIds.add(id);
-    s.seenOrder.push(id);
-    if (s.seenOrder.length > DEDUP_MAX) s.seenIds.delete(s.seenOrder.shift() as string);
-    return false;
   }
 }
