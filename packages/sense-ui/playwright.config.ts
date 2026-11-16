@@ -5,6 +5,9 @@ const PORT = 4173
 export default defineConfig({
   testDir: './test/e2e',
   outputDir: './test-results',
+  snapshotPathTemplate: '{testDir}/../screenshots/{arg}{ext}',
+  updateSnapshots: 'none',
+  expect: { toHaveScreenshot: { maxDiffPixelRatio: 0.001, threshold: 0.1 } },
   timeout: 60_000,
   fullyParallel: true,
   reporter: [['list']],

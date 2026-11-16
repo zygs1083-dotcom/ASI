@@ -22,6 +22,12 @@ export interface SparkThreshold {
   direction: 'above' | 'below'
   /** 线的短标签（底线 / 变化率 / 基线 / 显示底线）；展开图标注用。 */
   label?: string
+  /**
+   * 该线是否代表宿主当前触发状态。false 的线仅作信息参考画出，
+   * 不参与曲线分段告警染色。缺省视为 true（直接传入的阈值与
+   * 既有显示底线都按可告警处理）。
+   */
+  active?: boolean
 }
 
 /** 各指标 history 序列的单位（电池按百分点数值、温控按档位序数，均为 count）。 */
@@ -99,7 +105,9 @@ export interface ChartThresholds {
 /**
  * 画线阈值：收集全部可比较的宿主 floor/rate/baseline 线；
  * 无 supplied floor 时并入既有显示底线；floor 显式单位不符则阻断回退。
- * supplied 线的严重度取 effectiveSeverity（warn/critical），否则缺省 warn。
+ * 宿主线的 active 取「该层在 triggered 中且有效严重度非 good」：
+ * 激活线严重度取 effectiveSeverity（warn/critical）；未触发层仍是
+ * 信息参考线（warn 虚线样式、active=false），不充当当前告警线色。
  */
 export function chartThresholds(
   key: MetricKey,
@@ -107,7 +115,8 @@ export function chartThresholds(
   tokenWindow?: number,
 ): ChartThresholds {
   const lines: SparkThreshold[] = []
-  const sev = effectiveSeverity(insight) === 'critical' ? 'critical' : 'warn'
+  const eff = effectiveSeverity(insight)
+  const triggered = new Set(insight?.triggered ?? [])
   const direction = key === 'battery' ? 'below' : 'above'
   let supplied = false
   let floorBlocked = false
@@ -119,7 +128,14 @@ export function chartThresholds(
       continue
     }
     supplied = true
-    lines.push({ value: t.value, sev, direction, label: LAYER_LABEL[layer] })
+    const active = eff !== 'good' && triggered.has(layer)
+    lines.push({
+      value: t.value,
+      sev: active && eff === 'critical' ? 'critical' : 'warn',
+      direction,
+      label: LAYER_LABEL[layer],
+      active,
+    })
   }
   const floorSupplied = lines.some((l) => l.label === LAYER_LABEL.floor)
   if (!floorSupplied && !floorBlocked) {

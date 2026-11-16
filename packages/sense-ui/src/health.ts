@@ -1,14 +1,30 @@
 /** 身体各项指标的阈值与聚合健康度。全部纯函数，时间一律用传入的 now。 */
 
-import type {
-  Body,
-  Fact,
-  FactStatus,
-  MetricInsight,
-  MetricKey,
-} from './view-model'
+import type { Body, Fact, MetricInsight, MetricKey } from './view-model'
+import { effectiveDisks } from '@asi/sense-types'
+import { diskSeverity, diskUsable, diskValid } from './disk-health'
+import {
+  effectiveSeverity,
+  effectiveStatus,
+  isUsable,
+  maxSeverity,
+  type Severity,
+} from './fact-status'
 
-export type Severity = 'good' | 'warn' | 'critical' | 'unknown'
+export {
+  effectiveSeverity,
+  effectiveStatus,
+  isUsable,
+  maxSeverity,
+  type Severity,
+} from './fact-status'
+export {
+  diskFact,
+  diskSeverity,
+  diskUsable,
+  diskValid,
+  unavailableMountSet,
+} from './disk-health'
 
 export type BodyRowKey =
   | 'memory'
@@ -49,54 +65,16 @@ export interface RowResult {
   hidden: boolean
   /** unknown 但不计入聚合缺失（如 contextWindow 回退估值，容量未确认而非数据缺失）。 */
   uncounted?: boolean
+  /** 有可用数据但读数不完整（如磁盘存在失鲜/不可读挂载点）：不降低严重度、不改告警。 */
+  partial?: boolean
 }
 
 export interface BodyEvaluation {
   severity: Severity
   sentence: string
   rows: Record<BodyRowKey, RowResult>
-}
-
-/** ok 但超过 TTL 视为 stale（由读取时计算）。 */
-export function effectiveStatus<T>(fact: Fact<T>, now: number): FactStatus {
-  if (fact.status === 'ok' && now - fact.observedAt > fact.ttlMs) return 'stale'
-  return fact.status
-}
-
-export function isUsable<T>(fact: Fact<T>, now: number): boolean {
-  return effectiveStatus(fact, now) === 'ok' && fact.value !== null
-}
-
-const SEV_RANK: Record<Severity, number> = {
-  good: 0,
-  unknown: 0,
-  warn: 1,
-  critical: 2,
-}
-
-export function maxSeverity(a: Severity, b: Severity): Severity {
-  return SEV_RANK[b] > SEV_RANK[a] ? b : a
-}
-
-/**
- * insight 的有效严重度：severity 优先；triggered 非空但宿主没给 severity → warn
- * （宿主已声明触发，不能显示为良好）；否则 good。
- */
-export function effectiveSeverity(
-  item?: MetricInsight,
-): 'warn' | 'critical' | 'good' {
-  if (item?.severity) return item.severity
-  return item?.triggered?.length ? 'warn' : 'good'
-}
-
-/** 有效磁盘读数：total 为正有限、free 有限（free 可为 0）。 */
-export function diskValid(d: { total: number; free: number }): boolean {
-  return Number.isFinite(d.total) && d.total > 0 && Number.isFinite(d.free)
-}
-
-/** 单个磁盘剩余比例 → 严重度（每个盘独立着色用）。 */
-export function diskSeverity(freeRatio: number): Severity {
-  return freeRatio <= 0.05 ? 'critical' : freeRatio <= 0.1 ? 'warn' : 'good'
+  /** 任一行 partial 即聚合 partial；句子只在「其余全 good」时落成部分补全文案。 */
+  partial?: boolean
 }
 
 function unusable(): RowResult {
@@ -124,15 +102,19 @@ function evalMemory(body: Body, now: number): RowResult {
 }
 
 function evalDisks(body: Body, now: number): RowResult {
-  const f = body.disks
-  if (!isUsable(f, now)) return unusable()
-  const valid = f.value!.filter(diskValid)
-  if (valid.length === 0) return unusable()
+  const f = effectiveDisks(body.disks, now)
+  const values = f.value ?? []
+  // 只聚合新鲜可用卷：stale/unknown/unavailable/无效读数不告警；
+  // 没有任何新鲜卷才算缺失，父级状态不再一票否决。
+  const fresh = values.filter((d) => d.status === 'ok' && diskValid(d))
+  if (fresh.length === 0) return unusable()
   let severity: Severity = 'good'
-  for (const d of valid) {
+  for (const d of fresh) {
     severity = maxSeverity(severity, diskSeverity(d.free / d.total))
   }
-  return { severity, hidden: false }
+  const partial =
+    f.indeterminateMounts.length > 0 || values.some((d) => !diskValid(d))
+  return { severity, hidden: false, ...(partial ? { partial: true } : {}) }
 }
 
 function evalBattery(body: Body, now: number): RowResult {
@@ -199,8 +181,8 @@ const ROW_EVALUATORS: Record<BodyRowKey, (body: Body, now: number) => RowResult>
   process: evalProcess,
 }
 
-/** 每个行对应可查询的指标 key（网络/进程各两条，磁盘按挂载点展开）。 */
-export function rowMetricKeys(key: BodyRowKey, body: Body): MetricKey[] {
+/** 每个行对应可查询的指标 key（网络/进程各两条，磁盘只取新鲜可用挂载点）。 */
+export function rowMetricKeys(key: BodyRowKey, body: Body, now: number): MetricKey[] {
   switch (key) {
     case 'cpu':
     case 'memory':
@@ -213,16 +195,17 @@ export function rowMetricKeys(key: BodyRowKey, body: Body): MetricKey[] {
     case 'process':
       return ['processCpu', 'processRss']
     case 'disks':
-      // 无效挂载点（total<=0/NaN）不产生可聚合的 insight key
+      // 只有新鲜可用卷才聚合 insight：stale/unknown/unavailable/无效挂载点
+      // 不产生 key，防止陈旧卷的 insight/ETA 泄漏进告警
       return (body.disks.value ?? [])
-        .filter(diskValid)
+        .filter((d) => diskUsable(body.disks, d, now))
         .map((d) => `disk:${d.mount}` as const)
   }
 }
 
-/** 行事实是否新鲜可用（才可并入 insight 严重度，stale/denied 不假装当前）。 */
-export function rowUsable(key: BodyRowKey, body: Body, now: number): boolean {
-  const f: Fact<unknown> = {
+/** 行键 → 对应身体事实（process 行用 harnessProcess 字段）。 */
+export function rowFact(key: BodyRowKey, body: Body): Fact<unknown> {
+  return {
     cpu: body.cpu,
     memory: body.memory,
     disks: body.disks,
@@ -232,6 +215,15 @@ export function rowUsable(key: BodyRowKey, body: Body, now: number): boolean {
     process: body.harnessProcess,
     tokens: body.tokens,
   }[key]
+}
+
+/** 行事实是否新鲜可用（才可并入 insight 严重度，stale/denied 不假装当前）。 */
+export function rowUsable(key: BodyRowKey, body: Body, now: number): boolean {
+  if (key === 'disks') {
+    // 磁盘按卷判定：父级失鲜/拒绝不否决显式新鲜卷
+    return (body.disks.value ?? []).some((d) => diskUsable(body.disks, d, now))
+  }
+  const f = rowFact(key, body)
   if (!isUsable(f, now)) return false
   if (key === 'tokens') {
     const v = body.tokens.value!
@@ -241,9 +233,6 @@ export function rowUsable(key: BodyRowKey, body: Body, now: number): boolean {
       v.contextWindow > 0 &&
       v.contextUsed != null
     )
-  }
-  if (key === 'disks') {
-    return body.disks.value!.some(diskValid)
   }
   return true
 }
@@ -257,7 +246,7 @@ export function evaluateBody(
   for (const key of BODY_ROW_PRIORITY) {
     const r = ROW_EVALUATORS[key](body, now)
     if (insights && !r.hidden && rowUsable(key, body, now)) {
-      for (const mk of rowMetricKeys(key, body)) {
+      for (const mk of rowMetricKeys(key, body, now)) {
         const sev = effectiveSeverity(insights[mk])
         if (sev !== 'good') r.severity = maxSeverity(r.severity, sev)
       }
@@ -267,13 +256,17 @@ export function evaluateBody(
 
   let worst: Severity = 'good'
   let hasUnknown = false
+  let partial = false
   for (const key of BODY_ROW_PRIORITY) {
     const s = rows[key].severity
     if (s === 'unknown') {
       if (!rows[key].uncounted) hasUnknown = true
     } else if (s === 'critical') worst = 'critical'
     else if (s === 'warn' && worst !== 'critical') worst = 'warn'
+    if (rows[key].partial) partial = true
   }
+  const out = (severity: Severity, sentence: string): BodyEvaluation =>
+    partial ? { severity, sentence, rows, partial: true } : { severity, sentence, rows }
 
   if (worst === 'critical' || worst === 'warn') {
     const key = BODY_ROW_PRIORITY.find((k) => rows[k].severity === worst)!
@@ -281,10 +274,14 @@ export function evaluateBody(
       key === 'network' && body.network.value?.online
         ? '网络流量异常'
         : ROW_WARN_SENTENCE[key]
-    return { severity: worst, sentence, rows }
+    return out(worst, sentence)
   }
   if (hasUnknown) {
-    return { severity: 'unknown', sentence: '数据待补全', rows }
+    return out('unknown', '数据待补全')
   }
-  return { severity: 'good', sentence: '状态良好', rows }
+  if (partial) {
+    // 其余行全部良好但读数不完整：不升级严重度，句子标记部分缺失
+    return out('good', '部分 · 数据待补全')
+  }
+  return out('good', '状态良好')
 }

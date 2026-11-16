@@ -10,9 +10,11 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run --browser.headless",
     "e2e": "playwright test",
+    "e2e:update": "playwright test --update-snapshots=all",
     "check": "pnpm typecheck && pnpm test"
   },
   "dependencies": {
+    "@asi/sense-types": "workspace:*",
     "react": "^18.3.1",
     "react-dom": "^18.3.1"
   },

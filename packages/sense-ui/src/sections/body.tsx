@@ -1,4 +1,6 @@
+import { useMemo } from 'react'
 import { attentionLine } from '../attention'
+import { ClockProvider, SamplingProvider } from '../clock'
 import { evaluateBody, type Severity } from '../health'
 import { formatPercent } from '../format'
 import { DisksTile } from './disk-rows'
@@ -55,13 +57,17 @@ function LearningStrip({ l }: { l: LearningState }) {
   )
 }
 
-/** 监护概览：大写严重度词 + 状态句（有匹配的近期宿主投影时换成优先警示行）。 */
-function Monitor({ model, sev, sentence }: { model: Panel['model']; sev: Severity; sentence: string }) {
+/** 监护概览：大写严重度词 + 状态句（有匹配的近期宿主投影时换成优先警示行）。
+ *  读数不完整时词旁另出「部分」徽标——警示句被覆盖也不丢完整性提示。 */
+function Monitor({ model, sev, sentence, partial }: { model: Panel['model']; sev: Severity; sentence: string; partial?: boolean }) {
   return (
     <div className={mcss.monitor} data-sev={sev}>
       <Ecg />
       <div className={mcss.monitorText}>
-        <strong className={mcss.monitorWord}>{SEV_WORD[sev]}</strong>
+        <strong className={mcss.monitorWord}>
+          {SEV_WORD[sev]}
+          {partial ? <span className={mcss.monitorPartial}>部分</span> : null}
+        </strong>
         <span className={mcss.monitorSub}>{sentence}</span>
         {model.learning?.status === 'learning' && (
           <LearningStrip l={model.learning} />
@@ -87,20 +93,33 @@ export function BodySection({
     onAdjust: onAdjustMetric,
     onOpenPermissionSettings,
   }
+  const sampling = useMemo(
+    () => ({ paused: model.paused, intervals: model.sampleIntervalsMs }),
+    [model.paused, model.sampleIntervalsMs],
+  )
 
   return (
     <>
-      <Monitor model={model} sev={evalResult.severity} sentence={sentence} />
-      <div className={css.tiles}>
-        <CpuTile model={model} rows={rows} ctx={ctx} />
-        <MemoryTile model={model} rows={rows} ctx={ctx} />
-        <TokenTile model={model} rows={rows} ctx={ctx} />
-        <DisksTile model={model} rows={rows} ctx={ctx} />
-        <NetworkTile model={model} rows={rows} ctx={ctx} />
-        <ThermalTile model={model} rows={rows} ctx={ctx} />
-        {!rows.battery.hidden && <BatteryTile model={model} rows={rows} ctx={ctx} />}
-        <ProcessTile model={model} rows={rows} ctx={ctx} />
-      </div>
+      <Monitor
+        model={model}
+        sev={evalResult.severity}
+        sentence={sentence}
+        partial={evalResult.partial}
+      />
+      <ClockProvider value={now}>
+        <SamplingProvider value={sampling}>
+          <div className={css.tiles}>
+            <CpuTile model={model} rows={rows} ctx={ctx} />
+            <MemoryTile model={model} rows={rows} ctx={ctx} />
+            <TokenTile model={model} rows={rows} ctx={ctx} />
+            <DisksTile model={model} rows={rows} ctx={ctx} />
+            <NetworkTile model={model} rows={rows} ctx={ctx} />
+            <ThermalTile model={model} rows={rows} ctx={ctx} />
+            {!rows.battery.hidden && <BatteryTile model={model} rows={rows} ctx={ctx} />}
+            <ProcessTile model={model} rows={rows} ctx={ctx} />
+          </div>
+        </SamplingProvider>
+      </ClockProvider>
     </>
   )
 }

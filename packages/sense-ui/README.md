@@ -4,20 +4,23 @@ asi-sense 侧栏「环境感知」面板：React 18 + CSS Modules 的**纯 props
 
 ## 运行
 
+本包是根 `pnpm-workspace.yaml` 成员，事实骨架类型经 `workspace:*` 依赖来自 `@asi/sense-types`。依赖一律在**仓库根目录**安装：
+
 ```sh
-cd packages/sense-ui
-pnpm install --ignore-workspace   # 独立安装（非工作区成员）
-pnpm dev                          # Vite 预览：?scenario=<名>&theme=light|dark&realtime=1
-pnpm typecheck                    # tsc --noEmit
-pnpm test                         # Vitest 浏览器模式（本机 Chromium）
-pnpm e2e                          # Playwright：axe + 8 场景 × 2 宽度 × 2 主题截图
-pnpm build                        # 构建预览页到 dist/（预览产物，非库产物）
-pnpm check                        # typecheck + test
+pnpm install                    # 根目录 workspace 安装（链接 @asi/sense-types）
+cd packages/sense-ui            # 以下命令也可在根目录用 pnpm --filter @asi/sense-ui <script>
+pnpm dev                        # Vite 预览：?scenario=<名>&theme=light|dark&realtime=1
+pnpm typecheck                  # tsc --noEmit
+pnpm test                       # Vitest 浏览器模式（本机 Chromium）
+pnpm e2e                        # Playwright：axe + 8 场景 × 2 宽度 × 2 主题截图
+pnpm e2e:update                 # 显式更新截图基线
+pnpm build                      # 构建预览页到 dist/（预览产物，非库产物）
+pnpm check                      # typecheck + test（根级 pnpm check 跑全部包）
 ```
 
-`pnpm-lock.yaml` 与 test-results/artifacts 已 gitignore；**截图 `test/screenshots/` 不入 gitignore，随包提交**供评审比对。
+`pnpm-lock.yaml` 由根工作区统一管理，test-results/artifacts 已 gitignore；**截图 `test/screenshots/` 不入 gitignore，随包提交**供评审比对。普通 `pnpm e2e` 只比较、不写基线，容许像素差比例最多 0.001；只有显式执行 `pnpm e2e:update` 才更新基线。
 
-安装说明：pnpm 11 下 `.pnpmfile.cjs` 的 `updateConfig` 钩子把 `strictDepBuilds` 置为 false，依赖构建脚本被跳过（esbuild 的 postinstall 只是平台二进制校验，optional 依赖已提供二进制）；测试用本机安装的 Google Chrome channel，不下载浏览器。
+安装说明：依赖构建脚本由根 `pnpm-workspace.yaml` 的 `allowBuilds` 白名单放行（esbuild 的 postinstall 只是平台二进制校验，optional 依赖已提供二进制）；测试用本机安装的 Google Chrome channel，不下载浏览器。
 
 ## 使用
 
@@ -31,14 +34,18 @@ import type { SensePanelModel, SensePanelProps } from '@asi/sense-ui'
 ## model 要点（单位与动态）
 
 - **单位**：CPU `usage`/`perCore` 与 DSH 进程 `cpu` 为 0..1 比例，CPU `load1`/`load5`/`load15` 为系统平均负载（不限制在 0..1）；内存/磁盘 `used`/`total`/`free`、进程 `rss` 为**原始字节**；token `contextUsed`/`contextWindow`/sessionUsage 为**token 计数**；电池 `percent` 为 **0..100**；温控为档位枚举。
-- **历史**：`history.*` 为 `{at, value}` 点列，UI 只渲染 `[now-300000, now]`，x 域固定为该窗口（稀疏点按真实时间摆位）。单位：cpu 为 0..1 比例、memory 与 disks 为**占用比例**（磁盘是 used/total）、networkRx/Tx 为 B/s、tokens 为 token 计数、thermal 为序数 0..3、battery 为百分值、processCpu 0..1、processRss 字节。
-- **insights**：`baseline.low/high` 与 history 同单位（画基线带）；`sources`/`triggered` 为 `floor|rate|baseline`，UI 只展示不判定。可选 `thresholds.<层>` 提供宿主阈值（`{value, source, unit?}`）：floor 优先于既有显示底线，warn 虚线、critical 实线；`unit` 显式与 history 单位不符时不画线；rate/baseline 同值可比较时也会画线（标签「变化率」/「基线」），单位不符只在明细文本展示。`severity` 缺失但 `triggered` 非空时按 warn 处理并在明细标注「宿主未给严重度」。`currentEta` 为宿主当前投影（`{asOf, sampleIntervalMs, timeToThresholdMs?, ratePerMinute}`）：仅 asOf ≤ now、now-asOf ≤ 2×间隔、速率为恶化方向（磁盘/电池负、其余正）且 timeToThresholdMs ≤7 天时在监护句显示「N 分钟后见底/触及阈值」；同指标更新的 body.rate 信号使旧投影失效，事件里的历史 ETA 只作「当时预计」。
+- **历史**：`history.*` 为 `{at, value}` 点列，UI 按下述锚点渲染 5 分钟窗（稀疏点按真实时间摆位）。单位：cpu 为 0..1 比例、memory 与 disks 为**占用比例**（磁盘是 used/total）、networkRx/Tx 为 B/s、tokens 为 token 计数、thermal 为序数 0..3、battery 为百分值、processCpu 0..1、processRss 字节。降采样为软上限：≤240 普通采样点（119 桶 min/max + 首末），另加全部阈值穿越/相等迁移的边界点对（含未激活参考线）——同桶多次越界 excursion 不会被聚合抹掉，越界点数不设上限。同时间戳按输入顺序稳定，末点为最晚时间戳的最后一个点。
+- **insights**：`baseline.low/high` 与 history 同单位（画基线带）；`sources`/`triggered` 为 `floor|rate|baseline`，UI 只展示不判定。可选 `thresholds.<层>` 提供宿主阈值（`{value, source, unit?}`）：floor 优先于既有显示底线，warn 虚线、critical 实线；`unit` 显式与 history 单位不符时不画线；rate/baseline 同值可比较时也会画线（标签「变化率」/「基线」），单位不符只在明细文本展示。`severity` 缺失但 `triggered` 非空时按 warn 处理并在明细标注「宿主未给严重度」。`currentEta` 为宿主当前投影（`{asOf, sampleIntervalMs, timeToThresholdMs?, ratePerMinute}`）：仅 asOf ≤ now、now-asOf ≤ 2×间隔、速率为恶化方向（磁盘/电池负、其余正）、原始 timeToThresholdMs ≤7 天，且**剩余时间** `timeToThresholdMs - (now - asOf)` > 0 时在监护句显示「N 分钟后见底/触及阈值」（timeToThresholdMs 是 asOf 时刻估计，显示前扣除已流逝时间）；同指标更新的 body.rate 信号使旧投影失效，事件里的历史 ETA 只作「当时预计」。
 - **token 容量来源**：`body.tokens.value.contextWindowSource` 为 `configured`（配置值）/`catalog`（模型目录）/`fallback`（回退估值）。`fallback` 表示容量未确认：环与百分比降饱和、明示「容量未确认」、不显示剩余量/填满估算/压缩距离，行级视为未知但不计入聚合未知与告警；缺省保持旧版行为。
 - **可选字段**：`body.memory.value.breakdown`（`{app, wired, compressed, cached}` 原始字节）提供时画四段细分条（App/联动/压缩/缓存），缺失时只画 used/free 单段并在明细明示「未提供」；`body.tokens.value.contextGrowthPerMinute`（tokens/分）有限且 >0、且 `contextWindow`/`contextUsed` 均有限时，新鲜且容量已确认的卡片摘要估算「按当前速度约 N 分钟填满」；结果非有限或超过 7 天也不估算。无 `contextWindow`/`contextUsed` 时不出现压缩措辞，「本会话」用量行仍然显示。
+- **磁盘卷级状态（共享契约 `@asi/sense-types` 的 `DisksFact`/`DiskVolume`）**：`body.disks` 带必填 `kind: 'disks'` 和可选 `unavailableMounts`，各卷可加 `status`、`observedAt`、`ttlMs`。**自声明 `status` 的卷是权威的**：父事实失鲜/拒绝不再一票否决带元数据的 ok 卷；缺省字段（旧版只含 `mount/total/free` 的卷）回退父事实——状态继承父级有效状态作上界，时间戳沿用父级。`unavailableMounts` 声明读不出的挂载点并优先于 `value` 同名列：只显示「挂载点 · 无法读取」，无数字/无历史/无图。stale 卷灰显「上次读数 + 已过期 · 年龄」并保留读数，unknown/unavailable 卷不显示数值。行严重度只聚合 fresh 卷（非新鲜卷不产指标键、不并入 insight/ETA）；存在 fresh 卷但有失鲜/不可读记录时，卡片与总览监护词旁加「部分 · 数据待补全」徽标，不升级严重度、不覆盖告警句；全部卷失鲜或父级 denied/unavailable 且无 fresh 卷才报 unknown。主摘要焦点：新鲜告警卷 > 失鲜根卷（陈旧保留值）> 最差 fresh 卷。
 - **learning**：`collectedMs/targetMs` 由宿主给，UI 只算 `clamp(collected/target)`，target 非法显示"进度不可用"。
 - **tuning**：参数列表 + 调整日志（`previous→next`、`agent|user|auto`、`reverted`）。锁定/撤销只是回调，宿主拥有护栏。
 - **events**：`detail` 为宿主投影的告警明细（body.rate / body.anomaly / file.burst），`feedback` 状态只在 model 中。窗口类事件在 `sendTitles=false` 时隐藏主体/原因/规则名/detail。
-- **预览的实时模式**是演示假数据 tick（`src/preview/tick.ts`），不属于组件。
+- **图窗口与时钟**：走势图 x 域固定为 5 分钟窗，锚点是最近一次历史序列更新时的 `now`；历史引用不变时事实或语义更新也不移动锚点。宿主通过 `model.sampleIntervalsMs` 按指标键（含 `disk:<挂载点>`）提供各序列的历史采样周期；缺省或非法时磁盘为 10000ms、电池为 30000ms、其余为 2000ms。`model.paused` 立即显示「采集暂停 · 最后 X 前」；未暂停且最新点早于 `now - 3×该序列周期` 时显示「数据滞后 · 最后 X 前」，均不称「现在/当前」；纯时钟推进只刷新文案，不重采样、不重算路径。
+- **磁盘父事实**：有至少一卷新鲜则 `ok`，有值但全部 stale 则 `stale`；`null`/空数组在 `ok/stale/unavailable/unknown` 下均为 `unknown`，采集权限拒绝 `denied` 与不支持 `unsupported` 维持原状态。父级 `observedAt` 取新鲜卷最旧时间，`ttlMs` 截止于新鲜卷中最早的绝对过期时间。
+- **明细懒挂载**：卡片明细（展开图/阈值行/来源）仅 `<details>` 打开时挂载，收起态不付出明细渲染开销。
+- **预览的实时模式**是演示假数据 tick（`src/preview/tick.ts`），不属于组件：cpu/network/tokens 每秒重采样，其余 ok 事实到 2/3·TTL 才续期（非 ok 永不续期），未变化事实与历史序列保持原引用。
 
 ## 视觉结构（当前迭代）
 
@@ -49,7 +56,7 @@ import type { SensePanelModel, SensePanelProps } from '@asi/sense-ui'
 
 ## 规模
 
-每个 src 文件 ≤300 行。E2E 截图矩阵 32 张（8 场景 × 320/420 × 明暗）+ 卡片明细 4 张 + fallback 容量 2 张（420px 明暗），存于 `test/screenshots/`。
+每个 src 文件 ≤300 行。E2E 截图矩阵 32 张（8 场景 × 320/420 × 明暗）+ 卡片明细 4 张 + fallback 容量 2 张 + disk-partial 2 张（420px 明暗），共 40 张，存于 `test/screenshots/`。
 
 ## 评审修复对应测试
 
@@ -57,6 +64,11 @@ import type { SensePanelModel, SensePanelProps } from '@asi/sense-ui'
 |---|---|
 | 触发无 severity 误判健康 | `health.test.ts` 缺省严重度用例、`regressions.test.tsx`「宿主未给严重度」 |
 | fallback 容量与真容量不分 | `regressions.test.tsx`「容量未确认」用例、`panel.spec.ts`「容量未确认」截图 |
+| 父级磁盘状态一票否决新鲜卷 | `health.test.ts`「卷级磁盘状态」、`regressions.test.tsx`「磁盘卷级新鲜度」、`panel.spec.ts`「disk-partial」截图 |
+| 磁盘父级状态及新鲜卷期限 | body-probe `disks.test.ts`「aggregates parent metadata only over fresh volumes」 |
+| 根 stale + /data 剩余 2% 与 /net 不可读 | `regressions.test.tsx`「根卷 stale、/data 剩余 2%」「根卷新鲜且 /net 无法读取」 |
+| 时钟推进重算图形/明细早挂载 | `chart-perf.test.tsx`（sampleHistory/buildSpark spy）、`panel.test.tsx` 懒挂载断言 |
+| 标注半透明底不可读 | `panel.spec.ts`「标注底色不透明」alpha=1 断言 |
 | 历史事件 ETA 冒充当前 | `attention.test.ts`「insight 无 currentEta 时不从事件 detail 推导见底时间」等 |
 | stale 仍称「当前速度」 | `regressions.test.tsx`「过期事实禁用当前推算」 |
 | 极小增速溢出 Infinity | `format.test.ts`「formatDuration 边界」、`regressions.test.tsx`「fillMinutes 结果护栏」 |

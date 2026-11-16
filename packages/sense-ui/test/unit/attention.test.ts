@@ -128,21 +128,53 @@ describe('阈值解析', () => {
     ).toEqual(['变化率'])
   })
 
-  it('宿主 floor：电池方向 below；supplied 线严重度取 effectiveSeverity', () => {
+  it('宿主 floor：电池方向 below；supplied 触发线严重度取 effectiveSeverity', () => {
     const supplied = ins({
       severity: 'critical',
       sources: ['floor'],
+      triggered: ['floor'],
       thresholds: { floor: { value: 15, source: 'host-floor' } },
     })
     expect(chartThresholds('battery', supplied).lines).toEqual([
-      { value: 15, sev: 'critical', direction: 'below', label: '底线' },
+      { value: 15, sev: 'critical', direction: 'below', label: '底线', active: true },
     ])
     const cpu = chartThresholds('cpu', supplied)
     expect([cpu.lines[0]!.direction, cpu.lines[0]!.sev]).toEqual(['above', 'critical'])
-    // 无 severity 的 supplied 线缺省 warn
+    // 无 severity 的触发 supplied 线缺省 warn
     expect(
-      chartThresholds('cpu', ins({ thresholds: { floor: { value: 0.7, source: 'x' } } })).lines[0]!.sev,
+      chartThresholds('cpu', ins({ triggered: ['floor'], thresholds: { floor: { value: 0.7, source: 'x' } } })).lines[0]!.sev,
     ).toBe('warn')
+  })
+
+  it('宿主线 active 由 triggered ∩ 非 good 决定：未触发层画线但不分类曲线告警', () => {
+    const c = chartThresholds('cpu', ins({
+      triggered: ['floor'],
+      severity: 'critical',
+      thresholds: {
+        floor: { value: 0.8, source: 'h1' },
+        baseline: { value: 0.3, source: 'h2' },
+      },
+    }))
+    // 触发层带宿主严重度；未触发层降级为 warn 参考线且不参与曲线分类
+    expect(c.lines.map((l) => [l.label, l.sev, l.active])).toEqual([
+      ['底线', 'critical', true],
+      ['基线', 'warn', false],
+    ])
+    // 未触发层即使宿主标 critical 也不充当当前告警线色
+    const triggeredNone = chartThresholds('cpu', ins({
+      severity: 'critical',
+      thresholds: { floor: { value: 0.8, source: 'h' } },
+    }))
+    expect(triggeredNone.lines.every((l) => l.active === false && l.sev === 'warn')).toBe(true)
+  })
+
+  it('triggered 无 severity 的层 → active + warn（缺省严重度不误判良好）', () => {
+    const c = chartThresholds('cpu', ins({
+      triggered: ['rate'],
+      thresholds: { rate: { value: 0.5, source: 'h' } },
+    }))
+    const rateLine = c.lines.find((l) => l.label === '变化率')!
+    expect([rateLine.sev, rateLine.active]).toEqual(['warn', true])
   })
 
   it('收集全部可比较的 floor/rate/baseline 线并标注层名', () => {
@@ -230,6 +262,35 @@ describe('attentionLine 宿主 currentEta 投影', () => {
   ] as const)('无效投影字段 → 无倒计时 %j', (over) => {
     const m = noRateEvents(makeScenario('rapid-change'))
     setEta(m, over as Partial<NonNullable<MetricInsight['currentEta']>>)
+    expect(line(m)).toBeNull()
+  })
+
+  it('有效投影扣除已流逝时间：asOf=now-4min/间隔3min/当时9min → 剩余5min', () => {
+    const m = noRateEvents(makeScenario('rapid-change'))
+    setEta(m, {
+      asOf: T0 - 4 * 60_000,
+      sampleIntervalMs: 3 * 60_000,
+      timeToThresholdMs: 9 * 60_000,
+    })
+    expect(line(m)).toBe('磁盘 5 分钟后见底')
+  })
+
+  it.each([
+    {
+      desc: '恰好到期（elapsed = ETA）',
+      over: { asOf: T0 - 9 * 60_000, sampleIntervalMs: 5 * 60_000, timeToThresholdMs: 9 * 60_000 },
+    },
+    {
+      desc: '已过到期（elapsed > ETA）',
+      over: { asOf: T0 - 10 * 60_000, sampleIntervalMs: 6 * 60_000, timeToThresholdMs: 9 * 60_000 },
+    },
+    {
+      desc: '原始 ETA >7 天（扣除流逝后 <7 天仍拒绝）',
+      over: { asOf: T0 - 4 * 60_000, sampleIntervalMs: 3 * 60_000, timeToThresholdMs: 7 * 24 * 3600_000 + 1 },
+    },
+  ] as const)('投影到期/越界 $desc → 无倒计时', ({ over }) => {
+    const m = noRateEvents(makeScenario('rapid-change'))
+    setEta(m, over)
     expect(line(m)).toBeNull()
   })
 

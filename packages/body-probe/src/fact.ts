@@ -1,5 +1,6 @@
 import os from 'node:os';
-import type { Fact, FactStatus, SourceRef } from './types.js';
+import { effectiveDisks, ttlStatusAt } from '@asi/sense-types';
+import type { DisksFact, Fact, FactStatus, SourceRef } from './types.js';
 
 export const DEFAULT_TTL_MS = 6000;
 
@@ -84,12 +85,32 @@ function deadlineOf(o: FactLike & object, now: number, wall: number): number {
 export function ingest(f: FactLike & object, now: number, wall: number): void {
   deadlineOf(f, now, wall);
   if (Array.isArray(f.value)) {
-    for (const r of f.value) if (isFactLike(r)) deadlineOf(r, now, wall);
+    for (const r of f.value) {
+      if (isFactLike(r)) deadlineOf(r, now, wall);
+      else if (r && typeof r === 'object' && 'mount' in r && !deadlines.has(r)) {
+        const v = r as { observedAt?: number; ttlMs?: number };
+        deadlines.set(r, now + ((v.observedAt ?? f.observedAt) + (v.ttlMs ?? f.ttlMs) - wall));
+      }
+    }
   }
 }
 
+export function disksAt(f: DisksFact, now: number, wall: number): DisksFact {
+  const ttlMs = (o: object, observedAt: number, originalTtl: number) =>
+    (deadlines.get(o) ?? now + observedAt + originalTtl - wall) - now + wall - observedAt;
+  return effectiveDisks({
+    ...f,
+    ttlMs: ttlMs(f, f.observedAt, f.ttlMs),
+    value: f.value?.map((v) => ({
+      ...v,
+      ttlMs: ttlMs(v, v.observedAt ?? f.observedAt, v.ttlMs ?? f.ttlMs),
+    })) ?? null,
+  }, wall);
+}
+
 const mark = <T extends FactLike>(o: T, now: number, wall: number): T =>
-  o.status === 'ok' && now > deadlineOf(o, now, wall) ? ({ ...o, status: 'stale' } as T) : o;
+  o.status === 'ok' && ttlStatusAt({ status: 'ok', observedAt: deadlineOf(o, now, wall), ttlMs: 0 }, now) === 'stale'
+    ? ({ ...o, status: 'stale' } as T) : o;
 
 // Marks an ok fact stale once it outlives its tracked deadline (`now` is
 // monotonic, `wall` the wall reading of the same instant), plus fact-like

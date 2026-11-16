@@ -46,6 +46,10 @@ export function App() {
   }
 
   const act = useCallback((text: string) => setLastAction(text), [])
+  const onOpenPermissionSettings = useCallback(
+    () => act('请求打开系统授权设置'),
+    [act],
+  )
 
   return (
     <>
@@ -109,7 +113,7 @@ export function App() {
             setModel((m) => ({ ...m, rules: m.rules.filter((r) => r.id !== id) }))
             act(`删除/拒绝规则 ${id}`)
           }}
-          onOpenPermissionSettings={() => act('请求打开系统授权设置')}
+          onOpenPermissionSettings={onOpenPermissionSettings}
           onLockParam={(key, locked) => {
             setModel((m) => ({
               ...m,

@@ -9,6 +9,7 @@ import { MemorySampler } from '../src/memory.js';
 import { NetworkSampler } from '../src/network.js';
 import * as fact from '../src/fact.js';
 import type { Body, Fact, TokensValue } from '../src/types.js';
+import { effectiveDisks, factStatusAt } from '@asi/sense-types';
 
 const src = (api: string) => fact.source('test', api);
 const ok = <T>(v: T, api = 'fake'): Fact<T> => fact.ok(v, src(api));
@@ -17,7 +18,7 @@ const fx = (name: string) => fs.readFileSync(new URL(`./fixtures/${name}`, impor
 const baseCollectors = (): ProbeCollectors => ({
   cpu: async (ttl) => fact.ok({ usage: 0.5, perCore: [0.5], load1: 1, load5: 1, load15: 1 }, src('cpu'), ttl),
   memory: async (ttl) => fact.ok({ total: 1, used: 1, pressure: 'normal', swapUsed: 0 }, src('mem'), ttl),
-  disks: async (_cwd, ttl) => fact.ok([{ mount: '/', total: 10, free: 5 }], src('disks'), ttl),
+  disks: async (_cwd, ttl) => ({ ...fact.ok([{ mount: '/', total: 10, free: 5 }], src('disks'), ttl), kind: 'disks' }),
   battery: async (ttl) => fact.ok(null, src('batt'), ttl),
   network: async (ttl) => fact.ok({ online: true, rxBps: 1, txBps: 1 }, src('net'), ttl),
   process: async (_pid, ttl) => fact.ok({ rss: 1, cpu: 0.1, uptimeSec: 5 }, src('proc'), ttl),
@@ -58,6 +59,22 @@ describe('BodyProbe', () => {
     await probe.stop();
   });
 
+  it('preserves the disk discriminator for frozen collectors and collection failures', async () => {
+    for (const fails of [false, true]) {
+      const collectors = baseCollectors();
+      collectors.disks = async () => {
+        if (fails) throw new Error('fixture failure');
+        return Object.freeze({ ...fact.ok([{ mount: '/', total: 10, free: 5 }], src('disks')), kind: 'disks' as const });
+      };
+      const probe = new BodyProbe(collectors);
+      probe.start();
+      await flush();
+      expect(probe.history()[0]!.body.disks.kind).toBe('disks');
+      expect(probe.latest()!.disks).toMatchObject({ kind: 'disks', status: fails ? 'unknown' : 'ok' });
+      await probe.stop();
+    }
+  });
+
   it('rejects invalid interval and history arguments', async () => {
     const probe = new BodyProbe(baseCollectors());
     for (const bad of [0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
@@ -84,6 +101,70 @@ describe('BodyProbe', () => {
     expect(probe.latest()?.cpu.status).toBe('stale');
     const point = probe.history()[0]!;
     expect(point.body.cpu.status).toBe('ok');
+  });
+
+  it('reaggregates disk freshness between publications at each exact deadline', async () => {
+    const t0 = Date.now();
+    const collectors = baseCollectors();
+    collectors.disks = async () => ({
+      kind: 'disks',
+      value: [
+        { mount: '/', total: 100, free: 2, status: 'ok', observedAt: t0, ttlMs: 6000 },
+        { mount: '/b', total: 100, free: 90, status: 'ok', observedAt: t0 + 2000, ttlMs: 30000 },
+      ],
+      status: 'ok', source: src('disks'), observedAt: t0, ttlMs: 6000,
+      unavailableMounts: ['/missing'],
+    });
+    const probe = new BodyProbe(collectors);
+    probe.start({ intervalMs: 2000 });
+    await flush();
+    await probe.stop();
+    const original = probe.history()[0]!.body.disks;
+    expect(effectiveDisks(original, t0 + 6500)).toMatchObject({
+      status: 'ok', observedAt: t0 + 2000, ttlMs: 30000,
+      indeterminateMounts: ['/', '/missing'],
+    });
+    await vi.advanceTimersByTimeAsync(6000);
+    expect(probe.latest()!.disks.value?.[0]?.status).toBe('stale');
+    await vi.advanceTimersByTimeAsync(500);
+    expect(probe.latest()!.disks).toMatchObject({
+      status: 'ok', observedAt: t0 + 2000, ttlMs: 30000,
+      value: [{ status: 'stale' }, { status: 'ok' }],
+    });
+    await vi.advanceTimersByTimeAsync(25500);
+    expect(probe.latest()!.disks.status).toBe('stale');
+    expect(effectiveDisks({ ...original, status: 'denied' }, t0 + 6500).status).toBe('denied');
+    expect(effectiveDisks({ ...original, status: 'unsupported' }, t0 + 6500).status).toBe('unsupported');
+    expect(effectiveDisks({ ...original, value: null }, t0 + 6500).status).toBe('unknown');
+    expect(effectiveDisks({ ...original, value: null }, t0 + 6500).status).toBe('unknown');
+    expect(effectiveDisks({ ...original, value: [] }, t0 + 6500).status).toBe('unknown');
+    expect(factStatusAt({ value: [], status: 'ok', source: original.source, observedAt: t0, ttlMs: 30000 }, t0 + 6500)).toBe('ok');
+    expect(probe.history()[0]!.body.disks).toEqual(original);
+  });
+
+  it('uses monotonic disk deadlines after wall-clock jumps', async () => {
+    const t0 = Date.now();
+    const collectors = baseCollectors();
+    collectors.disks = async () => ({
+      kind: 'disks',
+      value: [
+        { mount: '/', total: 100, free: 2, status: 'ok', observedAt: t0, ttlMs: 6000 },
+        { mount: '/b', total: 100, free: 90, status: 'ok', observedAt: t0, ttlMs: 30000 },
+      ],
+      status: 'ok', source: src('disks'), observedAt: t0, ttlMs: 6000,
+    });
+    const probe = new BodyProbe(collectors);
+    probe.start({ intervalMs: 2000 });
+    await flush();
+    await probe.stop();
+    vi.setSystemTime(t0 + 3_600_000);
+    expect(probe.latest()!.disks.value?.map((v) => v.status)).toEqual(['ok', 'ok']);
+    await vi.advanceTimersByTimeAsync(6000);
+    expect(probe.latest()!.disks).toMatchObject({ status: 'ok', value: [{ status: 'stale' }, { status: 'ok' }] });
+    vi.setSystemTime(t0 - 3_600_000);
+    expect(probe.latest()!.disks.value?.map((v) => v.status)).toEqual(['stale', 'ok']);
+    await vi.advanceTimersByTimeAsync(24000);
+    expect(probe.latest()!.disks.status).toBe('stale');
   });
 
   it('unsubscribes listeners and isolates thrown errors and mutations', async () => {
@@ -661,7 +742,7 @@ describe('BodyProbe', () => {
     };
     collectors.disks = async (_cwd, ttl) => {
       counts.disks += 1;
-      return fact.ok([{ mount: '/', total: 10, free: 5 }], src('disks'), ttl);
+      return { ...fact.ok([{ mount: '/', total: 10, free: 5 }], src('disks'), ttl), kind: 'disks' };
     };
     // The injected mono clock wraps the faked global performance.now(), so
     // advancing timers progresses it while setSystemTime moves only the wall.

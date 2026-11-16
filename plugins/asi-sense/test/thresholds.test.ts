@@ -18,7 +18,7 @@ function mkBody(over: Partial<Body> = {}): Body {
   return {
     cpu: blank(),
     memory: blank(),
-    disks: blank(),
+    disks: { ...blank(), kind: 'disks' },
     battery: blank(),
     thermal: blank(),
     network: blank(),
@@ -32,7 +32,7 @@ function sample(body: Body, at: number, state?: BodyThresholdSample['state']): B
   return { body, at, source: SRC, ...(state ? { state } : {}) };
 }
 
-const disks = (free: number, total = 100) => mkBody({ disks: f([{ mount: '/', total, free }]) });
+const disks = (free: number, total = 100) => mkBody({ disks: { ...f([{ mount: '/', total, free }]), kind: 'disks' } });
 const tokens = (window: number, used?: number, projected?: number) =>
   mkBody({
     tokens: f({
@@ -103,15 +103,50 @@ describe('bodyThresholdSignals', () => {
 
   it('ignores invalid/stale facts and retains latch without fabricated recovery', () => {
     const prevState = { 'disk:/': 'warn' as const };
-    const bad = sample(mkBody({ disks: blank('stale') }), 10);
+    const bad = sample(mkBody({ disks: { ...blank('stale'), kind: 'disks' } }), 10);
     const r = bodyThresholdSignals(sample(disks(8), 0, prevState), bad);
     expect(r.signals).toHaveLength(0);
     expect(r.state['disk:/']).toBe('warn');
     const nan = bodyThresholdSignals(sample(disks(8), 0, prevState), sample(disks(Number.NaN), 20));
     expect(nan.signals).toHaveLength(0);
     expect(nan.state['disk:/']).toBe('warn');
-    const missing = bodyThresholdSignals(sample(disks(8), 0, prevState), sample(mkBody({ disks: f([]) }), 30));
+    const missing = bodyThresholdSignals(
+      sample(disks(8), 0, prevState),
+      sample(mkBody({ disks: { ...f([]), kind: 'disks' } }), 30),
+    );
     expect(missing.state['disk:/']).toBe('warn'); // absent mounts retain latch
+  });
+
+  it('evaluates each disk independently and retains stale or unreadable latches', () => {
+    const partial = mkBody({
+      disks: {
+        kind: 'disks',
+        ...f([
+          { mount: '/', total: 100, free: 2, status: 'stale' as const, observedAt: 0, ttlMs: 6000 },
+          { mount: '/data', total: 100, free: 90, status: 'ok' as const, observedAt: 2000, ttlMs: 30000 },
+        ]),
+        unavailableMounts: ['/missing'],
+      },
+    });
+    const prev = sample(mkBody(), 0);
+    const next = sample(partial, 6500);
+    expect(bodyThresholdSignals(prev, next).signals).toEqual([]);
+    const held = bodyThresholdSignals({ ...prev, state: { 'disk:/': 'critical' } }, next);
+    expect(held.signals).toEqual([]);
+    expect(held.state['disk:/']).toBe('critical');
+    const unreadable = { ...partial, disks: { ...partial.disks, unavailableMounts: ['/data'] } };
+    const heldData = bodyThresholdSignals({ ...prev, state: { 'disk:/data': 'critical' } }, sample(unreadable, 6500));
+    expect(heldData.state['disk:/data']).toBe('critical');
+    const restored = {
+      ...partial,
+      disks: {
+        ...partial.disks,
+        value: [{ mount: '/', total: 100, free: 90, status: 'ok' as const, observedAt: 6500, ttlMs: 6000 }],
+      },
+    };
+    expect(bodyThresholdSignals({ ...prev, state: held.state }, sample(restored, 6501)).signals).toMatchObject([
+      { subject: 'disk:/', data: { severity: 'normal' } },
+    ]);
   });
 
   it('uses actual context usage and ignores projected usage for thresholds', () => {

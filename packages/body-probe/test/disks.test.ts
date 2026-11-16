@@ -1,5 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { DiskSampler, collectDisks, type DisksDeps, type StatFsResult } from '../src/disks.js';
+import type { Body, Fact, SourceRef } from '@asi/sense-types';
+import { bodyThresholdSignals } from '../../../plugins/asi-sense/src/host/attention/thresholds.js';
 
 const statfs = (r: StatFsResult) => async () => r;
 
@@ -195,9 +197,81 @@ describe('DiskSampler', () => {
       expect(cwd?.status).toBe('stale'); // failed refresh -> stale immediately
       expect(cwd?.total).toBe(40960);    // numbers retained, never fabricated
       expect(f.value?.find((v) => v.mount === '/')?.status).toBe('ok');
-      expect(f.status).toBe('stale');
+      // 根卷刚刷新成功：父事实保持 ok，且元数据只聚合新鲜卷
+      expect(f.status).toBe('ok');
+      expect(f.observedAt).toBe(10_000);
     },
   );
+
+  it('aggregates parent metadata only over fresh volumes', async () => {
+    const { s } = make({
+      stat: async (p) => ({ dev: p === '/' ? 1 : p === '/a' ? 2 : 3 }),
+    });
+    await s.sample('/a', 6000); // '/'、'/a' 于 t=0 落盘，ttl 6000
+    await flush();
+    t = 2000;
+    await s.sample('/b', 30_000); // 新挂载点 '/b' 于 t=2000 落盘，ttl 30s
+    await flush();
+    let f = await s.sample('/b', 30_000);
+    expect(f.status).toBe('ok');
+    expect(f.value?.map((v) => v.mount)).toEqual(['/', '/b']);
+    expect(f.observedAt).toBe(0);   // 最旧新鲜观察
+    expect(f.ttlMs).toBe(6000);     // 最早新鲜过期 6000 − 最旧观察 0
+    t = 6500; // '/' 越过 6000 截止 -> stale；'/b' 仍新鲜
+    f = await s.sample('/b', 30_000);
+    expect(f.status).toBe('ok');    // 有新鲜兄弟卷，父事实不降级
+    expect(f.value?.find((v) => v.mount === '/')?.status).toBe('stale');
+    expect(f.observedAt).toBe(2000); // stale 根卷的更旧时间戳不进入父元数据
+    expect(f.ttlMs).toBe(30_000);    // 最早新鲜过期 32_000 − 观察 2000
+    t = 33_000; // '/b' 也越过 32_000 截止 -> 全部失鲜
+    f = await s.sample('/b', 30_000);
+    expect(f.status).toBe('stale');
+    expect(f.observedAt).toBe(0);    // 无新鲜卷时回落到全部记录元数据
+  });
+
+  it('keeps sampler-produced stale and unreadable volumes out of floor transitions', async () => {
+    let failRoot = false;
+    const { s } = make({
+      statfs: async (p) => {
+        if (p === '/' && failRoot) throw new Error('not readable');
+        return { bsize: 1, blocks: 100, bavail: p === '/' ? 2 : 90 };
+      },
+    });
+    await s.sample('/data', 30000);
+    await flush();
+    failRoot = true;
+    t = 10000;
+    await s.sample('/data', 30000);
+    await flush();
+    const disk = await s.sample('/data', 30000);
+    expect(disk.kind).toBe('disks');
+    expect(disk.value).toMatchObject([{ mount: '/', status: 'stale' }, { mount: '/data', status: 'ok' }]);
+    const source: SourceRef = { id: 'test', api: 'fixture', host: 'fake' };
+    const missing: Fact<never> = { value: null, status: 'unknown', source, observedAt: 0, ttlMs: 1 };
+    const body: Body = {
+      cpu: missing, memory: missing, disks: disk, battery: missing, thermal: missing,
+      network: missing, harnessProcess: missing, tokens: missing,
+    };
+    const previous = { body: { ...body, disks: { ...missing, kind: 'disks' as const } }, at: 0, source };
+    const next = { body, at: t, source };
+    expect(bodyThresholdSignals(previous, next).signals).toEqual([]);
+    const held = bodyThresholdSignals({ ...previous, state: { 'disk:/': 'critical' } }, next);
+    expect(held.signals).toEqual([]);
+    expect(held.state['disk:/']).toBe('critical');
+    s.stop();
+  });
+
+  it('expires disk volumes at the exact half-open TTL deadline', async () => {
+    const { s } = make();
+    await s.sample('/w', 6000);
+    await flush();
+    t = 6000;
+    const result = await s.sample('/w', 6000);
+    expect(result.status).toBe('stale');
+    expect(result.value?.map((v) => v.status)).toEqual(['stale', 'stale']);
+    s.stop();
+    await flush();
+  });
 
   it('marks retained numbers stale on a rejected refresh too', async () => {
     let fail = false;

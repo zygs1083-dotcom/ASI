@@ -69,6 +69,7 @@ export const NetworkTile = memoTile(
               ↑ {formatRate(val.txBps)} · {val.online ? '已连接' : '已断开'}
             </span>
             <Sparkline
+              metric="networkRx"
               points={model.history.networkRx}
               now={now}
               label="网络下行"
@@ -148,6 +149,7 @@ export const ProcessTile = memoTile(
             <span className={css.tileValue}>{formatBytes(val.rss)}</span>
             <span className={css.tileSub}>CPU {formatPercent(val.cpu)}</span>
             <Sparkline
+              metric="processRss"
               points={model.history.processRss}
               now={now}
               label="DSH 内存"

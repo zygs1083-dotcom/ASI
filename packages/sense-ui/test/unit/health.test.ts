@@ -1,7 +1,14 @@
 import { describe, expect, it } from 'vitest'
-import { effectiveSeverity, effectiveStatus, evaluateBody } from '../../src/health'
-import { T0, emptyFact, fact, makeBody } from '../../src/mock/fixtures'
-import type { Body } from '../../src/view-model'
+import {
+  diskFact,
+  effectiveSeverity,
+  effectiveStatus,
+  evaluateBody,
+  rowMetricKeys,
+  rowUsable,
+} from '../../src/health'
+import { T0, disksFixture, emptyFact, fact, makeBody } from '../../src/mock/fixtures'
+import type { Body, DiskVolume, DisksFact } from '../../src/view-model'
 
 function bodyWith(patch: Partial<Body>): Body {
   return { ...makeBody(), ...patch }
@@ -14,8 +21,8 @@ describe('effectiveStatus', () => {
   it('ok 但超过 TTL 记为 stale', () => {
     expect(effectiveStatus(fact(1, { ageMs: 6_000, ttlMs: 5_000 }), T0)).toBe('stale')
   })
-  it('恰好等于 TTL 不算过期', () => {
-    expect(effectiveStatus(fact(1, { ageMs: 5_000, ttlMs: 5_000 }), T0)).toBe('ok')
+  it('恰好等于 TTL 即过期', () => {
+    expect(effectiveStatus(fact(1, { ageMs: 5_000, ttlMs: 5_000 }), T0)).toBe('stale')
   })
   it('denied 不受 TTL 影响', () => {
     const f = fact<number>(null, { status: 'denied', ageMs: 99_000, ttlMs: 1_000 })
@@ -48,7 +55,7 @@ describe('单项阈值', () => {
   it('磁盘：free/total <=10% warn，<=5% critical', () => {
     const disk = (freeRatio: number) =>
       bodyWith({
-        disks: fact([{ mount: '/', total: 100e9, free: freeRatio * 100e9 }]),
+        disks: disksFixture([{ mount: '/', total: 100e9, free: freeRatio * 100e9 }]),
       })
     expect(sev(disk(0.11)).rows.disks.severity).toBe('good')
     expect(sev(disk(0.1)).rows.disks.severity).toBe('warn')
@@ -271,14 +278,14 @@ describe('磁盘有效性', () => {
     { disks: [] as { mount: string; total: number; free: number }[], sev: 'unknown' },
     { disks: [{ mount: '/', total: 0, free: 5e9 }, { mount: '/x', total: -1, free: 1e9 }], sev: 'unknown' },
   ])('空/全无效列表 → $sev 而非 good', ({ disks, sev }) => {
-    const r = evaluateBody(bodyWith({ disks: fact(disks) }), T0)
+    const r = evaluateBody(bodyWith({ disks: disksFixture(disks) }), T0)
     expect(r.rows.disks.severity).toBe(sev)
     expect(r.severity).toBe('unknown')
   })
 
   it('无效条目不参与极值/聚合；有效盘照常告警', () => {
     const r = evaluateBody(
-      bodyWith({ disks: fact([
+      bodyWith({ disks: disksFixture([
         { mount: '/', total: 0, free: 5e9 },
         { mount: '/d', total: 100e9, free: 2e9 },
       ]) }),
@@ -289,11 +296,11 @@ describe('磁盘有效性', () => {
 
   it('无效挂载点上的 critical insight 不能复活/升级磁盘行', () => {
     const r = evaluateBody(
-      bodyWith({ disks: fact([{ mount: '/', total: 0, free: 0 }]) }), T0, { 'disk:/': critInsight })
+      bodyWith({ disks: disksFixture([{ mount: '/', total: 0, free: 0 }]) }), T0, { 'disk:/': critInsight })
     expect(r.rows.disks.severity).toBe('unknown')
     // 混合列表：只聚合有效挂载点的 insight
     const r2 = evaluateBody(
-      bodyWith({ disks: fact([
+      bodyWith({ disks: disksFixture([
         { mount: '/', total: 100e9, free: 90e9 },
         { mount: '/bad', total: 0, free: 0 },
       ]) }),
@@ -340,4 +347,170 @@ describe('contextWindow 回退估值', () => {
       expect(evaluateBody(b, T0).rows.tokens.severity).toBe('critical')
     },
   )
+})
+
+describe('卷级磁盘状态（status/observedAt/ttlMs + unavailableMounts）', () => {
+  const mkDisks = (
+    volumes: DiskVolume[],
+    unavailableMounts?: string[],
+    parentOpts: Parameters<typeof fact>[1] = {},
+  ): DisksFact => ({
+    ...disksFixture(volumes, parentOpts),
+    unavailableMounts,
+  })
+
+  const rootStaleBody = () =>
+    bodyWith({
+      disks: mkDisks([
+        { mount: '/', total: 100e9, free: 90e9, observedAt: T0 - 90_000, ttlMs: 5_000 },
+        { mount: '/data', total: 100e9, free: 90e9 },
+      ]),
+    })
+
+  it('diskFact：卷级覆盖与父事实有效状态上界', () => {
+    const parent = mkDisks([])
+    const vol: DiskVolume = { mount: '/x', total: 10e9, free: 5e9 }
+    // 继承父 ok；卷级 stale 保留读数；卷级 unknown 清空；卷级 TTL 过期→stale
+    expect(effectiveStatus(diskFact(parent, vol, T0), T0)).toBe('ok')
+    const stale = diskFact(parent, { ...vol, status: 'stale' }, T0)
+    expect(effectiveStatus(stale, T0)).toBe('stale')
+    expect(stale.value).toMatchObject({ mount: '/x', free: 5e9 })
+    expect(effectiveStatus(diskFact(parent, { ...vol, status: 'unknown' }, T0), T0)).toBe('unknown')
+    const ttl = diskFact(parent, { ...vol, status: 'ok', observedAt: T0 - 90_000, ttlMs: 5_000 }, T0)
+    expect(effectiveStatus(ttl, T0)).toBe('stale')
+    // 显式卷级元数据权威：父级 stale/denied/过期不再一票否决带元数据的 ok 卷；
+    // 缺省（旧版）卷才继承父级有效状态作上界（时间戳同样回退父级）
+    for (const p of [
+      mkDisks([vol], undefined, { status: 'stale' }),
+      mkDisks([vol], undefined, { status: 'denied' }),
+      mkDisks([vol], undefined, { ageMs: 90_000, ttlMs: 5_000 }),
+    ]) {
+      const df = diskFact(p, { ...vol, status: 'ok', observedAt: T0 - 1_000, ttlMs: 60_000 }, T0)
+      expect(effectiveStatus(df, T0)).toBe('ok')
+      expect(effectiveStatus(diskFact(p, vol, T0), T0)).toBe(effectiveStatus(p, T0))
+    }
+    // unavailableMounts 命中即 unavailable 且清空读数（value 里带数也不展示），去重
+    const df = diskFact(
+      mkDisks([], ['/Volumes/network', '/Volumes/network']),
+      { mount: '/Volumes/network', total: 10e9, free: 5e9 },
+      T0,
+    )
+    expect(df.status).toBe('unavailable')
+    expect(df.value).toBeNull()
+    expect(df.source).toEqual(mkDisks([]).source)
+  })
+
+  it('新鲜卷优先：根卷失鲜不整行 unknown，不完整行明示「部分」', () => {
+    const expectPartialGood = (disks: DisksFact) => {
+      const r = evaluateBody(bodyWith({ disks }), T0)
+      expect(r.rows.disks.severity).toBe('good')
+      expect(r.rows.disks.partial).toBe(true)
+      expect(r.severity).toBe('good')
+      expect(r.partial).toBe(true)
+      expect(r.sentence).toBe('部分 · 数据待补全')
+    }
+    // 根卷 stale / unknown / 不可读都不一票否决其他新鲜卷
+    expectPartialGood(rootStaleBody().disks)
+    expectPartialGood(
+      mkDisks([
+        { mount: '/', total: 100e9, free: 90e9, status: 'unknown' },
+        { mount: '/data', total: 100e9, free: 90e9 },
+      ]),
+    )
+    expectPartialGood(
+      mkDisks(
+        [
+          { mount: '/', total: 100e9, free: 90e9 },
+          { mount: '/data', total: 100e9, free: 90e9 },
+        ],
+        ['/'],
+      ),
+    )
+    // unavailableMounts 含 / 但 value 无根条目 → 仍按新鲜卷 good+partial
+    const noRoot = mkDisks([{ mount: '/data', total: 100e9, free: 90e9 }], ['/'])
+    expectPartialGood(noRoot)
+    expect(rowMetricKeys('disks', bodyWith({ disks: noRoot }), T0)).toEqual(['disk:/data'])
+    // 全部卷失鲜/无可读 → 行才 unknown
+    const expectUnknown = (disks: DisksFact) => {
+      const r = evaluateBody(bodyWith({ disks }), T0)
+      expect(r.rows.disks.severity).toBe('unknown')
+      expect(r.severity).toBe('unknown')
+      expect(r.sentence).toBe('数据待补全')
+    }
+    expectUnknown(
+      mkDisks([{ mount: '/', total: 100e9, free: 90e9, status: 'stale' }]),
+    )
+    expectUnknown(mkDisks([], ['/']))
+    // 新鲜卷告警照常聚合；部分缺失只加 partial 徽标不覆盖告警句
+    const alerted = bodyWith({
+      disks: mkDisks([
+        { mount: '/', total: 100e9, free: 90e9, observedAt: T0 - 90_000, ttlMs: 5_000 },
+        { mount: '/data', total: 100e9, free: 2e9 }, // 2% → critical
+      ]),
+    })
+    const r = evaluateBody(alerted, T0)
+    expect(r.rows.disks.severity).toBe('critical')
+    expect(r.rows.disks.partial).toBe(true)
+    expect(r.partial).toBe(true)
+    expect(r.severity).toBe('critical')
+    expect(r.sentence).toBe('磁盘空间不足')
+  })
+
+  it('非新鲜卷不产 key、insight 不泄漏；unavailable 读数作废', () => {
+    const b = rootStaleBody()
+    expect(rowMetricKeys('disks', b, T0)).toEqual(['disk:/data'])
+    expect(rowUsable('disks', b, T0)).toBe(true)
+    // 'disk:/' critical insight 作用于 stale 根卷 → 不并入（行仍按新鲜卷 good）
+    expect(
+      evaluateBody(b, T0, {
+        'disk:/': { sources: ['floor'], triggered: ['floor'], severity: 'critical' },
+      }).rows.disks.severity,
+    ).toBe('good')
+    // 'disk:/data' critical insight 作用于新鲜卷 → 并入
+    expect(
+      evaluateBody(b, T0, {
+        'disk:/data': { sources: ['floor'], triggered: ['floor'], severity: 'critical' },
+      }).rows.disks.severity,
+    ).toBe('critical')
+    // 唯一卷 stale → 无可用键且行不可用
+    const onlyStale = bodyWith({
+      disks: mkDisks([{ mount: '/', total: 100e9, free: 90e9, status: 'stale' }]),
+    })
+    expect(rowMetricKeys('disks', onlyStale, T0)).toEqual([])
+    expect(rowUsable('disks', onlyStale, T0)).toBe(false)
+    // unavailableMounts 命中 value 内的挂载点：读数作废、不参与聚合/insight
+    const u = bodyWith({
+      disks: mkDisks(
+        [
+          { mount: '/', total: 100e9, free: 90e9 },
+          { mount: '/Volumes/network', total: 100e9, free: 1e9 }, // 1% 但挂载不可读
+        ],
+        ['/Volumes/network'],
+      ),
+    })
+    expect(
+      evaluateBody(u, T0, {
+        'disk:/Volumes/network': {
+          sources: ['floor'],
+          triggered: ['floor'],
+          severity: 'critical',
+        },
+      }).rows.disks.severity,
+    ).toBe('good')
+    expect(rowMetricKeys('disks', u, T0)).toEqual(['disk:/'])
+  })
+
+  it('无根卷 payload 保留旧版最差卷语义', () => {
+    const b = bodyWith({
+      disks: mkDisks([
+        { mount: '/data', total: 100e9, free: 5e9 }, // 5% → critical
+        { mount: '/vol', total: 100e9, free: 90e9 },
+      ]),
+    })
+    expect(evaluateBody(b, T0).rows.disks.severity).toBe('critical')
+    const b2 = bodyWith({
+      disks: mkDisks([{ mount: '/data', total: 100e9, free: 90e9 }]),
+    })
+    expect(evaluateBody(b2, T0).rows.disks.severity).toBe('good')
+  })
 })
