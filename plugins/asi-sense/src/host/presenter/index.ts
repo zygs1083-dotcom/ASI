@@ -61,7 +61,7 @@ export function createPresenter(
     const samples = history.update(runtime.state().self.body, now);
     const entries = runtime.events();
     const settings = runtime.rules.settings();
-    const { insights, learning } = projectInsights(runtime, samples, entries, clock, intervals);
+    const { insights, learning } = projectInsights(runtime, samples, history.rates, entries, clock, intervals);
     const next: PresenterModel = {
       state,
       history: samples,

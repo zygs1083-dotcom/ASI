@@ -18,12 +18,15 @@ export function createHistory() {
     disks: {},
   };
   const seen = new Map<MetricKey, number>();
+  const rates = new Map<MetricKey, MetricPoint[]>();
 
   function update(body: Body, now: number): BodyHistory {
     const readings = new Map<MetricKey, MetricPoint>();
-    const add = (key: MetricKey, at: number, value: number | undefined) => {
+    const raw = new Map<MetricKey, number>();
+    const add = (key: MetricKey, at: number, value: number | undefined, rateValue?: number) => {
       if (value !== undefined && Number.isFinite(value) && Number.isFinite(at) && at >= now - WINDOW) {
         readings.set(key, { at, value });
+        if (rateValue !== undefined && Number.isFinite(rateValue)) raw.set(key, rateValue);
       }
     };
     const fact = <T>(value: Fact<T>, read: (v: T) => void) => {
@@ -54,12 +57,18 @@ export function createHistory() {
         'tokens',
         body.tokens.observedAt,
         v.contextUsed !== undefined && v.contextUsed >= 0 ? v.contextUsed : undefined,
+        (!('contextWindowSource' in v) || v.contextWindowSource !== 'fallback') &&
+          v.contextWindow !== undefined &&
+          v.contextWindow > 0 &&
+          v.contextUsed !== undefined
+          ? v.contextWindow - v.contextUsed
+          : undefined,
       ),
     );
     for (const volume of body.disks.value ?? []) {
       const d = diskVolumeAt(body.disks, volume, now);
       if (d.status === 'ok' && Number.isFinite(d.total) && d.total > 0 && d.free >= 0 && d.free <= d.total) {
-        add(`disk:${d.mount}`, d.observedAt, (d.total - d.free) / d.total);
+        add(`disk:${d.mount}`, d.observedAt, (d.total - d.free) / d.total, d.free);
       }
     }
 
@@ -83,6 +92,17 @@ export function createHistory() {
         seen.set(key, point.at);
         points = [...points, point];
       }
+      if (disk || key === 'tokens') {
+        let ratePoints = rates.get(key) ?? [];
+        if (ratePoints.length && ratePoints[0].at < now - WINDOW)
+          ratePoints = ratePoints.filter((item) => item.at >= now - WINDOW);
+        if (fresh) {
+          const value = raw.get(key);
+          ratePoints = value === undefined ? [] : [...ratePoints, { at: point.at, value }];
+        }
+        if (ratePoints.length) rates.set(key, ratePoints);
+        else rates.delete(key);
+      }
       if (points !== old) {
         changed = true;
         if (disk) {
@@ -100,5 +120,5 @@ export function createHistory() {
     if (changed) history = next;
     return history;
   }
-  return { update };
+  return { update, rates };
 }

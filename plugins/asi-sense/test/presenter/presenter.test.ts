@@ -199,7 +199,7 @@ describe('presenter', () => {
     await h.runtime.stop();
   });
 
-  it('projects floor severity, rate thresholds and a current ETA without reusing an older estimate', async () => {
+  it('projects floor severity and rate thresholds but waits for three samples before estimating', async () => {
     const h = await harness();
     const gib = 1024 ** 3;
     const disks = (free: number) => {
@@ -219,12 +219,216 @@ describe('presenter', () => {
         floor: { value: 0.95, source: 'floor' },
         rate: { value: 2 * gib, unit: 'bytes' },
       },
-      currentEta: { asOf: Date.now(), sampleIntervalMs: 10_000, ratePerMinute: expect.any(Number) },
     });
-    expect(current?.currentEta?.ratePerMinute).toBeLessThan(0);
+    expect(current?.currentEta).toBeUndefined();
     await h.advance(2_000);
     await h.sample(mkBody({ disks: disks(gib / 20) }));
+    expect(h.presenter.snapshot().insights?.['disk:/']?.currentEta).toMatchObject({
+      asOf: Date.now(),
+      sampleIntervalMs: 10_000,
+      ratePerMinute: expect.any(Number),
+    });
+    expect(h.presenter.snapshot().insights?.['disk:/']?.currentEta?.ratePerMinute).toBeLessThan(0);
+    h.presenter.close();
+    await h.runtime.stop();
+  });
+
+  it('recalculates disk ETA for three consecutive samples and clears it on recovery', async () => {
+    const h = await harness();
+    const gib = 1024 ** 3;
+    const sampleDisk = async (free: number) => {
+      const disks = diskFact([{ mount: '/', total: 100 * gib, free: free * gib, observedAt: Date.now() }]);
+      disks.observedAt = Date.now();
+      await h.sample(mkBody({ disks }));
+    };
+    await sampleDisk(80);
+    await h.advance(10_000);
+    await sampleDisk(76);
     expect(h.presenter.snapshot().insights?.['disk:/']?.currentEta).toBeUndefined();
+    for (const [free, rate] of [
+      [75, -15],
+      [73, -13.2],
+      [70, -13.8],
+    ] as const) {
+      await h.advance(10_000);
+      await sampleDisk(free);
+      const eta = h.presenter.snapshot().insights?.['disk:/']?.currentEta;
+      expect(eta?.asOf).toBe(Date.now());
+      expect(eta?.ratePerMinute).toBeCloseTo(rate * gib, 3);
+      expect(eta?.timeToThresholdMs).toBeCloseTo(((free - 5) / -rate) * 60_000, 3);
+    }
+    await h.advance(10_000);
+    await sampleDisk(79);
+    expect(
+      h.runtime
+        .events()
+        .filter((event) => event.kind === 'body.rate')
+        .at(-1)?.detail?.severity,
+    ).toBe('normal');
+    expect(h.presenter.snapshot().insights?.['disk:/']?.currentEta).toBeUndefined();
+    h.presenter.close();
+    await h.runtime.stop();
+  });
+
+  it('hides disk ETA when the fitted trend reverses while the rate alarm remains active', async () => {
+    const h = await harness();
+    const gib = 1024 ** 3;
+    for (const free of [100, 30, 85, 95]) {
+      if (free !== 100) await h.advance(10_000);
+      const disks = diskFact([{ mount: '/', total: 100 * gib, free: free * gib, observedAt: Date.now() }]);
+      disks.observedAt = Date.now();
+      await h.sample(mkBody({ disks }));
+      if (free === 85) expect(h.presenter.snapshot().insights?.['disk:/']?.currentEta).toBeDefined();
+    }
+    expect(
+      h.runtime
+        .events()
+        .filter((event) => event.kind === 'body.rate')
+        .at(-1)?.detail?.severity,
+    ).toBe('warn');
+    expect(h.presenter.snapshot().insights?.['disk:/']?.currentEta).toBeUndefined();
+    h.presenter.close();
+    await h.runtime.stop();
+  });
+
+  it('hides disk ETA for a flat fitted trend while the rate alarm remains active', async () => {
+    const h = await harness();
+    const gib = 1024 ** 3;
+    for (const free of [100, 20, 80, 80]) {
+      if (free !== 100) await h.advance(10_000);
+      const disks = diskFact([{ mount: '/', total: 100 * gib, free: free * gib, observedAt: Date.now() }]);
+      disks.observedAt = Date.now();
+      await h.sample(mkBody({ disks }));
+    }
+    expect(
+      h.runtime
+        .events()
+        .filter((event) => event.kind === 'body.rate')
+        .at(-1)?.detail?.severity,
+    ).toBe('warn');
+    expect(h.presenter.snapshot().insights?.['disk:/']?.currentEta).toBeUndefined();
+    h.presenter.close();
+    await h.runtime.stop();
+  });
+
+  it('fits the exact event window, including its boundary, using raw free bytes', async () => {
+    const h = await harness();
+    const gib = 1024 ** 3;
+    for (const [delay, free] of [
+      [0, 80],
+      [10_000, 76],
+      [10_000, 75],
+      [50_000, 70],
+      [1_000, 69.9],
+    ] as const) {
+      await h.advance(delay);
+      const disks = diskFact([{ mount: '/', total: 100 * gib, free: free * gib, observedAt: Date.now() }]);
+      disks.observedAt = Date.now();
+      await h.sample(mkBody({ disks }));
+      if (free <= 70) {
+        const eta = h.presenter.snapshot().insights?.['disk:/']?.currentEta;
+        expect(eta?.ratePerMinute).toBeCloseTo(-6 * gib, 3);
+        expect(eta?.timeToThresholdMs).toBeCloseTo(((free - 5) / 6) * 60_000, 3);
+      }
+    }
+    h.presenter.close();
+    await h.runtime.stop();
+  });
+
+  it('estimates disk depletion from historical free bytes when capacity changes', async () => {
+    const h = await harness();
+    const gib = 1024 ** 3;
+    for (const [total, free] of [
+      [100, 80],
+      [200, 70],
+      [300, 60],
+    ] as const) {
+      if (total !== 100) await h.advance(10_000);
+      const disks = diskFact([{ mount: '/', total: total * gib, free: free * gib, observedAt: Date.now() }]);
+      disks.observedAt = Date.now();
+      await h.sample(mkBody({ disks }));
+    }
+    const eta = h.presenter.snapshot().insights?.['disk:/']?.currentEta;
+    expect(eta?.ratePerMinute).toBeCloseTo(-60 * gib, 3);
+    expect(eta?.timeToThresholdMs).toBeCloseTo(45_000, 3);
+    h.presenter.close();
+    await h.runtime.stop();
+  });
+
+  it('hides ETA when too few samples remain in the active event window', async () => {
+    const h = await harness();
+    const gib = 1024 ** 3;
+    for (const [delay, free] of [
+      [0, 80],
+      [10_000, 76],
+      [70_000, 74],
+    ] as const) {
+      await h.advance(delay);
+      const disks = diskFact([{ mount: '/', total: 100 * gib, free: free * gib, observedAt: Date.now() }]);
+      disks.observedAt = Date.now();
+      await h.sample(mkBody({ disks }));
+    }
+    expect(
+      h.runtime
+        .events()
+        .filter((event) => event.kind === 'body.rate')
+        .at(-1)?.detail?.severity,
+    ).toBe('warn');
+    expect(h.presenter.snapshot().insights?.['disk:/']?.currentEta).toBeUndefined();
+    h.presenter.close();
+    await h.runtime.stop();
+  });
+
+  it('uses remaining tokens and the event window for context ETA even when capacity changes', async () => {
+    const h = await harness();
+    for (const [window, used] of [
+      [1000, 0],
+      [1000, 200],
+      [1200, 500],
+    ] as const) {
+      if (used) await h.advance(70_000);
+      const tokens = f({
+        contextWindow: window,
+        contextUsed: used,
+        sessionUsage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      });
+      tokens.observedAt = Date.now();
+      await h.sample(mkBody({ tokens }));
+    }
+    const event = h.runtime
+      .events()
+      .filter((entry) => entry.kind === 'body.rate')
+      .at(-1);
+    expect(event?.detail).toMatchObject({ metric: 'context', severity: 'warn', windowMs: 300_000 });
+    const eta = h.presenter.snapshot().insights?.tokens?.currentEta;
+    expect(eta?.asOf).toBe(Date.now());
+    expect(eta?.ratePerMinute).toBeCloseTo((300 / 140) * 60);
+    expect(eta?.timeToThresholdMs).toBeCloseTo((700 / 300) * 140_000);
+    h.presenter.close();
+    await h.runtime.stop();
+  });
+
+  it('does not use unconfirmed context capacity as historical evidence', async () => {
+    const h = await harness();
+    for (const [used, source] of [
+      [0, 'fallback'],
+      [100, 'fallback'],
+      [200, 'configured'],
+      [300, 'configured'],
+      [400, 'configured'],
+    ] as const) {
+      if (used) await h.advance(10_000);
+      const tokens = f({
+        contextWindow: 1000,
+        contextUsed: used,
+        contextWindowSource: source,
+        sessionUsage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      });
+      tokens.observedAt = Date.now();
+      await h.sample(mkBody({ tokens }));
+      if (used === 300) expect(h.presenter.snapshot().insights?.tokens?.currentEta).toBeUndefined();
+    }
+    expect(h.presenter.snapshot().insights?.tokens?.currentEta?.ratePerMinute).toBeCloseTo(600);
     h.presenter.close();
     await h.runtime.stop();
   });
