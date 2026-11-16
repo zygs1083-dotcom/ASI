@@ -5,6 +5,8 @@ import { createActions } from '../../src/client/actions.ts';
 function fixture() {
   const method = () => vi.fn().mockResolvedValue({ ok: true, value: undefined });
   const api = {
+    selectTarget: method(),
+    dismissTargetNotice: method(),
     toggleRule: method(),
     confirmRule: method(),
     deleteRule: method(),
@@ -27,6 +29,9 @@ describe('sidebar action boundary', () => {
   it('routes existing callbacks through the matching Remote methods', async () => {
     const { api, controller } = fixture();
     const a = controller.actions;
+    await a.onSelectTarget?.('session');
+    await a.onSelectTarget?.();
+    await a.onDismissTargetNotice?.();
     a.onToggleRule('rule', false);
     a.onConfirmRule('rule');
     a.onDeleteRule('rule');
@@ -38,6 +43,9 @@ describe('sidebar action boundary', () => {
     a.onFeedback('signal', 'noise');
     await Promise.resolve();
     expect(api.toggleRule).toHaveBeenCalledWith('rule', false);
+    expect(api.selectTarget).toHaveBeenNthCalledWith(1, 'session');
+    expect(api.selectTarget).toHaveBeenNthCalledWith(2, '');
+    expect(api.dismissTargetNotice).toHaveBeenCalledOnce();
     expect(api.confirmRule).toHaveBeenCalledWith('rule');
     expect(api.deleteRule).toHaveBeenCalledWith('rule');
     expect(api.pause).toHaveBeenCalledWith(true);

@@ -24,6 +24,17 @@ vi.mock('../../src/host/dsh/tools.ts', () => ({ registerSenseTools: () => () => 
 describe('DSH sampling intervals', () => {
   it('passes the helper thermal heartbeat to the presenter', async () => {
     const ctx = new Context();
+    ctx.provide('profileContext', {
+      name: 'fixture',
+      dir: '/tmp/synthetic-profile',
+      patchPath: '',
+      installAnchor: '',
+      cwd: '',
+      home: '',
+      startedBundles: [],
+      overlays: [],
+      telemetryDisabledEnv: undefined,
+    });
     try {
       await apply(ctx, { storageRoot: '/tmp/synthetic' });
       expect(createPresenter).toHaveBeenCalledWith(
