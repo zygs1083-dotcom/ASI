@@ -46,7 +46,7 @@ import type { SensePanelModel, SensePanelProps } from '@asi/sense-ui'
 - **可选字段**：`body.memory.value.breakdown`（`{app, wired, compressed, cached}` 原始字节）提供时画四段细分条（App/联动/压缩/缓存），缺失时只画 used/free 单段并在明细明示「未提供」；`body.tokens.value.contextGrowthPerMinute`（tokens/分）有限且 >0、且 `contextWindow`/`contextUsed` 均有限时，新鲜且容量已确认的卡片摘要估算「按当前速度约 N 分钟填满」；结果非有限或超过 7 天也不估算。无 `contextWindow`/`contextUsed` 时不出现压缩措辞，「本会话」用量行仍然显示。
 - **磁盘卷级状态（共享契约 `@asi/sense-types` 的 `DisksFact`/`DiskVolume`）**：`body.disks` 带必填 `kind: 'disks'` 和可选 `unavailableMounts`，各卷可加 `status`、`observedAt`、`ttlMs`。**自声明 `status` 的卷是权威的**：父事实失鲜/拒绝不再一票否决带元数据的 ok 卷；缺省字段（旧版只含 `mount/total/free` 的卷）回退父事实——状态继承父级有效状态作上界，时间戳沿用父级。`unavailableMounts` 声明读不出的挂载点并优先于 `value` 同名列：只显示「挂载点 · 无法读取」，无数字/无历史/无图。stale 卷灰显「上次读数 + 已过期 · 年龄」并保留读数，unknown/unavailable 卷不显示数值。行严重度只聚合 fresh 卷（非新鲜卷不产指标键、不并入 insight/ETA）；存在 fresh 卷但有失鲜/不可读记录时，卡片与总览监护词旁加「部分 · 数据待补全」徽标，不升级严重度、不覆盖告警句；全部卷失鲜或父级 denied/unavailable 且无 fresh 卷才报 unknown。主摘要焦点：新鲜告警卷 > 失鲜根卷（陈旧保留值）> 最差 fresh 卷。
 - **learning**：`collectedMs/targetMs` 由宿主给，UI 只算 `clamp(collected/target)`，target 非法显示"进度不可用"。
-- **tuning**：参数列表 + 调整日志（`previous→next`、`agent|user|auto`、`reverted`）。锁定/撤销只是回调，宿主拥有护栏。
+- **tuning**：参数列表 + 调整日志（`previous→next`、`agent|user|auto`、`reverted`）；`disabled.reason` 区分保存失败与恢复失败，`suggestions` 包含建议 ID、指标键、必填 `unit`、时段、旧/新均值、样本数与日期数。均值保留运行时自然单位，不转换为 `history` 的单位：`ratio`（0..1，如 CPU/内存），`percent`（0..100，电池），`bytes`（磁盘剩余、进程 RSS），`tokens`（上下文剩余），`bytes-per-second`（网络），`ordinal`（温控序数）。保存失败时调用 `onResumeTuning()`；恢复失败时二次确认后调用 `onResetTuning()`；每条重新基线建议经二次确认后调用 `onAcceptRebaseline(id)`。回调只向宿主请求操作，宿主负责持久化、护栏与更新 model；UI 不自行宣布操作成功。
 - **events**：`detail` 为宿主投影的告警明细（body.rate / body.anomaly / file.burst），`feedback` 状态只在 model 中。窗口类事件在 `sendTitles=false` 时隐藏主体/原因/规则名/detail。
 - **图窗口与时钟**：走势图 x 域固定为 5 分钟窗，锚点是最近一次历史序列更新时的 `now`；历史引用不变时事实或语义更新也不移动锚点。宿主通过 `model.sampleIntervalsMs` 按指标键（含 `disk:<挂载点>`）提供各序列的历史采样周期；缺省或非法时磁盘为 10000ms、电池为 30000ms、其余为 2000ms。`model.paused` 立即显示「采集暂停 · 最后 X 前」；未暂停且最新点早于 `now - 3×该序列周期` 时显示「数据滞后 · 最后 X 前」，均不称「现在/当前」；纯时钟推进只刷新文案，不重采样、不重算路径。
 - **磁盘父事实**：有至少一卷新鲜则 `ok`，有值但全部 stale 则 `stale`；`null`/空数组在 `ok/stale/unavailable/unknown` 下均为 `unknown`，采集权限拒绝 `denied` 与不支持 `unsupported` 维持原状态。父级 `observedAt` 取新鲜卷最旧时间，`ttlMs` 截止于新鲜卷中最早的绝对过期时间。
@@ -62,7 +62,9 @@ import type { SensePanelModel, SensePanelProps } from '@asi/sense-ui'
 
 ## 规模
 
-每个 src 文件 ≤300 行。E2E 截图矩阵 32 张（8 场景 × 320/420 × 明暗）+ 卡片明细 4 张 + fallback 容量 2 张 + disk-partial 2 张（420px 明暗），共 40 张，存于 `test/screenshots/`。
+每个 src 文件 ≤300 行。E2E 截图矩阵 32 张（8 场景 × 320/420 × 明暗）+ 卡片明细 4 张 + fallback 容量 2 张 + disk-partial 2 张 + 调参操作 4 张（420px 明暗），共 44 张，存于 `test/screenshots/`。
+
+预览场景 `tuning-disabled` 展示损坏数据的重置确认；`rebaseline-suggested` 展示保存失败恢复及重新基线建议。预览中的操作只修改编造的演示 model，不连接宿主存储。
 
 ## 评审修复对应测试
 

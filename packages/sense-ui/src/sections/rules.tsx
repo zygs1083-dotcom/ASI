@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { formatTimestamp, formatTuningValue } from '../format'
 import { EyeOffIcon, PauseIcon } from '../icons'
+import { RebaselineSuggestions, TuningDisabled } from './tuning-actions'
 import type {
   SensePanelProps,
   SenseRule,
@@ -83,7 +84,8 @@ function TuningView({
   model,
   onLockParam,
   onRevertTuning,
-}: Pick<SensePanelProps, 'model' | 'onLockParam' | 'onRevertTuning'>) {
+  onAcceptRebaseline,
+}: Pick<SensePanelProps, 'model' | 'onLockParam' | 'onRevertTuning' | 'onAcceptRebaseline'>) {
   const tuning = model.tuning
   const params: TuningParam[] = tuning?.parameters ?? []
   const log = tuning?.log ?? []
@@ -114,6 +116,7 @@ function TuningView({
           ))}
         </ul>
       )}
+      <RebaselineSuggestions model={model} onAcceptRebaseline={onAcceptRebaseline} />
       <ul className={css.rules}>
         {log.length === 0 && <li className={css.empty}>暂无调整记录</li>}
         {log.map((e) => (
@@ -161,6 +164,9 @@ export function RulesSection(props: SensePanelProps & { tuningReq?: number }) {
   const { model, onPause, onToggleTitles, tuningReq } = props
   const [view, setView] = useState<'rules' | 'tuning'>('rules')
   const tuneRef = useRef<HTMLDivElement | null>(null)
+  const rulesButton = useRef<HTMLButtonElement | null>(null)
+  const tuningButton = useRef<HTMLButtonElement | null>(null)
+  const focusView = () => (view === 'rules' ? rulesButton : tuningButton).current?.focus()
   // 「调整」入口：分区被打开后切到调整日志并把焦点带过去
   useEffect(() => {
     if (tuningReq) setView('tuning')
@@ -172,6 +178,11 @@ export function RulesSection(props: SensePanelProps & { tuningReq?: number }) {
 
   return (
     <>
+      <TuningDisabled
+        {...props}
+        onResumeTuning={() => { focusView(); props.onResumeTuning() }}
+        onResetTuning={() => { focusView(); props.onResetTuning() }}
+      />
       <label className={css.switch}>
         <input
           type="checkbox"
@@ -193,6 +204,7 @@ export function RulesSection(props: SensePanelProps & { tuningReq?: number }) {
 
       <div className={css.viewSwitch} role="group" aria-label="规则视图">
         <button
+          ref={rulesButton}
           type="button"
           aria-pressed={view === 'rules'}
           onClick={() => setView('rules')}
@@ -200,6 +212,7 @@ export function RulesSection(props: SensePanelProps & { tuningReq?: number }) {
           规则列表
         </button>
         <button
+          ref={tuningButton}
           type="button"
           aria-pressed={view === 'tuning'}
           onClick={() => setView('tuning')}
@@ -212,7 +225,10 @@ export function RulesSection(props: SensePanelProps & { tuningReq?: number }) {
         <RuleList {...props} />
       ) : (
         <div ref={tuneRef} tabIndex={-1} className={css.tuneView}>
-          <TuningView {...props} />
+          <TuningView
+            {...props}
+            onAcceptRebaseline={(id) => { tuningButton.current?.focus(); props.onAcceptRebaseline(id) }}
+          />
         </div>
       )}
     </>

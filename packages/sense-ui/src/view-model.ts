@@ -7,8 +7,10 @@ import type {
   FactStatus,
   SourceRef,
 } from '@asi/sense-types'
+import type { TuningState } from './tuning-model'
 
 export type { DiskVolume, FactStatus, SourceRef } from '@asi/sense-types'
+export type { TuningEntry, TuningParam, TuningState } from './tuning-model'
 
 /** UI 事实：共享 Fact 骨架 + 宿主可读原因（denied/unavailable 时展示）。 */
 export type Fact<T> = SharedFact<T> & { reason?: string }
@@ -243,30 +245,6 @@ export interface LearningState {
   confidence?: number
 }
 
-export interface TuningParam {
-  key: string
-  label: string
-  value: number | string
-  unit?: string
-  locked: boolean
-}
-
-export interface TuningEntry {
-  id: string
-  paramKey: string
-  previous: number | string
-  next: number | string
-  by: 'agent' | 'user' | 'auto'
-  reason: string
-  at: number
-  reverted?: boolean
-}
-
-export interface TuningState {
-  parameters: TuningParam[]
-  log: TuningEntry[]
-}
-
 export interface SensePanelModel {
   state: SenseState
   events: SenseEvent[]
@@ -292,4 +270,7 @@ export interface SensePanelProps {
   onRevertTuning: (id: string) => void
   onLockParam: (key: string, locked: boolean) => void
   onFeedback: (signalId: string, value: 'useful' | 'noise') => void
+  onResumeTuning: () => void
+  onResetTuning: () => void
+  onAcceptRebaseline: (id: string) => void
 }
