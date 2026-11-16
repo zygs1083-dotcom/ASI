@@ -4,6 +4,9 @@
   "version": "0.0.0",
   "type": "module",
   "description": "asi-sense 侧栏面板：React 纯 props 组件 + Vite 预览",
+  "engines": {
+    "dsh": "0.2.2-rc.3"
+  },
   "scripts": {
     "dev": "vite",
     "build": "vite build",

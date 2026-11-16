@@ -19,6 +19,17 @@ await build({
   external: ['@deepseek-ai/*'],
 });
 
+const typert = await build({
+  entryPoints: [join(lib, 'typert.host.js')],
+  bundle: true,
+  write: false,
+  platform: 'node',
+  format: 'esm',
+  target: 'node22',
+  external: ['@deepseek-ai/*'],
+});
+await writeFile(join(lib, 'typert.host.js'), typert.outputFiles[0].contents);
+
 const browser = await build({
   entryPoints: [join(pkg, 'src/client/index.ts')],
   outfile: join(lib, 'client.js'),
