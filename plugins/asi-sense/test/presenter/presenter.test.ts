@@ -337,7 +337,7 @@ describe('presenter', () => {
     await h.runtime.stop();
   });
 
-  it('anchors delayed disk rate events to their evidence without hiding the current ETA', async () => {
+  it('anchors delayed disk rate event ETA to evaluation time without hiding the current ETA', async () => {
     const h = await harness();
     const start = Date.now();
     const gib = 1024 ** 3;
@@ -356,7 +356,7 @@ describe('presenter', () => {
     const projected = model.events.find((entry) => entry.signal.id === event?.id);
     expect(event).toMatchObject({ at: start + 20_000, detail: { evidenceAt: start + 15_000 } });
     expect(model.insights?.['disk:/']?.currentEta?.asOf).toBe(start + 15_000);
-    expect(projected?.signal.at).toBe(start + 15_000);
+    expect(projected?.signal.at).toBe(start + 20_000);
     expect(projected?.signal.data.evidenceAt).toBe(start + 15_000);
     expect(attentionLine(model, evaluateBody(model.state.self.body, model.now, model.insights))).toBe(
       '磁盘 4 分钟后见底',
@@ -390,9 +390,44 @@ describe('presenter', () => {
       detail: { evidenceAt: start + 10_000, timeToFloorMs: 595_000, severity: 'warn' },
     });
     expect(h.presenter.snapshot().events.find((entry) => entry.signal.id === event?.id)).toMatchObject({
-      signal: { at: start + 10_000, data: { evidenceAt: start + 10_000 } },
+      signal: { at: start + 20_000, data: { evidenceAt: start + 10_000 } },
       detail: { timeToFloorMs: 595_000 },
     });
+    h.presenter.close();
+    await h.runtime.stop();
+  });
+
+  it('raises an ETA alert on cached republication without inventing a new observation', async () => {
+    const h = await harness();
+    const start = Date.now();
+    const tokens = (remaining: number, observedAt: number) => ({
+      ...f({
+        contextWindow: 10_000,
+        contextUsed: 10_000 - remaining,
+        sessionUsage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      }),
+      observedAt,
+    });
+    await h.sample(mkBody({ tokens: tokens(615, start) }));
+    await h.advance(10_000);
+    const cached = mkBody({ tokens: tokens(605, start + 10_000) });
+    await h.sample(cached);
+    expect(h.runtime.events().filter((entry) => entry.kind === 'body.rate')).toHaveLength(0);
+    await h.advance(5_000);
+    await h.sample(cached);
+    const rateEvents = h.runtime.events().filter((entry) => entry.kind === 'body.rate');
+    expect(rateEvents).toHaveLength(1);
+    expect(rateEvents[0]).toMatchObject({
+      at: start + 15_000,
+      detail: { evidenceAt: start + 10_000, timeToFloorMs: 600_000 },
+    });
+    expect(h.presenter.snapshot().events.find((entry) => entry.signal.id === rateEvents[0].id)).toMatchObject({
+      signal: { at: start + 15_000, data: { evidenceAt: start + 10_000 } },
+    });
+    expect(h.runtime.body.monitor.rateEvidence('context').points).toHaveLength(2);
+    await h.advance(1_000);
+    await h.sample(cached);
+    expect(h.runtime.events().filter((entry) => entry.kind === 'body.rate')).toHaveLength(1);
     h.presenter.close();
     await h.runtime.stop();
   });
@@ -440,7 +475,7 @@ describe('presenter', () => {
     }
     const model = h.presenter.snapshot();
     expect(model.insights?.['disk:/']?.currentEta?.asOf).toBe(start + 15_000);
-    expect(model.events.find((entry) => entry.detail?.kind === 'body.rate')?.signal.at).toBe(start + 15_000);
+    expect(model.events.find((entry) => entry.detail?.kind === 'body.rate')?.signal.at).toBe(start + 20_000);
     expect(attentionLine(model, evaluateBody(model.state.self.body, model.now, model.insights))).toBe(
       '磁盘 4 分钟后见底',
     );

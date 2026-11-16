@@ -70,7 +70,7 @@ function eventDetail(entry: EventEntry): SenseEvent['detail'] {
   ) {
     return {
       kind: 'body.rate',
-      metric: d.metric,
+      metric: suggestionMetric(d.metric) ?? d.metric,
       windowMs: d.windowMs,
       delta: d.delta,
       unit: detailUnit(d.metric),
@@ -86,7 +86,7 @@ function eventDetail(entry: EventEntry): SenseEvent['detail'] {
   ) {
     return {
       kind: 'body.anomaly',
-      metric: d.metric,
+      metric: suggestionMetric(d.metric) ?? d.metric,
       current: d.value,
       baseline: d.baseline,
       deviation: d.deviation,
@@ -135,7 +135,7 @@ export function projectEvents(
       signal: {
         id: entry.id,
         kind: entry.kind,
-        at: evidenceAt ?? (entry.mono === undefined ? fromWall(entry.at) : at(entry.mono)),
+        at: entry.mono === undefined ? fromWall(entry.at) : at(entry.mono),
         source: entry.source,
         subject: hidden ? '' : entry.subject,
         data: {

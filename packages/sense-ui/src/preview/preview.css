@@ -88,3 +88,8 @@ body {
   max-width: 420px;
   margin: 0 auto;
 }
+
+.stage > [data-panel] {
+  height: auto;
+  overflow: visible;
+}

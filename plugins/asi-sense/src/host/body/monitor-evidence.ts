@@ -15,10 +15,14 @@ export function rateEvidence(
   const rule = matching.find((item) => history?.latch[latchKey(item)] === 'warn') ?? matching[0];
   const latched = !!rule && history?.latch[latchKey(rule)] === 'warn';
   const window = history?.windows[metric];
+  const evaluationMono =
+    window && 'evaluationMono' in window && typeof window.evaluationMono === 'number'
+      ? window.evaluationMono
+      : (history?.lastMono ?? window?.lastMono);
   const points =
-    rule && window
+    rule && window && evaluationMono !== undefined
       ? window.points
-          .filter((point) => point.at >= (history?.lastMono ?? window.lastMono) - rule.windowMs)
+          .filter((point) => point.at >= evaluationMono - rule.windowMs)
           .map((point) => ({
             mono: point.at,
             value: point.value,

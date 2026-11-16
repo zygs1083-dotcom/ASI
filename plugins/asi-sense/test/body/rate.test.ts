@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import type { BodyThresholdState, Signal } from '@asi/sense-types';
 import { describe, expect, it } from 'vitest';
+import { BodyMonitor } from '../../src/host/body/monitor.ts';
 import { captureRateTimes, RateEvaluator, type RateRule } from '../../src/host/body/rate.ts';
 import { type AdaptiveState, BODY_HISTORY } from '../../src/host/body/state.ts';
 import { SRC } from '../helpers.ts';
@@ -87,6 +88,139 @@ describe('RateEvaluator maxDelta', () => {
 });
 
 describe('RateEvaluator maxRatio + maxEtaMs', () => {
+  it('keeps the monitor evidence slope unchanged on cached republication', () => {
+    const monitor = new BodyMonitor({
+      clock: () => 0,
+      wallClock: () => 0,
+      rateRules: [{ id: 'c', metric: 'context', windowMs: 20_000, direction: 'down', maxEtaMs: 5_000, floor: 0 }],
+      anomalyRules: [],
+    });
+    const frame = (at: number, remaining: number) => ({
+      ...sample(ctxBody(1000, 1000 - remaining), at, undefined, at),
+      rateTimes: { context: { mono: at, wall: at } },
+    });
+    const first = frame(0, 1000);
+    const second = frame(10_000, 200);
+    const third = frame(20_000, 190);
+    const initial = monitor.evaluate(first, second, {});
+    const sampled = monitor.evaluate(second, third, initial.state);
+    const before = monitor.rateEvidence('context');
+    monitor.evaluate(third, { ...third, at: 21_000, monotonicAt: 21_000 }, sampled.state);
+    const after = monitor.rateEvidence('context');
+    expect(before.ratePerMinute).toBeCloseTo(-40.5 * 60);
+    expect(after).toEqual(before);
+  });
+
+  it.each([
+    { limit: 5_000, initiallyWarns: true },
+    { limit: 4_000, initiallyWarns: false },
+  ])('keeps the sampled slope while cached points age out (limit $limit)', ({ limit, initiallyWarns }) => {
+    const e = ev([{ id: 'c', metric: 'context', windowMs: 20_000, direction: 'down', maxEtaMs: limit, floor: 0 }]);
+    const frame = (at: number, remaining: number) => ({
+      ...sample(ctxBody(1000, 1000 - remaining), at, undefined, at),
+      rateTimes: { context: { mono: at, wall: at } },
+    });
+    const first = frame(0, 1000);
+    const second = frame(10_000, initiallyWarns ? 200 : 700);
+    const third = frame(20_000, 190);
+    const initial = e.evaluate(first, second, {});
+    const sampled = e.evaluate(second, third, initial.state);
+    expect(sampled.state['rate:c']).toBe(initiallyWarns ? 'warn' : 'normal');
+    const cached = { ...third, at: 21_000, monotonicAt: 21_000 };
+    const republished = e.evaluate(third, cached, sampled.state);
+    expect(republished.state['rate:c']).toBe('warn');
+    if (initiallyWarns) expect(republished.signals).toHaveLength(0);
+    else {
+      expect(republished.signals[0]?.data.slope).toBeCloseTo(-40.5);
+      expect(republished.signals[0]?.data.timeToFloorMs).toBeCloseTo(190_000 / 40.5 - 1000);
+    }
+    const later = { ...cached, at: 23_000, monotonicAt: 23_000 };
+    const repeated = e.evaluate(cached, later, republished.state);
+    expect(repeated.signals).toHaveLength(0);
+    expect(repeated.state['rate:c']).toBe('warn');
+    const recovered = e.evaluate(later, frame(30_000, 190), repeated.state);
+    expect(recovered.signals[0]?.data.severity).toBe('normal');
+  });
+
+  it('keeps each rule window anchored to the delayed evaluation of its last new observation', () => {
+    const e = ev([
+      { id: 'short', metric: 'context', windowMs: 20_000, direction: 'down', maxEtaMs: 2_000, floor: 0 },
+      { id: 'long', metric: 'context', windowMs: 30_000, direction: 'down', maxEtaMs: 3_000, floor: 0 },
+    ]);
+    const frame = (at: number, remaining: number) => ({
+      ...sample(ctxBody(1000, 1000 - remaining), at, undefined, at),
+      rateTimes: { context: { mono: at, wall: at } },
+    });
+    const first = frame(0, 1000);
+    const second = frame(10_000, 700);
+    const third = { ...frame(20_000, 190), evaluatedAt: { mono: 21_000, wall: 21_000 } };
+    const initial = e.evaluate(first, second, {});
+    const sampled = e.evaluate(second, third, initial.state);
+    expect(sampled.signals).toHaveLength(0);
+    const cached = { ...third, at: 22_000, monotonicAt: 22_000, evaluatedAt: { mono: 22_000, wall: 22_000 } };
+    const result = e.evaluate(third, cached, sampled.state);
+    expect(result.signals.map((signal) => [signal.data.ruleId, signal.data.slope])).toEqual([
+      ['short', -51],
+      ['long', -40.5],
+    ]);
+  });
+
+  it('retains a warning on cached evidence even if the configured ETA threshold changes', () => {
+    let limit = 5_000;
+    const e = ev(
+      [{ id: 'c', metric: 'context', windowMs: 20_000, direction: 'down', maxEtaMs: 5_000, floor: 0, param: 'eta' }],
+      () => limit,
+    );
+    const first = { ...sample(ctxBody(1000, 0), 0, undefined, 0), rateTimes: { context: { mono: 0, wall: 0 } } };
+    const second = {
+      ...sample(ctxBody(1000, 800), 10_000, undefined, 10_000),
+      rateTimes: { context: { mono: 10_000, wall: 10_000 } },
+    };
+    const sampled = e.evaluate(first, second, {});
+    expect(sampled.state['rate:c']).toBe('warn');
+    limit = 100;
+    const cached = e.evaluate(second, { ...second, at: 11_000, monotonicAt: 11_000 }, sampled.state);
+    expect(cached.state['rate:c']).toBe('warn');
+    expect(cached.signals).toHaveLength(0);
+  });
+
+  it('reevaluates a cached ETA as time passes without adding evidence or emitting duplicates', () => {
+    const e = ev([{ id: 'c', metric: 'context', windowMs: 300_000, direction: 'down', maxEtaMs: 5_000, floor: 0 }]);
+    const first = { ...sample(ctxBody(1000, 980), 0, undefined, 0), rateTimes: { context: { mono: 0, wall: 0 } } };
+    const second = {
+      ...sample(ctxBody(1000, 990), 10_000, undefined, 10_000),
+      rateTimes: { context: { mono: 10_000, wall: 10_000 } },
+    };
+    const initial = e.evaluate(first, second, {});
+    expect(initial.signals).toHaveLength(0);
+    const cached = { ...second, at: 15_000, monotonicAt: 15_000 };
+    const warning = e.evaluate(second, cached, initial.state);
+    expect(warning.signals[0]).toMatchObject({
+      at: 15_000,
+      data: { severity: 'warn', evidenceAt: 10_000, evidenceMono: 10_000, timeToFloorMs: 5_000 },
+    });
+    expect((warning.state as AdaptiveState)[BODY_HISTORY]?.fs?.rate?.windows.context.points).toHaveLength(2);
+    expect(e.evaluate(cached, { ...cached, at: 16_000, monotonicAt: 16_000 }, warning.state).signals).toHaveLength(0);
+  });
+
+  it('advances cached ETA without reevaluating other rules', () => {
+    const e = ev([
+      { id: 'c', metric: 'context', windowMs: 20_000, direction: 'down', maxEtaMs: 5_000, floor: 0 },
+      { id: 'd', metric: 'context', windowMs: 20_000, direction: 'down', maxDelta: 5 },
+    ]);
+    const first = { ...sample(ctxBody(1000, 980), 0, undefined, 0), rateTimes: { context: { mono: 0, wall: 0 } } };
+    const second = {
+      ...sample(ctxBody(1000, 990), 10_000, undefined, 10_000),
+      rateTimes: { context: { mono: 10_000, wall: 10_000 } },
+    };
+    const initial = e.evaluate(first, second, {});
+    expect(initial.signals.map((s) => s.data.ruleId)).toEqual(['d']);
+    const expired = e.evaluate(second, { ...second, at: 25_000, monotonicAt: 25_000 }, initial.state);
+    expect(expired.signals).toHaveLength(1);
+    expect(expired.signals[0]).toMatchObject({ data: { ruleId: 'c', severity: 'warn', timeToFloorMs: 0 } });
+    expect(expired.state['rate:d']).toBe('warn');
+  });
+
   it('clamps an already elapsed observation ETA to zero at evaluation', () => {
     const e = ev([{ id: 'c', metric: 'context', windowMs: 300_000, direction: 'down', maxEtaMs: 5_000, floor: 0 }]);
     const prev = { ...sample(ctxBody(1000, 985), 0, undefined, 0), rateTimes: { context: { mono: 0, wall: 0 } } };

@@ -6,6 +6,26 @@ import { effectiveDisks } from '@asi/sense-types'
 import { evaluateBody } from '../../src/health'
 
 describe('预览 tick（实时模式）', () => {
+  it('仅给本次续期的磁盘卷追加历史点，物化其他卷不算采样', () => {
+    const state = makeState()
+    state.self.body.disks = {
+      ...state.self.body.disks,
+      status: 'ok', observedAt: T0 - 1_000, ttlMs: 30_000,
+      value: [
+        { mount: '/', total: 100, free: 60, status: 'ok', observedAt: T0 - 19_000, ttlMs: 30_000 },
+        { mount: '/legacy', total: 100, free: 80 },
+        { mount: '/later', total: 100, free: 70, status: 'ok', observedAt: T0 - 1_000, ttlMs: 30_000 },
+      ],
+    }
+    const m = makeScenario('healthy')
+    const legacy = [{ at: T0 - 1_000, value: 0.2 }]
+    const later = [{ at: T0 - 1_000, value: 0.3 }]
+    const next = tick({ ...m, state, history: { ...m.history, disks: { '/': [], '/legacy': legacy, '/later': later } } })
+    expect(next.history.disks['/']).toEqual([{ at: next.now, value: 0.4 }])
+    expect(next.history.disks['/legacy']).toBe(legacy)
+    expect(next.history.disks['/later']).toBe(later)
+  })
+
   it('不复活父期限已到的旧卷，同时续期新鲜卷', () => {
     const state = makeState()
     state.self.body.disks = {
