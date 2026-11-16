@@ -9,6 +9,7 @@ import type {
   DshPort,
   FileChange,
   JobEvent,
+  SenseOptions,
   SensePorts,
   TokenSnapshot,
   ToolEvent,
@@ -17,7 +18,7 @@ import { f, mkBody } from '../body/helpers.ts';
 
 afterEach(() => vi.useRealTimers());
 
-function harness(savedSettings?: string) {
+function harness(savedSettings?: string, options: SenseOptions = {}) {
   vi.useFakeTimers();
   vi.setSystemTime(1_700_000_000_000);
   let mono = 0;
@@ -97,6 +98,7 @@ function harness(savedSettings?: string) {
         approved: true,
       },
     ],
+    ...options,
   });
   return {
     ports,
@@ -432,6 +434,86 @@ describe('host runtime', () => {
     ]);
     expect(h.runtime.events().find((e) => e.kind === 'job.started')).toMatchObject({ cause: 'agent', level: 'record' });
     await h.runtime.stop();
+  });
+
+  it.each([
+    { delay: 300, path: '/workspace/repo/a', agent: true },
+    { delay: 1_500, path: '/workspace/repo/a', agent: true },
+    { delay: 1_999, path: '/workspace/repo/a', agent: true },
+    { delay: 2_000, path: '/workspace/repo/a', agent: false },
+    { delay: 2_500, path: '/workspace/repo/a', agent: false },
+    { delay: 300, path: '/workspace/other/a', agent: false },
+    { delay: 2_500, path: '/workspace/repo/a', agent: true, oldMtime: true },
+  ])('classifies a file callback after $delay ms at $path (agent=$agent)', async (scenario) => {
+    const h = harness();
+    await h.runtime.start();
+    await h.agent({ type: 'created', sessionId: 's' });
+    await h.agent({ type: 'pre-step', sessionId: 's' });
+    await h.agent({ type: 'post-step', sessionId: 's' });
+    await h.tool({ type: 'pre-execute', sessionId: 's', toolCallId: 't', cwd: '/workspace/repo' });
+    await h.advance(50);
+    const mtime = Date.now();
+    await h.advance(50);
+    await h.tool({ type: 'post-execute', sessionId: 's', toolCallId: 't' });
+    await h.advance(scenario.delay);
+    await h.file({ path: scenario.path, change: 'modify', ...(scenario.oldMtime ? { at: mtime } : {}) });
+    const event = h.runtime.events().find((entry) => entry.kind === 'file.changed');
+    expect(event).toMatchObject(
+      scenario.agent ? { cause: 'agent', level: 'record', reason: 'self-caused' } : { cause: 'unknown', level: 'wake' },
+    );
+    await h.advance(5_001);
+    expect(h.delivered.map((intent) => intent.kind)).toEqual(scenario.agent ? [] : ['followup']);
+    await h.runtime.stop();
+  });
+
+  it('uses monotonic receipt time despite a wall-clock rollback and does not extend job events', async () => {
+    const h = harness();
+    await h.runtime.start();
+    await h.agent({ type: 'created', sessionId: 's' });
+    await h.agent({ type: 'pre-step', sessionId: 's' });
+    await h.agent({ type: 'post-step', sessionId: 's' });
+    await h.tool({ type: 'pre-execute', sessionId: 's', toolCallId: 't', pid: 42, cwd: '/workspace/repo' });
+    await h.advance(100);
+    await h.tool({ type: 'post-execute', sessionId: 's', toolCallId: 't' });
+    vi.setSystemTime(Date.now() - 10_000);
+    await h.advance(300);
+    await h.file({ path: '/workspace/repo/a', change: 'modify' });
+    expect(h.runtime.events().find((entry) => entry.kind === 'file.changed')).toMatchObject({
+      cause: 'agent',
+      level: 'record',
+    });
+    await h.job({ type: 'exited', id: 'late-job', pid: 42, exitCode: 1, at: Date.now() + 10_000 });
+    expect(h.runtime.events().find((entry) => entry.subject === 'late-job')).toMatchObject({
+      cause: 'unknown',
+      level: 'wake',
+    });
+    await h.runtime.stop();
+  });
+
+  it.each([
+    { grace: 500, delay: 499, cause: 'agent', level: 'record' },
+    { grace: 500, delay: 500, cause: 'unknown', level: 'wake' },
+    { grace: 0, delay: 1, cause: 'unknown', level: 'wake' },
+  ])('honors a configured $grace ms grace at $delay ms', async ({ grace, delay, cause, level }) => {
+    const h = harness(undefined, { selfCauseGraceMs: grace });
+    await h.runtime.start();
+    await h.agent({ type: 'created', sessionId: 's' });
+    await h.agent({ type: 'pre-step', sessionId: 's' });
+    await h.agent({ type: 'post-step', sessionId: 's' });
+    await h.tool({ type: 'pre-execute', sessionId: 's', toolCallId: 't', cwd: '/workspace/repo' });
+    await h.advance(100);
+    await h.tool({ type: 'post-execute', sessionId: 's', toolCallId: 't' });
+    await h.advance(delay);
+    await h.file({ path: '/workspace/repo/a', change: 'modify' });
+    expect(h.runtime.events().find((entry) => entry.kind === 'file.changed')).toMatchObject({
+      cause,
+      level,
+    });
+    await h.runtime.stop();
+  });
+
+  it.each([-1, Number.NaN, Number.POSITIVE_INFINITY])('rejects invalid self-cause grace %s', (selfCauseGraceMs) => {
+    expect(() => harness(undefined, { selfCauseGraceMs })).toThrow('selfCauseGraceMs');
   });
 
   it('notifies stale at the monotonic deadline after wall clock rollback', async () => {

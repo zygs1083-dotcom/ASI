@@ -19,12 +19,14 @@ export interface Config {
   storageRoot: string;
   helperPath?: string;
   intervalMs?: number;
+  selfCauseGraceMs?: number;
 }
 
 export const Config: z<Config> = z.object({
   storageRoot: z.string().required(),
   helperPath: z.string(),
   intervalMs: z.number().min(250).max(60_000),
+  selfCauseGraceMs: z.number().min(0),
 });
 
 export async function apply(ctx: Context, config: Config): Promise<void> {
@@ -34,6 +36,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     {
       helperPath: config.helperPath ?? fileURLToPath(new URL('./asi-sense-helper', import.meta.url)),
       ...(config.intervalMs === undefined ? {} : { intervalMs: config.intervalMs }),
+      ...(config.selfCauseGraceMs === undefined ? {} : { selfCauseGraceMs: config.selfCauseGraceMs }),
     },
   );
   let presenter: ReturnType<typeof createPresenter> | undefined;

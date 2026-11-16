@@ -164,4 +164,19 @@ describe('classifyCause', () => {
     const relWin: ToolWindow = { startedAt: 0, cwd: 'repo/sub' };
     expect(classifyCause(rel, [relWin])).toBe('unknown');
   });
+
+  it('limits trailing grace to cwd files and uses wall or monotonic evidence independently', () => {
+    const window: ToolWindow = { ...W, startedMono: 10, endedMono: 110 };
+    const file = sig({ id: 'f', kind: 'file.changed', at: 2_200, subject: '/repo/a', cause: 'user' });
+    expect(classifyCause(file, [window], 2_000, 2_110)).toBe('user');
+    expect(classifyCause(file, [window], 2_000, 2_109)).toBe('agent');
+    expect(classifyCause({ ...file, at: 2_199 }, [window], 2_000, 2_110)).toBe('agent');
+    expect(classifyCause({ ...file, at: 150 }, [window], 2_000, 9_000)).toBe('agent');
+    expect(classifyCause({ ...file, at: 99 }, [window], 2_000, 2_110)).toBe('user');
+    expect(classifyCause({ ...file, subject: '/repository/a', data: { pid: 42 } }, [window], 2_000, 111)).toBe('user');
+    expect(classifyCause({ ...file, kind: 'job.exited', at: 201, data: { pid: 42 } }, [window], 2_000, 111)).toBe(
+      'user',
+    );
+    expect(classifyCause({ ...file, at: 201 }, [window], 0, 111)).toBe('user');
+  });
 });

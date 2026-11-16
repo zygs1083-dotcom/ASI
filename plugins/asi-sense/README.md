@@ -133,6 +133,17 @@ owns the concrete ports declared in `runtime/ports.ts`:
   drive runtime scheduling, merge windows and helper retries. The probe and
   body persistence retain their own internal sampling/save timers.
 
+`selfCauseGraceMs` is an optional DSH plugin configuration and
+`createSenseRuntime` option, defaulting to 2000 ms; set it to 0 to disable the
+trailing grace. A file event under a tool's absolute cwd is self-caused when
+its wall timestamp or monotonic receipt falls in `[pre, post + grace)`.
+With grace disabled, the original inclusive tool window still applies.
+This can also suppress user edits inside that cwd during the grace interval;
+paths outside it and job/process events receive no trailing grace. A delayed
+event with an in-window mtime can still be self-caused after the grace expires.
+The local watcher uses `lstat` mtime for adds/modifications when it is not
+older than watcher startup; otherwise (including deletes) it uses callback time.
+
 The DSH adapter implements `storage` with its own `FileStoragePort`, not
 `storageDomain`: it writes and syncs a temporary file, atomically renames it,
 then attempts to sync the containing directory. Failures before rename reject
@@ -150,10 +161,9 @@ To run the isolated real-DSH check, set `DSH_ROOT` to a read-only DSH checkout
 and run `pnpm --filter asi-sense e2e:dsh`. The fixture uses a private temporary
 profile, disables title sharing and caps model requests at six per run.
 Set `ASI_E2E_NO_MODEL=1` for the sidebar, responsive layout and cleanup checks
-without model requests. On macOS, a delayed filesystem notification for an
-agent's own file write can arrive after the tool window closes and cause an
-unintended wake; this remains a known limitation pending the separate
-filesystem-timestamp and trailing-grace repair.
+without model requests. On macOS, delayed filesystem notifications are handled
+using the mtime and trailing grace described above; notifications without
+in-window timestamps that arrive after the grace can still cause a wake.
 
 `start()` restores before starting sources and may be called once. `stop()`
 closes subscriptions, watchers, probe, helper and timers, then waits for

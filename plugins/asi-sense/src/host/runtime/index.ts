@@ -14,6 +14,11 @@ import { runtimeTools } from './tools.ts';
 export type { EventEntry, EventLog } from './attention.ts';
 export type * from './ports.ts';
 export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}) {
+  if (
+    options.selfCauseGraceMs !== undefined &&
+    (!Number.isFinite(options.selfCauseGraceMs) || options.selfCauseGraceMs < 0)
+  )
+    throw new TypeError('selfCauseGraceMs must be a non-negative finite number');
   const { clock } = ports;
   const settings = new Settings(ports.storage, options.rules);
   let running = false;
@@ -52,7 +57,7 @@ export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}
     schedule();
   });
   const body = new BodySource(ports.probe, ports.dsh, ports.storage, clock, attention, expiry, isPaused, changed);
-  const dsh = new DshSource(ports.dsh, clock, attention, body.tokens.bind(body), isPaused);
+  const dsh = new DshSource(ports.dsh, clock, attention, body.tokens.bind(body), isPaused, options.selfCauseGraceMs);
   const files = new FileSource(
     ports.files,
     clock,

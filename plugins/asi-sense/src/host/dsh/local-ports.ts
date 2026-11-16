@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process';
-import { existsSync, watch } from 'node:fs';
+import { existsSync, lstatSync, watch } from 'node:fs';
 import * as fs from 'node:fs/promises';
 import { isAbsolute, relative, resolve, sep } from 'node:path';
 import { performance } from 'node:perf_hooks';
@@ -18,12 +18,21 @@ export function localPorts(ctx: Context, storageRoot: string): Omit<SensePorts, 
     files: {
       watch(root, callback) {
         const base = resolve(root);
+        const startedAt = Date.now();
         const watcher = watch(base, { recursive: true }, (event, filename) => {
           if (filename === null) return;
+          let at = Date.now();
           const path = resolve(base, filename.toString());
           const rel = relative(base, path);
           if (rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel)) return;
-          callback({ path, change: event === 'change' ? 'modify' : existsSync(path) ? 'add' : 'delete' });
+          const change = event === 'change' ? 'modify' : existsSync(path) ? 'add' : 'delete';
+          if (change !== 'delete') {
+            try {
+              const mtime = lstatSync(path).mtimeMs;
+              if (Number.isFinite(mtime) && mtime >= startedAt) at = mtime;
+            } catch {}
+          }
+          callback({ path, change, at });
         });
         watcher.on('error', () => ctx.logger.warn('asi-sense file watcher failed'));
         return { close: () => watcher.close() };
