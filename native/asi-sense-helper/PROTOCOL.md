@@ -24,7 +24,7 @@ Startup order:
 | `window.title` | `pid`,`bundleId`,`title?` | AX title change, debounced 250ms trailing, latest wins, same-as-emitted suppressed per focused-window context |
 | `titles.ack` | `session`,`id?`,`enabled`,`gen` | confirms each `titles` command: same session as hello, echoed state/id, strictly increasing process-local privacy generation |
 | `ax.unsupported` | `bundleId`,`pid`,`notification`,`error` (raw AXError code) | a required AX registration failed with a *permanent* unsupported error; at most once per app key per run (see AX semantics) |
-| `thermal` | `state` | ProcessInfo |
+| `thermal` | `state` | ProcessInfo, on change and every 30 seconds while the helper is running |
 | `power.sleep`/`power.wake`, `screen.locked`/`screen.unlocked`, `session.active`/`session.inactive` | - | NSWorkspace + DNC |
 | `snapshot` | see below | `{"cmd":"snapshot"}` |
 | `error` | `code`,`message`,`dropped?`,`droppedTypes?`,`pid?`,`bundleId?` | rejected input, flow-control notices or unrecognized OS state; fixed strings, never echoes input |
