@@ -47,6 +47,18 @@
   min-width: 0;
 }
 
+.notices {
+  position: sticky;
+  top: 0;
+  z-index: 3;
+  max-height: 40vh;
+  overflow-y: auto;
+}
+
+.panel:has(.notices [role='alert']) button {
+  scroll-margin-top: calc(40vh + 44px);
+}
+
 .privacy,
 .pausedTag {
   display: inline-flex;

@@ -42,17 +42,22 @@ export function SensePanel(props: SensePanelProps) {
         )}
       </header>
 
-      {Object.entries(operations.operations).map(([key, operation]) =>
-        (operation.phase === 'error' || operation.phase === 'unconfirmed') && (
-          <div key={key} className={rulesCss.notice} role="alert">
-            <span>{operation.label}{operation.phase === 'error' ? '失败，请重试' : '：未确认结果，请检查状态'}</span>
-            <button type="button" aria-label="关闭操作提示" onClick={() => {
-              operations.dismiss(key)
-              rulesSummary.current?.focus()
-            }}>关闭</button>
-          </div>
-        ),
-      )}
+      <div className={css.notices}>
+        {Object.entries(operations.operations).map(([key, operation]) =>
+          (operation.phase === 'error' || operation.phase === 'unconfirmed') && (
+            <div key={key} className={rulesCss.notice} role="alert">
+              <span>{operation.label}{operation.phase === 'error' ? '失败，请重试' : '：未确认结果，请检查状态'}</span>
+              <button type="button" aria-label="关闭操作提示" onClick={(event) => {
+                const notice = event.currentTarget.parentElement
+                const neighbor = notice?.nextElementSibling ?? notice?.previousElementSibling
+                const target = neighbor?.querySelector('button') ?? rulesSummary.current
+                target?.focus()
+                operations.dismiss(key)
+              }}>关闭</button>
+            </div>
+          ),
+        )}
+      </div>
 
       <details open className={css.section}>
         <summary>身体</summary>
