@@ -378,14 +378,16 @@ describe('卷级磁盘状态（status/observedAt/ttlMs + unavailableMounts）', 
     expect(effectiveStatus(diskFact(parent, { ...vol, status: 'unknown' }, T0), T0)).toBe('unknown')
     const ttl = diskFact(parent, { ...vol, status: 'ok', observedAt: T0 - 90_000, ttlMs: 5_000 }, T0)
     expect(effectiveStatus(ttl, T0)).toBe('stale')
-    // 父非 ok/已过期为上界：卷级 ok 与更新的 observedAt 都不能复活
+    // 显式卷级元数据权威：父级 stale/denied/过期不再一票否决带元数据的 ok 卷；
+    // 缺省（旧版）卷才继承父级有效状态作上界（时间戳同样回退父级）
     for (const p of [
       mkDisks([], undefined, { status: 'stale' }),
       mkDisks([], undefined, { status: 'denied' }),
       mkDisks([], undefined, { ageMs: 90_000, ttlMs: 5_000 }),
     ]) {
       const df = diskFact(p, { ...vol, status: 'ok', observedAt: T0 - 1_000, ttlMs: 60_000 }, T0)
-      expect(effectiveStatus(df, T0)).toBe(effectiveStatus(p, T0))
+      expect(effectiveStatus(df, T0)).toBe('ok')
+      expect(effectiveStatus(diskFact(p, vol, T0), T0)).toBe(effectiveStatus(p, T0))
     }
     // unavailableMounts 命中即 unavailable 且清空读数（value 里带数也不展示），去重
     const df = diskFact(
@@ -398,21 +400,24 @@ describe('卷级磁盘状态（status/observedAt/ttlMs + unavailableMounts）', 
     expect(df.source).toEqual(mkDisks([]).source)
   })
 
-  it('根卷非新鲜（stale/unknown/unavailable、含无根条目）→ 行 unknown，不得因其他卷健康报 good', () => {
-    const expectUnknown = (disks: DisksFact) => {
+  it('新鲜卷优先：根卷失鲜不整行 unknown，不完整行明示「部分」', () => {
+    const expectPartialGood = (disks: DisksFact) => {
       const r = evaluateBody(bodyWith({ disks }), T0)
-      expect(r.rows.disks.severity).toBe('unknown')
-      expect(r.severity).toBe('unknown')
-      expect(r.sentence).toBe('数据待补全')
+      expect(r.rows.disks.severity).toBe('good')
+      expect(r.rows.disks.partial).toBe(true)
+      expect(r.severity).toBe('good')
+      expect(r.partial).toBe(true)
+      expect(r.sentence).toBe('部分 · 数据待补全')
     }
-    expectUnknown(rootStaleBody().disks)
-    expectUnknown(
+    // 根卷 stale / unknown / 不可读都不一票否决其他新鲜卷
+    expectPartialGood(rootStaleBody().disks)
+    expectPartialGood(
       mkDisks([
         { mount: '/', total: 100e9, free: 90e9, status: 'unknown' },
         { mount: '/data', total: 100e9, free: 90e9 },
       ]),
     )
-    expectUnknown(
+    expectPartialGood(
       mkDisks(
         [
           { mount: '/', total: 100e9, free: 90e9 },
@@ -421,11 +426,22 @@ describe('卷级磁盘状态（status/observedAt/ttlMs + unavailableMounts）', 
         ['/'],
       ),
     )
-    // unavailableMounts 含 / 但 value 无根条目 → 仍 unknown
+    // unavailableMounts 含 / 但 value 无根条目 → 仍按新鲜卷 good+partial
     const noRoot = mkDisks([{ mount: '/data', total: 100e9, free: 90e9 }], ['/'])
-    expectUnknown(noRoot)
+    expectPartialGood(noRoot)
     expect(rowMetricKeys('disks', bodyWith({ disks: noRoot }), T0)).toEqual(['disk:/data'])
-    // 其他卷的新鲜告警仍可优先于根卷 unknown
+    // 全部卷失鲜/无可读 → 行才 unknown
+    const expectUnknown = (disks: DisksFact) => {
+      const r = evaluateBody(bodyWith({ disks }), T0)
+      expect(r.rows.disks.severity).toBe('unknown')
+      expect(r.severity).toBe('unknown')
+      expect(r.sentence).toBe('数据待补全')
+    }
+    expectUnknown(
+      mkDisks([{ mount: '/', total: 100e9, free: 90e9, status: 'stale' }]),
+    )
+    expectUnknown(mkDisks([], ['/']))
+    // 新鲜卷告警照常聚合；部分缺失只加 partial 徽标不覆盖告警句
     const alerted = bodyWith({
       disks: mkDisks([
         { mount: '/', total: 100e9, free: 90e9, observedAt: T0 - 90_000, ttlMs: 5_000 },
@@ -434,6 +450,9 @@ describe('卷级磁盘状态（status/observedAt/ttlMs + unavailableMounts）', 
     })
     const r = evaluateBody(alerted, T0)
     expect(r.rows.disks.severity).toBe('critical')
+    expect(r.rows.disks.partial).toBe(true)
+    expect(r.partial).toBe(true)
+    expect(r.severity).toBe('critical')
     expect(r.sentence).toBe('磁盘空间不足')
   })
 
@@ -441,12 +460,12 @@ describe('卷级磁盘状态（status/observedAt/ttlMs + unavailableMounts）', 
     const b = rootStaleBody()
     expect(rowMetricKeys('disks', b, T0)).toEqual(['disk:/data'])
     expect(rowUsable('disks', b, T0)).toBe(true)
-    // 'disk:/' critical insight 作用于 stale 根卷 → 不并入
+    // 'disk:/' critical insight 作用于 stale 根卷 → 不并入（行仍按新鲜卷 good）
     expect(
       evaluateBody(b, T0, {
         'disk:/': { sources: ['floor'], triggered: ['floor'], severity: 'critical' },
       }).rows.disks.severity,
-    ).toBe('unknown')
+    ).toBe('good')
     // 'disk:/data' critical insight 作用于新鲜卷 → 并入
     expect(
       evaluateBody(b, T0, {

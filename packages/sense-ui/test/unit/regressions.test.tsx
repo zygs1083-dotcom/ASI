@@ -1,5 +1,12 @@
 import { describe, expect, it, vi } from 'vitest'
-import { cleanup, fireEvent, render, screen, within } from '@testing-library/react'
+import {
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from '@testing-library/react'
 import { afterEach } from 'vitest'
 import { SensePanel } from '../../src/SensePanel'
 import type {
@@ -11,6 +18,7 @@ import type {
 import { makeScenario } from '../../src/mock/scenarios'
 import { emptyFact, fact, makeBody, makeEvent, makeState, T0 } from '../../src/mock/fixtures'
 import { formatClock } from '../../src/format'
+import { evaluateBody } from '../../src/health'
 
 afterEach(cleanup)
 
@@ -39,16 +47,20 @@ function openSection(name: string) {
   return details
 }
 
-function openTile(key: string): HTMLElement {
+async function openTile(key: string): Promise<HTMLElement> {
   const el = document.querySelector(`details[data-tile="${key}"]`)!
   if (!(el as HTMLDetailsElement).open) {
     fireEvent.click(el.querySelector('summary')!)
   }
+  // toggle 事件由浏览器按任务派发，detail 懒挂载需等下一轮渲染
+  await waitFor(() =>
+    expect(el.querySelector('[class*="tileDetail"]')).toBeTruthy(),
+  )
   return el as HTMLElement
 }
 
 describe('过期保留值', () => {
-  it('CPU 过期但保留值：摘要仍显示值 + 已过期年龄 + 未知标签', () => {
+  it('CPU 过期但保留值：摘要仍显示值 + 已过期年龄 + 未知标签', async () => {
     const state = makeState()
     state.self.body.cpu = fact(
       { usage: 0.3, perCore: [0.1, 0.2], load1: 0, load5: 0, load15: 0 },
@@ -66,7 +78,7 @@ describe('过期保留值', () => {
     expect(staleEl.className).toContain('factStale')
   })
 
-  it('磁盘过期但保留值：挂载列表可见、标签未知、无速率徽标', () => {
+  it('磁盘过期但保留值：挂载列表可见、标签未知、无速率徽标', async () => {
     const state = makeState()
     state.self.body.disks = fact(
       [
@@ -87,7 +99,7 @@ describe('过期保留值', () => {
     expect(summary.querySelector('[data-strip="remaining"]')).toBeTruthy()
   })
 
-  it('磁盘剩余比例条按 free/total 填充并带 data-ratio', () => {
+  it('磁盘剩余比例条按 free/total 填充并带 data-ratio', async () => {
     const state = makeState()
     state.self.body.disks = fact([
       { mount: '/', total: 200e9, free: 40e9 },
@@ -102,7 +114,7 @@ describe('过期保留值', () => {
     expect(strip.style.width).toBe('20%')
   })
 
-  it('最近触发忽略未来/非法时间戳，历史更早事件仍算数', () => {
+  it('最近触发忽略未来/非法时间戳，历史更早事件仍算数', async () => {
     const anomaly = (id: number) =>
       makeEvent(id, {
         detail: {
@@ -120,14 +132,14 @@ describe('过期保留值', () => {
     future.signal.at = T0 + 120_000
     const m = { ...makeScenario('healthy'), events: [older, future] }
     renderPanel(m)
-    const details = openTile('memory')
+    const details = await openTile('memory')
     expect(details.textContent).toContain(formatClock(T0 - 120_000))
     expect(details.textContent).not.toContain(formatClock(T0 + 120_000))
   })
 })
 
 describe('Token 速率估算与布局', () => {
-  it('增速缺失/零/负/非有限都不估算填满', () => {
+  it('增速缺失/零/负/非有限都不估算填满', async () => {
     for (const rate of [0, -5, Number.NaN, Number.POSITIVE_INFINITY]) {
       const state = makeState()
       state.self.body.tokens = fact({
@@ -148,7 +160,7 @@ describe('Token 速率估算与布局', () => {
     expect(document.body.textContent).not.toContain('按当前速度')
   })
 
-  it('无上下文时仍显示本会话行且无压缩措辞', () => {
+  it('无上下文时仍显示本会话行且无压缩措辞', async () => {
     const state = makeState()
     state.self.body.tokens = fact({
       sessionUsage: { input: 2_000, output: 100, cacheRead: 500, cacheWrite: 0 },
@@ -162,7 +174,7 @@ describe('Token 速率估算与布局', () => {
     ).toBeNull()
   })
 
-  it('每张卡片头都有折叠箭头标识', () => {
+  it('每张卡片头都有折叠箭头标识', async () => {
     renderPanel(makeScenario('healthy'))
     const tiles = document.querySelectorAll('details[data-tile]')
     expect(tiles.length).toBeGreaterThan(5)
@@ -171,7 +183,7 @@ describe('Token 速率估算与布局', () => {
     }
   })
 
-  it('卡片顺序：CPU、内存、Token(满宽)、磁盘、网络、温控、电池、进程', () => {
+  it('卡片顺序：CPU、内存、Token(满宽)、磁盘、网络、温控、电池、进程', async () => {
     renderPanel(makeScenario('healthy'))
     const keys = [...document.querySelectorAll('details[data-tile]')].map((t) =>
       t.getAttribute('data-tile'),
@@ -190,7 +202,7 @@ describe('Token 速率估算与布局', () => {
 })
 
 describe('位置与焦点卡', () => {
-  it('多主机时「位置详情」保留全部原始字段与来源', () => {
+  it('多主机时「位置详情」保留全部原始字段与来源', async () => {
     const state = makeState()
     state.env.where.toolExec = fact({ host: 'build-node', cwd: '/demo/elsewhere' })
     renderPanel({ ...makeScenario('healthy'), state })
@@ -204,7 +216,7 @@ describe('位置与焦点卡', () => {
     expect(details.textContent).toContain('来源')
   })
 
-  it('应用不可用时窗口 denied 仍显示原因与授权回调', () => {
+  it('应用不可用时窗口 denied 仍显示原因与授权回调', async () => {
     const state = makeState()
     state.env.frontApp = emptyFact('unavailable')
     state.env.focusedWindow = emptyFact('denied', '未授予辅助功能')
@@ -216,14 +228,14 @@ describe('位置与焦点卡', () => {
     expect(props.onOpenPermissionSettings).toHaveBeenCalled()
   })
 
-  it('应用不可用但窗口可用时标题仍显示', () => {
+  it('应用不可用但窗口可用时标题仍显示', async () => {
     const state = makeState()
     state.env.frontApp = emptyFact('unavailable')
     renderPanel({ ...makeScenario('healthy'), state })
     expect(document.body.textContent).toContain('demo.ts — project')
   })
 
-  it('sendTitles=false 时窗口 denied reason / 不可用保留标题都不进 DOM', () => {
+  it('sendTitles=false 时窗口 denied reason / 不可用保留标题都不进 DOM', async () => {
     const state = makeState()
     state.env.focusedWindow = emptyFact('denied', 'PrivateWindowSecret 未授权')
     const { view } = renderPanel({
@@ -247,7 +259,7 @@ describe('位置与焦点卡', () => {
     expect(document.body.innerHTML).not.toContain('thatsecret')
   })
 
-  it('焦点卡 app/窗口超过「刚刚」的新鲜度显示秒级年龄', () => {
+  it('焦点卡 app/窗口超过「刚刚」的新鲜度显示秒级年龄', async () => {
     const state = makeState()
     state.env.frontApp = fact(
       { name: 'Finder', bundleId: 'com.demo.finder' },
@@ -263,7 +275,7 @@ describe('位置与焦点卡', () => {
     expect(within(card).getAllByText(/60 秒前/).length).toBe(2)
   })
 
-  it('关注路径 lastChange 为刚刚时省略年龄后缀', () => {
+  it('关注路径 lastChange 为刚刚时省略年龄后缀', async () => {
     const state = makeState()
     state.env.watchedPaths = fact({
       '/demo/src': { changes: 3, lastChange: T0 - 1_000 },
@@ -276,9 +288,9 @@ describe('位置与焦点卡', () => {
 })
 
 describe('调整入口与反馈标记', () => {
-  it('已在调整视图时再次点「调整」仍重新聚焦', () => {
+  it('已在调整视图时再次点「调整」仍重新聚焦', async () => {
     renderPanel(makeScenario('rapid-change'))
-    fireEvent.click(within(openTile('memory')).getByText('调整'))
+    fireEvent.click(within(await openTile('memory')).getByText('调整'))
     expect(
       (document.activeElement as HTMLElement).textContent,
     ).toContain('采样间隔')
@@ -288,7 +300,7 @@ describe('调整入口与反馈标记', () => {
         'details[data-tile="cpu"] summary',
       ) as HTMLElement
     ).focus()
-    fireEvent.click(within(openTile('cpu')).getByText('调整'))
+    fireEvent.click(within(await openTile('cpu')).getByText('调整'))
     expect(
       (document.activeElement as HTMLElement).textContent,
     ).toContain('采样间隔')
@@ -298,7 +310,7 @@ describe('调整入口与反馈标记', () => {
     expect(rules.open).toBe(true)
   })
 
-  it('调整记录 prev/next 节点带原值/新值 aria-label', () => {
+  it('调整记录 prev/next 节点带原值/新值 aria-label', async () => {
     renderPanel(makeScenario('rapid-change'))
     openSection('规则')
     fireEvent.click(screen.getByRole('button', { name: '调整日志' }))
@@ -306,7 +318,7 @@ describe('调整入口与反馈标记', () => {
     expect(screen.getAllByLabelText(/^新值/).length).toBeGreaterThan(0)
   })
 
-  it('只有可反馈事件带 data-feedback 标记', () => {
+  it('只有可反馈事件带 data-feedback 标记', async () => {
     const m = { ...makeScenario('healthy'), events: [makeEvent(9)] }
     const { view } = renderPanel(m)
     const li = document.querySelector('li[class*="event"]')!
@@ -325,7 +337,7 @@ describe('调整入口与反馈标记', () => {
 describe('宿主触发缺省严重度（缺 severity 不显示为良好）', () => {
   it.each(['floor', 'rate', 'baseline'] as const)(
     '%s 层 triggered 无 severity：磁贴/总览/图标记 warn，明细标注未给严重度',
-    (layer) => {
+    async (layer) => {
       const state = makeState()
       state.self.body.cpu = fact({ usage: 0.5, perCore: [0.5], load1: 1, load5: 1, load15: 1 })
       renderPanel({ ...makeScenario('healthy'), state, insights: { cpu: { sources: [layer], triggered: [layer] } } })
@@ -334,7 +346,7 @@ describe('宿主触发缺省严重度（缺 severity 不显示为良好）', () 
       expect(screen.getByText('CPU 负载较高')).toBeTruthy()
       // 摘要图末点标记取 effectiveSeverity（无可比阈值也可见 warn）
       expect(tile.querySelector('summary circle[data-current="warn"]')).not.toBeNull()
-      expect(openTile('cpu').textContent).toContain('宿主未给严重度')
+      expect((await openTile('cpu')).textContent).toContain('宿主未给严重度')
     },
   )
 })
@@ -348,7 +360,7 @@ describe('曲线告警服从触发状态', () => {
     return document.querySelector('details[data-tile="cpu"] summary')!
   }
 
-  it('未触发宿主层不把曲线染成告警：cpu 0.5、baseline 线 0.4、triggered 空 → good 且中性', () => {
+  it('未触发宿主层不把曲线染成告警：cpu 0.5、baseline 线 0.4、triggered 空 → good 且中性', async () => {
     const summary = cpuPanel(0.5, {
       sources: ['baseline'],
       triggered: [],
@@ -375,7 +387,7 @@ describe('contextWindow 回退估值', () => {
     return s
   }
 
-  it('容量未确认：环降饱和、无剩余/填满/压缩派生，磁贴未知但总览不计缺失', () => {
+  it('容量未确认：环降饱和、无剩余/填满/压缩派生，磁贴未知但总览不计缺失', async () => {
     renderPanel({ ...makeScenario('healthy'), state: tokenState('fallback') })
     const tile = document.querySelector('details[data-tile="tokens"]')!
     expect(tile.getAttribute('data-sev')).toBe('unknown')
@@ -388,7 +400,9 @@ describe('contextWindow 回退估值', () => {
     expect(tile.textContent).toContain('本会话')
     expect(screen.getByText('状态良好')).toBeTruthy()
     expect(
-      openTile('tokens').querySelectorAll('[class*="metricBlock"] line[data-threshold]'),
+      (await openTile('tokens')).querySelectorAll(
+        '[class*="metricBlock"] line[data-threshold]',
+      ),
     ).toHaveLength(0)
   })
 
@@ -396,16 +410,16 @@ describe('contextWindow 回退估值', () => {
     ['configured', '配置值'],
     ['catalog', '模型目录'],
     ['fallback', '回退估值'],
-  ] as const)('%s 容量来源在明细标注为「%s」', (source, text) => {
+  ] as const)('%s 容量来源在明细标注为「%s」', async (source, text) => {
     renderPanel({ ...makeScenario('healthy'), state: tokenState(source) })
-    expect(openTile('tokens').textContent).toContain(text)
+    expect((await openTile('tokens')).textContent).toContain(text)
   })
 })
 
 describe('过期事实禁用当前推算', () => {
   const staleOf = <T,>(value: T) => fact(value, { status: 'ok', ageMs: 120_000, ttlMs: 5_000 })
 
-  it('stale 保留值标「上次读数」+ 已过期，禁用全部当前推算与明细 insight', () => {
+  it('stale 保留值标「上次读数」+ 已过期，禁用全部当前推算与明细 insight', async () => {
     const state = makeState()
     state.self.body.tokens = staleOf(state.self.body.tokens.value!)
     state.self.body.battery = staleOf(state.self.body.battery.value!)
@@ -428,13 +442,13 @@ describe('过期事实禁用当前推算', () => {
     // CPU 摘要图不引用 insight；明细表头为上次读数且触发层清空
     const summary = document.querySelector('details[data-tile="cpu"] summary')!
     expect(summary.querySelector('rect[data-baseline]')).toBeNull()
-    const details = openTile('cpu')
+    const details = await openTile('cpu')
     expect(details.textContent).toContain('上次读数 30%')
     expect(details.textContent).not.toContain('当前 30%')
     expect(details.textContent).toContain('未触发')
   })
 
-  it('stale token/battery 清除全部当前投影：预计下次/压缩/ETA/基线带/阈值线', () => {
+  it('stale token/battery 清除全部当前投影：预计下次/压缩/ETA/基线带/阈值线', async () => {
     const state = makeState()
     state.self.body.tokens = fact(
       {
@@ -487,7 +501,7 @@ describe('过期事实禁用当前推算', () => {
     expect(tokens.textContent).toContain('本会话')
 
     // 明细展开后同样无投影/insight，且不再生成默认底线/基线带
-    const detail = openTile('tokens')
+    const detail = await openTile('tokens')
     for (const w of ['预计下次', '下次请求', '按当前速度', '压缩', '显示底线']) {
       expect(detail.textContent, `明细不应出现「${w}」`).not.toContain(w)
     }
@@ -505,13 +519,13 @@ describe('过期事实禁用当前推算', () => {
 
   it.each(['denied', 'unavailable'] as const)(
     '%s 保留值不泄露：摘要/明细都不出现（CPU 与 Token）',
-    (status) => {
+    async (status) => {
       const state = makeState()
       state.self.body.cpu = fact(state.self.body.cpu.value!, { status, reason: '受限' })
       state.self.body.tokens = fact(state.self.body.tokens.value!, { status, reason: '受限' })
       renderPanel({ ...makeScenario('healthy'), state })
       for (const key of ['cpu', 'tokens']) {
-        const tile = openTile(key)
+        const tile = await openTile(key)
         for (const v of ['34%', '46.2', '12.34', '上次读数']) {
           expect(tile.textContent).not.toContain(v)
         }
@@ -524,11 +538,11 @@ describe('无有效磁盘读数', () => {
   it.each([
     { disks: [] as { mount: string; total: number; free: number }[] },
     { disks: [{ mount: '/', total: 0, free: 0 }, { mount: '/x', total: -1, free: 0 }] },
-  ])('空/全无效列表 → 明示无有效读数、行未知、不伪造 0', ({ disks }) => {
+  ])('空/全无效列表 → 明示无有效读数、行未知、不伪造 0', async ({ disks }) => {
     const state = makeState()
     state.self.body.disks = fact(disks)
     renderPanel({ ...makeScenario('healthy'), state })
-    const tile = openTile('disks')
+    const tile = await openTile('disks')
     expect(tile.textContent).toContain('无有效磁盘读数')
     expect(tile.textContent).not.toContain('0 B')
     expect(within(tile as HTMLElement).getByText('未知')).toBeTruthy()
@@ -550,7 +564,7 @@ describe('fillMinutes 结果护栏', () => {
 })
 
 describe('磁贴渲染隔离', () => {
-  it('无关更新不重渲 CPU 卡片；CPU 事实变化才重渲', () => {
+  it('无关更新不重渲 CPU 卡片；CPU 事实变化才重渲', async () => {
     const m = makeScenario('healthy')
     const spy = vi.spyOn(m.state.self.body.cpu.value!.perCore, 'map')
     const { view, props } = renderPanel(m)
@@ -576,7 +590,7 @@ describe('磁贴渲染隔离', () => {
     expect(spy3.mock.calls.length).toBeGreaterThan(0)
   })
 
-  it('时钟/事件拷贝/无关事件不重渲；相关事件与 TTL 过期重渲；年龄独立前进', () => {
+  it('时钟/事件拷贝/无关事件不重渲；相关事件与 TTL 过期重渲；年龄独立前进', async () => {
     const m = makeScenario('healthy')
     const spy = vi.spyOn(m.state.self.body.cpu.value!.perCore, 'map')
     // 内存渲染计数器：breakdown 只有 MemoryTile 渲染路径读取
@@ -630,7 +644,7 @@ describe('磁贴渲染隔离', () => {
     expect(memReads).toBe(memBase)
   })
 
-  it('CPU TTL 过期强制重渲并显示过期；过期年龄随时钟独立前进', () => {
+  it('CPU TTL 过期强制重渲并显示过期；过期年龄随时钟独立前进', async () => {
     const m = makeScenario('healthy')
     // age 4s / ttl 5s：T0 时 ok，T0+2s 时过期
     m.state.self.body.cpu = fact(
@@ -654,7 +668,7 @@ describe('磁贴渲染隔离', () => {
     expect(spy.mock.calls.length).toBe(staleBase)
   })
 
-  it('>5min 历史匹配事件与未来事件到点：相关集合仍更新明细「最近触发」', () => {
+  it('>5min 历史匹配事件与未来事件到点：相关集合仍更新明细「最近触发」', async () => {
     const m = makeScenario('healthy')
     m.state.self.body.cpu = fact(
       { usage: 0.3, perCore: [0.3], load1: 1, load5: 1, load15: 1 },
@@ -676,7 +690,7 @@ describe('磁贴渲染隔离', () => {
           unit: 'ratio',
         },
       })
-    const detail = openTile('cpu')
+    const detail = await openTile('cpu')
     const block = () => detail.querySelector('[data-metric="cpu"]')!
     expect(block().textContent).toContain('最近触发：无')
 
@@ -708,7 +722,7 @@ describe('磁贴渲染隔离', () => {
     expect(block().textContent).toContain(formatClock(T0 + 60_000))
   })
 
-  it('磁盘 rate 徽标跨 5 分钟窗消失；陈旧卷历史事件仍更新明细；CPU 不动', () => {
+  it('磁盘 rate 徽标跨 5 分钟窗消失；陈旧卷历史事件仍更新明细；CPU 不动', async () => {
     const m = makeScenario('healthy')
     m.state.self.body.cpu = fact(
       { usage: 0.3, perCore: [0.3], load1: 1, load5: 1, load15: 1 },
@@ -751,7 +765,8 @@ describe('磁贴渲染隔离', () => {
     const tile = document.querySelector('details[data-tile="disks"]')!
     const summary = tile.querySelector('summary')!
     expect(summary.textContent).toContain('/分') // rate 4min 前 → 徽标在
-    const dataBlock = () => openTile('disks').querySelector('[data-metric="disk:/data"]')!
+    const diskDetail = await openTile('disks')
+    const dataBlock = () => diskDetail.querySelector('[data-metric="disk:/data"]')!
     expect(dataBlock().textContent).toContain('最近触发：无')
 
     // 陈旧卷的历史 anom（>5min）仍属相关 key → 重渲并更新「最近触发」
@@ -776,21 +791,26 @@ describe('磁盘卷级新鲜度', () => {
     unavailableMounts: ['/Volumes/network'],
   })
 
-  it('根卷 stale 灰显 + 已过期年龄 + 保留值；/data 新鲜；unavailable 挂载「无法读取」无数字无图', () => {
+  it('根卷 stale 灰显 + 已过期年龄 + 保留值；/data 新鲜；unavailable 挂载「无法读取」无数字无图', async () => {
     const state = makeState()
     state.self.body.disks = partialDisks()
     renderPanel({ ...makeScenario('healthy'), state })
-    // 磁贴 unknown、总览数据待补全（根卷非新鲜不能报 good）
+    // 行按新鲜 /data 仍 good；根卷失鲜只加「部分」标记不降级
     const tile = document.querySelector('details[data-tile="disks"]')!
-    expect(tile.getAttribute('data-sev')).toBe('unknown')
-    expect(screen.getByText('数据待补全')).toBeTruthy()
+    expect(tile.getAttribute('data-sev')).toBe('good')
+    expect(tile.querySelector('summary [data-partial]')?.textContent).toContain(
+      '部分 · 数据待补全',
+    )
+    // 总览：严重度词旁「部分」徽标 + 部分补全句
+    expect(screen.getByText('部分')).toBeTruthy()
+    expect(screen.getAllByText(/数据待补全/).length).toBeGreaterThanOrEqual(2)
     // 主摘要选根卷：stale 标记 + 保留值 163.0 GB
     const summary = tile.querySelector('summary')!
     expect(summary.textContent).toContain('已过期 · 90 秒前')
     expect(summary.textContent).toContain('163.0 GB')
     expect(summary.querySelector('[data-status="stale"]')).toBeTruthy()
 
-    const detail = openTile('disks')
+    const detail = await openTile('disks')
     // 根卷行 stale 表头（保留值），/data 行当前读数
     const rootBlock = detail.querySelector('[data-metric="disk:/"]')!
     expect(rootBlock.textContent).toContain('上次读数')
@@ -807,7 +827,7 @@ describe('磁盘卷级新鲜度', () => {
     expect(detail.querySelector('[data-metric="disk:/Volumes/network"]')).toBeNull()
   })
 
-  it('父整体 stale：主摘要只标一次「已过期」，保留值仍在', () => {
+  it('父整体 stale：主摘要只标一次「已过期」，保留值仍在', async () => {
     const state = makeState()
     state.self.body.disks = fact(
       [{ mount: '/', total: 460e9, free: 175e9 }],
@@ -818,5 +838,95 @@ describe('磁盘卷级新鲜度', () => {
     expect(summary.textContent).toContain('163.0 GB')
     expect(summary.querySelectorAll('[data-status="stale"]')).toHaveLength(1)
     expect(summary.textContent!.match(/已过期/g)).toHaveLength(1)
+  })
+
+  it.each(['ok', 'stale'] as const)(
+    '根卷 stale、/data 剩余 2%%：父级 %s 时磁盘及总览均为 critical',
+    (parentStatus) => {
+    const vols = [
+      {
+        mount: '/',
+        total: 100e9,
+        free: 40e9,
+        status: 'stale' as const,
+        observedAt: T0 - 90_000,
+        ttlMs: 30_000,
+      },
+      {
+        mount: '/data',
+        total: 100e9,
+        free: 2e9,
+        status: 'ok' as const,
+        observedAt: T0 - 1_000,
+        ttlMs: 30_000,
+      },
+    ]
+    const state = makeState()
+    state.self.body.disks = fact(vols, {
+      status: parentStatus,
+      ageMs: 1_000,
+      ttlMs: 30_000,
+    })
+    const result = evaluateBody(state.self.body, T0)
+    expect(result.rows.disks).toMatchObject({ severity: 'critical', partial: true })
+    expect(result).toMatchObject({
+      severity: 'critical', sentence: '磁盘空间不足', partial: true,
+    })
+    console.info(`disk-regression ${parentStatus}: ${JSON.stringify({
+      disk: result.rows.disks.severity,
+      overview: result.severity,
+      partial: result.partial,
+      sentence: result.sentence,
+    })}`)
+    renderPanel({ ...makeScenario('healthy'), state })
+    const tile = document.querySelector('details[data-tile="disks"]')!
+    expect(tile.getAttribute('data-sev')).toBe('critical')
+    const summary = tile.querySelector('summary')!
+    expect(summary.textContent).toContain('/data')
+    expect(summary.textContent).toContain('部分')
+    expect(summary.querySelector('[data-status="stale"]')).toBeNull()
+    // 总览紧急 + 「部分」徽标
+    expect(
+      document
+        .querySelector('[class*="monitor"][data-sev]')!
+        .getAttribute('data-sev'),
+    ).toBe('critical')
+    expect(screen.getByText('部分')).toBeTruthy()
+    },
+  )
+
+  it('根卷新鲜且 /net 无法读取：磁盘和总览标部分而非状态良好', async () => {
+    const state = makeState()
+    state.self.body.disks = {
+      ...fact([{
+        mount: '/', total: 100e9, free: 90e9, status: 'ok' as const,
+        observedAt: T0 - 1_000, ttlMs: 30_000,
+      }], { ageMs: 1_000, ttlMs: 30_000 }),
+      unavailableMounts: ['/net'],
+    }
+    const result = evaluateBody(state.self.body, T0)
+    expect(result.rows.disks).toEqual({ severity: 'good', hidden: false, partial: true })
+    expect(result).toMatchObject({
+      severity: 'good', sentence: '部分 · 数据待补全', partial: true,
+    })
+    console.info(`disk-regression /net: ${JSON.stringify({
+      disk: result.rows.disks.severity,
+      overview: result.severity,
+      partial: result.partial,
+      sentence: result.sentence,
+    })}`)
+    renderPanel({ ...makeScenario('healthy'), state })
+    const tile = document.querySelector('details[data-tile="disks"]')!
+    expect(tile.getAttribute('data-sev')).toBe('good')
+    expect(tile.querySelector('summary [data-partial]')?.textContent).toContain('部分 · 数据待补全')
+    expect(screen.queryByText('状态良好')).toBeNull()
+    expect(screen.getByText('部分')).toBeTruthy()
+    const detail = await openTile('disks')
+    const net = [...detail.querySelectorAll('[class*="detailLine"]')]
+      .find((row) => row.textContent?.includes('/net'))!
+    expect(net.textContent).toContain('/net 无法读取')
+    expect(net.textContent).not.toMatch(/\d|GB/)
+    expect(net.querySelector('[data-strip]')).toBeNull()
+    expect(detail.querySelector('[data-metric="disk:/net"]')).toBeNull()
   })
 })

@@ -474,15 +474,26 @@ test.describe('容量未确认（fallback 上下文窗口）', () => {
 
 test.describe('磁盘卷级状态（disk-partial，420px × 明暗）', () => {
   for (const theme of THEMES) {
-    test(`disk-partial 420 ${theme}：根卷过期灰显 / 网络盘无法读取 / 卡片未知`, async ({
+    test(`disk-partial 420 ${theme}：根卷过期灰显 / 网络盘无法读取 / 新鲜卷仍良好`, async ({
       page,
     }) => {
       const errors = watchErrors(page)
       await page.setViewportSize({ width: 420, height: 900 })
       await open(page, 'disk-partial', theme)
       const t = tile(page, 'disks')
-      // 根卷非新鲜 → 卡片未知，主摘要为根卷过期保留值（灰显 + 年龄）
-      await expect(t).toHaveAttribute('data-sev', 'unknown')
+      // /data 新鲜 → 行仍良好；根卷失鲜+不可读盘只加「部分」标记
+      await expect(t).toHaveAttribute('data-sev', 'good')
+      await expect(t.locator('summary [data-partial]')).toContainText(
+        '部分 · 数据待补全',
+      )
+      // 总览：严重度词旁「部分」徽标 + 部分补全句
+      await expect(
+        page.locator('[class*="monitorPartial"]'),
+      ).toContainText('部分')
+      await expect(
+        page.locator('[class*="monitorSub"]').first(),
+      ).toContainText('数据待补全')
+      // 主摘要为根卷过期保留值（灰显 + 年龄）
       const summary = t.locator('summary')
       await expect(summary.locator('[data-status="stale"]').first()).toBeVisible()
       await expect(summary).toContainText('已过期 · 90 秒前')
@@ -623,4 +634,30 @@ test.describe('修复验收：网格末位与阈值图', () => {
     }
   })
 
+})
+
+test.describe('标注底色不透明（y 轴/明细标签/剩余条）', () => {
+  test('展开磁盘明细：y 轴极值、已用率标签、剩余条标签底色 alpha=1', async ({
+    page,
+  }) => {
+    await page.setViewportSize({ width: 420, height: 900 })
+    await open(page, 'healthy', 'light')
+    const t = await openTile(page, 'disks')
+    const bgAlpha = (loc: ReturnType<Page['locator']>) =>
+      loc.first().evaluate((el) => {
+        const s = getComputedStyle(el).backgroundColor
+        const m = s.match(/[\d.]+/g)
+        return m && m.length >= 4 ? parseFloat(m[3]!) : 1
+      })
+    // y 轴极值标签（展开图内）
+    expect(await bgAlpha(t.locator('[class*="axisYMax"]'))).toBe(1)
+    expect(await bgAlpha(t.locator('[class*="axisYMin"]'))).toBe(1)
+    // 明细指标名「磁盘 / 已用率」与剩余条可见标签
+    expect(
+      await bgAlpha(t.locator('[class*="metricName"]', { hasText: '已用率' })),
+    ).toBe(1)
+    expect(
+      await bgAlpha(t.locator('[class*="stripText"]', { hasText: '剩余' })),
+    ).toBe(1)
+  })
 })
