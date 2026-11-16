@@ -59,8 +59,8 @@ export class RuntimeAttention {
     private readonly titlesAllowed: () => boolean,
     readonly changed: () => void,
     expiry: FactExpiry,
-    private readonly ensureTarget?: () => Promise<void>,
-    canEnsureTarget?: () => boolean,
+    private readonly ensureTarget?: () => void,
+    private readonly canEnsureTarget?: () => boolean,
   ) {
     const staged = dsh as DshPort & { onDeliveryCommitted?: (cb: (session: string, id: string) => void) => () => void };
     this.store = new StateStore(
@@ -271,15 +271,15 @@ export class RuntimeAttention {
     if (this.stopped || this.closed.has(id)) return;
     const session = this.sessions.get(id);
     if (!session) return;
-    if (this.needsRestore()) {
-      await this.ensureTarget?.();
-      if (this.stopped || this.sessions.get(id) !== session || this.closed.has(id)) return;
-    }
+    if (this.needsRestore()) this.ensureTarget?.();
     const generation = ++this.selectionGeneration;
     const index = this.recent.indexOf(id);
     if (index >= 0) this.recent.splice(index, 1);
     this.recent.push(id);
-    this.selected = this.pinned && this.sessions.has(this.pinned) && !this.closed.has(this.pinned) ? this.pinned : id;
+    this.selected =
+      this.pinned && this.sessions.has(this.pinned) && !this.closed.has(this.pinned) && !this.canEnsureTarget?.()
+        ? this.pinned
+        : id;
     this.privateStep = this.selected === id ? undefined : id;
     session.busy = true;
     session.userInitiated = userInitiated;
@@ -368,7 +368,7 @@ export class RuntimeAttention {
     }
     if (this.needsRestore() && signal.cause !== 'agent') {
       const level = this.pipeline.selectRule(signal, this.rules())?.level;
-      if (level && level !== 'record') await this.ensureTarget?.();
+      if (level && level !== 'record') this.ensureTarget?.();
     }
     if (this.stopped) return;
     const session = this.selected && this.sessions.get(this.selected);
@@ -417,10 +417,7 @@ export class RuntimeAttention {
   async flush(): Promise<void> {
     try {
       this.pipeline.pruneSessions();
-      if (this.needsRestore()) {
-        await this.pipeline.flushOwned();
-        await this.ensureTarget?.();
-      }
+      if (this.needsRestore()) this.ensureTarget?.();
       if (this.selected) await this.pipeline.retarget(this.selected);
       if (!this.stopped) await this.pipeline.flush();
     } finally {
