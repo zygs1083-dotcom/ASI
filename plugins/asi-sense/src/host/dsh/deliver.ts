@@ -51,7 +51,7 @@ function modelUpdate(update: EnvUpdate): EnvUpdate {
         if (typeof signal.data.title === 'string') data.title = modelTitle(signal.data.title);
       } else if (signal.kind === 'file.changed') {
         data.path = modelPath(typeof signal.data.path === 'string' ? signal.data.path : signal.subject);
-      } else if (signal.kind === 'job.exited' || signal.kind === 'process.exited') {
+      } else if (signal.kind === 'job.started' || signal.kind === 'job.exited' || signal.kind === 'process.exited') {
         if (typeof signal.data.id === 'string') data.id = modelLabel(signal.data.id);
         if (typeof signal.data.exitCode === 'number') data.exitCode = signal.data.exitCode;
         if (typeof signal.data.durationMs === 'number') data.durationMs = signal.data.durationMs;

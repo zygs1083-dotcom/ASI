@@ -64,6 +64,7 @@ export interface Bucket {
   splitFrom?: Bucket;
   /** Signals already injected from this bucket via split context. */
   alreadyInjected?: number;
+  budgetSuppressed?: boolean;
   jobs?: {
     recent: Map<string, { id: string; kind: string; count: number; exitCode?: number }>;
     omitted: number;
@@ -189,18 +190,21 @@ export function upsertJobs(
     detail.level = level;
     detail.ruleId = rule?.id;
     detail.note = rule?.note;
-    detail.reason = reason;
+    detail.reason = bucket.budgetSuppressed && level === 'context' ? 'wake-budget' : reason;
   }
   bucket.jobs ??= { recent: new Map(), omitted: 0 };
   const jobs = bucket.jobs;
   const id = typeof signal.data.id === 'string' ? signal.data.id : signal.subject;
-  const prior = jobs.recent.get(id);
-  jobs.recent.delete(id);
-  jobs.recent.set(id, {
+  const key = JSON.stringify([id, signal.kind]);
+  const prior = jobs.recent.get(key);
+  jobs.recent.delete(key);
+  jobs.recent.set(key, {
     id,
     kind: signal.kind,
     count: (prior?.count ?? 0) + 1,
-    ...(typeof signal.data.exitCode === 'number' ? { exitCode: signal.data.exitCode } : {}),
+    ...(signal.kind === 'job.exited' && typeof signal.data.exitCode === 'number'
+      ? { exitCode: signal.data.exitCode }
+      : {}),
   });
   if (jobs.recent.size > 20) {
     const oldest = jobs.recent.keys().next().value as string;

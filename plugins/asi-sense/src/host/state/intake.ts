@@ -1,9 +1,9 @@
 import type { Signal } from '@asi/sense-types';
 
-export type ApplyResult = 'applied' | 'duplicate' | 'older';
+export type ApplyResult = 'applied' | 'duplicate' | 'older' | 'invalid';
 
 export class SignalIntake {
-  private readonly queue: { signal: Signal; afterApply?: (result: ApplyResult) => void }[] = [];
+  private readonly queue: { signal: Signal; afterApply?: (result: ApplyResult) => void; valid?: () => boolean }[] = [];
   private processing = false;
   private deferred?: Signal[];
 
@@ -13,8 +13,8 @@ export class SignalIntake {
     private readonly emit: (signal: Signal) => void,
   ) {}
 
-  apply(signal: Signal, afterApply?: (result: ApplyResult) => void): void {
-    this.queue.push({ signal: structuredClone(signal), afterApply });
+  apply(signal: Signal, afterApply?: (result: ApplyResult) => void, valid?: () => boolean): void {
+    this.queue.push({ signal: structuredClone(signal), afterApply, valid });
     this.drain();
   }
 
@@ -45,7 +45,7 @@ export class SignalIntake {
     try {
       let next = this.queue.shift();
       while (next !== undefined) {
-        const result = this.applyOne(next.signal);
+        const result = next.valid && !next.valid() ? 'invalid' : this.applyOne(next.signal);
         if (result === 'applied') {
           if (this.deferred) this.deferred.push(next.signal);
           else {

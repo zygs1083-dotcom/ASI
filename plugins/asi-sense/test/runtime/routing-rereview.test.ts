@@ -62,6 +62,53 @@ function harness(failFirst: boolean, configuredRules = rules, blockFirst = true,
 }
 
 describe('in-flight session ownership', () => {
+  it('does not apply a queued job after its owner is disposed and recreated reentrantly', async () => {
+    const h = harness(
+      false,
+      [{ id: 'starts', match: { kind: 'job.started' }, level: 'context', createdBy: 'user', approved: true }],
+      false,
+    );
+    h.attention.create('a');
+    await h.attention.preStep('a');
+    let queued: Promise<void> | undefined;
+    const off = h.attention.store.subscribe(() => {
+      off();
+      queued = h.attention.accept({
+        id: 'old-event',
+        kind: 'job.started',
+        at: 0,
+        subject: 'synthetic-old-job',
+        source: { id: 'dsh', api: 'events', host: 'local' },
+        data: { id: 'synthetic-old-job', sessionId: 'a', sessionToken: h.attention.sessionToken('a') },
+      });
+      h.attention.dispose('a');
+      h.attention.create('a');
+    });
+    await h.attention.accept(signal('outer', 'context'));
+    await queued;
+    expect(h.attention.state().env.activeJobs.value ?? []).not.toContainEqual(
+      expect.objectContaining({ id: 'synthetic-old-job' }),
+    );
+    expect(h.attention.state().observation.sources.dsh).toBeUndefined();
+    expect(h.attention.events()).toContainEqual(
+      expect.objectContaining({ id: 'old-event', reason: 'session-private' }),
+    );
+    expect(h.attention.pipeline.nextDeadline()).toBeUndefined();
+    await h.attention.preStep('a');
+    await h.attention.accept({
+      id: 'old-event',
+      kind: 'job.started',
+      at: 0,
+      subject: 'synthetic-new-job',
+      source: { id: 'dsh', api: 'events', host: 'local' },
+      data: { id: 'synthetic-new-job', sessionId: 'a', sessionToken: h.attention.sessionToken('a') },
+    });
+    expect(h.attention.state().env.activeJobs.value).toContainEqual(
+      expect.objectContaining({ id: 'synthetic-new-job' }),
+    );
+    await h.attention.stop();
+  });
+
   it('does not enqueue a job if the owner generation changes during store notification', async () => {
     const configured: WatchRule[] = [
       { id: 'jobs', match: { kind: 'job.exited' }, level: 'wake', createdBy: 'user', approved: true },
@@ -180,12 +227,191 @@ describe('in-flight session ownership', () => {
         data: {
           jobSummary: {
             total: 60,
-            omitted: 20,
-            recent: expect.arrayContaining([expect.objectContaining({ id: 'job-29', count: 2, kind: 'job.exited' })]),
+            omitted: 40,
+            recent: expect.arrayContaining([
+              expect.objectContaining({ id: 'job-29', count: 1, kind: 'job.started' }),
+              expect.objectContaining({ id: 'job-29', count: 1, kind: 'job.exited' }),
+            ]),
           },
         },
       },
     });
+    await h.attention.stop();
+  });
+
+  it('reports each job kind and count accurately in the model delivery', async () => {
+    const configured: WatchRule[] = [
+      { id: 'starts', match: { kind: 'job.started' }, level: 'context', createdBy: 'user', approved: true },
+      { id: 'exits', match: { kind: 'job.exited' }, level: 'wake', createdBy: 'user', approved: true },
+    ];
+    const h = harness(false, configured, false);
+    h.attention.create('a');
+    h.attention.create('b');
+    await h.attention.preStep('b');
+    for (const [index, kind] of ['job.started', 'job.exited', 'job.started', 'job.exited', 'job.exited'].entries()) {
+      await h.attention.accept({
+        id: `event-${index}`,
+        kind,
+        at: index,
+        subject: 'id1',
+        source: { id: 'dsh', api: 'events', host: 'local' },
+        data: { id: 'id1', sessionId: 'a', sessionToken: h.attention.sessionToken('a'), exitCode: 1 },
+      });
+    }
+    h.advance();
+    await h.attention.preStep('a');
+    const messages: unknown[] = [];
+    const agent = { inject: () => {}, send: (message: unknown) => messages.push(message), followup: () => {} };
+    const deliver = createDelivery(
+      () => agent as never,
+      () => true,
+      async () => false,
+    );
+    await deliver('a', h.delivered[0] as Parameters<typeof deliver>[1]);
+    const text = JSON.stringify(messages);
+    expect(text).toContain('jobs: 5 events');
+    expect(text).toContain('job: `id1` started ×2');
+    expect(text).toContain('job: `id1` exited 1 ×3');
+    expect(text).not.toContain('job: `id1` exited 1 ×5');
+    await h.attention.stop();
+  });
+
+  it('wakes for a failed job while an earlier successful job awaits injection', async () => {
+    const configured: WatchRule[] = [
+      {
+        id: 'failed',
+        match: { kind: 'job.exited', where: { exitCode: { '!=': 0 } } },
+        level: 'wake',
+        createdBy: 'user',
+        approved: true,
+      },
+      { id: 'done', match: { kind: 'job.exited' }, level: 'context', createdBy: 'user', approved: true },
+    ];
+    const h = harness(false, configured, false);
+    h.attention.create('a');
+    await h.attention.preStep('a');
+    h.attention.postStep('a');
+    const add = (id: string, exitCode: number) =>
+      h.attention.accept({
+        id,
+        kind: 'job.exited',
+        at: 0,
+        subject: id,
+        source: { id: 'dsh', api: 'events', host: 'local' },
+        data: { id, sessionId: 'a', sessionToken: h.attention.sessionToken('a'), exitCode },
+      });
+    await add('success', 0);
+    h.advance();
+    await h.attention.flush();
+    await add('failure', 1);
+    expect(h.attention.pipeline.nextDeadline()).toBe(4_000);
+    h.advance();
+    await h.attention.flush();
+    expect(h.delivered.filter((intent) => intent.kind === 'followup')).toHaveLength(1);
+    expect(h.delivered[0]?.update.changes[0]?.signal.data.id).toBe('failure');
+    for (let i = 0; i < 50; i++) {
+      await add(`failure-${i}`, 1);
+      h.advance(500);
+      await h.attention.flush();
+    }
+    const drain = h.attention.pipeline as unknown as {
+      drain: { pending: Map<number, unknown>; ready: Map<string, unknown[]>; batches: Map<string, unknown[]> };
+    };
+    expect(
+      drain.drain.pending.size +
+        (drain.drain.ready.get('a')?.length ?? 0) +
+        (drain.drain.batches.get('a')?.length ?? 0),
+    ).toBeLessThanOrEqual(3);
+    expect(h.delivered.filter((intent) => intent.kind === 'followup')).toHaveLength(1);
+    expect(h.attention.pipeline.suppressed).toBe(1);
+    expect(h.attention.pipeline.nextDeadline()).toBeUndefined();
+    h.advance(40_000);
+    await add('failure-after-budget', 1);
+    expect(h.attention.pipeline.nextDeadline()).toBeDefined();
+    await h.attention.flush();
+    expect(h.delivered.filter((intent) => intent.kind === 'followup')).toHaveLength(2);
+    await h.attention.preStep('a');
+    expect(h.delivered.flatMap((intent) => intent.update.changes).reduce((sum, change) => sum + change.count, 0)).toBe(
+      53,
+    );
+    await h.attention.stop();
+  });
+
+  it('lets a wake pass a frozen context batch without changing that batch', async () => {
+    const configured: WatchRule[] = [
+      {
+        id: 'failed',
+        match: { kind: 'job.exited', where: { exitCode: { '!=': 0 } } },
+        level: 'wake',
+        createdBy: 'user',
+        approved: true,
+      },
+      { id: 'done', match: { kind: 'job.exited' }, level: 'context', createdBy: 'user', approved: true },
+    ];
+    const h = harness(false, configured, false, true);
+    h.attention.create('a');
+    await h.attention.preStep('a');
+    const add = (id: string, exitCode: number) =>
+      h.attention.accept({
+        id,
+        kind: 'job.exited',
+        at: 0,
+        subject: id,
+        source: { id: 'dsh', api: 'events', host: 'local' },
+        data: { id, sessionId: 'a', sessionToken: h.attention.sessionToken('a'), exitCode },
+      });
+    await add('success', 0);
+    await h.attention.preStep('a');
+    const first = structuredClone(h.delivered[0]);
+    h.attention.postStep('a');
+    await add('failure', 1);
+    h.advance();
+    expect(h.attention.pipeline.nextDeadline()).toBe(2_000);
+    await h.attention.flush();
+    expect(h.delivered.map((intent) => intent.kind)).toEqual(['inject', 'followup']);
+    expect(h.delivered[0]).toEqual(first);
+    expect(h.delivered[1]?.update.changes[0]?.signal.data.id).toBe('failure');
+    await h.attention.stop();
+  });
+
+  it('keeps the budget downgrade when a normal job joins a parked summary', async () => {
+    const configured: WatchRule[] = [
+      {
+        id: 'failed',
+        match: { kind: 'job.exited', where: { exitCode: { '!=': 0 } } },
+        level: 'wake',
+        createdBy: 'user',
+        approved: true,
+      },
+      { id: 'done', match: { kind: 'job.exited' }, level: 'context', createdBy: 'user', approved: true },
+    ];
+    const h = harness(false, configured, false);
+    h.attention.create('a');
+    await h.attention.preStep('a');
+    h.attention.postStep('a');
+    const add = (id: string, exitCode: number) =>
+      h.attention.accept({
+        id,
+        kind: 'job.exited',
+        at: 0,
+        subject: id,
+        source: { id: 'dsh', api: 'events', host: 'local' },
+        data: { id, sessionId: 'a', sessionToken: h.attention.sessionToken('a'), exitCode },
+      });
+    await add('success', 0);
+    h.advance();
+    await h.attention.flush();
+    await add('wake', 1);
+    h.advance();
+    await h.attention.flush();
+    await add('suppressed', 1);
+    h.advance();
+    await h.attention.flush();
+    await add('success-later', 0);
+    await h.attention.preStep('a');
+    const suppressed = h.delivered.find((intent) => intent.update.suppressed === 1);
+    expect(suppressed?.update.changes[0]).toMatchObject({ count: 2, level: 'context', reason: 'wake-budget' });
+    expect(h.attention.pipeline.suppressed).toBe(1);
     await h.attention.stop();
   });
 

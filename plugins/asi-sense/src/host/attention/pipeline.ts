@@ -222,20 +222,24 @@ export class AttentionPipeline {
     if (!pending) ev.cause = classifyCause(ev, session.toolWindows ?? [], 0, this.clock());
     if (!apply) return this.intake(ev, session, this.clock(), count, other, pending);
     return await new Promise<EnvChange>((resolve, reject) => {
-      this.store.apply(ev, (result) => {
-        try {
-          const change =
-            valid && !valid()
-              ? { signal: ev, count: 1, level: 'record', reason: 'session-private' }
-              : result === 'older'
-                ? { signal: ev, count: 1, level: 'record', reason: 'older-sequence' }
-                : this.intake(ev, session, this.clock(), count);
-          onIntake?.(change as EnvChange);
-          resolve(change as EnvChange);
-        } catch (e) {
-          reject(e);
-        }
-      });
+      this.store.apply(
+        ev,
+        (result) => {
+          try {
+            const change =
+              result === 'invalid' || (valid && !valid())
+                ? { signal: ev, count: 1, level: 'record', reason: 'session-private' }
+                : result === 'older'
+                  ? { signal: ev, count: 1, level: 'record', reason: 'older-sequence' }
+                  : this.intake(ev, session, this.clock(), count);
+            onIntake?.(change as EnvChange);
+            resolve(change as EnvChange);
+          } catch (e) {
+            reject(e);
+          }
+        },
+        valid,
+      );
     });
   }
 

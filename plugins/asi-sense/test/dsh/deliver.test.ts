@@ -44,6 +44,16 @@ function fixture() {
 }
 
 describe('DSH environment delivery', () => {
+  it('includes the job ID for an individual started event', async () => {
+    const { agent, deliver } = fixture();
+    const change = {
+      ...update.changes[0],
+      signal: { ...update.changes[0].signal, kind: 'job.started', data: { id: 'synthetic-job' } },
+    };
+    await deliver('session-a', { ...intent('followup'), update: { ...update, changes: [change] } });
+    expect(JSON.stringify(agent.followup.mock.calls)).toContain('job: `synthetic-job` started');
+  });
+
   it.each(['followup', 'send'] as const)('uses the %s boundary with an environment message', async (kind) => {
     const { agent, getAgent, deliver } = fixture();
     await deliver('session-a', intent(kind));

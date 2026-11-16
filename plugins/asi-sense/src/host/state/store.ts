@@ -83,8 +83,8 @@ export class StateStore {
    * fixed snapshots, then runs `afterApply` (even on a duplicate); its
    * errors are collected and the first rethrown after the queue drains.
    */
-  apply(signal: Signal, afterApply?: (result: ApplyResult) => void): void {
-    this.intake.apply(signal, afterApply);
+  apply(signal: Signal, afterApply?: (result: ApplyResult) => void, valid?: () => boolean): void {
+    this.intake.apply(signal, afterApply, valid);
   }
   batch<T>(work: () => T, publish: () => void = () => {}): T {
     if (this.batchState) return work();

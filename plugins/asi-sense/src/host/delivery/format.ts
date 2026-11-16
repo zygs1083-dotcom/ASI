@@ -79,6 +79,8 @@ function changeLines(ch: EnvChange, includeTitles: boolean, includeJobCommands: 
   } else if (s.kind === 'file.changed') {
     const path = str(s.data.path) || s.subject;
     main = `file: ${esc(path)} saved${ch.count > 1 ? ` ×${ch.count}` : ''}`;
+  } else if (s.kind === 'job.started') {
+    main = `job: \`${esc(str(s.data.id) || s.subject)}\` started`;
   } else if (s.kind === 'job.exited' || s.kind === 'process.exited') {
     const label = s.kind === 'job.exited' ? 'job' : 'process';
     const cmd = includeJobCommands ? str(s.data.command) || s.subject : str(s.data.id) || label;

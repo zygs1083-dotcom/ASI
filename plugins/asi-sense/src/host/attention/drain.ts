@@ -1,4 +1,4 @@
-import type { EnvUpdate, Signal, WatchRule } from '@asi/sense-types';
+import type { DeliveryLevel, EnvUpdate, Signal, WatchRule } from '@asi/sense-types';
 import {
   type Bucket,
   type BucketDetail,
@@ -91,16 +91,17 @@ export class BucketDrain {
     let min: number | undefined;
     for (const b of this.pending.values()) {
       if (privateBucket(b) && !this.isCurrent()(b.sessionId)) continue;
-      if (b.jobs && !b.sealed && this.blockedJobs(b.sessionId)) continue;
+      if (b.jobs && !b.sealed && this.blockedJobs(b.sessionId, bucketLevel(b))) continue;
       if (min === undefined || b.deadline < min) min = b.deadline;
     }
     return min;
   }
-  private blockedJobs(sessionId: string): boolean {
+  private blockedJobs(sessionId: string, level: DeliveryLevel): boolean {
+    const blocks = (bucket: Bucket) => bucket.jobs && bucketLevel(bucket) === level;
     return (
-      [...this.pending.values()].some((bucket) => bucket.sessionId === sessionId && bucket.sealed && bucket.jobs) ||
-      (this.ready.get(sessionId)?.some((bucket) => bucket.jobs) ?? false) ||
-      (this.batches.get(sessionId)?.some((batch) => batch.buckets.some((bucket) => bucket.jobs)) ?? false)
+      [...this.pending.values()].some((bucket) => bucket.sessionId === sessionId && bucket.sealed && blocks(bucket)) ||
+      (this.ready.get(sessionId)?.some(blocks) ?? false) ||
+      (this.batches.get(sessionId)?.some((batch) => batch.buckets.some(blocks)) ?? false)
     );
   }
   retarget(sessionId: string): void {
@@ -218,7 +219,7 @@ export class BucketDrain {
     if (!current(sessionId)) return;
     for (const b of [...this.pending.values()]) {
       if (b.sessionId !== sessionId || b.sealed) continue;
-      if (b.jobs && this.blockedJobs(sessionId)) continue;
+      if (b.jobs && this.blockedJobs(sessionId, bucketLevel(b))) continue;
       if (bucketLevel(b) === 'context') {
         this.pending.delete(b.id);
         this.list(this.ready, sessionId).push(b);
@@ -256,7 +257,7 @@ export class BucketDrain {
     for (const b of [...this.pending.values()]) {
       if (!current(b.sessionId)) continue;
       if (now < b.deadline) continue;
-      if (b.jobs && !b.sealed && this.blockedJobs(b.sessionId)) continue;
+      if (b.jobs && !b.sealed && this.blockedJobs(b.sessionId, bucketLevel(b))) continue;
       this.pending.delete(b.id);
       b.sealed = true;
       try {
@@ -295,9 +296,15 @@ export class BucketDrain {
           d.reason = 'wake-budget';
         }
       }
-      this.suppressedGroups++;
+      if (!b.budgetSuppressed) this.suppressedGroups++;
       if (b.frozenAt === undefined) {
-        this.list(this.ready, b.sessionId).push(b); // never attempted: aggregates
+        if (b.jobs && this.blockedJobs(b.sessionId, 'context')) {
+          b.budgetSuppressed = true;
+          b.sealed = false;
+          this.pending.set(b.id, b);
+        } else {
+          this.list(this.ready, b.sessionId).push(b); // never attempted: aggregates
+        }
       } else {
         // previously attempted wake: inject separately, keeping its
         // original display time and identity — never join a fresh batch
