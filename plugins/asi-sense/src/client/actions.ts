@@ -13,6 +13,9 @@ type Api = Pick<
   | 'revertTuning'
   | 'lockParam'
   | 'feedback'
+  | 'resumeTuning'
+  | 'resetTuning'
+  | 'acceptRebaseline'
 >;
 type Actions = Omit<SensePanelProps, 'model'>;
 
@@ -33,9 +36,15 @@ export function createActions(api: Api) {
       () => publish(true),
     );
   };
-  // TODO: connect the three deferred dangerous operations after client approval.
-  const unavailable = async () => {
-    throw new Error('This operation is not available in the sidebar yet');
+  const complete = async (action: () => Promise<RemoteResult<void>>) => {
+    try {
+      const result = await action();
+      if (!result.ok) throw result.error;
+    } catch (error) {
+      if (error instanceof Error && error.message.trim()) throw error;
+      const message = typeof error === 'string' ? error.trim() : '';
+      throw new Error(message || '操作失败，请重试。');
+    }
   };
   const actions: Actions = {
     onToggleRule: (id, enabled) => fire(api.toggleRule(id, enabled)),
@@ -47,9 +56,9 @@ export function createActions(api: Api) {
     onRevertTuning: (id) => fire(api.revertTuning(id)),
     onLockParam: (param, locked) => fire(api.lockParam(param, locked)),
     onFeedback: (id, verdict) => fire(api.feedback(id, verdict)),
-    onResumeTuning: unavailable,
-    onResetTuning: unavailable,
-    onAcceptRebaseline: unavailable,
+    onResumeTuning: () => complete(() => api.resumeTuning()),
+    onResetTuning: () => complete(() => api.resetTuning()),
+    onAcceptRebaseline: (id) => complete(() => api.acceptRebaseline(id)),
   };
   return {
     actions,

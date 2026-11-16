@@ -155,6 +155,12 @@ agent's own file write can arrive after the tool window closes and cause an
 unintended wake; this remains a known limitation pending the separate
 filesystem-timestamp and trailing-grace repair.
 
+For the dangerous-action sidebar check, build the bundle and run
+`DSH_ROOT=/path/to/dsh ASI_E2E_TMPDIR=/tmp pnpm --filter asi-sense exec tsx test/dsh/danger-e2e.ts`.
+It uses isolated synthetic storage, blocks model requests, checks resume
+pending/persistence and reset confirmation focus, and writes cropped screenshots
+under its temporary test profile.
+
 `start()` restores before starting sources and may be called once. `stop()`
 closes subscriptions, watchers, probe, helper and timers, then waits for
 pending body/settings saves; it rejects on a shutdown timeout (950 ms) or

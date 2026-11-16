@@ -1,3 +1,4 @@
+import { RemoteError } from '@deepseek-ai/dsh-typert-protocol';
 import { describe, expect, it, vi } from 'vitest';
 import { createActions } from '../../src/client/actions.ts';
 
@@ -67,14 +68,40 @@ describe('sidebar action boundary', () => {
     expect(listener).toHaveBeenCalledTimes(2);
   });
 
-  it('rejects the three explicitly deferred dangerous actions without claiming success', async () => {
+  it.each([
+    ['resumeTuning', 'onResumeTuning'],
+    ['resetTuning', 'onResetTuning'],
+    ['acceptRebaseline', 'onAcceptRebaseline'],
+  ] as const)('awaits %s and reports failures without setting the global error', async (method, callback) => {
     const { api, controller } = fixture();
-    await expect(controller.actions.onResumeTuning()).rejects.toThrow('not available');
-    await expect(controller.actions.onResetTuning()).rejects.toThrow('not available');
-    await expect(controller.actions.onAcceptRebaseline('baseline')).rejects.toThrow('not available');
-    expect(api.resumeTuning).not.toHaveBeenCalled();
-    expect(api.resetTuning).not.toHaveBeenCalled();
-    expect(api.acceptRebaseline).not.toHaveBeenCalled();
+    const invoke = () =>
+      callback === 'onAcceptRebaseline' ? controller.actions[callback]('baseline') : controller.actions[callback]();
+    await expect(invoke()).resolves.toBeUndefined();
+    expect(api[method]).toHaveBeenCalledWith(...(method === 'acceptRebaseline' ? ['baseline'] : []));
+    api[method].mockResolvedValueOnce({
+      ok: false,
+      error: new RemoteError('gateway/bad-request', 'fixture failure', {}),
+    });
+    await expect(invoke()).rejects.toThrow('fixture failure');
+    api[method].mockRejectedValueOnce(new Error('transport failure'));
+    await expect(invoke()).rejects.toThrow('transport failure');
+    api[method].mockRejectedValueOnce(undefined);
+    await expect(invoke()).rejects.toThrow();
+    expect(controller.getSnapshot()).toBe(false);
+    controller.dispose();
+  });
+
+  it('keeps a dangerous callback pending until the remote settles', async () => {
+    const { api, controller } = fixture();
+    let complete!: (result: { ok: true; value: undefined }) => void;
+    api.resumeTuning.mockReturnValueOnce(new Promise((resolve) => (complete = resolve)));
+    const done = vi.fn();
+    const pending = controller.actions.onResumeTuning().then(done);
+    await Promise.resolve();
+    expect(done).not.toHaveBeenCalled();
+    complete({ ok: true, value: undefined });
+    await pending;
+    expect(done).toHaveBeenCalledOnce();
     controller.dispose();
   });
 });
