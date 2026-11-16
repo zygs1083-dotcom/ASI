@@ -60,6 +60,7 @@ export class RuntimeAttention {
     readonly changed: () => void,
     expiry: FactExpiry,
     private readonly ensureTarget?: () => Promise<void>,
+    canEnsureTarget?: () => boolean,
   ) {
     const staged = dsh as DshPort & { onDeliveryCommitted?: (cb: (session: string, id: string) => void) => () => void };
     this.store = new StateStore(
@@ -82,6 +83,7 @@ export class RuntimeAttention {
           this.sessions.has(id);
       },
       isWakeOwner: (id) => !this.stopped && this.sessions.has(id) && !this.closed.has(id),
+      isPendingTarget: (id) => !this.stopped && this.pinned === id && !this.closed.has(id) && !!canEnsureTarget?.(),
       deliverer: {
         deliver: async (intent) => {
           if (this.stopped) throw new Error('stopped');
@@ -415,7 +417,10 @@ export class RuntimeAttention {
   async flush(): Promise<void> {
     try {
       this.pipeline.pruneSessions();
-      if (this.needsRestore()) await this.ensureTarget?.();
+      if (this.needsRestore()) {
+        await this.pipeline.flushOwned();
+        await this.ensureTarget?.();
+      }
       if (this.selected) await this.pipeline.retarget(this.selected);
       if (!this.stopped) await this.pipeline.flush();
     } finally {

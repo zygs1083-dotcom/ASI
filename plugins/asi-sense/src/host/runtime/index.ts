@@ -54,12 +54,14 @@ export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}
     changed,
     expiry,
     () => target.ensure(),
+    () => target.canEnsure(),
   );
   const listeners = createStateListeners();
   const body = new BodySource(ports.probe, ports.dsh, ports.storage, clock, attention, expiry, isPaused, changed);
-  const dsh = new DshSource(deliveryPort, clock, attention, body, isPaused, options.selfCauseGraceMs, (id) =>
-    target.unload(id),
-  );
+  const dsh = new DshSource(deliveryPort, clock, attention, body, isPaused, options.selfCauseGraceMs, (id) => {
+    target.unload(id);
+    attention.rescheduleDelivery();
+  });
   const target = createSessionTarget(
     ports.dsh,
     ports.storage,

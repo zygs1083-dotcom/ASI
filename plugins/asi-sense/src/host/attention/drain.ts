@@ -53,6 +53,7 @@ export class BucketDrain {
   private readonly wallClock: () => number;
   private readonly isCurrent: () => (sessionId: string) => boolean;
   private readonly isWakeOwner: (sessionId: string) => boolean;
+  private readonly isPendingTarget: (sessionId: string) => boolean;
   private seq = 0;
   private suppressedGroups = 0;
   constructor(hooks: DrainHooks) {
@@ -62,6 +63,7 @@ export class BucketDrain {
     this.wallClock = hooks.wallClock;
     this.isCurrent = hooks.isCurrent ?? (() => () => true);
     this.isWakeOwner = hooks.isWakeOwner ?? (() => false);
+    this.isPendingTarget = hooks.isPendingTarget ?? (() => false);
   }
   /** Cumulative count of wake groups suppressed by the budget. */
   get suppressed(): number {
@@ -92,7 +94,7 @@ export class BucketDrain {
   nextDeadline(): number | undefined {
     let min: number | undefined;
     for (const b of this.pending.values()) {
-      if (!this.eligible(b, this.isCurrent())) continue;
+      if (!this.eligible(b, this.isCurrent()) && (privateBucket(b) || !this.isPendingTarget(b.sessionId))) continue;
       if (b.jobs && !b.sealed && this.blockedJobs(b.sessionId, bucketLevel(b))) continue;
       if (min === undefined || b.deadline < min) min = b.deadline;
     }
@@ -220,6 +222,11 @@ export class BucketDrain {
     await this.attemptDue(now, errors, this.isCurrent());
     throwCollected(errors, 'delivery failed');
   }
+  async dueOwned(now: number): Promise<void> {
+    const errors: unknown[] = [];
+    await this.attemptDue(now, errors, this.isCurrent(), true);
+    throwCollected(errors, 'delivery failed');
+  }
   /**
    * Pre-step drain (DESIGN §2.3): the session's context ships FIRST — pure
    * context groups close early and context details split out of still-open
@@ -265,8 +272,14 @@ export class BucketDrain {
     throwCollected(errors, 'pre-step delivery failed');
   }
   /** Due buckets attempted independently; failures restore the sealed bucket for a same-payload retry. */
-  private async attemptDue(now: number, errors: unknown[], current: (id: string) => boolean): Promise<void> {
+  private async attemptDue(
+    now: number,
+    errors: unknown[],
+    current: (id: string) => boolean,
+    ownedOnly = false,
+  ): Promise<void> {
     for (const b of [...this.pending.values()]) {
+      if (ownedOnly && (!privateBucket(b) || bucketLevel(b) !== 'wake')) continue;
       if (!this.eligible(b, current)) continue;
       if (now < b.deadline) continue;
       if (b.jobs && !b.sealed && this.blockedJobs(b.sessionId, bucketLevel(b))) continue;

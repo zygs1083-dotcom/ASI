@@ -175,6 +175,7 @@ export function createSessionTarget(
         lazy = true;
       }
     },
+    canEnsure: () => active && !!selected && !applied && lazy,
     ensure(): Promise<void> {
       return enqueue(async () => {
         if (!active || !selected || applied || (!lazy && unavailable)) return;

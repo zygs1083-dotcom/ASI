@@ -13,6 +13,7 @@ export interface DrainHooks {
   wallClock: () => number;
   isCurrent?: () => (sessionId: string) => boolean;
   isWakeOwner?: (sessionId: string) => boolean;
+  isPendingTarget?: (sessionId: string) => boolean;
 }
 
 function throwCollected(errors: unknown[], label: string): void {

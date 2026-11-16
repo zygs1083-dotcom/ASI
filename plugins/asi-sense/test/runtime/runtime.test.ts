@@ -161,14 +161,79 @@ function harness(
 }
 
 describe('host runtime', () => {
-  it.each([false, true])(
-    'resolves an unloaded pinned owner before draining an already queued wake (recreated=%s)',
-    async (recreated) => {
+  it('retains an already queued wake while the only pinned agent temporarily fails to restore', async () => {
+    const h = harness();
+    let failing = true;
+    let attempts = 0;
+    h.ports.dsh.listSessions = async () => [{ id: 'b', title: '', updatedAt: 1, running: false }];
+    await h.runtime.start();
+    await h.agent({ type: 'created', sessionId: 'b' });
+    await h.agent({ type: 'pre-step', sessionId: 'b' });
+    await h.agent({ type: 'post-step', sessionId: 'b' });
+    await h.runtime.actions.selectTarget?.('b');
+    await h.file({ path: '/workspace/fixture', change: 'modify' });
+    await h.agent({ type: 'disposed', sessionId: 'b' });
+    h.ports.dsh.ensureSession = async (id) => {
+      attempts++;
+      if (failing) throw new Error('temporary failure');
+      await h.agent({ type: 'created', sessionId: id });
+    };
+    await h.advance(5_000);
+    expect(attempts).toBe(1);
+    expect(h.delivered).toEqual([]);
+    expect(h.runtime.target()).toMatchObject({ mode: 'pinned', sessionId: 'b', unavailable: true });
+    failing = false;
+    await h.advance(1_000);
+    expect(attempts).toBe(2);
+    await h.advance(1);
+    expect(h.delivered.map((intent) => [intent.sessionId, intent.kind])).toEqual([['b', 'followup']]);
+    await h.runtime.stop();
+  });
+
+  it('wakes an available owner even when restoring an unloaded pinned target is blocked', async () => {
+    const h = harness();
+    h.ports.dsh.listSessions = async () => ['a', 'b'].map((id) => ({ id, title: '', updatedAt: 1, running: false }));
+    let release = () => {};
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await h.runtime.start();
+    for (const sessionId of ['b', 'a']) {
+      await h.agent({ type: 'created', sessionId });
+      await h.agent({ type: 'pre-step', sessionId });
+      await h.agent({ type: 'post-step', sessionId });
+    }
+    await h.runtime.actions.selectTarget?.('b');
+    await h.agent({ type: 'disposed', sessionId: 'b' });
+    h.ports.dsh.ensureSession = async (id) => {
+      await gate;
+      await h.agent({ type: 'created', sessionId: id });
+    };
+    await h.jobRaw({ type: 'started', id: 'fixture-job', sessionId: 'a' });
+    await h.jobRaw({ type: 'exited', id: 'fixture-job', sessionId: 'a', exitCode: 1 });
+    try {
+      await h.advance(2_000);
+      expect(h.delivered.map((intent) => [intent.sessionId, intent.kind])).toEqual([['a', 'followup']]);
+    } finally {
+      release();
+      await vi.advanceTimersByTimeAsync(0);
+      await h.runtime.stop();
+    }
+  });
+
+  it.each([
+    { recreated: false, other: true },
+    { recreated: true, other: true },
+    { recreated: false, other: false },
+    { recreated: true, other: false },
+  ])(
+    'resolves an unloaded pinned owner before draining an already queued wake (recreated=$recreated other=$other)',
+    async ({ recreated, other }) => {
       const h = harness();
       let attempts = 0;
       h.ports.dsh.listSessions = async () => ['a', 'b'].map((id) => ({ id, title: '', updatedAt: 1, running: false }));
       await h.runtime.start();
-      for (const sessionId of ['b', 'a']) {
+      for (const sessionId of other ? ['b', 'a'] : ['b']) {
         await h.agent({ type: 'created', sessionId });
         await h.agent({ type: 'pre-step', sessionId });
         await h.agent({ type: 'post-step', sessionId });
