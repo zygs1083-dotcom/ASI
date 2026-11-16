@@ -21,6 +21,8 @@ function fixture() {
     acceptRebaseline: vi.fn(async () => ({ applied: true })),
     resumeTuning: vi.fn(async () => {}),
     resetTuning: vi.fn(async () => {}),
+    retryTuningBackup: vi.fn(async () => {}),
+    dismissTuningBackup: vi.fn(async () => {}),
   };
   const invalidate = vi.fn();
   const frames: FramesSource = Object.assign(async function* () {}, { invalidate });

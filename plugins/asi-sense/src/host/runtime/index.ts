@@ -220,6 +220,12 @@ export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}
       }),
     resumeTuning: () => body.asUser(() => body.tuner.resumeTuning()),
     resetTuning: () => body.asUser(() => body.tuner.resetTuning()),
+    retryTuningBackup: () =>
+      body.asUser(async () => {
+        await body.monitor.retryBackup();
+        body.sync();
+      }),
+    dismissTuningBackup: () => body.asUser(() => body.monitor.dismissBackup()),
   };
   const guarded = guardActions(unguarded, () => generation, check);
   const actions = guarded.actions;

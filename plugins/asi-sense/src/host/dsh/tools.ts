@@ -22,6 +22,16 @@ function bounded(args: unknown): void {
   }
 }
 
+function decodeAlertId(encoded: string): string {
+  if (!/^[A-Za-z0-9_-]{1,342}$/.test(encoded)) throw new ToolArgsError(['invalid alert id']);
+  const bytes = Buffer.from(encoded, 'base64url');
+  const id = bytes.toString('utf8');
+  if (bytes.length > 256 || bytes.toString('base64url') !== encoded || !Buffer.from(id, 'utf8').equals(bytes)) {
+    throw new ToolArgsError(['invalid alert id']);
+  }
+  return id;
+}
+
 export function createSenseTools(runtime: Runtime, now: () => number) {
   const envState = defineTool({
     name: 'env_state',
@@ -98,11 +108,15 @@ export function createSenseTools(runtime: Runtime, now: () => number) {
     description:
       'Adjust an allowed monitoring parameter within safety limits, or mark an alert useful or noise. Locked parameters cannot be changed.',
     parameters: {
-      param: { type: 'string' },
+      param: {
+        type: 'string',
+        description:
+          'Parameter key, including mergeWindowMs, fileMergeWindowMs or deliveryLevel.<body.rate|body.anomaly|file.burst>.',
+      },
       to: { oneOf: [{ type: 'number' }, { type: 'string' }, { type: 'boolean' }] },
       reason: { type: 'string' },
       action: { type: 'string', enum: ['feedback'] },
-      alertId: { type: 'string' },
+      alertId: { type: 'string', description: 'Alert id from an environment update with feedbackAvailable=true.' },
       verdict: { type: 'string', enum: ['useful', 'noise'] },
     },
     output,
@@ -112,7 +126,7 @@ export function createSenseTools(runtime: Runtime, now: () => number) {
       const request =
         args.action === 'feedback'
           ? args.alertId && args.verdict
-            ? { action: args.action, alertId: args.alertId, verdict: args.verdict }
+            ? { action: args.action, alertId: decodeAlertId(args.alertId), verdict: args.verdict }
             : undefined
           : args.param && args.to !== undefined
             ? { param: args.param, to: args.to, ...(args.reason === undefined ? {} : { reason: args.reason }) }

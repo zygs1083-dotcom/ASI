@@ -34,7 +34,7 @@ export interface GuardDeps {
  * actor; `user` (trusted sidebar only) may lock/unlock and bypasses the AI
  * guards — amplitude, tighten direction and budgets — with the sole
  * exception that a user REVERT may pass a lock. `agent`/`auto` are bound
- * by locks, ±50% amplitude vs the CURRENT value, tighten direction and
+ * by locks, amplitude vs the CURRENT value (±50%, or 0.5–2× for merge windows), tighten direction and
  * the monotonic budgets 2/param/hour, 6/param/day, 24 all-params/day.
  */
 export class TunerGuard {
@@ -96,6 +96,8 @@ export class TunerGuard {
       why = 'out of bounds';
     } else if (actor === undefined) why = 'untrusted actor';
     else if (this.store.locked.has(param) && !(actor === 'user' && operation === 'revert')) why = 'param locked';
+    else if (actor !== 'user' && param.startsWith('deliveryLevel.') && to === 'wake')
+      why = 'wake requires user approval';
     else if (actor !== 'user') why = this.aiGuard(param, spec, to, current as TuningValue, now, wall);
     const result = this.audit({
       param,
@@ -230,7 +232,9 @@ export class TunerGuard {
     if (!this.store.restored) return 'restore pending';
     if (this.store.disabled) return `tuning disabled: ${this.store.disabled}`;
     if (typeof to === 'number' && typeof current === 'number') {
-      if (current === 0 || Math.abs(to - current) > Math.abs(current) * 0.5) return 'exceeds ±50%';
+      if (param === 'mergeWindowMs' || param === 'fileMergeWindowMs') {
+        if (to < current * 0.5 || to > current * 2) return 'exceeds 0.5–2 times';
+      } else if (current === 0 || Math.abs(to - current) > Math.abs(current) * 0.5) return 'exceeds ±50%';
       if (spec.tighten === 'up' && to < current) return 'safety: cannot loosen';
       if (spec.tighten === 'down' && to > current) return 'safety: cannot loosen';
     }
