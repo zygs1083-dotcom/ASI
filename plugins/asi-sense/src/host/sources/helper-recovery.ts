@@ -17,7 +17,7 @@ export class HelperRecovery {
   }
 
   delta(event: Message): void {
-    if (!this.degraded || !this.waiting) return;
+    if (!this.waiting) return;
     if (event.type === 'thermal' && ['nominal', 'fair', 'serious', 'critical'].includes(String(event.state)))
       this.dirty.add('thermal');
     const appActivated = event.type === 'app.activated' && validApp(event);
@@ -87,6 +87,7 @@ export async function applyHelperEvent(
   attention: RuntimeAttention,
   body: BodySource,
   valid: () => boolean = () => true,
+  skip: ReadonlySet<string> = new Set(),
 ): Promise<boolean> {
   if (raw.type !== 'snapshot') recovery.delta(raw);
   if (raw.type === 'snapshot' && !Object.hasOwn(raw, 'frontApp') && !Object.hasOwn(raw, 'focusedWindow')) {
@@ -94,7 +95,7 @@ export async function applyHelperEvent(
       ['frontApp', 'env.frontApp'],
       ['focusedWindow', 'env.focusedWindow'],
     ] as const) {
-      if (recovery.degraded && recovery.dirty.has(field)) continue;
+      if (recovery.dirty.has(field) || skip.has(field)) continue;
       attention.store.apply({
         id: attention.id(),
         kind: 'fact.updated',
@@ -106,7 +107,14 @@ export async function applyHelperEvent(
     }
     attention.changed();
   }
-  await helperEvent(safe, attention, body, recovery.degraded, recovery.degraded ? recovery.dirty : undefined, valid);
+  await helperEvent(
+    safe,
+    attention,
+    body,
+    recovery.degraded,
+    raw.type === 'snapshot' ? new Set([...recovery.dirty, ...skip]) : undefined,
+    valid,
+  );
   if (!valid()) return false;
   if (!recovery.degraded || raw.type !== 'snapshot') return false;
   const missing = missingSnapshot(raw);

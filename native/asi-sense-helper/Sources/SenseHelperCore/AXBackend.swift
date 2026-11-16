@@ -11,6 +11,7 @@ public protocol AXBackend {
   func add(observer: Observer, element: Element, notification: String) -> AXError
   func remove(observer: Observer, element: Element, notification: String)
   func focusedWindow(_ app: Element) -> (AXError, Element?)
+  func windowCount(_ app: Element) -> (AXError, Int?)
   func title(_ window: Element) -> (AXError, String?)
   func equal(_ lhs: Element, _ rhs: Element) -> Bool
   func equalObserver(_ lhs: Observer, _ rhs: Observer) -> Bool
@@ -23,6 +24,7 @@ public struct AXObserverCreateError: Error {
 }
 
 public extension AXBackend {
+  func windowCount(_ app: Element) -> (AXError, Int?) { (.notImplemented, nil) }
   // AX supplies the source string; bound downstream work on the AX queue
   // before it reaches events, the debouncer or the main-thread encoder.
   static var sourceTitleLimit: Int { 1024 }
@@ -76,6 +78,13 @@ public final class SystemAXBackend: AXBackend {
     let window = value as! AXUIElement
     AXUIElementSetMessagingTimeout(window, Self.ipcTimeout)
     return (.success, window)
+  }
+  public func windowCount(_ app: AXUIElement) -> (AXError, Int?) {
+    var value: CFTypeRef?
+    let err = AXUIElementCopyAttributeValue(app, kAXWindowsAttribute as CFString, &value)
+    guard err == .success, let value, CFGetTypeID(value) == CFArrayGetTypeID(),
+          let windows = value as? [AXUIElement] else { return (err, nil) }
+    return (.success, windows.count)
   }
   public func title(_ window: AXUIElement) -> (AXError, String?) {
     var value: CFTypeRef?

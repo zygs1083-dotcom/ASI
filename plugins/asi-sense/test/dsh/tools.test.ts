@@ -34,7 +34,7 @@ async function fixture() {
   const live = createSenseRuntime(ports, { platform: 'linux' });
   await live.start();
   const state = new StateStore(() => 990).snapshot();
-  state.env.frontApp.value = { name: 'Fixture App', bundleId: 'org.fixture.app' };
+  state.env.frontApp.value = { name: 'Fixture App', bundleId: 'org.fixture.app', pid: 123, windowCount: 2 };
   state.env.frontApp.status = 'ok';
   state.env.focusedWindow.value = { title: 'Synthetic title' };
   state.env.focusedWindow.status = 'ok';
@@ -129,10 +129,10 @@ describe('model-facing tools', () => {
       isError: false,
       value: {
         current: true,
-        app: { value: { name: 'Fixture App', bundleId: 'org.fixture.app' } },
+        app: { value: { name: 'Fixture App', bundleId: 'org.fixture.app', pid: 123, windowCount: 2 } },
         window: { value: { title: 'Synthetic title' } },
-        pid: { value: null, status: 'unknown' },
-        windowCount: { value: null, status: 'unknown' },
+        pid: { value: 123, status: 'ok' },
+        windowCount: { value: 2, status: 'ok' },
         recentEvents: [{ kind: 'window.focused' }],
         sources: { helper: { status: 'ok' } },
         guidance: '如需查看窗口内容，请使用当前会话可用的 computer-use 工具（需经其授权流程）',
@@ -140,12 +140,34 @@ describe('model-facing tools', () => {
     });
     expect(await h.call('env_detail', { app: 'not-current' })).toMatchObject({
       isError: false,
-      value: { match: 'not-current', app: null, window: null, recentEvents: [] },
+      value: {
+        match: 'not-current',
+        app: null,
+        window: null,
+        recentEvents: [],
+        pid: { value: null, status: 'unknown' },
+        windowCount: { value: null, status: 'unknown' },
+      },
     });
     h.setTitles(false);
     const hidden = await h.call('env_detail', { window: 'Synthetic title' });
     expect(hidden).toMatchObject({ isError: false, value: { match: 'unknown', window: { value: null } } });
     expect(JSON.stringify(hidden.value)).not.toContain('Synthetic title');
+  });
+
+  it('distinguishes denied and stale foreground details without inventing a count', async () => {
+    const h = await fixture();
+    h.state.env.frontApp.value = { name: 'Fixture App', bundleId: 'org.fixture.app', pid: 123 };
+    h.state.observation.sources['helper.ax'] = { status: 'denied', lastSignalAt: 990 };
+    expect(await h.call('env_detail', {})).toMatchObject({
+      value: { pid: { value: 123, status: 'ok' }, windowCount: { value: null, status: 'denied' } },
+    });
+    h.state.env.frontApp.value.windowCount = 0;
+    h.state.env.frontApp.status = 'stale';
+    h.state.observation.sources['helper.ax'].status = 'ok';
+    expect(await h.call('env_detail', {})).toMatchObject({
+      value: { pid: { value: 123, status: 'stale' }, windowCount: { value: 0, status: 'stale' } },
+    });
   });
 
   it('proposes wake rules as an agent, does not remove user rules, and respects cancellation', async () => {

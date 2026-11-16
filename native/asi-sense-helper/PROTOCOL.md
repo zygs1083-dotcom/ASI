@@ -34,9 +34,11 @@ event (`code:"thermal-state"`) is emitted instead of an invented state.
 
 ### `snapshot` response
 
-`{frontApp:{name,bundleId,pid}, focusedWindow:{pid,bundleId,status,title?}, thermal, permissions}`
+`{frontApp:{name,bundleId,pid,windowCount?}, focusedWindow:{pid,bundleId,status,title?}, thermal, permissions}`
 
 - `frontApp`/`focusedWindow`: omitted when no front app exists.
+- `frontApp.windowCount`: non-negative count from the app's AX windows attribute;
+  omitted when permission, attachment, or the attribute read is unavailable.
 - `focusedWindow.status`: `ok` (attached observer and a focused window was read), `denied` (no
   Accessibility trust), `unsupported` (the app rejected AX observation),
   `unknown` (trusted but no attached observer or focused window;

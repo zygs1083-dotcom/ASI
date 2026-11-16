@@ -142,18 +142,21 @@ final class HelperRuntime {
       pid = app.processIdentifier; bid = app.bundleIdentifier ?? ""
       frontApp = .init(name: app.localizedName ?? "", bundleId: bid, pid: pid)
     }
-    let finish = { (status: String, title: String?) in
+    let finish = { (status: String, title: String?, count: Int?) in
       let fw = frontApp.map {
         SnapshotEvent.FocusedWindow(pid: $0.pid, bundleId: $0.bundleId, status: status, title: title)
       }
+      let observedApp = frontApp.map {
+        SnapshotEvent.FrontApp(name: $0.name, bundleId: $0.bundleId, pid: $0.pid, windowCount: count)
+      }
       let thermal = Self.thermalString(ProcessInfo.processInfo.thermalState) ?? "unknown"
       if thermal == "unknown" { self.channel.emitError("thermal-state", "unrecognized thermal state") }
-      self.emit(SnapshotEvent(at: nowMs(), frontApp: frontApp, focusedWindow: fw,
+      self.emit(SnapshotEvent(at: nowMs(), frontApp: observedApp, focusedWindow: fw,
                               thermal: thermal, permissions: .init(accessibility: permissionState())))
       done()
     }
-    guard frontApp != nil else { finish("unknown", nil); return }
-    session.snapshot(pid: pid, bundleId: bid) { status, title in finish(status, title) }
+    guard frontApp != nil else { finish("unknown", nil, nil); return }
+    session.snapshotDetail(pid: pid, bundleId: bid) { status, title, count in finish(status, title, count) }
   }
   func shutdown(exitCode: Int32, drainAll: Bool = false) {
     guard !stopping else { return }

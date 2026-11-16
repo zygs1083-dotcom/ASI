@@ -11,6 +11,7 @@ private final class FakeAX: AXBackend {
   var addOnce: [String: AXError] = [:] // consumed on the first matching add
   var adds: [(Int, String)] = [], removes: [(Int, String)] = []
   var detachCount = 0, fwCalls = 0, titleCalls = 0
+  var counts: [Int32: Int] = [:], countCalls = 0
   var fwApps: [Int] = [] // app element id per focusedWindow call
   var observers: [Obs] = [], started: [Obs] = [], detached: [Obs] = []
   var fwEntered: DispatchSemaphore?, fwRelease: DispatchSemaphore?
@@ -45,6 +46,10 @@ private final class FakeAX: AXBackend {
     if let e = errors["title:\(window.id)"] { return (e, nil) }
     if let o = titleOnce.removeValue(forKey: window.id) { return (.success, o) }
     return (.success, titles[window.id])
+  }
+  func windowCount(_ app: El) -> (AXError, Int?) {
+    countCalls += 1
+    return (.success, counts[Int32(-app.id)])
   }
   func equal(_ a: El, _ b: El) -> Bool { a.id == b.id }
   func equalObserver(_ a: Obs, _ b: Obs) -> Bool { a === b }
@@ -110,6 +115,21 @@ final class AXSessionTests: XCTestCase {
     let s = DispatchSemaphore(value: 0)
     axQ.async { s.wait() }
     return { s.signal() }
+  }
+
+  func testSnapshotCountsWindowsOnlyWhenTrusted() {
+    makeSession(titles: false)
+    fake.counts[7] = 3
+    attach(7, win: 1)
+    var count: Int?
+    session.snapshotDetail(pid: 7, bundleId: "b.x") { _, _, c in count = c }; drain()
+    XCTAssertEqual(count, 3)
+    XCTAssertEqual(fake.countCalls, 1)
+    trusted = false
+    count = 99
+    session.snapshotDetail(pid: 7, bundleId: "b.x") { _, _, c in count = c }; drain()
+    XCTAssertNil(count)
+    XCTAssertEqual(fake.countCalls, 1)
   }
 
   func testOptionalMainUnsupportedStillEmitsFocusedAndTitle() {

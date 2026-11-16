@@ -60,6 +60,18 @@ export function environmentDetail(runtime: Runtime, app?: string, window?: strin
   const matchesWindow = window === undefined ? true : title === undefined ? null : title === window;
   const available = matchesApp === true && matchesWindow === true;
   const mismatch = matchesApp === false || matchesWindow === false;
+  const axStatus = observation.sources['helper.ax']?.status;
+  const countDenied = axStatus === 'denied' || axStatus === 'unsupported';
+  const pid =
+    available && front?.pid !== undefined
+      ? { value: front.pid, status: env.frontApp.status }
+      : { value: null, status: 'unknown' };
+  const windowCount =
+    available && countDenied
+      ? { value: null, status: axStatus }
+      : available && front?.windowCount !== undefined
+        ? { value: front.windowCount, status: env.frontApp.status }
+        : { value: null, status: 'unknown' };
   const events = available
     ? runtime
         .events()
@@ -72,8 +84,8 @@ export function environmentDetail(runtime: Runtime, app?: string, window?: strin
     match: mismatch ? 'not-current' : available ? 'current' : 'unknown',
     app: mismatch ? null : env.frontApp,
     window: mismatch ? null : env.focusedWindow,
-    pid: { value: null, status: 'unknown' },
-    windowCount: { value: null, status: 'unknown' },
+    pid,
+    windowCount,
     recentEvents: events,
     sources: observation.sources,
     guidance: '如需查看窗口内容，请使用当前会话可用的 computer-use 工具（需经其授权流程）',

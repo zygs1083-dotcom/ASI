@@ -27,6 +27,7 @@ export class HelperSource {
   private readonly children = new Map<ChildProcessWithoutNullStreams, { done: Promise<void>; killAt?: number }>();
   private readonly writer = new HelperWriter((child) => this.fail('stdin-error', child));
   private recovery = new HelperRecovery();
+  private metadataSnapshot = false;
   private lastFailure?: string;
   constructor(
     private readonly spawner: HelperSpawner,
@@ -196,6 +197,7 @@ export class HelperSource {
       this.recovery.delta(raw);
       const permissions = object(raw.permissions);
       await axStatus(this.attention, permissions?.accessibility === 'granted' ? 'ok' : 'denied', raw.at as number);
+      if (!first && valid() && !this.paused()) this.requestSnapshot(true);
       return;
     }
     if (!this.session) throw new Error('missing hello');
@@ -233,6 +235,7 @@ export class HelperSource {
       return;
     }
     if (this.paused()) return;
+    let skip: Set<string> | undefined;
     if (raw.type === 'snapshot') {
       this.recovery.waiting = false;
       if (this.recovery.obsolete) {
@@ -240,15 +243,36 @@ export class HelperSource {
         this.requestSnapshot();
         return;
       }
+      if (this.metadataSnapshot && !this.recovery.degraded) {
+        skip = new Set(['focusedWindow', 'thermal']);
+        const previous = this.attention.state().env.frontApp.value;
+        const app = object(raw.frontApp);
+        if (
+          !previous ||
+          !app ||
+          app.bundleId !== previous.bundleId ||
+          (previous.pid !== undefined && app.pid !== previous.pid)
+        )
+          skip.add('frontApp');
+      }
+      this.metadataSnapshot = false;
     }
     const safe = (this.titles ? raw : strip(raw)) as Message;
-    const recovered = await applyHelperEvent(recovery, raw, safe, this.attention, this.body, valid);
+    const recovered = await applyHelperEvent(recovery, raw, safe, this.attention, this.body, valid, skip);
     if (!valid()) return;
     if (recovered) {
       this.snapshots.reset();
       await this.status('ok', 'snapshot');
     } else if (raw.type === 'snapshot' && this.recovery.degraded) this.snapshots.failed(this.clock.mono());
     else if (this.recovery.degraded && !this.recovery.waiting && this.snapshots.delta(raw)) this.requestSnapshot();
+    if (
+      !this.intent &&
+      !this.recovery.degraded &&
+      (raw.type === 'app.activated' ||
+        raw.type === 'window.focused' ||
+        (raw.type === 'snapshot' && this.recovery.dirty.size > 0))
+    )
+      this.requestSnapshot(true);
     this.reschedule();
   }
   private async status(status: 'ok' | 'unavailable' | 'error', reason: string): Promise<void> {
@@ -264,8 +288,9 @@ export class HelperSource {
     this.writer.write({ cmd: 'titles', ...intent });
     this.reschedule();
   }
-  private requestSnapshot(): void {
+  private requestSnapshot(metadataOnly = false): void {
     if (!this.recovery.request()) return;
+    this.metadataSnapshot = metadataOnly;
     this.writer.write({ cmd: 'snapshot' });
   }
   private fail(reason: string, expected = this.child): void {

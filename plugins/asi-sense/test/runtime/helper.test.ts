@@ -162,6 +162,58 @@ function setup(autoAck = true, stubborn = false, holdWrites = false) {
 afterEach(() => vi.useRealTimers());
 
 describe('helper protocol integration', () => {
+  it('passes foreground pid and snapshot window count through to state', async () => {
+    const h = setup();
+    await h.runtime.start();
+    await h.settle();
+    const child = h.children[0];
+    if (!child) throw new Error('missing helper');
+    child.snapshotReply = false;
+    child.send({
+      type: 'snapshot',
+      frontApp: { name: 'Fixture', bundleId: 'fixture.app', pid: 42, windowCount: 3 },
+      focusedWindow: { status: 'ok', pid: 42 },
+      thermal: 'nominal',
+    });
+    await h.settle();
+    expect(h.runtime.state().env.frontApp.value).toEqual({
+      name: 'Fixture',
+      bundleId: 'fixture.app',
+      pid: 42,
+      windowCount: 3,
+    });
+    await h.runtime.stop();
+  });
+
+  it('discards an old metadata snapshot when foreground activation changes in flight', async () => {
+    const h = setup();
+    await h.runtime.start();
+    await h.settle();
+    const child = h.children[0];
+    if (!child) throw new Error('missing helper');
+    child.snapshotReply = false;
+    child.send({ type: 'app.activated', name: 'A', bundleId: 'a', pid: 1 });
+    await h.settle();
+    child.send({ type: 'app.activated', name: 'B', bundleId: 'b', pid: 2 });
+    child.send({
+      type: 'snapshot',
+      frontApp: { name: 'A', bundleId: 'a', pid: 1, windowCount: 9 },
+      focusedWindow: { status: 'ok', pid: 1 },
+      thermal: 'nominal',
+    });
+    await h.settle();
+    expect(h.runtime.state().env.frontApp.value).toEqual({ name: 'B', bundleId: 'b', pid: 2 });
+    child.send({
+      type: 'snapshot',
+      frontApp: { name: 'B', bundleId: 'b', pid: 2, windowCount: 0 },
+      focusedWindow: { status: 'ok', pid: 2 },
+      thermal: 'nominal',
+    });
+    await h.settle();
+    expect(h.runtime.state().env.frontApp.value).toEqual({ name: 'B', bundleId: 'b', pid: 2, windowCount: 0 });
+    await h.runtime.stop();
+  });
+
   it('restarts three times and emits one context after exceeding the restart limit', async () => {
     const h = setup();
     await h.runtime.start();
@@ -176,7 +228,7 @@ describe('helper protocol integration', () => {
       await h.settle();
     }
     expect(h.children).toHaveLength(4);
-    expect(h.runtime.state().env.frontApp.value).toEqual({ name: 'ExampleApp', bundleId: 'example.app' });
+    expect(h.runtime.state().env.frontApp.value).toEqual({ name: 'ExampleApp', bundleId: 'example.app', pid: 123 });
     for (const delay of [2000, 4000]) {
       h.children.at(-1)?.crash();
       await h.advance(delay);
@@ -407,7 +459,7 @@ describe('helper protocol integration', () => {
     });
     await h.settle();
     expect(h.runtime.state().self.body.thermal).toMatchObject({ status: 'ok', value: 'critical' });
-    expect(h.runtime.state().env.frontApp.value).toEqual({ name: 'NewApp', bundleId: 'new.app' });
+    expect(h.runtime.state().env.frontApp.value).toEqual({ name: 'NewApp', bundleId: 'new.app', pid: 234 });
     expect(h.runtime.state().env.focusedWindow.value).toBeNull();
     expect(h.runtime.state().observation.sources.helper?.status).toBe('ok');
     await h.runtime.stop();
@@ -654,7 +706,7 @@ describe('helper protocol integration', () => {
       thermal: 'critical',
     });
     await h.settle();
-    expect(h.runtime.state().env.frontApp.value).toEqual({ name: 'ExampleApp', bundleId: 'example.app' });
+    expect(h.runtime.state().env.frontApp.value).toEqual({ name: 'ExampleApp', bundleId: 'example.app', pid: 123 });
     expect(h.runtime.state().env.focusedWindow).toMatchObject({ status: 'unknown', value: null });
     await h.runtime.stop();
   });

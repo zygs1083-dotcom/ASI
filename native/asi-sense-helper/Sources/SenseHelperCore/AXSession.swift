@@ -274,9 +274,14 @@ public final class AXSession<B: AXBackend> {
   // read and yields no title.
   public func snapshot(pid p: Int32, bundleId b: String,
                        completion: @escaping (_ status: String, _ title: String?) -> Void) {
+    snapshotDetail(pid: p, bundleId: b) { status, title, _ in completion(status, title) }
+  }
+  public func snapshotDetail(pid p: Int32, bundleId b: String,
+                             completion: @escaping (_ status: String, _ title: String?, _ count: Int?) -> Void) {
     let snap = stampNow()
     axQueue.async {
       var status = "unknown", title: String? = nil
+      var count: Int? = nil
       let k = b.isEmpty ? "pid:\(p)" : b
       let c = self.control.get()
       if c.appGen == snap.app, c.winGen == snap.win {
@@ -286,7 +291,15 @@ public final class AXSession<B: AXBackend> {
         // unknown rather than fabricating ok from a direct one-off read.
         else if self.observer == nil || self.pid != p { status = "unknown" }
         else {
-          let (err, win) = self.backend.focusedWindow(self.backend.application(pid: p))
+          let app = self.backend.application(pid: p)
+          let (countErr, observedCount) = self.backend.windowCount(app)
+          if countErr == .success, let observedCount, observedCount >= 0,
+             self.control.get().appGen == snap.app, self.isTrusted() { count = observedCount }
+          guard self.control.get().appGen == snap.app, self.isTrusted() else {
+            self.toMain { completion("unknown", nil, nil) }
+            return
+          }
+          let (err, win) = self.backend.focusedWindow(app)
           let c1 = self.control.get()
           if c1.appGen == snap.app {
             self.classifyRead(err, Self.focusedNotification, stamp: snap,
@@ -308,7 +321,8 @@ public final class AXSession<B: AXBackend> {
       self.toMain { [gen = self.control] in
         let c = gen.get()
         let valid = c.appGen == snap.app && c.winGen == snap.win
-        completion(valid ? status : "unknown", valid && c.privGen == snap.priv ? title : nil)
+        completion(valid ? status : "unknown", valid && c.privGen == snap.priv ? title : nil,
+                   valid && self.isTrusted() ? count : nil)
       }
     }
   }
