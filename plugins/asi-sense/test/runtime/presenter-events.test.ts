@@ -17,7 +17,7 @@ it('redacts old and new window events when title sharing is disabled', async () 
     () => {},
     () => titles,
     vi.fn(),
-    new FactExpiry({ wall: () => 100, mono: () => 0 }),
+    new FactExpiry({ mono: () => 0 }),
   );
   await attention.accept({
     id: 'a',
