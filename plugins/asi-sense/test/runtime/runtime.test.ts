@@ -1,9 +1,13 @@
 import { createHash } from 'node:crypto';
+import * as fs from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import type { Body } from '@asi/sense-types';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { DeliveryFailure } from '../../src/host/attention/drain.ts';
 import { DEFAULT_RULES } from '../../src/host/attention/rules.ts';
 import { defaultBodyRules } from '../../src/host/body/index.ts';
+import { FileStoragePort } from '../../src/host/dsh/storage.ts';
 import { createPresenter } from '../../src/host/presenter/index.ts';
 import { createSenseRuntime } from '../../src/host/runtime/index.ts';
 import type {
@@ -1463,6 +1467,44 @@ describe('host runtime', () => {
     await h.runtime.stop();
   });
 
+  it.each(['context', 'record'] as const)(
+    'emits one context ETA warning at the ten-minute boundary when rate delivery is %s',
+    async (level) => {
+      const h = harness();
+      await h.runtime.start();
+      if (level === 'record') await h.runtime.tools.bodyTune({ param: 'deliveryLevel.body.rate', to: 'record' });
+      await h.agent({ type: 'created', sessionId: 's' });
+      const sample = async (minute: number) => {
+        h.token({
+          contextWindow: 25_000,
+          contextUsed: 4_000 + 1_000 * minute,
+          contextWindowSource: 'configured',
+          sessionUsage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        });
+        await h.agent({ type: 'pre-step', sessionId: 's' });
+        await h.sample();
+        await h.agent({ type: 'post-step', sessionId: 's' });
+      };
+      await sample(0);
+      for (let minute = 1; minute <= 11; minute++) {
+        await h.advance(60_000);
+        await sample(minute);
+      }
+      await h.agent({ type: 'pre-step', sessionId: 's' });
+      const warnings = h.runtime
+        .events()
+        .filter((event) => event.kind === 'body.rate' && event.subject.includes('context'));
+      expect(warnings).toHaveLength(1);
+      expect(warnings[0].level).toBe('context');
+      const changes = h.delivered
+        .flatMap((intent) => intent.update.changes)
+        .filter((change) => change.signal.kind === 'body.rate' && change.signal.subject.includes('context'));
+      expect(changes).toHaveLength(1);
+      expect(changes[0].level).toBe('context');
+      await h.runtime.stop();
+    },
+  );
+
   it('applies, guards and reverts merge windows and delivery levels', async () => {
     const h = harness();
     await h.runtime.start();
@@ -1566,6 +1608,181 @@ describe('host runtime', () => {
     await restarted.runtime.actions.revertTuning(applied.change.id);
     expect(restarted.runtime.body.tuner.get('mergeWindowMs')).toBe(2_000);
     await restarted.runtime.stop();
+  });
+
+  it.each([false, true])(
+    'migrates a legacy ETA below the new floor (history only: %s) without losing state',
+    async (historyOnly) => {
+      let saved: string | undefined;
+      const storage = {
+        load: async (key: string) => (key === 'body' ? saved : undefined),
+        save: async (key: string, value: string) => {
+          if (key === 'body') saved = value;
+        },
+      };
+      const first = harness();
+      Object.assign(first.ports.storage, storage);
+      await first.runtime.start();
+      await first.sample(
+        mkBody({ cpu: { ...f({ usage: 0.42, perCore: [], load1: 0, load5: 0, load15: 0 }), observedAt: Date.now() } }),
+      );
+      await first.runtime.tools.bodyTune({ param: 'rate.rss.maxRatio', to: 0.6 });
+      await first.runtime.tools.bodyTune({ param: 'rate.rss.maxRatio', to: 0.7 });
+      await first.runtime.actions.lockParam('floor.disk.warn', true);
+      await first.runtime.stop();
+      if (!saved) throw new Error('missing snapshot');
+      const legacy = JSON.parse(saved);
+      const tuner = JSON.parse(legacy.tuner);
+      legacy.version = 1;
+      tuner.values = tuner.values.filter(
+        ([key]: [string, unknown]) =>
+          key !== 'mergeWindowMs' && key !== 'fileMergeWindowMs' && !key.startsWith('deliveryLevel.'),
+      );
+      const entry = (from: number, to: number) => ({
+        id: `${tuner.idPrefix}-${tuner.nextId++}`,
+        param: 'rate.context.maxEtaMs',
+        from,
+        to,
+        by: 'user',
+        reason: 'legacy user change',
+        at: Date.now(),
+        operation: 'propose',
+        status: 'applied',
+      });
+      const history = [entry(600_000, 300_000), ...(historyOnly ? [entry(300_000, 600_000)] : [])];
+      tuner.log.push(...history);
+      tuner.applied.push(...history);
+      tuner.values.find(([key]: [string, unknown]) => key === 'rate.context.maxEtaMs')[1] = historyOnly
+        ? 600_000
+        : 300_000;
+      legacy.tuner = JSON.stringify(tuner);
+      saved = JSON.stringify(legacy);
+      const restored = harness();
+      Object.assign(restored.ports.storage, storage);
+      await restored.runtime.start();
+      expect(restored.runtime.body.tuner.tuningDisabled).toBeUndefined();
+      expect(restored.runtime.body.tuner.get('rate.context.maxEtaMs')).toBe(600_000);
+      expect(restored.runtime.body.tuner.get('rate.rss.maxRatio')).toBe(0.7);
+      expect(restored.runtime.body.tuner.logs).toEqual(expect.arrayContaining(history));
+      const floorChanges = restored.runtime.body.tuner.logs.filter((entry) => entry.reason === '新版底线');
+      expect(floorChanges).toHaveLength(historyOnly ? 0 : 1);
+      if (!historyOnly) {
+        expect(floorChanges[0]).toMatchObject({ from: 300_000, to: 600_000, by: 'auto', status: 'applied' });
+        expect(restored.runtime.body.tuner.undoableChanges).not.toEqual(
+          expect.arrayContaining([expect.objectContaining({ id: floorChanges[0].id })]),
+        );
+        expect(await restored.runtime.actions.revertTuning(floorChanges[0].id)).toMatchObject({
+          applied: false,
+          reason: 'out of bounds',
+        });
+      }
+      expect(await restored.runtime.tools.bodyTune({ param: 'rate.rss.maxRatio', to: 0.8 })).toMatchObject({
+        reason: 'hourly change limit',
+      });
+      expect(await restored.runtime.tools.bodyTune({ param: 'floor.disk.warn', to: 0.11 })).toMatchObject({
+        reason: 'param locked',
+      });
+      await restored.runtime.stop();
+      if (!saved) throw new Error('missing migrated snapshot');
+      const migrated = JSON.parse(saved);
+      const migratedTuner = JSON.parse(migrated.tuner);
+      expect(migrated.baseline).toBe(legacy.baseline);
+      expect(migrated.history).toEqual(legacy.history);
+      expect(migrated.latch).toEqual(legacy.latch);
+      for (const [key, value] of tuner.values) {
+        expect(migratedTuner.values.find(([name]: [string, unknown]) => name === key)?.[1]).toBe(
+          key === 'rate.context.maxEtaMs' ? 600_000 : value,
+        );
+      }
+      expect(migratedTuner.locked).toEqual(tuner.locked);
+      expect(migratedTuner.log.slice(0, tuner.log.length)).toEqual(tuner.log);
+      expect(migratedTuner.applied.slice(0, tuner.applied.length)).toEqual(tuner.applied);
+      expect(migratedTuner.hour).toEqual(tuner.hour);
+      expect(migratedTuner.day).toEqual(tuner.day);
+      expect(migratedTuner.dayAll).toEqual(tuner.dayAll);
+      const restarted = harness();
+      Object.assign(restarted.ports.storage, storage);
+      await restarted.runtime.start();
+      expect(restarted.runtime.body.tuner.tuningDisabled).toBeUndefined();
+      expect(restarted.runtime.body.tuner.logs).toEqual(expect.arrayContaining(history));
+      expect(restarted.runtime.body.tuner.logs.filter((entry) => entry.reason === '新版底线')).toHaveLength(
+        historyOnly ? 0 : 1,
+      );
+      expect(restarted.runtime.body.tuner.get('rate.rss.maxRatio')).toBe(0.7);
+      await restarted.runtime.stop();
+    },
+  );
+
+  it('backs up an unrecognized v1 snapshot before falling back to safe defaults', async () => {
+    const root = await fs.mkdtemp(join(tmpdir(), 'asi-tuning-backup-'));
+    try {
+      const reportBackup = vi.fn();
+      const storage = new FileStoragePort(root, fs, () => {}, reportBackup);
+      const first = harness();
+      Object.assign(first.ports.storage, {
+        load: storage.load.bind(storage),
+        save: storage.save.bind(storage),
+        backup: (...args: [string, string]) => storage.backup(...args),
+      });
+      await first.runtime.start();
+      await first.runtime.tools.bodyTune({ param: 'rate.rss.maxRatio', to: 0.6 });
+      await first.runtime.stop();
+      const snapshot = JSON.parse((await storage.load('body')) as string);
+      snapshot.version = 1;
+      const original = JSON.stringify(snapshot);
+      await storage.save('body', original);
+      const restored = harness();
+      Object.assign(restored.ports.storage, first.ports.storage);
+      await restored.runtime.start();
+      expect(restored.runtime.body.tuner.tuningDisabled).toBe('restore-failed');
+      expect(restored.runtime.body.tuner.get('rate.rss.maxRatio')).toBe(0.5);
+      expect(restored.runtime.body.tuner.get('deliveryLevel.file.burst')).toBe('context');
+      const presenter = createPresenter(restored.runtime, { clock: restored.ports.clock });
+      expect(presenter.snapshot().tuning.disabled).toEqual({ reason: 'restore-failed' });
+      presenter.close();
+      const backups = (await fs.readdir(root)).filter((name) => name.startsWith('body.json.bak-'));
+      expect(backups).toHaveLength(1);
+      expect(await fs.readFile(join(root, backups[0]), 'utf8')).toBe(original);
+      expect((await fs.stat(join(root, backups[0]))).mode & 0o777).toBe(0o600);
+      expect(reportBackup).toHaveBeenCalledOnce();
+      await restored.runtime.stop();
+      const restarted = harness();
+      Object.assign(restarted.ports.storage, first.ports.storage);
+      await restarted.runtime.start();
+      expect(restarted.runtime.body.tuner.tuningDisabled).toBe('restore-failed');
+      expect((await fs.readdir(root)).filter((name) => name.startsWith('body.json.bak-'))).toHaveLength(1);
+      expect(reportBackup).toHaveBeenCalledOnce();
+      await restarted.runtime.actions.resetTuning();
+      expect(restarted.runtime.body.tuner.tuningDisabled).toBeUndefined();
+      await restarted.runtime.stop();
+      const reset = harness();
+      Object.assign(reset.ports.storage, first.ports.storage);
+      await reset.runtime.start();
+      expect(reset.runtime.body.tuner.tuningDisabled).toBeUndefined();
+      await reset.runtime.stop();
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('never overwrites an unrecognized snapshot when its backup fails', async () => {
+    let saved = '{"version":99}';
+    const original = saved;
+    const h = harness();
+    Object.assign(h.ports.storage, {
+      load: async (key: string) => (key === 'body' ? saved : undefined),
+      save: async (key: string, value: string) => {
+        if (key === 'body') saved = value;
+      },
+      backup: async () => {
+        throw new Error('backup failed');
+      },
+    });
+    await h.runtime.start();
+    expect(h.runtime.body.tuner.tuningDisabled).toBe('restore-failed');
+    await expect(h.runtime.actions.resetTuning()).rejects.toThrow();
+    await h.runtime.stop();
+    expect(saved).toBe(original);
   });
 
   it('fails closed for incomplete legacy and partially migrated tuning snapshots', async () => {

@@ -9,6 +9,7 @@
 export interface BodyPersistence {
   load(): Promise<string | undefined>;
   save(data: string): Promise<void>;
+  onRestoreFailure?(): Promise<void>;
 }
 
 /**

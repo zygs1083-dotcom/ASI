@@ -3,7 +3,7 @@ import { join } from 'node:path';
 import type { StoragePort } from '../runtime/ports.ts';
 
 interface StorageFile {
-  writeFile(value: string): Promise<void>;
+  writeFile(value: string | Uint8Array): Promise<void>;
   sync(): Promise<void>;
   close(): Promise<void>;
 }
@@ -11,6 +11,7 @@ interface StorageFile {
 export interface StorageFileSystem {
   mkdir(path: string, options: { recursive: true; mode: number }): Promise<unknown>;
   open(path: string, flags: 'r' | 'wx', mode?: number): Promise<StorageFile>;
+  readFile(path: string): Promise<Uint8Array>;
   readFile(path: string, encoding: 'utf8'): Promise<string>;
   rename(from: string, to: string): Promise<void>;
   unlink(path: string): Promise<void>;
@@ -27,6 +28,7 @@ export class FileStoragePort implements StoragePort {
     private readonly root: string,
     private readonly fs: StorageFileSystem,
     private readonly warn: () => void,
+    private readonly backupNotice: () => void = () => {},
   ) {}
 
   private path(key: string): string {
@@ -47,6 +49,41 @@ export class FileStoragePort implements StoragePort {
 
   save(key: string, json: string): Promise<void> {
     const write = this.tail.then(() => this.commit(key, json));
+    this.tail = write.catch(() => undefined);
+    return write;
+  }
+
+  backup(key: string, original: string): Promise<void> {
+    const write = this.tail.then(async () => {
+      const target = this.path(key);
+      const bytes = await this.fs.readFile(target);
+      if (Buffer.from(bytes).toString('utf8') !== original) throw new Error('storage snapshot changed before backup');
+      const path = `${target}.bak-${Date.now()}-${randomUUID()}`;
+      let handle: StorageFile | undefined;
+      let created = false;
+      let complete = false;
+      try {
+        handle = await this.fs.open(path, 'wx', 0o600);
+        created = true;
+        await handle.writeFile(bytes);
+        await handle.sync();
+        await handle.close();
+        handle = undefined;
+        const directory = await this.fs.open(this.root, 'r');
+        try {
+          await directory.sync();
+        } finally {
+          await directory.close();
+        }
+        complete = true;
+        await Promise.resolve()
+          .then(() => this.backupNotice())
+          .catch(() => undefined);
+      } finally {
+        if (handle) await handle.close().catch(() => {});
+        if (created && !complete) await this.fs.unlink(path).catch(() => {});
+      }
+    });
     this.tail = write.catch(() => undefined);
     return write;
   }

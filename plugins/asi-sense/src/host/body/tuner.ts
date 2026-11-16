@@ -101,7 +101,17 @@ export class Tuner {
 
   get undoableChanges(): TuningLog[] {
     return this.store.applied
-      .filter((entry) => this.store.lastApplied.get(entry.param) === entry.id)
+      .filter((entry) => {
+        if (this.store.lastApplied.get(entry.param) !== entry.id) return false;
+        const spec = this.store.specs.get(entry.param);
+        return (
+          !spec ||
+          ((!spec.choices || spec.choices.includes(entry.from)) &&
+            (typeof entry.from !== 'number' ||
+              ((spec.min === undefined || entry.from >= spec.min) &&
+                (spec.max === undefined || entry.from <= spec.max))))
+        );
+      })
       .map((entry) => ({ ...entry }));
   }
 

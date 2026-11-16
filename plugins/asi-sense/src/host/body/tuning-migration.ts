@@ -41,6 +41,7 @@ function validApplied(entries: ReturnType<typeof validateSnapshot>, specs: Recor
 
 export function markTuningSnapshot(text: string): string {
   const monitor = JSON.parse(text);
+  if (monitor.disabled === 'restore-failed') return JSON.stringify({ version: 2, disabled: 'restore-failed' });
   monitor.version = 2;
   return JSON.stringify(monitor);
 }
@@ -49,16 +50,47 @@ export function migrateTuningSnapshot(
   text: string | undefined,
   previous: Record<string, ParameterSpec>,
   added: Record<string, ParameterSpec>,
+  wallClock: () => number,
 ): string | undefined {
   if (text === undefined) return undefined;
   try {
     const monitor = JSON.parse(text);
+    if (
+      (monitor?.version === 1 || monitor?.version === 2) &&
+      monitor.disabled === 'restore-failed' &&
+      Object.keys(monitor).length === 2
+    )
+      return JSON.stringify({ version: 1, disabled: 'restore-failed' });
     if ((monitor?.version !== 1 && monitor?.version !== 2) || typeof monitor.tuner !== 'string') return invalid;
     const tuner = JSON.parse(monitor.tuner);
-    const specs = monitor.version === 1 ? previous : { ...previous, ...added };
+    const legacy = {
+      ...previous,
+      'rate.context.maxEtaMs': { ...previous['rate.context.maxEtaMs'], min: 1, tighten: undefined },
+    };
+    const specs = monitor.version === 1 ? legacy : { ...previous, ...added };
     const validated = validateSnapshot(monitor.tuner, specs);
-    if (!validApplied(validated, specs)) return invalid;
+    if (!validApplied(validated, { ...specs, 'rate.context.maxEtaMs': legacy['rate.context.maxEtaMs'] }))
+      return invalid;
     if (monitor.version === 1) {
+      const eta = tuner.values.find(([key]: [string, unknown]) => key === 'rate.context.maxEtaMs');
+      const floor = previous['rate.context.maxEtaMs'].min as number;
+      if (eta[1] < floor) {
+        if (!Number.isSafeInteger(tuner.nextId + 1)) return invalid;
+        const change = {
+          id: `${tuner.idPrefix}-${tuner.nextId++}`,
+          param: 'rate.context.maxEtaMs',
+          from: eta[1],
+          to: floor,
+          by: 'auto',
+          reason: '新版底线',
+          at: wallClock(),
+          operation: 'propose',
+          status: 'applied',
+        };
+        eta[1] = floor;
+        tuner.log.push(change);
+        tuner.applied.push(change);
+      }
       tuner.values.push(...Object.entries(added).map(([key, spec]) => [key, spec.value]));
       monitor.tuner = JSON.stringify(tuner);
     }

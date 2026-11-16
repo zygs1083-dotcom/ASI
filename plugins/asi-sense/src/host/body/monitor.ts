@@ -223,6 +223,11 @@ export class BodyMonitor implements BodyEvaluator {
       if (this.tuner) this.tuner.restoreSnapshot(BAD); // sets its own flag too
       this.seed = new Baseline(this.baselineOptions()); // baseline reset
       this.rebuildAnomaly();
+      try {
+        await this.persistence?.onRestoreFailure?.();
+      } catch {
+        return;
+      }
       await this.persistence?.save(JSON.stringify({ version: 1, disabled: 'restore-failed' })).catch(() => {});
       this.persistReady = true;
     };
@@ -237,6 +242,12 @@ export class BodyMonitor implements BodyEvaluator {
       if (p && typeof p === 'object' && !Array.isArray(p)) d = p;
     } catch {
       /* corrupt */
+    }
+    if (d?.version === 1 && d.disabled === 'restore-failed' && Object.keys(d).length === 2) {
+      this.tuningDisabled = 'restore-failed';
+      this.tuner?.restoreSnapshot(BAD);
+      this.persistReady = true;
+      return;
     }
     // A v1 snapshot is REQUIRED to carry every field: baseline text, latch
     // and history records, and tuner text whenever a tuner is wired —

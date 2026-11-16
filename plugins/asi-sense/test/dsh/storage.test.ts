@@ -78,4 +78,31 @@ describe('atomic file storage', () => {
     await expect(port.load('missing')).resolves.toBeUndefined();
     await expect(port.save('../other', '{}')).rejects.toThrow();
   });
+
+  it('backs up the exact bytes with private permissions and unique names', async () => {
+    const { root, port } = await fixture();
+    const bytes = Buffer.from([0x7b, 0xff, 0x7d]);
+    await fs.writeFile(join(root, 'settings.json'), bytes);
+    const original = (await port.load('settings')) as string;
+    await port.backup('settings', original);
+    await port.backup('settings', original);
+    const backups = (await fs.readdir(root)).filter((name) => name.startsWith('settings.json.bak-'));
+    expect(backups).toHaveLength(2);
+    for (const name of backups) {
+      expect(await fs.readFile(join(root, name))).toEqual(bytes);
+      expect((await fs.stat(join(root, name))).mode & 0o777).toBe(0o600);
+    }
+    await expect(port.backup('settings', 'different')).rejects.toThrow('changed');
+    expect((await fs.readdir(root)).filter((name) => name.startsWith('settings.json.bak-'))).toHaveLength(2);
+  });
+
+  it.each(['file-open', 'write', 'file-sync', 'file-close', 'dir-open', 'dir-sync', 'dir-close'])(
+    'does not install a backup after a %s failure',
+    async (fault) => {
+      const { root, port } = await fixture(fault);
+      await expect(port.backup('settings', 'old')).rejects.toThrow();
+      expect(await fs.readFile(join(root, 'settings.json'), 'utf8')).toBe('old');
+      expect(await fs.readdir(root)).toEqual(['settings.json']);
+    },
+  );
 });

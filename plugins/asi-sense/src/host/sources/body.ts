@@ -93,6 +93,7 @@ export class BodySource {
         },
       },
     );
+    let originalSnapshot: string | undefined;
     this.monitor = new BodyMonitor({
       tuner: this.tuner,
       rateRules: [
@@ -110,7 +111,14 @@ export class BodySource {
       clock: () => clock.mono(),
       wallClock: () => clock.wall(),
       persistence: {
-        load: async () => migrateTuningSnapshot(await storage.load('body'), specs, attentionSpecs),
+        load: async () => {
+          originalSnapshot = await storage.load('body');
+          return migrateTuningSnapshot(originalSnapshot, specs, attentionSpecs, () => clock.wall());
+        },
+        onRestoreFailure: async () => {
+          if (originalSnapshot === undefined || !storage.backup) throw new Error('body snapshot backup unavailable');
+          await storage.backup('body', originalSnapshot);
+        },
         save: (value) => storage.save('body', markTuningSnapshot(value)),
       },
     });
@@ -272,12 +280,16 @@ export class BodySource {
     const commit: NonNullable<Parameters<typeof this.monitor.evaluateAuto>[3]> = (result, publish) => {
       this.state = result.state;
       this.previous = next;
+      const contextWarning = result.signals.some(
+        (signal) =>
+          signal.kind === 'body.rate' && signal.data.ruleId === 'context-eta' && signal.data.severity === 'warn',
+      );
       signals = result.signals.filter(
         (signal) =>
           !(
             signal.kind === 'body.rate' &&
             (signal.data.ruleId === 'disk-eta' || signal.data.ruleId === 'context-critical-eta') &&
-            signal.data.severity === 'normal'
+            (signal.data.severity === 'normal' || (signal.data.ruleId === 'context-critical-eta' && contextWarning))
           ),
       );
       if (result.tuningError) {

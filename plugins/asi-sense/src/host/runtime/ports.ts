@@ -50,6 +50,7 @@ export interface DshPort {
 export interface StoragePort {
   load(key: string): Promise<string | undefined>;
   save(key: string, json: string): Promise<void>;
+  backup?(key: string, original: string): Promise<void>;
 }
 export interface HelperSpawner {
   spawn(path: string): ChildProcessWithoutNullStreams | undefined;

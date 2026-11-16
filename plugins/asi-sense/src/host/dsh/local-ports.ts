@@ -12,7 +12,12 @@ export function localPorts(ctx: Context, storageRoot: string): Omit<SensePorts, 
   if (!isAbsolute(storageRoot)) throw new TypeError('asi-sense storageRoot must be absolute');
   return {
     clock: { wall: Date.now, mono: () => performance.now() },
-    storage: new FileStoragePort(storageRoot, fs, () => ctx.logger.warn('asi-sense storage directory sync failed')),
+    storage: new FileStoragePort(
+      storageRoot,
+      fs,
+      () => ctx.logger.warn('asi-sense storage directory sync failed'),
+      () => ctx.logger.warn('asi-sense unrecognized or invalid body snapshot backed up; AI tuning disabled'),
+    ),
     helper: { spawn: (path) => spawn(path, [], { stdio: 'pipe' }) },
     probe: { create: () => new BodyProbe() },
     files: {
