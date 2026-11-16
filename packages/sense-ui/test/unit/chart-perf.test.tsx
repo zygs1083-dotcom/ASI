@@ -9,7 +9,7 @@ import { buildSpark } from '../../src/geometry'
 import { tick } from '../../src/preview/tick'
 import { Sparkline } from '../../src/sparkline'
 import { formatPercent } from '../../src/format'
-import { ClockProvider } from '../../src/clock'
+import { ClockProvider, SamplingProvider } from '../../src/clock'
 
 vi.mock('../../src/history', async (orig) => {
   const mod = await orig<typeof import('../../src/history')>()
@@ -44,6 +44,29 @@ const histCalls = () => vi.mocked(sampleHistory).mock.calls.length
 const geoCalls = () => vi.mocked(buildSpark).mock.calls.length
 
 describe('图表渲染预算', () => {
+  it('温控按 30 秒心跳判断滞后，2 秒指标仍按原周期判断', () => {
+    const now = 1_700_000_000_000
+    const points = [{ at: now - 1_000, value: 0 }, { at: now, value: 0 }]
+    const draw = (age: number) => (
+      <SamplingProvider value={{ paused: false, intervals: { thermal: 30_000 } }}>
+        <Sparkline metric="thermal" points={points} now={now + age} label="温控" format={String} />
+        <Sparkline metric="cpu" points={points} now={now + age} label="CPU" format={String} />
+      </SamplingProvider>
+    )
+    const view = render(draw(0))
+    for (const age of [13_000, 59_000, 90_000]) {
+      view.rerender(draw(age))
+      expect(view.container.textContent).toContain('温控最近 5 分钟趋势：当前')
+      expect(view.container.textContent).toContain('CPU历史 5 分钟趋势，数据滞后')
+    }
+    view.rerender(draw(90_001))
+    expect(view.container.textContent).toContain('温控历史 5 分钟趋势，数据滞后')
+    view.rerender(draw(6_000))
+    expect(view.container.textContent).toContain('CPU最近 5 分钟趋势：当前')
+    view.rerender(draw(6_001))
+    expect(view.container.textContent).toContain('CPU历史 5 分钟趋势，数据滞后')
+  })
+
   it('按各序列周期标记滞后，显式暂停立即生效且不重建图形', async () => {
     const m = makeScenario('healthy')
     const points = [{ at: m.now - 60_000, value: 0.2 }, { at: m.now, value: 0.3 }]

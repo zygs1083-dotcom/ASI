@@ -52,7 +52,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   try {
     await runtime.start();
     if (disposed) return;
-    presenter = createPresenter(runtime, { clock: local.clock });
+    presenter = createPresenter(runtime, { clock: local.clock, sampleIntervalsMs: { thermal: 30_000 } });
     new AsiSenseRemote(ctx, runtime.actions, presenterFrames(presenter));
     offTools = registerSenseTools(ctx, runtime, local.clock.wall);
   } catch (error) {
