@@ -6,6 +6,7 @@ import { HelperSource } from '../sources/helper.ts';
 import { boundedShutdown, guardActions } from './action-guard.ts';
 import { RuntimeAttention } from './attention.ts';
 import { createChanges, createStateListeners, observableActions, settleShutdown } from './changes.ts';
+import { deliveryRetry } from './delivery-retry.ts';
 import { FactExpiry } from './expiry.ts';
 import type { SenseActions, SenseOptions, SensePorts } from './ports.ts';
 import { Settings } from './settings.ts';
@@ -42,9 +43,10 @@ export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}
     if (stopping || epoch !== generation) throw new Error('stopped');
   };
   const expiry = new FactExpiry(clock);
+  const deliveryPort = deliveryRetry(ports.dsh, clock, () => attention);
   const attention = new RuntimeAttention(
     clock,
-    ports.dsh,
+    deliveryPort,
     () => settings.enabled(),
     schedule,
     () => allowTitles && helper.titlesEnabled(),
@@ -57,7 +59,7 @@ export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}
     schedule();
   });
   const body = new BodySource(ports.probe, ports.dsh, ports.storage, clock, attention, expiry, isPaused, changed);
-  const dsh = new DshSource(ports.dsh, clock, attention, body.tokens.bind(body), isPaused, options.selfCauseGraceMs);
+  const dsh = new DshSource(deliveryPort, clock, attention, body.tokens.bind(body), isPaused, options.selfCauseGraceMs);
   const files = new FileSource(
     ports.files,
     clock,

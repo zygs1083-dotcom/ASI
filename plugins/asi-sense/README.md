@@ -133,6 +133,38 @@ owns the concrete ports declared in `runtime/ports.ts`:
   drive runtime scheduling, merge windows and helper retries. The probe and
   body persistence retain their own internal sampling/save timers.
 
+The DSH adapter adds context to the accepted `agent/pre-step` decision, not
+the already-claimed inbox. DSH logs the admitted messages in the current step;
+context is retained in memory if that step is canceled before admission and
+the title setting is checked again when it is formatted. Staged context is not
+durable across a process restart before admission.
+
+Wake deliveries use a message id derived from the delivery id. A session
+projection records both inbox insertions and admitted messages, including
+messages already claimed, so an accepted call that throws is not repeated.
+If acceptance cannot be determined, a `delivery-unknown` event is recorded
+and the delivery is not retried. The projection retains accepted ids for the
+session lifetime and therefore grows with delivered messages.
+
+Failed runtime deliveries retry after 1, 2, 4 seconds and so on, capped at
+60 seconds, for at most ten attempts or ten monotonic minutes. Context retries
+wait for a pre-step; wake retries use the host timer. The `delivery` source
+reports failures and their retry count, then reports that retries have stopped
+at the limit. Exhausted deliveries are recorded without another wake. The
+source returns to ok after a later delivery succeeds. The retry budget resets
+on session selection changes; a staged context clears degradation only after
+DSH records it in the session.
+
+Regression tests: `adds context to the claimed step and reconstructs it without
+another inbox entry`, `retains staged context if cancellation prevents admission,
+then admits it on the next step`, `does not enqueue twice after a message is
+accepted, claimed and the call throws`, `stops retrying after ten failures,
+reports degradation and recovers after a later delivery`, `expires a retry
+after ten monotonic minutes even if fewer than ten attempts ran`, and `resets
+the retry budget when the selected session changes`. Additional regressions
+cover concurrent identical deliveries, unknown outcomes, and waiting for
+staged context to commit before clearing degradation.
+
 `selfCauseGraceMs` is an optional DSH plugin configuration and
 `createSenseRuntime` option, defaulting to 2000 ms; set it to 0 to disable the
 trailing grace. A file event under a tool's absolute cwd is self-caused when
