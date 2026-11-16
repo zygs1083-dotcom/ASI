@@ -6,41 +6,108 @@ import { describe, expect, it } from 'vitest';
 import { stop, temporaryProfile, wakeDiagnostics } from '../../scripts/e2e-support.ts';
 
 describe('woken model turn diagnostics', () => {
-  const wake = {
+  const start = (turn: number) => ({ type: 'turn/start', data: { turn } });
+  const environment = { type: 'user/message', data: { source: { kind: 'environment' } } };
+  const followup = {
     type: 'agent/inbox/spliced',
     data: { target: 'next-turn', inserted: [{ source: { kind: 'environment' } }] },
+  };
+  const job = {
+    type: 'agent/inbox/spliced',
+    data: { target: 'next-turn', inserted: [{ source: { kind: 'tool-jobs' } }] },
   };
   const assistant = (turn: number, text: string) => ({
     type: 'assistant/message',
     data: { turn, message: { content: [{ type: 'text', text }] } },
   });
   const end = (turn: number, kind: string) => ({ type: 'turn/end', data: { turn, reason: { kind } } });
+  const initial = [
+    start(1),
+    assistant(1, 'ready'),
+    end(1, 'completed'),
+    {
+      type: 'job/settled',
+      data: { kind: 'bash', label: 'sleep 20; exit 1', status: 'completed', detail: 'exit code: 1' },
+    },
+  ];
 
-  it('distinguishes a missing wake from a wake whose reply has not finished', () => {
-    const initial = [assistant(1, 'ready'), end(1, 'completed')];
-    expect(wakeDiagnostics(initial)).toMatchObject({
+  it('distinguishes a missing turn from a turn whose reply has not finished', () => {
+    expect(wakeDiagnostics(initial, 1)).toMatchObject({
       status: '等待唤醒超时',
       wakeCount: 0,
-      lastAssistantLength: 5,
-      lastTurnEnd: 'completed',
     });
-    expect(wakeDiagnostics([...initial, wake])).toMatchObject({
+    expect(wakeDiagnostics([...initial, start(2), environment], 1)).toMatchObject({
       status: '唤醒已发生但回复未完成',
       wakeCount: 1,
-      wakeTurnEnd: null,
     });
   });
 
-  it('distinguishes a failed, empty, or successful woken turn', () => {
-    expect(wakeDiagnostics([wake, end(2, 'error')])).toMatchObject({ status: '回复有错误', wakeTurnEnd: 'error' });
-    expect(wakeDiagnostics([wake, assistant(2, ''), end(2, 'completed')])).toMatchObject({ status: '回复有错误' });
-    expect(wakeDiagnostics([wake, assistant(2, 'ACK'), end(2, 'completed')])).toMatchObject({
+  it.each([followup, job])('accepts one environment message in a completed turn regardless of trigger', (trigger) => {
+    expect(
+      wakeDiagnostics([...initial, trigger, start(2), environment, assistant(2, 'ACK'), end(2, 'completed')], 1),
+    ).toMatchObject({
       status: '完成',
       wakeCount: 1,
-      lastAssistantLength: 3,
+      environmentMessages: 1,
+      replyLength: 3,
       wakeTurnEnd: 'completed',
     });
-    expect(wakeDiagnostics([wake, wake])).toMatchObject({ status: '唤醒次数不符', wakeCount: 2 });
+  });
+
+  it('rejects missing, duplicated or out-of-turn delivery, duplicate turns, and bad replies', () => {
+    expect(wakeDiagnostics([...initial, start(2), end(2, 'completed')], 1)).toMatchObject({
+      status: '环境投递次数不符',
+    });
+    expect(wakeDiagnostics([...initial, start(2), environment, environment, end(2, 'completed')], 1)).toMatchObject({
+      status: '环境投递次数不符',
+    });
+    expect(
+      wakeDiagnostics([...initial, environment, start(2), assistant(2, 'ACK'), end(2, 'completed')], 1),
+    ).toMatchObject({ status: '环境投递次数不符' });
+    expect(wakeDiagnostics([...initial, environment, start(2), environment], 1)).toMatchObject({
+      status: '环境投递次数不符',
+    });
+    expect(wakeDiagnostics([...initial, start(2), environment, end(2, 'error')], 1)).toMatchObject({
+      status: '回复有错误',
+    });
+    expect(
+      wakeDiagnostics([...initial, start(2), environment, assistant(2, ' '), end(2, 'completed')], 1),
+    ).toMatchObject({ status: '回复有错误' });
+    expect(
+      wakeDiagnostics([...initial, start(2), environment, assistant(1, 'ACK'), end(2, 'completed')], 1),
+    ).toMatchObject({ status: '回复有错误' });
+    expect(
+      wakeDiagnostics([...initial, start(2), environment, assistant(2, 'ACK'), end(2, 'completed'), start(3)], 1),
+    ).toMatchObject({ status: '唤醒次数不符', wakeCount: 2 });
+  });
+
+  it('requires the specified background failure before the new turn', () => {
+    const beforeFailure = initial.slice(0, -1);
+    expect(wakeDiagnostics(beforeFailure, 1)).toMatchObject({ status: '等待后台失败' });
+    expect(
+      wakeDiagnostics([...beforeFailure, start(2), initial[initial.length - 1], environment, end(2, 'completed')], 1),
+    ).toMatchObject({ status: '后台失败前已有新轮次' });
+    const wrongExit = {
+      type: 'job/settled',
+      data: { kind: 'bash', label: 'sleep 20; exit 1', status: 'completed', detail: 'exit code: 0' },
+    };
+    expect(wakeDiagnostics([...beforeFailure, wrongExit], 1)).toMatchObject({ status: '等待后台失败' });
+  });
+
+  it('prints event types and source kinds without message content', () => {
+    const result = wakeDiagnostics(
+      [...initial, job, start(2), environment, assistant(2, 'private content'), end(2, 'completed')],
+      1,
+    );
+    expect(result.sequence).toEqual([
+      'job/settled',
+      'agent/inbox/spliced(next-turn:tool-jobs)',
+      'turn/start',
+      'user/message(environment)',
+      'assistant/message',
+      'turn/end',
+    ]);
+    expect(JSON.stringify(result)).not.toContain('private content');
   });
 });
 

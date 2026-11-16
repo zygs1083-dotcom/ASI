@@ -150,28 +150,32 @@ export function envInjections(log: Record<string, unknown>[]): Record<string, un
   return envInbox(log, 'next-step');
 }
 
-export function wakeDiagnostics(log: Record<string, unknown>[]) {
-  const wakes = envFollowups(log);
-  const wake = wakes[0];
-  const index = wake ? log.indexOf(wake) : -1;
-  const tail = index < 0 ? [] : log.slice(index + 1);
-  const end = tail.find((event) => event.type === 'turn/end');
+export function wakeDiagnostics(log: Record<string, unknown>[], initialTurn: number | undefined) {
+  const initialEnd = log.findIndex(
+    (event) => event.type === 'turn/end' && record(event.data).turn === initialTurn && initialTurn !== undefined,
+  );
+  const tail = initialEnd < 0 ? [] : log.slice(initialEnd + 1);
+  const starts = tail.filter((event) => event.type === 'turn/start');
+  const start = starts[0];
+  const settled = tail.findIndex((event) => {
+    const data = record(event.data);
+    return (
+      event.type === 'job/settled' &&
+      data.kind === 'bash' &&
+      typeof data.label === 'string' &&
+      data.label.includes('sleep 20') &&
+      data.label.includes('exit 1') &&
+      data.status === 'completed' &&
+      typeof data.detail === 'string' &&
+      /^exit code: 1(?:;|$)/.test(data.detail)
+    );
+  });
+  const turn = record(start?.data).turn;
+  const turnEvents = start ? tail.slice(tail.indexOf(start)) : [];
+  const end = turnEvents.find((event) => event.type === 'turn/end' && record(event.data).turn === turn);
+  const withinTurn = end ? turnEvents.slice(0, turnEvents.indexOf(end) + 1) : turnEvents;
   const reason = record(record(end?.data).reason);
-  const turn = record(end?.data).turn;
-  const assistantLength = (event: Record<string, unknown> | undefined) => {
-    if (!event) return null;
-    const content = record(record(event.data).message).content;
-    return Array.isArray(content)
-      ? content
-          .map(record)
-          .reduce(
-            (sum, part) => sum + (part.type === 'text' && typeof part.text === 'string' ? part.text.length : 0),
-            0,
-          )
-      : 0;
-  };
-  const last = [...log].reverse().find((event) => event.type === 'assistant/message');
-  const reply = [...tail]
+  const reply = [...withinTurn]
     .reverse()
     .find(
       (event) =>
@@ -179,25 +183,50 @@ export function wakeDiagnostics(log: Record<string, unknown>[]) {
         record(event.data).turn === turn &&
         record(event.data).interrupted !== true,
     );
+  const content = record(record(reply?.data).message).content;
+  const text = Array.isArray(content)
+    ? content.map(record).flatMap((part) => (part.type === 'text' && typeof part.text === 'string' ? [part.text] : []))
+    : [];
+  const environmentMessages = envMessages(tail).length;
+  const turnMessages = envMessages(withinTurn).length;
+  const sourceKind = (value: unknown) =>
+    ['user', 'environment', 'tool-jobs', 'runtime-context'].includes(String(value)) ? String(value) : 'other';
+  const sequence = tail.map((event) => {
+    const data = record(event.data);
+    if (event.type === 'user/message') return `user/message(${sourceKind(record(data.source).kind)})`;
+    if (event.type === 'agent/inbox/spliced' && Array.isArray(data.inserted) && data.inserted.length) {
+      const target = data.target === 'next-turn' || data.target === 'next-step' ? data.target : 'other';
+      return `agent/inbox/spliced(${target}:${data.inserted.map((item) => sourceKind(record(record(item).source).kind)).join(',')})`;
+    }
+    return String(event.type);
+  });
   const status =
-    wakes.length > 1
+    starts.length > 1
       ? '唤醒次数不符'
-      : !wake
-        ? '等待唤醒超时'
-        : !end
-          ? '唤醒已发生但回复未完成'
-          : reason.kind !== 'completed' || !assistantLength(reply)
-            ? '回复有错误'
-            : '完成';
-  const lastEnd = [...log].reverse().find((event) => event.type === 'turn/end');
+      : environmentMessages > 1
+        ? '环境投递次数不符'
+        : start && (settled < 0 || tail.indexOf(start) < settled)
+          ? '后台失败前已有新轮次'
+          : settled < 0
+            ? '等待后台失败'
+            : !start
+              ? '等待唤醒超时'
+              : !end
+                ? '唤醒已发生但回复未完成'
+                : environmentMessages !== 1 || turnMessages !== 1
+                  ? '环境投递次数不符'
+                  : reason.kind !== 'completed' || !text.some((part) => part.trim())
+                    ? '回复有错误'
+                    : '完成';
   return {
     status,
-    wakeCount: wakes.length,
-    environmentMessages: envMessages(log).length,
-    lastAssistantLength: assistantLength(last),
-    lastTurnEnd: record(record(lastEnd?.data).reason).kind ?? null,
+    wakeCount: starts.length,
+    environmentMessages,
+    turnMessages,
+    replyLength: text.reduce((sum, part) => sum + part.length, 0),
     wakeTurnEnd: reason.kind ?? null,
     wakeErrorCode: record(reason.error).code ?? null,
+    sequence,
   };
 }
 
