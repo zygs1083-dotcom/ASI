@@ -180,6 +180,11 @@
   background: var(--dsw-alias-bg-layer-1);
 }
 
+.backupText {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
 .suggestion {
   padding: var(--sense-pad-row) 0;
   border-bottom: 0.5px solid var(--dsw-alias-border-l1);

@@ -122,6 +122,30 @@ describe('user-confirmed rebaseline', () => {
     await f.monitor.close();
   });
 
+  it.each(['crash', 'clean shutdown'])(
+    'R3 loses elapsed suggestion age across %s if wall time is stopped',
+    async (mode) => {
+      const f = await fixture();
+      for (let week = 0; week < 3; week++) {
+        for (let i = 0; i < 8; i++) await f.feed(START + week * WEEK + i * 60_000, 0.99);
+      }
+      await f.monitor.persist();
+      const wall = START + 2 * WEEK + 7 * 60_000;
+      f.setClocks(wall, 2 * WEEK + 7 * 60_000 + 6 * DAY);
+      expect(f.monitor.rebaselineSuggestions).toHaveLength(1);
+      if (mode === 'clean shutdown') await f.monitor.close();
+      f.setClocks(wall, 0);
+      const restored = f.make();
+      await restored.monitor.restore();
+      f.setClocks(wall, DAY);
+      expect(restored.monitor.rebaselineSuggestions).toHaveLength(1);
+      f.setClocks(wall, WEEK);
+      expect(restored.monitor.rebaselineSuggestions).toHaveLength(0);
+      await restored.monitor.close();
+      if (mode === 'crash') await f.monitor.close();
+    },
+  );
+
   it('R3 uses the last evidence sample, not the first sample of its date', async () => {
     const f = await fixture();
     for (let i = 0; i < 4; i++) await f.feed(START + i * 60_000, 0.99);

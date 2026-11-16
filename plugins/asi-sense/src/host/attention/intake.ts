@@ -1,7 +1,7 @@
 import type { DeliveryLevel, EnvChange, Signal, WatchRule } from '@asi/sense-types';
 import type { BucketDrain } from './drain.ts';
 import type { SessionContext, SessionState } from './pipeline-types.ts';
-import { isRuleApproved, selectRule } from './rules.ts';
+import { isRuleApproved } from './rules.ts';
 import { sourceMarkSeen } from './source-mark.ts';
 
 const DEDUP_MAX = 1024;
@@ -14,11 +14,11 @@ export function intake(
   now: number,
   count: number,
   other: boolean,
-  rules: WatchRule[],
-  wallClock: () => number,
+  selectRule: (signal: Signal) => WatchRule | undefined,
   drain: BucketDrain,
   mergeWindowMs: number,
   fileMergeWindowMs: number,
+  pending?: { rule?: WatchRule; reason?: string },
 ): EnvChange {
   s.context = session;
   const change: EnvChange = { signal: ev, count: 1, level: 'record' };
@@ -29,15 +29,15 @@ export function intake(
     if (ev.cause === 'agent') {
       change.reason = 'self-caused';
     } else {
-      const rule = selectRule(rules, ev, wallClock());
+      const rule = pending ? pending.rule : selectRule(ev);
       if (other) ev.kind = 'other';
-      let level: DeliveryLevel = rule?.level ?? 'record';
-      let reason: string | undefined;
-      if (level === 'wake' && rule && !isRuleApproved(rule)) {
+      let level: DeliveryLevel = pending ? 'context' : (rule?.level ?? 'record');
+      let reason: string | undefined = pending?.reason;
+      if (!pending && level === 'wake' && rule && !isRuleApproved(rule)) {
         level = 'context';
         reason = 'rule-pending-approval';
       }
-      if ((ev.kind === 'source.status' || ev.kind === 'source.error') && repeatedStatus) {
+      if (!pending && (ev.kind === 'source.status' || ev.kind === 'source.error') && repeatedStatus) {
         level = 'record';
       }
       change.level = level;

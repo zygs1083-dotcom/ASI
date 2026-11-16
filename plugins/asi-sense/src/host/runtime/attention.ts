@@ -3,7 +3,7 @@ import type { DeliveryLevel, SenseState, Signal, SignalCause, SourceRef, WatchRu
 import { DeliveryFailure } from '../attention/drain.ts';
 import { injectOutcomes } from '../attention/drain-transfer.ts';
 import { AttentionPipeline, type SessionContext } from '../attention/pipeline.ts';
-import { isRuleApproved, selectRule } from '../attention/rules.ts';
+import { isRuleApproved } from '../attention/rules.ts';
 import { sourceObservation } from '../state/source-health.ts';
 import { StateStore } from '../state/store.ts';
 import { eventDetail } from './event-detail.ts';
@@ -26,6 +26,7 @@ export interface EventEntry {
   detail?: Record<string, string | number | boolean>;
   currentEta?: { asOf: number; ratePerMinute: number; timeToThresholdMs?: number };
   feedback?: 'useful' | 'noise';
+  feedbackAvailable?: boolean;
 }
 export type EventLog = EventEntry[];
 
@@ -135,6 +136,17 @@ export class RuntimeAttention {
       this.changed();
     }
   }
+  refreshFeedback(available: (id: string) => boolean): void {
+    this.pipeline.refreshFeedback(available);
+    this.pending.refreshFeedback(available);
+    for (const entry of this.entries) {
+      if (entry.feedbackAvailable !== undefined) entry.feedbackAvailable = available(entry.id);
+    }
+    this.changed();
+  }
+  rescheduleDelivery(): void {
+    this.reschedule();
+  }
   isStopped(): boolean {
     return this.stopped;
   }
@@ -178,7 +190,7 @@ export class RuntimeAttention {
     let entry = this.pending.take();
     while (entry) {
       if ('batch' in entry) await this.pipeline.restore(id, entry.batch);
-      else await this.pipeline.acceptCount(entry.signal, session, entry.count, entry.other);
+      else await this.pipeline.acceptCount(entry.signal, session, entry.count, entry.other, entry.classification);
       if (this.stopped || generation !== this.selectionGeneration || this.selected !== id) return;
       entry = this.pending.take();
     }
@@ -197,7 +209,11 @@ export class RuntimeAttention {
   }
   async accept(signal: Signal): Promise<void> {
     if (this.stopped) return;
-    const mono = this.clock.mono() - Math.max(0, this.clock.wall() - signal.at);
+    const evaluated = signal.kind === 'body.rate' ? signal.data.evaluationMono : undefined;
+    const mono =
+      typeof evaluated === 'number' && Number.isFinite(evaluated)
+        ? evaluated
+        : this.clock.mono() - Math.max(0, this.clock.wall() - signal.at);
     const session = this.selected && this.sessions.get(this.selected);
     if (!session) {
       const prior = this.store.snapshot().observation.sources[signal.source.id];
@@ -209,7 +225,7 @@ export class RuntimeAttention {
               resolve();
               return;
             }
-            const rule = signal.cause === 'agent' ? undefined : selectRule(this.rules(), signal, this.clock.wall());
+            const rule = signal.cause === 'agent' ? undefined : this.pipeline.selectRule(signal, this.rules());
             let level = rule?.level ?? 'record';
             let reason = signal.cause === 'agent' ? 'self-caused' : undefined;
             if (level === 'wake' && rule && !isRuleApproved(rule)) {
@@ -224,7 +240,7 @@ export class RuntimeAttention {
             }
             if (level === 'wake') reason = 'no-session';
             if (level === 'context') {
-              const evicted = this.pending.add(signal);
+              const evicted = this.pending.add(signal, { rule, reason });
               if (evicted !== undefined) reason = `pending-evicted:${evicted}`;
             }
             this.log({ signal, level, ruleId: rule?.id, reason }, mono);
@@ -276,6 +292,9 @@ export class RuntimeAttention {
       cause: signal.cause,
       restarts,
       source: { ...signal.source },
+      ...(typeof signal.data.feedbackAvailable === 'boolean'
+        ? { feedbackAvailable: signal.data.feedbackAvailable }
+        : {}),
       ...(detail ? { detail } : {}),
       ...(slope === undefined
         ? {}

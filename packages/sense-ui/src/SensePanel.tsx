@@ -6,6 +6,7 @@ import { NowSection } from './sections/now'
 import { EventsSection } from './sections/events'
 import { RulesSection } from './sections/rules'
 import { useTuningOperations } from './sections/tuning-operation'
+import { defaultTuningCopy, TuningBackupStatus } from './sections/tuning-actions'
 import { useFreshModel } from './freshness'
 import rulesCss from './sections/rules.module.css'
 import css from './panel.module.css'
@@ -44,10 +45,11 @@ export function SensePanel(props: SensePanelProps) {
       </header>
 
       <div className={css.notices}>
+        <TuningBackupStatus {...props} model={model} operations={operations} />
         {Object.entries(operations.operations).map(([key, operation]) =>
           (operation.phase === 'error' || operation.phase === 'unconfirmed') && (
             <div key={key} className={rulesCss.notice} role="alert">
-              <span>{operation.label}{operation.phase === 'error' ? '失败，请重试' : '：未确认结果，请检查状态'}</span>
+              <span>{operation.label}{operation.phase === 'error' ? (props.tuningCopy ?? defaultTuningCopy).actionFailed : (props.tuningCopy ?? defaultTuningCopy).actionUnconfirmed}</span>
               <button type="button" aria-label="关闭操作提示" onClick={(event) => {
                 const notice = event.currentTarget.parentElement
                 const neighbor = notice?.nextElementSibling ?? notice?.previousElementSibling

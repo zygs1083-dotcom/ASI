@@ -49,19 +49,19 @@ export DSH_LAUNCHER="$ASI_ROOT/plugins/asi-sense/scripts/dsh.sh"
 export DSH_HOME="$(mktemp -d "${TMPDIR:-/tmp}/asi-sense-dsh.XXXXXX")"
 node -e 'require("node:fs").writeFileSync(process.env.DSH_HOME + "/workspace.json", JSON.stringify([{id:"workspace-controller",config:{documentsDirectory:process.env.DSH_HOME}}]))'
 "$DSH_LAUNCHER" --profile asi-dev --from-default-profile web --dump-config
-"$DSH_LAUNCHER" plugin --profile asi-dev add "$ASI_ROOT/plugins/asi-sense/dist/asi-sense-0.0.0.tgz"
+"$DSH_LAUNCHER" plugin --profile asi-dev add "$ASI_ROOT/plugins/asi-sense/dist/asi-sense-0.1.1.tgz"
 ```
 
 这里为本次安装新建独立 `DSH_HOME` 并从 `web` 模板初始化 `asi-dev` profile，不影响已有 DSH profile 数据。`workspace.json` 让首次启动的默认工作区也位于独立 home 内，而不是共享的 Documents 目录；启动时必须加上该 patch。示例 home 位于系统临时目录，可能被系统清理；需要长期保留数据时，将 `mktemp` 的模板改为持久目录中的新路径。后续每次操作同一 profile 时都要使用同一个 `DSH_HOME`；不要重复执行 `--from-default-profile`，它会重新初始化 profile。
 
-产物是 `plugins/asi-sense/dist/asi-sense-0.0.0.tgz`（文件名中的版本取自包的 `version`）。安装后保留该文件，profile 的依赖指向它。启动脚本也随 tarball 的 `package/scripts/dsh.sh` 分发：打包它是为了把产物复制到其他机器时仍可使用同一启动方式；上面的命令使用仓库中的副本。
+产物是 `plugins/asi-sense/dist/asi-sense-0.1.1.tgz`（文件名中的版本取自包的 `version`）。安装后保留该文件，profile 的依赖指向它。启动脚本也随 tarball 的 `package/scripts/dsh.sh` 分发：打包它是为了把产物复制到其他机器时仍可使用同一启动方式；上面的命令使用仓库中的副本。
 
 ### 只有安装包时
 
 满足前置条件后，把第一行改为安装包的绝对路径，在同一终端执行：
 
 ```sh
-export ASI_TGZ="/absolute/path/to/asi-sense-0.0.0.tgz"
+export ASI_TGZ="/absolute/path/to/asi-sense-0.1.1.tgz"
 export ASI_INSTALL="$(mktemp -d "${TMPDIR:-/tmp}/asi-sense-install.XXXXXX")"
 tar -xzf "$ASI_TGZ" -C "$ASI_INSTALL" package/scripts/dsh.sh
 export DSH_LAUNCHER="$ASI_INSTALL/package/scripts/dsh.sh"
@@ -354,12 +354,21 @@ failed buckets migrate to the new session. Helper overflow marks helper
 facts stale; recovery applies all snapshot fields and concurrent deltas and
 keeps the source degraded if a required field is missing.
 
-`bodyTune` accepts only the parameters wired to `BodyMonitor`/`Tuner`:
+`bodyTune` accepts the parameters wired to `BodyMonitor`/`Tuner`:
 `floor.{disk,context,battery}.{warn,critical}`, `rate.disk.maxDelta`,
 `rate.rss.maxRatio`, `rate.context.maxEtaMs`, `anomaly.{cpu,memory,network}.sigma`,
-and `file.burst.{windowMs,maxChanges,maxDeleted}`. Unsupported parameters,
-including merge-window and delivery-level tuning, reject with
-`unsupported-param`; `envWatch` also rejects a tuning `param`. Rule changes
+`file.burst.{windowMs,maxChanges,maxDeleted}`, `mergeWindowMs` (1000–30000),
+`fileMergeWindowMs` (1000–60000), and `deliveryLevel.body.rate`,
+`deliveryLevel.body.anomaly`, `deliveryLevel.file.burst`. Window changes allow
+0.5–2 times the current value per AI operation; other numerical tuning retains
+the ±50% bound. Alert levels may be reduced to record or context but AI cannot
+raise them to wake. Built-in critical and imminent-exhaustion alerts are never
+downgraded, and separately approved user rules remain effective. Window changes
+shorten unattempted in-flight buckets to the earlier of their existing deadline
+and first receipt plus the new window, without extending or dropping them.
+Already attempted retries keep their deadline and payload; new buckets use the
+new window. Levels apply to subsequent signals, not already classified buckets.
+Unsupported parameters reject with `unsupported-param`; `envWatch` also rejects a tuning `param`. Rule changes
 remain available through `envWatch` with agent-proposed wake rules pending
 user approval. `bodyTune({ action: 'feedback', alertId, verdict })` and the
 trusted-user feedback action accept alerts registered by the runtime. The
@@ -424,10 +433,17 @@ model requests, watches files or delivers attention intents.
   with `data.type === 'rebaseline-suggestion'`; missing samples do not interrupt
   the candidate, but a non-alert reading in that bucket does. Incomplete
   candidates expire after 21 days; generated suggestions expire 7 days after
-  their last evidence, including without new samples or across restart.
+  their last evidence using wall time or accumulated monotonic sample age.
   Display, restore, and acceptance all clear expired suggestions; a wall clock
   before the last evidence also expires them. Suggestions are available through
   `monitor.rebaselineSuggestions`; they never replace buckets automatically.
+  Display and acceptance calculate monotonic age without updating the saved
+  per-stream baseline age. Even a clean shutdown can therefore lose elapsed
+  time since the last adaptive sample. If wall time stops, a restart can leave
+  a suggestion available beyond seven real days, especially with repeated
+  restarts.
+  This trade-off avoids continuous persistence solely for the expiration timer;
+  user confirmation is still required before changing the baseline.
   The pure synchronous `evaluate` seam clears existing suggestion evidence and
   does not collect new evidence.
   Floor and rate rules remain active.
@@ -649,10 +665,11 @@ republish and is not counted. Exposing per-metric acquisition generations or
 monotonic timestamps from body-probe is future work.
 
 Alert registration is persisted asynchronously after the alert is published.
-Its initial `feedbackAvailable` is conservatively `false`; queued and already
-delivered signals are not rewritten if registration later succeeds. Feedback
-is usable after successful registration, but the original signal does not
-reflect that later change; publishing updated availability is future work.
+Its initial `feedbackAvailable` is `false`; successful registration updates
+unattempted queued signals and the presenter, while already attempted deliveries
+retain their frozen payload. Registration failure, consumption and eviction
+leave feedback unavailable. Model updates include a bounded, base64url alert ID
+only when it can be used for feedback.
 
 Regression tests:
 
@@ -680,7 +697,7 @@ Regression tests:
 3. Evaluation-time ETA: `uses elapsed monotonic time for delayed context ETA alerts and event details`, `evaluates ETA when a received sample waits before publication`, and `clamps an already elapsed observation ETA to zero at evaluation` (`test/body/rate.test.ts`).
 4. Disk aggregation and cache expiry: `aggregates disk parent from final volume deadlines after cached republishes` and `never revives an expired cached disk when its TTL metadata changes`.
 
-Tests are in `test/presenter/presenter.test.ts` unless otherwise noted. Rate signals retain their evaluation-time `at` and remaining ETA, alongside the observation `evidenceAt`; panel events project the evidence time to the display timeline, while current ETA remains anchored to the observation. Disk parent status and deadline reflect the final fresh-volume set; repeated cached volume timestamps cannot extend a volume's deadline. Collection-level `denied` and `unsupported` remain unchanged even with no volumes or an explicitly fresh volume, as covered by `preserves disk collection status %s with or without fresh volumes`.
+Tests are in `test/presenter/presenter.test.ts` unless otherwise noted. Rate signals retain their evaluation-time `at` and remaining ETA, alongside the observation `evidenceAt`; panel events project the evaluation time to the display timeline, while current ETA remains anchored to the observation. Disk parent status and deadline reflect the final fresh-volume set; repeated cached volume timestamps cannot extend a volume's deadline. Collection-level `denied` and `unsupported` remain unchanged even with no volumes or an explicitly fresh volume, as covered by `preserves disk collection status %s with or without fresh volumes`.
 
 ## DSH runtime regressions
 

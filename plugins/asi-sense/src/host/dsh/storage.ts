@@ -1,9 +1,9 @@
-import { randomUUID } from 'node:crypto';
-import { join } from 'node:path';
+import { createHash, randomUUID } from 'node:crypto';
+import { basename, join } from 'node:path';
 import type { StoragePort } from '../runtime/ports.ts';
 
 interface StorageFile {
-  writeFile(value: string): Promise<void>;
+  writeFile(value: string | Uint8Array): Promise<void>;
   sync(): Promise<void>;
   close(): Promise<void>;
 }
@@ -11,7 +11,9 @@ interface StorageFile {
 export interface StorageFileSystem {
   mkdir(path: string, options: { recursive: true; mode: number }): Promise<unknown>;
   open(path: string, flags: 'r' | 'wx', mode?: number): Promise<StorageFile>;
+  readFile(path: string): Promise<Uint8Array>;
   readFile(path: string, encoding: 'utf8'): Promise<string>;
+  readdir(path: string): Promise<string[]>;
   rename(from: string, to: string): Promise<void>;
   unlink(path: string): Promise<void>;
 }
@@ -27,6 +29,8 @@ export class FileStoragePort implements StoragePort {
     private readonly root: string,
     private readonly fs: StorageFileSystem,
     private readonly warn: () => void,
+    private readonly backupNotice: () => void = () => {},
+    readonly reportBackupFailure: (code: string) => void = () => {},
   ) {}
 
   private path(key: string): string {
@@ -48,6 +52,76 @@ export class FileStoragePort implements StoragePort {
   save(key: string, json: string): Promise<void> {
     const write = this.tail.then(() => this.commit(key, json));
     this.tail = write.catch(() => undefined);
+    return write;
+  }
+
+  backup(key: string, original: string): Promise<string> {
+    const write = this.tail.then(async () => {
+      const target = this.path(key);
+      const bytes = await this.fs.readFile(target);
+      if (Buffer.from(bytes).toString('utf8') !== original) {
+        throw Object.assign(new Error('storage snapshot changed before backup'), { code: 'SNAPSHOT_CHANGED' });
+      }
+      const hash = createHash('sha256').update(bytes).digest('hex');
+      const prefix = `${basename(target)}.bak-`;
+      let path = `${target}.bak-${hash}`;
+      const temp = join(this.root, `.${key}.${randomUUID()}.tmp`);
+      let handle: StorageFile | undefined;
+      let created = false;
+      let installed = false;
+      let complete = false;
+      try {
+        let existing = false;
+        for (const name of await this.fs.readdir(this.root)) {
+          if (!name.startsWith(prefix)) continue;
+          const suffix = name.slice(prefix.length);
+          if (suffix !== hash && !/^\d{1,20}-[a-f0-9-]{36}$/i.test(suffix)) continue;
+          const candidate = join(this.root, name);
+          const content = await this.fs.readFile(candidate);
+          if (createHash('sha256').update(content).digest('hex') === hash && Buffer.from(content).equals(bytes)) {
+            path = candidate;
+            existing = true;
+            break;
+          }
+          if (suffix === hash) throw Object.assign(new Error('backup content mismatch'), { code: 'EEXIST' });
+        }
+        if (existing) {
+          handle = await this.fs.open(path, 'r');
+          await handle.sync();
+          await handle.close();
+          handle = undefined;
+        } else {
+          handle = await this.fs.open(temp, 'wx', 0o600);
+          created = true;
+          await handle.writeFile(bytes);
+          await handle.sync();
+          await handle.close();
+          handle = undefined;
+          await this.fs.rename(temp, path);
+          created = false;
+          installed = true;
+        }
+        const directory = await this.fs.open(this.root, 'r');
+        try {
+          await directory.sync();
+        } finally {
+          await directory.close();
+        }
+        complete = true;
+        await Promise.resolve()
+          .then(() => this.backupNotice())
+          .catch(() => undefined);
+        return basename(path);
+      } finally {
+        if (handle) await handle.close().catch(() => {});
+        if (created) await this.fs.unlink(temp).catch(() => {});
+        if (installed && !complete) await this.fs.unlink(path).catch(() => {});
+      }
+    });
+    this.tail = write.then(
+      () => undefined,
+      () => undefined,
+    );
     return write;
   }
 

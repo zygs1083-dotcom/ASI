@@ -61,6 +61,86 @@ async function openTile(key: string): Promise<HTMLDetailsElement> {
 }
 
 describe('结构与分区', () => {
+  it.each([320, 420, 1100])('面板在 %ipx 宽的固定高度容器中滚动到底且没有横向溢出', (width) => {
+    const { container } = render(
+      <div style={{ display: 'flex', flexDirection: 'column', width, height: 400 }}>
+        <SensePanel {...makeProps(makeScenario('healthy'))} />
+      </div>,
+    )
+    const panel = container.querySelector<HTMLElement>('[data-panel]')!
+    expect(panel.clientHeight).toBe(400)
+    expect(panel.scrollHeight).toBeGreaterThan(panel.clientHeight)
+    expect(panel.scrollWidth).toBeLessThanOrEqual(panel.clientWidth)
+    panel.scrollTop = panel.scrollHeight
+    expect(panel.scrollTop).toBeGreaterThan(0)
+    const rules = within(panel).getByText('规则', { selector: 'summary' })
+    expect(rules.getBoundingClientRect().bottom).toBeLessThanOrEqual(panel.getBoundingClientRect().bottom)
+  })
+
+  it.each([320, 420, 1100])('位置链在 %ipx 宽时完整显示且不重叠', (width) => {
+    const state = makeState()
+    state.env.where.model = fact({ provider: 'demo', endpoint: 'https://model.example.test/v1', local: false })
+    state.env.where.harness = fact({ host: 'harness-example-host', os: 'demo', pid: 1 })
+    state.env.where.observed = fact({ host: 'observed-example-host', userSession: 'demo' })
+    state.env.where.toolExec = fact({ host: 'tool-example-host', cwd: '/demo' })
+    const { container } = render(
+      <div style={{ width }}>
+        <SensePanel {...makeProps({ ...makeScenario('healthy'), state })} />
+      </div>,
+    )
+    const chain = container.querySelector<HTMLElement>('[aria-label="位置链"]')!
+    const nodes = [...chain.querySelectorAll<HTMLElement>('[class*="locNode"]')]
+    expect(nodes).toHaveLength(4)
+    for (const node of nodes) {
+      const [label, host] = [...node.children].map((element) => element.getBoundingClientRect())
+      const bounds = node.getBoundingClientRect()
+      expect(label!.height).toBeLessThanOrEqual(20)
+      expect(label!.bottom).toBeLessThanOrEqual(host!.top)
+      expect(host!.bottom).toBeLessThanOrEqual(bounds.bottom)
+      expect(node.scrollWidth).toBeLessThanOrEqual(node.clientWidth)
+    }
+    for (let i = 1; i < nodes.length; i++) {
+      const previous = nodes[i - 1]!.getBoundingClientRect()
+      const next = nodes[i]!.getBoundingClientRect()
+      expect(previous.right <= next.left || previous.bottom <= next.top).toBe(true)
+    }
+  })
+
+  it.each([320, 420, 1100])('位置链在 %ipx 宽时完整显示权限原因和操作', (width) => {
+    const state = makeState()
+    state.env.where.model = fact(null, { status: 'denied', reason: '测试权限原因' })
+    state.env.where.observed = fact(null, { status: 'denied', reason: '测试权限原因' })
+    const { container } = render(
+      <div style={{ width }}>
+        <SensePanel {...makeProps({ ...makeScenario('healthy'), state })} />
+      </div>,
+    )
+    const chain = container.querySelector<HTMLElement>('[aria-label="位置链"]')!
+    for (const node of chain.querySelectorAll<HTMLElement>('[class*="locNode"]')) {
+      expect(node.scrollWidth).toBeLessThanOrEqual(node.clientWidth)
+    }
+    expect(within(chain).getAllByRole('button', { name: '授权' })).toHaveLength(2)
+  })
+
+  it('操作失败提示在面板滚动后保持吸顶并可以关闭', async () => {
+    const model = makeScenario('healthy')
+    model.tuning = { parameters: [], log: [], disabled: { reason: 'storage-failed' } }
+    const { container } = render(
+      <div style={{ display: 'flex', flexDirection: 'column', width: 420, height: 400 }}>
+        <SensePanel {...makeProps(model, { onResumeTuning: vi.fn(async () => { throw new Error('test') }) })} />
+      </div>,
+    )
+    fireEvent.click(screen.getByText('规则', { selector: 'summary' }))
+    fireEvent.click(screen.getByRole('button', { name: '恢复 AI 调参' }))
+    const alert = await screen.findByRole('alert')
+    const panel = container.querySelector<HTMLElement>('[data-panel]')!
+    panel.scrollTop = panel.scrollHeight
+    expect(panel.scrollTop).toBeGreaterThan(0)
+    expect(alert.getBoundingClientRect().top).toBeCloseTo(panel.getBoundingClientRect().top, 0)
+    fireEvent.click(within(alert).getByRole('button', { name: '关闭操作提示' }))
+    expect(screen.queryByRole('alert')).toBeNull()
+  })
+
   it('身体/现在/事件流默认展开，规则默认收起', async () => {
     renderPanel(makeScenario('healthy'))
     expect(screen.getByText('环境感知')).toBeTruthy()
@@ -284,6 +364,22 @@ describe('位置链', () => {
 })
 
 describe('事件流', () => {
+  it('说明列表时间和变化率事件预计的共同起点', () => {
+    const model = makeScenario('healthy')
+    model.events = [makeEvent(1, {
+      signal: { kind: 'body.rate', at: T0, subject: '磁盘 /' },
+      detail: { kind: 'body.rate', metric: 'disk:/', windowMs: 60_000, delta: -100, unit: 'bytes', timeToFloorMs: 600_000 },
+    })]
+    const { view } = renderPanel(model)
+    const timeMeaning = screen.getByText(/变化率预计从事件时间起算/)
+    expect(timeMeaning.textContent).toContain('变化率为评估时间')
+    for (const width of [320, 420]) {
+      view.container.style.width = `${width}px`
+      expect(timeMeaning.scrollWidth).toBeLessThanOrEqual(timeMeaning.clientWidth)
+    }
+    expect(screen.getByText(/当时预计 10 分 0 秒后触及底线/)).toBeTruthy()
+  })
+
   it('超过 200 截断、每页 10 条、可翻页', async () => {
     renderPanel(makeScenario('busy-events'))
     expect(screen.getByText(/最新 200 条/)).toBeTruthy()

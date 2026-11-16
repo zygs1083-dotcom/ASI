@@ -2,6 +2,7 @@
 
 import {
   BODY_ROW_PRIORITY,
+  eventMetricKey,
   rowMetricKeys,
   rowUsable,
   type BodyEvaluation,
@@ -58,7 +59,7 @@ function validEta(key: MetricKey, eta: Eta | undefined, now: number): Eta | null
  * 再从该行各指标的 insight.currentEta 里挑最新且仍有效的宿主投影；
  * timeToThresholdMs 是 asOf 时刻的估计，显示前先扣除已流逝时间
  * （remaining = ETA − (now − asOf)，remaining ≤ 0 即视为已到期不显示）；
- * 更新的匹配 body.rate 信号使旧投影失效（信号意味着宿主已重新评估，
+ * 有更新证据的匹配 body.rate 信号使旧投影失效（信号意味着宿主已重新评估，
  * 包括新的无 ETA / 零速率 / 反向更新，不做历史 ETA 替补）。
  */
 export function attentionLine(
@@ -73,22 +74,26 @@ export function attentionLine(
   if (!rowUsable(rowKey, body, model.now)) return null
   const keys = rowMetricKeys(rowKey, body, model.now)
 
-  // 每指标最近一次 body.rate 信号时间（> now 的不算）
+  // 每指标最近一次 body.rate 证据时间（未来事件不算）
   const latestRateAt = new Map<string, number>()
   for (const e of model.events) {
     const d = e.detail
     if (!d || d.kind !== 'body.rate') continue
-    const at = e.signal.at
-    if (!Number.isFinite(at) || at > model.now) continue
-    const cur = latestRateAt.get(d.metric)
-    if (cur == null || at > cur) latestRateAt.set(d.metric, at)
+    if (!Number.isFinite(e.signal.at) || e.signal.at > model.now) continue
+    const evidenceAt = e.signal.data.evidenceAt
+    const at = typeof evidenceAt === 'number' && Number.isFinite(evidenceAt) && evidenceAt <= e.signal.at
+      ? evidenceAt
+      : e.signal.at
+    const metric = eventMetricKey(d.metric)
+    const cur = latestRateAt.get(metric)
+    if (cur == null || at > cur) latestRateAt.set(metric, at)
   }
 
   let best: { key: MetricKey; asOf: number; ms: number } | null = null
   for (const key of keys) {
     const eta = validEta(key, model.insights?.[key]?.currentEta, model.now)
     if (!eta) continue
-    // 更新的匹配 body.rate 信号使旧投影失效：宿主已重新评估
+    // 有更新证据的匹配 body.rate 信号使旧投影失效：宿主已重新评估
     //（含新的无 ETA / 零速率 / 反向更新，不做历史 ETA 替补）。
     const signalAt = latestRateAt.get(key)
     if (signalAt != null && signalAt > eta.asOf) continue

@@ -15,6 +15,8 @@ type Api = Pick<
   | 'feedback'
   | 'resumeTuning'
   | 'resetTuning'
+  | 'retryTuningBackup'
+  | 'dismissTuningBackup'
   | 'acceptRebaseline'
 >;
 type Actions = Omit<SensePanelProps, 'model'>;
@@ -58,6 +60,8 @@ export function createActions(api: Api) {
     onFeedback: (id, verdict) => fire(api.feedback(id, verdict)),
     onResumeTuning: () => complete(() => api.resumeTuning()),
     onResetTuning: () => complete(() => api.resetTuning()),
+    onRetryTuningBackup: () => complete(() => api.retryTuningBackup()),
+    onDismissTuningBackup: () => complete(() => api.dismissTuningBackup()),
     onAcceptRebaseline: (id) => complete(() => api.acceptRebaseline(id)),
   };
   return {

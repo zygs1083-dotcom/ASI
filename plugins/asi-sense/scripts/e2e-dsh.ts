@@ -23,7 +23,7 @@ import {
   webUrl,
 } from './e2e-support.ts';
 import { syntheticBundle } from './e2e-synthetic.ts';
-import { checkResponsive, screenshotDesktop } from './e2e-ui.ts';
+import { checkPanelScroll, checkResponsive, screenshotDesktop, screenshotLocation } from './e2e-ui.ts';
 
 const pkg = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 await using profile = await temporaryProfile();
@@ -197,6 +197,7 @@ try {
   await panelPage.getByRole('button', { name: 'Environment sense', exact: true }).first().click();
   const panel = panelPage.getByTestId('asi-sense-panel');
   await expect(panel.getByRole('heading', { name: '环境感知' })).toBeVisible();
+  await checkPanelScroll(panelPage, panel);
   await panel.locator('summary').filter({ hasText: '规则' }).click();
   await expect(panel.getByLabel('窗口标题发给模型')).not.toBeChecked();
   for (const metric of ['cpu', 'memory', 'disks']) {
@@ -374,8 +375,14 @@ try {
     await mkdir('/tmp/asi-sense-e2e-shots', { recursive: true, mode: 0o700 });
     shots = await mkdtemp('/tmp/asi-sense-e2e-shots/run-');
     await screenshotDesktop(panelPage, panel, join(shots, 'asi-sense.png'));
+    await screenshotLocation(panel, join(shots, 'location-wide.png'));
   }
-  await checkResponsive(panelPage, panel, shots ? join(shots, 'asi-sense-mobile.png') : undefined);
+  await checkResponsive(
+    panelPage,
+    panel,
+    shots ? join(shots, 'asi-sense-mobile.png') : undefined,
+    shots ? join(shots, 'location-narrow.png') : undefined,
+  );
   expect(browserErrors).toBe(0);
   expect(await count()).toBeLessThanOrEqual(limit);
   console.log(`Model request upper bound: ${await count()}/${limit}`);
@@ -400,6 +407,7 @@ try {
   ]);
   if (cleanup.some((result) => result.status === 'rejected')) {
     console.error(`Browser cleanup: ${cleanup[0].status}; DSH cleanup: ${cleanup[1].status}`);
+    for (const result of cleanup) if (result.status === 'rejected') console.error(result.reason);
     process.exitCode = 1;
   }
   const remaining = helperPids();

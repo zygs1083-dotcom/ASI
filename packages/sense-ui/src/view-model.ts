@@ -275,4 +275,30 @@ export interface SensePanelProps {
   onResumeTuning: () => Promise<void>
   onResetTuning: () => Promise<void>
   onAcceptRebaseline: (id: string) => Promise<void>
+  onRetryTuningBackup?: () => Promise<void>
+  onDismissTuningBackup?: () => Promise<void>
+  tuningCopy?: {
+    backupFailed: string
+    saveFailed: string
+    permission: string
+    noSpace: string
+    readOnly: string
+    snapshotChanged: string
+    backupUnavailable: string
+    unknown: string
+    retry: string
+    reset: string
+    backupCorrupt: string
+    backupUnknown: string
+    restored: string
+    dismissBackup: string
+    restoreUnknown: string
+    restoreCorrupt: string
+    confirmReset: string
+    cancel: string
+    resetMessage: string
+    processing: string
+    actionFailed: string
+    actionUnconfirmed: string
+  }
 }

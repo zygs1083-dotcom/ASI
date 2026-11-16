@@ -8,6 +8,7 @@ import { intake } from './intake.ts';
 import type { AttentionPipelineOptions, SessionContext, SessionState } from './pipeline-types.ts';
 import { DEFAULT_RULES, validateRule } from './rules.ts';
 import { classifyCause } from './selfcause.ts';
+import { type AlertLevels, tunedRule } from './tuning.ts';
 
 export type {
   AttentionPipelineOptions,
@@ -40,8 +41,9 @@ export class AttentionPipeline {
   private readonly clock: () => number;
   private readonly wallClock: () => number;
   private readonly rules: WatchRule[];
-  private readonly mergeWindowMs: number;
-  private readonly fileMergeWindowMs: number;
+  private mergeWindowMs: number;
+  private fileMergeWindowMs: number;
+  private levels: AlertLevels = { 'body.rate': 'context', 'body.anomaly': 'context', 'file.burst': 'wake' };
   private readonly sessions = new Map<string, SessionState>();
   private readonly disposed = new Map<string, number>();
   /**
@@ -90,6 +92,36 @@ export class AttentionPipeline {
   /** Cumulative count of wake groups suppressed by the budget. */
   get suppressed(): number {
     return this.drain.suppressed;
+  }
+  setMergeWindows(mergeWindowMs: number, fileMergeWindowMs: number): void {
+    if (
+      !Number.isFinite(mergeWindowMs) ||
+      mergeWindowMs <= 0 ||
+      !Number.isFinite(fileMergeWindowMs) ||
+      fileMergeWindowMs <= 0
+    )
+      throw new TypeError('merge windows must be positive finite numbers');
+    this.mergeWindowMs = mergeWindowMs;
+    this.fileMergeWindowMs = fileMergeWindowMs;
+    this.drain.setMergeWindows(mergeWindowMs, fileMergeWindowMs);
+  }
+  setDeliveryLevels(levels: AlertLevels, actor: 'agent' | 'user' = 'agent'): void {
+    if (
+      (actor !== 'agent' && actor !== 'user') ||
+      !['record', 'context'].includes(levels['body.rate']) ||
+      !['record', 'context'].includes(levels['body.anomaly']) ||
+      !['record', 'context', 'wake'].includes(levels['file.burst'])
+    )
+      throw new TypeError('invalid alert delivery levels');
+    if (actor !== 'user' && levels['file.burst'] === 'wake' && this.levels['file.burst'] !== 'wake')
+      throw new TypeError('only a trusted user can restore wake');
+    this.levels = { ...levels };
+  }
+  selectRule(signal: Signal, rules: readonly WatchRule[] = this.rules): WatchRule | undefined {
+    return tunedRule(rules, signal, this.wallClock(), this.levels);
+  }
+  refreshFeedback(available: (id: string) => boolean): void {
+    this.drain.refreshFeedback(available);
   }
 
   /** Updates the latest context for a session (e.g. busy flag) without a signal. */
@@ -160,8 +192,14 @@ export class AttentionPipeline {
   async accept(signal: Signal, session: SessionContext, onIntake?: (change: EnvChange) => void): Promise<EnvChange> {
     return this.process(signal, session, 1, true, false, onIntake);
   }
-  async acceptCount(signal: Signal, session: SessionContext, count: number, other = false): Promise<EnvChange> {
-    return this.process(signal, session, count, false, other);
+  async acceptCount(
+    signal: Signal,
+    session: SessionContext,
+    count: number,
+    other = false,
+    pending?: { rule?: WatchRule; reason?: string },
+  ): Promise<EnvChange> {
+    return this.process(signal, session, count, false, other, undefined, pending);
   }
   private async process(
     signal: Signal,
@@ -170,10 +208,11 @@ export class AttentionPipeline {
     apply: boolean,
     other = false,
     onIntake?: (change: EnvChange) => void,
+    pending?: { rule?: WatchRule; reason?: string },
   ): Promise<EnvChange> {
     const ev = structuredClone(signal);
-    ev.cause = classifyCause(ev, session.toolWindows ?? [], 0, this.clock());
-    if (!apply) return this.intake(ev, session, this.clock(), count, other);
+    if (!pending) ev.cause = classifyCause(ev, session.toolWindows ?? [], 0, this.clock());
+    if (!apply) return this.intake(ev, session, this.clock(), count, other, pending);
     return await new Promise<EnvChange>((resolve, reject) => {
       this.store.apply(ev, (result) => {
         try {
@@ -190,7 +229,15 @@ export class AttentionPipeline {
     });
   }
 
-  private intake(ev: Signal, session: SessionContext, now: number, count: number, other = false): EnvChange {
+  /** All mutable accept intake — runs inside the store's apply callback (FIFO). */
+  private intake(
+    ev: Signal,
+    session: SessionContext,
+    now: number,
+    count: number,
+    other = false,
+    pending?: { rule?: WatchRule; reason?: string },
+  ): EnvChange {
     return intake(
       this.session(session.id),
       ev,
@@ -198,11 +245,11 @@ export class AttentionPipeline {
       now,
       count,
       other,
-      this.rules,
-      () => this.wallClock(),
+      (signal) => this.selectRule(signal),
       this.drain,
       this.mergeWindowMs,
       this.fileMergeWindowMs,
+      pending,
     );
   }
 

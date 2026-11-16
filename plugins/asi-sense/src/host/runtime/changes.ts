@@ -90,5 +90,7 @@ export function observableActions(actions: SenseActions, changed: () => void): S
     acceptRebaseline: (id) => publish(actions.acceptRebaseline(id)),
     resumeTuning: () => publish(actions.resumeTuning()),
     resetTuning: () => publish(actions.resetTuning()),
+    retryTuningBackup: () => publish(actions.retryTuningBackup()),
+    dismissTuningBackup: () => publish(actions.dismissTuningBackup()),
   };
 }
