@@ -1,195 +1,262 @@
 import assert from 'node:assert/strict';
-import type { Body, BodyThresholdSample, BodyThresholdState, Fact, Signal } from '@asi/sense-types';
-import { AnomalyEvaluator, Baseline, BodyMonitor, FileBurstDetector, Tuner } from '../src/host/body/index.ts';
+import type { BodyThresholdSample, BodyThresholdState, Signal } from '@asi/sense-types';
+import { AttentionPipeline, type DeliveryIntent } from '../src/host/attention/pipeline.ts';
+import { DEFAULT_RULES } from '../src/host/attention/rules.ts';
+import { BodyMonitor, defaultBodyRules } from '../src/host/body/index.ts';
+import { StateStore } from '../src/host/state/store.ts';
+import { DAY, disturbances, type Frame, HOUR, ROOT, SEEDS, START, trace } from './eval-body.data.ts';
 
-// Entirely synthetic: Monday UTC start, one-minute samples, xorshift32 seed.
-const MIN = 60_000;
-const HOUR = 60 * MIN;
-const DAY = 24 * HOUR;
-const GIB = 1024 ** 3;
-const START = Date.UTC(2026, 10, 2);
-const source = { id: 'synthetic', api: 'eval', host: 'fixture' };
-let now = START;
-let seed = 0x415349;
-function noise() {
-  seed ^= seed << 13;
-  seed ^= seed >>> 17;
-  seed ^= seed << 5;
-  return ((seed >>> 0) / 2 ** 32 - 0.5) * 2;
-}
-const injections = [
-  { name: 'disk drop', metric: 'disk:/', kind: 'body.rate', start: DAY + 2 * HOUR + 15 * MIN, duration: 10 * MIN },
-  { name: 'RSS leak', metric: 'rss', kind: 'body.rate', start: 2 * DAY + 4 * HOUR + 15 * MIN, duration: 10 * MIN },
-  { name: 'excess deletion', metric: '/fixture/work', kind: 'file.burst', start: 3 * DAY + HOUR, duration: MIN },
-  {
-    name: 'CPU anomaly',
-    metric: 'cpu',
-    kind: 'body.anomaly',
-    start: 4 * DAY + 12 * HOUR + 15 * MIN,
-    duration: 10 * MIN,
-  },
-  {
-    name: 'context drain',
-    metric: 'context',
-    kind: 'body.rate',
-    start: 5 * DAY + 8 * HOUR + 15 * MIN,
-    duration: 10 * MIN,
-  },
-];
-function elapsed(name: string, t: number) {
-  const injection = injections.find((i) => i.name === name);
-  assert(injection);
-  const delta = t - injection.start;
-  return delta >= 0 && delta < injection.duration ? delta / 1000 : undefined;
-}
-function sample(t: number): BodyThresholdSample {
-  const at = START + t;
-  const fact = <T>(value: T): Fact<T> => ({ value, observedAt: at, ttlMs: 2 * MIN, status: 'ok', source });
-  const hour = (t % DAY) / HOUR;
-  const weekend = new Date(at).getUTCDay() % 6 === 0 ? 0.65 : 1;
-  const cycle = (1 + Math.sin(((hour - 6) / 24) * 2 * Math.PI)) / 2;
-  const cpu = elapsed('CPU anomaly', t) === undefined ? (0.15 + 0.16 * cycle + 0.008 * noise()) * weekend : 0.95;
-  const rss = GIB + 16 * 1024 ** 2 * cycle + 1024 ** 2 * noise() + (elapsed('RSS leak', t) ?? 0) * 4 * 1024 ** 2;
-  const free = 60 * GIB + 16 * 1024 ** 2 * noise() - (elapsed('disk drop', t) === undefined ? 0 : 4 * GIB);
-  const used = 20_000 + 100 * cycle + 20 * noise() + (elapsed('context drain', t) ?? 0) * 300;
-  const body: Body = {
-    cpu: fact({ usage: cpu, perCore: [cpu], load1: cpu, load5: cpu, load15: cpu }),
-    memory: fact({ total: 16 * GIB, used: 5 * GIB, pressure: 'normal', swapUsed: 0 }),
-    disks: fact([{ mount: '/', total: 100 * GIB, free }]),
-    battery: fact(null),
-    thermal: fact('nominal'),
-    network: fact({ online: true, rxBps: 5000 + 1000 * cycle * weekend, txBps: 1000 }),
-    harnessProcess: fact({ rss, cpu, uptimeSec: t / 1000 }),
-    tokens: fact({
-      contextWindow: 120_000,
-      contextUsed: used,
-      sessionUsage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-    }),
-  };
-  return { at, body, source };
-}
-const baseline = new Baseline({ clock: () => now, installedAt: START });
-const monitor = new BodyMonitor({
-  rateRules: [
-    { id: 'disk-loss', metric: 'disk:/', direction: 'down', windowMs: MIN, maxDelta: 2 * GIB },
-    { id: 'rss-leak', metric: 'rss', direction: 'up', windowMs: 5 * MIN, maxSlope: 2 * 1024 ** 2 },
-    { id: 'context-loss', metric: 'context', direction: 'down', windowMs: MIN, maxSlope: 100 },
-  ],
-  anomaly: new AnomalyEvaluator(baseline, [{ id: 'cpu-anomaly', metric: 'cpu', sigma: 3 }]),
-});
-const burst = new FileBurstDetector();
-const alerts: Signal[] = [];
-const stableSamples = Array<number>(7).fill(0);
-const falsePositives = Array<number>(7).fill(0);
-let state: BodyThresholdState = {};
-let prev = sample(0);
-function stable(t: number) {
-  // An injected disturbance is not stationary; include the longest rate window
-  // after it ends. Count every other entry alert, including floor alerts.
-  return !injections.some((i) => t >= i.start && t <= i.start + i.duration + 5 * MIN);
-}
-function record(signal: Signal) {
-  if (signal.data.severity === 'normal' || signal.data.level === 'record') return;
-  alerts.push(signal);
-  const t = signal.at - START;
-  if (stable(t)) falsePositives[Math.floor(t / DAY)]++;
-}
-for (let t = MIN; t <= 7 * DAY; t += MIN) {
-  now = START + t;
-  const next = sample(t);
-  const result = monitor.evaluate(prev, next, state);
-  state = result.state;
-  for (const signal of result.signals) record(signal);
-  if (t < 7 * DAY && stable(t)) stableSamples[Math.floor(t / DAY)]++;
-  if (t === injections[2].start) {
-    for (let j = 0; j < 60; j++) {
-      for (const signal of burst.accept({
-        id: `delete-${j}`,
-        kind: 'file.changed',
-        at: now + j * 500,
-        source,
-        subject: `/fixture/work/file-${j}.txt`,
-        data: { change: 'delete' },
-        cause: 'user',
-      }))
-        record(signal);
+type Counts = { detector: number[]; delivery: number[] };
+type Delays = Map<string, { detector: number; delivery?: number }>;
+const freshCounts = (): Counts => ({ detector: Array(7).fill(0), delivery: Array(7).fill(0) });
+const alert = (s: Signal) => s.data.severity !== 'normal' && s.data.level !== 'record';
+const session = { id: 'synthetic-session', busy: false, userInitiated: false };
+
+class Replay {
+  private mono: number;
+  private wall: number;
+  private snapshot?: string;
+  private monitor: BodyMonitor;
+  private state: BodyThresholdState = {};
+  private prev?: BodyThresholdSample;
+  private coldStart = false;
+  private readonly pipeline: AttentionPipeline;
+  private readonly provenance = new Map<string, number>();
+  readonly counts = freshCounts();
+  readonly delays: Delays = new Map();
+  readonly restarts: number[] = [];
+  readonly cpuEvidence: unknown[] = [];
+  readonly falseEvidence: unknown[] = [];
+  sustainedSamples = 0;
+
+  constructor(
+    private readonly injections: boolean,
+    start = START,
+  ) {
+    this.wall = start;
+    this.mono = start - START;
+    this.monitor = this.createMonitor();
+    this.pipeline = new AttentionPipeline({
+      store: new StateStore(
+        () => this.wall,
+        undefined,
+        () => this.mono,
+      ),
+      clock: () => this.mono,
+      wallClock: () => this.wall,
+      rules: [...DEFAULT_RULES, ...defaultBodyRules()],
+      deliverer: { deliver: async (intent) => this.delivered(intent) },
+    });
+  }
+
+  private createMonitor(): BodyMonitor {
+    return new BodyMonitor({
+      clock: () => this.mono,
+      wallClock: () => this.wall,
+      timeZone: 'America/New_York',
+      fileBurst: { roots: [ROOT] },
+      persistence: {
+        load: async () => this.snapshot,
+        save: async (data) => {
+          this.snapshot = data;
+        },
+      },
+    });
+  }
+
+  async restore(snapshot?: string): Promise<void> {
+    this.snapshot = snapshot;
+    this.coldStart = snapshot === undefined && this.wall === START;
+    await this.monitor.restore();
+    this.state = this.monitor.restoredState ?? {};
+  }
+
+  async capture(): Promise<string> {
+    await this.monitor.persist();
+    assert(this.snapshot, 'persist must produce a snapshot');
+    return this.snapshot;
+  }
+
+  async restart(): Promise<void> {
+    const snapshot = await this.capture();
+    await this.monitor.close();
+    this.monitor = this.createMonitor();
+    await this.restore(snapshot);
+    this.prev = undefined;
+    this.restarts.push(this.mono);
+  }
+
+  private disturbance(s: Signal, elapsed: number) {
+    return disturbances.find(
+      (d) =>
+        s.kind === d.kind &&
+        (s.data.metric === d.metric || s.subject === d.metric) &&
+        elapsed >= d.start &&
+        elapsed < d.start + d.duration,
+    );
+  }
+
+  private delivered(intent: DeliveryIntent): void {
+    for (const change of intent.update.changes) {
+      const elapsed = this.provenance.get(change.signal.id);
+      assert(elapsed !== undefined, 'delivered signals must have recorded detector provenance');
+      if (!this.injections) this.counts.delivery[Math.floor(elapsed / DAY)] += change.count;
+      const disturbance = this.disturbance(change.signal, elapsed);
+      if (this.injections && disturbance) {
+        const delay = this.delays.get(disturbance.name);
+        assert(delay, 'delivery cannot precede detection');
+        delay.delivery ??= this.mono - disturbance.start;
+        assert.equal(change.level, disturbance.kind === 'file.burst' ? 'wake' : 'context');
+      }
     }
   }
-  prev = next;
-}
-console.log('# Body Adaptive Evaluation\n');
-console.log('Synthetic only; xorshift32 seed 0x415349; 7 days, 60s cadence, UTC hourly-week buckets.');
-console.log(
-  'Calm data includes a daily cycle, bounded noise and weekend amplitude 0.65; no model or host observations.\n',
-);
-console.log('| Injection | Detected | Delay (s) |');
-console.log('| --- | --- | ---: |');
-for (const injection of injections) {
-  const found = alerts.find(
-    (signal) =>
-      signal.kind === injection.kind &&
-      (signal.data.metric === injection.metric || signal.subject === injection.metric) &&
-      signal.at >= START + injection.start &&
-      signal.at < START + injection.start + injection.duration,
-  );
-  console.log(
-    `| ${injection.name} | ${found ? 'yes' : 'NO'} | ${found ? (found.at - START - injection.start) / 1000 : '-'} |`,
-  );
-  assert(found, `Missed injection: ${injection.name}`);
-}
-console.log('\n| Day | Stable exposure (days) | False alerts | False alerts / stable day |');
-console.log('| ---: | ---: | ---: | ---: |');
-for (let day = 0; day < 7; day++) {
-  const exposure = (stableSamples[day] * MIN) / DAY;
-  const rate = falsePositives[day] / exposure;
-  console.log(`| ${day + 1} | ${exposure.toFixed(4)} | ${falsePositives[day]} | ${rate.toFixed(4)} |`);
-  if (day >= 1) assert(rate < 1, `Day ${day + 1} false-positive rate >= 1`);
-}
-console.log(
-  '\nStable exposure excludes only injected intervals plus 5min of rate-window washout; recovery signals are not alerts.',
-);
-console.log('\n| Installed hours | Learning progress (%) |');
-console.log('| ---: | ---: |');
-for (const hour of [0, 6, 7.2, 12, 18, 24, 48, 168]) {
-  now = START + hour * HOUR;
-  console.log(`| ${hour} | ${baseline.learningProgress.toFixed(1)} |`);
+
+  async step(frame: Frame, measured: boolean): Promise<void> {
+    this.mono = frame.elapsed;
+    this.wall = frame.wall;
+    const sustained = disturbances.find((d) => d.name === 'CPU sustained (2h)');
+    const checkDrift =
+      this.injections &&
+      sustained !== undefined &&
+      frame.elapsed >= sustained.start &&
+      frame.elapsed < sustained.start + sustained.duration;
+    const before = checkDrift ? this.monitor.baseline.read('cpu', frame.wall) : undefined;
+    const result = this.monitor.evaluate(this.prev ?? frame.sample, frame.sample, this.state);
+    this.state = result.state;
+    this.prev = frame.sample;
+    if (checkDrift) {
+      assert(before && before.count >= 8 && before.dates >= 2, 'sustained scenario needs mature hourly buckets');
+      assert.deepEqual(this.monitor.baseline.read('cpu', frame.wall), before, 'abnormal CPU must not train baseline');
+      if (frame.sample.body.cpu.value) this.sustainedSamples++;
+    }
+    const signals = [...result.signals, ...frame.files.flatMap((s) => this.monitor.accept(s))];
+    if (!measured) return;
+    const cpu = disturbances.find((d) => d.name === 'CPU anomaly');
+    if (this.injections && cpu && frame.elapsed >= cpu.start && frame.elapsed < cpu.start + cpu.duration) {
+      this.cpuEvidence.push({
+        elapsed: frame.elapsed,
+        value: frame.sample.body.cpu.value?.usage,
+        installedAt: this.monitor.baseline.installedAt,
+        stat: this.monitor.baseline.read('cpu', frame.wall),
+      });
+    }
+    for (const signal of signals) {
+      this.provenance.set(signal.id, frame.elapsed);
+      if (!this.injections && alert(signal)) {
+        this.counts.detector[Math.floor(frame.elapsed / DAY)]++;
+        if (this.falseEvidence.length < 20) this.falseEvidence.push({ elapsed: frame.elapsed, signal });
+        if (this.coldStart && frame.elapsed < DAY) {
+          assert.notEqual(signal.kind, 'body.anomaly', 'cold first day must remain learning');
+        }
+      }
+      const disturbance = this.disturbance(signal, frame.elapsed);
+      if (this.injections && alert(signal) && disturbance && !this.delays.has(disturbance.name)) {
+        this.delays.set(disturbance.name, { detector: frame.elapsed - disturbance.start });
+      }
+      await this.pipeline.accept(signal, session);
+    }
+    await this.pipeline.preStep(session.id);
+    this.mono += 2501;
+    await this.pipeline.flush();
+  }
+
+  async close(): Promise<void> {
+    await this.monitor.close();
+  }
 }
 
-// Replay distinct alert feedback for ONE rule. Every 3 consecutive noise labels
-// requests 20% less sensitivity: an upper sigma threshold is divided by 0.8.
-now = START + 7 * DAY;
-const tuner = new Tuner(
-  {
-    'cpu.sigma': { value: 3, min: 1, max: 12, noiseDirection: 'up' },
-    'floor.disk': { value: 0.05, min: 0.02, max: 0.5, tighten: 'up' },
-  },
-  () => now,
-);
-for (let i = 0; i < 9; i++) {
-  tuner.registerAlert(`cpu-${i}`, 'cpu-anomaly', 'cpu.sigma');
-  tuner.feedback(`cpu-${i}`, 'noise');
+async function warmup(seed: number): Promise<string> {
+  const replay = new Replay(false, START - 14 * DAY);
+  try {
+    await replay.restore();
+    for (const frame of trace(seed, { warmup: true })) await replay.step(frame, false);
+    return await replay.capture();
+  } finally {
+    await replay.close();
+  }
 }
-tuner.propose({ param: 'floor.disk', to: 0.04, reason: 'must reject loosening a safety floor' }, 'agent');
-tuner.lock('cpu.sigma');
-tuner.propose({ param: 'cpu.sigma', to: 5, reason: 'must reject a locked parameter' }, 'agent');
-console.log('\n## Repeated Noise Feedback\n');
-console.log('| Operation | Parameter | From | To | Status | Reason |');
-console.log('| --- | --- | ---: | ---: | --- | --- |');
-for (const log of tuner.logs.filter((log) => log.operation !== 'feedback')) {
-  console.log(
-    `| ${log.operation} | ${log.param} | ${log.from} | ${log.to} | ${log.status} | ${log.rejectionReason ?? log.reason} |`,
-  );
+
+async function stable(seed: number, cohort: string, snapshot?: string): Promise<void> {
+  const replay = new Replay(false);
+  let restart = 0;
+  try {
+    await replay.restore(snapshot);
+    for (const frame of trace(seed)) {
+      if (restart < 2 && frame.elapsed >= (2.5 + restart * 3) * DAY) {
+        await replay.restart();
+        restart++;
+      }
+      await replay.step(frame, true);
+    }
+    assert.equal(replay.restarts.length, 2);
+    for (let day = 0; day < 7; day++) {
+      const detector = replay.counts.detector[day];
+      const delivery = replay.counts.delivery[day];
+      console.log(`| ${seed.toString(16)} | ${cohort} | ${day + 1} | ${detector} | ${delivery} |`);
+      assert(detector < 1, `${seed}/${cohort}/day${day + 1}: ${JSON.stringify(replay.falseEvidence)}`);
+      assert(delivery < 1, `${seed}/${cohort}/day${day + 1}: delivery false alerts >=1`);
+    }
+  } finally {
+    await replay.close();
+  }
 }
-const applied = tuner.logs.filter((log) => log.operation === 'propose' && log.status === 'applied');
-assert.equal(applied.length, 2);
-assert.equal(tuner.get('cpu.sigma'), 4.6875);
-assert.equal(tuner.get('floor.disk'), 0.05);
-for (const log of applied) {
-  assert.equal(typeof log.from, 'number');
-  assert.equal(typeof log.to, 'number');
-  assert(Math.abs(Number(log.to) - Number(log.from)) <= Math.abs(Number(log.from)) * 0.5);
+
+async function latency(seed: number, snapshot: string): Promise<Delays> {
+  const replay = new Replay(true);
+  try {
+    await replay.restore(snapshot);
+    for (const frame of trace(seed, { inject: true })) await replay.step(frame, true);
+    assert(replay.sustainedSamples >= 100, 'two-hour drift check must cover >=100 valid CPU samples');
+    for (const d of disturbances) {
+      const delay = replay.delays.get(d.name);
+      assert(delay, `${seed}: missed ${d.name}; CPU evidence ${JSON.stringify(replay.cpuEvidence.slice(0, 6))}`);
+      assert(delay.delivery !== undefined, `${seed}: no pipeline delivery for ${d.name}`);
+      assert(delay.detector <= 5 * 60_000, `${seed}: ${d.name} detection exceeded 5min`);
+      assert(delay.delivery <= delay.detector + 2501, `${seed}: delayed pipeline delivery for ${d.name}`);
+    }
+    return replay.delays;
+  } finally {
+    await replay.close();
+  }
 }
-assert(tuner.logs.some((log) => log.status === 'rejected' && log.by === 'auto'));
+
+console.log('# Body Adaptive Evaluation\n');
+console.log('Offline synthetic fixtures only; no observed host data, filesystem watching, model or network requests.');
+console.log('Fixed xorshift32 seeds; independent workload generator never reads detector parameters.');
+console.log('Cold and mature cohorts each cover seven complete 24h receipt-time days, including cold day one.');
+console.log('Mature baselines come from a separate 14-day, 90s-cadence training capture, reused without retraining.');
+console.log('Weekly-hour buckets need two dates, so disturbance latencies use mature captures, not cold week one.');
+console.log('Both stable cohorts include stationary high-variance CPU/network/RSS, sub-threshold boundary jitter,');
+console.log('49/50 external deletes across watched subdirectories, 120 self-caused adds/modifies, missing facts,');
+console.log('four-minute outages, 35-53s jitter, two restarts, NY spring DST and +3h/rollback wall jumps.');
+console.log('False counts are alert entries (not recoveries/audits); delivered counts sum EnvChange.count,');
+console.log('after actual defaultBodyRules + M1 intake/preStep/flush, not payload delivery-level guesses.\n');
+console.log('| Seed (hex) | Cohort | Day | Detector False | Delivery False |');
+console.log('| --- | --- | ---: | ---: | ---: |');
+const captures = new Map<number, string>();
+for (const seed of SEEDS) {
+  const snapshot = await warmup(seed);
+  captures.set(seed, snapshot);
+  await stable(seed, 'cold');
+  await stable(seed, 'mature', snapshot);
+}
+console.log('\n| Seed (hex) | Disturbance | Detector Delay (s) | Delivery Delay (s) |');
+console.log('| --- | --- | ---: | ---: |');
+for (const seed of SEEDS) {
+  const snapshot = captures.get(seed);
+  assert(snapshot);
+  const delays = await latency(seed, snapshot);
+  for (const d of disturbances) {
+    const delay = delays.get(d.name);
+    assert(delay?.delivery !== undefined);
+    console.log(
+      `| ${seed.toString(16)} | ${d.name} | ${(delay.detector / 1000).toFixed(3)} | ${(delay.delivery / 1000).toFixed(3)} |`,
+    );
+  }
+}
+console.log('\nPASS: 3 seeds x 2 cohorts x 7 daily detector/delivery assertions; five classes detected and delivered.');
 console.log(
-  '\nPASS: five injections detected; days 2-7 <1 false alert/stable day; only two guarded auto changes, floor unchanged.',
+  'Additional two-hour sustained CPU scenario: >=100 valid samples/seed, every before/after baseline identical.',
 );
+console.log('\nLimits: bounded synthetic workloads, not arbitrary real workloads; 14-day training is not scored.');
+console.log(`Clock fixtures start ${new Date(START).toISOString()}; each measured cohort spans ${(7 * DAY) / HOUR}h.`);

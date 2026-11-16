@@ -112,8 +112,106 @@ and deterministic environment-update formatting.
 
 ## M1 boundaries
 
-No persistence, watchers, helpers, DSH/Cordis integration or model requests.
-Rate/anomaly/burst/tuning contracts are types only; data stays local.
+The M1 attention/state implementation remains unchanged: no persistence,
+watchers, helpers, DSH/Cordis integration or model requests in that layer.
+Body detection adds local evaluators and persistence ports, not host IO.
+
+## Adaptive Body Monitoring
+
+`src/host/body/index.ts` exports `BodyMonitor`, `Tuner`, `Baseline`,
+`defaultBodyRules()` and the individual evaluator seams. No body API sends
+model requests, watches files or delivers attention intents.
+
+- `new BodyMonitor()` installs disk loss (>2GiB/60s), RSS growth (>50%/5min),
+  context exhaustion (ETA <=10min) and external file deletion (>50/60s).
+  The first three use body samples; pass `file.changed` signals to
+  `monitor.accept(signal)` for the fourth. Configure `fileBurst.roots` to
+  aggregate a watched tree's scattered subdirectories; absent roots, each
+  directory has its own independent watermark/window.
+- Baseline and CPU/memory/network anomaly detection are assembled by default.
+  Anomalies wait 24 full hours since persisted installation time, then require
+  eight valid samples on two different local dates **in that weekly-hour
+  bucket**. Cold installations can therefore take more than a week to qualify
+  a bucket. The first eight readings calibrate mean/median/MAD, followed by
+  clipped EWMA and stochastic median/MAD updates. Pending outliers and readings
+  sustaining a warning do not train their own baseline, including across hour
+  boundaries; normal readings continue learning.
+- `rateRules` and `anomalyRules` explicitly replace their respective defaults;
+  `[]` deliberately disables that adaptive layer. Fixed safety floors remain
+  active. An injected `baseline` is an immutable seed, forked in caller state.
+  `timeZone` defaults to the runtime's resolved IANA zone; repeated DST hours
+  share a bucket and skipped hours create none. The zone is persisted.
+- Evaluator state belongs to the caller. Thread `result.state` into the next
+  `evaluate(prev, next, state)`; histories, streaks and per-source latches live
+  under the enumerable `BODY_HISTORY` symbol. Keep that symbol when copying
+  state (object spread does); JSON persistence uses the dedicated monitor
+  snapshot instead. Retry a failed evaluation with its original input state.
+  After restore, resume with `monitor.restoredState ?? {}`.
+
+### Trusted Tuning Boundary
+
+Construct `new Tuner(whitelist, { actor, clock, wallClock })`; `actor()` is a
+**trusted host resolver**, defaulting to `agent`. Only authenticated sidebar
+user calls may resolve to `user`; never forward a tool's `by`/`actor` field
+into that resolver. `propose({ param, to, reason })`, `lock`, `unlock`,
+`revert(id)` and `feedback` do not accept caller-declared identity.
+
+Every `floor.*` spec needs a finite numeric value and `tighten: 'up'|'down'`;
+known free-disk/context/battery floors must use `'up'`. AI checks against the
+**current** effective value, never the original default. Agent and automatic
+feedback changes share +/-50% amplitude, locks and sliding caps of two per
+parameter/hour, six per parameter/day and 24 total/day. User changes bypass
+those AI limits but retain whitelist/type/bounds checks and audit records;
+only users can lock/unlock or loosen floors. User revert also bypasses a
+lock; agent revert uses the same AI guards. Superseded IDs cannot be reverted.
+The 500-entry display log is separate from retained applied/undo history.
+
+### Persistence And Clocks
+
+Supply `BodyPersistence` with `load(): Promise<string | undefined>` and
+`save(data: string): Promise<void>`. `undefined` means first installation.
+The host owns local access control and **atomic temp-file + rename writes**;
+M3 will connect the port to DSH `storageDomain`. Pass the port to the monitor
+for one versioned snapshot containing baseline, installation time, zone,
+latches, tuner values, locks, audits, quota windows and ID lineage. Do not
+also configure a separate tuner store when the monitor owns the combined one.
+
+Always `await monitor.restore()` before use (or `tuner.restore()` standalone).
+AI and automatic saving stay blocked before restore. Mutations coalesce saves
+to at most once per 10s; `persist()` explicitly flushes, and shutdown must
+`await monitor.close()` (or standalone `tuner.close()`). These explicit flushes
+are exempt from throttling. Save failures from explicit flushes reject for
+host retry; the host must also monitor its storage adapter's background errors.
+
+Malformed/unknown-version/non-finite snapshots fail closed:
+`tuningDisabled === 'restore-failed'` is exposed for the sidebar, baseline
+learning resets, AI stays disabled across restarts and IDs get a new random
+prefix. No automatic "fresh start" can clear quota/lock protection. A trusted
+user may still tune; repairing/resetting damaged storage is an explicit host
+recovery operation, not an agent tool.
+
+Use injected monotonic milliseconds (default `performance.now()`) for rate
+windows, quotas and save throttling; live samples should carry `monotonicAt`.
+Standalone evaluator `at` fallback is for deterministic logical replay only.
+Wall time (default `Date.now()`) serves audit display, installation age and
+local weekly buckets; non-finite inputs are rejected. Restart recovery
+persists remaining quota durations plus a wall high-water mark: downtime,
+including forward wall jumps, never expires saved budgets. A wall rollback
+freezes AI as fully used until wall time catches up, then remaining windows
+age on the new process's monotonic clock. Rate windows restart cold because
+old process monotonic stamps are meaningless; wall jumps cannot erase a
+running rate window.
+
+### Attention Installation
+
+The host/M3 installs `defaultBodyRules()` alongside M1 `DEFAULT_RULES`, or
+explicitly replaces them with its own validated `WatchRule[]`. Built-ins
+route rate/anomaly warnings to `context`, recoveries to `record`, and external
+deletion-overage bursts to pre-approved `wake`; self-caused add/modify/delete
+activity remains `record` with `cause: 'agent'`. Body detection only produces
+signals: M1 `accept` intakes them, then `preStep`/`flush` controls delivery.
+Regression evidence and the offline multi-seed report live in
+`scripts/eval-body.md`.
 
 ## Requirements
 

@@ -41,6 +41,42 @@ describe('Tuner hard guard regressions', () => {
     expect(tuner.logs.at(-1)?.at).toBe(WALL);
   });
 
+  it('preserves the daily budget across restart despite a forward wall-clock jump', async () => {
+    let mono = 0;
+    let wall = WALL;
+    let data: string | undefined;
+    const persistence = {
+      load: async () => data,
+      save: async (value: string) => {
+        data = value;
+      },
+    };
+    const create = () =>
+      new Tuner(
+        { x: { value: 10 } },
+        {
+          clock: () => mono,
+          wallClock: () => wall,
+          persistence,
+        },
+      );
+    const a = create();
+    await a.restore();
+    for (let hour = 0; hour < 3; hour++) {
+      mono = hour * HOUR;
+      expect(a.propose({ param: 'x', to: 11 }).applied).toBe(true);
+      expect(a.propose({ param: 'x', to: 10 }).applied).toBe(true);
+    }
+    await a.close();
+    wall += 2 * 24 * HOUR;
+    mono = 0;
+    const b = create();
+    await b.restore();
+    mono = HOUR + 1;
+    expect(b.propose({ param: 'x', to: 11 }).reason).toBe('daily change limit');
+    await b.close();
+  });
+
   it('corrupt restore cannot reset two used changes into a permitted third attempt', () => {
     const tuner = new Tuner({ x: { value: 10 } }, { clock: () => 0, wallClock: () => WALL });
     const first = tuner.propose({ param: 'x', to: 11 });
