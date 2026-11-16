@@ -170,11 +170,18 @@ export type ThresholdSeverity = 'normal' | 'warn' | 'critical';
 /** Per-metric latch, carried between samples as `BodyThresholdSample.state`. */
 export type BodyThresholdState = Record<string, ThresholdSeverity>;
 
-/** Two body samples to compare. `state` is the latch returned for `prev`. */
+/**
+ * Two body samples to compare. `state` is the latch returned for `prev`.
+ * `monotonicAt` is the sample's monotonic-clock stamp (ms), stamped by the
+ * host/`BodyMonitor`; rate-of-change windows are measured on it, never on
+ * wall `at`. Live callers always carry it — the `at` fallback exists only
+ * for direct logical-replay callers and must never be fed live wall time.
+ */
 export interface BodyThresholdSample {
   body: Body;
   at: number;
   source: SourceRef;
+  monotonicAt: number;
   state?: BodyThresholdState;
 }
 
@@ -251,16 +258,4 @@ export type TypedSignal<K extends keyof KnownSignalData> = K extends keyof Known
   ? Omit<Signal, 'kind' | 'data'> & { kind: K; data: KnownSignalData[K] }
   : never;
 
-/** Values an attention/body tuning parameter may take. */
-export type TuningValue = number | string | boolean;
-
-/** A recorded change to a tuning parameter (audit trail; DESIGN §2.2c). */
-export interface TuningChange {
-  id: string;
-  param: string;
-  from: TuningValue;
-  to: TuningValue;
-  by: 'agent' | 'user' | 'auto';
-  reason: string;
-  at: number;
-}
+export type { TuningChange, TuningValue } from './tuning.ts';

@@ -38,11 +38,14 @@ describe('disk snapshot contract', () => {
       expect(body.disks.value?.[0]).toMatchObject({ status: 'stale', observedAt: 0, ttlMs: 6000 });
       expect(body.disks.value?.[1]).toMatchObject({ status: 'ok', observedAt: 200, ttlMs: 30000 });
       expect(body.disks).toMatchObject({ status: 'ok', observedAt: 200, ttlMs: 30000 });
-      const withoutLatch = bodyThresholdSignals({ body: prev, at: 0, source: SRC }, { body, at: 500, source: SRC });
+      const withoutLatch = bodyThresholdSignals(
+        { body: prev, at: 0, monotonicAt: 0, source: SRC },
+        { body, at: 500, monotonicAt: 500, source: SRC },
+      );
       expect(withoutLatch.signals).toEqual([]);
       const result = bodyThresholdSignals(
-        { body: prev, at: 0, source: SRC, state: { 'disk:/': 'critical' } },
-        { body, at: 500, source: SRC },
+        { body: prev, at: 0, monotonicAt: 0, source: SRC, state: { 'disk:/': 'critical' } },
+        { body, at: 500, monotonicAt: 500, source: SRC },
       );
       expect(result.signals).toEqual([]);
       expect(result.state['disk:/']).toBe('critical');
@@ -72,10 +75,15 @@ describe('disk snapshot contract', () => {
     const body = st.snapshot(1).self.body;
     expect(body.disks.unavailableMounts).toEqual(['/', '/net']);
     expect(body.disks.value?.[0]?.status).toBe('unavailable');
-    expect(bodyThresholdSignals({ body: prev, at: 0, source: SRC }, { body, at: 1, source: SRC }).signals).toEqual([]);
+    expect(
+      bodyThresholdSignals(
+        { body: prev, at: 0, monotonicAt: 0, source: SRC },
+        { body, at: 1, monotonicAt: 1, source: SRC },
+      ).signals,
+    ).toEqual([]);
     const result = bodyThresholdSignals(
-      { body: prev, at: 0, source: SRC, state: { 'disk:/': 'critical' } },
-      { body, at: 1, source: SRC },
+      { body: prev, at: 0, monotonicAt: 0, source: SRC, state: { 'disk:/': 'critical' } },
+      { body, at: 1, monotonicAt: 1, source: SRC },
     );
     expect(result.signals).toEqual([]);
     expect(result.state['disk:/']).toBe('critical');
@@ -83,8 +91,10 @@ describe('disk snapshot contract', () => {
     const recovered = st.snapshot(2).self.body;
     expect(recovered.disks.unavailableMounts ?? []).toEqual([]);
     expect(
-      bodyThresholdSignals({ body, at: 1, source: SRC, state: result.state }, { body: recovered, at: 2, source: SRC })
-        .signals,
+      bodyThresholdSignals(
+        { body, at: 1, monotonicAt: 1, source: SRC, state: result.state },
+        { body: recovered, at: 2, monotonicAt: 2, source: SRC },
+      ).signals,
     ).toMatchObject([{ subject: 'disk:/', data: { severity: 'normal' } }]);
   });
 

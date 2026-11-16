@@ -252,8 +252,8 @@ describe('DiskSampler', () => {
       cpu: missing, memory: missing, disks: disk, battery: missing, thermal: missing,
       network: missing, harnessProcess: missing, tokens: missing,
     };
-    const previous = { body: { ...body, disks: { ...missing, kind: 'disks' as const } }, at: 0, source };
-    const next = { body, at: t, source };
+    const previous = { body: { ...body, disks: { ...missing, kind: 'disks' as const } }, at: 0, monotonicAt: 0, source };
+    const next = { body, at: t, monotonicAt: t, source };
     expect(bodyThresholdSignals(previous, next).signals).toEqual([]);
     const held = bodyThresholdSignals({ ...previous, state: { 'disk:/': 'critical' } }, next);
     expect(held.signals).toEqual([]);

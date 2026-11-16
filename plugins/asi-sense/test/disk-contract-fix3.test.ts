@@ -92,8 +92,8 @@ describe('disk snapshots across time', () => {
       }),
     );
     const body = st.snapshot(5000).self.body;
-    const next = { body, at: 6500, source: SRC };
-    const prev = { body: previous, at: 0, source: SRC };
+    const next = { body, at: 6500, monotonicAt: 6500, source: SRC };
+    const prev = { body: previous, at: 0, monotonicAt: 0, source: SRC };
     expect(bodyThresholdSignals(prev, next).signals).toEqual([]);
     const latched = bodyThresholdSignals({ ...prev, state: { 'disk:/data': 'critical' } }, next);
     expect(latched.signals).toEqual([]);
