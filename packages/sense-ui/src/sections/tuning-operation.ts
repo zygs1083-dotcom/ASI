@@ -1,12 +1,12 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import type { SensePanelModel } from '../view-model'
 
-type Operation = { phase: 'pending' | 'waiting' | 'error' | 'unconfirmed'; timer?: ReturnType<typeof setTimeout> }
+type Operation = { phase: 'pending' | 'waiting' | 'error' | 'unconfirmed'; label: string; timer?: ReturnType<typeof setTimeout> }
 
 function reflected(key: string, model: SensePanelModel): boolean {
   return key.startsWith('suggestion:')
     ? !model.tuning?.suggestions?.some((suggestion) => suggestion.id === key.slice(11))
-    : model.tuning?.disabled?.reason !== (key === 'resume' ? 'storage-failed' : 'restore-failed')
+    : !model.tuning?.disabled
 }
 
 export function useTuningOperations(model: SensePanelModel) {
@@ -41,9 +41,9 @@ export function useTuningOperations(model: SensePanelModel) {
     }
   }, [])
 
-  const run = (key: string, callback: () => Promise<void>) => {
+  const run = (key: string, callback: () => Promise<void>, label: string) => {
     if (current.current[key]?.phase === 'pending' || current.current[key]?.phase === 'waiting') return
-    const operation: Operation = { phase: 'pending' }
+    const operation: Operation = { phase: 'pending', label }
     update(key, operation)
     try {
       const result: unknown = callback()
@@ -53,12 +53,12 @@ export function useTuningOperations(model: SensePanelModel) {
         if (reflected(key, latestModel.current)) update(key)
         else {
           operation.phase = 'waiting'
-          operation.timer = setTimeout(() => update(key, { phase: 'unconfirmed' }), 10_000)
+          operation.timer = setTimeout(() => update(key, { phase: 'unconfirmed', label }), 10_000)
           update(key, operation)
         }
-      }, () => update(key, { phase: 'error' }))
+      }, () => update(key, { phase: 'error', label }))
     } catch {
-      update(key, { phase: 'error' })
+      update(key, { phase: 'error', label })
     }
   }
   return { operations, run, dismiss: (key: string) => update(key) }

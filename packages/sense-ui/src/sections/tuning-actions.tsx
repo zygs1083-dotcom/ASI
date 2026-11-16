@@ -64,7 +64,7 @@ export function TuningDisabled({ model, onResumeTuning, onResetTuning, operation
       {reason === 'storage-failed' ? (
         <>
           <span>保存调参数据失败，AI 调参已停用</span>
-          <button type="button" disabled={busy} onClick={() => operations.run('resume', onResumeTuning)}>
+          <button type="button" disabled={busy} onClick={() => operations.run('resume', onResumeTuning, '恢复 AI 调参')}>
             {busy ? '恢复 AI 调参 · 处理中' : '恢复 AI 调参'}
           </button>
         </>
@@ -76,7 +76,7 @@ export function TuningDisabled({ model, onResumeTuning, onResetTuning, operation
             confirmLabel="确认重置"
             message="将丢弃已保存的调参、锁定和调整记录，所有参数恢复默认值，基线重新学习"
             operation={operations.operations.reset}
-            onConfirm={() => operations.run('reset', onResetTuning)}
+            onConfirm={() => operations.run('reset', onResetTuning, '重置调参')}
           />
         </>
       )}
@@ -148,7 +148,7 @@ function SuggestionRow({ suggestion, onAcceptRebaseline, operations, onOpen, onC
         operation={operations.operations[`suggestion:${id}`]}
         onOpen={onOpen}
         onClose={onClose}
-        onConfirm={() => operations.run(`suggestion:${id}`, () => onAcceptRebaseline(id))}
+        onConfirm={() => operations.run(`suggestion:${id}`, () => onAcceptRebaseline(id), `接受 ${metricLabel(metric)} ${slotLabel} 重新基线`)}
       />
     </li>
   )

@@ -268,7 +268,7 @@ describe('异步操作保护', () => {
     }
     expect(callback).toHaveBeenCalledOnce()
     await act(async () => reject(new Error('failed')))
-    expect(screen.getByText(/操作失败/)).toBeTruthy()
+    expect(screen.getByText(/失败，请重试/)).toBeTruthy()
     expect((screen.getByRole('button', { name: label }) as HTMLButtonElement).disabled).toBe(false)
     fireEvent.click(screen.getByRole('button', { name: label }))
     if (action !== 'resume') fireEvent.click(screen.getByRole('button', { name: action === 'reset' ? '确认重置' : '确认应用' }))
@@ -436,7 +436,7 @@ describe('异步操作保护', () => {
     const callback = vi.fn(() => { throw new Error('failed') })
     view.rerender(<SensePanel {...props} onResumeTuning={callback} />)
     fireEvent.click(screen.getByRole('button', { name: '恢复 AI 调参' }))
-    expect(screen.getByText(/操作失败/)).toBeTruthy()
+    expect(screen.getByText(/失败，请重试/)).toBeTruthy()
     expect((screen.getByRole('button', { name: '恢复 AI 调参' }) as HTMLButtonElement).disabled).toBe(false)
   })
 
@@ -459,7 +459,7 @@ describe('异步操作保护', () => {
     const label = action === 'resume' ? '恢复 AI 调参' : action === 'reset' ? '重置调参' : '确认重新基线'
     fireEvent.click(screen.getByRole('button', { name: label }))
     if (action !== 'resume') fireEvent.click(screen.getByRole('button', { name: action === 'reset' ? '确认重置' : '确认应用' }))
-    expect(screen.getByText(/操作失败/)).toBeTruthy()
+    expect(screen.getByText(/失败，请重试/)).toBeTruthy()
     expect((screen.getByRole('button', { name: label }) as HTMLButtonElement).disabled).toBe(false)
   })
 
@@ -485,31 +485,44 @@ describe('异步操作保护', () => {
       tuning: { ...model.tuning, suggestions: [], disabled: action === 'resume' ? { reason: 'restore-failed' } : undefined },
     }} />)
     await act(async () => reject())
-    expect(screen.getByRole('alert').textContent).toContain('操作失败')
+    expect(screen.getByRole('alert').textContent).toContain('失败，请重试')
     fireEvent.click(screen.getByRole('button', { name: '关闭操作提示' }))
-    expect(screen.queryByText(/操作失败/)).toBeNull()
+    expect(screen.queryByText(/失败，请重试/)).toBeNull()
   })
 
-  it.each(['resume', 'reset'] as const)('%s 原因变化后 resolve 可解锁，再次出现时不再处理中', async (action) => {
-    const model = makeScenario('healthy')
-    model.tuning = { parameters: [], log: [], disabled: { reason: action === 'resume' ? 'storage-failed' : 'restore-failed' } }
-    const { props, view } = setup(model)
-    let resolve!: () => void
-    const callback = () => new Promise<void>((done) => { resolve = done })
-    const changed = { ...props, onResumeTuning: callback, onResetTuning: callback }
-    view.rerender(<SensePanel {...changed} />)
-    const label = action === 'resume' ? '恢复 AI 调参' : '重置调参'
-    fireEvent.click(screen.getByRole('button', { name: label }))
-    if (action === 'reset') fireEvent.click(screen.getByRole('button', { name: '确认重置' }))
-    view.rerender(<SensePanel {...changed} model={{
-      ...model, tuning: { ...model.tuning, disabled: { reason: action === 'resume' ? 'restore-failed' : 'storage-failed' } },
-    }} />)
-    await act(async () => resolve())
-    view.rerender(<SensePanel {...changed} model={model} />)
-    expect((screen.getByRole('button', { name: label }) as HTMLButtonElement).disabled).toBe(false)
+  it.each(['resume', 'reset'] as const)('%s 原因切换后 resolve，再回到旧原因仍锁定至超时', async (action) => {
+    vi.useFakeTimers()
+    try {
+      const model = makeScenario('healthy')
+      model.tuning = { parameters: [], log: [], disabled: { reason: action === 'resume' ? 'storage-failed' : 'restore-failed' } }
+      const { props, view } = setup(model)
+      let resolve!: () => void
+      const callback = vi.fn(() => new Promise<void>((done) => { resolve = done }))
+      const changed = { ...props, onResumeTuning: callback, onResetTuning: callback }
+      view.rerender(<SensePanel {...changed} />)
+      const label = action === 'resume' ? '恢复 AI 调参' : '重置调参'
+      fireEvent.click(screen.getByRole('button', { name: label }))
+      if (action === 'reset') fireEvent.click(screen.getByRole('button', { name: '确认重置' }))
+      view.rerender(<SensePanel {...changed} model={{
+        ...model, tuning: { ...model.tuning, disabled: { reason: action === 'resume' ? 'restore-failed' : 'storage-failed' } },
+      }} />)
+      await act(async () => resolve())
+      view.rerender(<SensePanel {...changed} model={model} />)
+      const working = screen.getByRole('button', { name: /处理中/ }) as HTMLButtonElement
+      expect(working.disabled).toBe(true)
+      fireEvent.click(working)
+      act(() => vi.advanceTimersByTime(9999))
+      expect(working.disabled).toBe(true)
+      act(() => vi.advanceTimersByTime(1))
+      expect((screen.getByRole('button', { name: label }) as HTMLButtonElement).disabled).toBe(false)
+      expect(screen.getByRole('alert').textContent).toContain(`${label}：未确认结果，请检查状态`)
+      expect(callback).toHaveBeenCalledOnce()
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
-  it.each(['resume', 'reset'] as const)('%s resolve 后原因变化解除锁定', async (action) => {
+  it.each(['resume', 'reset'] as const)('%s resolve 后原因切换并返回旧原因仍锁定', async (action) => {
     const model = makeScenario('healthy')
     model.tuning = { parameters: [], log: [], disabled: { reason: action === 'resume' ? 'storage-failed' : 'restore-failed' } }
     const { props, view } = setup(model)
@@ -519,12 +532,99 @@ describe('异步操作保护', () => {
     fireEvent.click(screen.getByRole('button', { name: label }))
     if (action === 'reset') fireEvent.click(screen.getByRole('button', { name: '确认重置' }))
     await act(async () => {})
-    expect((screen.getByRole('button', { name: /处理中/ }) as HTMLButtonElement).disabled).toBe(true)
     view.rerender(<SensePanel {...changed} model={{
       ...model, tuning: { ...model.tuning, disabled: { reason: action === 'resume' ? 'restore-failed' : 'storage-failed' } },
     }} />)
     view.rerender(<SensePanel {...changed} model={model} />)
-    expect((screen.getByRole('button', { name: label }) as HTMLButtonElement).disabled).toBe(false)
+    expect((screen.getByRole('button', { name: /处理中/ }) as HTMLButtonElement).disabled).toBe(true)
+  })
+
+  it.each(['resume', 'reset', 'accept'] as const)('%s 收起规则后 reject 的提示仍可见，关闭后焦点回到规则标题', async (action) => {
+    const model = makeScenario('healthy')
+    model.tuning = {
+      parameters: [], log: [],
+      disabled: action === 'accept' ? undefined : { reason: action === 'resume' ? 'storage-failed' : 'restore-failed' },
+      suggestions: action === 'accept'
+        ? [{ id: 'cpu', metric: 'cpu', unit: 'ratio', slotLabel: '夜间', from: 0.2, to: 0.7, samples: 12, dates: 3 }]
+        : [],
+    }
+    const { props, view } = setup(model)
+    let reject!: () => void
+    const callback = () => new Promise<void>((_, fail) => { reject = () => fail(new Error('failed')) })
+    view.rerender(<SensePanel {...props} onResumeTuning={callback} onResetTuning={callback} onAcceptRebaseline={callback} />)
+    if (action === 'accept') fireEvent.click(screen.getByRole('button', { name: '调整日志' }))
+    const label = action === 'resume' ? '恢复 AI 调参' : action === 'reset' ? '重置调参' : '确认重新基线'
+    fireEvent.click(screen.getByRole('button', { name: label }))
+    if (action !== 'resume') fireEvent.click(screen.getByRole('button', { name: action === 'reset' ? '确认重置' : '确认应用' }))
+    const summary = screen.getByText('规则', { selector: 'summary' })
+    fireEvent.click(summary)
+    expect((summary.parentElement as HTMLDetailsElement).open).toBe(false)
+    await act(async () => reject())
+    const alert = screen.getByRole('alert')
+    expect(alert.closest('details')).toBeNull()
+    expect(alert.getBoundingClientRect().height).toBeGreaterThan(0)
+    expect(alert.textContent).toContain(action === 'accept' ? '接受 CPU 夜间 重新基线失败，请重试' : `${label}失败，请重试`)
+    const close = within(alert).getByRole('button', { name: '关闭操作提示' })
+    close.focus()
+    fireEvent.click(close)
+    expect(document.activeElement).toBe(summary)
+  })
+
+  it.each(['resume', 'reset', 'accept'] as const)('%s 收起规则后超时仍可见并宣布操作对象', async (action) => {
+    vi.useFakeTimers()
+    try {
+      const model = makeScenario('healthy')
+      model.tuning = {
+        parameters: [], log: [],
+        disabled: action === 'accept' ? undefined : { reason: action === 'resume' ? 'storage-failed' : 'restore-failed' },
+        suggestions: action === 'accept'
+          ? [{ id: 'cpu', metric: 'cpu', unit: 'ratio', slotLabel: '夜间', from: 0.2, to: 0.7, samples: 12, dates: 3 }]
+          : [],
+      }
+      setup(model)
+      if (action === 'accept') fireEvent.click(screen.getByRole('button', { name: '调整日志' }))
+      const label = action === 'resume' ? '恢复 AI 调参' : action === 'reset' ? '重置调参' : '确认重新基线'
+      fireEvent.click(screen.getByRole('button', { name: label }))
+      if (action !== 'resume') fireEvent.click(screen.getByRole('button', { name: action === 'reset' ? '确认重置' : '确认应用' }))
+      fireEvent.click(screen.getByText('规则', { selector: 'summary' }))
+      await act(async () => {})
+      act(() => vi.advanceTimersByTime(10_000))
+      const alert = screen.getByRole('alert')
+      expect(alert.closest('details')).toBeNull()
+      expect(alert.getBoundingClientRect().height).toBeGreaterThan(0)
+      expect(alert.textContent).toContain(`${action === 'accept' ? '接受 CPU 夜间 重新基线' : label}：未确认结果，请检查状态`)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('并发建议失败各自保留原对象和独立提示', async () => {
+    const model = makeScenario('healthy')
+    model.tuning = {
+      parameters: [], log: [],
+      suggestions: [
+        { id: 'cpu', metric: 'cpu', unit: 'ratio', slotLabel: '夜间', from: 0.2, to: 0.7, samples: 8, dates: 3 },
+        { id: 'memory', metric: 'memory', unit: 'ratio', slotLabel: '白天', from: 0.3, to: 0.8, samples: 8, dates: 3 },
+      ],
+    }
+    const { props, view } = setup(model)
+    const rejects: Record<string, () => void> = {}
+    const callback = (id: string) => new Promise<void>((_, fail) => { rejects[id] = () => fail(new Error('failed')) })
+    view.rerender(<SensePanel {...props} onAcceptRebaseline={callback} />)
+    fireEvent.click(screen.getByRole('button', { name: '调整日志' }))
+    for (const item of within(screen.getByRole('list', { name: '重新基线建议' })).getAllByRole('listitem')) {
+      fireEvent.click(within(item).getByRole('button', { name: '确认重新基线' }))
+      fireEvent.click(within(item).getByRole('button', { name: '确认应用' }))
+    }
+    view.rerender(<SensePanel {...props} onAcceptRebaseline={callback} model={{ ...model, tuning: { ...model.tuning, suggestions: [] } }} />)
+    await act(async () => { rejects.cpu!(); rejects.memory!() })
+    const alerts = screen.getAllByRole('alert')
+    expect(alerts.map((alert) => alert.textContent)).toEqual([
+      expect.stringContaining('接受 CPU 夜间 重新基线失败，请重试'),
+      expect.stringContaining('接受 内存 白天 重新基线失败，请重试'),
+    ])
+    fireEvent.click(within(alerts[0]!).getByRole('button', { name: '关闭操作提示' }))
+    expect(screen.getByRole('alert').textContent).toContain('接受 内存 白天 重新基线失败，请重试')
   })
 
   it('卸载清除等待计时器，卸载后的 resolve 和 reject 不再设置计时器', async () => {
@@ -535,15 +635,15 @@ describe('异步操作保护', () => {
       let resolve!: () => void
       let reject!: () => void
       const waiting = renderHook(() => useTuningOperations(model))
-      act(() => waiting.result.current.run('resume', async () => {}))
+      act(() => waiting.result.current.run('resume', async () => {}, '恢复 AI 调参'))
       await act(async () => {})
       expect(vi.getTimerCount()).toBe(1)
       waiting.unmount()
       expect(vi.getTimerCount()).toBe(0)
       const late = renderHook(() => useTuningOperations(model))
       act(() => {
-        late.result.current.run('resume', () => new Promise<void>((done) => { resolve = done }))
-        late.result.current.run('reset', () => new Promise<void>((_, fail) => { reject = () => fail(new Error('failed')) }))
+        late.result.current.run('resume', () => new Promise<void>((done) => { resolve = done }), '恢复 AI 调参')
+        late.result.current.run('reset', () => new Promise<void>((_, fail) => { reject = () => fail(new Error('failed')) }), '重置调参')
       })
       late.unmount()
       await act(async () => { resolve(); reject() })

@@ -30,6 +30,44 @@ async function tabTo(page: Page, target: Locator) {
 }
 
 for (const theme of ['light', 'dark']) {
+  test(`收起后失败及超时提示保持可见，关闭后恢复焦点 ${theme}`, async ({ page }) => {
+    const errors: string[] = []
+    page.on('pageerror', (e) => errors.push(e.message))
+    page.on('console', (m) => { if (m.type() === 'error') errors.push(m.text()) })
+    await page.clock.install()
+    await page.setViewportSize({ width: 320, height: 900 })
+    await page.goto('/test/e2e/tuning-alert.html')
+    if (theme === 'dark') await page.evaluate(() => document.body.setAttribute('data-ds-dark-theme', ''))
+    const summary = page.locator('details > summary', { hasText: '规则' }).first()
+    await summary.click()
+    await page.getByRole('button', { name: '恢复 AI 调参' }).click()
+    await summary.click()
+    await page.evaluate(() => window.dispatchEvent(new Event('test-reject')))
+    const alert = page.getByRole('alert')
+    await expect(alert).toBeVisible()
+    await expect(alert).toContainText('恢复 AI 调参失败，请重试')
+    expect(await alert.evaluate((el) => el.closest('details'))).toBeNull()
+    expect(await page.evaluate(() => document.documentElement.scrollWidth - innerWidth)).toBeLessThanOrEqual(0)
+    await checkA11y(page)
+    await expect(alert).toHaveScreenshot(`tuning-failure-alert-320-${theme}.png`)
+    const close = alert.getByRole('button', { name: '关闭操作提示' })
+    await close.focus()
+    await page.keyboard.press('Enter')
+    await expect(summary).toBeFocused()
+    await expect(alert).toHaveCount(0)
+
+    await page.keyboard.press('Enter')
+    await page.getByRole('button', { name: '恢复 AI 调参' }).click()
+    await summary.click()
+    await page.evaluate(() => window.dispatchEvent(new Event('test-resolve')))
+    await page.clock.fastForward(10_000)
+    await expect(alert).toBeVisible()
+    await expect(alert).toContainText('恢复 AI 调参：未确认结果，请检查状态')
+    await expect(alert.getByRole('button', { name: '关闭操作提示' })).toBeVisible()
+    await checkA11y(page)
+    expect(errors).toEqual([])
+  })
+
   test(`tuning-disabled 420 ${theme}: 键盘确认重置`, async ({ page }) => {
     const errors: string[] = []
     page.on('pageerror', (e) => errors.push(e.message))
