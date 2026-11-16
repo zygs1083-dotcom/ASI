@@ -135,6 +135,24 @@ function harness(savedSettings?: string, options: SenseOptions = {}) {
 }
 
 describe('host runtime', () => {
+  it('keeps token read failures distinct from missing usage until session presence changes', async () => {
+    const h = harness();
+    h.ports.dsh.tokenSnapshot = async () => {
+      throw new Error('private details');
+    };
+    await h.runtime.start();
+    await h.agent({ type: 'created', sessionId: 'a' });
+    await h.agent({ type: 'pre-step', sessionId: 'a' });
+    expect(h.runtime.state().self.body.tokens).toMatchObject({ status: 'unavailable', reason: '用量读取失败' });
+    expect(JSON.stringify(h.runtime.state().self.body.tokens)).not.toContain('private details');
+    await h.agent({ type: 'created', sessionId: 'b' });
+    await h.agent({ type: 'disposed', sessionId: 'b' });
+    expect(h.runtime.state().self.body.tokens.reason).toBe('用量读取失败');
+    await h.agent({ type: 'disposed', sessionId: 'a' });
+    expect(h.runtime.state().self.body.tokens.reason).toBe('没有活动会话');
+    await h.runtime.stop();
+  });
+
   it('stops retrying after ten failures, reports degradation and recovers after a later delivery', async () => {
     const h = harness();
     let attempts = 0;

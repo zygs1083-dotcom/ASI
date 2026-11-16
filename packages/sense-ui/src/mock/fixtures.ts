@@ -100,6 +100,7 @@ export function makeInsights(
 }
 
 export function makeBody(): SenseState['self']['body'] {
+  const battery = { percent: 76, charging: false, powerState: 'battery' as const, minutesLeft: 240 }
   return {
     cpu: fact({ usage: 0.34, perCore: [0.3, 0.5, 0.28, 0.42, 0.36, 0.31, 0.4, 0.29], load1: 2.1, load5: 1.8, load15: 1.6 }),
     memory: fact({
@@ -113,7 +114,7 @@ export function makeBody(): SenseState['self']['body'] {
       { mount: '/', total: 460e9, free: 175e9 },
       { mount: '/demo/vol', total: 120e9, free: 72e9 },
     ]),
-    battery: fact({ percent: 76, charging: false, minutesLeft: 240 }),
+    battery: fact(battery),
     thermal: fact('nominal'),
     network: fact({ online: true, rxBps: 512_000, txBps: 96_000 }),
     harnessProcess: fact({ rss: 512e6, cpu: 0.07, uptimeSec: 14_200 }),

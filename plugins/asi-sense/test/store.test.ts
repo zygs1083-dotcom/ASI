@@ -25,6 +25,29 @@ describe('factStatusAt', () => {
 });
 
 describe('StateStore', () => {
+  it('preserves a fact reason and clears it on a subsequent observation without one', () => {
+    const store = storeAt(new FakeClock());
+    store.apply(
+      sig({
+        id: 'missing-token',
+        kind: 'fact.updated',
+        data: { path: 'self.body.tokens', value: null, status: 'unavailable', reason: 'fixture reason' },
+      }),
+    );
+    expect(store.snapshot().self.body.tokens.reason).toBe('fixture reason');
+    store.apply(
+      sig({
+        id: 'new-token',
+        kind: 'fact.updated',
+        data: {
+          path: 'self.body.tokens',
+          value: { sessionUsage: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0 } },
+        },
+      }),
+    );
+    expect(store.snapshot().self.body.tokens.reason).toBeUndefined();
+  });
+
   it('accepts new same-source samples after wall rollback and expires from receipt time', () => {
     const clock = new FakeClock();
     clock.wall = 100_000;

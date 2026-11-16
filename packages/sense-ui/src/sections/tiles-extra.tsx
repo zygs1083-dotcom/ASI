@@ -10,6 +10,7 @@ import { isUsable } from '../health'
 import { Sparkline } from '../sparkline'
 import { chartThresholds } from '../thresholds'
 import { BatteryIcon, ThermalIcon } from '../icons'
+import type { Body as SharedBody } from '@asi/sense-types'
 import { Tile, TileDetail } from './tile'
 import { memoTile, type MetricTileProps } from './tiles-basic'
 import css from './body.module.css'
@@ -118,15 +119,22 @@ export const BatteryTile = memoTile(
       }
     >
       <FactStatusText fact={battery} now={now}>
-        {(val) =>
-          val && (
+        {(val) => {
+          if (!val) return null
+          const battery: NonNullable<SharedBody['battery']['value']> = val
+          const estimate = fresh && battery.minutesLeft != null && Number.isFinite(battery.minutesLeft) && battery.minutesLeft > 0
+            ? formatDuration(battery.minutesLeft * 60)
+            : null
+          return (
             <>
               <span className={css.tileValue}>{formatPercentValue(val.percent)}</span>
               <span className={css.tileSub}>
-                {val.charging ? '充电中' : '未充电'}
-                {fresh && val.minutesLeft != null
-                  ? ` · 约剩 ${formatDuration(val.minutesLeft * 60)}`
-                  : ''}
+                {battery.powerState === 'charged' ? '已充满 · 接通电源' :
+                  battery.powerState === 'external' ? '未充电 · 接通电源' :
+                  battery.powerState === 'charging' || (!battery.powerState && battery.charging) ? '充电中' : '未充电'}
+                {fresh && battery.powerState === 'charging' ? (estimate ? ` · 约 ${estimate} 后充满` : ' · 估算中') :
+                  fresh && battery.powerState === 'battery' ? (estimate ? ` · 约剩 ${estimate}` : ' · 估算中') :
+                  fresh && battery.powerState !== 'charged' && battery.estimatePending ? ' · 估算中' : ''}
               </span>
               <Sparkline
                 metric="battery"
@@ -140,7 +148,7 @@ export const BatteryTile = memoTile(
               />
             </>
           )
-        }
+        }}
       </FactStatusText>
     </Tile>
   )

@@ -12,7 +12,8 @@ import {
 import { captureRateTimes, type RateTimes } from '../body/rate.ts';
 import type { RuntimeAttention } from '../runtime/attention.ts';
 import type { FactExpiry } from '../runtime/expiry.ts';
-import type { Clock, DshPort, ProbeFactory, StoragePort, TokenSnapshot } from '../runtime/ports.ts';
+import type { Clock, DshPort, ProbeFactory, StoragePort } from '../runtime/ports.ts';
+import { TokenFacts } from './token-facts.ts';
 
 const source = { id: 'body', api: 'probe', host: 'local' };
 const specs: Record<string, ParameterSpec> = {
@@ -47,10 +48,7 @@ export class BodySource {
   private stopped = false;
   private intervalMs = 2_000;
   private sampling = false;
-  private token?: Fact<NonNullable<Body['tokens']['value']>>;
-  private tokenSource?: TokenSnapshot['contextWindowSource'];
-  private tokenGeneration = 0;
-  private readonly tokenWork = new Set<Promise<void>>();
+  private readonly tokenFacts: TokenFacts;
   private thermal?: Body['thermal'];
   private thermalRecovering = false;
   private burstRoots = '';
@@ -59,7 +57,7 @@ export class BodySource {
 
   constructor(
     factory: ProbeFactory,
-    private readonly dsh: DshPort,
+    dsh: DshPort,
     storage: StoragePort,
     private readonly clock: Clock,
     private readonly attention: RuntimeAttention,
@@ -68,6 +66,13 @@ export class BodySource {
     private readonly changed: () => void,
   ) {
     this.probe = factory.create();
+    this.tokenFacts = new TokenFacts(
+      dsh,
+      clock,
+      () => attention.state().self.body.tokens,
+      (fact) => this.write('tokens', fact),
+      changed,
+    );
     this.tuner = new Tuner(specs, {
       actor: () => this.identity.getStore() ?? 'agent',
       clock: () => clock.mono(),
@@ -97,7 +102,7 @@ export class BodySource {
     await this.setPaused(this.paused());
   }
   async setPaused(paused: boolean): Promise<void> {
-    if (paused) this.tokenGeneration++;
+    if (paused) this.tokenFacts.pause();
     if (paused && this.sampling) {
       this.sampling = false;
       await this.probe.stop();
@@ -112,32 +117,11 @@ export class BodySource {
   sync(): void {
     this.state = this.monitor.restoredState ?? this.state;
   }
-  tokens(session: string, valid: () => boolean = () => true): Promise<void> {
-    if (this.stopped) return Promise.resolve();
-    const work = this.readTokens(session, valid);
-    this.tokenWork.add(work);
-    void work.then(
-      () => this.tokenWork.delete(work),
-      () => this.tokenWork.delete(work),
-    );
-    return work;
+  sessionsChanged(present: boolean): void {
+    this.tokenFacts.sessionsChanged(present);
   }
-  private async readTokens(session: string, valid: () => boolean): Promise<void> {
-    const generation = ++this.tokenGeneration;
-    const snapshot = await Promise.resolve()
-      .then(() => this.dsh.tokenSnapshot(session))
-      .catch(() => undefined);
-    if (this.stopped || generation !== this.tokenGeneration || !valid()) return;
-    this.tokenSource = snapshot?.contextWindowSource;
-    this.token = {
-      value: snapshot ?? null,
-      status: snapshot ? 'ok' : 'unavailable',
-      source: { id: 'tokens', api: 'dsh', host: 'local' },
-      observedAt: this.clock.wall(),
-      ttlMs: 15_000,
-    };
-    this.write('tokens', this.token);
-    this.changed();
+  tokens(session: string, valid: () => boolean = () => true): Promise<void> {
+    return this.tokenFacts.tokens(session, valid);
   }
   setThermal(fact: Body['thermal'], recovering = false): void {
     if (this.stopped) return;
@@ -169,7 +153,7 @@ export class BodySource {
   }
   async stop(): Promise<void> {
     this.stopped = true;
-    const tokens = Promise.allSettled([...this.tokenWork]);
+    const tokens = this.tokenFacts.stop();
     this.off?.();
     if (this.sampling) await this.probe.stop();
     this.sampling = false;
@@ -194,6 +178,7 @@ export class BodySource {
         value: fact.value,
         status: fact.status,
         ttlMs: fact.ttlMs,
+        ...(fact.reason === undefined ? {} : { reason: fact.reason }),
         ...(key === 'thermal' && this.thermalRecovering ? { preserveSourceStatus: true } : {}),
         ...('unavailableMounts' in fact ? { unavailableMounts: fact.unavailableMounts } : {}),
       },
@@ -201,10 +186,10 @@ export class BodySource {
   }
   private async sample(body: Body, at: number, mono: number): Promise<void> {
     if (this.stopped || this.paused()) return;
-    const current = this.token || this.thermal ? this.attention.state().self.body : undefined;
-    if (this.token && current) body.tokens = current.tokens;
+    const current = this.tokenFacts.hasReading || this.thermal ? this.attention.state().self.body : undefined;
+    if (this.tokenFacts.hasReading && current) body.tokens = current.tokens;
     if (this.thermal && current) body.thermal = current.thermal;
-    const tokenTime = this.token && this.expiry.factMeta('/self/body/tokens');
+    const tokenTime = this.tokenFacts.hasReading && this.expiry.factMeta('/self/body/tokens');
     if (tokenTime && current?.tokens.status === 'ok')
       this.rateTimes.context = { wall: current.tokens.observedAt, mono: tokenTime.observedMono };
     this.rateTimes = captureRateTimes(body, mono, at, this.rateTimes);
@@ -231,7 +216,7 @@ export class BodySource {
     if (this.thermal && evaluated.thermal.status === 'ok') evaluated.thermal.observedAt = at;
     if (
       evaluated.tokens.value &&
-      (this.tokenSource === 'fallback' ||
+      (this.tokenFacts.source === 'fallback' ||
         ('contextWindowSource' in evaluated.tokens.value && evaluated.tokens.value.contextWindowSource === 'fallback'))
     )
       delete evaluated.tokens.value.contextWindow;
@@ -256,8 +241,8 @@ export class BodySource {
       this.expiry.withObservationTimes(this.rateTimes, () =>
         this.attention.batch(() => {
           for (const key of Object.keys(body) as (keyof Body)[]) {
-            if ((key === 'tokens' && this.token) || (key === 'thermal' && this.thermal)) continue;
-            this.write(key, body[key]);
+            if ((key === 'tokens' && this.tokenFacts.hasReading) || (key === 'thermal' && this.thermal)) continue;
+            this.write(key, key === 'tokens' ? this.tokenFacts.decorate(body.tokens) : body[key]);
           }
           for (const signal of signals) {
             signal.data.feedbackAvailable = false;
