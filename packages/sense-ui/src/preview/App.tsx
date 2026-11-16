@@ -157,21 +157,21 @@ export function App() {
             }))
             act(`反馈${value === 'useful' ? '有用' : '噪音'} ${signalId}`)
           }}
-          onResumeTuning={() => {
+          onResumeTuning={async () => {
             setModel((m) => ({
               ...m,
               tuning: m.tuning && { ...m.tuning, disabled: undefined },
             }))
             act('恢复 AI 调参')
           }}
-          onResetTuning={() => {
+          onResetTuning={async () => {
             setModel((m) => ({
               ...m,
               tuning: m.tuning && { parameters: [], log: [] },
             }))
             act('重置调参')
           }}
-          onAcceptRebaseline={(id) => {
+          onAcceptRebaseline={async (id) => {
             setModel((m) => ({
               ...m,
               tuning: m.tuning && {

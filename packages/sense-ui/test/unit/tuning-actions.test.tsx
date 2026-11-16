@@ -1,7 +1,8 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { act, cleanup, fireEvent, render, screen, within } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, renderHook, screen, within } from '@testing-library/react'
 import { SensePanel } from '../../src/SensePanel'
 import { makeScenario } from '../../src/mock/scenarios'
+import { useTuningOperations } from '../../src/sections/tuning-operation'
 import type { SensePanelModel, SensePanelProps } from '../../src/view-model'
 
 afterEach(cleanup)
@@ -18,9 +19,9 @@ function setup(model: SensePanelModel) {
     onRevertTuning: vi.fn(),
     onLockParam: vi.fn(),
     onFeedback: vi.fn(),
-    onResumeTuning: vi.fn(),
-    onResetTuning: vi.fn(),
-    onAcceptRebaseline: vi.fn(),
+    onResumeTuning: vi.fn(async () => {}),
+    onResetTuning: vi.fn(async () => {}),
+    onAcceptRebaseline: vi.fn(async (_id: string) => {}),
   } satisfies SensePanelProps
   const view = render(<SensePanel {...props} />)
   fireEvent.click(screen.getByText('规则', { selector: 'summary' }))
@@ -49,6 +50,8 @@ describe('调参恢复与重置', () => {
     expect(props.onResetTuning).not.toHaveBeenCalled()
     expect(document.activeElement).toBe(screen.getByRole('button', { name: '取消' }))
     expect(screen.getByText('将丢弃已保存的调参、锁定和调整记录，所有参数恢复默认值，基线重新学习')).toBeTruthy()
+    expect(screen.getByRole('alertdialog', { description: /将丢弃已保存的调参/ })).toBeTruthy()
+    expect(screen.getByRole('button', { name: '取消', description: /将丢弃已保存的调参/ })).toBeTruthy()
     fireEvent.click(screen.getByRole('button', { name: '取消' }))
     expect(document.activeElement).toBe(trigger)
     expect(props.onResetTuning).not.toHaveBeenCalled()
@@ -100,6 +103,8 @@ describe('重新基线建议', () => {
     expect(props.onAcceptRebaseline).not.toHaveBeenCalled()
     expect(within(items[1]!).getByText('持续故障和新负载无法自动区分，请确认这是正常的新状态')).toBeTruthy()
     expect(document.activeElement).toBe(within(items[1]!).getByRole('button', { name: '取消' }))
+    expect(within(items[1]!).getByRole('alertdialog', { description: /持续故障和新负载无法自动区分/ })).toBeTruthy()
+    expect(within(items[1]!).getByRole('button', { name: '取消', description: /持续故障和新负载无法自动区分/ })).toBeTruthy()
     fireEvent.click(within(items[1]!).getByRole('button', { name: '取消' }))
     expect(document.activeElement).toBe(button)
     fireEvent.click(button)
@@ -124,7 +129,7 @@ describe('重新基线建议', () => {
     expect(screen.queryByRole('button', { name: '确认应用' })).toBeNull()
     expect(props.onAcceptRebaseline).not.toHaveBeenCalled()
     expect(document.activeElement).toBe(screen.getByText('重新基线建议', { selector: '[tabindex]' }))
-    expect(screen.getByText('建议已更新，请重新确认').getAttribute('aria-live')).toBeTruthy()
+    expect(screen.getByText(/建议已更新，请重新确认/).getAttribute('aria-live')).toBeTruthy()
   })
 
   it('最后一条建议消失时保留标题并通知用户', () => {
@@ -138,11 +143,11 @@ describe('重新基线建议', () => {
     fireEvent.click(screen.getByRole('button', { name: '确认重新基线' }))
     view.rerender(<SensePanel {...props} model={{ ...model, tuning: { ...model.tuning, suggestions: [] } }} />)
     expect(document.activeElement).toBe(screen.getByText('重新基线建议', { selector: '[tabindex]' }))
-    expect(screen.getByText('建议已更新，请重新确认').getAttribute('aria-live')).toBeTruthy()
+    expect(screen.getByText(/建议已更新，请重新确认/).getAttribute('aria-live')).toBeTruthy()
     expect(props.onAcceptRebaseline).not.toHaveBeenCalled()
   })
 
-  it('多个确认打开时，每条过期建议都能触发焦点和通知', () => {
+  it('连续两次失效分别通知，另一行或外部持有焦点时不抢焦点', () => {
     const model = makeScenario('healthy')
     model.tuning = {
       parameters: [], log: [],
@@ -156,12 +161,21 @@ describe('重新基线建议', () => {
     const triggers = screen.getAllByRole('button', { name: '确认重新基线' })
     fireEvent.click(triggers[0]!)
     fireEvent.click(triggers[1]!)
+    const secondCancel = screen.getAllByRole('button', { name: '取消' })[1]!
+    expect(document.activeElement).toBe(secondCancel)
     view.rerender(<SensePanel {...props} model={{
       ...model, tuning: { ...model.tuning, suggestions: [model.tuning.suggestions![1]!] },
     }} />)
-    expect(document.activeElement).toBe(screen.getByText('重新基线建议', { selector: '[tabindex]' }))
-    expect(screen.getByText('建议已更新，请重新确认')).toBeTruthy()
+    expect(document.activeElement).toBe(secondCancel)
+    const live = screen.getByText(/建议已更新，请重新确认/)
+    const firstNotice = live.textContent
     expect(screen.getAllByRole('button', { name: '确认应用' })).toHaveLength(1)
+    const pause = screen.getByRole('checkbox', { name: /暂停感知/ })
+    pause.focus()
+    view.rerender(<SensePanel {...props} model={{ ...model, tuning: { ...model.tuning, suggestions: [] } }} />)
+    expect(document.activeElement).toBe(pause)
+    expect(live.textContent).toMatch(/建议已更新，请重新确认/)
+    expect(live.textContent).not.toBe(firstNotice)
   })
 
   it('缺失或未知单位使用原始数值和未知单位提示，包括相等均值', () => {
@@ -314,41 +328,52 @@ describe('异步操作保护', () => {
       expect((screen.getByRole('button', { name: /处理中/ }) as HTMLButtonElement).disabled).toBe(true)
       act(() => vi.advanceTimersByTime(1))
       expect((screen.getByRole('button', { name: label }) as HTMLButtonElement).disabled).toBe(false)
+      expect(screen.getByText(/未确认结果，请检查状态/)).toBeTruthy()
       expect(callback).toHaveBeenCalledOnce()
     } finally {
       vi.useRealTimers()
     }
   })
 
-  it.each(['resume', 'reset', 'accept'] as const)('%s 等待 model 反映后立即解锁，未决期间即使 model 改变仍锁定', async (action) => {
-    const model = makeScenario('healthy')
-    const suggestion = { id: 'cpu', metric: 'cpu' as const, unit: 'ratio' as const, slotLabel: '周二', from: 0.2, to: 0.7, samples: 12, dates: 3 }
-    model.tuning = {
-      parameters: [], log: [],
-      disabled: action === 'accept' ? undefined : { reason: action === 'resume' ? 'storage-failed' : 'restore-failed' },
-      suggestions: action === 'accept' ? [suggestion] : [],
+  it.each(['resume', 'reset', 'accept'] as const)('%s 反映后回到原 model 再 resolve 仍锁定', async (action) => {
+    vi.useFakeTimers()
+    try {
+      const model = makeScenario('healthy')
+      const suggestion = { id: 'cpu', metric: 'cpu' as const, unit: 'ratio' as const, slotLabel: '周二', from: 0.2, to: 0.7, samples: 12, dates: 3 }
+      model.tuning = {
+        parameters: [], log: [],
+        disabled: action === 'accept' ? undefined : { reason: action === 'resume' ? 'storage-failed' : 'restore-failed' },
+        suggestions: action === 'accept' ? [suggestion] : [],
+      }
+      const { props, view } = setup(model)
+      let resolve!: () => void
+      const callback = vi.fn(() => new Promise<void>((done) => { resolve = done }))
+      const changed = {
+        ...props,
+        ...(action === 'resume' ? { onResumeTuning: callback } : {}),
+        ...(action === 'reset' ? { onResetTuning: callback } : {}),
+        ...(action === 'accept' ? { onAcceptRebaseline: callback } : {}),
+      }
+      view.rerender(<SensePanel {...changed} />)
+      if (action === 'accept') fireEvent.click(screen.getByRole('button', { name: '调整日志' }))
+      const label = action === 'resume' ? '恢复 AI 调参' : action === 'reset' ? '重置调参' : '确认重新基线'
+      fireEvent.click(screen.getByRole('button', { name: label }))
+      if (action !== 'resume') fireEvent.click(screen.getByRole('button', { name: action === 'reset' ? '确认重置' : '确认应用' }))
+      const reflected = { ...model, tuning: { ...model.tuning, disabled: undefined, suggestions: [] } }
+      view.rerender(<SensePanel {...changed} model={reflected} />)
+      view.rerender(<SensePanel {...changed} model={model} />)
+      expect((screen.getByRole('button', { name: /处理中/ }) as HTMLButtonElement).disabled).toBe(true)
+      await act(async () => resolve())
+      expect((screen.getByRole('button', { name: /处理中/ }) as HTMLButtonElement).disabled).toBe(true)
+      act(() => vi.advanceTimersByTime(9999))
+      expect((screen.getByRole('button', { name: /处理中/ }) as HTMLButtonElement).disabled).toBe(true)
+      act(() => vi.advanceTimersByTime(1))
+      expect((screen.getByRole('button', { name: label }) as HTMLButtonElement).disabled).toBe(false)
+      expect(screen.getByText(/未确认结果，请检查状态/)).toBeTruthy()
+      expect(callback).toHaveBeenCalledOnce()
+    } finally {
+      vi.useRealTimers()
     }
-    const { props, view } = setup(model)
-    let resolve!: () => void
-    const callback = vi.fn(() => new Promise<void>((done) => { resolve = done }))
-    const changed = {
-      ...props,
-      ...(action === 'resume' ? { onResumeTuning: callback } : {}),
-      ...(action === 'reset' ? { onResetTuning: callback } : {}),
-      ...(action === 'accept' ? { onAcceptRebaseline: callback } : {}),
-    }
-    view.rerender(<SensePanel {...changed} />)
-    if (action === 'accept') fireEvent.click(screen.getByRole('button', { name: '调整日志' }))
-    const label = action === 'resume' ? '恢复 AI 调参' : action === 'reset' ? '重置调参' : '确认重新基线'
-    fireEvent.click(screen.getByRole('button', { name: label }))
-    if (action !== 'resume') fireEvent.click(screen.getByRole('button', { name: action === 'reset' ? '确认重置' : '确认应用' }))
-    const reflected = { ...model, tuning: { ...model.tuning, disabled: undefined, suggestions: [] } }
-    view.rerender(<SensePanel {...changed} model={reflected} />)
-    view.rerender(<SensePanel {...changed} model={model} />)
-    expect((screen.getByRole('button', { name: /处理中/ }) as HTMLButtonElement).disabled).toBe(true)
-    await act(async () => resolve())
-    expect((screen.getByRole('button', { name: label }) as HTMLButtonElement).disabled).toBe(false)
-    expect(callback).toHaveBeenCalledOnce()
   })
 
   it.each(['resume', 'reset', 'accept'] as const)('%s resolve 后 model 更新解除锁定', async (action) => {
@@ -380,6 +405,30 @@ describe('异步操作保护', () => {
     expect((screen.getByRole('button', { name: label }) as HTMLButtonElement).disabled).toBe(false)
   })
 
+  it.each(['resume', 'reset', 'accept'] as const)('%s resolve 时最新 model 已反映则立即解锁', async (action) => {
+    const model = makeScenario('healthy')
+    model.tuning = {
+      parameters: [], log: [],
+      disabled: action === 'accept' ? undefined : { reason: action === 'resume' ? 'storage-failed' : 'restore-failed' },
+      suggestions: action === 'accept'
+        ? [{ id: 'cpu', metric: 'cpu', unit: 'ratio', slotLabel: '周二', from: 0.2, to: 0.7, samples: 12, dates: 3 }]
+        : [],
+    }
+    const { props, view } = setup(model)
+    let resolve!: () => void
+    const callback = () => new Promise<void>((done) => { resolve = done })
+    const changed = { ...props, onResumeTuning: callback, onResetTuning: callback, onAcceptRebaseline: callback }
+    view.rerender(<SensePanel {...changed} />)
+    if (action === 'accept') fireEvent.click(screen.getByRole('button', { name: '调整日志' }))
+    const label = action === 'resume' ? '恢复 AI 调参' : action === 'reset' ? '重置调参' : '确认重新基线'
+    fireEvent.click(screen.getByRole('button', { name: label }))
+    if (action !== 'resume') fireEvent.click(screen.getByRole('button', { name: action === 'reset' ? '确认重置' : '确认应用' }))
+    view.rerender(<SensePanel {...changed} model={{ ...model, tuning: { ...model.tuning, disabled: undefined, suggestions: [] } }} />)
+    await act(async () => resolve())
+    view.rerender(<SensePanel {...changed} model={model} />)
+    expect((screen.getByRole('button', { name: label }) as HTMLButtonElement).disabled).toBe(false)
+  })
+
   it('同步抛错也会显示失败并解锁', () => {
     const model = makeScenario('healthy')
     model.tuning = { parameters: [], log: [], disabled: { reason: 'storage-failed' } }
@@ -389,5 +438,118 @@ describe('异步操作保护', () => {
     fireEvent.click(screen.getByRole('button', { name: '恢复 AI 调参' }))
     expect(screen.getByText(/操作失败/)).toBeTruthy()
     expect((screen.getByRole('button', { name: '恢复 AI 调参' }) as HTMLButtonElement).disabled).toBe(false)
+  })
+
+  it.each(['resume', 'reset', 'accept'] as const)('%s 返回非 Promise 时显示失败并解锁', (action) => {
+    const model = makeScenario('healthy')
+    model.tuning = {
+      parameters: [], log: [],
+      disabled: action === 'accept' ? undefined : { reason: action === 'resume' ? 'storage-failed' : 'restore-failed' },
+      suggestions: action === 'accept'
+        ? [{ id: 'cpu', metric: 'cpu', unit: 'ratio', slotLabel: '周二', from: 0.2, to: 0.7, samples: 12, dates: 3 }]
+        : [],
+    }
+    const { props, view } = setup(model)
+    const bad = (() => {}) as unknown as () => Promise<void>
+    view.rerender(<SensePanel {...props}
+      onResumeTuning={action === 'resume' ? bad : props.onResumeTuning}
+      onResetTuning={action === 'reset' ? bad : props.onResetTuning}
+      onAcceptRebaseline={action === 'accept' ? bad : props.onAcceptRebaseline} />)
+    if (action === 'accept') fireEvent.click(screen.getByRole('button', { name: '调整日志' }))
+    const label = action === 'resume' ? '恢复 AI 调参' : action === 'reset' ? '重置调参' : '确认重新基线'
+    fireEvent.click(screen.getByRole('button', { name: label }))
+    if (action !== 'resume') fireEvent.click(screen.getByRole('button', { name: action === 'reset' ? '确认重置' : '确认应用' }))
+    expect(screen.getByText(/操作失败/)).toBeTruthy()
+    expect((screen.getByRole('button', { name: label }) as HTMLButtonElement).disabled).toBe(false)
+  })
+
+  it.each(['resume', 'reset', 'accept'] as const)('%s 对应行消失或原因变化后 reject 仍显示可关闭的失败', async (action) => {
+    const model = makeScenario('healthy')
+    model.tuning = {
+      parameters: [], log: [],
+      disabled: action === 'accept' ? undefined : { reason: action === 'resume' ? 'storage-failed' : 'restore-failed' },
+      suggestions: action === 'accept'
+        ? [{ id: 'cpu', metric: 'cpu', unit: 'ratio', slotLabel: '周二', from: 0.2, to: 0.7, samples: 12, dates: 3 }]
+        : [],
+    }
+    const { props, view } = setup(model)
+    let reject!: () => void
+    const callback = () => new Promise<void>((_, fail) => { reject = () => fail(new Error('failed')) })
+    const changed = { ...props, onResumeTuning: callback, onResetTuning: callback, onAcceptRebaseline: callback }
+    view.rerender(<SensePanel {...changed} />)
+    if (action === 'accept') fireEvent.click(screen.getByRole('button', { name: '调整日志' }))
+    fireEvent.click(screen.getByRole('button', { name: action === 'resume' ? '恢复 AI 调参' : action === 'reset' ? '重置调参' : '确认重新基线' }))
+    if (action !== 'resume') fireEvent.click(screen.getByRole('button', { name: action === 'reset' ? '确认重置' : '确认应用' }))
+    view.rerender(<SensePanel {...changed} model={{
+      ...model,
+      tuning: { ...model.tuning, suggestions: [], disabled: action === 'resume' ? { reason: 'restore-failed' } : undefined },
+    }} />)
+    await act(async () => reject())
+    expect(screen.getByRole('alert').textContent).toContain('操作失败')
+    fireEvent.click(screen.getByRole('button', { name: '关闭操作提示' }))
+    expect(screen.queryByText(/操作失败/)).toBeNull()
+  })
+
+  it.each(['resume', 'reset'] as const)('%s 原因变化后 resolve 可解锁，再次出现时不再处理中', async (action) => {
+    const model = makeScenario('healthy')
+    model.tuning = { parameters: [], log: [], disabled: { reason: action === 'resume' ? 'storage-failed' : 'restore-failed' } }
+    const { props, view } = setup(model)
+    let resolve!: () => void
+    const callback = () => new Promise<void>((done) => { resolve = done })
+    const changed = { ...props, onResumeTuning: callback, onResetTuning: callback }
+    view.rerender(<SensePanel {...changed} />)
+    const label = action === 'resume' ? '恢复 AI 调参' : '重置调参'
+    fireEvent.click(screen.getByRole('button', { name: label }))
+    if (action === 'reset') fireEvent.click(screen.getByRole('button', { name: '确认重置' }))
+    view.rerender(<SensePanel {...changed} model={{
+      ...model, tuning: { ...model.tuning, disabled: { reason: action === 'resume' ? 'restore-failed' : 'storage-failed' } },
+    }} />)
+    await act(async () => resolve())
+    view.rerender(<SensePanel {...changed} model={model} />)
+    expect((screen.getByRole('button', { name: label }) as HTMLButtonElement).disabled).toBe(false)
+  })
+
+  it.each(['resume', 'reset'] as const)('%s resolve 后原因变化解除锁定', async (action) => {
+    const model = makeScenario('healthy')
+    model.tuning = { parameters: [], log: [], disabled: { reason: action === 'resume' ? 'storage-failed' : 'restore-failed' } }
+    const { props, view } = setup(model)
+    const changed = { ...props, onResumeTuning: async () => {}, onResetTuning: async () => {} }
+    view.rerender(<SensePanel {...changed} />)
+    const label = action === 'resume' ? '恢复 AI 调参' : '重置调参'
+    fireEvent.click(screen.getByRole('button', { name: label }))
+    if (action === 'reset') fireEvent.click(screen.getByRole('button', { name: '确认重置' }))
+    await act(async () => {})
+    expect((screen.getByRole('button', { name: /处理中/ }) as HTMLButtonElement).disabled).toBe(true)
+    view.rerender(<SensePanel {...changed} model={{
+      ...model, tuning: { ...model.tuning, disabled: { reason: action === 'resume' ? 'restore-failed' : 'storage-failed' } },
+    }} />)
+    view.rerender(<SensePanel {...changed} model={model} />)
+    expect((screen.getByRole('button', { name: label }) as HTMLButtonElement).disabled).toBe(false)
+  })
+
+  it('卸载清除等待计时器，卸载后的 resolve 和 reject 不再设置计时器', async () => {
+    vi.useFakeTimers()
+    try {
+      const model = makeScenario('healthy')
+      model.tuning = { parameters: [], log: [], disabled: { reason: 'storage-failed' } }
+      let resolve!: () => void
+      let reject!: () => void
+      const waiting = renderHook(() => useTuningOperations(model))
+      act(() => waiting.result.current.run('resume', async () => {}))
+      await act(async () => {})
+      expect(vi.getTimerCount()).toBe(1)
+      waiting.unmount()
+      expect(vi.getTimerCount()).toBe(0)
+      const late = renderHook(() => useTuningOperations(model))
+      act(() => {
+        late.result.current.run('resume', () => new Promise<void>((done) => { resolve = done }))
+        late.result.current.run('reset', () => new Promise<void>((_, fail) => { reject = () => fail(new Error('failed')) }))
+      })
+      late.unmount()
+      await act(async () => { resolve(); reject() })
+      expect(vi.getTimerCount()).toBe(0)
+    } finally {
+      vi.useRealTimers()
+    }
   })
 })

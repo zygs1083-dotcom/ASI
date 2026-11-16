@@ -187,6 +187,14 @@ export function RulesSection(props: SensePanelProps & { tuningReq?: number }) {
         onResumeTuning={() => { focusView(); return props.onResumeTuning() }}
         onResetTuning={() => { focusView(); return props.onResetTuning() }}
       />
+      {Object.entries(operations.operations).map(([key, operation]) =>
+        (operation.phase === 'error' || operation.phase === 'unconfirmed') && (
+          <div key={key} className={css.notice} role="alert">
+            <span>{operation.phase === 'error' ? '操作失败，请重试' : '未确认结果，请检查状态'}</span>
+            <button type="button" aria-label="关闭操作提示" onClick={() => operations.dismiss(key)}>关闭</button>
+          </div>
+        ),
+      )}
       <label className={css.switch}>
         <input
           type="checkbox"

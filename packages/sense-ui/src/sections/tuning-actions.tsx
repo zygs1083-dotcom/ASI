@@ -1,4 +1,4 @@
-import { useEffect, useId, useRef, useState } from 'react'
+import { useEffect, useId, useLayoutEffect, useRef, useState, type MutableRefObject } from 'react'
 import { formatBytes, formatPercent, formatPercentValue, formatRate, formatTokens, formatTuningValue } from '../format'
 import type { MetricKey, SensePanelProps, TuningState } from '../view-model'
 import type { TuningOperations } from './tuning-operation'
@@ -12,7 +12,7 @@ function ConfirmAction({ label, confirmLabel, message, onConfirm, describedBy, o
   message: string
   onConfirm: () => void
   describedBy?: string
-  operation?: { phase: 'pending' | 'waiting' | 'error' }
+  operation?: { phase: 'pending' | 'waiting' | 'error' | 'unconfirmed' }
   onOpen?: () => void
   onClose?: () => void
 }) {
@@ -37,15 +37,14 @@ function ConfirmAction({ label, confirmLabel, message, onConfirm, describedBy, o
       }}>
         {busy ? `${label} · 处理中` : label}
       </button>
-      {operation?.phase === 'error' && <span role="alert">操作失败，请重试</span>}
       {open && (
-        <div className={css.confirmation}>
+        <div className={css.confirmation} role="alertdialog" aria-label={label} aria-describedby={messageId}>
           <span id={messageId}>{message}</span>
           <div className={css.confirmButtons}>
             <button type="button" aria-describedby={[describedBy, messageId].filter(Boolean).join(' ')} onClick={() => { close(); onConfirm() }}>
               {confirmLabel}
             </button>
-            <button ref={cancel} type="button" onClick={close}>取消</button>
+            <button ref={cancel} type="button" aria-describedby={[describedBy, messageId].filter(Boolean).join(' ')} onClick={close}>取消</button>
           </div>
         </div>
       )}
@@ -68,7 +67,6 @@ export function TuningDisabled({ model, onResumeTuning, onResetTuning, operation
           <button type="button" disabled={busy} onClick={() => operations.run('resume', onResumeTuning)}>
             {busy ? '恢复 AI 调参 · 处理中' : '恢复 AI 调参'}
           </button>
-          {resume?.phase === 'error' && <span role="alert">操作失败，请重试</span>}
         </>
       ) : (
         <>
@@ -115,15 +113,20 @@ function exactValue(unit: Suggestion['unit'], value: number): string {
   return formatTuningValue(value, suffix)
 }
 
-function SuggestionRow({ suggestion, onAcceptRebaseline, operations, onOpen, onClose }: {
+function SuggestionRow({ suggestion, onAcceptRebaseline, operations, onOpen, onClose, focusLost }: {
   suggestion: Suggestion
-  onAcceptRebaseline: (id: string) => void | Promise<void>
+  onAcceptRebaseline: (id: string) => Promise<void>
   operations: TuningOperations
   onOpen: () => void
   onClose: () => void
+  focusLost: MutableRefObject<string | null>
 }) {
   const { metric, unit, slotLabel, from, to, samples, dates, id } = suggestion
   const descriptionId = useId()
+  const row = useRef<HTMLLIElement>(null)
+  useLayoutEffect(() => () => {
+    if (row.current?.contains(document.activeElement)) focusLost.current = id
+  }, [focusLost, id])
   let previous = metricValue(unit, from)
   let next = metricValue(unit, to)
   if (previous === next && from !== to) {
@@ -131,7 +134,7 @@ function SuggestionRow({ suggestion, onAcceptRebaseline, operations, onOpen, onC
     next = exactValue(unit, to)
   }
   return (
-    <li className={css.suggestion}>
+    <li ref={row} className={css.suggestion}>
       <div id={descriptionId}>
         <div className={css.ruleName}>{metricLabel(metric)} · {slotLabel}</div>
         <div>均值 {previous} → {next}</div>
@@ -156,22 +159,24 @@ export function RebaselineSuggestions({ model, onAcceptRebaseline, operations }:
 > & { operations: TuningOperations }) {
   const suggestions = model.tuning?.suggestions ?? []
   const [active, setActive] = useState<Record<string, string>>({})
-  const [notice, setNotice] = useState(false)
+  const [notice, setNotice] = useState(0)
   const heading = useRef<HTMLDivElement>(null)
-  useEffect(() => {
+  const focusLost = useRef<string | null>(null)
+  useLayoutEffect(() => {
     const valid = Object.fromEntries(Object.entries(active).filter(([id, content]) =>
       suggestions.some((suggestion) => suggestion.id === id && JSON.stringify(suggestion) === content)))
     if (Object.keys(valid).length !== Object.keys(active).length) {
       setActive(valid)
-      setNotice(true)
-      heading.current?.focus()
+      setNotice((previous) => previous + 1)
+      if (focusLost.current && focusLost.current in active && !(focusLost.current in valid)) heading.current?.focus()
     }
+    focusLost.current = null
   }, [active, suggestions])
   if (!suggestions.length && !Object.keys(active).length && !notice) return null
   return (
     <div>
       <div ref={heading} tabIndex={-1} className={css.ruleName}>重新基线建议</div>
-      <div aria-live="polite">{notice ? '建议已更新，请重新确认' : ''}</div>
+      <div aria-live="polite">{notice ? `建议已更新，请重新确认（${notice}）` : ''}</div>
       <ul className={css.rules} aria-label="重新基线建议">
         {suggestions.map((suggestion) => (
           <SuggestionRow
@@ -179,7 +184,8 @@ export function RebaselineSuggestions({ model, onAcceptRebaseline, operations }:
             suggestion={suggestion}
             onAcceptRebaseline={onAcceptRebaseline}
             operations={operations}
-            onOpen={() => { setNotice(false); setActive((previous) => ({ ...previous, [suggestion.id]: JSON.stringify(suggestion) })) }}
+            focusLost={focusLost}
+            onOpen={() => setActive((previous) => ({ ...previous, [suggestion.id]: JSON.stringify(suggestion) }))}
             onClose={() => setActive((previous) => Object.fromEntries(Object.entries(previous).filter(([id]) => id !== suggestion.id)))}
           />
         ))}

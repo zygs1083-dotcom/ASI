@@ -44,6 +44,8 @@ for (const theme of ['light', 'dark']) {
     await page.keyboard.press('Enter')
     await expect(page.getByText('保存的调参数据损坏，AI 调参已停用')).toBeVisible()
     await expect(page.getByRole('button', { name: '取消' })).toBeFocused()
+    await expect(page.getByRole('alertdialog', { name: '重置调参' })).toHaveAccessibleDescription('将丢弃已保存的调参、锁定和调整记录，所有参数恢复默认值，基线重新学习')
+    await expect(page.getByRole('button', { name: '取消' })).toHaveAccessibleDescription('将丢弃已保存的调参、锁定和调整记录，所有参数恢复默认值，基线重新学习')
     await expect(page.getByRole('button', { name: '确认重置' })).toHaveAccessibleDescription('将丢弃已保存的调参、锁定和调整记录，所有参数恢复默认值，基线重新学习')
     await expect(page.locator('.demoAction')).toBeEmpty()
     await checkA11y(page)
@@ -88,6 +90,10 @@ for (const theme of ['light', 'dark']) {
     await page.keyboard.press('Enter')
     await expect(page.getByText('持续故障和新负载无法自动区分，请确认这是正常的新状态')).toBeVisible()
     await expect(page.getByRole('button', { name: '取消' })).toBeFocused()
+    await expect(page.getByRole('alertdialog', { name: '确认重新基线' })).toHaveAccessibleDescription(/持续故障和新负载无法自动区分/)
+    await expect(page.getByRole('button', { name: '取消' })).toHaveAccessibleDescription(
+      /CPU · 周二 14 时.*持续故障和新负载无法自动区分/,
+    )
     await expect(page.getByRole('button', { name: '确认应用' })).toHaveAccessibleDescription(
       /CPU · 周二 14 时.*均值 20% → 68%.*持续故障和新负载无法自动区分/,
     )
