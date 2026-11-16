@@ -57,15 +57,19 @@
 /* 位置链：四节点横向排列，同主机时合并成一条可展开明细 */
 
 .locChain {
-  display: grid;
-  grid-template-columns: repeat(7, minmax(0, auto));
-  align-items: start;
-  gap: 2px 4px;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  gap: 4px;
   padding: 4px 0;
 }
 
 .locPart {
-  display: contents;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  max-width: 100%;
 }
 
 .locArrow {
