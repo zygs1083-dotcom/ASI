@@ -121,6 +121,11 @@ Node `^22.12.0 || ^24.0.0 || >=26.0.0` (declared in every package; developed
 on 26; ES2022 runtime). `pnpm check`: typecheck + lint + tests;
 `pnpm test:coverage`: attention lines >=90%.
 
+The disk snapshot property test covers all 2,016 parent/volume combinations
+and 11,658 comparisons with a fixed-seed sample of snapshot times by default.
+Run every snapshot time and all 58,464 comparisons with
+`ASI_PROPERTY_FULL=1 pnpm --filter asi-sense exec vitest run test/disk-contract-fix3.test.ts`.
+
 ## M1 review findings → regression tests
 
 1. Durable intake before awaited drain; independent cross-session attempts —
