@@ -29,6 +29,7 @@ export interface Fact<T> {
   source: SourceRef;
   observedAt: number;
   ttlMs: number;
+  reason?: string;
 }
 
 /**

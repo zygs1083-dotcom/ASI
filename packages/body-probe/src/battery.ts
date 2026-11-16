@@ -13,9 +13,21 @@ export function parsePmsetBatt(text: string): BatteryValue | null {
     throw new Error('pmset: percent out of range');
   }
   const charging = m[2]!.trim() === 'charging';
-  const estimate = /(\d+):(\d+)\s+remaining/.exec(m[3]!);
-  if (!estimate) return { percent, charging };
-  return { percent, charging, minutesLeft: Number(estimate[1]) * 60 + Number(estimate[2]) };
+  const estimate = /(?:^|\s)(\d+):([0-5]\d)\s+remaining\b/.exec(m[3]!);
+  const minutes = estimate ? Number(estimate[1]) * 60 + Number(estimate[2]) : undefined;
+  const ac = /Now drawing from 'AC Power'/.test(text);
+  const onBattery = /Now drawing from 'Battery Power'/.test(text);
+  const powerState = ac
+    ? m[2]!.trim() === 'charged' || minutes === 0 ? 'charged' : charging ? 'charging' : 'external'
+    : onBattery ? 'battery' : undefined;
+  return {
+    percent,
+    charging,
+    ...(powerState ? { powerState } : {}),
+    ...(powerState !== 'charged' && /\(no estimate\)/i.test(m[3]!) ? { estimatePending: true } : {}),
+    ...((powerState === 'battery' || powerState === 'charging') &&
+      minutes !== undefined && Number.isSafeInteger(minutes) && minutes > 0 ? { minutesLeft: minutes } : {}),
+  };
 }
 
 export interface BatteryDeps {

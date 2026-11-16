@@ -9,21 +9,24 @@ const run = (stdout: string): RunFn => async () => stdout;
 describe('parsePmsetBatt', () => {
   it('parses discharging on battery with hh:mm estimate', () => {
     expect(parsePmsetBatt(fx('pmset_discharging.txt'))).toEqual({
-      percent: 85, charging: false, minutesLeft: 3 * 60 + 25,
+      percent: 85, charging: false, powerState: 'battery', minutesLeft: 3 * 60 + 25,
     });
   });
   it('parses charging only for the exact charging token', () => {
     expect(parsePmsetBatt(fx('pmset_charging.txt'))).toEqual({
-      percent: 40, charging: true, minutesLeft: 70,
+      percent: 40, charging: true, powerState: 'charging', minutesLeft: 70,
     });
   });
-  it('treats charged as not charging and omits the estimate', () => {
-    expect(parsePmsetBatt(fx('pmset_charged.txt'))).toEqual({ percent: 100, charging: false });
+  it.each(['pmset_charged.txt', 'pmset_ac_zero.txt'])('recognizes AC full without a remaining estimate: %s', (fixture) => {
+    expect(parsePmsetBatt(fx(fixture))).toEqual({ percent: 100, charging: false, powerState: 'charged' });
   });
-  it('omits minutesLeft when pmset reports no estimate', () => {
-    const v = parsePmsetBatt(fx('pmset_noestimate.txt'));
-    expect(v?.charging).toBe(false);
-    expect(v && 'minutesLeft' in v).toBe(false);
+  it.each([
+    ['pmset_noestimate.txt', 55, false, 'battery', true],
+    ['pmset_ac_noestimate.txt', 40, true, 'charging', true],
+    ['pmset_ac_paused.txt', 80, false, 'external', true],
+    ['pmset_invalid_estimate.txt', 55, false, 'battery', false],
+  ])('omits unavailable or invalid estimates: %s', (fixture, percent, charging, powerState, pending) => {
+    expect(parsePmsetBatt(fx(fixture))).toEqual({ percent, charging, powerState, ...(pending ? { estimatePending: true } : {}) });
   });
   it('returns null for a desktop with no battery row', () => {
     expect(parsePmsetBatt(fx('pmset_desktop.txt'))).toBeNull();

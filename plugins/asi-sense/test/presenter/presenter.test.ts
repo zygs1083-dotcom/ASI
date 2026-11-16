@@ -98,6 +98,67 @@ async function harness() {
 }
 
 describe('presenter', () => {
+  it('preserves token reasons through probe, session transitions, store and presenter', async () => {
+    const h = await harness();
+    const token = () => h.presenter.snapshot().state.self.body.tokens;
+    expect(token()).toMatchObject({ status: 'unknown', reason: '没有活动会话' });
+    await h.sample(mkBody({ tokens: { ...f(null, 'unavailable'), reason: '未接入用量来源' } }));
+    expect(token()).toMatchObject({ status: 'unavailable', reason: '没有活动会话' });
+    await h.agent({ type: 'created', sessionId: 'a' });
+    expect(token()).toMatchObject({ status: 'unavailable', reason: '会话中尚未收到用量' });
+    await h.agent({ type: 'created', sessionId: 'b' });
+    await h.agent({ type: 'disposed', sessionId: 'a' });
+    expect(token().reason).toBe('会话中尚未收到用量');
+    await h.agent({ type: 'pre-step', sessionId: 'b' });
+    expect(token()).toMatchObject({ status: 'unavailable', reason: '会话中尚未收到用量' });
+    h.tokens({ sessionUsage: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0 } });
+    await h.agent({ type: 'post-step', sessionId: 'b' });
+    expect(token().status).toBe('ok');
+    expect(token().reason).toBeUndefined();
+    await h.agent({ type: 'disposed', sessionId: 'b' });
+    h.presenter.close();
+    await h.runtime.stop();
+  });
+
+  it('updates an unavailable token reason when the last session closes', async () => {
+    const h = await harness();
+    await h.agent({ type: 'created', sessionId: 's' });
+    await h.agent({ type: 'pre-step', sessionId: 's' });
+    expect(h.presenter.snapshot().state.self.body.tokens.reason).toBe('会话中尚未收到用量');
+    await h.agent({ type: 'disposed', sessionId: 's' });
+    expect(h.presenter.snapshot().state.self.body.tokens.reason).toBe('没有活动会话');
+    h.presenter.close();
+    await h.runtime.stop();
+  });
+
+  it.each(['created', 'disposed'] as const)(
+    'uses current session presence when a delayed probe sample commits after %s',
+    async (event) => {
+      const h = await harness();
+      if (event === 'disposed') await h.agent({ type: 'created', sessionId: 's' });
+      const original = h.runtime.body.monitor.evaluateAuto.bind(h.runtime.body.monitor);
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const spy = vi.spyOn(h.runtime.body.monitor, 'evaluateAuto').mockImplementation(async (...args) => {
+        await gate;
+        return original(...args);
+      });
+      h.sampleRaw(mkBody({ tokens: { ...f(null, 'unavailable'), reason: '未接入用量来源' } }));
+      await h.settle();
+      expect(spy).toHaveBeenCalled();
+      await h.agent({ type: event, sessionId: 's' });
+      release();
+      await h.settle();
+      expect(h.presenter.snapshot().state.self.body.tokens.reason).toBe(
+        event === 'created' ? '会话中尚未收到用量' : '没有活动会话',
+      );
+      h.presenter.close();
+      await h.runtime.stop();
+    },
+  );
+
   it.each([false, true])(
     'commits every fact deadline before batched notifications with session=%s',
     async (session) => {

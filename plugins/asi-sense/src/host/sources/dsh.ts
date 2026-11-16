@@ -16,12 +16,16 @@ export class DshSource {
     private readonly port: DshPort,
     private readonly clock: Clock,
     private readonly attention: RuntimeAttention,
-    private readonly tokens: (session: string, valid?: () => boolean) => Promise<void>,
+    private readonly body: {
+      tokens(session: string, valid?: () => boolean): Promise<void>;
+      sessionsChanged(present: boolean): void;
+    },
     private readonly paused: () => boolean,
     private readonly selfCauseGraceMs = 2_000,
   ) {}
   start(): void {
     this.active = true;
+    this.body.sessionsChanged(false);
     this.off.push(this.port.onAgentEvent((event) => this.track(() => this.agent(event))));
     this.off.push(this.port.onTool((event) => this.track(() => this.tool(event))));
     this.off.push(this.port.onJob((event) => this.track(() => this.job(event))));
@@ -53,10 +57,12 @@ export class DshSource {
     if (event.type === 'created') {
       this.instances.set(event.sessionId, {});
       this.attention.create(event.sessionId);
+      this.body.sessionsChanged(true);
     }
     if (event.type === 'disposed') {
       this.instances.delete(event.sessionId);
       this.attention.dispose(event.sessionId);
+      this.body.sessionsChanged(this.instances.size > 0);
     }
     if (event.type === 'pre-step') {
       const sequence = ++this.selection;
@@ -64,12 +70,12 @@ export class DshSource {
       const valid = () =>
         this.active && !!instance && this.instances.get(event.sessionId) === instance && this.selection === sequence;
       if (!instance) return;
-      if (!this.paused()) await this.tokens(event.sessionId, valid);
+      if (!this.paused()) await this.body.tokens(event.sessionId, valid);
       if (valid()) await this.attention.preStep(event.sessionId, event.userInitiated, !this.paused());
     }
     if (event.type === 'post-step') {
       this.attention.postStep(event.sessionId);
-      if (!this.paused()) await this.tokens(event.sessionId);
+      if (!this.paused()) await this.body.tokens(event.sessionId);
     }
   }
   private async tool(event: ToolEvent): Promise<void> {

@@ -3,8 +3,8 @@ import { TOKEN_READ_TIMEOUT_MS } from './probe-options.js';
 import type { Fact, TokenSource, TokensValue } from './types.js';
 
 export async function readTokens(source: TokenSource | undefined, ttl: number, signal: AbortSignal): Promise<Fact<TokensValue>> {
-  const fallback = () => fact.fail<TokensValue>('unavailable', fact.source('tokens', 'TokenSource.read'), ttl);
-  if (!source || signal.aborted) return fallback(); // abort may predate this call
+  const fallback = (reason: string) => ({ ...fact.fail<TokensValue>('unavailable', fact.source('tokens', 'TokenSource.read'), ttl), reason });
+  if (!source || signal.aborted) return fallback(source ? '用量读取已取消' : '未接入用量来源'); // abort may predate this call
   let timer: NodeJS.Timeout | undefined;
   let rejectAbort!: (e: unknown) => void;
   const aborted = new Promise<never>((_res, rej) => { rejectAbort = rej; });
@@ -20,7 +20,7 @@ export async function readTokens(source: TokenSource | undefined, ttl: number, s
     ]);
     return f as Fact<TokensValue>;
   } catch {
-    return fallback();
+    return fallback(signal.aborted ? '用量读取已取消' : '用量读取失败');
   } finally {
     signal.removeEventListener('abort', onAbort);
     if (timer) clearTimeout(timer);

@@ -180,6 +180,7 @@ export class StateStore {
     fact.source = signal.source;
     fact.observedAt = signal.at;
     fact.ttlMs = ttlOf(signal.data.ttlMs, this.defaultTtlMs);
+    delete fact.reason;
   }
 
   private jobId(signal: Signal): string {
@@ -278,6 +279,8 @@ export class StateStore {
     fact.source = signal.source;
     fact.observedAt = signal.at;
     fact.ttlMs = ttlOf(signal.data.ttlMs, this.defaultTtlMs);
+    if (typeof signal.data.reason === 'string') fact.reason = signal.data.reason;
+    else delete fact.reason;
     if (path === 'self.body.disks') {
       if (unavailable === undefined) delete this.state.self.body.disks.unavailableMounts;
       else this.state.self.body.disks.unavailableMounts = unavailable as string[];

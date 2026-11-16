@@ -23,6 +23,8 @@ export interface Body {
     percent: number;
     charging: boolean;
     minutesLeft?: number;
+    powerState?: 'battery' | 'charging' | 'charged' | 'external';
+    estimatePending?: boolean;
   } | null>;
   thermal: Fact<'nominal' | 'fair' | 'serious' | 'critical'>;
   network: Fact<{ online: boolean; rxBps: number; txBps: number }>;
