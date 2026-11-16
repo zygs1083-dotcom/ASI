@@ -52,6 +52,8 @@ export class BucketDrain {
   private readonly clock: () => number;
   private readonly wallClock: () => number;
   private readonly isCurrent: () => (sessionId: string) => boolean;
+  private readonly isTarget: (sessionId: string) => boolean;
+  private readonly isDeliveryProtected: (sessionId: string, deliveryId: string) => boolean;
   private readonly isWakeOwner: (sessionId: string) => boolean;
   private readonly isPendingTarget: (sessionId: string) => boolean;
   private seq = 0;
@@ -62,6 +64,8 @@ export class BucketDrain {
     this.clock = hooks.clock;
     this.wallClock = hooks.wallClock;
     this.isCurrent = hooks.isCurrent ?? (() => () => true);
+    this.isTarget = hooks.isTarget ?? (() => true);
+    this.isDeliveryProtected = hooks.isDeliveryProtected ?? (() => false);
     this.isWakeOwner = hooks.isWakeOwner ?? (() => false);
     this.isPendingTarget = hooks.isPendingTarget ?? (() => false);
   }
@@ -102,7 +106,7 @@ export class BucketDrain {
   }
   private eligible(bucket: Bucket, current: (id: string) => boolean): boolean {
     return (
-      current(bucket.sessionId) ||
+      (current(bucket.sessionId) && (privateBucket(bucket) || this.isTarget(bucket.sessionId))) ||
       (privateBucket(bucket) && bucketLevel(bucket) === 'wake' && this.isWakeOwner(bucket.sessionId))
     );
   }
@@ -115,10 +119,15 @@ export class BucketDrain {
     );
   }
   retarget(sessionId: string): void {
-    if (!this.isCurrent()(sessionId)) return;
+    if (!this.isCurrent()(sessionId) || !this.isTarget(sessionId)) return;
     for (const b of this.pending.values()) if (b.sessionId !== sessionId && b.sealed) b.deadline = this.clock();
-    this.suppressedGroups -= retargetBuckets(this.pending, this.ready, this.batches, sessionId, (id, buckets, at) =>
-      this.buildInjectBatch(id, buckets, at),
+    this.suppressedGroups -= retargetBuckets(
+      this.pending,
+      this.ready,
+      this.batches,
+      sessionId,
+      (id, buckets, at) => this.buildInjectBatch(id, buckets, at),
+      this.isDeliveryProtected,
     );
   }
   confirm(id: string): void {
@@ -238,6 +247,7 @@ export class BucketDrain {
     if (!current(sessionId)) return;
     for (const b of [...this.pending.values()]) {
       if (b.sessionId !== sessionId || b.sealed) continue;
+      if (!privateBucket(b) && !this.isTarget(sessionId)) continue;
       if (b.jobs && this.blockedJobs(sessionId, bucketLevel(b))) continue;
       if (bucketLevel(b) === 'context') {
         this.pending.delete(b.id);
@@ -376,6 +386,7 @@ export class BucketDrain {
     if (batches === undefined) return;
     for (const batch of [...batches]) {
       if (!current(sessionId)) break;
+      if (!batch.buckets.some(privateBucket) && !this.isTarget(sessionId)) continue;
       if (attempted.has(batch)) continue;
       attempted.add(batch);
       try {

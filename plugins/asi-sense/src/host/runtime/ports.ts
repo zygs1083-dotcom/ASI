@@ -51,6 +51,8 @@ export interface DshPort {
   ensureSession?(id: string): Promise<void>;
   onSessionsChanged?(cb: (closed?: string) => void): Unsubscribe;
   selectDeliveryTarget?(id: string | undefined): void;
+  isDeliveryProtected?(sessionId: string, deliveryId: string): boolean;
+  onStepDiscarded?(cb: () => void): Unsubscribe;
   onAgentEvent(cb: (event: AgentEvent) => Promise<void>): Unsubscribe;
   onTool(cb: (event: ToolEvent) => Promise<void>): Unsubscribe;
   onJob(cb: (event: JobEvent) => Promise<void>): Unsubscribe;

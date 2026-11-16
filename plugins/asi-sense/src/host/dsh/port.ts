@@ -37,8 +37,9 @@ export function createDshPort(
   const revisions = new WeakMap<Agent, number>();
   const waiting = new Map<string, { agent: Agent; tokens: Set<symbol> }>();
   let selected: string | undefined;
-  let selection = 0;
+  const steps = new Map<string, symbol>();
   const committed = new Set<(sessionId: string, id: string) => void>();
+  const discarded = new Set<() => void>();
   const jobs = new JobEventCorrelator(activeTools);
   const accepted = ctx.sessionProjections.register({
     key: 'asiSenseDeliveries',
@@ -81,8 +82,12 @@ export function createDshPort(
     ...sessionCatalog(ctx),
     selectDeliveryTarget(id) {
       selected = id;
-      selection++;
       deliver.select(id);
+    },
+    isDeliveryProtected: deliver.protected,
+    onStepDiscarded(cb) {
+      discarded.add(cb);
+      return () => discarded.delete(cb);
     },
     nowReadings: (sessionId) =>
       nowReadings(
@@ -200,8 +205,8 @@ export function createDshPort(
       const offDisposed = ctx.on('agent/disposed', ({ agent }) => {
         if (selected === agent.id) {
           selected = undefined;
-          selection++;
         }
+        steps.delete(agent.id);
         turns.delete(agent.id);
         thinking.delete(agent.id);
         waiting.delete(agent.id);
@@ -219,7 +224,9 @@ export function createDshPort(
       const offStep = ctx.on('agent/pre-step', async (payload, next) => {
         const decision = await next();
         if (decision.kind === 'reject' || payload.signal.aborted) return decision;
-        const generation = ++selection;
+        const step = Symbol();
+        steps.set(payload.agent.id, step);
+        deliver.begin(payload.agent.id, step);
         selected = payload.agent.id;
         if (!pinned()) deliver.select(payload.agent.id);
         const prior = turns.get(payload.agent.id);
@@ -235,20 +242,25 @@ export function createDshPort(
         }
         if (
           payload.signal.aborted ||
-          generation !== selection ||
+          steps.get(payload.agent.id) !== step ||
           (decision.messages.length === 0 && (payload.step === 1 || payload.messages.length > 0))
         ) {
-          if (generation === selection || selected !== payload.agent.id) deliver.discard(payload.agent.id);
+          deliver.finish(payload.agent.id, step);
+          for (const listener of discarded) listener();
           return decision;
         }
         try {
           const messages = await deliver.messages(payload.agent.id);
-          if (payload.signal.aborted || generation !== selection || messages.length === 0) {
-            if (generation === selection || selected !== payload.agent.id) deliver.discard(payload.agent.id);
+          if (payload.signal.aborted || steps.get(payload.agent.id) !== step || messages.length === 0) {
+            deliver.finish(payload.agent.id, step);
+            for (const listener of discarded) listener();
             return decision;
           }
+          deliver.finish(payload.agent.id, step, messages);
           return { ...decision, messages: [...decision.messages, ...messages] };
         } catch {
+          deliver.finish(payload.agent.id, step);
+          for (const listener of discarded) listener();
           warn();
           return decision;
         }
@@ -264,6 +276,7 @@ export function createDshPort(
         offStep();
         offStatus();
         turns.clear();
+        steps.clear();
       };
     },
     onTool(cb) {

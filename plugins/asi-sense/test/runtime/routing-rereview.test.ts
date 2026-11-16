@@ -62,6 +62,35 @@ function harness(failFirst: boolean, configuredRules = rules, blockFirst = true,
 }
 
 describe('in-flight session ownership', () => {
+  it('drains an owner pre-step queued before the target changes', async () => {
+    const h = harness(false, [
+      ...rules,
+      { id: 'start', match: { kind: 'job.started' }, level: 'context', createdBy: 'user', approved: true },
+    ]);
+    for (const id of ['a', 'b', 'c']) h.attention.create(id);
+    await h.attention.preStep('a');
+    await h.attention.accept(signal('ordinary', 'context'));
+    const first = h.attention.preStep('a');
+    await h.waiting;
+    await h.attention.accept({
+      id: 'private',
+      kind: 'job.started',
+      at: 0,
+      subject: 'fixture-job',
+      source: { id: 'dsh', api: 'events', host: 'local' },
+      data: { id: 'fixture-job', sessionId: 'b', sessionToken: h.attention.sessionToken('b') },
+    });
+    const owner = h.attention.preStep('b');
+    const target = h.attention.setTarget('c');
+    h.release();
+    await Promise.all([first, owner, target]);
+    expect(h.delivered.filter((intent) => intent.sessionId === 'b')).toMatchObject([
+      { kind: 'inject', update: { changes: [{ signal: { id: 'private' } }] } },
+    ]);
+    expect(h.delivered.filter((intent) => intent.sessionId === 'c')).toHaveLength(0);
+    await h.attention.stop();
+  });
+
   it('does not schedule an unowned bucket after the only target closes', async () => {
     const h = harness(false, rules, false);
     h.attention.create('b');

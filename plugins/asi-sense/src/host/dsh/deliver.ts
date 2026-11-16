@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import type { EnvUpdate } from '@asi/sense-types';
 import type { Agent } from '@deepseek-ai/dsh-agent';
 import { freezeMessage, MessageId, type UserMessage } from '@deepseek-ai/dsh-llm';
+import { isSessionContext } from '../attention/buckets.ts';
 import { DeliveryFailure } from '../attention/drain.ts';
 import type { DeliveryIntent } from '../attention/pipeline.ts';
 import { formatEnvUpdate } from '../delivery/format.ts';
@@ -160,7 +161,8 @@ export function createDelivery(
   accepted: (sessionId: string, id: string) => Promise<boolean>,
 ) {
   const delivered = new Map<string, Set<string>>();
-  const staged = new Map<string, Map<string, DeliveryIntent>>();
+  const staged = new Map<string, Map<string, { intent: DeliveryIntent; step?: symbol; admitted: boolean }>>();
+  const steps = new Map<string, symbol>();
   const inflight = new Map<string, Promise<void>>();
   const message = (id: string, intent: DeliveryIntent): UserMessage =>
     freezeMessage({
@@ -184,8 +186,9 @@ export function createDelivery(
     if (previous?.has(id) || (await accepted(sessionId, id))) return;
     if (getAgent(sessionId) !== agent) throw new Error('delivery session changed');
     if (intent.kind === 'inject') {
-      const pending = staged.get(sessionId) ?? new Map<string, DeliveryIntent>();
-      pending.set(id, structuredClone(intent));
+      const pending = staged.get(sessionId) ?? new Map();
+      if (pending.get(id)?.admitted) return;
+      pending.set(id, { intent: structuredClone(intent), step: steps.get(sessionId), admitted: false });
       staged.set(sessionId, pending);
       return;
     }
@@ -232,11 +235,13 @@ export function createDelivery(
       const pending = staged.get(sessionId);
       if (!pending) return [];
       const messages: UserMessage[] = [];
-      for (const [id, intent] of pending) {
-        if (await accepted(sessionId, id)) pending.delete(id);
-        else messages.push(message(id, intent));
+      for (const [id, entry] of pending) {
+        const wasAccepted = await accepted(sessionId, id);
+        if (pending.get(id) !== entry) continue;
+        if (wasAccepted) pending.delete(id);
+        else if (!entry.admitted) messages.push(message(id, entry.intent));
       }
-      if (!pending.size) staged.delete(sessionId);
+      if (!pending.size && staged.get(sessionId) === pending) staged.delete(sessionId);
       return messages;
     },
     acknowledge(sessionId: string, id: string): void {
@@ -247,12 +252,35 @@ export function createDelivery(
     clear(sessionId: string): void {
       staged.delete(sessionId);
       delivered.delete(sessionId);
+      steps.delete(sessionId);
     },
     select(sessionId: string | undefined): void {
-      for (const id of staged.keys()) if (id !== sessionId) staged.delete(id);
+      for (const [session, pending] of staged) {
+        if (session === sessionId) continue;
+        for (const [id, entry] of pending) {
+          const owned = entry.intent.update.changes.some(
+            ({ signal }) => isSessionContext(signal) || (signal.source.id === 'dsh' && signal.kind.startsWith('job.')),
+          );
+          if (!owned && !entry.admitted && (!entry.step || steps.get(session) !== entry.step)) pending.delete(id);
+        }
+        if (!pending.size) staged.delete(session);
+      }
     },
-    discard(sessionId: string): void {
-      staged.delete(sessionId);
+    begin(sessionId: string, step: symbol): void {
+      steps.set(sessionId, step);
+    },
+    finish(sessionId: string, step: symbol, messages?: UserMessage[]): void {
+      const pending = staged.get(sessionId);
+      for (const [id, entry] of pending ?? []) {
+        if (messages?.some((message) => message.id === id)) entry.admitted = true;
+        else if (!messages && entry.step === step) pending?.delete(id);
+      }
+      if (pending?.size === 0) staged.delete(sessionId);
+      if (steps.get(sessionId) === step) steps.delete(sessionId);
+    },
+    protected(sessionId: string, id: string): boolean {
+      const entry = staged.get(sessionId)?.get(`asi-sense:${id}`);
+      return !!entry && (entry.admitted || (!!entry.step && steps.get(sessionId) === entry.step));
     },
   });
 }

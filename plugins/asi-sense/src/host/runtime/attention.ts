@@ -44,12 +44,13 @@ export class RuntimeAttention {
   private readonly inflight = new Set<Promise<void>>();
   private selected?: string;
   private pinned?: string;
-  private privateStep?: string;
+  private readonly steps = new Map<string, symbol>();
   private selectionGeneration = 0;
   private sequence = 0;
   private stopped = false;
   private readonly prefix = randomUUID();
   private readonly offCommit?: () => void;
+  private readonly offDiscard?: () => void;
 
   constructor(
     private readonly clock: Clock,
@@ -76,12 +77,15 @@ export class RuntimeAttention {
       wallClock: () => clock.wall(),
       isCurrent: () => {
         const generation = this.selectionGeneration;
+        const steps = new Map(this.steps);
         return (id) =>
           !this.stopped &&
-          generation === this.selectionGeneration &&
-          (this.selected === id || this.privateStep === id) &&
+          ((generation === this.selectionGeneration && this.selected === id) ||
+            (steps.has(id) && steps.get(id) === this.steps.get(id))) &&
           this.sessions.has(id);
       },
+      isTarget: (id) => this.selected === id,
+      isDeliveryProtected: (id, deliveryId) => dsh.isDeliveryProtected?.(id, deliveryId) ?? false,
       isWakeOwner: (id) => !this.stopped && this.sessions.has(id) && !this.closed.has(id),
       isPendingTarget: (id) => !this.stopped && this.pinned === id && !this.closed.has(id) && !!canEnsureTarget?.(),
       deliverer: {
@@ -131,6 +135,10 @@ export class RuntimeAttention {
       void this.pending.committed(session, id, this.pipeline).then(() => {
         if (!this.stopped) this.reschedule();
       });
+    });
+    this.offDiscard = dsh.onStepDiscarded?.(() => {
+      if (this.selected && !this.stopped)
+        void this.pipeline.retarget(this.selected).then(this.reschedule, this.reschedule);
     });
   }
 
@@ -191,7 +199,6 @@ export class RuntimeAttention {
   async setTarget(id: string | undefined): Promise<void> {
     if (id && (!this.sessions.has(id) || this.closed.has(id))) throw new Error('target session unavailable');
     this.pinned = id;
-    this.privateStep = undefined;
     this.selected = id ?? this.recent.at(-1);
     const generation = ++this.selectionGeneration;
     if (this.selected) {
@@ -245,6 +252,7 @@ export class RuntimeAttention {
   stop(): Promise<void> {
     this.stopped = true;
     this.offCommit?.();
+    this.offDiscard?.();
     return Promise.allSettled([...this.inflight, this.pending.settled()]).then(() => {});
   }
   create(id: string): void {
@@ -253,6 +261,7 @@ export class RuntimeAttention {
     this.sessionTokens.set(id, randomUUID());
   }
   dispose(id: string): void {
+    this.steps.delete(id);
     const token = this.sessionTokens.get(id);
     this.sessions.delete(id);
     this.sessionTokens.delete(id);
@@ -273,6 +282,8 @@ export class RuntimeAttention {
     if (!session) return;
     if (this.needsRestore()) this.ensureTarget?.();
     const generation = ++this.selectionGeneration;
+    const step = Symbol();
+    this.steps.set(id, step);
     const index = this.recent.indexOf(id);
     if (index >= 0) this.recent.splice(index, 1);
     this.recent.push(id);
@@ -280,20 +291,20 @@ export class RuntimeAttention {
       this.pinned && this.sessions.has(this.pinned) && !this.closed.has(this.pinned) && !this.canEnsureTarget?.()
         ? this.pinned
         : id;
-    this.privateStep = this.selected === id ? undefined : id;
     session.busy = true;
     session.userInitiated = userInitiated;
     this.pipeline.setSession(session);
     if (!drain) {
-      this.privateStep = undefined;
+      if (this.steps.get(id) === step) this.steps.delete(id);
       return;
     }
     const selected = this.selected;
-    if (!(await this.transfer(selected, generation))) return;
     try {
+      await this.transfer(selected, generation);
+      if (this.stopped || this.steps.get(id) !== step || this.sessions.get(id) !== session) return;
       await this.pipeline.preStep(id);
     } finally {
-      if (generation === this.selectionGeneration) this.privateStep = undefined;
+      if (this.steps.get(id) === step) this.steps.delete(id);
       this.reschedule();
     }
   }

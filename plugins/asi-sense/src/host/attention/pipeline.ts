@@ -86,6 +86,8 @@ export class AttentionPipeline {
       clock: this.clock,
       wallClock: this.wallClock,
       isCurrent: options.isCurrent,
+      isTarget: options.isTarget,
+      isDeliveryProtected: options.isDeliveryProtected,
       isWakeOwner: options.isWakeOwner,
       isPendingTarget: options.isPendingTarget,
     });
