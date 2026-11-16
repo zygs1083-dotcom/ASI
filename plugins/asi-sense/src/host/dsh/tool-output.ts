@@ -50,16 +50,29 @@ export function modelOutput(value: unknown, now?: number): JsonValue {
 
 type Runtime = Pick<ReturnType<typeof createSenseRuntime>, 'tools' | 'events' | 'rules'>;
 
-export function environmentDetail(runtime: Runtime, app?: string, window?: string): JsonValue {
+export function environmentDetail(runtime: Runtime, app?: string, window?: string, countFresh = true): JsonValue {
   const snapshot = runtime.tools.envState();
   if (!('env' in snapshot) || !('observation' in snapshot)) throw new TypeError('full sense state unavailable');
   const { env, observation } = snapshot;
   const front = env.frontApp.value;
+  const axStatus = observation.sources['helper.ax']?.status;
+  const countDenied = axStatus === 'denied' || axStatus === 'unsupported';
+  if ((!countFresh || countDenied) && front) delete front.windowCount;
   const title = env.focusedWindow.value?.title;
   const matchesApp = front === null ? null : app === undefined || app === front.name || app === front.bundleId;
   const matchesWindow = window === undefined ? true : title === undefined ? null : title === window;
   const available = matchesApp === true && matchesWindow === true;
   const mismatch = matchesApp === false || matchesWindow === false;
+  const pid =
+    available && front?.pid !== undefined
+      ? { value: front.pid, status: env.frontApp.status }
+      : { value: null, status: 'unknown' };
+  const windowCount =
+    available && countDenied
+      ? { value: null, status: axStatus }
+      : available && front?.windowCount !== undefined
+        ? { value: front.windowCount, status: env.frontApp.status }
+        : { value: null, status: 'unknown' };
   const events = available
     ? runtime
         .events()
@@ -72,8 +85,8 @@ export function environmentDetail(runtime: Runtime, app?: string, window?: strin
     match: mismatch ? 'not-current' : available ? 'current' : 'unknown',
     app: mismatch ? null : env.frontApp,
     window: mismatch ? null : env.focusedWindow,
-    pid: { value: null, status: 'unknown' },
-    windowCount: { value: null, status: 'unknown' },
+    pid,
+    windowCount,
     recentEvents: events,
     sources: observation.sources,
     guidance: '如需查看窗口内容，请使用当前会话可用的 computer-use 工具（需经其授权流程）',

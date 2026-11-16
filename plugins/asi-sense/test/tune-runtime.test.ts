@@ -1,6 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import { DEFAULT_RULES } from '../src/host/attention/rules.ts';
 import { defaultBodyRules } from '../src/host/body/rules.ts';
+import { RuntimeAttention } from '../src/host/runtime/attention.ts';
+import { FactExpiry } from '../src/host/runtime/expiry.ts';
+import type { DshPort } from '../src/host/runtime/ports.ts';
 import { FakeClock, jobExit, pipe, sess, sig } from './helpers.ts';
 
 describe('runtime attention tuning', () => {
@@ -94,5 +97,41 @@ describe('runtime attention tuning', () => {
         )
       ).level,
     ).toBe('context');
+  });
+
+  it('preserves tuned classification with and without a session across pending transfer', async () => {
+    const clock = { wall: () => 1_000, mono: () => 1_000 };
+    const deliveries: Parameters<DshPort['deliver']>[1][] = [];
+    const dsh = { deliver: async (_id, intent) => void deliveries.push(intent) } as DshPort;
+    const rules = [...DEFAULT_RULES, ...defaultBodyRules()];
+    const attention = new RuntimeAttention(
+      clock,
+      dsh,
+      () => rules,
+      () => {},
+      () => true,
+      () => {},
+      new FactExpiry(clock),
+    );
+    const rate = (id: string) => sig({ id, at: 1_000, kind: 'body.rate', data: { severity: 'warn', metric: 'disk' } });
+    const levels = { 'body.rate': 'record', 'body.anomaly': 'context', 'file.burst': 'context' } as const;
+    attention.pipeline.setDeliveryLevels(levels);
+    await attention.accept(rate('offline-record'));
+    attention.pipeline.setDeliveryLevels({ ...levels, 'body.rate': 'context' });
+    await attention.accept(rate('offline-context'));
+    attention.pipeline.setDeliveryLevels(levels);
+    attention.create('s');
+    await attention.preStep('s', false);
+    await attention.accept(rate('online-record'));
+    expect(
+      attention
+        .events()
+        .filter((event) => event.kind === 'body.rate')
+        .map((event) => event.level),
+    ).toEqual(['record', 'context', 'record']);
+    expect(deliveries.flatMap((intent) => intent.update.changes.map((change) => change.signal.id))).toEqual([
+      'offline-context',
+    ]);
+    await attention.stop();
   });
 });

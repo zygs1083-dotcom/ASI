@@ -2,6 +2,7 @@ import type { WatchRule } from '@asi/sense-types';
 import { createWatchRule, validateRule } from '../attention/rules.ts';
 import type { BodySource } from '../sources/body.ts';
 import type { FileSource } from '../sources/files.ts';
+import type { HelperSource } from '../sources/helper.ts';
 import type { RuntimeAttention } from './attention.ts';
 import type { SenseActions, TuneRequest } from './ports.ts';
 import type { Settings } from './settings.ts';
@@ -50,12 +51,14 @@ export function runtimeTools(
   settings: Settings,
   actions: SenseActions,
   files: FileSource,
+  helper: HelperSource,
   syncRules: () => Promise<void>,
   check: () => void,
   titlesAllowed: () => boolean,
   changed: () => void,
 ) {
   return {
+    refreshDetail: () => helper.refreshDetail(),
     envState: (section?: 'self' | 'env' | 'observation') => {
       const state = attention.state();
       if (!titlesAllowed()) state.env.focusedWindow.value = null;

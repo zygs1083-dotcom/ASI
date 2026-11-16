@@ -70,7 +70,7 @@ export async function helperError(attention: RuntimeAttention, event: Message): 
 }
 export async function axStatus(
   attention: RuntimeAttention,
-  status: 'ok' | 'denied' | 'unsupported',
+  status: 'ok' | 'denied' | 'unsupported' | 'unknown',
   at: number,
 ): Promise<void> {
   if (attention.isStopped()) return;
@@ -93,6 +93,50 @@ export async function axStatus(
     subject: ax.id,
     data: { status },
   });
+}
+export async function appObservation(
+  attention: RuntimeAttention,
+  app: Message,
+  at: number,
+  recovering = false,
+  valid: () => boolean = () => true,
+): Promise<void> {
+  if (!validApp(app) || attention.isStopped()) return;
+  const previous = attention.state().env.frontApp.value;
+  const sameBundle = previous?.bundleId === app.bundleId;
+  const sameProcess = sameBundle && (previous?.pid === undefined || app.pid === undefined || previous.pid === app.pid);
+  if (!sameProcess && attention.state().observation.sources['helper.ax']?.status !== 'denied') {
+    await axStatus(attention, 'unknown', at);
+    if (!valid() || attention.isStopped()) return;
+  }
+  if (!sameBundle) {
+    await attention.accept({
+      id: attention.id(),
+      kind: 'app.activated',
+      at,
+      source,
+      subject: app.bundleId as string,
+      data: recovering ? { ...app, preserveSourceStatus: true } : app,
+    });
+    return;
+  }
+  const value = {
+    name: app.name,
+    bundleId: app.bundleId,
+    ...(Number.isSafeInteger(app.pid) && (app.pid as number) > 0 ? { pid: app.pid } : {}),
+    ...(Number.isSafeInteger(app.windowCount) && (app.windowCount as number) >= 0
+      ? { windowCount: app.windowCount }
+      : {}),
+  };
+  attention.store.apply({
+    id: attention.id(),
+    kind: 'fact.updated',
+    at,
+    source,
+    subject: 'env.frontApp',
+    data: { path: 'env.frontApp', value, status: 'ok', preserveSourceStatus: recovering },
+  });
+  attention.changed();
 }
 export async function helperEvent(
   event: Message,
@@ -127,7 +171,7 @@ export async function helperEvent(
     );
   } else if (event.type === 'snapshot') {
     const app = object(event.frontApp);
-    if (validApp(app) && !skip.has('frontApp')) await emit('app.activated', app);
+    if (validApp(app) && !skip.has('frontApp')) await appObservation(attention, app, at, recovering, valid);
     if (!valid()) return;
     const window = object(event.focusedWindow);
     if (!skip.has('focusedWindow')) {
@@ -143,6 +187,13 @@ export async function helperEvent(
       );
     }
   } else if (event.type === 'ax.unsupported') {
+    const current = attention.state().env.frontApp.value;
+    if (
+      current &&
+      ((typeof event.bundleId === 'string' && event.bundleId !== current.bundleId) ||
+        (current.pid !== undefined && typeof event.pid === 'number' && event.pid !== current.pid))
+    )
+      return;
     await axStatus(attention, 'unsupported', at);
   } else if (event.type === 'app.activated' || event.type === 'app.launched' || event.type === 'app.terminated') {
     if (event.type === 'app.activated' && !validApp(event)) return;
@@ -152,7 +203,8 @@ export async function helperEvent(
       !['denied', 'unsupported'].includes(attention.state().env.focusedWindow.status)
     )
       clearWindow(attention, at);
-    await emit(event.type, event);
+    if (event.type === 'app.activated') await appObservation(attention, event, at, recovering, valid);
+    else await emit(event.type, event);
   } else if ((event.type === 'window.focused' || event.type === 'window.title') && typeof event.title === 'string') {
     await emit(event.type === 'window.title' ? 'window.title-changed' : event.type, event);
   } else if (event.type === 'window.focused') {

@@ -4,6 +4,7 @@ import { readFileSync } from 'node:fs';
 import { PassThrough } from 'node:stream';
 import type { Body } from '@asi/sense-types';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { environmentDetail } from '../../src/host/dsh/tool-output.ts';
 import { createSenseRuntime } from '../../src/host/runtime/index.ts';
 import type { AgentEvent, DshPort, SensePorts } from '../../src/host/runtime/ports.ts';
 import { mkBody } from '../body/helpers.ts';
@@ -162,6 +163,348 @@ function setup(autoAck = true, stubborn = false, holdWrites = false) {
 afterEach(() => vi.useRealTimers());
 
 describe('helper protocol integration', () => {
+  it('refreshes metadata without another activation event or delivery', async () => {
+    const h = setup();
+    await h.runtime.start();
+    await h.settle();
+    await h.runtime.tools.envWatch({
+      action: 'add',
+      rule: { id: 'activation-context', match: { kind: 'app.activated' }, level: 'context' },
+    });
+    await h.agent({ type: 'created', sessionId: 's' });
+    await h.agent({ type: 'pre-step', sessionId: 's' });
+    await h.agent({ type: 'post-step', sessionId: 's' });
+    const child = h.children[0];
+    child.snapshotReply = false;
+    const activationCount = h.runtime.events().filter((event) => event.kind === 'app.activated').length;
+    child.send({ type: 'window.focused', bundleId: 'example.app', pid: 123, title: 'Synthetic new window' });
+    await h.settle();
+    child.send({
+      type: 'snapshot',
+      frontApp: { name: 'ExampleApp', bundleId: 'example.app', pid: 123, windowCount: 4 },
+      focusedWindow: { status: 'ok', pid: 123, title: 'Synthetic new window' },
+      permissions: { accessibility: 'granted' },
+      thermal: 'nominal',
+    });
+    await h.settle();
+    expect(h.runtime.state().env.frontApp.value?.windowCount).toBe(4);
+    expect(h.runtime.events().filter((event) => event.kind === 'app.activated')).toHaveLength(activationCount);
+    await h.agent({ type: 'pre-step', sessionId: 's' });
+    expect(
+      h.delivered.flatMap((intent) => intent.update.changes).filter((change) => change.signal.kind === 'app.activated'),
+    ).toHaveLength(0);
+    await h.runtime.stop();
+  });
+
+  it('uses the current app AX result after switching from an unsupported app with titles disabled', async () => {
+    const h = setup();
+    await h.runtime.start();
+    await h.settle();
+    await h.runtime.actions.setSendTitles(false);
+    await h.settle();
+    const child = h.children[0];
+    child.snapshotReply = false;
+    child.send({ type: 'app.activated', name: 'A', bundleId: 'a', pid: 1 });
+    child.send({ type: 'ax.unsupported', bundleId: 'a', pid: 1 });
+    await h.settle();
+    child.send({
+      type: 'snapshot',
+      frontApp: { name: 'A', bundleId: 'a', pid: 1 },
+      focusedWindow: { status: 'unsupported', pid: 1, bundleId: 'a' },
+      permissions: { accessibility: 'granted' },
+      thermal: 'nominal',
+    });
+    await h.settle();
+    child.send({
+      type: 'snapshot',
+      frontApp: { name: 'A', bundleId: 'a', pid: 1 },
+      focusedWindow: { status: 'unsupported', pid: 1, bundleId: 'a' },
+      permissions: { accessibility: 'granted' },
+      thermal: 'nominal',
+    });
+    await h.settle();
+    child.send({ type: 'app.activated', name: 'B', bundleId: 'b', pid: 2 });
+    child.send({ type: 'window.focused', bundleId: 'b', pid: 2 });
+    await h.settle();
+    expect(h.runtime.state().observation.sources['helper.ax']?.status).not.toBe('unsupported');
+    child.send({
+      type: 'snapshot',
+      frontApp: { name: 'B', bundleId: 'b', pid: 2, windowCount: 2 },
+      focusedWindow: { status: 'ok', pid: 2, bundleId: 'b' },
+      permissions: { accessibility: 'granted' },
+      thermal: 'nominal',
+    });
+    await h.settle();
+    expect(h.runtime.state().env.frontApp.value).toEqual({ name: 'B', bundleId: 'b', pid: 2, windowCount: 2 });
+    expect(environmentDetail(h.runtime)).toMatchObject({ windowCount: { value: 2, status: 'ok' } });
+    expect(h.runtime.state().env.focusedWindow.value).toBeNull();
+    await h.runtime.stop();
+  });
+
+  it('applies permission revocation from metadata snapshots without restoring a title', async () => {
+    const h = setup();
+    await h.runtime.start();
+    await h.settle();
+    const child = h.children[0];
+    child.snapshotReply = false;
+    child.send({ type: 'window.focused', bundleId: 'example.app', pid: 123, title: 'Synthetic title' });
+    await h.settle();
+    child.send({
+      type: 'snapshot',
+      frontApp: { name: 'ExampleApp', bundleId: 'example.app', pid: 123, windowCount: 2 },
+      focusedWindow: { status: 'denied', pid: 123, bundleId: 'example.app' },
+      permissions: { accessibility: 'denied' },
+      thermal: 'nominal',
+    });
+    await h.settle();
+    expect(h.runtime.state().observation.sources['helper.ax']?.status).toBe('denied');
+    expect(h.runtime.state().env.focusedWindow).toMatchObject({ status: 'denied', value: null });
+    expect(h.runtime.state().env.frontApp.value?.windowCount).toBeUndefined();
+    expect(h.runtime.events()).toContainEqual(
+      expect.objectContaining({ kind: 'source.status', subject: 'helper.ax', level: 'context' }),
+    );
+    await h.runtime.stop();
+  });
+
+  it('applies snapshot permission revocation even if focus changes while it is in flight', async () => {
+    const h = setup();
+    await h.runtime.start();
+    await h.settle();
+    const child = h.children[0];
+    child.snapshotReply = false;
+    child.send({ type: 'window.focused', bundleId: 'example.app', pid: 123, title: 'Synthetic one' });
+    await h.settle();
+    child.send({ type: 'window.focused', bundleId: 'example.app', pid: 123, title: 'Synthetic two' });
+    child.send({
+      type: 'snapshot',
+      frontApp: { name: 'ExampleApp', bundleId: 'example.app', pid: 123 },
+      focusedWindow: { status: 'denied', pid: 123, bundleId: 'example.app' },
+      permissions: { accessibility: 'denied' },
+      thermal: 'nominal',
+    });
+    await h.settle();
+    expect(h.runtime.state().observation.sources['helper.ax']?.status).toBe('denied');
+    expect(h.runtime.state().env.focusedWindow).toMatchObject({ status: 'denied', value: null });
+    await h.runtime.stop();
+  });
+
+  it('does not apply snapshot permissions older than a later hello', async () => {
+    const h = setup();
+    await h.runtime.start();
+    await h.settle();
+    const child = h.children[0];
+    child.snapshotReply = false;
+    child.send({ type: 'window.focused', bundleId: 'example.app', pid: 123, title: 'Synthetic' });
+    await h.settle();
+    child.send({ type: 'hello', session: 'fixture-session', permissions: { accessibility: 'granted' } });
+    child.send({
+      type: 'snapshot',
+      frontApp: { name: 'ExampleApp', bundleId: 'example.app', pid: 123 },
+      focusedWindow: { status: 'denied', pid: 123, bundleId: 'example.app' },
+      permissions: { accessibility: 'denied' },
+      thermal: 'nominal',
+    });
+    await h.settle();
+    expect(h.runtime.state().observation.sources['helper.ax']?.status).toBe('ok');
+    await h.runtime.stop();
+  });
+
+  it('refreshes window count on demand when another window closes without a focus change', async () => {
+    const h = setup();
+    await h.runtime.start();
+    await h.settle();
+    const child = h.children[0];
+    child.snapshotReply = false;
+    child.send({ type: 'app.activated', name: 'ExampleApp', bundleId: 'example.app', pid: 123 });
+    await h.settle();
+    child.send({
+      type: 'snapshot',
+      frontApp: { name: 'ExampleApp', bundleId: 'example.app', pid: 123, windowCount: 3 },
+      focusedWindow: { status: 'ok', pid: 123, bundleId: 'example.app' },
+      permissions: { accessibility: 'granted' },
+      thermal: 'nominal',
+    });
+    await h.settle();
+    expect(h.runtime.state().env.frontApp.value?.windowCount).toBe(3);
+    const refresh = h.runtime.tools.refreshDetail();
+    await h.settle();
+    child.send({
+      type: 'snapshot',
+      frontApp: { name: 'ExampleApp', bundleId: 'example.app', pid: 123, windowCount: 2 },
+      focusedWindow: { status: 'ok', pid: 123, bundleId: 'example.app' },
+      permissions: { accessibility: 'granted' },
+      thermal: 'nominal',
+    });
+    await h.settle();
+    expect(await refresh).toBe(true);
+    expect(environmentDetail(h.runtime)).toMatchObject({ windowCount: { value: 2, status: 'ok' } });
+    await h.runtime.stop();
+  });
+
+  it('takes a fresh snapshot for each detail read after an already pending snapshot', async () => {
+    const h = setup();
+    await h.runtime.start();
+    await h.settle();
+    const child = h.children[0];
+    child.snapshotReply = false;
+    let requests = 0;
+    child.stdin.on('data', (chunk: Buffer) => {
+      if (chunk.toString().includes('"snapshot"')) requests++;
+    });
+    child.send({ type: 'window.focused', bundleId: 'example.app', pid: 123, title: 'Synthetic' });
+    await h.settle();
+    expect(requests).toBe(1);
+    const first = h.runtime.tools.refreshDetail();
+    const second = h.runtime.tools.refreshDetail();
+    expect(await h.runtime.tools.refreshDetail()).toBe(false);
+    const snapshot = (count: number) => ({
+      type: 'snapshot',
+      frontApp: { name: 'ExampleApp', bundleId: 'example.app', pid: 123, windowCount: count },
+      focusedWindow: { status: 'ok', pid: 123, bundleId: 'example.app' },
+      permissions: { accessibility: 'granted' },
+      thermal: 'nominal',
+    });
+    child.send(snapshot(3));
+    await h.settle();
+    expect(requests).toBe(2);
+    child.send(snapshot(2));
+    await h.settle();
+    expect(await first).toBe(true);
+    expect(requests).toBe(3);
+    child.send(snapshot(1));
+    await h.settle();
+    expect(await Promise.all([first, second])).toEqual([true, true]);
+    expect(h.runtime.state().env.frontApp.value?.windowCount).toBe(1);
+    await h.runtime.stop();
+  });
+
+  it('times out a missing detail snapshot and cancels outstanding reads on stop', async () => {
+    const h = setup();
+    await h.runtime.start();
+    await h.settle();
+    const child = h.children[0];
+    child.snapshotReply = false;
+    const first = h.runtime.tools.refreshDetail();
+    await h.advance(3_000);
+    expect(await first).toBe(false);
+    const second = h.runtime.tools.refreshDetail();
+    await h.runtime.stop();
+    expect(await second).toBe(false);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('does not mark an incomplete matching snapshot as a fresh detail read', async () => {
+    const h = setup();
+    await h.runtime.start();
+    await h.settle();
+    const child = h.children[0];
+    child.snapshotReply = false;
+    const refresh = h.runtime.tools.refreshDetail();
+    child.send({
+      type: 'snapshot',
+      frontApp: { bundleId: 'example.app', pid: 123, windowCount: 2 },
+      focusedWindow: { status: 'ok', pid: 123, bundleId: 'example.app' },
+      permissions: { accessibility: 'granted' },
+      thermal: 'nominal',
+    });
+    await h.settle();
+    expect(await refresh).toBe(false);
+    await h.runtime.stop();
+  });
+
+  it('rejects an obsolete detail snapshot after the foreground app changes', async () => {
+    const h = setup();
+    await h.runtime.start();
+    await h.settle();
+    const child = h.children[0];
+    child.snapshotReply = false;
+    const refresh = h.runtime.tools.refreshDetail();
+    child.send({ type: 'app.activated', name: 'B', bundleId: 'b', pid: 2 });
+    child.send({
+      type: 'snapshot',
+      frontApp: { name: 'ExampleApp', bundleId: 'example.app', pid: 123, windowCount: 5 },
+      focusedWindow: { status: 'ok', pid: 123, bundleId: 'example.app' },
+      permissions: { accessibility: 'granted' },
+      thermal: 'nominal',
+    });
+    await h.settle();
+    expect(await refresh).toBe(false);
+    expect(h.runtime.state().env.frontApp.value).toEqual({ name: 'B', bundleId: 'b', pid: 2 });
+    await h.runtime.stop();
+  });
+
+  it('resets per-process AX state without fabricating an activation for the same bundle', async () => {
+    const h = setup();
+    await h.runtime.start();
+    await h.settle();
+    const child = h.children[0];
+    child.snapshotReply = false;
+    child.send({ type: 'ax.unsupported', bundleId: 'example.app', pid: 123 });
+    await h.settle();
+    const before = h.runtime.events().filter((event) => event.kind === 'app.activated').length;
+    child.send({ type: 'app.activated', name: 'ExampleApp', bundleId: 'example.app', pid: 456 });
+    await h.settle();
+    expect(h.runtime.state().observation.sources['helper.ax']?.status).toBe('unknown');
+    expect(h.runtime.state().env.frontApp.value).toEqual({ name: 'ExampleApp', bundleId: 'example.app', pid: 456 });
+    expect(h.runtime.events().filter((event) => event.kind === 'app.activated')).toHaveLength(before);
+    child.send({ type: 'ax.unsupported', bundleId: 'example.app', pid: 123 });
+    await h.settle();
+    expect(h.runtime.state().observation.sources['helper.ax']?.status).toBe('unknown');
+    await h.runtime.stop();
+  });
+
+  it('passes foreground pid and snapshot window count through to state', async () => {
+    const h = setup();
+    await h.runtime.start();
+    await h.settle();
+    const child = h.children[0];
+    if (!child) throw new Error('missing helper');
+    child.snapshotReply = false;
+    child.send({
+      type: 'snapshot',
+      frontApp: { name: 'Fixture', bundleId: 'fixture.app', pid: 42, windowCount: 3 },
+      focusedWindow: { status: 'ok', pid: 42 },
+      thermal: 'nominal',
+    });
+    await h.settle();
+    expect(h.runtime.state().env.frontApp.value).toEqual({
+      name: 'Fixture',
+      bundleId: 'fixture.app',
+      pid: 42,
+      windowCount: 3,
+    });
+    await h.runtime.stop();
+  });
+
+  it('discards an old metadata snapshot when foreground activation changes in flight', async () => {
+    const h = setup();
+    await h.runtime.start();
+    await h.settle();
+    const child = h.children[0];
+    if (!child) throw new Error('missing helper');
+    child.snapshotReply = false;
+    child.send({ type: 'app.activated', name: 'A', bundleId: 'a', pid: 1 });
+    await h.settle();
+    child.send({ type: 'app.activated', name: 'B', bundleId: 'b', pid: 2 });
+    child.send({
+      type: 'snapshot',
+      frontApp: { name: 'A', bundleId: 'a', pid: 1, windowCount: 9 },
+      focusedWindow: { status: 'ok', pid: 1 },
+      thermal: 'nominal',
+    });
+    await h.settle();
+    expect(h.runtime.state().env.frontApp.value).toEqual({ name: 'B', bundleId: 'b', pid: 2 });
+    child.send({
+      type: 'snapshot',
+      frontApp: { name: 'B', bundleId: 'b', pid: 2, windowCount: 0 },
+      focusedWindow: { status: 'ok', pid: 2 },
+      thermal: 'nominal',
+    });
+    await h.settle();
+    expect(h.runtime.state().env.frontApp.value).toEqual({ name: 'B', bundleId: 'b', pid: 2, windowCount: 0 });
+    await h.runtime.stop();
+  });
+
   it('restarts three times and emits one context after exceeding the restart limit', async () => {
     const h = setup();
     await h.runtime.start();
@@ -176,7 +519,7 @@ describe('helper protocol integration', () => {
       await h.settle();
     }
     expect(h.children).toHaveLength(4);
-    expect(h.runtime.state().env.frontApp.value).toEqual({ name: 'ExampleApp', bundleId: 'example.app' });
+    expect(h.runtime.state().env.frontApp.value).toEqual({ name: 'ExampleApp', bundleId: 'example.app', pid: 123 });
     for (const delay of [2000, 4000]) {
       h.children.at(-1)?.crash();
       await h.advance(delay);
@@ -407,7 +750,7 @@ describe('helper protocol integration', () => {
     });
     await h.settle();
     expect(h.runtime.state().self.body.thermal).toMatchObject({ status: 'ok', value: 'critical' });
-    expect(h.runtime.state().env.frontApp.value).toEqual({ name: 'NewApp', bundleId: 'new.app' });
+    expect(h.runtime.state().env.frontApp.value).toEqual({ name: 'NewApp', bundleId: 'new.app', pid: 234 });
     expect(h.runtime.state().env.focusedWindow.value).toBeNull();
     expect(h.runtime.state().observation.sources.helper?.status).toBe('ok');
     await h.runtime.stop();
@@ -654,7 +997,7 @@ describe('helper protocol integration', () => {
       thermal: 'critical',
     });
     await h.settle();
-    expect(h.runtime.state().env.frontApp.value).toEqual({ name: 'ExampleApp', bundleId: 'example.app' });
+    expect(h.runtime.state().env.frontApp.value).toEqual({ name: 'ExampleApp', bundleId: 'example.app', pid: 123 });
     expect(h.runtime.state().env.focusedWindow).toMatchObject({ status: 'unknown', value: null });
     await h.runtime.stop();
   });

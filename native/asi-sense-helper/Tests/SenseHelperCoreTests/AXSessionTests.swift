@@ -11,6 +11,7 @@ private final class FakeAX: AXBackend {
   var addOnce: [String: AXError] = [:] // consumed on the first matching add
   var adds: [(Int, String)] = [], removes: [(Int, String)] = []
   var detachCount = 0, fwCalls = 0, titleCalls = 0
+  var counts: [Int32: Int] = [:], countCalls = 0
   var fwApps: [Int] = [] // app element id per focusedWindow call
   var observers: [Obs] = [], started: [Obs] = [], detached: [Obs] = []
   var fwEntered: DispatchSemaphore?, fwRelease: DispatchSemaphore?
@@ -45,6 +46,10 @@ private final class FakeAX: AXBackend {
     if let e = errors["title:\(window.id)"] { return (e, nil) }
     if let o = titleOnce.removeValue(forKey: window.id) { return (.success, o) }
     return (.success, titles[window.id])
+  }
+  func windowCount(_ app: El) -> (AXError, Int?) {
+    countCalls += 1
+    return (.success, counts[Int32(-app.id)])
   }
   func equal(_ a: El, _ b: El) -> Bool { a.id == b.id }
   func equalObserver(_ a: Obs, _ b: Obs) -> Bool { a === b }
@@ -112,6 +117,21 @@ final class AXSessionTests: XCTestCase {
     return { s.signal() }
   }
 
+  func testSnapshotCountsWindowsOnlyWhenTrusted() {
+    makeSession(titles: false)
+    fake.counts[7] = 3
+    attach(7, win: 1)
+    var count: Int?
+    session.snapshotDetail(pid: 7, bundleId: "b.x") { _, _, c in count = c }; drain()
+    XCTAssertEqual(count, 3)
+    XCTAssertEqual(fake.countCalls, 1)
+    trusted = false
+    count = 99
+    session.snapshotDetail(pid: 7, bundleId: "b.x") { _, _, c in count = c }; drain()
+    XCTAssertNil(count)
+    XCTAssertEqual(fake.countCalls, 1)
+  }
+
   func testOptionalMainUnsupportedStillEmitsFocusedAndTitle() {
     makeSession()
     fake.errors["add:\(-7):\(S.mainNotification)"] = .notificationUnsupported
@@ -134,6 +154,31 @@ final class AXSessionTests: XCTestCase {
     XCTAssertEqual(ofType("ax.unsupported").last?["bundleId"] as? String, "")
     attach(6, "", win: 8)
     XCTAssertEqual(ofType("window.focused").count, 1)
+  }
+  func testUnsupportedProcessDoesNotMaskAnotherProcessInSameBundle() {
+    makeSession(titles: false)
+    fake.errors["add:\(-7):\(S.focusedNotification)"] = .notificationUnsupported
+    attach(7, "b.u")
+    fake.counts[8] = 2
+    attach(8, "b.u", win: 1)
+    var status = "", count: Int?
+    session.snapshotDetail(pid: 8, bundleId: "b.u") { s, _, c in status = s; count = c }; drain()
+    XCTAssertEqual(status, "ok")
+    XCTAssertEqual(count, 2)
+  }
+  func testTerminatedUnsupportedProcessDoesNotMaskReusedPid() {
+    makeSession(titles: false)
+    fake.errors["add:\(-7):\(S.focusedNotification)"] = .notificationUnsupported
+    attach(7, "b.u")
+    attach(8, "b.other", win: 2)
+    session.appTerminated(pid: 7); drain()
+    fake.errors.removeAll()
+    fake.counts[7] = 1
+    attach(7, "b.u", win: 1)
+    var status = "", count: Int?
+    session.snapshotDetail(pid: 7, bundleId: "b.u") { s, _, c in status = s; count = c }; drain()
+    XCTAssertEqual(status, "ok")
+    XCTAssertEqual(count, 1)
   }
   func testRetryableFailuresRecoverOnActivateAndRecheck() {
     makeSession()
