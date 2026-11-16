@@ -1,6 +1,7 @@
 import { Context } from '@deepseek-ai/cordis';
+import type { Agent } from '@deepseek-ai/dsh-agent';
 import { Session, SessionId, SessionSeq } from '@deepseek-ai/dsh-session';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { sessionCatalog, sessionRows } from '../../src/host/dsh/sessions.ts';
 
 describe('DSH session rows', () => {
@@ -34,11 +35,34 @@ describe('DSH session rows', () => {
       data: { title: 'Fixture', messageSeqs: [], source: { kind: 'user' } },
     });
     await ctx.parallel('workspace/session-archived', { sessionId: session.id });
+    ctx.emit('agent/disposed', { agent: { id: session.id } as Agent });
     ctx.emit('session/disposed', session);
-    expect(seen).toEqual([undefined, undefined, 'fixture', 'fixture']);
+    expect(seen).toEqual([undefined, undefined, 'fixture', 'fixture', 'fixture']);
     stop();
     ctx.emit('session/disposed', session);
-    expect(seen).toHaveLength(4);
+    expect(seen).toHaveLength(5);
     await ctx.fiber.dispose();
+  });
+
+  it('reads missing cold titles through the session query service', async () => {
+    const readTitleSnapshots = vi.fn(async () => [
+      { sessionId: 'cold', status: 'fulfilled', value: { title: { title: 'Archived fixture title' } } },
+    ]);
+    const ctx = {
+      sessionController: {
+        list: async () => ({
+          items: [
+            { sessionId: 'cold', updatedAt: 3, running: false, projections: { values: {} } },
+            { sessionId: 'blank', updatedAt: 2, running: false, projections: { values: { title: null } } },
+            { sessionId: 'warm', updatedAt: 1, running: true, projections: { values: { title: 'Warm fixture' } } },
+          ],
+        }),
+      },
+      workspaceRegistry: { archivedSessionIds: [] },
+      sessionQuery: { readTitleSnapshots },
+    } as unknown as Context;
+    const rows = await sessionCatalog(ctx).listSessions();
+    expect(readTitleSnapshots).toHaveBeenCalledWith(['cold'], expect.any(AbortSignal));
+    expect(rows.map((row) => row.title)).toEqual(['Archived fixture title', '', 'Warm fixture']);
   });
 });

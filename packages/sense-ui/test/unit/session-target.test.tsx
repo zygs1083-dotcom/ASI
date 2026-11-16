@@ -39,4 +39,33 @@ describe('delivery target', () => {
     fireEvent.keyDown(view.getByRole('combobox'), { key: 'Escape' })
     expect(view.queryByRole('listbox')).toBeNull()
   })
+
+  it('supports ArrowUp and selecting Auto, and restores focus', async () => {
+    const onSelect = vi.fn(async () => {})
+    const view = render(<SessionTarget target={{
+      mode: 'pinned', sessionId: 'a',
+      sessions: [{ id: 'a', title: 'Fixture', updatedAt: 1000, running: false }],
+    }} now={3000} onSelect={onSelect} />)
+    const button = view.getByRole('button', { name: /投递到/ })
+    fireEvent.click(button)
+    const input = view.getByRole('combobox')
+    fireEvent.keyDown(input, { key: 'ArrowDown' })
+    fireEvent.keyDown(input, { key: 'ArrowDown' })
+    fireEvent.keyDown(input, { key: 'ArrowUp' })
+    fireEvent.keyDown(input, { key: 'Enter' })
+    await waitFor(() => expect(onSelect).toHaveBeenCalledWith(undefined))
+    await waitFor(() => expect(document.activeElement).toBe(button))
+  })
+
+  it.each([180, 420])('keeps the search control within a %dpx panel', (width) => {
+    const view = render(<SessionTarget target={{
+      mode: 'auto', sessions: [{ id: 'a', title: 'A long synthetic conversation title', updatedAt: 1000, running: true }],
+    }} now={3000} onSelect={async () => {}} />)
+    view.container.style.width = `${width}px`
+    fireEvent.click(view.getByRole('button', { name: /投递到/ }))
+    const root = view.container.getBoundingClientRect()
+    const search = view.getByRole('combobox').getBoundingClientRect()
+    expect(search.left).toBeGreaterThanOrEqual(root.left)
+    expect(search.right).toBeLessThanOrEqual(root.right)
+  })
 })

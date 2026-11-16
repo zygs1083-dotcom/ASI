@@ -156,6 +156,7 @@ async function fixture(liveState = false, isolated = false) {
     });
   return {
     ctx,
+    ports,
     live,
     state,
     call,
@@ -169,6 +170,18 @@ async function fixture(liveState = false, isolated = false) {
 }
 
 describe('model-facing tools', () => {
+  it('reports a pinned target mode without exposing its conversation title', async () => {
+    const h = await fixture(true, true);
+    h.ports.dsh.listSessions = async () => [
+      { id: 'session-a', title: 'Private Synthetic Conversation', updatedAt: 1, running: false },
+    ];
+    h.ports.dsh.ensureSession = async () => {};
+    await h.agentEvent({ type: 'created', sessionId: 'session-a' });
+    await h.live.actions.selectTarget?.('session-a');
+    const result = await h.call('env_state', {}, { session: 'session-a' });
+    expect(result).toMatchObject({ isError: false, value: { deliveryTarget: 'pinned' } });
+    expect(JSON.stringify(result.value)).not.toContain('Private Synthetic Conversation');
+  });
   it('returns fact age and redacts titles when disabled; rejects calls without an agent', async () => {
     const h = await fixture();
     expect(await h.call('env_state', {}, { agent: false })).toMatchObject({

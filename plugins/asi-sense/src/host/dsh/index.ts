@@ -22,6 +22,7 @@ export const inject = [
   'profileContext',
   'sessionController',
   'sessionProjections',
+  'sessionQuery',
   'sessions',
   'systemPrompt',
   'tokenMeter',

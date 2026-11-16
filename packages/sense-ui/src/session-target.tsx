@@ -42,6 +42,7 @@ export function SessionTarget({ target, now, onSelect, onDismiss, copy = zh }: {
   const root = useRef<HTMLDivElement>(null)
   const button = useRef<HTMLButtonElement>(null)
   const input = useRef<HTMLInputElement>(null)
+  const restoreFocus = useRef(false)
   const listId = useId()
   const selected = target.sessions.find((item) => item.id === target.sessionId)
   const title = target.mode === 'pinned' ? selected?.title || copy.untitled : copy.auto
@@ -52,8 +53,14 @@ export function SessionTarget({ target, now, onSelect, onDismiss, copy = zh }: {
       .sort((a, b) => b.updatedAt - a.updatedAt || a.id.localeCompare(b.id))
       .filter((item) => (item.title || copy.untitled).toLocaleLowerCase().includes(normalized)),
   ]
-  useEffect(() => { if (open) input.current?.focus() }, [open])
-  const close = () => { setOpen(false); setQuery(''); setActive(-1); button.current?.focus() }
+  useEffect(() => {
+    if (open) input.current?.focus()
+    else if (!busy && restoreFocus.current) {
+      restoreFocus.current = false
+      button.current?.focus()
+    }
+  }, [open, busy])
+  const close = () => { restoreFocus.current = true; setOpen(false); setQuery(''); setActive(-1) }
   const select = async (id: string) => {
     setBusy(true)
     setFailed(false)

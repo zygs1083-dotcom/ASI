@@ -9,10 +9,16 @@ function fixture(initial?: string) {
     { id: 'b', title: 'Second fixture', updatedAt: 2, running: false },
   ];
   let notify: (closed?: string) => void = () => {};
+  let failList = false;
+  let failSave = false;
+  let failApply: string | undefined;
   const applied: Array<string | undefined> = [];
   let resets = 0;
   const port: Pick<DshPort, 'listSessions' | 'ensureSession' | 'onSessionsChanged'> = {
-    listSessions: async () => rows,
+    listSessions: async () => {
+      if (failList) throw new Error('list unavailable');
+      return rows;
+    },
     ensureSession: async () => {},
     onSessionsChanged: (cb) => {
       notify = cb;
@@ -22,6 +28,7 @@ function fixture(initial?: string) {
   const storage: StoragePort = {
     load: async (key) => data.get(key),
     save: async (key, value) => {
+      if (failSave) throw new Error('save unavailable');
       data.set(key, value);
     },
   };
@@ -31,6 +38,7 @@ function fixture(initial?: string) {
     'target-fixture',
     async (id) => {
       applied.push(id);
+      if (id && failApply === id) throw new Error('apply unavailable');
     },
     () => {
       resets++;
@@ -43,6 +51,15 @@ function fixture(initial?: string) {
     applied,
     get resets() {
       return resets;
+    },
+    failList: () => {
+      failList = true;
+    },
+    failSave: () => {
+      failSave = true;
+    },
+    failApply: (id: string) => {
+      failApply = id;
     },
     close: (id: string) => {
       rows = rows.filter((row) => row.id !== id);
@@ -84,6 +101,32 @@ describe('session target persistence', () => {
     await h.target.start();
     expect(h.target.snapshot()).toMatchObject({ mode: 'auto', notice: true });
     expect(h.resets).toBe(1);
+    await h.target.stop();
+  });
+
+  it('falls back when the close event arrives even if listing or persistence fails', async () => {
+    const h = fixture();
+    await h.target.start();
+    await h.target.select('a');
+    h.failList();
+    h.failSave();
+    h.close('a');
+    await h.target.settled();
+    expect(h.target.snapshot()).toMatchObject({ mode: 'auto', notice: true, unavailable: true });
+    expect(h.applied).toEqual(['a', undefined]);
+    expect(h.resets).toBe(1);
+    await h.target.stop();
+  });
+
+  it('restores the prior target and durable choice when applying a new selection fails', async () => {
+    const h = fixture();
+    await h.target.start();
+    await h.target.select('a');
+    h.failApply('b');
+    await expect(h.target.select('b')).rejects.toThrow('apply unavailable');
+    expect(h.target.snapshot()).toMatchObject({ mode: 'pinned', sessionId: 'a' });
+    expect(h.applied).toEqual(['a', 'b', 'a']);
+    expect(h.data.get('target-fixture')).toContain('"a"');
     await h.target.stop();
   });
 });

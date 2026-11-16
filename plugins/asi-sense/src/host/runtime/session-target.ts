@@ -32,13 +32,14 @@ export function createSessionTarget(
   };
   const save = (id: string | undefined) => storage.save(key, JSON.stringify({ version: 1, sessionId: id ?? null }));
   const reset = async () => {
-    await save(undefined);
-    check();
-    await apply(undefined);
-    check();
     selected = undefined;
     notice = true;
     recordReset();
+    changed();
+    const results = await Promise.allSettled([apply(undefined), save(undefined)]);
+    const failed = results.find((result): result is PromiseRejectedResult => result.status === 'rejected');
+    if (failed) throw failed.reason;
+    check();
   };
   return {
     async start(): Promise<void> {
@@ -46,8 +47,9 @@ export function createSessionTarget(
       off = port.onSessionsChanged?.((closed) => {
         void enqueue(async () => {
           if (!active) return;
+          if (selected && closed === selected) await reset();
           await refresh();
-          if (selected && (closed === selected || !rows.some((row) => row.id === selected))) await reset();
+          if (selected && !rows.some((row) => row.id === selected)) await reset();
           changed();
         }).catch(() => {
           if (active) {
@@ -98,7 +100,11 @@ export function createSessionTarget(
           await apply(id);
           check();
         } catch (error) {
-          if (active) await save(previous);
+          if (active) {
+            const rollback = await Promise.allSettled([apply(previous), save(previous)]);
+            const failed = rollback.find((result): result is PromiseRejectedResult => result.status === 'rejected');
+            if (failed) throw new AggregateError([error, failed.reason], 'target selection rollback failed');
+          }
           throw error;
         }
         selected = id;

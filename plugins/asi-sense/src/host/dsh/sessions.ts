@@ -1,6 +1,7 @@
 import type { Context } from '@deepseek-ai/cordis';
 import type {} from '@deepseek-ai/dsh-api-session-controller';
 import { SessionId } from '@deepseek-ai/dsh-session';
+import type {} from '@deepseek-ai/dsh-session-query';
 import type {} from '@deepseek-ai/dsh-workspace';
 import type { SessionRow } from '../runtime/ports.ts';
 
@@ -31,8 +32,23 @@ export function sessionRows(items: readonly Summary[], archived: readonly string
 export function sessionCatalog(ctx: Context) {
   return {
     async listSessions(): Promise<SessionRow[]> {
-      const { items } = await ctx.sessionController.list({}, new AbortController().signal);
-      return sessionRows(items, ctx.workspaceRegistry.archivedSessionIds);
+      const signal = new AbortController().signal;
+      const { items } = await ctx.sessionController.list({}, signal);
+      const rows = sessionRows(items, ctx.workspaceRegistry.archivedSessionIds);
+      const visible = new Set(rows.map((row) => row.id));
+      const missing = items
+        .filter((item) => visible.has(item.sessionId) && item.projections?.values.title === undefined)
+        .map((item) => item.sessionId);
+      if (!missing.length) return rows;
+      const results = await ctx.sessionQuery.readTitleSnapshots(missing, signal);
+      const titles = new Map(
+        results.flatMap((result) =>
+          result.status === 'fulfilled' && result.value.title
+            ? [[result.sessionId, result.value.title.title] as const]
+            : [],
+        ),
+      );
+      return rows.map((row) => ({ ...row, title: row.title || titles.get(SessionId(row.id)) || '' }));
     },
     async ensureSession(id: string): Promise<void> {
       const result = await ctx.sessionController.resolveAgent(SessionId(id));
@@ -42,6 +58,7 @@ export function sessionCatalog(ctx: Context) {
       const off = [
         ctx.on('session/created', () => cb()),
         ctx.on('session/disposed', (session) => cb(session.id)),
+        ctx.on('agent/disposed', ({ agent }) => cb(agent.id)),
         ctx.on('agent/status', () => cb()),
         ctx.on('session/event', (_session, event) => {
           if (event.type === 'session/title' || event.type === 'user/message') cb();

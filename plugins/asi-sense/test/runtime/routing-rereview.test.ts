@@ -108,6 +108,59 @@ describe('in-flight session ownership', () => {
     expect(h.delivered[0]?.sessionId).toBe('a');
     await h.attention.stop();
   });
+
+  it('keeps wake budgets separate for each pinned target', async () => {
+    const h = harness(false, rules, false);
+    h.attention.create('a');
+    h.attention.create('b');
+    await h.attention.preStep('a');
+    h.attention.postStep('a');
+    await h.attention.accept(signal('first-a', 'wake'));
+    h.advance();
+    await h.attention.flush();
+    await h.attention.setTarget('b');
+    await h.attention.accept(signal('first-b', 'wake'));
+    h.advance();
+    await h.attention.flush();
+    await h.attention.setTarget('a');
+    await h.attention.accept(signal('second-a', 'wake'));
+    h.advance();
+    await h.attention.flush();
+    expect(h.delivered.map((item) => [item.sessionId, item.kind])).toEqual([
+      ['a', 'followup'],
+      ['b', 'followup'],
+    ]);
+    await h.attention.preStep('a');
+    expect(h.delivered[2]).toMatchObject({
+      sessionId: 'a',
+      kind: 'inject',
+      update: { changes: [expect.objectContaining({ reason: 'wake-budget' })] },
+    });
+    await h.attention.stop();
+  });
+
+  it('moves a failed in-flight wake and the remaining queue on a pinned target switch', async () => {
+    const h = harness(true);
+    h.attention.create('a');
+    h.attention.create('b');
+    await h.attention.preStep('a');
+    await h.attention.accept(signal('wake-1', 'wake'));
+    await h.attention.accept(signal('wake-2', 'wake'));
+    h.advance();
+    const old = h.attention.flush().catch(() => {});
+    await h.waiting;
+    const switched = h.attention.setTarget('b');
+    h.release();
+    await Promise.all([old, switched]);
+    await h.attention.preStep('b');
+    await h.attention.preStep('b');
+    const deliveredToB = h.delivered
+      .filter((item) => item.sessionId === 'b')
+      .flatMap((item) => item.update.changes.map((change) => change.signal.id))
+      .sort();
+    expect(deliveredToB).toEqual(['wake-1', 'wake-2']);
+    await h.attention.stop();
+  });
   it('does not apply a queued job after its owner is disposed and recreated reentrantly', async () => {
     const h = harness(
       false,
