@@ -107,6 +107,31 @@ describe('NetworkSampler', () => {
     expect(second.value).toEqual({ online: true, rxBps: 1000, txBps: 1500 });
   });
 
+  it.each([-20_000, 0, 20_000])('timestamps fresh rates independently of cached routes after a %i ms wall jump', async (jump) => {
+    let mono = 0;
+    let wall = 100_000;
+    let routeCalls = 0;
+    let i = 0;
+    const texts = [fx('netstat_1.txt'), fx('netstat_2.txt')];
+    const s = new NetworkSampler({
+      platform: 'darwin',
+      run: async (file) => file.endsWith('netstat') ? texts[Math.min(i++, 1)]! : (routeCalls++, ''),
+      now: () => mono,
+      wall: () => wall,
+      interfaces: () => ({ en0: [iface({})] }),
+    });
+    await s.sample(30_000, undefined, { routeMs: 10_000 });
+    mono = 9_000;
+    wall += 9_000 + jump;
+    const result = await s.sample(30_000, undefined, { routeMs: 10_000 });
+    expect(result.status).toBe('ok');
+    expect(result.observedAt).toBe(wall);
+    expect(result.ttlMs).toBe(21_000);
+    expect(routeCalls).toBe(1);
+    expect(fact.stale(result, 29_999, wall).status).toBe('ok');
+    expect(fact.stale(result, 30_000, wall).status).toBe('stale');
+  });
+
   it('gives newly appearing interfaces their own baseline and reports unknown on resets', async () => {
     let t = 0;
     const s = sampler(
@@ -272,7 +297,7 @@ describe('NetworkSampler', () => {
     expect(routes).toBe(2); // the fresh verdict is now cached
   });
 
-  it('composes observedAt/ttlMs from the earliest absolute expiry (rate vs route)', async () => {
+  it('uses the rate observation time and earliest monotonic constituent deadline', async () => {
     let mono = 0;
     let wall = 1_000;
     let i = 0;
@@ -291,8 +316,8 @@ describe('NetworkSampler', () => {
     wall = 5_000; mono = 4_000;
     const f = await s.sample(6000);
     expect(f.status).toBe('ok');
-    expect(f.observedAt).toBe(1000); // the cached route observation is oldest
-    expect(f.ttlMs).toBe(10_000);    // expires at 11000: the rate sample's own 6s ttl
+    expect(f.observedAt).toBe(5_000); // the current rate observation
+    expect(f.ttlMs).toBe(6_000);      // expires at 11000: the rate sample's own 6s ttl
     expect(routeCalls).toBe(1);
     // tracked monotonic deadline: rate part mono 4000 + 6s — boundary is stale
     expect(fact.stale(f, 9_999, 5_000).status).toBe('ok');

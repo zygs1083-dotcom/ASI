@@ -1,9 +1,11 @@
 import { createRequire } from 'node:module';
+import { MemorySampler, NetworkSampler } from '@asi/body-probe';
 import type { Body } from '@asi/sense-types';
 import type { SensePanelProps } from '@asi/sense-ui/model';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { attentionLine } from '../../../../packages/sense-ui/src/attention.ts';
 import { evaluateBody } from '../../../../packages/sense-ui/src/health.ts';
+import { Sparkline } from '../../../../packages/sense-ui/src/sparkline.tsx';
 import { createPresenter } from '../../src/host/presenter/index.ts';
 import { createSenseRuntime } from '../../src/host/runtime/index.ts';
 import type { AgentEvent, JobEvent, TokenSnapshot } from '../../src/host/runtime/ports.ts';
@@ -98,6 +100,110 @@ async function harness() {
 }
 
 describe('presenter', () => {
+  it.each([-61_000, 0, 61_000])(
+    'shows freshly sampled memory and network trends without lag across a %i ms wall jump, then shows real lag',
+    async (jump) => {
+      const h = await harness();
+      let mono = 0;
+      let reads = 0;
+      let routes = 0;
+      let swaps = 0;
+      let lastBody: Body | undefined;
+      const network = new NetworkSampler({
+        platform: 'darwin',
+        now: () => mono,
+        wall: () => Date.now(),
+        interfaces: () => ({
+          en0: [
+            { address: '198.51.100.1', netmask: '255.255.255.0', family: 'IPv4', mac: '', internal: false, cidr: null },
+          ],
+        }),
+        run: async (file) => {
+          if (!file.endsWith('netstat')) {
+            routes++;
+            return '';
+          }
+          reads++;
+          return (
+            `Name Mtu Network Address Ipkts Ierrs Ibytes Opkts Oerrs Obytes Coll\n` +
+            `en0 1500 <Link#4> aa 1 0 ${reads * reads * 7000} 1 0 ${reads * reads * 14000} 0`
+          );
+        },
+      });
+      const memory = new MemorySampler({
+        platform: 'darwin',
+        now: () => mono,
+        wall: () => Date.now(),
+        totalmem: () => 1_000_000,
+        run: async (file, args = []) => {
+          if (file.endsWith('vm_stat')) {
+            return (
+              `page size of 4096 bytes\nAnonymous pages: ${reads * 10}.\nPages purgeable: 0.\n` +
+              'File-backed pages: 5.\nPages wired down: 5.\nPages occupied by compressor: 5.'
+            );
+          }
+          return args
+            .slice(1)
+            .map((key) => {
+              if (key === 'vm.swapusage') swaps++;
+              return key === 'vm.swapusage' ? 'used = 1M' : '1';
+            })
+            .join('\n');
+        },
+      });
+      const sample = async () => {
+        const networkFact = await network.sample(15_000);
+        const memoryFact = await memory.sample(15_000);
+        lastBody = mkBody({ network: networkFact, memory: memoryFact });
+        await h.sample(lastBody);
+      };
+      await sample();
+      mono += 17_000;
+      h.elapse(17_000);
+      await sample();
+      vi.setSystemTime(Date.now() + jump);
+      mono += 7_000;
+      h.elapse(7_000);
+      await sample();
+      expect(routes).toBe(1);
+      expect(swaps).toBe(1);
+      const current = h.presenter.snapshot();
+      expect(current.history.memory.at(-1)).toEqual({ at: current.now, value: 0.16384 });
+      expect(current.history.networkRx.at(-1)).toEqual({ at: current.now, value: 5000 });
+      expect(current.history.networkTx.at(-1)).toEqual({ at: current.now, value: 10000 });
+      expect(current.state.self.body.memory.observedAt).toBe(current.now);
+      expect(current.state.self.body.network.observedAt).toBe(current.now);
+      const require = createRequire(import.meta.resolve('@asi/sense-ui'));
+      const React = require('react');
+      const { renderToString } = require('react-dom/server');
+      const render = (points: typeof current.history.memory, now: number) =>
+        renderToString(
+          React.createElement(Sparkline, {
+            points,
+            now,
+            sampleIntervalMs: 5_000,
+            label: '合成趋势',
+            format: String,
+          }),
+        );
+      for (const points of [current.history.memory, current.history.networkRx, current.history.networkTx]) {
+        const html = render(points, current.now);
+        expect(html).toContain('最近 5 分钟趋势：当前');
+        expect(html).not.toContain('数据滞后');
+      }
+      mono += 16_000;
+      h.elapse(16_000);
+      if (!lastBody) throw new Error('missing sample');
+      await h.sample(lastBody);
+      const stopped = h.presenter.snapshot();
+      for (const points of [stopped.history.memory, stopped.history.networkRx, stopped.history.networkTx]) {
+        expect(render(points, stopped.now)).toContain('数据滞后');
+      }
+      h.presenter.close();
+      await h.runtime.stop();
+    },
+  );
+
   it.each([false, true])(
     'commits every fact deadline before batched notifications with session=%s',
     async (session) => {
