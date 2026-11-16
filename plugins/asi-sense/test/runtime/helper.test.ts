@@ -607,7 +607,7 @@ describe('helper protocol integration', () => {
     await h.settle();
     expect(h.runtime.state().observation.sources.helper?.status).toBe('ok');
     await h.runtime.stop();
-  });
+  }, 30_000); // cooldown advances a 5-minute fake clock (~3s alone, >5s under root pnpm check)
 
   it('applies complete snapshot fields after an unusable incremental thermal event', async () => {
     const h = setup();
