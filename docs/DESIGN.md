@@ -257,7 +257,8 @@ note: 测试失败时看日志并决定是否提醒我
 `SensePanelModel.tuning` 扩展（sense-ui 与 presenter 共同遵守）：
 ```ts
 disabled?: { reason: 'storage-failed' | 'restore-failed' }
-suggestions?: { id: string; metric: MetricKey; slotLabel: string /* 例 "周二 14 时" */; from: number; to: number; samples: number; dates: number }[]
+suggestions?: { id: string; metric: MetricKey; slotLabel: string /* 例 "周二 14 时" */; from: number; to: number; unit: 'ratio' | 'bytes' | 'tokens' | 'bytes-per-second' | 'ordinal'; samples: number; dates: number }[]
+// from/to 为运行时自然单位（disk:<mount> = 剩余字节，context = 剩余 token，cpu/memory = 0..1 比例），由 presenter 填 unit，UI 只按 unit 格式化，不换算成 history 单位。
 ```
 UI：disabled 时规则区顶部提示条——storage-failed 给「恢复 AI 调参」（`onResumeTuning`），restore-failed 给「重置调参」（`onResetTuning`，二次确认）；suggestions 列在调整日志上方，每条「确认重新基线」（`onAcceptRebaseline(id)`，二次确认，文案说明"持续故障与新负载无法自动区分"）。
 
