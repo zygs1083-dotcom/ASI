@@ -1,8 +1,15 @@
-import type { SensePanelModel } from '@asi/sense-ui';
 import type { Context } from '@deepseek-ai/cordis';
 import { principalOf, Remote, RemoteError, TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol';
 import type { SenseActions } from '../runtime/ports.ts';
 import type { FramesSource } from './frames.ts';
+import { toWirePanelModel } from './wire.ts';
+import type { WirePanelModel } from './wire-types.ts';
+
+declare module '@deepseek-ai/cordis' {
+  interface Context {
+    asiSense: AsiSenseRemote;
+  }
+}
 
 export class AsiSenseRemote extends TypertRemoteService {
   constructor(
@@ -35,9 +42,9 @@ export class AsiSenseRemote extends TypertRemoteService {
   }
 
   @Remote({ mode: 'stream' })
-  frames(signal: AbortSignal): AsyncIterable<SensePanelModel> {
+  async *frames(signal: AbortSignal): AsyncIterable<WirePanelModel> {
     this.checkUser();
-    return this.framesSource(signal);
+    for await (const frame of this.framesSource(signal)) yield toWirePanelModel(frame);
   }
 
   @Remote
