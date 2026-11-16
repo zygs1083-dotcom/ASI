@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import type { Body } from '@asi/sense-types';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { DeliveryFailure } from '../../src/host/attention/drain.ts';
+import { AttentionPipeline } from '../../src/host/attention/pipeline.ts';
 import { DEFAULT_RULES } from '../../src/host/attention/rules.ts';
 import { defaultBodyRules } from '../../src/host/body/index.ts';
 import { FileStoragePort } from '../../src/host/dsh/storage.ts';
@@ -1308,6 +1309,132 @@ describe('host runtime', () => {
     expect(vi.getTimerCount()).toBe(0);
   });
 
+  it('keeps displayed tuning and the actual pipeline equal through restore, retry, tuning, revert and reset', async () => {
+    const levels = vi.spyOn(AttentionPipeline.prototype, 'setDeliveryLevels');
+    let saved: string | undefined;
+    let failRead = false;
+    const storage = {
+      load: async (key: string) => {
+        if (key !== 'body') return undefined;
+        if (failRead) throw Object.assign(new Error('fixture'), { code: 'EACCES' });
+        return saved;
+      },
+      save: async (key: string, value: string) => {
+        if (key === 'body') saved = value;
+      },
+      backup: async () => 'body.json.bak-fixture',
+    };
+    const check = (h: ReturnType<typeof harness>) => {
+      const presenter = createPresenter(h.runtime, { clock: h.ports.clock });
+      const params = Object.fromEntries(presenter.snapshot().tuning.parameters.map((item) => [item.key, item.value]));
+      presenter.close();
+      const pipeline = levels.mock.contexts.at(-1) as AttentionPipeline;
+      const actual = pipeline as unknown as {
+        levels: Record<string, string>;
+        mergeWindowMs: number;
+        fileMergeWindowMs: number;
+      };
+      expect(actual.levels).toEqual({
+        'body.rate': params['deliveryLevel.body.rate'],
+        'body.anomaly': params['deliveryLevel.body.anomaly'],
+        'file.burst': params['deliveryLevel.file.burst'],
+      });
+      for (const kind of ['body.rate', 'body.anomaly', 'file.burst'] as const) {
+        const rule = pipeline.selectRule({
+          id: 'fixture',
+          kind,
+          at: Date.now(),
+          source: { id: 'fixture', api: 'fixture', host: 'local' },
+          subject: 'fixture',
+          data: { severity: 'warn', externalDeletionExceeded: true },
+        });
+        expect(rule?.level).toBe(params[`deliveryLevel.${kind}`]);
+      }
+      expect(actual.mergeWindowMs).toBe(params.mergeWindowMs);
+      expect(actual.fileMergeWindowMs).toBe(params.fileMergeWindowMs);
+    };
+    try {
+      const first = harness();
+      Object.assign(first.ports.storage, storage);
+      await first.runtime.start();
+      check(first);
+      for (const [param, to] of [
+        ['mergeWindowMs', 4_000],
+        ['fileMergeWindowMs', 10_000],
+        ['deliveryLevel.body.rate', 'record'],
+        ['deliveryLevel.body.anomaly', 'record'],
+      ] as const) {
+        expect(await first.runtime.tools.bodyTune({ param, to })).toMatchObject({ applied: true });
+        check(first);
+      }
+      await first.runtime.stop();
+
+      failRead = true;
+      const restored = harness();
+      Object.assign(restored.ports.storage, storage);
+      await restored.runtime.start();
+      expect(restored.runtime.body.monitor.backupError).toEqual({ code: 'EACCES', stage: 'backup' });
+      check(restored);
+      const mismatches: string[] = [];
+      const unwatch = restored.runtime.onChange(() => {
+        try {
+          check(restored);
+        } catch (error) {
+          mismatches.push(String(error));
+        }
+      });
+      expect(restored.runtime.body.tuner.get('deliveryLevel.file.burst')).toBe('context');
+      failRead = false;
+      await restored.runtime.actions.retryTuningBackup();
+      expect(restored.runtime.body.tuner.get('deliveryLevel.file.burst')).toBe('wake');
+      check(restored);
+      await restored.runtime.actions.deleteRule('files-wake');
+      await restored.runtime.tools.envWatch({
+        action: 'add',
+        rule: { id: 'context-files', match: { kind: 'file.changed', subject: '/workspace/**' }, level: 'context' },
+      });
+      await restored.agent({ type: 'created', sessionId: 's' });
+      await restored.agent({ type: 'pre-step', sessionId: 's' });
+      await restored.agent({ type: 'post-step', sessionId: 's' });
+      for (let i = 0; i < 51; i++) await restored.file({ path: `/workspace/${i}.ts`, change: 'delete' });
+      await restored.advance(4_000);
+      expect(restored.delivered).toContainEqual(
+        expect.objectContaining({
+          kind: 'followup',
+          update: expect.objectContaining({
+            changes: expect.arrayContaining([
+              expect.objectContaining({ signal: expect.objectContaining({ kind: 'file.burst' }) }),
+            ]),
+          }),
+        }),
+      );
+      const change = await restored.runtime.tools.bodyTune({ param: 'deliveryLevel.file.burst', to: 'context' });
+      expect(change).toMatchObject({ applied: true });
+      check(restored);
+      await restored.runtime.actions.revertTuning(change.change.id);
+      check(restored);
+      expect(mismatches).toEqual([]);
+      unwatch();
+      await restored.runtime.stop();
+
+      const normal = harness();
+      Object.assign(normal.ports.storage, storage);
+      await normal.runtime.start();
+      check(normal);
+      await normal.runtime.stop();
+      saved = '{broken';
+      const reset = harness();
+      Object.assign(reset.ports.storage, storage);
+      await reset.runtime.start();
+      check(reset);
+      await reset.runtime.actions.resetTuning();
+      check(reset);
+      await reset.runtime.stop();
+    } finally {
+      levels.mockRestore();
+    }
+  });
+
   it('refreshes tokens at steps and five seconds, excludes fallback capacity from alerts and clears missing data', async () => {
     const h = harness();
     const usage = { input: 10, output: 1, cacheRead: 0, cacheWrite: 0 };
@@ -1930,6 +2057,97 @@ describe('host runtime', () => {
     presenter.close();
     await h.runtime.stop();
     expect(saved).not.toBe(original);
+  });
+
+  it('shows a completed backup when marker saving fails and reuses it on retries and restart', async () => {
+    const root = await fs.mkdtemp(join(tmpdir(), 'asi-tuning-save-failed-'));
+    try {
+      const storage = new FileStoragePort(root, fs, () => {});
+      const original = '{"version":99}';
+      await storage.save('body', original);
+      let failSave = true;
+      const create = async () => {
+        const h = harness();
+        const port = new FileStoragePort(root, fs, () => {});
+        Object.assign(h.ports.storage, {
+          load: port.load.bind(port),
+          save: async (key: string, value: string) => {
+            if (key === 'body' && failSave) throw Object.assign(new Error('fixture'), { code: 'ENOSPC' });
+            await port.save(key, value);
+          },
+          backup: port.backup.bind(port),
+        });
+        await h.runtime.start();
+        return h;
+      };
+      const first = await create();
+      const presenter = createPresenter(first.runtime, { clock: first.ports.clock });
+      const notice = presenter.snapshot().tuning.backupNotice;
+      expect(notice).toEqual({ kind: 'unknown-version', fileName: expect.stringMatching(/^body\.json\.bak-/) });
+      if (!notice) throw new Error('missing backup notice');
+      expect(await fs.readFile(join(root, notice.fileName), 'utf8')).toBe(original);
+      expect((await fs.stat(join(root, notice.fileName))).mode & 0o777).toBe(0o600);
+      expect(presenter.snapshot().tuning.backupError).toEqual({ code: 'ENOSPC', stage: 'save' });
+      await expect(first.runtime.actions.resetTuning()).rejects.toThrow();
+      await expect(first.runtime.actions.retryTuningBackup()).rejects.toThrow();
+      expect(await storage.load('body')).toBe(original);
+      expect((await fs.readdir(root)).filter((name) => name.startsWith('body.json.bak-'))).toEqual([notice.fileName]);
+      presenter.close();
+      await first.runtime.stop();
+
+      const restarted = await create();
+      expect(restarted.runtime.body.monitor.backupNotice).toEqual(notice);
+      expect((await fs.readdir(root)).filter((name) => name.startsWith('body.json.bak-'))).toEqual([notice.fileName]);
+      failSave = false;
+      await restarted.runtime.actions.retryTuningBackup();
+      expect(restarted.runtime.body.monitor.backupNotice).toEqual(notice);
+      expect(restarted.runtime.body.monitor.backupError).toBeUndefined();
+      await restarted.runtime.actions.resetTuning();
+      await restarted.runtime.stop();
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('classifies supported but corrupt v1 and v2 snapshots separately from unknown versions', async () => {
+    let saved: string | undefined;
+    const storage = {
+      load: async (key: string) => (key === 'body' ? saved : undefined),
+      save: async (key: string, value: string) => {
+        if (key === 'body') saved = value;
+      },
+      backup: async () => 'body.json.bak-fixture',
+    };
+    const first = harness();
+    Object.assign(first.ports.storage, storage);
+    await first.runtime.start();
+    await first.runtime.stop();
+    if (!saved) throw new Error('missing snapshot');
+    const v2 = JSON.parse(saved);
+    const v1 = structuredClone(v2);
+    v1.version = 1;
+    const tuner = JSON.parse(v1.tuner);
+    tuner.values = tuner.values.filter(
+      ([key]: [string, unknown]) =>
+        key !== 'mergeWindowMs' && key !== 'fileMergeWindowMs' && !key.startsWith('deliveryLevel.'),
+    );
+    v1.tuner = JSON.stringify(tuner);
+    v1.baseline = 'invalid';
+    const fullV1 = { ...v2, version: 1 };
+    const corruptV2 = { ...v2, baseline: 'invalid' };
+    for (const [input, kind] of [
+      [v1, 'corrupt'],
+      [fullV1, 'corrupt'],
+      [corruptV2, 'corrupt'],
+      [{ version: 99 }, 'unknown-version'],
+    ] as const) {
+      saved = JSON.stringify(input);
+      const h = harness();
+      Object.assign(h.ports.storage, storage);
+      await h.runtime.start();
+      expect(h.runtime.body.monitor.backupNotice).toMatchObject({ kind });
+      await h.runtime.stop();
+    }
   });
 
   it.each([

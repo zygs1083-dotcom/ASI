@@ -44,6 +44,29 @@ describe('调参恢复与重置', () => {
     await act(async () => {})
   })
 
+  it('备份成功但保存失败时同时显示文件名和错误，保存前不能关闭提示', async () => {
+    const model = makeScenario('healthy')
+    model.tuning = {
+      parameters: [], log: [], disabled: { reason: 'restore-failed' },
+      backupError: { code: 'ENOSPC', stage: 'save' },
+      backupNotice: { kind: 'corrupt', fileName: 'body.json.bak-example' },
+    }
+    const dismiss = vi.fn(async () => {})
+    const { props, view } = setup(model)
+    view.rerender(<SensePanel {...props} onRetryTuningBackup={async () => {}} onDismissTuningBackup={dismiss} />)
+    expect(screen.getByText(/无法保存调参恢复状态：磁盘空间不足/)).toBeTruthy()
+    expect(screen.getByText(/已将损坏的调参数据备份为 body.json.bak-example/)).toBeTruthy()
+    expect((screen.getByRole('button', { name: '重置调参' }) as HTMLButtonElement).disabled).toBe(true)
+    expect((screen.getByRole('button', { name: '关闭备份提示' }) as HTMLButtonElement).disabled).toBe(true)
+    view.rerender(<SensePanel {...props} onDismissTuningBackup={dismiss} model={{
+      ...model, tuning: { ...model.tuning!, backupError: undefined },
+    }} />)
+    expect((screen.getByRole('button', { name: '关闭备份提示' }) as HTMLButtonElement).disabled).toBe(false)
+    fireEvent.click(screen.getByRole('button', { name: '关闭备份提示' }))
+    expect(dismiss).toHaveBeenCalledOnce()
+    await act(async () => {})
+  })
+
   it.each([
     ['corrupt', '已将损坏的调参数据备份为 body.json.bak-example，已恢复默认'],
     ['unknown-version', '已将无法识别版本的调参数据备份为 body.json.bak-example，已恢复默认'],

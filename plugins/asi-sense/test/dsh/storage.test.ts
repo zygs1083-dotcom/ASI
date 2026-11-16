@@ -79,24 +79,49 @@ describe('atomic file storage', () => {
     await expect(port.save('../other', '{}')).rejects.toThrow();
   });
 
-  it('backs up the exact bytes with private permissions and unique names', async () => {
+  it('reuses an identical backup by content hash and preserves distinct exact bytes', async () => {
     const { root, port } = await fixture();
     const bytes = Buffer.from([0x7b, 0xff, 0x7d]);
     await fs.writeFile(join(root, 'settings.json'), bytes);
     const original = (await port.load('settings')) as string;
-    await port.backup('settings', original);
-    await port.backup('settings', original);
+    const first = await port.backup('settings', original);
+    expect(await port.backup('settings', original)).toBe(first);
+    expect((await fs.readdir(root)).filter((name) => name.startsWith('settings.json.bak-'))).toEqual([first]);
+    const other = Buffer.from([0x7b, 0xfe, 0x7d]);
+    await fs.writeFile(join(root, 'settings.json'), other);
+    const second = await port.backup('settings', (await port.load('settings')) as string);
+    expect(second).not.toBe(first);
     const backups = (await fs.readdir(root)).filter((name) => name.startsWith('settings.json.bak-'));
     expect(backups).toHaveLength(2);
-    for (const name of backups) {
-      expect(await fs.readFile(join(root, name))).toEqual(bytes);
+    for (const [name, contents] of [
+      [first, bytes],
+      [second, other],
+    ] as const) {
+      expect(await fs.readFile(join(root, name))).toEqual(contents);
       expect((await fs.stat(join(root, name))).mode & 0o777).toBe(0o600);
     }
     await expect(port.backup('settings', 'different')).rejects.toThrow('changed');
     expect((await fs.readdir(root)).filter((name) => name.startsWith('settings.json.bak-'))).toHaveLength(2);
   });
 
-  it.each(['file-open', 'write', 'file-sync', 'file-close', 'dir-open', 'dir-sync', 'dir-close'])(
+  it('reuses a byte-identical legacy backup and never overwrites it', async () => {
+    const { root, port } = await fixture();
+    const legacy = 'settings.json.bak-1700000000000-11111111-2222-3333-4444-555555555555';
+    await fs.writeFile(join(root, legacy), 'old', { mode: 0o600 });
+    expect(await port.backup('settings', 'old')).toBe(legacy);
+    expect((await fs.readdir(root)).filter((name) => name.startsWith('settings.json.bak-'))).toEqual([legacy]);
+  });
+
+  it('does not reuse or overwrite a damaged hash-named backup', async () => {
+    const { root, port } = await fixture();
+    const name = await port.backup('settings', 'old');
+    await fs.writeFile(join(root, name), 'damaged');
+    await expect(port.backup('settings', 'old')).rejects.toMatchObject({ code: 'EEXIST' });
+    expect(await fs.readFile(join(root, name), 'utf8')).toBe('damaged');
+    expect(await port.load('settings')).toBe('old');
+  });
+
+  it.each(['file-open', 'write', 'file-sync', 'file-close', 'rename', 'dir-open', 'dir-sync', 'dir-close'])(
     'does not install a backup after a %s failure',
     async (fault) => {
       const { root, port } = await fixture(fault);

@@ -55,7 +55,7 @@ export function TuningBackupStatus({ model, onRetryTuningBackup, onDismissTuning
       </div>}
       {notice && <div className={css.notice} role="status">
         <span className={css.backupText}>{notice.kind === 'corrupt' ? copy.backupCorrupt : copy.backupUnknown}{notice.fileName}{copy.restored}</span>
-        <button type="button" disabled={!onDismissTuningBackup || busy(dismiss)} onClick={() => onDismissTuningBackup && operations.run('dismiss-backup', onDismissTuningBackup, copy.dismissBackup)}>{copy.dismissBackup}</button>
+        <button type="button" disabled={!!error || !onDismissTuningBackup || busy(dismiss)} onClick={() => onDismissTuningBackup && operations.run('dismiss-backup', onDismissTuningBackup, copy.dismissBackup)}>{copy.dismissBackup}</button>
       </div>}
     </>
   )

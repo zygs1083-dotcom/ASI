@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { basename, join } from 'node:path';
 import type { StoragePort } from '../runtime/ports.ts';
 
@@ -13,6 +13,7 @@ export interface StorageFileSystem {
   open(path: string, flags: 'r' | 'wx', mode?: number): Promise<StorageFile>;
   readFile(path: string): Promise<Uint8Array>;
   readFile(path: string, encoding: 'utf8'): Promise<string>;
+  readdir(path: string): Promise<string[]>;
   rename(from: string, to: string): Promise<void>;
   unlink(path: string): Promise<void>;
 }
@@ -61,17 +62,45 @@ export class FileStoragePort implements StoragePort {
       if (Buffer.from(bytes).toString('utf8') !== original) {
         throw Object.assign(new Error('storage snapshot changed before backup'), { code: 'SNAPSHOT_CHANGED' });
       }
-      const path = `${target}.bak-${Date.now()}-${randomUUID()}`;
+      const hash = createHash('sha256').update(bytes).digest('hex');
+      const prefix = `${basename(target)}.bak-`;
+      let path = `${target}.bak-${hash}`;
+      const temp = join(this.root, `.${key}.${randomUUID()}.tmp`);
       let handle: StorageFile | undefined;
       let created = false;
+      let installed = false;
       let complete = false;
       try {
-        handle = await this.fs.open(path, 'wx', 0o600);
-        created = true;
-        await handle.writeFile(bytes);
-        await handle.sync();
-        await handle.close();
-        handle = undefined;
+        let existing = false;
+        for (const name of await this.fs.readdir(this.root)) {
+          if (!name.startsWith(prefix)) continue;
+          const suffix = name.slice(prefix.length);
+          if (suffix !== hash && !/^\d{1,20}-[a-f0-9-]{36}$/i.test(suffix)) continue;
+          const candidate = join(this.root, name);
+          const content = await this.fs.readFile(candidate);
+          if (createHash('sha256').update(content).digest('hex') === hash && Buffer.from(content).equals(bytes)) {
+            path = candidate;
+            existing = true;
+            break;
+          }
+          if (suffix === hash) throw Object.assign(new Error('backup content mismatch'), { code: 'EEXIST' });
+        }
+        if (existing) {
+          handle = await this.fs.open(path, 'r');
+          await handle.sync();
+          await handle.close();
+          handle = undefined;
+        } else {
+          handle = await this.fs.open(temp, 'wx', 0o600);
+          created = true;
+          await handle.writeFile(bytes);
+          await handle.sync();
+          await handle.close();
+          handle = undefined;
+          await this.fs.rename(temp, path);
+          created = false;
+          installed = true;
+        }
         const directory = await this.fs.open(this.root, 'r');
         try {
           await directory.sync();
@@ -85,7 +114,8 @@ export class FileStoragePort implements StoragePort {
         return basename(path);
       } finally {
         if (handle) await handle.close().catch(() => {});
-        if (created && !complete) await this.fs.unlink(path).catch(() => {});
+        if (created) await this.fs.unlink(temp).catch(() => {});
+        if (installed && !complete) await this.fs.unlink(path).catch(() => {});
       }
     });
     this.tail = write.then(

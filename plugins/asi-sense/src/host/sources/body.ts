@@ -81,16 +81,17 @@ export class BodySource {
       (fact) => this.write('tokens', fact),
       changed,
     );
+    const applyTuning = (restored = false) => {
+      this.syncAttention(restored ? 'user' : undefined);
+      changed();
+    };
     this.tuner = new Tuner(
       { ...specs, ...attentionSpecs },
       {
         actor: () => this.identity.getStore() ?? 'agent',
         clock: () => clock.mono(),
         wallClock: () => clock.wall(),
-        onChange: () => {
-          this.syncAttention();
-          changed();
-        },
+        onChange: () => applyTuning(),
       },
     );
     let originalSnapshot: string | undefined;
@@ -99,6 +100,7 @@ export class BodySource {
       rateRules: defaultRateRules(),
       clock: () => clock.mono(),
       wallClock: () => clock.wall(),
+      onTuningApplied: applyTuning,
       persistence: {
         load: async () => {
           originalSnapshot = await storage.load('body');
@@ -111,11 +113,13 @@ export class BodySource {
           let kind: 'corrupt' | 'unknown-version' = 'corrupt';
           try {
             const value = JSON.parse(originalSnapshot);
-            if (value && typeof value === 'object' && value.version !== 2) kind = 'unknown-version';
+            if (value && typeof value === 'object' && 'version' in value && value.version !== 1 && value.version !== 2)
+              kind = 'unknown-version';
           } catch {
             kind = 'corrupt';
           }
           const fileName = await storage.backup('body', originalSnapshot);
+          // DSH has one writer per home; this check and the later save assume that boundary.
           if ((await storage.load('body')) !== originalSnapshot) {
             throw Object.assign(new Error('body snapshot changed after backup'), { code: 'SNAPSHOT_CHANGED' });
           }
@@ -132,7 +136,6 @@ export class BodySource {
       await this.monitor.close();
       return;
     }
-    this.syncAttention();
     this.state = this.monitor.restoredState ?? {};
     this.off = this.probe.onSample((body) => {
       const at = this.clock.wall();
@@ -158,7 +161,7 @@ export class BodySource {
   sync(): void {
     this.state = this.monitor.restoredState ?? this.state;
   }
-  private syncAttention(): void {
+  private syncAttention(actor: 'agent' | 'user' = this.identity.getStore() ?? 'agent'): void {
     if (this.stopped) return;
     const pipeline = this.attention.pipeline;
     pipeline.setMergeWindows(this.tuner.number('mergeWindowMs', 2_000), this.tuner.number('fileMergeWindowMs', 5_000));
@@ -168,7 +171,7 @@ export class BodySource {
         'body.anomaly': this.tuner.get('deliveryLevel.body.anomaly') as 'record' | 'context',
         'file.burst': this.tuner.get('deliveryLevel.file.burst') as 'record' | 'context' | 'wake',
       },
-      this.identity.getStore() ?? 'agent',
+      actor,
     );
     this.attention.refreshFeedback((id) => this.tuner.hasAlert(id));
     this.attention.rescheduleDelivery();
