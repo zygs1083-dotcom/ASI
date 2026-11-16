@@ -242,6 +242,7 @@ export class Tuner {
       try {
         await this.commit(
           () => {
+            if (this.store.disabled) throw new Error(`tuner: tuning disabled: ${this.store.disabled}`);
             const mono = this.clock();
             const wall = this.wallClock();
             if (!finiteNum(mono) || !finiteNum(wall)) throw new TypeError('tuner: clocks must be finite');
