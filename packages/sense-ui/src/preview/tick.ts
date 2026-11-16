@@ -123,6 +123,7 @@ export function tick(m: SensePanelModel): SensePanelModel {
   const nv = ok(body.network)
   const pv = ok(body.harnessProcess)
   const tv = ok(body.tokens)
+  const previousDisks = effectiveDisks(b0.disks, now).value ?? []
   // 历史只随「本次采样有变化的事实」推进：未更新的事实保留原数组引用；
   // 变化时先按 5 分钟窗裁剪，值缺失/不可用不补点。
   const history: BodyHistory = {
@@ -172,8 +173,10 @@ export function tick(m: SensePanelModel): SensePanelModel {
         ? Object.fromEntries(
             Object.entries(m.history.disks).map(([mount, pts]) => {
               const d = body.disks.value?.find((v) => v.mount === mount)
+              const previous = previousDisks.find((v) => v.mount === mount)
+              if (!d || d.observedAt === previous?.observedAt) return [mount, pts]
               const v =
-                d && diskUsable(body.disks, d, now) && d.total > 0
+                diskUsable(body.disks, d, now) && d.total > 0
                   ? 1 - d.free / d.total
                   : null
               return [mount, push(pts, now, v)]
