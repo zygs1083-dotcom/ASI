@@ -489,7 +489,9 @@ final class AXSessionTests: XCTestCase {
     let release = hold()
     available.set(true)
     for _ in 0..<10000 { session.focusCapacityRecovered() }
+    #if DEBUG
     XCTAssertLessThanOrEqual(session.pendingFocusAndPrivacyJobsForTesting, 2)
+    #endif
     release()
     drain()
     XCTAssertEqual(attempts.get(), 2)
@@ -521,6 +523,73 @@ final class AXSessionTests: XCTestCase {
     drain()
     XCTAssertEqual(attempts.get(), 2)
     XCTAssertEqual(ofType("window.focused").count, 1)
+  }
+  private func setupDroppedTitledFocus() -> (Locked<Bool>, Locked<[WindowEvent]>) {
+    fake = FakeAX(); events = []
+    axQ = DispatchQueue(label: "test.ax.changed-focus-retry")
+    let available = Locked(false), attempts = Locked<[WindowEvent]>([])
+    session = S(backend: fake, isTrusted: { true }, nowMs: { 7 }, emit: { _ in },
+                emitFocus: { event, done in
+      attempts.mutate { $0.append(event) }
+      done(available.get())
+    }, canRetryFocus: { available.get() }, queue: axQ, toMain: { $0() })
+    session.setTitlesEnabled(true); drain()
+    attach(7, win: 1, title: "A")
+    return (available, attempts)
+  }
+  func testFocusRetryQueriesWindowlessWithoutNotification() {
+    let (available, attempts) = setupDroppedTitledFocus()
+    XCTAssertEqual(attempts.get().count, 1)
+    XCTAssertFalse(attempts.get().first?.windowless ?? true)
+    fake.windows.removeValue(forKey: 7)
+    available.set(true)
+    session.focusCapacityRecovered(); drain()
+    XCTAssertEqual(attempts.get().count, 2)
+    XCTAssertTrue(attempts.get().last?.windowless == true)
+    XCTAssertNil(attempts.get().last?.title)
+    XCTAssertEqual(fake.fwCalls, 2)
+  }
+  func testFocusRetryQueriesChangedWindowWithoutNotification() {
+    let (available, attempts) = setupDroppedTitledFocus()
+    XCTAssertEqual(attempts.get().count, 1)
+    fake.windows[7] = .init(2); fake.titles[2] = "B"
+    available.set(true)
+    session.focusCapacityRecovered(); drain()
+    XCTAssertEqual(attempts.get().count, 2)
+    XCTAssertFalse(attempts.get().last?.windowless ?? true)
+    XCTAssertEqual(attempts.get().last?.title, "B")
+    XCTAssertEqual(fake.fwCalls, 2)
+    XCTAssertTrue(fake.removes.contains { $0.0 == 1 && $0.1 == S.titleNotification })
+    XCTAssertTrue(fake.adds.contains { $0.0 == 2 && $0.1 == S.titleNotification })
+  }
+  func testFocusRetryDropsTitleWhenPrivacyChangesDuringFocusedRead() {
+    let (available, attempts) = setupDroppedTitledFocus()
+    fake.windows[7] = .init(2); fake.titles[2] = "B"
+    raceThroughFwRead(start: {
+      available.set(true)
+      self.session.focusCapacityRecovered()
+    }, body: {
+      self.session.setTitlesEnabled(false)
+    })
+    XCTAssertEqual(attempts.get().count, 2)
+    XCTAssertFalse(attempts.get().last?.windowless ?? true)
+    XCTAssertNil(attempts.get().last?.title)
+    XCTAssertEqual(fake.titleCalls, 1)
+  }
+  func testFocusRetryDropsStaleReadAfterAppSwitch() {
+    let (available, attempts) = setupDroppedTitledFocus()
+    fake.windows[7] = .init(2); fake.titles[2] = "B"
+    fake.windows[8] = .init(3); fake.titles[3] = "C"
+    raceThroughFwRead(start: {
+      available.set(true)
+      self.session.focusCapacityRecovered()
+    }, body: {
+      self.session.activate(pid: 8, bundleId: "b.new")
+    })
+    XCTAssertEqual(attempts.get().count, 2)
+    XCTAssertEqual(attempts.get().last?.pid, 8)
+    XCTAssertEqual(attempts.get().last?.title, "C")
+    XCTAssertEqual(fake.fwCalls, 3)
   }
   // #8: errors produced before an app switch die at main delivery.
   func testStaleAxErrorsDropAfterAppSwitch() {

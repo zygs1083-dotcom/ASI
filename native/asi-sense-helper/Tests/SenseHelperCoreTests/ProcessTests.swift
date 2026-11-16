@@ -841,6 +841,7 @@ final class ProcessTests: XCTestCase {
     XCTAssertEqual(p.waitExit(), 0)
   }
 
+  #if DEBUG
   func testFixtureBlockedAXControlFloodCoalescesJobsAndRSS() throws {
     let p = try launchFixture(["--gate-fw-from=1", "--measure-jobs=32000"])
     XCTAssertTrue(p.waitStderr("fixture:gate-hold"))
@@ -882,4 +883,5 @@ final class ProcessTests: XCTestCase {
     p.process.terminate()
     XCTAssertEqual(p.waitExit(timeout: 2), 0)
   }
+  #endif
 }

@@ -65,7 +65,9 @@ session = AXSession(backend: synthetic, isTrusted: { true }, nowMs: nowMs,
   }
 }, canRetryFocus: { channel.writer.hasLowWaterCapacity },
    onFocusUndelivered: { channel.writer.requestCapacityNotification() })
+#if DEBUG
 var appliedControls = 0, peakJobs = 0
+#endif
 channel.onTitles = { on in
   let gen = session.setTitlesEnabled(on)
   if blockMainMs > 0 {
@@ -83,6 +85,7 @@ channel.onTitles = { on in
   return gen
 }
 channel.writer.onCapacityRecovered = { session.focusCapacityRecovered() }
+#if DEBUG
 channel.onTitlesApplied = {
   if measureJobs > 0 {
     appliedControls += 1
@@ -90,6 +93,7 @@ channel.onTitlesApplied = {
     if appliedControls == measureJobs { note("fixture:peak-ax-jobs=\(peakJobs)") }
   }
 }
+#endif
 channel.onCommand = { cmd, done in
   switch cmd {
   case .snapshot:

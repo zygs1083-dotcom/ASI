@@ -48,7 +48,9 @@ public final class AXSession<B: AXBackend> {
   private let refreshState = Locked<(posted: Bool, pending: Bool, appGen: Int, privGen: Int)>((false, false, 0, 0))
   private let titleState = Locked<(posted: Bool, element: B.Element?, appGen: Int, privGen: Int)>((false, nil, 0, 0))
   private let privState = Locked<(posted: Bool, pending: Bool, gen: Int)>((false, false, 0))
+  #if DEBUG
   private let queuedControlJobs = Locked(0)
+  #endif
 
   public init(backend: B, isTrusted: @escaping () -> Bool, nowMs: @escaping () -> Int64,
               emit: @escaping (_ event: any Encodable) -> Void,
@@ -204,15 +206,19 @@ public final class AXSession<B: AXBackend> {
     else if canRetryFocus() { focusCapacityRecovered() }
   }
   private func queueControlJob(_ work: @escaping () -> Void) {
+    #if DEBUG
     queuedControlJobs.mutate { $0 += 1 }
+    #endif
     axQueue.async {
+      #if DEBUG
       self.queuedControlJobs.mutate { $0 -= 1 }
+      #endif
       work()
     }
   }
   private func focusRetryStep() {
     if control.get().focusUndelivered {
-      if canRetryFocus() { repostFocusIfUnreported(gen: attachedGen) }
+      if canRetryFocus() { refreshNow(gen: attachedGen, priv: control.get().privGen) }
       else { requestFocusCapacity() }
     }
     if control.mutate({ c -> Bool in
@@ -538,15 +544,6 @@ public final class AXSession<B: AXBackend> {
                           bundleId: bundleId, title: title, windowless: newWin == nil),
               stamp: stamp, emittedTitle: title)
   }
-  // Privacy recovery is title-free and uses the current epoch.
-  private func repostFocusIfUnreported(gen appG: Int, title: String? = nil) {
-    let c = control.get()
-    guard c.appGen == appG, hasWindowContext,
-          !(c.deliveredApp == appG && c.deliveredWin == c.winGen) else { return }
-    postFocus(WindowEvent(type: "window.focused", at: nowMs(), pid: pid,
-                          bundleId: bundleId, title: title, windowless: windowEl == nil),
-              stamp: (appG, c.winGen, c.privGen), emittedTitle: title)
-  }
   private func titleStep() {
     let (el, g, p) = titleState.mutate { st -> (B.Element?, Int, Int) in
       let e = st.element; st.element = nil; return (e, st.appGen, st.privGen)
@@ -606,6 +603,7 @@ public final class AXSession<B: AXBackend> {
       else { return }
       if let t, terr == .success { submitTitle(t, stamp: (appG, c2.winGen, c2.privGen)) }
     } else {
+      // Privacy recovery is title-free and uses the current epoch.
       debouncer.cancelPending()
       cancelTitleFire()
       if titleSubscribed, let obs = observer, let w = windowEl {
@@ -640,7 +638,9 @@ public final class AXSession<B: AXBackend> {
   }
   // Test support (@testable): run when the AX queue has quiesced.
   func drainQueueForTesting() { axQueue.sync {} }
+  #if DEBUG
   public var pendingFocusAndPrivacyJobsForTesting: Int {
     queuedControlJobs.get()
   }
+  #endif
 }
