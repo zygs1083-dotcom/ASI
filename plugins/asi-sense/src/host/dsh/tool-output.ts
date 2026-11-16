@@ -7,6 +7,7 @@ import type { createSenseRuntime } from '../runtime/index.ts';
 import type { JsonValue } from './wire-types.ts';
 
 const MAX_BYTES = 32_768;
+const MAX_TITLE_LENGTH = 512;
 const FIXED_IDENTIFIERS = new Set([
   'accessibility',
   'other',
@@ -29,8 +30,17 @@ const FIXED_IDENTIFIERS = new Set([
   'node',
 ]);
 
+function boundedText(value: string, limit: number): string {
+  if (value.length <= limit) return value;
+  const prefix = value.slice(0, limit);
+  if (/[\s"'<>]/u.test(value[limit])) return prefix;
+  let end = prefix.length;
+  while (end > 0 && !/[\s"'<>]/u.test(prefix[end - 1])) end--;
+  return prefix.slice(0, end);
+}
+
 export function modelText(value: string, hostname = os.hostname()): string {
-  const safe = value
+  const safe = boundedText(value, MAX_BYTES)
     .replace(/https?:\/\/[^\s"'<>]+/gi, '[endpoint]')
     .replace(/(?<![\w])(?:[A-Za-z]:\\|\/)(?:[^\s"'<>/\\]+[/\\])*[^\s"'<>/\\]*/g, (path) => {
       const parts = path.split(/[\\/]/).filter(Boolean);
@@ -43,19 +53,25 @@ export function modelTitle(value: string, hostname = os.hostname()): string {
   const hidden: string[] = [];
   const hide = () => `\0${hidden.push('<host>') - 1}\0`;
   const escapedHost = hostname.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const projected = value
-    .replace(/\b[a-z][a-z\d+.-]*:\/\/[^\s"'<>]+/gi, hide)
-    .replace(/(?<![\p{L}\p{N}_])[\w.+%-]+@(?:\[[\da-f:.]+\]|[\p{L}\p{N}_.-]+)(?::\d+)?(?:[/\\][^\s"'<>]*)?/giu, hide)
+  const projected = boundedText(value, MAX_TITLE_LENGTH)
+    .replace(/(?<![a-z\d+.-])[a-z\d+.-]+:\/\/[^\s"'<>]+/gi, hide)
+    .replace(
+      /(?<![\p{L}\p{N}_.+%-])[\p{L}\p{N}_.+%-]+@(?:\[[\da-f:.]+\]|[\p{L}\p{N}_.-]+)(?::\d+)?(?:[/\\][^\s"'<>]*)?/giu,
+      hide,
+    )
     .replace(
       /\[[\da-f:.]+\](?::\d+)?(?:[/\\][^\s"'<>]*)?|(?<![\w:])(?:[\da-f]{0,4}:){2,}[\da-f]{0,4}(?![\w:])(?:[/\\][^\s"'<>]*)?/gi,
       hide,
     )
     .replace(/\b(?:\d{1,3}\.){3}\d{1,3}(?::\d+)?\b(?:[/\\][^\s"'<>]*)?/gi, hide)
-    .replace(/(?<![\p{L}\p{N}_:])[\p{L}\p{N}_.-]+:\d+\b(?:[/\\][^\s"'<>]*)?/giu, hide)
-    .replace(/(?<![\w])(?:[A-Za-z]:\\|\/|[\p{L}\p{N}._-]+\/)(?:[^\s"'<>/\\]+[/\\])*[^\s"'<>/\\]*/gu, (path) => {
-      const parts = path.split(/[\\/]/).filter(Boolean);
-      return parts.at(-1) ?? '[path]';
-    });
+    .replace(/(?<![\p{L}\p{N}_.:-])[\p{L}\p{N}_.-]+:\d+\b(?:[/\\][^\s"'<>]*)?/giu, hide)
+    .replace(
+      /(?<![\p{L}\p{N}._-])(?:[A-Za-z]:\\|\/|[\p{L}\p{N}._-]+\/)(?:[^\s"'<>/\\]+[/\\])*[^\s"'<>/\\]*/gu,
+      (path) => {
+        const parts = path.split(/[\\/]/).filter(Boolean);
+        return parts.at(-1) ?? '[path]';
+      },
+    );
   const withoutLocalHost = hostname ? projected.replace(new RegExp(escapedHost, 'gi'), hide) : projected;
   return withoutLocalHost.replace(/\0(\d+)\0/g, (_match, index: string) => hidden[Number(index)] ?? '<host>');
 }

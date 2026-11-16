@@ -721,8 +721,9 @@ describe('model-facing tools', () => {
     const h = await fixture();
     h.state.env.focusedWindow.value = { title: '汉'.repeat(20_000) };
     const result = await h.call('env_state', { section: 'env' });
-    expect(result).toMatchObject({ isError: false, value: { truncated: true } });
+    expect(result).toMatchObject({ isError: false, value: { focusedWindow: { value: { title: '' } } } });
     expect(Buffer.byteLength(JSON.stringify(result.value), 'utf8')).toBeLessThan(32_768);
+    expect(modelOutput({ text: 'x '.repeat(17_000) })).toMatchObject({ truncated: true });
     expect((await h.ctx.systemPrompt.assemble()).sections.some((section) => section.name === 'asi-sense')).toBe(true);
     h.off();
     expect(h.ctx.tools.get('env_state')).toBeUndefined();
