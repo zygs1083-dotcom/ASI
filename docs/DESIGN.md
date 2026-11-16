@@ -260,6 +260,7 @@ disabled?: { reason: 'storage-failed' | 'restore-failed' }
 suggestions?: { id: string; metric: MetricKey; slotLabel: string /* 例 "周二 14 时" */; from: number; to: number; unit: 'ratio' | 'percent' | 'bytes' | 'tokens' | 'bytes-per-second' | 'ordinal'; samples: number; dates: number }[]
 // from/to 为运行时自然单位（disk:<mount> = 剩余字节，context = 剩余 token，cpu/memory = 0..1 比例 ratio，battery = 0..100 percent），由 presenter 填 unit，UI 只按 unit 格式化，不换算成 history 单位。
 ```
+危险操作回调（`onResumeTuning`/`onResetTuning`/`onAcceptRebaseline`）返回 `Promise<void>`：UI 在 Promise 未决期间锁定该操作（按钮 disabled + 「处理中」），resolve 后等待新 model 反映结果，reject 时内联显示失败并解锁；打开二次确认时焦点落在「取消」，不落在确认按钮。
 UI：disabled 时规则区顶部提示条——storage-failed 给「恢复 AI 调参」（`onResumeTuning`），restore-failed 给「重置调参」（`onResetTuning`，二次确认）；suggestions 列在调整日志上方，每条「确认重新基线」（`onAcceptRebaseline(id)`，二次确认，文案说明"持续故障与新负载无法自动区分"）。
 
 ## 3. 目录结构（计划）
