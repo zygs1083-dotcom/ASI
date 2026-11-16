@@ -94,7 +94,12 @@ export class AsiSenseRemote extends TypertRemoteService {
 
   @Remote
   async acceptRebaseline(id: string): Promise<void> {
-    await this.userAction(() => this.applied(this.actions.acceptRebaseline(id)));
+    await this.userAction(() => {
+      if (typeof id !== 'string' || !id.trim()) {
+        throw new RemoteError('gateway/bad-request', 'Rebaseline suggestion ID is required', {});
+      }
+      return this.applied(this.actions.acceptRebaseline(id));
+    });
   }
 
   @Remote
