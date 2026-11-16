@@ -1,4 +1,4 @@
-import type { Body, BodyThresholdSample, Fact, FactStatus, Signal } from '@asi/sense-types';
+import type { Body, BodyThresholdSample, Fact, FactStatus, Signal, SourceRef } from '@asi/sense-types';
 import { SRC } from '../helpers.ts';
 
 export function f<T>(value: T | null, status: FactStatus = 'ok'): Fact<T> {
@@ -6,6 +6,8 @@ export function f<T>(value: T | null, status: FactStatus = 'ok'): Fact<T> {
 }
 
 export const blank = (status: FactStatus = 'unknown'): Fact<never> => f<never>(null, status);
+
+export const SRC2: SourceRef = { id: 'ax', api: 'test', host: 'local' };
 
 export function mkBody(over: Partial<Body> = {}): Body {
   return {
@@ -21,8 +23,35 @@ export function mkBody(over: Partial<Body> = {}): Body {
   };
 }
 
-export function sample(body: Body, at: number, state?: BodyThresholdSample['state']): BodyThresholdSample {
-  return { body, at, source: SRC, ...(state ? { state } : {}) };
+export function sample(
+  body: Body,
+  at: number,
+  state?: BodyThresholdSample['state'],
+  monotonicAt?: number,
+): BodyThresholdSample {
+  return {
+    body,
+    at,
+    source: SRC,
+    ...(state ? { state } : {}),
+    ...(monotonicAt !== undefined ? { monotonicAt } : {}),
+  };
+}
+
+/** Fresh sensor facts for wall-clock and multi-week replay tests. */
+export function freshSample(
+  body: Body,
+  at: number,
+  state?: BodyThresholdSample['state'],
+  mono?: number,
+): BodyThresholdSample {
+  const fresh = Object.fromEntries(Object.entries(body).map(([k, fact]) => [k, { ...fact, observedAt: at }])) as Body;
+  return sample(fresh, at, state, mono);
+}
+
+/** Same shape with a caller-chosen stream source. */
+export function sampleSrc(source: SourceRef, body: Body, at: number, monotonicAt?: number): BodyThresholdSample {
+  return { ...freshSample(body, at, undefined, monotonicAt), source };
 }
 
 export const cpuBody = (usage: number) =>
@@ -40,6 +69,9 @@ export const ctxBody = (window: number, used?: number) =>
   });
 export const battBody = (percent: number | null, charging = false) =>
   mkBody({ battery: f(percent === null ? null : { percent, charging }) });
+export const netBody = (rxBps: number, txBps: number) => mkBody({ network: f({ online: true, rxBps, txBps }) });
+export const memBody = (used: number, total = 100) =>
+  mkBody({ memory: f({ total, used, pressure: 'normal', swapUsed: 0 }) });
 
 export function fileChanged(id: string, at: number, path: string, change: string, cause?: Signal['cause']): Signal {
   return {

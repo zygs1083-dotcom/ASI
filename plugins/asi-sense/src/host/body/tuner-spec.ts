@@ -25,11 +25,27 @@ export interface AlertBinding {
 }
 
 export const HOUR_MS = 3_600_000;
+export const DAY_MS = 86_400_000;
 export const LOG_CAP = 500;
 export const ALERT_CAP = 500;
 export const HOURLY_CAP = 2;
+export const DAILY_CAP = 6;
+export const GLOBAL_DAILY_CAP = 24;
 export const VALID_BY = ['user', 'agent', 'auto'] as const;
 export const VALID_OPS = ['propose', 'revert', 'feedback', 'lock', 'unlock'] as const;
+
+/** Known safety floors (DESIGN §2.2c): AI may only ever tighten these. */
+const KNOWN_FLOOR = /^(disk|context|battery)(\.(warn|critical))?$/;
+
+/**
+ * Floor-spec rule: `floor.<known>` must tighten `up`; every other `floor.*`
+ * parameter must still declare an explicit tighten direction. Floor specs
+ * are required to carry a numeric finite value.
+ */
+export function floorDirection(name: string): 'up' | 'down' | 'any' | undefined {
+  if (!name.startsWith('floor.')) return undefined;
+  return KNOWN_FLOOR.test(name.slice('floor.'.length)) ? 'up' : 'any';
+}
 
 export const finiteNum = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v);
 export const isValue = (v: unknown): v is TuningValue =>
@@ -44,6 +60,8 @@ export function validateSpec(name: string, spec: ParameterSpec): ParameterSpec {
   if (spec === null || typeof spec !== 'object') throw bad('spec must be an object');
   const { value } = spec;
   if (!isValue(value)) throw bad('value must be number|string|boolean');
+  const floor = floorDirection(name);
+  if (floor !== undefined && typeof value !== 'number') throw bad('floor params require a numeric value');
   if (typeof value === 'number') {
     if (!finiteNum(value)) throw bad('value must be finite');
     for (const b of ['min', 'max'] as const)
@@ -67,6 +85,8 @@ export function validateSpec(name: string, spec: ParameterSpec): ParameterSpec {
     if (spec[k] !== 'up' && spec[k] !== 'down') throw bad(`${k} must be up|down`);
     if (typeof value !== 'number') throw bad(`${k} requires a numeric value`);
   }
+  if (floor === 'up' && spec.tighten !== 'up') throw bad("known floor params must declare tighten 'up'");
+  if (floor === 'any' && spec.tighten === undefined) throw bad('floor params require an explicit tighten direction');
   return { ...spec, choices: spec.choices ? [...spec.choices] : undefined };
 }
 

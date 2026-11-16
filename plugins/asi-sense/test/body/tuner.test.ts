@@ -1,225 +1,369 @@
-import { describe, expect, it } from 'vitest';
-import { type ParameterSpec, Tuner } from '../../src/host/body/tuner.ts';
+import { beforeEach, describe, expect, it } from 'vitest';
+import type { BodyPersistence } from '../../src/host/body/persistence.ts';
+import { Tuner, type TunerActor, type TunerOptions } from '../../src/host/body/tuner.ts';
+import type { ParameterSpec } from '../../src/host/body/tuner-spec.ts';
 
-const T = Date.UTC(2026, 0, 5);
+const T = 1_700_000_000_000;
 const HOUR = 3_600_000;
-let now = T;
+const DAY = 86_400_000;
+
 const specs: Record<string, ParameterSpec> = {
   'cpu.sigma': { value: 3, min: 1, max: 12, noiseDirection: 'up' },
   'floor.disk': { value: 0.05, min: 0.02, max: 0.5, tighten: 'up' },
-  'floor.down': { value: 0.5, tighten: 'down' },
+  'floor.ctx': { value: 0.5, tighten: 'down' },
+  'floor.custom': { value: 0.5, tighten: 'down' },
   mode: { value: 'auto', choices: ['auto', 'manual'] },
   flag: { value: true },
   zero: { value: 0 },
-  plain: { value: 10 },
+  plain: { value: 10, min: 0, max: 1000 },
 };
-const mk = (s = specs) => new Tuner(s, () => now);
-const propose = (t: Tuner, param: string, to: number | string | boolean, by: 'user' | 'agent' | 'auto' = 'user') =>
-  t.propose({ param, to, reason: 'test' }, by);
 
-describe('Tuner guards', () => {
-  it('applies bounded changes and rejects everything outside them', () => {
-    const t = mk();
-    expect(propose(t, 'cpu.sigma', 4.5).applied).toBe(true); // exactly +50% allowed
-    expect(t.get('cpu.sigma')).toBe(4.5);
-    expect(t.number('cpu.sigma', 9)).toBe(4.5);
-    expect(t.number('missing', 9)).toBe(9);
-    const rejected: [string, number | string | boolean][] = [
-      ['cpu.sigma', 7], // >+50%
-      ['cpu.sigma', 4.5], // no-op
-      ['cpu.sigma', 20], // max bound
-      ['cpu.sigma', Number.NaN],
-      ['mode', 'bogus'], // not in choices
-      ['mode', 5], // type
-      ['flag', 'yes'], // type
-      ['nope', 1], // unknown
-      ['zero', 0.1], // zero can only stay zero
-      ['zero', 0], // …and that is a no-op anyway
-      ['floor.disk', 0.03], // tighten:up forbids loosening
-      ['floor.down', 0.6], // tighten:down forbids loosening
-    ];
-    for (const [param, to] of rejected) {
-      const r = propose(t, param, to);
-      expect(r.applied, `${param}→${String(to)}`).toBe(false);
-      expect(r.change.status).toBe('rejected');
-    }
-    expect(propose(t, 'floor.disk', 0.06).applied).toBe(true); // tightening is allowed
-    expect(propose(t, 'floor.down', 0.4).applied).toBe(true);
-    expect(propose(t, 'mode', 'manual').applied).toBe(true);
+let mono = 0;
+let wall = T;
+let actor: TunerActor | 'admin' = 'agent';
+const mk = (s = specs, extra: Partial<TunerOptions> = {}) =>
+  new Tuner(s, {
+    clock: () => mono,
+    wallClock: () => wall,
+    actor: () => actor as TunerActor,
+    ...extra,
   });
+const asUser = () => {
+  actor = 'user';
+};
+const asAgent = () => {
+  actor = 'agent';
+};
 
-  it('enforces the rolling-hour cap of 2 applied changes per param', () => {
-    const t = mk();
-    expect(propose(t, 'plain', 12).applied).toBe(true);
-    expect(propose(t, 'plain', 10).applied).toBe(true);
-    expect(propose(t, 'plain', 9).applied).toBe(false);
-    now += HOUR; // exact expiry boundary
-    expect(propose(t, 'plain', 9).applied).toBe(true);
-    now = T;
-  });
+beforeEach(() => {
+  mono = 0;
+  wall = T;
+  actor = 'agent';
+});
 
-  it('locks reject proposes from every actor; unlock restores', () => {
-    const t = mk();
-    expect(t.lock('cpu.sigma').change.status).toBe('applied');
-    for (const by of ['user', 'agent', 'auto'] as const) expect(propose(t, 'cpu.sigma', 4, by).applied).toBe(false);
-    expect(t.lock('nope').change.status).toBe('rejected');
-    expect(t.unlock('cpu.sigma').applied).toBe(true);
-    expect(propose(t, 'cpu.sigma', 4).applied).toBe(true);
-  });
+class FakePersist implements BodyPersistence {
+  data: string | undefined;
+  saves = 0;
+  load(): Promise<string | undefined> {
+    return Promise.resolve(this.data);
+  }
+  save(d: string): Promise<void> {
+    this.data = d;
+    this.saves++;
+    return Promise.resolve();
+  }
+}
 
-  it('reverts an applied change through the same guards', () => {
+describe('Tuner actor trust', () => {
+  it('defaults to agent and resolves the actor only through the injected resolver', () => {
+    mono = 0;
+    wall = T;
     const t = mk();
-    const p = propose(t, 'plain', 12);
-    const r = t.revert(p.change.id);
+    // Extra forged argument is ignored; the resolver still governs.
+    const r = (t.propose as (req: unknown, by?: string) => { applied: boolean; change: { by: string } })(
+      { param: 'plain', to: 15, reason: 'x' },
+      'user',
+    );
     expect(r.applied).toBe(true);
-    expect(r.change.operation).toBe('revert');
+    expect(r.change.by).toBe('agent'); // +50% boundary OK for agent
+  });
+
+  it('rejects an untrusted actor resolver result without applying', () => {
+    actor = 'admin';
+    const t = mk();
+    const r = t.propose({ param: 'plain', to: 12 });
+    expect(r.applied).toBe(false);
+    expect(r.reason).toBe('untrusted actor');
     expect(t.get('plain')).toBe(10);
-    expect(t.revert(p.change.id).applied).toBe(false); // stale
-    expect(t.revert('chg-999').applied).toBe(false); // unknown id
-    const l = propose(t, 'floor.disk', 0.06);
-    t.lock('floor.disk');
-    expect(t.revert(l.change.id).applied).toBe(false); // locked blocks revert too
+    asAgent();
+  });
+
+  it('only the trusted user may lock/unlock; agents are audited and rejected', () => {
+    const t = mk();
+    const rl = t.lock('plain');
+    expect(rl.applied).toBe(false);
+    expect(rl.reason).toBe('lock requires trusted user');
+    expect(t.logs.at(-1)?.operation).toBe('lock');
+    asUser();
+    expect(t.lock('plain').applied).toBe(true);
+    asAgent();
+    expect(t.unlock('plain').applied).toBe(false); // agent cannot undo it either
   });
 });
 
-describe('Tuner feedback', () => {
-  const fb = (t: Tuner, i: number, v: 'useful' | 'noise', param = 'cpu.sigma', ruleId = 'cpu-anomaly') => {
-    t.registerAlert(`al-${i}`, ruleId, param);
-    return t.feedback(`al-${i}`, v);
-  };
-
-  it('auto-tunes after 3 noise, resets on useful, consumes alerts once', () => {
+describe('Tuner guard matrix', () => {
+  it('binds agent/auto to amplitude, direction, lock and budgets; user bypasses AI guards', () => {
     const t = mk();
-    expect(fb(t, 1, 'noise').applied).toBe(true);
-    expect(fb(t, 2, 'useful').applied).toBe(true); // streak reset
-    expect(t.feedback('al-2', 'noise').applied).toBe(false); // consumed already
-    expect(t.feedback('ghost', 'noise').applied).toBe(false); // unknown
-    fb(t, 3, 'noise');
-    fb(t, 4, 'noise');
-    fb(t, 5, 'noise'); // streak 3 → auto 3*1.25
-    expect(t.get('cpu.sigma')).toBe(3.75);
-    expect(t.logs.find((l) => l.operation === 'propose' && l.by === 'auto')?.status).toBe('applied');
-    for (let i = 6; i <= 11; i++) fb(t, i, 'noise'); // two more autos
-    expect(t.get('cpu.sigma')).toBe(4.6875); // third hourly auto rejected by cap
-    expect(t.logs.filter((l) => l.by === 'auto' && l.status === 'rejected').length).toBeGreaterThan(0);
+    expect(t.propose({ param: 'plain', to: 15 }).applied).toBe(true); // +50% ok
+    expect(t.propose({ param: 'plain', to: 16 }).applied).toBe(true); // vs CURRENT 15 → +6% ok
+    expect(t.propose({ param: 'plain', to: 100 }).reason).toBe('exceeds ±50%');
+    asUser();
+    expect(t.propose({ param: 'plain', to: 900 }).applied).toBe(true); // user bypasses amplitude
+    asAgent();
+    // Floor tighten: agent may only move a floor param in its tighten direction.
+    const t2 = mk();
+    expect(t2.propose({ param: 'floor.disk', to: 0.075 }).applied).toBe(true); // tighten:up → raise ok
+    expect(t2.propose({ param: 'floor.disk', to: 0.05 }).reason).toBe('safety: cannot loosen');
+    expect(t2.propose({ param: 'floor.custom', to: 0.4 }).applied).toBe(true); // tighten:down → lower ok
+    expect(t2.propose({ param: 'floor.custom', to: 0.5 }).reason).toBe('safety: cannot loosen');
   });
 
-  it('logs a rejected auto proposal when the param has no noise policy', () => {
+  it('still enforces whitelist/type/bounds/no-op on user', () => {
     const t = mk();
-    for (let i = 0; i < 3; i++) fb(t, i, 'noise', 'plain', 'rule-x');
-    expect(t.logs.find((l) => l.operation === 'propose' && l.by === 'auto')?.status).toBe('rejected');
-    expect(t.get('plain')).toBe(10); // no policy → never guessed
-    expect(t.registerAlert('dup', 'r', 'plain')).toBe(true);
-    expect(t.registerAlert('dup', 'r2', 'mode')).toBe(false); // live binding can't be overwritten
+    asUser();
+    expect(t.propose({ param: 'nope', to: 1 }).reason).toBe('unknown param');
+    expect(t.propose({ param: 'mode', to: 'bogus' }).reason).toBe('not in choices');
+    expect(t.propose({ param: 'mode', to: 5 }).reason).toBe('type mismatch');
+    expect(t.propose({ param: 'plain', to: 10 }).reason).toBe('no-op');
+    expect(t.propose({ param: 'plain', to: 2000 }).reason).toBe('out of bounds');
+    expect(t.propose({ param: 'plain', to: Number.NaN }).reason).toBe('nonfinite');
+    expect(t.propose({ param: 'zero', to: 0.1 }).applied).toBe(true); // user bypasses amplitude even off zero
+    asAgent();
+    expect(t.propose({ param: 'zero', to: 0 }).reason).toBe('exceeds ±50%'); // |0-0.1| > 0.05
+    const t2 = mk();
+    expect(t2.propose({ param: 'zero', to: 0.1 }).reason).toBe('exceeds ±50%'); // agent cannot leave zero at all
+  });
+
+  it('rejects locked params for propose but lets the user REVERT through the lock', () => {
+    const t = mk();
+    expect(t.propose({ param: 'plain', to: 15 }).applied).toBe(true);
+    const changeId = t.logs.filter((l) => l.status === 'applied').at(-1)?.id as string;
+    asUser();
+    expect(t.lock('plain').applied).toBe(true);
+    expect(t.propose({ param: 'plain', to: 20 }).reason).toBe('param locked');
+    const rv = t.revert(changeId); // user revert bypasses the lock
+    expect(rv.applied).toBe(true);
+    expect(t.get('plain')).toBe(10);
+  });
+
+  it('rejects nonfinite clocks for propose, lock and feedback — no mutation', () => {
+    const t = mk();
+    asUser(); // even the trusted user cannot act on bad clocks
+    mono = Number.NaN;
+    expect(t.propose({ param: 'plain', to: 12 }).reason).toBe('nonfinite clock');
+    mono = 0;
+    wall = Number.NaN;
+    expect(t.propose({ param: 'plain', to: 12 }).reason).toBe('nonfinite clock');
+    expect(t.lock('plain').reason).toBe('nonfinite clock');
+    expect(t.registerAlert('a1', 'r1', 'cpu.sigma')).toBe(false);
+    expect(t.feedback('a1', 'noise').reason).toBe('nonfinite clock');
+    wall = T;
+    expect(t.get('plain')).toBe(10);
+    expect(t.lock('plain').applied).toBe(true);
   });
 });
 
-describe('Tuner durability', () => {
-  it('caps the log at 500 without laundering the hourly limit', () => {
+describe('Tuner revert semantics', () => {
+  it('rejects stale reverts — ABA (10→11→10) never revives the first change', () => {
     const t = mk();
-    expect(propose(t, 'plain', 12).applied).toBe(true);
-    expect(propose(t, 'plain', 10).applied).toBe(true); // 2 applied stamps FIRST
-    for (let i = 0; i < 600; i++) propose(t, 'cpu.sigma', 20); // flood >500 rejected
-    expect(t.logs.length).toBe(500);
-    expect(t.logs.some((l) => l.param === 'plain')).toBe(false); // applied entries evicted…
-    expect(propose(t, 'plain', 9).applied).toBe(false); // …but the cap still bites
-    const rt = Tuner.deserialize(t.serialize(), specs, () => now);
-    expect(propose(rt, 'plain', 9).applied).toBe(false); // throttle survives reload
+    const id1 = t.propose({ param: 'plain', to: 11 }).change.id;
+    t.propose({ param: 'plain', to: 10 });
+    const stale = t.revert(id1);
+    expect(stale.applied).toBe(false);
+    expect(stale.reason).toContain('stale');
+    expect(t.revert('nonexistent').reason).toContain('no applied change');
   });
 
-  it('round-trips state and rebuilds on malformed or loosened snapshots', () => {
+  it('lets the user revert a large change the agent could not', () => {
     const t = mk();
-    propose(t, 'cpu.sigma', 4);
-    t.lock('floor.disk');
-    t.registerAlert('keep', 'r1', 'cpu.sigma');
-    const rt = Tuner.deserialize(t.serialize(), specs, () => now);
-    expect(rt.get('cpu.sigma')).toBe(4);
-    expect(propose(rt, 'floor.disk', 0.06).applied).toBe(false); // lock survived
-    expect(rt.feedback('keep', 'noise').applied).toBe(true); // alert binding survived
-    expect(propose(rt, 'cpu.sigma', 5).applied).toBe(true);
-    expect(propose(rt, 'cpu.sigma', 6).applied).toBe(false); // throttle survived
+    asUser();
+    const id = t.propose({ param: 'plain', to: 100 }).change.id; // user 10→100
+    asAgent();
+    const r = t.revert(id); // agent revert = AI attempt 100→10 → −90% > 50%
+    expect(r.applied).toBe(false);
+    asUser();
+    expect(t.revert(id).applied).toBe(true);
+    expect(t.get('plain')).toBe(10);
   });
+});
 
-  it('rejects malformed snapshots wholesale — never partially restores', () => {
-    const base = JSON.parse(mk().serialize()) as Record<string, unknown>;
-    const snap = (mut: (d: Record<string, unknown>) => void) => {
-      const d = JSON.parse(JSON.stringify(base)) as Record<string, unknown>;
-      mut(d);
-      return JSON.stringify(d);
-    };
-    const fresh = mk().serialize();
-    const logOk = {
-      id: 'chg-1',
-      param: 'plain',
-      from: 10,
-      to: 12,
-      by: 'user',
-      reason: 'r',
-      at: 0,
-      operation: 'propose',
-      status: 'applied',
-    };
-    const bads = [
-      'x',
-      '{"version":2}',
-      snap((d) => void (d.values as unknown[]).push(['cpu.sigma', 20])), // dup key / extra
-      snap((d) => void (d.values as unknown[]).pop()), // missing param
-      snap((d) => {
-        (d.values as unknown[][])[0][1] = 0.03; // cpu.sigma below min bound
-      }),
-      snap((d) => void (d.locked as unknown[]).push('nope')), // unknown lock
-      snap((d) => void (d.noise as unknown[]).push(['r', 9])), // streak >2
-      snap((d) => void (d.alerts as unknown[]).push(['a', { ruleId: '', param: 'plain' }])), // empty ruleId
-      snap((d) => void (d.alerts as unknown[]).push(['a', { ruleId: 'r', param: 'ghost' }])), // unknown param
-      snap((d) => void (d.throttle as unknown[]).push(['plain', [1, 2, 3]])), // >2 stamps
-      snap((d) => void (d.throttle as unknown[]).push(['ghost', [1]])), // unknown param
-      snap((d) => void (d.log as unknown[]).push({ ...logOk })), // chg-1 ≥ nextId=1
-      snap((d) => void (d.log as unknown[]).push({ ...logOk, id: 'bogus' })), // bad id shape
-      snap((d) => void (d.log as unknown[]).push({ ...logOk, reason: 5 })), // bad reason
+describe('Tuner budgets (monotonic sliding windows)', () => {
+  it('allows 2 changes/param/hour, 6/param/day, 24/day global', () => {
+    const t = mk();
+    const bump = (p: string, i: number) => t.propose({ param: p, to: 10 + i });
+    expect(bump('plain', 1).applied).toBe(true);
+    expect(bump('plain', 2).applied).toBe(true);
+    expect(t.propose({ param: 'plain', to: 13 }).reason).toBe('hourly change limit');
+    for (let i = 3; i <= 6; i++) {
+      if (i % 2 === 1) mono += HOUR + 1;
+      expect(bump('plain', i).applied).toBe(true);
+    }
+    mono += HOUR + 1;
+    expect(t.propose({ param: 'plain', to: 17 }).reason).toBe('daily change limit');
+
+    // Per-param daily cap alone: one param, proposals spaced past the hour window.
+    const t2 = mk();
+    let applied = 0;
+    for (let i = 0; i < 8; i++) {
+      if (t2.propose({ param: 'cpu.sigma', to: i % 2 ? 3 : 4 }).applied) applied++;
+      mono += HOUR + 1;
+    }
+    expect(applied).toBe(6);
+
+    // Global daily cap: five params × five rounds = 25 attempts; per-param
+    // caps never bind (≤5 each), so the 25th hits the global 24/day limit.
+    const t3 = mk();
+    const grid: [string, number][] = [
+      ['cpu.sigma', 4],
+      ['plain', 11],
+      ['floor.disk', 0.06],
+      ['floor.custom', 0.4],
+      ['floor.ctx', 0.4],
+      ['cpu.sigma', 3.5],
+      ['plain', 12],
+      ['floor.disk', 0.07],
+      ['floor.custom', 0.35],
+      ['floor.ctx', 0.35],
+      ['cpu.sigma', 4],
+      ['plain', 11],
+      ['floor.disk', 0.08],
+      ['floor.custom', 0.3],
+      ['floor.ctx', 0.3],
+      ['cpu.sigma', 3.5],
+      ['plain', 12],
+      ['floor.disk', 0.09],
+      ['floor.custom', 0.25],
+      ['floor.ctx', 0.25],
+      ['cpu.sigma', 4],
+      ['plain', 11],
+      ['floor.disk', 0.1],
+      ['floor.custom', 0.2],
+      ['floor.ctx', 0.2],
     ];
-    for (const json of bads) {
-      expect(Tuner.deserialize(json, specs, () => now).serialize()).toBe(fresh);
+    let total = 0;
+    let lastReason = '';
+    for (const [p, to] of grid) {
+      const r = t3.propose({ param: p, to });
+      if (r.applied) total++;
+      else {
+        lastReason = r.reason ?? '';
+        break;
+      }
+      mono += HOUR - 10; // ~1h spacing keeps per-param hourly windows clear
     }
-    // >500 log entries and duplicate IDs rejected
-    const big = snap((d) => {
-      d.log = Array.from({ length: 501 }, (_, i) => ({ ...logOk, id: `chg-${i + 1}` }));
-      d.nextId = 999;
-    });
-    expect(Tuner.deserialize(big, specs, () => now).serialize()).toBe(fresh);
-    const dup = snap((d) => {
-      d.log = [logOk, { ...logOk, at: 1 }];
-      d.nextId = 9;
-    });
-    expect(Tuner.deserialize(dup, specs, () => now).serialize()).toBe(fresh);
-    // the old public restore bypass is gone (apply is now TS-private)
-    expect((mk() as unknown as Record<string, unknown>).restoreValidated).toBeUndefined();
+    expect(total).toBe(24);
+    expect(lastReason).toBe('global daily change limit');
   });
 
-  it('logs nonfinite attempts as JSON-safe strings without poisoning durable state', () => {
+  it('counts auto feedback changes as AI budget', () => {
     const t = mk();
-    propose(t, 'plain', 12);
-    propose(t, 'plain', 10);
+    expect(t.registerAlert('a1', 'rule1', 'cpu.sigma')).toBe(true);
+    expect(t.feedback('a1', 'noise').applied).toBe(true);
+    t.registerAlert('a2', 'rule1', 'cpu.sigma');
+    t.feedback('a2', 'noise');
+    t.registerAlert('a3', 'rule1', 'cpu.sigma');
+    t.feedback('a3', 'noise'); // streak 3 → auto propose 3→3.75
+    expect(t.get('cpu.sigma')).toBeCloseTo(3.75);
+    const autoLog = t.logs.find((l) => l.by === 'auto' && l.status === 'applied');
+    expect(autoLog?.operation).toBe('propose');
+    expect(t.propose({ param: 'cpu.sigma', to: 6 }).reason).toBe('exceeds ±50%'); // still AI-bound
+  });
+});
+
+describe('Tuner persistence', () => {
+  it('blocks AI until restore() completes when persistence is configured', async () => {
+    const p = new FakePersist();
+    const t = mk(specs, { persistence: p });
+    expect(t.propose({ param: 'plain', to: 15 }).reason).toBe('restore pending');
+    p.data = undefined; // first install → fresh state
+    await t.restore();
+    expect(t.propose({ param: 'plain', to: 15 }).applied).toBe(true);
+  });
+
+  it('round-trips values, locks, windows and ID lineage across restart', async () => {
+    const p = new FakePersist();
+    const t = mk(specs, { persistence: p });
+    await t.restore(); // first install
+    t.propose({ param: 'plain', to: 15 });
+    asUser();
     t.lock('floor.disk');
-    for (const bad of [Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY]) {
-      const r = propose(t, 'cpu.sigma', bad);
-      expect(r.applied).toBe(false);
-      expect(r.change.to).toBe(String(bad)); // 'NaN' | 'Infinity' | '-Infinity'
-      expect(r.change.from).toBe(3); // finite current stays numeric
-    }
-    const u = propose(t, 'nope', Number.NaN);
-    expect(u.applied).toBe(false);
-    expect(u.change.to).toBe('NaN');
-    expect(u.change.from).toBe('NaN'); // unknown param's `from` fell back to `to`
-    expect(t.get('cpu.sigma')).toBe(3); // rejected input can't move values
-    // unknown/empty alert bindings rejected before they can poison a snapshot
-    expect(t.registerAlert('bad1', '', 'plain')).toBe(false);
-    expect(t.registerAlert('bad2', 'r', 'ghost')).toBe(false);
-    const json = t.serialize();
-    const rt = Tuner.deserialize(json, specs, () => now);
-    expect(JSON.parse(rt.serialize()).log).toEqual(JSON.parse(json).log); // deep-equal roundtrip
-    expect(rt.get('cpu.sigma')).toBe(3);
-    expect(propose(rt, 'floor.disk', 0.06).applied).toBe(false); // lock survived
-    expect(propose(rt, 'plain', 9).applied).toBe(false); // hourly cap survived
-    expect(Tuner.deserialize(t.serialize(), specs, () => now).serialize()).toBe(t.serialize());
+    asAgent();
+    await t.persist();
+    const t2 = mk(specs, { persistence: p });
+    await t2.restore();
+    expect(t2.get('plain')).toBe(15);
+    expect(t2.propose({ param: 'plain', to: 16 }).applied).toBe(true); // window restored → 3rd within hour ok? count: 2 in hour (15,16)... 15 applied pre-restart +16 now =2 → hourly allows
+    expect(t2.propose({ param: 'plain', to: 17 }).reason).toBe('hourly change limit'); // 3rd hits restored window
+    expect(t2.lock('floor.disk').reason).toBe('lock requires trusted user');
+    // IDs continue the same lineage
+    const next = t2.logs.at(-1)?.id ?? '';
+    expect(next).toContain('-');
+  });
+
+  it('fails closed on corrupt snapshots and persists a disabled marker', async () => {
+    const p = new FakePersist();
+    p.data = '{';
+    const t = mk(specs, { persistence: p });
+    await t.restore();
+    expect(t.tuningDisabled).toBe('restore-failed');
+    expect(t.propose({ param: 'plain', to: 15 }).reason).toContain('disabled');
+    expect(p.data).toContain('restore-failed'); // marker persisted
+    // A later restart sees the marker and STAYS disabled — cannot unlock.
+    const t2 = mk(specs, { persistence: p });
+    await t2.restore();
+    expect(t2.tuningDisabled).toBe('restore-failed');
+    expect(t2.propose({ param: 'plain', to: 15 }).reason).toContain('disabled');
+  });
+
+  it('rejects malformed versions and nonfinite values', async () => {
+    const p = new FakePersist();
+    const t = mk(specs, { persistence: p });
+    await t.restore();
+    t.propose({ param: 'plain', to: 15 });
+    await t.persist();
+    const d = JSON.parse(p.data as string) as Record<string, unknown>;
+    d.version = 1;
+    p.data = JSON.stringify(d);
+    const t2 = mk(specs, { persistence: p });
+    await t2.restore();
+    expect(t2.tuningDisabled).toBe('restore-failed');
+  });
+
+  it('keeps a revertable applied entry after a 500-reject flood, across reload', async () => {
+    const p = new FakePersist();
+    const t = mk(specs, { persistence: p });
+    await t.restore();
+    const id = t.propose({ param: 'plain', to: 15 }).change.id;
+    for (let i = 0; i < 500; i++) t.propose({ param: 'plain', to: 2000 }); // all rejected (out of bounds)
+    expect(t.logs.length).toBeLessThanOrEqual(500);
+    await t.persist();
+    const t2 = mk(specs, { persistence: p });
+    await t2.restore();
+    expect(t2.revert(id).applied).toBe(true);
+    expect(t2.get('plain')).toBe(10);
+  });
+
+  it('freezes AI when the wall clock is behind the saved high-water mark', async () => {
+    const p = new FakePersist();
+    const t = mk(specs, { persistence: p });
+    await t.restore();
+    wall = T + 10_000;
+    t.propose({ param: 'plain', to: 15 });
+    await t.persist(); // highwater ~T+10s
+    wall = T; // wall regressed 10s below highwater
+    const t2 = mk(specs, { persistence: p });
+    await t2.restore();
+    expect(t2.propose({ param: 'plain', to: 16 }).reason).toContain('frozen');
+    wall = T + 10_000; // caught up → aging resumes, windows thaw
+    mono += 1;
+    expect(t2.propose({ param: 'plain', to: 16 }).applied).toBe(true);
+  });
+
+  it('never credits restart downtime: restored windows keep their remaining time', async () => {
+    const p = new FakePersist();
+    const t = mk(specs, { persistence: p });
+    await t.restore();
+    t.propose({ param: 'plain', to: 15 });
+    t.propose({ param: 'plain', to: 16 });
+    await t.persist();
+    // Downtime of a full day must NOT expire the hourly window.
+    mono += DAY + 1;
+    wall += DAY + 1;
+    const t2 = mk(specs, { persistence: p });
+    await t2.restore();
+    expect(t2.propose({ param: 'plain', to: 17 }).reason).toBe('hourly change limit');
+    // Age past the restored remaining window → frees up.
+    mono += HOUR + 1;
+    expect(t2.propose({ param: 'plain', to: 17 }).applied).toBe(true);
   });
 });

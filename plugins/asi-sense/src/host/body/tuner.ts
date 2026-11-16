@@ -1,109 +1,115 @@
-import type { TuningChange, TuningValue } from '@asi/sense-types';
-import { type ValidatedState, validateSnapshot } from './tuner-persist.ts';
+import type { TuningValue } from '@asi/sense-types';
+import { type BodyPersistence, PersistScheduler } from './persistence.ts';
+import { type TunerActor, TunerGuard, type TuningResult } from './tuner-guard.ts';
+import { validateSnapshot } from './tuner-persist.ts';
 import {
   ALERT_CAP,
   type AlertBinding,
   finiteNum,
-  HOUR_MS,
-  HOURLY_CAP,
-  LOG_CAP,
   type ParameterSpec,
-  safeAuditValue,
   type TuningLog,
   validateSpec,
 } from './tuner-spec.ts';
+import { applySnapshot, serializeTuner, TunerStore } from './tuner-state.ts';
 
-export type { AlertBinding, ParameterSpec, TuningLog };
+export type { AlertBinding, ParameterSpec, TunerActor, TuningLog, TuningResult };
 
-export interface TuningResult {
-  applied: boolean;
-  change: TuningLog;
-  reason?: string;
+export interface TunerOptions {
+  /** Host-supplied trusted actor: 'user' from the sidebar boundary, 'agent' otherwise. */
+  actor?: () => TunerActor;
+  /** Monotonic ms for budgets; default performance.now. */
+  clock?: () => number;
+  /** Wall ms for audit stamps + the freeze high-water mark; default Date.now. */
+  wallClock?: () => number;
+  persistence?: BodyPersistence;
 }
 
-/** Guarded self-tuning (§2.2c `body_tune`): whitelist type/bounds/choices, ±50%
- * amplitude, tighten direction, locks, 2 applied changes/param/hour. Throttle
- * stamps live outside the 500-entry audit log so truncation can't launder the
- * cap. Specs `tuner-spec.ts`; snapshots `tuner-persist.ts`. */
+/**
+ * Guarded self-tuning (§2.2c `body_tune`). Callers never supply an actor —
+ * the injected resolver decides, and anything it returns that is not a
+ * known actor is untrusted. `user` (sidebar only) may lock/unlock and
+ * bypasses AI amplitude, direction and budget guards — including the lock
+ * on revert — but still hits whitelist type/bounds/no-op checks. `agent`
+ * and `auto` are bound by locks, ±50% amplitude vs the CURRENT value,
+ * tighten direction and sliding monotonic budgets 2/param/hour,
+ * 6/param/day, 24 all-params/day. The 500-entry display log is display
+ * only: every applied change is retained separately so reject floods
+ * cannot evict a revertable entry. With persistence configured AI stays
+ * blocked until {@link restore}; a corrupt/unknown snapshot sets
+ * `tuningDisabled` and a `restore-failed` marker is persisted so a later
+ * restart cannot unlock.
+ */
 export class Tuner {
+  private readonly store = new TunerStore();
+  private readonly guard: TunerGuard;
   private readonly clock: () => number;
-  private readonly specs = new Map<string, ParameterSpec>();
-  private readonly values = new Map<string, TuningValue>();
-  private readonly locked = new Set<string>();
-  private readonly throttle = new Map<string, number[]>();
-  private readonly noise = new Map<string, number>();
-  private readonly alerts = new Map<string, AlertBinding>();
-  private log: TuningLog[] = [];
-  private nextId = 1;
+  private readonly wallClock: () => number;
+  private readonly persistence?: BodyPersistence;
+  private readonly scheduler?: PersistScheduler;
 
-  constructor(parameters: Record<string, ParameterSpec>, clock: () => number) {
-    if (typeof clock !== 'function') throw new TypeError('tuner: clock function required');
-    this.clock = clock;
+  constructor(parameters: Record<string, ParameterSpec>, options: TunerOptions = {}) {
+    for (const k of ['actor', 'clock', 'wallClock'] as const) {
+      if (options[k] !== undefined && typeof options[k] !== 'function') {
+        throw new TypeError(`tuner: options.${k} must be a function`);
+      }
+    }
+    const actorFn = options.actor ?? (() => 'agent' as const);
+    this.clock = options.clock ?? (() => performance.now());
+    this.wallClock = options.wallClock ?? Date.now;
+    this.store.restored = options.persistence === undefined;
+    this.persistence = options.persistence;
+    if (options.persistence) {
+      const save = options.persistence.save.bind(options.persistence);
+      this.scheduler = new PersistScheduler(() => save(this.serialize()), this.clock);
+    }
+    this.guard = new TunerGuard(this.store, {
+      actor: actorFn,
+      mono: this.clock,
+      wall: this.wallClock,
+      onChange: () => this.schedule(),
+    });
     for (const [name, spec] of Object.entries(parameters)) {
       const s = validateSpec(name, spec);
-      this.specs.set(name, s);
-      this.values.set(name, s.value);
+      this.store.specs.set(name, s);
+      this.store.values.set(name, s.value);
     }
   }
 
+  /** Public kill switch: a failed restore disables AI tuning permanently. */
+  get tuningDisabled(): 'restore-failed' | undefined {
+    return this.store.disabled;
+  }
+
   get(param: string): TuningValue | undefined {
-    return this.values.get(param);
+    return this.store.values.get(param);
   }
 
   /** Positive finite numeric value, else the caller's fallback. */
   number(param: string, fallback: number): number {
-    const v = this.values.get(param);
+    const v = this.store.values.get(param);
     return typeof v === 'number' && finiteNum(v) && v > 0 ? v : fallback;
   }
 
+  /** Display audit log (capped at 500); applied changes are never lost. */
   get logs(): TuningLog[] {
-    return this.log.map((e) => ({ ...e }));
+    return this.store.log.map((e) => ({ ...e }));
   }
 
-  propose(req: { param: string; to: TuningValue; reason?: string }, by: TuningChange['by']): TuningResult {
-    return this.attempt('propose', req.param, req.to, String(req.reason ?? ''), by);
+  propose(req: { param: string; to: TuningValue; reason?: string }): TuningResult {
+    return this.guard.attempt('propose', req.param, req.to, String(req.reason ?? ''));
   }
 
-  lock(param: string, by: TuningChange['by'] = 'user'): TuningResult {
-    return this.setLock(param, true, by);
+  lock(param: string): TuningResult {
+    return this.guard.setLock(param, true);
   }
 
-  unlock(param: string, by: TuningChange['by'] = 'user'): TuningResult {
-    return this.setLock(param, false, by);
+  unlock(param: string): TuningResult {
+    return this.guard.setLock(param, false);
   }
 
-  /** Inverse of an applied change, through the same guards. */
-  revert(changeId: string, by: TuningChange['by'] = 'user'): TuningResult {
-    const e = this.log.find(
-      (x) => x.id === changeId && x.status === 'applied' && (x.operation === 'propose' || x.operation === 'revert'),
-    );
-    if (!e) {
-      return this.audit({
-        param: changeId,
-        from: '',
-        to: '',
-        by,
-        reason: 'revert',
-        at: this.clock(),
-        operation: 'revert',
-        status: 'rejected',
-        rejectionReason: 'no applied change with that id',
-      });
-    }
-    if (this.values.get(e.param) !== e.to) {
-      return this.audit({
-        param: e.param,
-        from: this.values.get(e.param) ?? '',
-        to: e.from,
-        by,
-        reason: `revert ${changeId}`,
-        at: this.clock(),
-        operation: 'revert',
-        status: 'rejected',
-        rejectionReason: 'stale: value moved on',
-      });
-    }
-    return this.attempt('revert', e.param, e.from, `revert ${changeId}`, by);
+  /** Inverse of an applied change; stale IDs (ABA included) are rejected. */
+  revert(changeId: string): TuningResult {
+    return this.guard.revert(changeId);
   }
 
   registerAlert(alertId: string, ruleId: string, param: string): boolean {
@@ -112,52 +118,57 @@ export class Tuner {
       alertId === '' ||
       typeof ruleId !== 'string' ||
       ruleId === '' ||
-      !this.specs.has(param) ||
-      this.alerts.has(alertId) ||
-      this.alerts.size >= ALERT_CAP
+      !finiteNum(this.clock()) ||
+      !finiteNum(this.wallClock()) ||
+      !this.store.specs.has(param) ||
+      this.store.alerts.has(alertId) ||
+      this.store.alerts.size >= ALERT_CAP
     ) {
       return false;
     }
-    this.alerts.set(alertId, { ruleId, param });
+    this.store.alerts.set(alertId, { ruleId, param });
+    this.schedule();
     return true;
   }
 
   /** Consumes an alert registration once; three noise streaks auto-tune. */
   feedback(alertId: string, verdict: 'useful' | 'noise'): TuningResult {
-    const binding = this.alerts.get(alertId);
-    if (!binding || (verdict !== 'useful' && verdict !== 'noise')) {
-      return this.audit({
+    const by = this.guard.actor() ?? 'agent';
+    const binding = this.store.alerts.get(alertId);
+    const badClock = !finiteNum(this.clock()) || !finiteNum(this.wallClock());
+    if (!binding || (verdict !== 'useful' && verdict !== 'noise') || badClock) {
+      return this.guard.audit({
         param: binding?.param ?? '',
         from: '',
         to: '',
-        by: 'auto',
-        reason: `feedback ${verdict}`,
-        at: this.clock(),
+        by,
+        reason: `feedback ${String(verdict)}`,
+        at: this.guard.auditAt(),
         operation: 'feedback',
         status: 'rejected',
-        rejectionReason: 'unknown or consumed alert',
+        rejectionReason: badClock ? 'nonfinite clock' : 'unknown or consumed alert',
       });
     }
-    this.alerts.delete(alertId);
-    const result = this.audit({
+    this.store.alerts.delete(alertId);
+    const result = this.guard.audit({
       param: binding.param,
       from: verdict,
       to: verdict,
-      by: 'auto',
+      by,
       reason: `feedback ${verdict} on ${alertId}`,
-      at: this.clock(),
+      at: this.guard.auditAt(),
       operation: 'feedback',
       status: 'applied',
     });
-    const streak = verdict === 'useful' ? 0 : (this.noise.get(binding.ruleId) ?? 0) + 1;
-    this.noise.set(binding.ruleId, streak);
+    const streak = verdict === 'useful' ? 0 : (this.store.noise.get(binding.ruleId) ?? 0) + 1;
+    this.store.noise.set(binding.ruleId, streak);
     if (streak < 3) return result;
-    this.noise.set(binding.ruleId, 0);
-    const spec = this.specs.get(binding.param);
-    const current = this.values.get(binding.param);
+    this.store.noise.set(binding.ruleId, 0);
+    const spec = this.store.specs.get(binding.param);
+    const current = this.store.values.get(binding.param);
     const dir = spec?.noiseDirection;
     if (dir && typeof current === 'number' && finiteNum(current)) {
-      this.attempt(
+      this.guard.attempt(
         'propose',
         binding.param,
         current * (dir === 'up' ? 1.25 : 0.8),
@@ -165,13 +176,13 @@ export class Tuner {
         'auto',
       );
     } else {
-      this.audit({
+      this.guard.audit({
         param: binding.param,
         from: current ?? '',
         to: current ?? '',
         by: 'auto',
         reason: `auto: no noise policy for ${binding.param}`,
-        at: this.clock(),
+        at: this.guard.auditAt(),
         operation: 'propose',
         status: 'rejected',
         rejectionReason: 'no noise policy',
@@ -181,119 +192,77 @@ export class Tuner {
   }
 
   serialize(): string {
-    return JSON.stringify({
-      version: 1,
-      values: [...this.values],
-      locked: [...this.locked],
-      noise: [...this.noise],
-      alerts: [...this.alerts],
-      throttle: [...this.throttle],
-      log: this.log,
-      nextId: this.nextId,
-    });
+    const mono = this.clock();
+    const wall = this.wallClock();
+    if (!finiteNum(mono) || !finiteNum(wall)) throw new TypeError('tuner: clocks must be finite');
+    return serializeTuner(this.store, mono, wall);
   }
 
-  /** Restores a v1 snapshot; malformed state or loosened floors rebuild empty. */
-  static deserialize(json: string, parameters: Record<string, ParameterSpec>, clock: () => number): Tuner {
-    const t = new Tuner(parameters, clock);
-    const s = validateSnapshot(json, parameters, clock);
-    if (s) t.applyRestored(s);
-    return t;
-  }
-
-  private applyRestored(s: ValidatedState): void {
-    for (const [k, v] of s.values) this.values.set(k, v);
-    for (const k of s.locked) this.locked.add(k);
-    for (const [k, n] of s.noise) this.noise.set(k, n);
-    for (const [k, a] of s.alerts) this.alerts.set(k, a);
-    for (const [k, ts] of s.throttle) this.throttle.set(k, ts);
-    this.log = s.log;
-    this.nextId = s.nextId;
-  }
-
-  private guard(param: string, to: TuningValue): string | null {
-    const spec = this.specs.get(param);
-    if (!spec) return 'unknown param';
-    const current = this.values.get(param) as TuningValue;
-    if (this.locked.has(param)) return 'param locked';
-    if (typeof to !== typeof current) return 'type mismatch';
-    if (typeof to === 'number' && !finiteNum(to)) return 'nonfinite';
-    if (to === current) return 'no-op';
-    if (spec.choices && !spec.choices.includes(to)) return 'not in choices';
-    if (typeof to === 'number' && typeof current === 'number') {
-      if ((spec.min !== undefined && to < spec.min) || (spec.max !== undefined && to > spec.max))
-        return 'out of bounds';
-      if (current === 0 || Math.abs(to - current) > Math.abs(current) * 0.5) return 'exceeds ±50%';
-      if (spec.tighten === 'up' && to < current) return 'safety: cannot loosen';
-      if (spec.tighten === 'down' && to > current) return 'safety: cannot loosen';
+  /** Loads + applies the persisted snapshot; corrupt data disables AI tuning. */
+  async restore(): Promise<void> {
+    if (!this.persistence || this.store.restored) {
+      this.store.restored = true;
+      return;
     }
-    const now = this.clock();
-    const stamps = (this.throttle.get(param) ?? []).filter((t) => now - t < HOUR_MS);
-    this.throttle.set(param, stamps);
-    if (stamps.length >= HOURLY_CAP) return 'hourly change limit';
-    return null;
-  }
-
-  private attempt(
-    operation: 'propose' | 'revert',
-    param: string,
-    to: TuningValue,
-    reason: string,
-    by: TuningChange['by'],
-  ): TuningResult {
-    const at = this.clock();
-    const why = this.guard(param, to);
-    const result = this.audit({
-      param,
-      from: this.values.get(param) ?? to,
-      to,
-      by,
-      reason,
-      at,
-      operation,
-      status: why ? 'rejected' : 'applied',
-      ...(why ? { rejectionReason: why } : {}),
-    });
-    if (!why) {
-      this.values.set(param, to);
-      const stamps = this.throttle.get(param) ?? [];
-      stamps.push(at);
-      this.throttle.set(param, stamps);
+    let data: string | undefined;
+    try {
+      data = await this.persistence.load();
+    } catch {
+      data = '\x00load-failed';
     }
-    return result;
+    if (data !== undefined && typeof data !== 'string') data = '\x00bad';
+    if (this.restoreSnapshot(data) === 'failed') await this.persist().catch(() => {});
   }
 
-  private setLock(param: string, lock: boolean, by: TuningChange['by']): TuningResult {
-    const known = this.specs.has(param);
-    if (known) {
-      if (lock) this.locked.add(param);
-      else this.locked.delete(param);
+  /**
+   * Applies snapshot text (undefined = first install) — used by
+   * BodyMonitor-managed combined snapshots. On any invalid input AI tuning
+   * is disabled and the ID lineage is replaced with a fresh random prefix.
+   */
+  restoreSnapshot(data: string | undefined): 'fresh' | 'ok' | 'failed' {
+    if (data === undefined) {
+      this.store.restored = true;
+      return 'fresh';
     }
-    const current = this.values.get(param) ?? '';
-    return this.audit({
-      param,
-      from: current,
-      to: current,
-      by,
-      reason: lock ? 'locked' : 'unlocked',
-      at: this.clock(),
-      operation: lock ? 'lock' : 'unlock',
-      status: known ? 'applied' : 'rejected',
-      ...(known ? {} : { rejectionReason: 'unknown param' }),
-    });
+    const v = validateSnapshot(data, Object.fromEntries(this.store.specs));
+    if (v === undefined || v.disabled) {
+      this.store.disabled = 'restore-failed';
+      this.store.resetIds();
+      this.store.restored = true;
+      return 'failed';
+    }
+    applySnapshot(this.store, v, this.clock(), this.wallClock());
+    this.store.restored = true;
+    return 'ok';
   }
 
-  /** Appends an audit entry (nonfinite scalars JSON-safed) and returns it. */
-  private audit(fields: Omit<TuningLog, 'id'>): TuningResult {
-    const entry = {
-      id: `chg-${this.nextId++}`,
-      ...fields,
-      from: safeAuditValue(fields.from),
-      to: safeAuditValue(fields.to),
-    } as TuningLog;
-    this.log.push(entry);
-    if (this.log.length > LOG_CAP) this.log.splice(0, this.log.length - LOG_CAP);
-    const applied = entry.status === 'applied';
-    return { applied, change: { ...entry }, reason: entry.rejectionReason };
+  /** @internal BodyMonitor marks this tuner as managed before driving restore. */
+  expectRestore(): void {
+    this.store.restored = false;
+  }
+
+  /** Force-flushes the current snapshot (no-op before restore/without persistence). */
+  persist(): Promise<void> {
+    return this.store.restored && this.scheduler ? this.scheduler.flush() : Promise.resolve();
+  }
+
+  /** Cancels the pending write + timer, then flushes — even before restore. */
+  async close(): Promise<void> {
+    if (this.store.restored) await this.scheduler?.close();
+    else this.scheduler?.cancel();
+  }
+
+  /** Host hook (e.g. a BodyMonitor managing a combined store): fires on
+   *  every post-restore mutation even without own persistence. */
+  setOnChange(fn: (() => void) | undefined): void {
+    this.onChanged = fn;
+  }
+
+  private onChanged?: () => void;
+
+  private schedule(): void {
+    if (!this.store.restored) return;
+    this.scheduler?.schedule();
+    this.onChanged?.();
   }
 }

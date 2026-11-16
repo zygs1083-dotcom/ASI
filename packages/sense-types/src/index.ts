@@ -202,11 +202,18 @@ export type ThresholdSeverity = 'normal' | 'warn' | 'critical';
 /** Per-metric latch, carried between samples as `BodyThresholdSample.state`. */
 export type BodyThresholdState = Record<string, ThresholdSeverity>;
 
-/** Two body samples to compare. `state` is the latch returned for `prev`. */
+/**
+ * Two body samples to compare. `state` is the latch returned for `prev`.
+ * `monotonicAt` is the sample's monotonic-clock stamp (ms), stamped by the
+ * host/`BodyMonitor`; rate-of-change windows are measured on it, never on
+ * wall `at`. Live callers always carry it — the `at` fallback exists only
+ * for direct logical-replay callers and must never be fed live wall time.
+ */
 export interface BodyThresholdSample {
   body: Body;
   at: number;
   source: SourceRef;
+  monotonicAt?: number;
   state?: BodyThresholdState;
 }
 

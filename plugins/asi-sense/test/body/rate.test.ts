@@ -1,176 +1,234 @@
-import type { Signal } from '@asi/sense-types';
+import type { BodyThresholdState, Signal } from '@asi/sense-types';
 import { describe, expect, it } from 'vitest';
 import { RateEvaluator, type RateRule } from '../../src/host/body/rate.ts';
-import { blank, cpuBody, diskBody, f, mkBody, rssBody, sample } from './helpers.ts';
+import { type AdaptiveState, BODY_HISTORY } from '../../src/host/body/state.ts';
+import { SRC } from '../helpers.ts';
+import { cpuBody, ctxBody, diskBody, f, mkBody, rssBody, SRC2, freshSample as sample, sampleSrc } from './helpers.ts';
 
-const rule = (over: Partial<RateRule> = {}): RateRule =>
-  ({ id: 'r', metric: 'rss', windowMs: 10_000, direction: 'up', maxDelta: 10, ...over }) as RateRule;
+const deltaRule = (over: Partial<RateRule> = {}): RateRule =>
+  ({
+    id: 'r',
+    metric: 'rss',
+    windowMs: 10_000,
+    direction: 'up',
+    maxDelta: 10,
+    ...over,
+  }) as RateRule;
+const ev = (rules: readonly RateRule[], thr?: (p: string, f: number) => number) => new RateEvaluator(rules, thr);
+const GIB = 1024 ** 3;
 
-describe('RateEvaluator construction', () => {
-  it('rejects invalid rules and clones config defensively', () => {
-    const base = rule();
-    expect(() => new RateEvaluator([base, rule({ id: 'r' })])).toThrow(TypeError); // duplicate id
-    expect(() => new RateEvaluator([rule({ metric: '' })])).toThrow(TypeError);
-    expect(() => new RateEvaluator([rule({ windowMs: 0 })])).toThrow(TypeError);
-    expect(() => new RateEvaluator([rule({ maxDelta: Number.NaN })])).toThrow(TypeError);
-    expect(() => new RateEvaluator([rule({ maxDelta: -1 })])).toThrow(TypeError);
-    expect(() => new RateEvaluator([{ ...base, maxSlope: 1 } as never])).toThrow(TypeError); // both limits
-    expect(() => new RateEvaluator([{ id: 'x', metric: 'rss', windowMs: 1, direction: 'up' } as never])).toThrow(
-      TypeError,
-    ); // neither limit
-    expect(() => new RateEvaluator([rule({ direction: 'sideways' as never })])).toThrow(TypeError);
-    expect(() => new RateEvaluator([rule({ floor: Number.NaN })])).toThrow(TypeError);
-    const rules = [rule({ maxDelta: 6 })];
-    const ev = new RateEvaluator(rules);
-    rules[0] = { ...rules[0], maxDelta: 0.001 } as RateRule;
-    const r = ev.evaluate(sample(rssBody(0), 0), sample(rssBody(5), 1000), {});
-    expect(r.signals).toHaveLength(0); // still uses the cloned limit 6
+const run = (e: RateEvaluator, frames: [number, number, number][] /* [at, mono, rss] */) => {
+  let state: BodyThresholdState = {};
+  const outs: Signal[][] = [];
+  let prev = sample(rssBody(0), -1_000_000, undefined, -1_000_000);
+  for (const [at, mono, rss] of frames) {
+    const next = sample(rssBody(rss), at, undefined, mono);
+    const r = e.evaluate(prev, next, state);
+    state = r.state;
+    outs.push(r.signals);
+    prev = next;
+  }
+  return { outs, state };
+};
+
+describe('RateEvaluator maxDelta', () => {
+  it('warns on a rising breach and recovers, latching per rule', () => {
+    const { outs, state } = run(ev([deltaRule()]), [
+      [0, 0, 0],
+      [1, 1000, 20], // delta +20 > 10
+      [2, 2000, 20], // window 0..2000 still +20 → latched, no re-emit
+      [3, 2000, 10], // delta +10 → not > limit; hysteresis 8 → active? +10>=8 was warn → stays
+      [4, 4000, 0], // first pt (0,0) pruned at 4000-10000? window 10s keeps all → first=0 last=0 delta 0 → normal
+    ]);
+    expect(outs[0]).toHaveLength(0);
+    expect(outs[1]).toHaveLength(1);
+    expect(outs[1]?.[0]).toMatchObject({
+      kind: 'body.rate',
+      subject: 'rate:r',
+      data: { severity: 'warn', metric: 'rss' },
+    });
+    expect(outs[2]).toHaveLength(0);
+    const normals = outs.flat().filter((s) => s.data.severity === 'normal');
+    expect(normals).toHaveLength(1);
+    expect(state['rate:r']).toBe('normal');
+  });
+
+  it('supports direction down for drops', () => {
+    const e = ev([deltaRule({ id: 'd', metric: 'disk:/', direction: 'down', maxDelta: 100 })]);
+    const p = sample(diskBody(500), 0, undefined, 0);
+    const n = sample(diskBody(100), 1, undefined, 1000);
+    const r = e.evaluate(p, n, {});
+    expect(r.signals[0]).toMatchObject({ data: { severity: 'warn', delta: -400 } });
   });
 });
 
-describe('RateEvaluator.evaluate', () => {
-  it('derives slope in units/second (OLS) and a signed delta, emitting on transitions only', () => {
-    const ev = new RateEvaluator([rule({ id: 's', maxDelta: undefined, maxSlope: 1 })]);
-    const r1 = ev.evaluate(sample(rssBody(10), 0), sample(rssBody(16), 3000), {});
-    expect(r1.signals).toHaveLength(1);
-    expect(r1.signals[0]).toMatchObject({
-      kind: 'body.rate',
-      subject: 'rate:s',
-      layer: 'rate',
-      at: 3000,
-    });
-    expect(r1.signals[0]?.data).toMatchObject({
-      layer: 'rate',
-      severity: 'warn',
-      ruleId: 's',
-      metric: 'rss',
-      windowMs: 10_000,
-      delta: 6, // signed raw last-first
-      slope: 2, // (16-10)/3s on the y=2t+10 line
-      direction: 'up',
-    });
-    expect(r1.state['rate:s']).toBe('warn');
-    const r2 = ev.evaluate(sample(rssBody(16), 3000), sample(rssBody(24), 7000), r1.state);
-    expect(r2.signals).toHaveLength(0); // still latched, no re-emit
-    expect(r2.state['rate:s']).toBe('warn');
+describe('RateEvaluator maxRatio + maxEtaMs', () => {
+  it('includes the exact ten-minute context ETA boundary', () => {
+    const e = ev([{ id: 'c', metric: 'context', windowMs: 300_000, direction: 'down', maxEtaMs: 600_000, floor: 0 }]);
+    const p = sample(ctxBody(601_000, 0), 0, undefined, 0);
+    const n = sample(ctxBody(601_000, 1000), 1000, undefined, 1000);
+    expect(e.evaluate(p, n, {}).signals[0]?.data.etaToFloorMs).toBe(600_000);
   });
 
-  it('supports direction down with maxDelta (signed magnitude check)', () => {
-    const ev = new RateEvaluator([rule({ id: 'd', direction: 'down', maxDelta: 5 })]);
-    const r = ev.evaluate(sample(rssBody(30), 0), sample(rssBody(24), 3000), {});
-    expect(r.signals[0]?.data).toMatchObject({ severity: 'warn', delta: -6, slope: -2, direction: 'down' });
+  it('breaches ratio on zero initial + positive change (RSS 0→1GiB in 1s)', () => {
+    const e = ev([{ id: 'r', metric: 'rss', windowMs: 300_000, direction: 'up', maxRatio: 0.5 }]);
+    const p = sample(rssBody(0), 0, undefined, 0);
+    const n = sample(rssBody(GIB), 1, undefined, 1000);
+    expect(e.evaluate(p, n, {}).signals[0]).toMatchObject({ kind: 'body.rate', data: { severity: 'warn' } });
   });
 
-  it('evaluates only points inside now-windowMs (exact time expiry)', () => {
-    const ev = new RateEvaluator([rule({ id: 'e', windowMs: 5000, maxDelta: 7 })]);
-    const r1 = ev.evaluate(sample(rssBody(10), 0), sample(rssBody(16), 3000), {});
-    expect(r1.signals).toHaveLength(0); // delta 6 <= 7
-    const r2 = ev.evaluate(sample(rssBody(16), 3000), sample(rssBody(24), 7000), r1.state);
-    // cutoff 2000: only (3000,16) and (7000,24) remain — delta 8, not 14
-    expect(r2.signals[0]?.data).toMatchObject({ severity: 'warn', delta: 8, slope: 2 });
+  it('breaches ETA when projected exhaustion drops below the limit', () => {
+    const e = ev([{ id: 'c', metric: 'context', windowMs: 300_000, direction: 'down', maxEtaMs: 600_000, floor: 0 }]);
+    // context falls 1000/s → eta ≈ 500s < 600s → breach
+    const a = sample(ctxBody(1_000_000, 0), 0, undefined, 0);
+    const b = sample(ctxBody(1_000_000, 500_000), 1, undefined, 1000);
+    const r = e.evaluate(a, b, {});
+    expect(r.signals[0]).toMatchObject({ data: { severity: 'warn' } });
+    expect(r.signals[0]?.data.etaToFloorMs).toBeLessThan(600_000);
   });
 
-  it('holds the latch at exactly 80% of the limit and rearms below it', () => {
-    const ev = new RateEvaluator([rule({ id: 'h', maxDelta: 10 })]);
-    const r1 = ev.evaluate(sample(rssBody(0), 0), sample(rssBody(12), 1000), {});
-    expect(r1.signals[0]?.data.severity).toBe('warn');
-    const r2 = ev.evaluate(sample(rssBody(12), 1000), sample(rssBody(8), 2000), r1.state);
-    expect(r2.signals).toHaveLength(0); // magnitude 8 == 0.8*10: still latched
-    expect(r2.state['rate:h']).toBe('warn');
-    const r3 = ev.evaluate(sample(rssBody(8), 2000), sample(rssBody(7), 3000), r2.state);
-    expect(r3.signals[0]?.data).toMatchObject({ severity: 'normal', delta: 7 });
-    expect(r3.state['rate:h']).toBe('normal');
-    const r4 = ev.evaluate(sample(rssBody(7), 3000), sample(rssBody(20), 4000), r3.state);
-    expect(r4.signals[0]?.data.severity).toBe('warn'); // rearmed and re-triggered
+  it('does not breach ETA while context grows', () => {
+    const e = ev([{ id: 'c', metric: 'context', windowMs: 300_000, direction: 'down', maxEtaMs: 600_000, floor: 0 }]);
+    const a = sample(ctxBody(1_000_000, 500_000), 0, undefined, 0);
+    const b = sample(ctxBody(1_000_000, 100_000), 1, undefined, 1000);
+    expect(e.evaluate(a, b, {}).signals).toHaveLength(0);
   });
+});
 
-  it('computes etaToFloorMs for falling floor-bearing metrics and omits it otherwise', () => {
-    const usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
-    const body = (free: number, used: number, pct: number) =>
+describe('RateEvaluator wildcard metrics', () => {
+  it('latches each concrete disk metric separately', () => {
+    const e = ev([{ id: 'd', metric: 'disk:*', windowMs: 60_000, direction: 'down', maxDelta: 100 }]);
+    const both = (a: number, b: number) =>
       mkBody({
-        disks: f([{ mount: '/', total: 1000, free }]),
-        tokens: f({ contextWindow: 1000, contextUsed: used, sessionUsage: usage }),
-        battery: f({ percent: pct, charging: false }),
+        disks: f([
+          { mount: '/', total: 1000, free: a },
+          { mount: '/v', total: 1000, free: b },
+        ]),
       });
-    const ev = new RateEvaluator([
-      rule({ id: 'dk', metric: 'disk:/', windowMs: 20_000, direction: 'down', maxDelta: undefined, maxSlope: 10 }),
-      rule({ id: 'cx', metric: 'context', windowMs: 20_000, direction: 'down', maxDelta: undefined, maxSlope: 10 }),
-      rule({ id: 'bt', metric: 'battery', windowMs: 20_000, direction: 'down', maxDelta: undefined, maxSlope: 10 }),
-    ]);
-    const r = ev.evaluate(sample(body(500, 300, 50), 0), sample(body(400, 600, 30), 1000), {});
-    const byRule = new Map<string, Signal>(r.signals.map((s) => [String(s.data.ruleId), s]));
-    expect(r.signals).toHaveLength(3);
-    // disk floor 50, slope -100/s → (400-50)/100*1000 = 3500
-    expect(byRule.get('dk')?.data).toMatchObject({ delta: -100, etaToFloorMs: 3500, timeToFloorMs: 3500 });
-    // context floor 50, remaining 400, slope -300/s → 1166.67
-    expect(byRule.get('cx')?.data.etaToFloorMs).toBeCloseTo(1166.67, 2);
-    expect(byRule.get('cx')?.data.timeToFloorMs).toBeCloseTo(1166.67, 2);
-    // battery floor 5, slope -20/s → (30-5)/20*1000 = 1250
-    expect(byRule.get('bt')?.data).toMatchObject({ etaToFloorMs: 1250, timeToFloorMs: 1250 });
+    const p = sample(both(500, 500), 0, undefined, 0);
+    const n = sample(both(100, 490), 1, undefined, 1000);
+    const r = e.evaluate(p, n, {});
+    expect(r.signals).toHaveLength(1);
+    expect(r.signals[0]).toMatchObject({ subject: 'rate:d:disk:/', data: { metric: 'disk:/' } });
+    expect(r.state['rate:d:disk:/']).toBe('warn');
+    expect(r.state['rate:d:disk:/v']).toBe('normal');
+  });
+});
 
-    const floorless = new RateEvaluator([
-      rule({ id: 'c', metric: 'cpu', direction: 'down', maxDelta: undefined, maxSlope: 0.5 }),
-    ]);
-    const fc = floorless.evaluate(sample(cpuBody(0.9), 0), sample(cpuBody(0.1), 1000), {});
-    expect(fc.signals[0]?.data).not.toHaveProperty('etaToFloorMs');
-    expect(fc.signals[0]?.data).not.toHaveProperty('timeToFloorMs');
-
-    const rising = new RateEvaluator([rule({ id: 'u', metric: 'disk:/', maxDelta: 10 })]);
-    const ru = rising.evaluate(sample(diskBody(100), 0), sample(diskBody(300), 1000), {});
-    expect(ru.signals[0]?.data).not.toHaveProperty('etaToFloorMs'); // rising: no ETA
-
-    const override = new RateEvaluator([
-      rule({ id: 'o', metric: 'disk:/', direction: 'down', maxDelta: undefined, maxSlope: 10, floor: 100 }),
-    ]);
-    const ro = override.evaluate(sample(diskBody(500), 0), sample(diskBody(400), 1000), {});
-    expect(ro.signals[0]?.data.etaToFloorMs).toBe(3000); // rule.floor wins over 5% default
+describe('RateEvaluator monotonic ordering + purity', () => {
+  it('measures windows on monotonic stamps, not chaotic wall times', () => {
+    // RSS wall: 0, 1000, 3601000, 2000 — mono: 0,1000,2000,3000.
+    const e = ev([deltaRule()]);
+    let state: BodyThresholdState = {};
+    const seq: [number, number, number][] = [
+      [0, 0, 0],
+      [1000, 1000, 5],
+      [3_601_000, 2000, 30], // +25 in 2s of mono > 10 → warn
+      [2000, 3000, 40],
+    ];
+    const sigs: Signal[][] = [];
+    let prev = sample(rssBody(0), -1, undefined, -1);
+    for (const [at, mono, rss] of seq) {
+      const next = sample(rssBody(rss), at, undefined, mono);
+      const r = e.evaluate(prev, next, state);
+      state = r.state;
+      sigs.push(r.signals);
+      prev = next;
+    }
+    expect(sigs.flat().filter((s) => s.data.severity === 'warn')).toHaveLength(1);
   });
 
-  it('retains the latch and breaks history on missing/stale/NaN metrics', () => {
-    const ev = new RateEvaluator([
-      rule({ id: 'm', metric: 'disk:/', direction: 'down', maxDelta: undefined, maxSlope: 10 }),
-    ]);
-    const r1 = ev.evaluate(sample(diskBody(500), 0), sample(diskBody(400), 1000), {});
-    expect(r1.state['rate:m']).toBe('warn');
-    const stale = mkBody({ disks: blank('stale') });
-    const r2 = ev.evaluate(sample(diskBody(400), 1000), sample(stale, 2000), r1.state);
+  it('rejects nonfinite/backward monotonic stamps and is replay-safe', () => {
+    const e = ev([deltaRule()]);
+    let state: BodyThresholdState = {};
+    const p0 = sample(rssBody(0), 0, undefined, 0);
+    const n1 = sample(rssBody(20), 1, undefined, 1000);
+    const r1 = e.evaluate(p0, n1, state);
+    state = r1.state;
+    expect(r1.signals).toHaveLength(1);
+    // Retry of the SAME sample with the SAME state → ignored (ordering gate).
+    const retry = e.evaluate(p0, n1, r1.state);
+    expect(retry.signals).toHaveLength(0);
+    // Backward + nonfinite stamps are ignored too.
+    expect(e.evaluate(n1, sample(rssBody(50), 2, undefined, 500), state).signals).toHaveLength(0);
+    expect(e.evaluate(n1, sample(rssBody(50), 3, undefined, Number.NaN), state).signals).toHaveLength(0);
+  });
+
+  it('produces identical output for identical inputs (no hidden mutation)', () => {
+    const e = ev([deltaRule()]);
+    const runOnce = () => {
+      let st: BodyThresholdState = {};
+      const seq: Signal[][] = [];
+      let prev = sample(rssBody(0), 0, undefined, 0);
+      for (const [at, mono, rss] of [
+        [1, 1000, 5],
+        [2, 2000, 30],
+      ] as const) {
+        const next = sample(rssBody(rss), at, undefined, mono);
+        const r = e.evaluate(prev, next, st);
+        st = r.state;
+        seq.push(r.signals);
+        prev = next;
+      }
+      return { seq, st };
+    };
+    const a = runOnce();
+    const b = runOnce();
+    expect(a.seq).toEqual(b.seq);
+    expect(a.st).toEqual(b.st);
+  });
+
+  it('isolates interleaved streams sharing one caller state', () => {
+    const e = ev([deltaRule()]);
+    let state: BodyThresholdState = {};
+    const a0 = sampleSrc(SRC, rssBody(0), 0, 0);
+    const a1 = sampleSrc(SRC, rssBody(30), 1, 1000);
+    const r1 = e.evaluate(a0, a1, state); // stream A breaches → warn
+    expect(r1.signals[0]?.data.severity).toBe('warn');
+    state = r1.state;
+    const b0 = sampleSrc(SRC2, rssBody(0), 0, 0);
+    const b1 = sampleSrc(SRC2, rssBody(1), 1, 500);
+    const r2 = e.evaluate(b0, b1, state); // stream B normal — must NOT inherit A's warn
     expect(r2.signals).toHaveLength(0);
-    expect(r2.state['rate:m']).toBe('warn'); // retained, no fabricated recovery
-    const r3 = ev.evaluate(sample(stale, 2000), sample(diskBody(400), 3000), r2.state);
-    expect(r3.signals).toHaveLength(0); // history broken: only 1 fresh point
-    const r4 = ev.evaluate(sample(diskBody(400), 3000), sample(diskBody(400), 4000), r3.state);
-    expect(r4.signals[0]?.data.severity).toBe('normal'); // two fresh points → recovery
-    const nan = ev.evaluate(sample(diskBody(400), 4000), sample(diskBody(Number.NaN), 5000), r4.state);
-    expect(nan.signals).toHaveLength(0);
-    expect(nan.state['rate:m']).toBe('normal');
+    const hB = (r2.state as AdaptiveState)[BODY_HISTORY]!.ax!.rate!;
+    expect(hB.latch['rate:r']).toBe('normal');
+    // B then breaches — its own streak, not suppressed by A's latch.
+    const b2 = sampleSrc(SRC2, rssBody(50), 2, 1500);
+    const r3 = e.evaluate(b1, b2, r2.state);
+    expect(r3.signals[0]?.data.severity).toBe('warn');
+    // And A's latch is still authoritative in A's metadata.
+    const hA = (r3.state as AdaptiveState)[BODY_HISTORY]!.fs!.rate!;
+    expect(hA.latch['rate:r']).toBe('warn');
   });
 
-  it('ignores equal or backward sample timestamps wholesale', () => {
-    const ev = new RateEvaluator([rule({ id: 't' })]);
-    const r1 = ev.evaluate(sample(rssBody(0), 0), sample(rssBody(5), 1000), {});
-    const equal = ev.evaluate(sample(rssBody(5), 1000), sample(rssBody(50), 1000), r1.state);
-    expect(equal.signals).toHaveLength(0);
-    expect(equal.state).toEqual(r1.state);
-    expect(equal.state).not.toBe(r1.state); // unchanged but cloned
-    const back = ev.evaluate(sample(rssBody(50), 1000), sample(rssBody(90), 500), r1.state);
-    expect(back.signals).toHaveLength(0);
-    expect(back.state).toEqual(r1.state);
-    const fwd = ev.evaluate(sample(rssBody(50), 1000), sample(rssBody(90), 2000), r1.state);
-    expect(fwd.signals[0]?.data.severity).toBe('warn'); // history resumed: delta 90-0
-    expect(fwd.signals[0]?.data.delta).toBe(90);
+  it('drops a missing metric window but retains the latch', () => {
+    const e = ev([deltaRule()]);
+    let state: BodyThresholdState = {};
+    let prev = sample(rssBody(0), 0, undefined, 0);
+    const n1 = sample(rssBody(30), 1, undefined, 1000);
+    const r1 = e.evaluate(prev, n1, state);
+    state = r1.state;
+    prev = n1;
+    // rss missing entirely → window dropped, no fabricated recovery signal.
+    const r2 = e.evaluate(prev, sample(cpuBody(0.5), 2, undefined, 2000), state);
+    expect(r2.signals).toHaveLength(0);
+    const hist = (r2.state as AdaptiveState)[BODY_HISTORY]!.fs!.rate!;
+    expect(hist.windows.rss).toBeUndefined();
+    expect(hist.latch['rate:r']).toBe('warn'); // latch retained
   });
 
-  it('resolves the live limit through rule.param', () => {
-    const calls: [string, number][] = [];
-    const ev = new RateEvaluator([rule({ id: 'p', maxDelta: 10, param: 'rate.rss.maxDelta' })], (param, fallback) => {
-      calls.push([param, fallback]);
-      return 2;
-    });
-    const r = ev.evaluate(sample(rssBody(0), 0), sample(rssBody(5), 1000), {});
-    expect(r.signals[0]?.data.severity).toBe('warn'); // resolved 2, not fallback 10
-    expect(calls).toEqual([['rate.rss.maxDelta', 10]]);
-    const bad = new RateEvaluator([rule({ id: 'q', maxDelta: 10, param: 'x' })], () => Number.NaN);
-    const rb = bad.evaluate(sample(rssBody(0), 0), sample(rssBody(5), 1000), {});
-    expect(rb.signals).toHaveLength(0); // invalid lookup → configured 10
+  it('consults the live tuner limit per evaluation', () => {
+    let limit = 10;
+    const e = ev([deltaRule({ param: 'rate.x' })], () => limit);
+    const state: BodyThresholdState = {};
+    const p = sample(rssBody(0), 0, undefined, 0);
+    const n = sample(rssBody(15), 1, undefined, 1000);
+    const r1 = e.evaluate(p, n, state);
+    expect(r1.signals).toHaveLength(1); // 15 > 10
+    limit = 100;
+    const n2 = sample(rssBody(30), 2, undefined, 2000);
+    const r2 = e.evaluate(n, n2, r1.state);
+    // widened to 100 → +30 < 100 → recovers
+    expect(r2.signals[0]?.data.severity).toBe('normal');
   });
 });

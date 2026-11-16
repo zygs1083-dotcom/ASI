@@ -1,13 +1,21 @@
 import type { BodyEvaluation, BodyEvaluator, BodyThresholdSample, BodyThresholdState } from '@asi/sense-types';
 import { type BodySignal, type Metric, readMetrics } from './metrics.ts';
-import { TimeWindow } from './window.ts';
+import { type AdaptiveState, BODY_HISTORY, type RateHistory, type RateWindow } from './state.ts';
 
 /**
  * A rate-of-change rule (DESIGN §2.2c, layer `rate`). Exactly one limit is
  * required: `maxDelta` compares the signed last-first delta over the window,
- * `maxSlope` the OLS slope in units/second. `direction` is the breach side;
- * `floor` overrides the metric's natural exhaustion level for ETA reporting.
- * `param` names a tuning parameter consulted for the live limit.
+ * `maxSlope` the OLS slope in units/second, `maxRatio` the delta over the
+ * initial magnitude (a zero start with nonzero delta always breaches), and
+ * `maxEtaMs` breaches when the projected time to the floor drops below the
+ * limit — the comparison is INVERTED (1/eta vs 1/limit) so the usual 80%
+ * hysteresis requires eta to climb 25% above the limit before rearming.
+ * `direction` is the breach side (`up`/`down`); for `maxEtaMs` the metric
+ * must be falling, so `direction` is descriptive only. `floor` overrides
+ * the metric's natural exhaustion level for ETA reporting. `param` names a
+ * tuning parameter consulted for the live limit. `metric` may end in `:*`
+ * to match every metric with that prefix (e.g. `disk:*`); wildcard hits get
+ * per-metric latches `rate:<id>:<metric>`.
  */
 export type RateRule = {
   id: string;
@@ -16,17 +24,19 @@ export type RateRule = {
   direction: 'up' | 'down';
   floor?: number;
   param?: string;
-} & ({ maxDelta: number; maxSlope?: never } | { maxSlope: number; maxDelta?: never });
+} & (
+  | { maxDelta: number; maxSlope?: never; maxRatio?: never; maxEtaMs?: never }
+  | { maxSlope: number; maxDelta?: never; maxRatio?: never; maxEtaMs?: never }
+  | { maxRatio: number; maxDelta?: never; maxSlope?: never; maxEtaMs?: never }
+  | { maxEtaMs: number; maxDelta?: never; maxSlope?: never; maxRatio?: never }
+);
 
 interface Point {
   at: number;
   value: number;
 }
 
-interface History {
-  win: TimeWindow<Point>;
-  lastAt: number;
-}
+const LIMITS = ['maxDelta', 'maxSlope', 'maxRatio', 'maxEtaMs'] as const;
 
 function validate(rule: RateRule, seen: Set<string>): void {
   const bad = (why: string) => new TypeError(`rate rule ${JSON.stringify(rule.id)}: ${why}`);
@@ -35,29 +45,26 @@ function validate(rule: RateRule, seen: Set<string>): void {
   if (rule.direction !== 'up' && rule.direction !== 'down') throw bad('direction must be up|down');
   if (!Number.isFinite(rule.windowMs) || rule.windowMs <= 0) throw bad('windowMs must be positive and finite');
   if (rule.floor !== undefined && !Number.isFinite(rule.floor)) throw bad('floor must be finite');
-  const hasDelta = rule.maxDelta !== undefined;
-  const hasSlope = rule.maxSlope !== undefined;
-  if (hasDelta === hasSlope) throw bad('exactly one of maxDelta/maxSlope is required');
-  const limit = hasDelta ? rule.maxDelta : rule.maxSlope;
-  if (!Number.isFinite(limit) || (limit as number) <= 0) throw bad('limit must be positive and finite');
+  const limits = LIMITS.filter((k) => rule[k] !== undefined);
+  if (limits.length !== 1) throw bad(`exactly one of ${LIMITS.join('/')} is required`);
+  const limit = rule[limits[0]] as number;
+  if (!Number.isFinite(limit) || limit <= 0) throw bad('limit must be positive and finite');
   seen.add(rule.id);
 }
 
 /**
- * Rate-of-change {@link BodyEvaluator} (DESIGN §2.2c). Per-metric time
- * windows are seeded from `prev` on first sight and fed by `next`; samples
- * with equal or backward `at` are ignored wholesale. A metric that goes
- * missing breaks its history while the latch is retained — no fabricated
- * recovery. `state` keys are `rate:${rule.id}` with `warn`/`normal` values;
- * signals (`body.rate`, layer `rate`) fire only on latch transitions, with
- * an 80%-of-limit hysteresis band.
+ * Pure rate-of-change {@link BodyEvaluator} (DESIGN §2.2c): ALL history
+ * lives in the caller-threaded `{@link BODY_HISTORY}` metadata for
+ * `next.source.id` — identical inputs give identical outputs, so replay
+ * and retry are safe. Time is measured on the monotonic `monotonicAt`
+ * stamp; the `at` fallback exists only for direct logical-replay callers
+ * and must never be fed live wall time. A metric that goes missing clears
+ * its window while the latch is retained — no fabricated recovery.
+ * Signals (`body.rate`, layer `rate`) fire only on latch transitions.
  */
 export class RateEvaluator implements BodyEvaluator {
   private readonly rules: RateRule[];
   private readonly threshold: (param: string, fallback: number) => number;
-  private readonly maxWindow = new Map<string, number>();
-  private readonly histories = new Map<string, History>();
-  private lastAt: number | undefined;
 
   constructor(rules: readonly RateRule[], threshold: (param: string, fallback: number) => number = (_p, n) => n) {
     const seen = new Set<string>();
@@ -65,96 +72,153 @@ export class RateEvaluator implements BodyEvaluator {
       validate(r, seen);
       return { ...r };
     });
-    for (const r of this.rules) {
-      this.maxWindow.set(r.metric, Math.max(this.maxWindow.get(r.metric) ?? 0, r.windowMs));
-    }
     this.threshold = threshold;
   }
 
+  /** Max retention window for one concrete metric key. */
+  private retention(key: string): number {
+    let max = 0;
+    for (const r of this.rules) {
+      const match = r.metric.endsWith(':*') ? key.startsWith(r.metric.slice(0, -1)) : r.metric === key;
+      if (match) max = Math.max(max, r.windowMs);
+    }
+    return max;
+  }
+
+  /** Concrete metric keys a rule evaluates (`prefix:*` wildcard or exact). */
+  private metricKeys(rule: RateRule, metrics: Map<string, Metric>): string[] {
+    if (!rule.metric.endsWith(':*')) return metrics.has(rule.metric) ? [rule.metric] : [];
+    const prefix = rule.metric.slice(0, -1);
+    const out: string[] = [];
+    for (const k of metrics.keys()) if (k.startsWith(prefix)) out.push(k);
+    return out;
+  }
+
+  private liveLimit(configured: number, param?: string): number {
+    if (param === undefined) return configured;
+    const v = this.threshold(param, configured);
+    return Number.isFinite(v) && v > 0 ? v : configured;
+  }
+
   evaluate(prev: BodyThresholdSample, next: BodyThresholdSample, state: BodyThresholdState): BodyEvaluation {
-    const out: BodyThresholdState = { ...state };
-    if (!Number.isFinite(next.at) || (this.lastAt !== undefined && next.at <= this.lastAt)) {
-      return { signals: [], state: out };
+    const pub: BodyThresholdState = { ...state };
+    const inHist = (state as AdaptiveState)[BODY_HISTORY]?.[next.source.id]?.rate;
+    const mono = next.monotonicAt ?? next.at; // logical-replay fallback — never live wall time
+    if (!Number.isFinite(mono) || (inHist?.lastMono !== undefined && mono <= inHist.lastMono)) {
+      return { signals: [], state: pub };
     }
-    this.lastAt = next.at;
     const metrics = readMetrics(next);
-    for (const key of [...this.histories.keys()]) {
-      if (!metrics.has(key)) this.histories.delete(key);
+    const windows: Record<string, RateWindow> = {};
+    for (const [k, w] of Object.entries(inHist?.windows ?? {})) {
+      if (metrics.has(k)) windows[k] = w; // missing metric → window dropped, latch retained
     }
+    const updated = new Map<string, RateWindow>();
+    const windowFor = (key: string, metric: Metric): RateWindow => {
+      const done = updated.get(key);
+      if (done) return done;
+      const old = windows[key];
+      let pts: Point[];
+      if (old) {
+        pts = old.points.slice();
+      } else {
+        const seed = Number.isFinite(prev.at) ? readMetrics(prev).get(key) : undefined;
+        const pMono = prev.monotonicAt ?? prev.at;
+        pts = seed && Number.isFinite(pMono) && pMono < mono ? [{ at: pMono as number, value: seed.value }] : [];
+      }
+      pts.push({ at: mono, value: metric.value });
+      pts = pts.filter((p) => p.at >= mono - this.retention(key));
+      const w: RateWindow = { points: pts, lastMono: mono };
+      updated.set(key, w);
+      return w;
+    };
+    // Per-stream latch (authoritative, metadata); `pub` keys are projections.
+    const streamLatch: RateHistory['latch'] = { ...inHist?.latch };
     const signals: BodySignal[] = [];
-    let prevMetrics: Map<string, Metric> | undefined;
     for (const rule of this.rules) {
-      const metric = metrics.get(rule.metric);
-      if (!metric) continue;
-      let hist = this.histories.get(rule.metric);
-      if (!hist) {
-        hist = { win: new TimeWindow<Point>(), lastAt: Number.NEGATIVE_INFINITY };
-        this.histories.set(rule.metric, hist);
-        prevMetrics ??= Number.isFinite(prev.at) ? readMetrics(prev) : new Map();
-        const seed = prevMetrics.get(rule.metric);
-        if (seed && prev.at < next.at) {
-          hist.win.push({ at: prev.at, value: seed.value });
-          hist.lastAt = prev.at;
-        }
+      for (const key of this.metricKeys(rule, metrics)) {
+        const metric = metrics.get(key) as Metric;
+        const w = windowFor(key, metric);
+        const pts = w.points.filter((p) => p.at >= mono - rule.windowMs);
+        if (pts.length < 2) continue;
+        const sig = this.step(rule, key, metric, pts, next, pub, streamLatch);
+        if (sig) signals.push(sig);
       }
-      if (next.at > hist.lastAt) {
-        hist.win.push({ at: next.at, value: metric.value });
-        hist.lastAt = next.at;
-      }
-      hist.win.prune(next.at - (this.maxWindow.get(rule.metric) ?? rule.windowMs));
-      const pts = hist.win.values(next.at - rule.windowMs);
-      if (pts.length < 2) continue;
-      const first = pts[0];
-      const last = pts[pts.length - 1];
-      const delta = last.value - first.value;
-      const slope = ols(pts);
-      if (slope === undefined) continue;
-      const measure = rule.maxDelta !== undefined ? delta : slope;
-      const magnitude = rule.direction === 'up' ? measure : -measure;
-      const fallback = rule.maxDelta ?? rule.maxSlope ?? 0;
-      const resolved = rule.param !== undefined ? this.threshold(rule.param, fallback) : fallback;
-      // A broken live lookup can never fabricate or loosen the configured limit.
-      const limit = Number.isFinite(resolved) && resolved > 0 ? resolved : fallback;
-      const key = `rate:${rule.id}`;
-      const was = out[key] === 'warn';
-      const active = magnitude > limit || (was && magnitude >= limit * 0.8);
-      out[key] = active ? 'warn' : 'normal';
-      if (active === was) continue;
-      signals.push(this.signal(rule, metric, next, delta, slope, last, active));
     }
+    const history: RateHistory = {
+      lastMono: mono,
+      windows: { ...windows, ...Object.fromEntries(updated) },
+      latch: streamLatch,
+    };
+    const stream = { ...(state as AdaptiveState)[BODY_HISTORY]?.[next.source.id], rate: history };
+    const hist = { ...(state as AdaptiveState)[BODY_HISTORY], [next.source.id]: stream };
+    const out: AdaptiveState = { ...pub, [BODY_HISTORY]: hist };
     return { signals, state: out };
   }
 
-  private signal(
+  /** Evaluates one rule against one metric's points; emits on latch transitions. */
+  private step(
     rule: RateRule,
+    key: string,
     metric: Metric,
+    pts: Point[],
     next: BodyThresholdSample,
-    delta: number,
-    slope: number,
-    last: Point,
-    active: boolean,
-  ): BodySignal {
+    pub: BodyThresholdState,
+    streamLatch: Record<string, 'normal' | 'warn'>,
+  ): BodySignal | undefined {
+    const first = pts[0];
+    const last = pts[pts.length - 1];
+    const delta = last.value - first.value;
+    const slope = ols(pts);
+    if (slope === undefined) return undefined; // degenerate x — cannot measure a rate
+    const floor = rule.floor ?? metric.floor;
+    const eta = floor !== undefined && slope < 0 ? Math.max(0, ((last.value - floor) / -slope) * 1000) : undefined;
+    let magnitude: number;
+    let limit: number;
+    if (rule.maxEtaMs !== undefined) {
+      // Inverted: danger rises as eta shrinks; eta = ∞ (stable/rising) → 0.
+      magnitude = 1 / (eta ?? Number.POSITIVE_INFINITY);
+      limit = 1 / this.liveLimit(rule.maxEtaMs, rule.param);
+    } else {
+      const measure =
+        rule.maxDelta !== undefined
+          ? delta
+          : rule.maxSlope !== undefined
+            ? slope
+            : first.value === 0
+              ? delta === 0
+                ? 0
+                : Math.sign(delta) * Number.POSITIVE_INFINITY
+              : delta / Math.abs(first.value);
+      magnitude = rule.direction === 'up' ? measure : -measure;
+      limit = this.liveLimit((rule.maxDelta ?? rule.maxSlope ?? rule.maxRatio) as number, rule.param);
+    }
+    const latchKey = rule.metric.endsWith(':*') ? `rate:${rule.id}:${key}` : `rate:${rule.id}`;
+    const was = streamLatch[latchKey] === 'warn';
+    const active =
+      (rule.maxEtaMs !== undefined ? magnitude >= limit : magnitude > limit) || (was && magnitude >= limit * 0.8);
+    streamLatch[latchKey] = active ? 'warn' : 'normal';
+    pub[latchKey] = active ? 'warn' : 'normal';
+    if (active === was) return undefined;
     const severity = active ? 'warn' : 'normal';
     const data: Record<string, unknown> = {
       layer: 'rate',
       severity,
       ruleId: rule.id,
-      metric: rule.metric,
+      metric: key,
       windowMs: rule.windowMs,
       delta,
       slope,
       direction: rule.direction,
     };
-    const floor = rule.floor ?? metric.floor;
-    if (slope < 0 && floor !== undefined) {
-      data.etaToFloorMs = data.timeToFloorMs = Math.max(0, ((last.value - floor) / -slope) * 1000);
+    if (eta !== undefined) {
+      data.etaToFloorMs = data.timeToFloorMs = eta;
     }
     return {
-      id: `${next.source.id}:rate:${rule.id}:${next.at}:${severity}`,
+      id: `${next.source.id}:${latchKey}:${next.at}:${severity}`,
       kind: 'body.rate',
       at: next.at,
       source: next.source,
-      subject: `rate:${rule.id}`,
+      subject: latchKey,
       layer: 'rate',
       data,
     };

@@ -7,8 +7,12 @@ export interface FileBurstOptions {
   windowMs?: number;
   maxChanges?: number;
   maxDeleted?: number;
-  /** When true, agent-caused deletes count toward the eligible totals. */
-  includeAgentDeletes?: boolean;
+  /**
+   * Watched roots: an event groups under the LONGEST matching root
+   * (`path === root` or `path` under `root/`); events outside every root
+   * are ignored. Absent: each event groups under its own dirname.
+   */
+  roots?: readonly string[];
   /** Live tuning lookup; falls back to the configured value. */
   threshold?: (param: string, fallback: number) => number;
 }
@@ -26,7 +30,7 @@ interface DirState {
   lastAt: number;
   /** External-burst wake latch. */
   wake: boolean;
-  /** Agent-only delete-burst audit latch (never suppresses `wake`). */
+  /** Self-cause crossing audit latch (never suppresses `wake`). */
   agentOnly: boolean;
 }
 
@@ -34,6 +38,8 @@ interface Counts {
   created: number;
   modified: number;
   deleted: number;
+  agentCreated: number;
+  agentModified: number;
   agentDeleted: number;
 }
 
@@ -41,18 +47,21 @@ const DEFAULTS = { windowMs: 60_000, maxChanges: 100, maxDeleted: 50 } as const;
 const REARM = 0.8;
 
 /**
- * Per-directory file-burst detector (DESIGN §2.2c, layer `rate`, kind
- * `file.burst`). Counts `file.changed` events inside a sliding time window;
- * a burst of external changes (or eligible deletes) emits a `wake` signal
- * once per latch. A burst attributable solely to agent deletes instead
- * emits a `record`-level audit signal that can never trigger or suppress
- * the wake latch. Pure bookkeeping — never touches the filesystem.
+ * Per-directory (or per watched root) file-burst detector (DESIGN §2.2c,
+ * layer `rate`, kind `file.burst`). Counts `file.changed` events inside a
+ * sliding window on each directory's OWN watermark — an event never prunes
+ * another directory's history. External and agent-caused events are
+ * counted separately for every change type; only EXTERNAL counts arm the
+ * `wake` latch (`externalDeletionExceeded` names the deletion trigger).
+ * A burst that crosses a limit purely through agent-caused events emits a
+ * `record`-level `cause:'agent'` audit instead — never a wake. Pure
+ * bookkeeping — never touches the filesystem.
  */
 export class FileBurstDetector {
   private readonly windowMs: number;
   private readonly maxChanges: number;
   private readonly maxDeleted: number;
-  private readonly includeAgentDeletes: boolean;
+  private readonly roots?: readonly string[];
   private readonly threshold: (param: string, fallback: number) => number;
   private readonly dirs = new Map<string, DirState>();
 
@@ -72,7 +81,16 @@ export class FileBurstDetector {
     this.windowMs = opts.windowMs;
     this.maxChanges = opts.maxChanges;
     this.maxDeleted = opts.maxDeleted;
-    this.includeAgentDeletes = options.includeAgentDeletes ?? false;
+    if (options.roots !== undefined) {
+      if (
+        !Array.isArray(options.roots) ||
+        options.roots.length === 0 ||
+        !options.roots.every((r) => typeof r === 'string' && r.startsWith('/'))
+      ) {
+        throw new TypeError('file.burst: roots must be nonempty absolute paths');
+      }
+      this.roots = options.roots.map((r) => (r === '/' ? r : r.replace(/\/+$/, '')));
+    }
   }
 
   /** Live limits: the resolver is consulted per accept; bad reads fall back to config. */
@@ -88,44 +106,66 @@ export class FileBurstDetector {
     };
   }
 
+  /** Longest watched root containing `path`, or its dirname without roots. */
+  private group(path: string): string | undefined {
+    if (!this.roots) return posix.dirname(path);
+    let best: string | undefined;
+    for (const r of this.roots) {
+      if (path === r || path.startsWith(r === '/' ? '/' : `${r}/`)) {
+        if (best === undefined || r.length > best.length) best = r;
+      }
+    }
+    return best;
+  }
+
   accept(signal: Signal): BodySignal[] {
     // All cheap validation first: a malformed or backward event must never
-    // sweep (and thereby erase) healthy per-directory history.
+    // touch (and thereby erase) healthy per-directory history.
     if (signal.kind !== 'file.changed' || !Number.isFinite(signal.at)) return [];
     const change = signal.data.change as Change | undefined;
     if (change !== 'add' && change !== 'modify' && change !== 'delete') return [];
-    const dir = posix.dirname(typeof signal.data.path === 'string' ? signal.data.path : signal.subject);
+    const path = typeof signal.data.path === 'string' ? signal.data.path : signal.subject;
+    const dir = this.group(path);
+    if (dir === undefined) return []; // outside every watched root
     const existing = this.dirs.get(dir);
     if (existing && signal.at < existing.lastAt) return []; // backward per-directory event
     const lim = this.limits();
-    this.sweep(signal.at, lim.windowMs);
-    let st = this.dirs.get(dir);
+    let st = existing;
+    if (st) {
+      st.win.prune(signal.at - lim.windowMs);
+      if (st.win.size === 0) {
+        this.dirs.delete(dir);
+        st = undefined; // expired under its own watermark: fresh state
+      }
+    }
     if (!st) {
       st = { win: new TimeWindow<FileEvent>(), lastAt: Number.NEGATIVE_INFINITY, wake: false, agentOnly: false };
       this.dirs.set(dir, st);
     }
     st.lastAt = signal.at;
     st.win.push({ at: signal.at, change, agent: signal.cause === 'agent' });
-    st.win.prune(signal.at - lim.windowMs);
     const counts = this.count(st.win);
-    const eligibleDeleted = counts.deleted - (this.includeAgentDeletes ? 0 : counts.agentDeleted);
-    const eligibleTotal = counts.created + counts.modified + eligibleDeleted;
+    const extDeleted = counts.deleted - counts.agentDeleted;
+    const extTotal = counts.created + counts.modified + counts.deleted - extCounts(counts);
+    const externalDeletionExceeded = extDeleted > lim.maxDeleted;
     const out: BodySignal[] = [];
-    if (eligibleTotal > lim.maxChanges || eligibleDeleted > lim.maxDeleted) {
+    if (extTotal > lim.maxChanges || externalDeletionExceeded) {
       if (!st.wake) {
         st.wake = true;
-        out.push(this.emit(signal, dir, 'wake', counts, lim.windowMs));
+        out.push(this.emit(signal, dir, 'wake', counts, lim, externalDeletionExceeded));
       }
     } else {
-      if (st.wake && eligibleTotal < lim.maxChanges * REARM && eligibleDeleted < lim.maxDeleted * REARM) {
+      if (st.wake && extTotal < lim.maxChanges * REARM && extDeleted < lim.maxDeleted * REARM) {
         st.wake = false;
       }
-      if (counts.deleted > lim.maxDeleted) {
+      // Pure self-cause crossing: totals only breach through agent events.
+      const total = counts.created + counts.modified + counts.deleted;
+      if (total > lim.maxChanges || counts.deleted > lim.maxDeleted) {
         if (!st.agentOnly) {
           st.agentOnly = true;
-          out.push(this.emit(signal, dir, 'record', counts, lim.windowMs, 'agent'));
+          out.push(this.emit(signal, dir, 'record', counts, lim, externalDeletionExceeded, 'agent'));
         }
-      } else if (st.agentOnly && counts.deleted < lim.maxDeleted * REARM) {
+      } else if (st.agentOnly && total < lim.maxChanges * REARM && counts.deleted < lim.maxDeleted * REARM) {
         st.agentOnly = false;
       }
     }
@@ -133,11 +173,15 @@ export class FileBurstDetector {
   }
 
   private count(win: TimeWindow<FileEvent>): Counts {
-    const c: Counts = { created: 0, modified: 0, deleted: 0, agentDeleted: 0 };
+    const c: Counts = { created: 0, modified: 0, deleted: 0, agentCreated: 0, agentModified: 0, agentDeleted: 0 };
     for (const e of win.values()) {
-      if (e.change === 'add') c.created++;
-      else if (e.change === 'modify') c.modified++;
-      else {
+      if (e.change === 'add') {
+        c.created++;
+        if (e.agent) c.agentCreated++;
+      } else if (e.change === 'modify') {
+        c.modified++;
+        if (e.agent) c.agentModified++;
+      } else {
         c.deleted++;
         if (e.agent) c.agentDeleted++;
       }
@@ -145,20 +189,13 @@ export class FileBurstDetector {
     return c;
   }
 
-  /** Drops every directory whose window expired — latched or not. */
-  private sweep(at: number, windowMs: number): void {
-    for (const [dir, st] of this.dirs) {
-      st.win.prune(at - windowMs);
-      if (st.win.size === 0) this.dirs.delete(dir);
-    }
-  }
-
   private emit(
     src: Signal,
     dir: string,
     level: 'wake' | 'record',
     c: Counts,
-    windowMs: number,
+    lim: { windowMs: number; maxDeleted: number },
+    externalDeletionExceeded: boolean,
     cause?: 'agent',
   ): BodySignal {
     return {
@@ -175,9 +212,12 @@ export class FileBurstDetector {
         wake: level === 'wake',
         ruleId: 'file.burst',
         directory: dir,
-        windowMs,
+        windowMs: lim.windowMs,
+        externalDeletionExceeded,
         ...c,
       },
     };
   }
 }
+
+const extCounts = (c: Counts): number => c.agentCreated + c.agentModified + c.agentDeleted;
