@@ -1,3 +1,4 @@
+import type { DisksFact } from './disks.js';
 import type { Fact } from './index.js';
 
 /** Agent "body vitals" facts (DESIGN §2.2b). */
@@ -15,7 +16,8 @@ export interface Body {
     pressure: 'normal' | 'warn' | 'critical';
     swapUsed: number;
   }>;
-  disks: Fact<Array<{ mount: string; total: number; free: number }>>;
+  /** 磁盘：各挂载点独立读数，父级状态仅做聚合（见 DisksFact）。 */
+  disks: DisksFact;
   /** `null` value on desktops without a battery. */
   battery: Fact<{
     percent: number;

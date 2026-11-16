@@ -56,13 +56,17 @@ function LearningStrip({ l }: { l: LearningState }) {
   )
 }
 
-/** 监护概览：大写严重度词 + 状态句（有匹配的近期宿主投影时换成优先警示行）。 */
-function Monitor({ model, sev, sentence }: { model: Panel['model']; sev: Severity; sentence: string }) {
+/** 监护概览：大写严重度词 + 状态句（有匹配的近期宿主投影时换成优先警示行）。
+ *  读数不完整时词旁另出「部分」徽标——警示句被覆盖也不丢完整性提示。 */
+function Monitor({ model, sev, sentence, partial }: { model: Panel['model']; sev: Severity; sentence: string; partial?: boolean }) {
   return (
     <div className={mcss.monitor} data-sev={sev}>
       <Ecg />
       <div className={mcss.monitorText}>
-        <strong className={mcss.monitorWord}>{SEV_WORD[sev]}</strong>
+        <strong className={mcss.monitorWord}>
+          {SEV_WORD[sev]}
+          {partial ? <span className={mcss.monitorPartial}>部分</span> : null}
+        </strong>
         <span className={mcss.monitorSub}>{sentence}</span>
         {model.learning?.status === 'learning' && (
           <LearningStrip l={model.learning} />
@@ -91,7 +95,12 @@ export function BodySection({
 
   return (
     <>
-      <Monitor model={model} sev={evalResult.severity} sentence={sentence} />
+      <Monitor
+        model={model}
+        sev={evalResult.severity}
+        sentence={sentence}
+        partial={evalResult.partial}
+      />
       <ClockProvider value={now}>
         <div className={css.tiles}>
         <CpuTile model={model} rows={rows} ctx={ctx} />

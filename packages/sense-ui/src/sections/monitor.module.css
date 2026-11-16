@@ -97,6 +97,17 @@
   color: var(--dsw-alias-label-secondary, #61666b);
 }
 
+/* 读数不完整的「部分」徽标：跟在严重度词后，不复制句子。 */
+.monitorPartial {
+  margin-left: var(--sense-gap, 6px);
+  font-size: var(--sense-fs-s);
+  font-weight: 500;
+  padding: 0 5px;
+  border-radius: var(--dsw-radius-xs, 4px);
+  border: 0.5px solid var(--dsw-alias-border-l4, rgba(0, 0, 0, 0.16));
+  color: var(--dsw-alias-label-secondary, #61666b);
+}
+
 .learning {
   display: flex;
   align-items: center;

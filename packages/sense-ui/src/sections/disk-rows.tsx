@@ -14,7 +14,6 @@ import {
   diskValid,
   effectiveStatus,
   effectiveSeverity,
-  isUsable,
   maxSeverity,
   unavailableMountSet,
   type Severity,
@@ -83,17 +82,20 @@ function attentionDisk(disks: Disk[], insights: Insights, fresh: boolean): Disk 
 }
 
 /** 剩余比例条：填充宽度 = free/total（剩余量），不是已用占比。 */
-function FreeStrip({ d }: { d: Disk }) {
+function FreeStrip({ d, label }: { d: Disk; label?: boolean }) {
   const remaining =
     d.total > 0 ? Math.min(1, Math.max(0, d.free / d.total)) : 0
   return (
-    <span className={css.memStrip} aria-hidden="true">
-      <i
-        className={css.diskUsed}
-        data-strip="remaining"
-        data-ratio={remaining}
-        style={{ width: `${remaining * 100}%` }}
-      />
+    <span className={css.stripWrap}>
+      {label ? <span className={css.stripText}>剩余</span> : null}
+      <span className={css.memStrip} aria-hidden="true">
+        <i
+          className={css.diskUsed}
+          data-strip="remaining"
+          data-ratio={remaining}
+          style={{ width: `${remaining * 100}%` }}
+        />
+      </span>
     </span>
   )
 }
@@ -111,12 +113,10 @@ export const DisksTile = memoTile(
   function DisksTile({ model, rows, ctx }: MetricTileProps) {
   const { disks } = model.state.self.body
   const { now, events, insights } = model
-  const parentFresh = isUsable(disks, now)
-  // 过期但保留值：列表仍可展示，严重度/速率徽标一律降级为未知、不引用 insight
-  const stale = !parentFresh && effectiveStatus(disks, now) === 'stale'
-  const raw = parentFresh || (stale && disks.value !== null) ? disks.value! : null
   const unavail = unavailableMountSet(disks)
-  const usable = (d: Disk): boolean => parentFresh && diskUsable(disks, d, now)
+  // 卷级状态权威：父级失鲜/拒绝不再整列置灰，显式新鲜卷照常展示
+  const raw = disks.value ?? []
+  const usable = (d: Disk): boolean => diskUsable(disks, d, now)
 
   // 可展示卷：有效读数、带卷级元数据（stale 保留值/unknown 状态行）、或
   // unavailableMounts（value 未含也补「无法读取」）；无元数据无效读数不展示
@@ -147,6 +147,12 @@ export const DisksTile = memoTile(
     alert ?? (root && !usable(root) ? root : null) ?? worstFresh ?? entries[0] ?? null
   const sev = (d: Disk): Severity =>
     usable(d) ? diskSev(d, insights ?? {}, true) : 'unknown'
+  const focusDf =
+    focus && diskValid(focus) && !unavail.has(focus.mount)
+      ? diskFact(disks, focus, now)
+      : null
+  const focusEff = focusDf ? effectiveStatus(focusDf, now) : null
+  const focusUsable = focus != null && usable(focus)
 
   // 明细图块只给 ok/stale 卷：unavailable/unknown 卷无读数，不产数字与图
   const metrics: DetailMetric[] = entries
@@ -160,7 +166,7 @@ export const DisksTile = memoTile(
       const u = usable(d)
       return {
         key,
-        label: `磁盘 ${d.mount}`,
+        label: `磁盘 ${d.mount} 已用率`,
         points: model.history.disks[d.mount] ?? [],
         format: formatPercent,
         valueText: `剩余 ${formatBytes(d.free)} / ${formatBytes(d.total)}`,
@@ -198,7 +204,7 @@ export const DisksTile = memoTile(
                 <div key={d.mount} className={css.detailLine} data-sev={sev(d)}>
                   {d.mount}{' '}
                   <FactStatusText fact={diskFact(disks, d, now)} now={now}>
-                    {(v) => <FreeStrip d={v} />}
+                    {(v) => <FreeStrip d={v} label />}
                   </FactStatusText>
                 </div>
               )
@@ -207,18 +213,31 @@ export const DisksTile = memoTile(
         />
       }
     >
-      <FactStatusText fact={disks} now={now}>
-        {(_val) => {
-          if (!focus) return <span className={css.tileSub}>无有效磁盘读数</span>
-          if (unavail.has(focus.mount) || !diskValid(focus)) {
-            return (
-              <span className={css.tileSub}>
-                {focus.mount} {unavail.has(focus.mount) ? '无法读取' : '· 未知'}
-              </span>
-            )
-          }
-          const focusUsable = usable(focus)
-          const content = (d: Disk) => (
+      {rows.disks.partial ? (
+        <span className={css.tileSub} data-partial>
+          部分 · 数据待补全
+        </span>
+      ) : null}
+      {focus == null ? (
+        // 无可展示卷时父事实兜底：denied 原因 / 不可用状态 / 无有效读数
+        <FactStatusText fact={disks} now={now}>
+          {() => <span className={css.tileSub}>无有效磁盘读数</span>}
+        </FactStatusText>
+      ) : unavail.has(focus.mount) || !diskValid(focus) ? (
+        <span className={css.tileSub}>
+          {focus.mount} {unavail.has(focus.mount) ? '无法读取' : '· 未知'}
+        </span>
+      ) : focusEff !== 'ok' && focusEff !== 'stale' ? (
+        <span className={css.tileSub}>
+          {focus.mount} ·{' '}
+          <FactStatusText fact={focusDf!} now={now}>
+            {() => null}
+          </FactStatusText>
+        </span>
+      ) : (
+        // 卷级事实标注：新鲜告警卷优先，陈旧值灰显，父级不再一票置灰
+        <FactStatusText fact={focusDf!} now={now}>
+          {(d) => (
             <>
               <span className={css.tileValue}>
                 <span className={css.mainLabel}>剩余</span>
@@ -237,7 +256,7 @@ export const DisksTile = memoTile(
               <Sparkline
                 points={model.history.disks[d.mount] ?? []}
                 now={now}
-                label={`磁盘 ${d.mount} 使用率`}
+                label={`磁盘 ${d.mount} 已用率`}
                 format={formatPercent}
                 severity={sev(focus)}
                 baseline={
@@ -253,17 +272,9 @@ export const DisksTile = memoTile(
                 }
               />
             </>
-          )
-          // 父新鲜才按卷级事实标注；父已整体过期时外层统一标注，不再重复
-          return effectiveStatus(disks, now) === 'ok' ? (
-            <FactStatusText fact={diskFact(disks, focus, now)} now={now}>
-              {content}
-            </FactStatusText>
-          ) : (
-            content(focus)
-          )
-        }}
-      </FactStatusText>
+          )}
+        </FactStatusText>
+      )}
     </Tile>
   )
 })

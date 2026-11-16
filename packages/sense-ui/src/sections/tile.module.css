@@ -50,6 +50,12 @@
   font-variant-numeric: tabular-nums;
 }
 
+/* 指标名压在图上方：不透明侧栏底，避免与图上沿重叠时不可读。 */
+.metricName {
+  background: var(--dsw-specific-sidebar-fill, #f9fafb);
+  border-radius: 2px;
+}
+
 .metricRows {
   display: flex;
   flex-direction: column;

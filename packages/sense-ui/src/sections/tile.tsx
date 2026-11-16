@@ -1,4 +1,4 @@
-import type { ReactNode } from 'react'
+import { useState, type ReactNode } from 'react'
 import { FactMeta, FactValue } from '../fact'
 import { formatClock } from '../format'
 import { effectiveStatus, isUsable, type Severity } from '../health'
@@ -44,7 +44,8 @@ export interface TileProps {
 /**
  * 指标卡片：原生 details/summary 折叠。
  * summary 内只有静态内容（数值/图），交互控件一律放 detail。
- * 展开时卡片跨满整行宽。
+ * 展开时卡片跨满整行宽。detail 仅在打开时挂载（收起不付出明细渲染开销），
+ * 开合状态由原生 toggle 事件镜像，不反向控制 open 属性。
  */
 export function Tile({
   tileKey,
@@ -55,12 +56,14 @@ export function Tile({
   detail,
   children,
 }: TileProps) {
+  const [open, setOpen] = useState(false)
   return (
     <details
       className={css.tile}
       data-tile={tileKey}
       data-sev={sev}
       data-span2={span2 || undefined}
+      onToggle={(e) => setOpen(e.currentTarget.open)}
     >
       <summary className={css.tileSummary}>
         <span className={css.tileHead}>
@@ -90,7 +93,9 @@ export function Tile({
         </span>
         {children}
       </summary>
-      {detail != null && <div className={dcss.tileDetail}>{detail}</div>}
+      {open && detail != null && (
+        <div className={dcss.tileDetail}>{detail}</div>
+      )}
     </details>
   )
 }
@@ -171,7 +176,7 @@ function MetricBlock({
       data-status={head === 'stale' ? 'stale' : undefined}
     >
       <div className={dcss.metricHead}>
-        <span>{m.label}</span>
+        <span className={dcss.metricName}>{m.label}</span>
         <span>
           {HEAD_PREFIX[head]}
           {m.valueText ?? '未提供'}

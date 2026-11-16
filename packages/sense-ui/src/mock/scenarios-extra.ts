@@ -36,7 +36,12 @@ export function tokenFallback(): SensePanelModel {
   return m
 }
 
-/** 卷级新鲜度混杂：根卷读数过期（保留值灰显）、/data 新鲜、网络盘挂起无法读取。 */
+/**
+ * 卷级新鲜度混杂（与 DiskSampler.sample 实际产物同形）：
+ * 根卷显式 stale（保留值灰显）、/data 显式 ok；父事实 ok，元数据只来自
+ * 唯一的 fresh 卷（observedAt/ttlMs 沿用 /data）；网络盘挂起列入
+ * unavailableMounts（不产数字、历史、图）。
+ */
 export function diskPartial(): SensePanelModel {
   const state = makeState()
   state.self.body.disks = {
@@ -46,12 +51,20 @@ export function diskPartial(): SensePanelModel {
           mount: '/',
           total: 460e9,
           free: 175e9,
+          status: 'stale',
           observedAt: T0 - 90_000,
           ttlMs: 5_000,
         },
-        { mount: '/data', total: 200e9, free: 160e9 },
+        {
+          mount: '/data',
+          total: 200e9,
+          free: 160e9,
+          status: 'ok',
+          observedAt: T0 - 1_000,
+          ttlMs: 30_000,
+        },
       ],
-      { api: 'diskstat' },
+      { api: 'diskstat', ageMs: 1_000, ttlMs: 30_000 },
     ),
     unavailableMounts: ['/Volumes/network'],
   }

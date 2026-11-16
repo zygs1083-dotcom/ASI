@@ -27,5 +27,8 @@
     "onlyBuiltDependencies": [
       "esbuild"
     ]
+  },
+  "dependencies": {
+    "@asi/sense-types": "workspace:*"
   }
 }

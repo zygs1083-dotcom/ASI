@@ -64,12 +64,16 @@ export interface RowResult {
   hidden: boolean
   /** unknown 但不计入聚合缺失（如 contextWindow 回退估值，容量未确认而非数据缺失）。 */
   uncounted?: boolean
+  /** 有可用数据但读数不完整（如磁盘存在失鲜/不可读挂载点）：不降低严重度、不改告警。 */
+  partial?: boolean
 }
 
 export interface BodyEvaluation {
   severity: Severity
   sentence: string
   rows: Record<BodyRowKey, RowResult>
+  /** 任一行 partial 即聚合 partial；句子只在「其余全 good」时落成部分补全文案。 */
+  partial?: boolean
 }
 
 function unusable(): RowResult {
@@ -98,29 +102,18 @@ function evalMemory(body: Body, now: number): RowResult {
 
 function evalDisks(body: Body, now: number): RowResult {
   const f = body.disks
-  if (!isUsable(f, now)) return unusable()
   const values = f.value ?? []
-  const unavail = unavailableMountSet(f)
-  // 只聚合新鲜可用卷：stale/unknown/unavailable/无效读数不告警
+  // 只聚合新鲜可用卷：stale/unknown/unavailable/无效读数不告警；
+  // 没有任何新鲜卷才算缺失，父级状态不再一票否决。
   const fresh = values.filter((d) => diskUsable(f, d, now))
+  if (fresh.length === 0) return unusable()
   let severity: Severity = 'good'
   for (const d of fresh) {
     severity = maxSeverity(severity, diskSeverity(d.free / d.total))
   }
-  // 根卷显式非新鲜（声明 stale/unknown、unavailable——即使 value 无根条目、
-  // 或自身 TTL 过期）时行报 unknown 而非 good；其他卷新鲜告警仍可优先。
-  // 无卷级元数据的旧版 payload 走「无效条目不参与聚合」语义。
-  const root = values.find((d) => d.mount === '/')
-  const rootNonfresh =
-    unavail.has('/') ||
-    (root != null &&
-      !diskUsable(f, root, now) &&
-      (root.status != null || root.observedAt != null || root.ttlMs != null))
-  if (rootNonfresh) {
-    return { severity: severity === 'good' ? 'unknown' : severity, hidden: false }
-  }
-  if (fresh.length === 0) return unusable()
-  return { severity, hidden: false }
+  const partial =
+    unavailableMountSet(f).size > 0 || values.some((d) => !diskUsable(f, d, now))
+  return { severity, hidden: false, ...(partial ? { partial: true } : {}) }
 }
 
 function evalBattery(body: Body, now: number): RowResult {
@@ -225,6 +218,10 @@ export function rowFact(key: BodyRowKey, body: Body): Fact<unknown> {
 
 /** 行事实是否新鲜可用（才可并入 insight 严重度，stale/denied 不假装当前）。 */
 export function rowUsable(key: BodyRowKey, body: Body, now: number): boolean {
+  if (key === 'disks') {
+    // 磁盘按卷判定：父级失鲜/拒绝不否决显式新鲜卷
+    return (body.disks.value ?? []).some((d) => diskUsable(body.disks, d, now))
+  }
   const f = rowFact(key, body)
   if (!isUsable(f, now)) return false
   if (key === 'tokens') {
@@ -235,9 +232,6 @@ export function rowUsable(key: BodyRowKey, body: Body, now: number): boolean {
       v.contextWindow > 0 &&
       v.contextUsed != null
     )
-  }
-  if (key === 'disks') {
-    return body.disks.value!.some((d) => diskUsable(body.disks, d, now))
   }
   return true
 }
@@ -261,13 +255,17 @@ export function evaluateBody(
 
   let worst: Severity = 'good'
   let hasUnknown = false
+  let partial = false
   for (const key of BODY_ROW_PRIORITY) {
     const s = rows[key].severity
     if (s === 'unknown') {
       if (!rows[key].uncounted) hasUnknown = true
     } else if (s === 'critical') worst = 'critical'
     else if (s === 'warn' && worst !== 'critical') worst = 'warn'
+    if (rows[key].partial) partial = true
   }
+  const out = (severity: Severity, sentence: string): BodyEvaluation =>
+    partial ? { severity, sentence, rows, partial: true } : { severity, sentence, rows }
 
   if (worst === 'critical' || worst === 'warn') {
     const key = BODY_ROW_PRIORITY.find((k) => rows[k].severity === worst)!
@@ -275,10 +273,14 @@ export function evaluateBody(
       key === 'network' && body.network.value?.online
         ? '网络流量异常'
         : ROW_WARN_SENTENCE[key]
-    return { severity: worst, sentence, rows }
+    return out(worst, sentence)
   }
   if (hasUnknown) {
-    return { severity: 'unknown', sentence: '数据待补全', rows }
+    return out('unknown', '数据待补全')
   }
-  return { severity: 'good', sentence: '状态良好', rows }
+  if (partial) {
+    // 其余行全部良好但读数不完整：不升级严重度，句子标记部分缺失
+    return out('good', '部分 · 数据待补全')
+  }
+  return out('good', '状态良好')
 }

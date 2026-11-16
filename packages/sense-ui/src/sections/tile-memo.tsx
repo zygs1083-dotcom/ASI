@@ -70,9 +70,10 @@ function eventKeys(
 
 /**
  * 指标卡片 memo：now/events 引用不算依赖。重渲条件：
- * 行严重度/可见性、回调、自身 deps 引用、相关事件集合（at≤now 全历史，
- * 未来事件到点即入选；rate 事件跨 5 分钟徽标窗也算变化）、以及每个行事实
- * 在前后两个 now 的有效状态翻转（TTL 过期）。年龄/图窗口前进由 BodyClock 独立处理。
+ * 行严重度/可见性/完整性(partial)、回调、自身 deps 引用、相关事件集合
+ * （at≤now 全历史，未来事件到点即入选；rate 事件跨 5 分钟徽标窗也算变化）、
+ * 以及每个行事实在前后两个 now 的有效状态翻转（TTL 过期）。
+ * 年龄由时钟订阅独立处理，图窗口随数据更新。
  */
 export function memoTile(
   key: BodyRowKey,
@@ -83,6 +84,7 @@ export function memoTile(
     if (
       a.rows[key].severity !== b.rows[key].severity ||
       a.rows[key].hidden !== b.rows[key].hidden ||
+      a.rows[key].partial !== b.rows[key].partial ||
       a.ctx.onAdjust !== b.ctx.onAdjust ||
       a.ctx.onOpenPermissionSettings !== b.ctx.onOpenPermissionSettings
     ) {

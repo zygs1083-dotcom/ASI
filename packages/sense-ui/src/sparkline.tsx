@@ -1,9 +1,8 @@
-import type { MetricInsight, MetricPoint } from './view-model'
+import { memo, useRef } from 'react'
 import type { Severity } from './health'
+import { buildSpark, sameThresholds } from './geometry'
 import type { SparkThreshold } from './thresholds'
-import { useClock } from './clock'
-import { HISTORY_WINDOW_MS, sampleHistory } from './history'
-import { sevOf, sevCap, spreadLabels } from './geometry'
+import type { MetricInsight, MetricPoint } from './view-model'
 import css from './viz.module.css'
 
 export { HISTORY_WINDOW_MS, sampleHistory } from './history'
@@ -31,13 +30,35 @@ const SEV_WORD: Record<Severity, string> = {
   unknown: '未知',
 }
 
+interface GeoKey {
+  points: MetricPoint[]
+  thresholds: SparkThreshold[]
+  baseLow?: number
+  baseHigh?: number
+  severity?: Severity
+  expanded: boolean
+}
+
+function sameGeoKey(a: GeoKey | undefined, b: GeoKey): boolean {
+  return (
+    a !== undefined &&
+    a.points === b.points &&
+    a.baseLow === b.baseLow &&
+    a.baseHigh === b.baseHigh &&
+    a.severity === b.severity &&
+    a.expanded === b.expanded &&
+    sameThresholds(a.thresholds, b.thresholds)
+  )
+}
+
 /**
  * 最近 5 分钟走势图。
- * x 域固定为 [now-300s, now]（稀疏点也按真实时间摆位）；y 域取数据/基线/阈值
- * 的并集。越界线段才染告警色，正常历史保持中性色；末点标记当前行级状态。
- * 数据不足给占位文案。
+ * x 域固定为 [anchor-300s, anchor]：锚点是最近一次「数据/语义更新」时的 now——
+ * 纯时钟推进只刷新 FactMeta 等年龄文案，不驱动窗口前进、不重采样、不重算路径
+ * （图窗口随数据更新前进，刻意不做时钟跟随）。越界线段才染告警色，正常历史
+ * 保持中性色；末点标记当前行级状态。数据不足给占位文案。
  */
-export function Sparkline({
+function SparklineBase({
   points,
   now,
   label,
@@ -48,96 +69,32 @@ export function Sparkline({
   expanded = false,
   className,
 }: SparklineProps) {
-  // Body 时钟让固定 5 分钟窗口随时间自行前进（外层卡片不重渲时图仍然准确）
-  const effNow = useClock(now)
-  const since = effNow - HISTORY_WINDOW_MS
-  // 阈值传入采样器：越界/相等迁移的边界点强制保留（含未激活参考线的几何）
-  const recent = sampleHistory(points, effNow, thresholds)
-
-  if (recent.length < 2) return <span className={css.sparkEmpty}>暂无趋势数据</span>
-
-  // 数据极值只来自观察点（无障碍文案）；绘图域再纳入基线带与阈值线保证可见。
-  let dataMin = Infinity
-  let dataMax = -Infinity
-  for (const p of recent) {
-    if (p.value < dataMin) dataMin = p.value
-    if (p.value > dataMax) dataMax = p.value
+  // 降采样 + 路径几何按几何键缓存：format/label/className 变化只重排文案。
+  // now 不进键：只有数据/语义变化才以本次渲染的 now 重锚 5 分钟窗口。
+  const key: GeoKey = {
+    points,
+    thresholds,
+    baseLow: baseline?.low,
+    baseHigh: baseline?.high,
+    severity,
+    expanded,
   }
-  const band =
-    baseline && Number.isFinite(baseline.low) && Number.isFinite(baseline.high)
-      ? baseline
-      : null
-  let min = dataMin
-  let max = dataMax
-  if (band) {
-    min = Math.min(min, band.low)
-    max = Math.max(max, band.high)
-  }
-  for (const t of thresholds) {
-    if (Number.isFinite(t.value)) {
-      min = Math.min(min, t.value)
-      max = Math.max(max, t.value)
+  const cache = useRef<{ key: GeoKey; built: ReturnType<typeof buildSpark> }>()
+  if (!sameGeoKey(cache.current?.key, key)) {
+    cache.current = {
+      key,
+      built: buildSpark(points, now, { baseline, thresholds, severity, expanded }),
     }
   }
-  const pad = (max - min) * 0.08 || Math.max(Math.abs(max) * 0.1, 1e-6)
-  min -= pad
-  max += pad
-  const span = max - min
+  const built = cache.current!.built
 
-  const xOf = (at: number) => ((at - since) / HISTORY_WINDOW_MS) * 100
-  const yOf = (v: number) => (1 - (v - min) / span) * 100
-
-  // 逐段拆分：跨越激活阈值线的段在交点切开，越界部分单独着色。
-  // 染色上限受行级 severity 约束（good/unknown 全中性，warn 不升 critical），
-  // active=false 的参考线只画不切。
-  const cap = sevCap(severity)
-  const normalSegs: string[] = []
-  const warnSegs: string[] = []
-  const critSegs: string[] = []
-  for (let i = 1; i < recent.length; i++) {
-    const p0 = recent[i - 1]!
-    const p1 = recent[i]!
-    const x0 = xOf(p0.at)
-    const x1 = xOf(p1.at)
-    const cuts = thresholds
-      .filter(
-        (t) =>
-          t.active !== false &&
-          Number.isFinite(t.value) &&
-          (p0.value - t.value) * (p1.value - t.value) < 0,
-      )
-      .map((t) => (t.value - p0.value) / (p1.value - p0.value))
-      .sort((a, b) => a - b)
-    let prev = 0
-    for (const cut of [...cuts, 1]) {
-      const xa = x0 + (x1 - x0) * prev
-      const xb = x0 + (x1 - x0) * cut
-      const ya = yOf(p0.value + (p1.value - p0.value) * prev)
-      const yb = yOf(p0.value + (p1.value - p0.value) * cut)
-      const mid = p0.value + (p1.value - p0.value) * ((prev + cut) / 2)
-      const seg = sevOf(mid, thresholds)
-      const capped = seg === null || cap === null ? null : seg === 'critical' && cap === 'warn' ? 'warn' : seg
-      const bucket =
-        capped === 'critical' ? critSegs : capped === 'warn' ? warnSegs : normalSegs
-      bucket.push(`M${xa.toFixed(2)},${ya.toFixed(2)} L${xb.toFixed(2)},${yb.toFixed(2)}`)
-      prev = cut
-    }
-  }
-
-  const last = recent[recent.length - 1]!
-  const thrMarks = expanded
-    ? spreadLabels(
-        thresholds
-          .filter((t) => Number.isFinite(t.value))
-          .map((t) => ({ t, y: Math.min(100, Math.max(0, yOf(t.value))) }))
-          .sort((a, b) => a.y - b.y),
-      )
-    : []
+  if (!built) return <span className={css.sparkEmpty}>暂无趋势数据</span>
+  const { g } = built
 
   const summary =
-    `${label}最近 5 分钟趋势：当前 ${format(last.value)}，最高 ${format(dataMax)}，` +
-    `最低 ${format(dataMin)}` +
-    (band ? `，基线区间 ${format(band.low)} 至 ${format(band.high)}` : '') +
+    `${label}最近 5 分钟趋势：当前 ${format(g.last.value)}，最高 ${format(g.dataMax)}，` +
+    `最低 ${format(g.dataMin)}` +
+    (g.band ? `，基线区间 ${format(g.band.low)} 至 ${format(g.band.high)}` : '') +
     (thresholds.length
       ? `，阈值 ${thresholds
           .map((t) => `${t.label ?? '底线'} ${format(t.value)}`)
@@ -155,14 +112,14 @@ export function Sparkline({
           preserveAspectRatio="none"
           aria-hidden="true"
         >
-          {band && (
+          {g.band && (
             <rect
               data-baseline="true"
               className={css.sparkBand}
               x={0}
-              y={yOf(band.high)}
+              y={g.yOf(g.band.high)}
               width={100}
-              height={Math.max(1, yOf(band.low) - yOf(band.high))}
+              height={Math.max(1, g.yOf(g.band.low) - g.yOf(g.band.high))}
             />
           )}
           {thresholds
@@ -174,29 +131,29 @@ export function Sparkline({
                 className={t.sev === 'critical' ? css.thrCritical : css.thrWarn}
                 x1={0}
                 x2={100}
-                y1={yOf(t.value)}
-                y2={yOf(t.value)}
+                y1={g.yOf(t.value)}
+                y2={g.yOf(t.value)}
                 vectorEffect="non-scaling-stroke"
               />
             ))}
           <path
             className={css.segNormal}
-            d={normalSegs.join(' ')}
+            d={g.normalSegs.join(' ')}
             vectorEffect="non-scaling-stroke"
           />
-          {warnSegs.length > 0 && (
+          {g.warnSegs.length > 0 && (
             <path
               className={css.segWarn}
               data-out-of-range="warn"
-              d={warnSegs.join(' ')}
+              d={g.warnSegs.join(' ')}
               vectorEffect="non-scaling-stroke"
             />
           )}
-          {critSegs.length > 0 && (
+          {g.critSegs.length > 0 && (
             <path
               className={css.segCritical}
               data-out-of-range="critical"
-              d={critSegs.join(' ')}
+              d={g.critSegs.join(' ')}
               vectorEffect="non-scaling-stroke"
             />
           )}
@@ -206,8 +163,8 @@ export function Sparkline({
               className={
                 severity === 'critical' ? css.curCritical : css.curWarn
               }
-              cx={xOf(last.at)}
-              cy={yOf(last.value)}
+              cx={g.xOf(g.last.at)}
+              cy={g.yOf(g.last.value)}
               r={1.5}
               vectorEffect="non-scaling-stroke"
             />
@@ -215,9 +172,9 @@ export function Sparkline({
         </svg>
         {expanded && (
           <>
-            <span className={css.axisYMax}>{format(max)}</span>
-            <span className={css.axisYMin}>{format(min)}</span>
-            {thrMarks.map(({ t, y }, i) => (
+            <span className={css.axisYMax}>{format(g.max)}</span>
+            <span className={css.axisYMin}>{format(g.min)}</span>
+            {g.thrMarks.map(({ t, y }, i) => (
               <span
                 key={i}
                 className={css.thrLabel}
@@ -241,3 +198,19 @@ export function Sparkline({
     </div>
   )
 }
+
+// 纯时钟推进（now 变化但数据/语义相同）不重渲：重渲条件为 points 引用、
+// label/format/severity/expanded/className、基线标量与阈值语义值的变化。
+export const Sparkline = memo(
+  SparklineBase,
+  (a, b) =>
+    a.points === b.points &&
+    a.label === b.label &&
+    a.format === b.format &&
+    a.severity === b.severity &&
+    (a.expanded ?? false) === (b.expanded ?? false) &&
+    a.className === b.className &&
+    a.baseline?.low === b.baseline?.low &&
+    a.baseline?.high === b.baseline?.high &&
+    sameThresholds(a.thresholds ?? [], b.thresholds ?? []),
+)

@@ -7,14 +7,14 @@ import { MemorySampler } from './memory.js';
 import { NetworkSampler } from './network.js';
 import { ExternalProcessSampler, SelfProcessSampler } from './process.js';
 import type {
-  BatteryValue, Body, CpuValue, DisksValue, Fact, MemoryValue,
+  BatteryValue, Body, CpuValue, DisksFact, DisksValue, Fact, MemoryValue,
   NetworkValue, ProcessValue, ThermalValue, TokenSource, TokensValue,
 } from './types.js';
 
 export interface ProbeCollectors {
   cpu(ttlMs: number, signal?: AbortSignal): Promise<Fact<CpuValue>>;
   memory(ttlMs: number, signal?: AbortSignal): Promise<Fact<MemoryValue>>;
-  disks(cwd: string, ttlMs: number, signal?: AbortSignal): Promise<Fact<DisksValue>>;
+  disks(cwd: string, ttlMs: number, signal?: AbortSignal): Promise<DisksFact>;
   battery(ttlMs: number, signal?: AbortSignal): Promise<Fact<BatteryValue | null>>;
   network(ttlMs: number, signal?: AbortSignal): Promise<Fact<NetworkValue>>;
   process(pid: number, ttlMs: number, signal?: AbortSignal): Promise<Fact<ProcessValue>>;
@@ -310,7 +310,7 @@ export class BodyProbe {
   // so it is queried every tick; its background jobs never see the tick
   // signal (it dies with the next tick — stopInner aborts generations). An
   // injected disks collector keeps the whole-group cached cadence instead.
-  private disksFact(signal: AbortSignal): Promise<Fact<DisksValue>> {
+  private disksFact(signal: AbortSignal): Promise<DisksFact> {
     const ttl = this.cadence.disksMs * 3;
     if (this.customDisks) {
       return this.cached('disks', () => this.collectors.disks(this.cwd, ttl, signal), signal);

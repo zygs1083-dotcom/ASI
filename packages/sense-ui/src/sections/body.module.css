@@ -198,6 +198,27 @@
   background: var(--dsw-alias-state-business-primary, #4176e6);
 }
 
+/* 剩余比例条 + 可见「剩余」标签。 */
+.stripWrap {
+  display: flex;
+  align-items: center;
+  gap: var(--sense-gap, 6px);
+}
+
+.stripText {
+  flex-shrink: 0;
+  font-size: var(--sense-fs-s);
+  color: var(--dsw-alias-label-secondary, #61666b);
+  /* 标签贴条边缘：不透明侧栏底 */
+  background: var(--dsw-specific-sidebar-fill, #f9fafb);
+  border-radius: 2px;
+}
+
+.stripWrap > .memStrip {
+  flex: 1;
+  width: auto;
+}
+
 .sevTag {
   font-size: var(--sense-fs-s);
   font-weight: 500;

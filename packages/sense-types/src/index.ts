@@ -7,6 +7,7 @@
 import type { Body } from './body.js';
 
 export type { Body } from './body.js';
+export type { DisksFact, DiskVolume } from './disks.js';
 
 /** Identifies a signal/fact producer: which source, via which API, on which host. */
 export interface SourceRef {

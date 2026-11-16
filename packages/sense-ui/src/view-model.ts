@@ -1,27 +1,23 @@
-// 侧栏面板视图模型；合并后对齐 @asi/sense-types（docs/DESIGN.md §2.2/§2.2b/§2.3）。
+// 侧栏面板视图模型；事实骨架来自 @asi/sense-types（docs/DESIGN.md §2.2/§2.2b/§2.3），
+// UI 侧只追加可选 reason、内存细分、token 生命体征与本地面板任务摘要投影。
 
-export interface SourceRef {
-  id: string
-  api: string
-  host: string
-}
+import type {
+  DisksFact as SharedDisksFact,
+  Fact as SharedFact,
+  FactStatus,
+  SourceRef,
+} from '@asi/sense-types'
 
-export type FactStatus =
-  | 'ok'
-  | 'stale'
-  | 'denied'
-  | 'unsupported'
-  | 'unavailable'
-  | 'unknown'
+export type { DiskVolume, FactStatus, SourceRef } from '@asi/sense-types'
 
-export interface Fact<T> {
-  value: T | null
-  status: FactStatus
-  source: SourceRef
-  observedAt: number
-  ttlMs: number
-  reason?: string
-}
+/** UI 事实：共享 Fact 骨架 + 宿主可读原因（denied/unavailable 时展示）。 */
+export type Fact<T> = SharedFact<T> & { reason?: string }
+
+/**
+ * 磁盘事实：value 为各挂载点独立读数，父级状态只兜底缺省卷（见 sense-types/disks.ts）。
+ * unavailableMounts 声明读不出的挂载点：即使 value 里带记录也一律不展示。
+ */
+export type DisksFact = SharedDisksFact & { reason?: string }
 
 export interface Signal {
   id: string
@@ -61,27 +57,6 @@ export interface Body {
   network: Fact<{ online: boolean; rxBps: number; txBps: number }>
   harnessProcess: Fact<{ rss: number; cpu: number; uptimeSec: number }>
   tokens: Fact<TokenVitals>
-}
-
-/**
- * 磁盘卷读数。可选字段全部为增量契约：
- * status/observedAt/ttlMs 提供卷级新鲜度覆盖（缺省继承父事实 ok/observedAt/ttlMs）；
- * 旧的只含 mount/total/free 的 payload 行为完全不变。
- */
-export interface DiskVolume {
-  mount: string
-  total: number
-  free: number
-  /** 卷级新鲜度覆盖：'stale'/'unknown' 只降级该卷；不能复活父事实的非 ok 状态。 */
-  status?: 'ok' | 'stale' | 'unknown'
-  observedAt?: number
-  ttlMs?: number
-}
-
-/** 磁盘事实：value 为卷列表；unavailableMounts 声明读不出的挂载点（如挂起网络盘）。 */
-export type DisksFact = Fact<DiskVolume[]> & {
-  /** 即使 value 里带该挂载点读数也一律不展示（无数字、无历史、无图）。 */
-  unavailableMounts?: string[]
 }
 
 export interface TokenVitals {

@@ -1,5 +1,7 @@
+/** 磁盘卷级健康度：每卷独立求值，父事实只做缺省兜底。 */
+
 import type { DiskVolume, DisksFact, Fact } from './view-model'
-import { effectiveStatus, isUsable, type Severity } from './fact-status'
+import { effectiveStatus, type Severity } from './fact-status'
 
 /** 有效磁盘读数：total 为正有限、free 有限（free 可为 0）。 */
 export function diskValid(d: { total: number; free: number }): boolean {
@@ -12,10 +14,11 @@ export function unavailableMountSet(f: DisksFact): Set<string> {
 }
 
 /**
- * 卷级事实：父事实为底，叠加卷级 status/observedAt/ttlMs 覆盖。
- * unavailableMounts 命中即 unavailable 且清空读数；父事实有效状态为上界
- * （整列 stale/denied/已过期不能被卷级 ok 复活）；stale 保留读数供灰显，
- * unknown/unavailable 清空。配 effectiveStatus 得含 TTL 的最终状态。
+ * 卷级事实：卷自声明 status/observedAt/ttlMs 权威（父事实 stale/denied 不封顶
+ * 显式 ok 的卷）；缺省字段回落到父事实——只有缺省 status 的卷才被父级有效
+ * 状态兜底。unavailableMounts 命中即 unavailable 且清空读数（value 里带同名
+ * 记录也不展示）；stale 保留读数供灰显，其余非 ok 清空。配 effectiveStatus
+ * 得含自身 TTL 的最终状态。
  */
 export function diskFact(parent: DisksFact, disk: DiskVolume, now: number): Fact<DiskVolume> {
   const observedAt = disk.observedAt ?? parent.observedAt
@@ -29,9 +32,7 @@ export function diskFact(parent: DisksFact, disk: DiskVolume, now: number): Fact
       ttlMs,
     }
   }
-  // 父事实有效状态为上界：整体已过期/拒绝不能靠卷级元数据复活
-  const parentEff = effectiveStatus(parent, now)
-  const status = parentEff === 'ok' ? (disk.status ?? 'ok') : parentEff
+  const status = disk.status ?? effectiveStatus(parent, now)
   return {
     value:
       status === 'ok' || status === 'stale'
@@ -45,9 +46,9 @@ export function diskFact(parent: DisksFact, disk: DiskVolume, now: number): Fact
   }
 }
 
-/** 卷是否新鲜可用：父可用、读数有效、不在 unavailableMounts、卷级有效状态 ok。 */
+/** 卷是否新鲜可用：读数有效、不在 unavailableMounts、卷级有效状态 ok。不做父级门槛。 */
 export function diskUsable(f: DisksFact, d: DiskVolume, now: number): boolean {
-  return isUsable(f, now) && diskValid(d) && effectiveStatus(diskFact(f, d, now), now) === 'ok'
+  return diskValid(d) && effectiveStatus(diskFact(f, d, now), now) === 'ok'
 }
 
 /** 单个磁盘剩余比例 → 严重度（每个盘独立着色用）。 */

@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import * as fact from './fact.js';
-import type { DisksValue, DiskVolume, Fact, SourceRef } from './types.js';
+import type { DisksFact, DisksValue, DiskVolume, SourceRef } from './types.js';
 
 export interface StatFsResult {
   bsize: number;
@@ -77,7 +77,7 @@ export class DiskSampler {
     this.src = deps.src ?? fact.source('disks', 'fs.statfs');
   }
 
-  sample(cwd: string, ttlMs: number = fact.DEFAULT_TTL_MS, signal?: AbortSignal): Promise<Fact<DisksValue>> {
+  sample(cwd: string, ttlMs: number = fact.DEFAULT_TTL_MS, signal?: AbortSignal): Promise<DisksFact> {
     const stat = this.deps.stat ?? ((p: string) => fs.promises.stat(p));
     const statfs = this.deps.statfs ?? ((p: string) => fs.promises.statfs(p));
     const resolve = this.deps.resolve ?? ((p: string) => path.resolve(p));
@@ -90,6 +90,7 @@ export class DiskSampler {
     const seenDev = new Set<number>();
     const missing: string[] = [];
     const parts: fact.FactMeta[] = [];
+    const freshParts: fact.FactMeta[] = [];
     for (const q of queried) {
       let v = this.volumes.get(q);
       if (!v) {
@@ -111,16 +112,21 @@ export class DiskSampler {
         };
         fact.trackDeadline(rec, deadline);
         records.push(rec);
-        parts.push({ observedAt: v.observedAt, periodMs: v.ttl / 3, at: v.at });
+        const part = { observedAt: v.observedAt, periodMs: v.ttl / 3, at: v.at };
+        parts.push(part);
+        if (rec.status === 'ok') freshParts.push(part);
       } else if (v.value === undefined) {
         missing.push(q);
       }
     }
-    const meta = parts.length ? fact.oldestMeta(parts) : undefined;
-    const f: Fact<DisksValue> = {
+    // 父级元数据只聚合新鲜卷；全部失鲜时才回落到全部记录（最旧观察 +
+    // 最早过期）。父状态：任一 ok → ok；有记录全失鲜 → stale；无记录 → unknown。
+    const pool = freshParts.length ? freshParts : parts;
+    const meta = pool.length ? fact.oldestMeta(pool) : undefined;
+    const f: DisksFact = {
       value: records.length ? records : null,
-      status: records.some((r) => r.status === 'stale') ? 'stale'
-        : records.length ? 'ok' : 'unknown',
+      status: records.some((r) => r.status === 'ok') ? 'ok'
+        : records.length ? 'stale' : 'unknown',
       source: this.src,
       observedAt: meta?.observedAt ?? wall,
       ttlMs: meta?.ttlMs ?? ttlMs,
