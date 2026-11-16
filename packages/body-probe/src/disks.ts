@@ -125,6 +125,7 @@ export class DiskSampler {
     const pool = freshParts.length ? freshParts : parts;
     const meta = pool.length ? fact.oldestMeta(pool) : undefined;
     const f: DisksFact = {
+      kind: 'disks',
       value: records.length ? records : null,
       status: records.some((r) => r.status === 'ok') ? 'ok'
         : records.length ? 'stale' : 'unknown',

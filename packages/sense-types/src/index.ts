@@ -36,7 +36,7 @@ export interface Fact<T> {
  * `ok` facts become stale at `now >= observedAt + ttlMs`.
  * Disk facts use `disksStatusAt` instead.
  */
-export function factStatusAt(fact: Fact<unknown>, now: number): FactStatus {
+export function factStatusAt(fact: Fact<unknown> & { kind?: never }, now: number): FactStatus {
   return ttlStatusAt(fact, now);
 }
 

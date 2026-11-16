@@ -7,7 +7,7 @@ import {
   rowMetricKeys,
   rowUsable,
 } from '../../src/health'
-import { T0, emptyFact, fact, makeBody } from '../../src/mock/fixtures'
+import { T0, disksFixture, emptyFact, fact, makeBody } from '../../src/mock/fixtures'
 import type { Body, DiskVolume, DisksFact } from '../../src/view-model'
 
 function bodyWith(patch: Partial<Body>): Body {
@@ -55,7 +55,7 @@ describe('单项阈值', () => {
   it('磁盘：free/total <=10% warn，<=5% critical', () => {
     const disk = (freeRatio: number) =>
       bodyWith({
-        disks: fact([{ mount: '/', total: 100e9, free: freeRatio * 100e9 }]),
+        disks: disksFixture([{ mount: '/', total: 100e9, free: freeRatio * 100e9 }]),
       })
     expect(sev(disk(0.11)).rows.disks.severity).toBe('good')
     expect(sev(disk(0.1)).rows.disks.severity).toBe('warn')
@@ -278,14 +278,14 @@ describe('磁盘有效性', () => {
     { disks: [] as { mount: string; total: number; free: number }[], sev: 'unknown' },
     { disks: [{ mount: '/', total: 0, free: 5e9 }, { mount: '/x', total: -1, free: 1e9 }], sev: 'unknown' },
   ])('空/全无效列表 → $sev 而非 good', ({ disks, sev }) => {
-    const r = evaluateBody(bodyWith({ disks: fact(disks) }), T0)
+    const r = evaluateBody(bodyWith({ disks: disksFixture(disks) }), T0)
     expect(r.rows.disks.severity).toBe(sev)
     expect(r.severity).toBe('unknown')
   })
 
   it('无效条目不参与极值/聚合；有效盘照常告警', () => {
     const r = evaluateBody(
-      bodyWith({ disks: fact([
+      bodyWith({ disks: disksFixture([
         { mount: '/', total: 0, free: 5e9 },
         { mount: '/d', total: 100e9, free: 2e9 },
       ]) }),
@@ -296,11 +296,11 @@ describe('磁盘有效性', () => {
 
   it('无效挂载点上的 critical insight 不能复活/升级磁盘行', () => {
     const r = evaluateBody(
-      bodyWith({ disks: fact([{ mount: '/', total: 0, free: 0 }]) }), T0, { 'disk:/': critInsight })
+      bodyWith({ disks: disksFixture([{ mount: '/', total: 0, free: 0 }]) }), T0, { 'disk:/': critInsight })
     expect(r.rows.disks.severity).toBe('unknown')
     // 混合列表：只聚合有效挂载点的 insight
     const r2 = evaluateBody(
-      bodyWith({ disks: fact([
+      bodyWith({ disks: disksFixture([
         { mount: '/', total: 100e9, free: 90e9 },
         { mount: '/bad', total: 0, free: 0 },
       ]) }),
@@ -355,7 +355,7 @@ describe('卷级磁盘状态（status/observedAt/ttlMs + unavailableMounts）', 
     unavailableMounts?: string[],
     parentOpts: Parameters<typeof fact>[1] = {},
   ): DisksFact => ({
-    ...fact<DiskVolume[]>(volumes, parentOpts),
+    ...disksFixture(volumes, parentOpts),
     unavailableMounts,
   })
 

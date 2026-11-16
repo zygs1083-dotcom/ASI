@@ -18,7 +18,7 @@ const fx = (name: string) => fs.readFileSync(new URL(`./fixtures/${name}`, impor
 const baseCollectors = (): ProbeCollectors => ({
   cpu: async (ttl) => fact.ok({ usage: 0.5, perCore: [0.5], load1: 1, load5: 1, load15: 1 }, src('cpu'), ttl),
   memory: async (ttl) => fact.ok({ total: 1, used: 1, pressure: 'normal', swapUsed: 0 }, src('mem'), ttl),
-  disks: async (_cwd, ttl) => fact.ok([{ mount: '/', total: 10, free: 5 }], src('disks'), ttl),
+  disks: async (_cwd, ttl) => ({ ...fact.ok([{ mount: '/', total: 10, free: 5 }], src('disks'), ttl), kind: 'disks' }),
   battery: async (ttl) => fact.ok(null, src('batt'), ttl),
   network: async (ttl) => fact.ok({ online: true, rxBps: 1, txBps: 1 }, src('net'), ttl),
   process: async (_pid, ttl) => fact.ok({ rss: 1, cpu: 0.1, uptimeSec: 5 }, src('proc'), ttl),
@@ -59,6 +59,22 @@ describe('BodyProbe', () => {
     await probe.stop();
   });
 
+  it('preserves the disk discriminator for frozen collectors and collection failures', async () => {
+    for (const fails of [false, true]) {
+      const collectors = baseCollectors();
+      collectors.disks = async () => {
+        if (fails) throw new Error('fixture failure');
+        return Object.freeze({ ...fact.ok([{ mount: '/', total: 10, free: 5 }], src('disks')), kind: 'disks' as const });
+      };
+      const probe = new BodyProbe(collectors);
+      probe.start();
+      await flush();
+      expect(probe.history()[0]!.body.disks.kind).toBe('disks');
+      expect(probe.latest()!.disks).toMatchObject({ kind: 'disks', status: fails ? 'unknown' : 'ok' });
+      await probe.stop();
+    }
+  });
+
   it('rejects invalid interval and history arguments', async () => {
     const probe = new BodyProbe(baseCollectors());
     for (const bad of [0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
@@ -91,6 +107,7 @@ describe('BodyProbe', () => {
     const t0 = Date.now();
     const collectors = baseCollectors();
     collectors.disks = async () => ({
+      kind: 'disks',
       value: [
         { mount: '/', total: 100, free: 2, status: 'ok', observedAt: t0, ttlMs: 6000 },
         { mount: '/b', total: 100, free: 90, status: 'ok', observedAt: t0 + 2000, ttlMs: 30000 },
@@ -103,7 +120,6 @@ describe('BodyProbe', () => {
     await flush();
     await probe.stop();
     const original = probe.history()[0]!.body.disks;
-    expect(factStatusAt(original, t0 + 6500)).toBe('stale');
     expect(effectiveDisks(original, t0 + 6500)).toMatchObject({
       status: 'ok', observedAt: t0 + 2000, ttlMs: 30000,
       indeterminateMounts: ['/', '/missing'],
@@ -130,6 +146,7 @@ describe('BodyProbe', () => {
     const t0 = Date.now();
     const collectors = baseCollectors();
     collectors.disks = async () => ({
+      kind: 'disks',
       value: [
         { mount: '/', total: 100, free: 2, status: 'ok', observedAt: t0, ttlMs: 6000 },
         { mount: '/b', total: 100, free: 90, status: 'ok', observedAt: t0, ttlMs: 30000 },
@@ -725,7 +742,7 @@ describe('BodyProbe', () => {
     };
     collectors.disks = async (_cwd, ttl) => {
       counts.disks += 1;
-      return fact.ok([{ mount: '/', total: 10, free: 5 }], src('disks'), ttl);
+      return { ...fact.ok([{ mount: '/', total: 10, free: 5 }], src('disks'), ttl), kind: 'disks' };
     };
     // The injected mono clock wraps the faked global performance.now(), so
     // advancing timers progresses it while setSystemTime moves only the wall.

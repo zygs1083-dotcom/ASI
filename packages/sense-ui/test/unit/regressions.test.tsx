@@ -16,7 +16,7 @@ import type {
   SensePanelModel,
 } from '../../src/view-model'
 import { makeScenario } from '../../src/mock/scenarios'
-import { emptyFact, fact, makeBody, makeEvent, makeState, T0 } from '../../src/mock/fixtures'
+import { disksFixture, emptyFact, fact, makeBody, makeEvent, makeState, T0 } from '../../src/mock/fixtures'
 import { formatClock } from '../../src/format'
 import { evaluateBody } from '../../src/health'
 
@@ -62,8 +62,8 @@ async function openTile(key: string): Promise<HTMLElement> {
 describe('过期保留值', () => {
   it('空磁盘在摘要及明细均按磁盘契约显示未知', async () => {
     for (const disks of [
-      fact(null, { status: 'unavailable' }),
-      fact([], { status: 'ok' }),
+      disksFixture(null, { status: 'unavailable' }),
+      disksFixture([], { status: 'ok' }),
     ]) {
       const state = makeState()
       state.self.body.disks = disks
@@ -96,7 +96,7 @@ describe('过期保留值', () => {
 
   it('磁盘过期但保留值：挂载列表可见、标签未知、无速率徽标', async () => {
     const state = makeState()
-    state.self.body.disks = fact(
+    state.self.body.disks = disksFixture(
       [
         { mount: '/', total: 200e9, free: 40e9 },
         { mount: '/data', total: 100e9, free: 90e9 },
@@ -117,7 +117,7 @@ describe('过期保留值', () => {
 
   it('磁盘剩余比例条按 free/total 填充并带 data-ratio', async () => {
     const state = makeState()
-    state.self.body.disks = fact([
+    state.self.body.disks = disksFixture([
       { mount: '/', total: 200e9, free: 40e9 },
       { mount: '/data', total: 100e9, free: 90e9 },
     ])
@@ -556,7 +556,7 @@ describe('无有效磁盘读数', () => {
     { disks: [{ mount: '/', total: 0, free: 0 }, { mount: '/x', total: -1, free: 0 }] },
   ])('空/全无效列表 → 明示无有效读数、行未知、不伪造 0', async ({ disks }) => {
     const state = makeState()
-    state.self.body.disks = fact(disks)
+    state.self.body.disks = disksFixture(disks)
     renderPanel({ ...makeScenario('healthy'), state })
     const tile = await openTile('disks')
     expect(tile.textContent).toContain(disks.length ? '无有效磁盘读数' : '未知')
@@ -744,7 +744,7 @@ describe('磁贴渲染隔离', () => {
       { usage: 0.3, perCore: [0.3], load1: 1, load5: 1, load15: 1 },
       { ttlMs: 600_000 },
     )
-    m.state.self.body.disks = fact(
+    m.state.self.body.disks = disksFixture(
       [
         { mount: '/', total: 460e9, free: 175e9 },
         { mount: '/data', total: 200e9, free: 160e9, status: 'stale' as const },
@@ -798,7 +798,7 @@ describe('磁贴渲染隔离', () => {
 
 describe('磁盘卷级新鲜度', () => {
   const partialDisks = () => ({
-    ...fact(
+    ...disksFixture(
       [
         { mount: '/', total: 460e9, free: 175e9, status: 'ok' as const, observedAt: T0 - 90_000, ttlMs: 5_000 },
         { mount: '/data', total: 200e9, free: 160e9 },
@@ -845,7 +845,7 @@ describe('磁盘卷级新鲜度', () => {
 
   it('父整体 stale：主摘要只标一次「已过期」，保留值仍在', async () => {
     const state = makeState()
-    state.self.body.disks = fact(
+    state.self.body.disks = disksFixture(
       [{ mount: '/', total: 460e9, free: 175e9 }],
       { ageMs: 90_000, ttlMs: 5_000 },
     )
@@ -878,7 +878,7 @@ describe('磁盘卷级新鲜度', () => {
       },
     ]
     const state = makeState()
-    state.self.body.disks = fact(vols, {
+    state.self.body.disks = disksFixture(vols, {
       status: parentStatus,
       ageMs: 1_000,
       ttlMs: 30_000,
@@ -914,7 +914,7 @@ describe('磁盘卷级新鲜度', () => {
   it('根卷新鲜且 /net 无法读取：磁盘和总览标部分而非状态良好', async () => {
     const state = makeState()
     state.self.body.disks = {
-      ...fact([{
+      ...disksFixture([{
         mount: '/', total: 100e9, free: 90e9, status: 'ok' as const,
         observedAt: T0 - 1_000, ttlMs: 30_000,
       }], { ageMs: 1_000, ttlMs: 30_000 }),

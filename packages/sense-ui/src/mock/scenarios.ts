@@ -64,7 +64,7 @@ function permissionDenied(): SensePanelModel {
   body.thermal = emptyFact('unavailable', 'helper 未上报温控')
   body.battery = emptyFact('unknown')
   body.network = emptyFact('unsupported', '非 macOS 无此信号源')
-  body.disks = emptyFact('stale')
+  body.disks = { ...emptyFact('stale'), kind: 'disks' }
   state.self.body = body
   state.observation.sources['macos-helper'] = {
     status: 'denied',

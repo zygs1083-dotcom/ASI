@@ -45,6 +45,7 @@ export function tokenFallback(): SensePanelModel {
 export function diskPartial(): SensePanelModel {
   const state = makeState()
   state.self.body.disks = {
+    kind: 'disks',
     ...fact(
       [
         {

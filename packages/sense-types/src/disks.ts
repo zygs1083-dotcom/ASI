@@ -8,6 +8,7 @@ import type { Fact, FactStatus } from './index.js';
  * （仅 mount/total/free）仍然合法：
  * - status 缺省时该卷没有自声明状态，父事实的有效状态
  *   （effectiveStatus：status 字段叠加 TTL 过期判定）作为上限/兜底；
+ *   物化期限为卷与父事实的较早到期时刻，即使 ttlMs 因此为负；
  * - observedAt/ttlMs 缺省时回落到父事实同名字段；
  * - 一旦 volume 自声明 status，它就是权威的，父状态不再封顶。
  */
@@ -28,13 +29,14 @@ export interface DiskVolume {
  *
  * 父级聚合语义（生产方约定）：
  * - 任一卷为 fresh/ok → status 'ok'；
- * - 有值但全部 stale → 'stale'；无值 → 'unknown'；
- * - 'denied'/'unsupported' 由采集失败直接置位，不做聚合；
+ * - 有值但全部 stale → 'stale'；null/空数组在 ok/stale/unavailable/unknown 下为 'unknown'；
+ * - 'denied'/'unsupported' 由采集失败直接置位，不做聚合，即使 null/空数组也保留；
  * - observedAt 取 fresh 卷中最旧的采样时间；
  * - ttlMs = fresh 卷中最早绝对过期时刻 − 最旧 fresh observedAt，
  *   即父事实的保鲜窗口只覆盖仍然新鲜的那部分数据。
  */
 export type DisksFact = Fact<DiskVolume[]> & {
+  kind: 'disks';
   unavailableMounts?: string[];
 };
 
@@ -48,14 +50,19 @@ export function diskVolumeAt(
   ttlMs: number;
 } {
   const observedAt = volume.observedAt ?? fact.observedAt;
-  const ttlMs = volume.ttlMs ?? fact.ttlMs;
+  const deadline = observedAt + (volume.ttlMs ?? fact.ttlMs);
+  const ttlMs =
+    (volume.status === undefined ? Math.min(deadline, fact.observedAt + fact.ttlMs) : deadline) - observedAt;
   const status = (fact.unavailableMounts ?? []).includes(volume.mount)
     ? 'unavailable'
     : (volume.status ?? ttlStatusAt(fact, now));
   return { ...volume, observedAt, ttlMs, status: ttlStatusAt({ status, observedAt, ttlMs }, now) };
 }
 
-export function effectiveDisks(fact: DisksFact, now: number): DisksFact & { indeterminateMounts: string[] } {
+export function effectiveDisks(
+  fact: DisksFact,
+  now: number,
+): Omit<DisksFact, 'value'> & { value: ReturnType<typeof diskVolumeAt>[] | null; indeterminateMounts: string[] } {
   const volumes = (fact.value ?? []).map((volume) => diskVolumeAt(fact, volume, now));
   const fresh = volumes.filter((volume) => volume.status === 'ok');
   const indeterminateMounts = [

@@ -1,4 +1,4 @@
-import { factStatusAt } from '@asi/sense-types';
+import { disksStatusAt } from '@asi/sense-types';
 import { describe, expect, it } from 'vitest';
 import { bodyThresholdSignals } from '../src/host/attention/thresholds.ts';
 import { StateStore } from '../src/host/state/store.ts';
@@ -61,7 +61,7 @@ describe('disk snapshot contract', () => {
     const disks = st.snapshot(6500).self.body.disks;
     expect(disks).toMatchObject({ status: 'ok', observedAt: 2000, ttlMs: 30000 });
     expect(disks.value).toMatchObject([{ status: 'stale' }, { status: 'ok' }]);
-    expect(factStatusAt(disks, 6500)).toBe('ok');
+    expect(disksStatusAt(disks, 6500)).toBe('ok');
   });
 
   it('persists unreadable mounts, overrides readings, retains latches and clears on replacement', () => {

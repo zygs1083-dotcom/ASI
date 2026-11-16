@@ -256,10 +256,16 @@ export class BodyProbe {
   // injected disks collector keeps the whole-group cached cadence instead.
   private disksFact(signal: AbortSignal): Promise<DisksFact> {
     const ttl = this.cadence.disksMs * 3;
-    if (this.customDisks) {
-      return this.cached('disks', () => this.collectors.disks(this.cwd, ttl, signal), signal);
-    }
-    return this.call(() => this.collectors.disks(this.cwd, ttl), 'disks', ttl, signal);
+    const result = this.customDisks
+      ? this.cached('disks', () => this.collectors.disks(this.cwd, ttl, signal), signal)
+      : this.call(() => this.collectors.disks(this.cwd, ttl), 'disks', ttl, signal);
+    return result.then((f) => {
+      if ('kind' in f && f.kind === 'disks') return f as DisksFact;
+      const disks = { ...f, kind: 'disks' as const };
+      const deadline = fact.deadline(f);
+      if (deadline !== undefined) fact.trackDeadline(disks, deadline);
+      return disks;
+    });
   }
 
   private async call<T>(

@@ -1,12 +1,12 @@
 /** 预览实时模式用的确定性 tick（导出供单测验证，不进入组件逻辑）。 */
 
 import { diskUsable } from '../disk-health'
+import { effectiveDisks } from '@asi/sense-types'
 import {
   THERMAL_ORDINAL,
   type Body,
   type BodyHistory,
   type DisksFact,
-  type DiskVolume,
   type Fact,
   type MetricPoint,
   type SensePanelModel,
@@ -27,36 +27,22 @@ const renew = <T>(f: Fact<T>, now: number): Fact<T> =>
     : f
 
 /**
- * 磁盘事实续期：父级到期才动；每个显式 ok 卷仅在自己的 2/3·TTL 到期时
- * 刷新 observedAt（stale/其他非 ok 卷永不续期），旧版缺省卷沿用刷新后的
- * 父级元数据。父级 observedAt/ttlMs 只聚合 fresh 卷（最旧观察 +
- * 最早绝对过期）；没有 fresh 卷则不动（卷级状态已权威）。
+ * 磁盘事实续期：各卷按有效状态和期限独立判断，仅新鲜卷到 2/3·TTL 时
+ * 刷新 observedAt；续期时物化未刷新的卷，避免父级变化复活旧卷。
  */
 function renewDisks(f: DisksFact, now: number): DisksFact {
-  if (f.status !== 'ok' || !due(f.observedAt, f.ttlMs, now)) return f
-  const vols = f.value ?? []
-  const fresh = (v: DiskVolume) => (v.status ?? 'ok') === 'ok'
-  const newVols = vols.map((v) => {
-    if (!fresh(v)) return v
-    if (v.observedAt != null && v.ttlMs != null) {
-      return due(v.observedAt, v.ttlMs, now) ? { ...v, observedAt: now } : v
+  const volumes = effectiveDisks(f, now).value ?? []
+  if (!volumes.some((v) => v.status === 'ok' && due(v.observedAt, v.ttlMs, now))) return f
+  const value = volumes.map((v, i) => {
+    const original = f.value![i]!
+    if (v.status === 'ok' && due(v.observedAt, v.ttlMs, now)) {
+      return { ...v, observedAt: now, ttlMs: original.ttlMs ?? f.ttlMs }
     }
-    return v
+    return original.status === v.status && original.observedAt === v.observedAt && original.ttlMs === v.ttlMs
+      ? original : v
   })
-  const freshVols = newVols.filter(fresh)
-  if (!freshVols.length) return f
-  const obs = Math.min(...freshVols.map((v) => v.observedAt ?? now))
-  const exp = Math.min(
-    ...freshVols.map((v) => (v.observedAt ?? now) + (v.ttlMs ?? f.ttlMs)),
-  )
-  if (
-    obs === f.observedAt &&
-    exp - obs === f.ttlMs &&
-    newVols.every((v, i) => v === vols[i])
-  ) {
-    return f
-  }
-  return { ...f, value: newVols, observedAt: obs, ttlMs: exp - obs }
+  const { status, observedAt, ttlMs } = effectiveDisks({ ...f, value }, now)
+  return { ...f, value, status, observedAt, ttlMs }
 }
 
 /** 仅在值非 null 时追加历史点；始终裁剪到最近 5 分钟。 */

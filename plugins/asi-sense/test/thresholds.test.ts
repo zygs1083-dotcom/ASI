@@ -18,7 +18,7 @@ function mkBody(over: Partial<Body> = {}): Body {
   return {
     cpu: blank(),
     memory: blank(),
-    disks: blank(),
+    disks: { ...blank(), kind: 'disks' },
     battery: blank(),
     thermal: blank(),
     network: blank(),
@@ -32,7 +32,7 @@ function sample(body: Body, at: number, state?: BodyThresholdSample['state']): B
   return { body, at, source: SRC, ...(state ? { state } : {}) };
 }
 
-const disks = (free: number, total = 100) => mkBody({ disks: f([{ mount: '/', total, free }]) });
+const disks = (free: number, total = 100) => mkBody({ disks: { ...f([{ mount: '/', total, free }]), kind: 'disks' } });
 const tokens = (window: number, used?: number, projected?: number) =>
   mkBody({
     tokens: f({
@@ -103,20 +103,24 @@ describe('bodyThresholdSignals', () => {
 
   it('ignores invalid/stale facts and retains latch without fabricated recovery', () => {
     const prevState = { 'disk:/': 'warn' as const };
-    const bad = sample(mkBody({ disks: blank('stale') }), 10);
+    const bad = sample(mkBody({ disks: { ...blank('stale'), kind: 'disks' } }), 10);
     const r = bodyThresholdSignals(sample(disks(8), 0, prevState), bad);
     expect(r.signals).toHaveLength(0);
     expect(r.state['disk:/']).toBe('warn');
     const nan = bodyThresholdSignals(sample(disks(8), 0, prevState), sample(disks(Number.NaN), 20));
     expect(nan.signals).toHaveLength(0);
     expect(nan.state['disk:/']).toBe('warn');
-    const missing = bodyThresholdSignals(sample(disks(8), 0, prevState), sample(mkBody({ disks: f([]) }), 30));
+    const missing = bodyThresholdSignals(
+      sample(disks(8), 0, prevState),
+      sample(mkBody({ disks: { ...f([]), kind: 'disks' } }), 30),
+    );
     expect(missing.state['disk:/']).toBe('warn'); // absent mounts retain latch
   });
 
   it('evaluates each disk independently and retains stale or unreadable latches', () => {
     const partial = mkBody({
       disks: {
+        kind: 'disks',
         ...f([
           { mount: '/', total: 100, free: 2, status: 'stale' as const, observedAt: 0, ttlMs: 6000 },
           { mount: '/data', total: 100, free: 90, status: 'ok' as const, observedAt: 2000, ttlMs: 30000 },

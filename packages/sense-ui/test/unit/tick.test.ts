@@ -2,8 +2,54 @@ import { describe, expect, it } from 'vitest'
 import { tick } from '../../src/preview/tick'
 import { T0, emptyFact, fact, makeBody, makeState } from '../../src/mock/fixtures'
 import { makeScenario } from '../../src/mock/scenarios'
+import { effectiveDisks } from '@asi/sense-types'
+import { evaluateBody } from '../../src/health'
 
 describe('预览 tick（实时模式）', () => {
+  it('不复活父期限已到的旧卷，同时续期新鲜卷', () => {
+    const state = makeState()
+    state.self.body.disks = {
+      ...state.self.body.disks,
+      status: 'ok', observedAt: T0 - 5000, ttlMs: 6000,
+      value: [
+        { mount: '/', total: 100, free: 2 },
+        { mount: '/data', total: 100, free: 90, status: 'ok', observedAt: T0 - 19000, ttlMs: 30000 },
+      ],
+    }
+    const next = tick({ ...makeScenario('healthy'), state })
+    expect(effectiveDisks(next.state.self.body.disks, next.now).value?.map((v) => v.status))
+      .toEqual(['stale', 'ok'])
+    expect(evaluateBody(next.state.self.body, next.now).rows.disks)
+      .toMatchObject({ severity: 'good', partial: true })
+    expect(next.state.self.body.disks.value?.[1]?.observedAt).toBe(next.now)
+  })
+
+  it('父级 stale 时仍续期显式新鲜卷，且不可读卷不续期', () => {
+    const state = makeState()
+    state.self.body.disks = {
+      ...state.self.body.disks,
+      status: 'stale', observedAt: T0 - 30000, ttlMs: 6000, unavailableMounts: ['/net'],
+      value: [
+        { mount: '/', total: 100, free: 2 },
+        { mount: '/data', total: 100, free: 90, status: 'ok', observedAt: T0 - 19000, ttlMs: 30000 },
+        { mount: '/net', total: 100, free: 2, status: 'ok', observedAt: T0 - 19000, ttlMs: 30000 },
+      ],
+    }
+    const m = makeScenario('healthy')
+    const next = tick({ ...m, state, history: { ...m.history, disks: { '/data': [], '/net': [] } } })
+    expect(effectiveDisks(next.state.self.body.disks, next.now).value?.map((v) => v.status))
+      .toEqual(['stale', 'ok', 'unavailable'])
+    expect(next.state.self.body.disks.value?.[1]?.observedAt).toBe(next.now)
+    expect(next.state.self.body.disks.value?.[2]?.observedAt).toBe(T0 - 19000)
+    expect(next.history.disks['/data']).toHaveLength(1)
+    expect(next.history.disks['/net']).toHaveLength(0)
+    let later = next
+    for (let i = 0; i < 40; i++) later = tick(later)
+    expect(effectiveDisks(later.state.self.body.disks, later.now).value?.map((v) => v.status))
+      .toEqual(['stale', 'ok', 'unavailable'])
+    expect(later.history.disks['/data']!.length).toBeGreaterThan(1)
+    expect(later.history.disks['/net']).toHaveLength(0)
+  })
   it('cpu/network/tokens 每 tick 采样；其余 ok 事实未到期保持原引用', () => {
     const state = makeState()
     state.self.body.thermal = emptyFact('unavailable', 'helper 未上报')
@@ -47,6 +93,7 @@ describe('预览 tick（实时模式）', () => {
   it('磁盘续期只刷显式 ok 卷，stale 卷保留；父级元数据聚合 fresh 卷', () => {
     const state = makeState()
     state.self.body.disks = {
+      kind: 'disks',
       ...fact(
         [
           {
@@ -71,20 +118,18 @@ describe('预览 tick（实时模式）', () => {
       ),
     }
     let m = { ...makeScenario('healthy'), state }
-    // 父级 TTL 30s + 夹具默认 1s 年龄：age≥20s 到期，即第 19 tick 才动
-    for (let i = 0; i < 18; i++) m = tick(m)
-    expect(m.state.self.body.disks).toBe(state.self.body.disks)
+    // 根卷已达自己的 2/3·TTL，第一 tick 独立续期
     m = tick(m)
     const d = m.state.self.body.disks
     expect(d).not.toBe(state.self.body.disks)
     const vols = Object.fromEntries(d.value!.map((v) => [v.mount, v]))
-    // '/' 显式 ok 且 age=20s ≥ 2/3·30s → 刷到 now；stale 卷不动；legacy 不带时间戳
+    // '/' 显式 ok 且 age=20s ≥ 2/3·30s → 刷到 now；stale 卷不动；legacy 物化旧期限
     expect(vols['/']!.observedAt).toBe(m.now)
     expect(vols['/stale']).toBe(state.self.body.disks.value![1])
-    expect(vols['/legacy']!.observedAt).toBeUndefined()
+    expect(vols['/legacy']!.observedAt).toBe(T0 - 1000)
     // 父级聚合 fresh 卷（/ + legacy）：observedAt=最旧 fresh 观察，ttl=最早绝对过期-最旧观察
     expect(d.status).toBe('ok')
-    expect(d.observedAt).toBe(Math.min(vols['/']!.observedAt!, m.now))
+    expect(d.observedAt).toBe(T0 - 1000)
     expect(d.ttlMs).toBeGreaterThan(0)
   })
 

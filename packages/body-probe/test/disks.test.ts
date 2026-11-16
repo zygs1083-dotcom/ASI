@@ -244,6 +244,7 @@ describe('DiskSampler', () => {
     await s.sample('/data', 30000);
     await flush();
     const disk = await s.sample('/data', 30000);
+    expect(disk.kind).toBe('disks');
     expect(disk.value).toMatchObject([{ mount: '/', status: 'stale' }, { mount: '/data', status: 'ok' }]);
     const source: SourceRef = { id: 'test', api: 'fixture', host: 'fake' };
     const missing: Fact<never> = { value: null, status: 'unknown', source, observedAt: 0, ttlMs: 1 };
@@ -251,7 +252,7 @@ describe('DiskSampler', () => {
       cpu: missing, memory: missing, disks: disk, battery: missing, thermal: missing,
       network: missing, harnessProcess: missing, tokens: missing,
     };
-    const previous = { body: { ...body, disks: missing }, at: 0, source };
+    const previous = { body: { ...body, disks: { ...missing, kind: 'disks' as const } }, at: 0, source };
     const next = { body, at: t, source };
     expect(bodyThresholdSignals(previous, next).signals).toEqual([]);
     const held = bodyThresholdSignals({ ...previous, state: { 'disk:/': 'critical' } }, next);

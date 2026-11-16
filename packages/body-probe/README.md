@@ -116,10 +116,17 @@ status. `unavailableMounts` always wins over a same-named record in `value`.
 remaining monotonic deadlines; TTL expires at the deadline itself. After a
 wall-clock jump, its returned disk TTLs express those deadlines against the
 current wall clock while retaining the original observation timestamps.
-For a null or empty disk value without a disk marker, use
-`factStatusAt(fact, now, 'disks')` or `effectiveDisks(fact, now)` because the
-generic `Fact` shape cannot otherwise distinguish an empty disk list from
-another kind of fact.
+`DisksFact` carries `kind: 'disks'`; use `disksStatusAt(disks, now)` for
+its aggregate status or `effectiveDisks(disks, now)` for per-volume
+freshness. A `null` or empty value is `unknown` for `ok`, `stale`,
+`unavailable`, and `unknown`; `denied` and `unsupported` retain their
+status so consumers can guide authorization or explain missing support.
+
+```ts
+import { disksStatusAt, effectiveDisks } from '@asi/sense-types';
+const status = disksStatusAt(body.disks, now);
+const volumes = effectiveDisks(body.disks, now).value;
+```
 
 `collectDisks` remains the standalone sequential helper: it checks its
 `AbortSignal` before every `stat`/`statfs`.

@@ -71,7 +71,7 @@ export function initialState(at: number, ttlMs: number): SenseState {
       body: {
         cpu: f(),
         memory: f(),
-        disks: f(),
+        disks: { ...f(), kind: 'disks' },
         battery: f(),
         thermal: f(),
         network: f(),
