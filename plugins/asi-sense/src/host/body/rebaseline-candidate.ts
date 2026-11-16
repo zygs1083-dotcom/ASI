@@ -1,3 +1,4 @@
+import type { AnomalyRule } from './anomaly.ts';
 import type { Baseline } from './baseline.ts';
 import { parseBucket } from './baseline-parse.ts';
 import { advanceBucket, type Bucket } from './baseline-stat.ts';
@@ -22,6 +23,8 @@ export interface Candidate {
   slot: number;
   days: RecentDay[];
   lastMono?: number;
+  suggested?: boolean;
+  latest?: RecentSample;
 }
 
 const DAY = 86_400_000;
@@ -31,6 +34,48 @@ export const keyOf = (stream: string, metric: string, slot: number): string => J
 export const paramOf = (stream: string, metric: string, slot: number): string =>
   `baseline:${Buffer.from(stream).toString('base64url')}:${Buffer.from(metric).toString('base64url')}:${slot}`;
 export const encode = (bucket: Bucket): string => JSON.stringify({ ...bucket, dates: [...bucket.dates] });
+export const candidateId = (c: Candidate): string => `${paramOf(c.stream, c.metric, c.slot)}:${c.days[0].elapsed}`;
+export const sampleCount = (c: Candidate): number => c.days.reduce((sum, day) => sum + day.samples.length, 0);
+export const ready = (c: Candidate): boolean => c.days.length >= 3 && sampleCount(c) >= 8;
+export const expired = (c: Candidate, elapsed: number, wall: number): boolean =>
+  elapsed - c.days[0].elapsed > 21 * DAY || wall - c.days[0].samples[0].at > 21 * DAY || wall < c.days[0].samples[0].at;
+
+export interface MetricState {
+  latch: Record<string, 'normal' | 'warn'>;
+  streaks: Record<string, number>;
+}
+
+export function metricState(state: AdaptiveState, stream: string, rules: readonly AnomalyRule[]): MetricState {
+  const anomaly = state[BODY_HISTORY]?.[stream]?.anomaly;
+  const latch: MetricState['latch'] = {};
+  const streaks: MetricState['streaks'] = {};
+  for (const rule of rules) {
+    latch[`baseline:${rule.id}`] = anomaly?.latch[`baseline:${rule.id}`] ?? 'normal';
+    streaks[rule.id] = anomaly?.streaks[rule.id] ?? 0;
+  }
+  return { latch, streaks };
+}
+
+export function withMetricState(state: AdaptiveState, stream: string, metric: MetricState): AdaptiveState {
+  const history = state[BODY_HISTORY] ?? {};
+  const entry = history[stream];
+  if (!entry?.anomaly) throw new TypeError('rebaseline: missing history');
+  return {
+    ...state,
+    ...metric.latch,
+    [BODY_HISTORY]: {
+      ...history,
+      [stream]: {
+        ...entry,
+        anomaly: {
+          ...entry.anomaly,
+          latch: { ...entry.anomaly.latch, ...metric.latch },
+          streaks: { ...entry.anomaly.streaks, ...metric.streaks },
+        },
+      },
+    },
+  };
+}
 
 export function withBaseline(state: AdaptiveState, stream: string, baseline: Baseline): AdaptiveState {
   const history = state[BODY_HISTORY] ?? {};
@@ -40,20 +85,6 @@ export function withBaseline(state: AdaptiveState, stream: string, baseline: Bas
     ...state,
     [BODY_HISTORY]: { ...history, [stream]: { ...entry, anomaly: { ...entry.anomaly, baseline } } },
   };
-}
-
-export function clearMetric(
-  candidates: Map<string, Candidate>,
-  retry: Map<string, number>,
-  stream: string,
-  metric: string,
-): void {
-  for (const [key, candidate] of candidates) {
-    if (candidate.stream === stream && candidate.metric === metric) {
-      candidates.delete(key);
-      retry.delete(key);
-    }
-  }
 }
 
 export function decode(backup: string, slot: number): Bucket {
@@ -70,6 +101,8 @@ export function record(
   sample: RecentSample,
 ): boolean {
   if (candidate.lastMono !== undefined && mono <= candidate.lastMono) return false;
+  const latest = candidate.days.at(-1)?.samples.at(-1);
+  if (latest && sample.at <= latest.at) return false;
   candidate.lastMono = mono;
   let day = candidate.days.at(-1);
   if (day?.date !== date) {
@@ -118,7 +151,8 @@ export function validate(raw: unknown): Candidate | undefined {
     (c.slot as number) >= 168 ||
     !Array.isArray(c.days) ||
     c.days.length < 1 ||
-    c.days.length > 3
+    c.days.length > 3 ||
+    (c.suggested !== undefined && typeof c.suggested !== 'boolean')
   )
     return undefined;
   const days: RecentDay[] = [];
@@ -154,5 +188,36 @@ export function validate(raw: unknown): Candidate | undefined {
   } catch {
     return undefined;
   }
-  return { stream: c.stream, metric: c.metric, slot: c.slot as number, days };
+  let latest: RecentSample | undefined;
+  if (c.latest !== undefined) {
+    const sample = c.latest as RecentSample;
+    if (
+      !sample ||
+      !finite(sample.at) ||
+      Math.abs(sample.at) > 8.64e15 ||
+      !finite(sample.value) ||
+      typeof sample.zone !== 'string'
+    )
+      return undefined;
+    try {
+      formatter(sample.zone);
+    } catch {
+      return undefined;
+    }
+    latest = { ...sample };
+  }
+  const candidate = {
+    stream: c.stream,
+    metric: c.metric,
+    slot: c.slot as number,
+    days,
+    suggested: c.suggested as boolean | undefined,
+    latest,
+  };
+  if (
+    candidate.suggested &&
+    (!ready(candidate) || expired(candidate, days.at(-1)?.elapsed ?? 0, days.at(-1)?.samples.at(-1)?.at ?? 0))
+  )
+    return undefined;
+  return candidate;
 }

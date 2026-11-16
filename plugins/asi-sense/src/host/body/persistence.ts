@@ -1,8 +1,10 @@
 /**
  * Host-provided atomic local persistence (DESIGN §2.2c). `load` returns the
  * previously saved snapshot text or `undefined` on a first install; `save`
- * is expected to be an atomic write (temp + rename) — a torn write must
- * never produce a half snapshot. Nothing here does IO itself.
+ * resolves only after the new snapshot is installed and must reject only when
+ * it was not installed. Write a temp file
+ * and make atomic rename the final rejecting step; post-rename errors must
+ * be recorded by the host without rejecting. Nothing here does IO itself.
  */
 export interface BodyPersistence {
   load(): Promise<string | undefined>;
@@ -30,7 +32,7 @@ export class PersistScheduler {
     private readonly save: () => Promise<void>,
     private readonly clock: () => number = () => performance.now(),
     private readonly intervalMs = 10_000,
-    private readonly onError?: (err: unknown) => void,
+    private readonly onError?: (err: unknown) => void | Promise<void>,
   ) {}
 
   /** Marks state dirty; the write happens within `intervalMs`, coalesced. */
@@ -57,9 +59,14 @@ export class PersistScheduler {
   private enqueue(save = this.save): Promise<void> {
     const p = this.tail.then(async () => {
       this.lastRun = this.clock();
-      await save();
+      try {
+        await save();
+      } catch (err) {
+        await this.onError?.(err);
+        throw err;
+      }
     });
-    this.tail = p.catch((err) => this.onError?.(err));
+    this.tail = p.catch(() => {});
     return p;
   }
 

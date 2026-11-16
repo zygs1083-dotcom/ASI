@@ -17,6 +17,13 @@ interface RestoredWindows {
   dayAll: number[];
 }
 
+function retainApplied(entries: TuningLog[], lastApplied: Map<string, string>, wall: number): TuningLog[] {
+  return entries.filter(
+    (entry, index) =>
+      lastApplied.get(entry.param) === entry.id || index >= entries.length - 200 || entry.at >= wall - 30 * DAY_MS,
+  );
+}
+
 /**
  * All mutable {@link Tuner} state plus the throttle-window bookkeeping
  * (DESIGN §2.2c). Live stamps are strictly monotonic. Restored windows are
@@ -49,6 +56,23 @@ export class TunerStore {
     return Object.assign(new TunerStore(), structuredClone({ ...this }));
   }
 
+  resume(): void {
+    this.disabled = undefined;
+  }
+
+  pruneApplied(wall: number): void {
+    const time = Math.max(this.wallHighwater, wall);
+    this.applied = retainApplied(this.applied, this.lastApplied, time);
+    const ids = new Set(
+      retainApplied(
+        this.log.filter((entry) => entry.status === 'applied'),
+        this.lastApplied,
+        time,
+      ).map((entry) => entry.id),
+    );
+    this.log = this.log.filter((entry) => entry.status === 'rejected' || ids.has(entry.id));
+  }
+
   /** Fresh ID lineage after a failed restore — old IDs can never collide. */
   resetIds(): void {
     this.idPrefix = randomUUID();
@@ -57,7 +81,12 @@ export class TunerStore {
 
   appendLog(entry: TuningLog): void {
     this.log.push(entry);
-    if (this.log.length > LOG_CAP) this.log.splice(0, this.log.length - LOG_CAP);
+    if (entry.status === 'rejected' && this.log.filter((item) => item.status === 'rejected').length > LOG_CAP) {
+      this.log.splice(
+        this.log.findIndex((item) => item.status === 'rejected'),
+        1,
+      );
+    }
   }
 
   /** Consumes one AI budget stamp in all three windows. */
@@ -158,15 +187,13 @@ export class TunerStore {
   }
 }
 
-/** Full v2 snapshot text; a disabled tuner persists only its marker. */
+/** Full v2 snapshot text, including confirmed state when tuning is disabled. */
 export function serializeTuner(s: TunerStore, now: number, wall: number): string {
-  if (s.disabled) {
-    return JSON.stringify({ version: 2, disabled: 'restore-failed', idPrefix: s.idPrefix });
-  }
   const w = s.serializeWindows(now);
   const hw = finiteNum(wall) ? Math.max(s.wallHighwater, wall) : s.wallHighwater;
   return JSON.stringify({
     version: 2,
+    disabled: s.disabled,
     idPrefix: s.idPrefix,
     nextId: s.nextId,
     wallHighwater: hw,
@@ -177,8 +204,12 @@ export function serializeTuner(s: TunerStore, now: number, wall: number): string
     hour: w.hour,
     day: w.day,
     dayAll: w.dayAll,
-    log: s.log,
-    applied: s.applied,
+    log: retainApplied(
+      s.log.filter((entry) => entry.status === 'applied'),
+      s.lastApplied,
+      hw,
+    ),
+    applied: retainApplied(s.applied, s.lastApplied, hw),
   });
 }
 

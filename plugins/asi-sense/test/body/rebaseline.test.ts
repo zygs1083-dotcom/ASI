@@ -77,6 +77,9 @@ async function fixture(
     asUser: () => {
       actor = 'user';
     },
+    asAgent: () => {
+      actor = 'agent';
+    },
   };
 }
 
@@ -120,8 +123,8 @@ async function reload(
   };
 }
 
-describe('automatic rebaselining', () => {
-  it('relearns the third alerting date during an eight-week hourly sustained CPU workload', async () => {
+describe('user-confirmed rebaselining', () => {
+  it('never automatically relearns during an eight-week hourly sustained CPU workload', async () => {
     const hour = 3_600_000;
     let mono = 0;
     let wall = MON10;
@@ -161,22 +164,21 @@ describe('automatic rebaselining', () => {
       state = result.state;
       prev = next;
       if (sample === 168 + 2) expect(monitor.baseline.read('cpu', MON10 + 2 * hour)?.mean).toBeCloseTo(0.5);
-      if (sample === 2 * 168 + 2) expect(monitor.baseline.read('cpu', MON10 + 2 * hour)?.mean).toBeCloseTo(0.99);
+      if (sample === 2 * 168 + 2) expect(monitor.baseline.read('cpu', MON10 + 2 * hour)?.mean).toBeCloseTo(0.5);
     }
-    expect(tuner.undoableChanges.filter((entry) => entry.kind === 'rebaseline').length).toBeGreaterThan(100);
+    expect(tuner.undoableChanges.filter((entry) => entry.kind === 'rebaseline')).toHaveLength(0);
     await monitor.close();
   }, 30_000);
 
-  it('relearns a sustained new workload on the third date and supports undo', async () => {
-    const { monitor, tuner, feed, asUser } = await fixture();
-    for (let week = 0; week < 8; week++) {
+  it('suggests a sustained new workload on the third date and supports user undo', async () => {
+    const { monitor, tuner, feed, asUser, asAgent } = await fixture();
+    for (let week = 0; week < 3; week++) {
       for (let i = 0; i < 8; i++) await feed(MON10 + week * WEEK + i * 60_000, week * WEEK + i * 60_000, 0.99);
-      if (week === 1) expect(monitor.baseline.read('cpu', MON10)?.mean).toBe(0.5);
-      if (week === 2) expect(monitor.baseline.read('cpu', MON10)?.mean).toBeCloseTo(0.99);
+      expect(monitor.baseline.read('cpu', MON10)?.mean).toBe(0.5);
     }
-    const change = tuner.undoableChanges.find((entry) => entry.by === 'auto');
-    expect(change).toBeDefined();
-    if (!change) throw new Error('automatic rebaseline missing');
+    asUser();
+    const change = (await monitor.acceptRebaseline(monitor.rebaselineSuggestions[0].id)).change;
+    asAgent();
     expect((await tuner.revert(change.id)).reason).toContain('trusted user');
     expect(monitor.baseline.read('cpu', MON10)?.mean).toBeCloseTo(0.99);
     asUser();
@@ -224,7 +226,7 @@ describe('automatic rebaselining', () => {
     await current.monitor.close();
   });
 
-  it('relearns when any configured rule for a metric is alerting', async () => {
+  it('suggests when any configured rule for a metric is alerting', async () => {
     const current = await fixture({}, [
       { id: 'permissive', metric: 'cpu', sigma: 100 },
       { id: 'sensitive', metric: 'cpu', sigma: 3 },
@@ -234,7 +236,8 @@ describe('automatic rebaselining', () => {
         await current.feed(MON10 + week * WEEK + i * 60_000, week * WEEK + i * 60_000, 0.99);
       }
     }
-    expect(current.monitor.baseline.read('cpu', MON10)?.mean).toBeCloseTo(0.99);
+    expect(current.monitor.baseline.read('cpu', MON10)?.mean).toBeCloseTo(0.5);
+    expect(current.monitor.rebaselineSuggestions).toHaveLength(1);
     await current.monitor.close();
   });
 
@@ -246,6 +249,9 @@ describe('automatic rebaselining', () => {
         state = (await current.feed(MON10 + week * WEEK + i * 60_000, week * WEEK + i * 60_000, 0.99)).state;
       }
     }
+    current.asUser();
+    await current.monitor.acceptRebaseline(current.monitor.rebaselineSuggestions[0].id);
+    state = current.monitor.restoredState ?? {};
     expect(current.monitor.baseline.read('cpu', MON10)?.mean).toBeCloseTo(0.99);
     const wall = MON10 + 2 * WEEK + 8 * 60_000;
     const mono = 2 * WEEK + 8 * 60_000;
@@ -273,8 +279,10 @@ describe('automatic rebaselining', () => {
     const second = await reload(first.persistence);
     expect(second.monitor.tuningDisabled).toBeUndefined();
     for (let i = 0; i < 8; i++) await second.feed(MON10 + 2 * WEEK + i * 60_000, WEEK + i * 60_000, 0.99);
+    second.asUser();
+    await second.monitor.acceptRebaseline(second.monitor.rebaselineSuggestions[0].id);
     expect(second.monitor.baseline.read('cpu', MON10)?.mean).toBeCloseTo(0.99);
-    const change = second.tuner.undoableChanges.find((entry) => entry.by === 'auto');
+    const change = second.tuner.undoableChanges.find((entry) => entry.kind === 'rebaseline');
     if (!change) throw new Error('missing rebaseline');
     await second.monitor.persist();
     const third = await reload(first.persistence);
@@ -301,7 +309,9 @@ describe('automatic rebaselining', () => {
         await current.feed(MON10 + week * WEEK + i * 60_000, week * WEEK + i * 60_000, 0.99);
       }
     }
-    const change = current.tuner.undoableChanges.find((entry) => entry.by === 'auto');
+    current.asUser();
+    await current.monitor.acceptRebaseline(current.monitor.rebaselineSuggestions[0].id);
+    const change = current.tuner.undoableChanges.find((entry) => entry.kind === 'rebaseline');
     if (!change) throw new Error('missing rebaseline');
     for (let i = 0; i < 501; i++) {
       expect((await current.tuner.propose({ param: 'unknown', to: i })).applied).toBe(false);
@@ -355,7 +365,9 @@ describe('automatic rebaselining', () => {
         await current.feed(MON10 + week * WEEK + i * 60_000, week * WEEK + i * 60_000, 0.99);
       }
     }
-    const change = current.tuner.undoableChanges.find((entry) => entry.by === 'auto');
+    current.asUser();
+    await current.monitor.acceptRebaseline(current.monitor.rebaselineSuggestions[0].id);
+    const change = current.tuner.undoableChanges.find((entry) => entry.kind === 'rebaseline');
     if (!change) throw new Error('missing rebaseline');
     await current.monitor.persist();
     const restored = await reload(current.persistence, []);
@@ -374,6 +386,8 @@ describe('automatic rebaselining', () => {
         await current.feed(MON10 + week * WEEK + i * 60_000, week * WEEK + i * 60_000, 0.99);
       }
     }
+    current.asUser();
+    await current.monitor.acceptRebaseline(current.monitor.rebaselineSuggestions[0].id);
     await current.monitor.persist();
     const snapshot = JSON.parse(current.snapshot() ?? '{}') as { rebaseline?: { undos: unknown[] } };
     if (mode === 'missing') delete snapshot.rebaseline;
@@ -395,11 +409,14 @@ describe('automatic rebaselining', () => {
     for (let week = 0; week < 2; week++) {
       for (let i = 0; i < 8; i++) await first.feed(MON10 + week * WEEK + i * 60_000, week * WEEK + i * 60_000, 0.99);
     }
+    await first.feed(MON10 + 2 * WEEK, 2 * WEEK, 0.99);
     await first.monitor.persist();
     const committed = first.snapshot();
+    first.asUser();
     first.fail();
-    const failed = await first.feed(MON10 + 2 * WEEK, 2 * WEEK, 0.99);
-    expect(failed.tuningError).toBeInstanceOf(Error);
+    await expect(first.monitor.acceptRebaseline(first.monitor.rebaselineSuggestions[0].id)).rejects.toThrow(
+      'storage failure',
+    );
     expect(first.monitor.baseline.read('cpu', MON10)?.mean).toBeCloseTo(0.5);
     expect(first.tuner.undoableChanges.some((entry) => entry.by === 'auto')).toBe(false);
     expect(first.tuner.tuningDisabled).toBe('storage-failed');
@@ -425,7 +442,6 @@ describe('automatic rebaselining', () => {
       }
     }
     await current.monitor.persist();
-    current.fail();
     const wall = MON10 + 2 * WEEK;
     const mono = 2 * WEEK;
     current.setTime(wall, mono);
@@ -437,12 +453,17 @@ describe('automatic rebaselining', () => {
     const prev = freshSample(body(0, 1000), wall - 1000, undefined, mono - 1000);
     const next = freshSample(body(1024 ** 3, 20), wall, undefined, mono);
     const result = await current.monitor.evaluateAuto(prev, next, state);
-    expect(result.tuningError).toBeInstanceOf(Error);
+    expect(result.tuningError).toBeUndefined();
     expect(result.signals.some((signal) => signal.kind === 'body.rate' && signal.data.severity === 'warn')).toBe(true);
     expect(result.signals.some((signal) => signal.subject === 'disk:/' && signal.data.severity === 'critical')).toBe(
       true,
     );
     expect(current.monitor.baseline.read('cpu', MON10)?.mean).toBeCloseTo(0.5);
+    current.asUser();
+    current.fail();
+    await expect(current.monitor.acceptRebaseline(current.monitor.rebaselineSuggestions[0].id)).rejects.toThrow(
+      'storage failure',
+    );
     await expect(current.monitor.close()).rejects.toThrow('storage failure');
   });
 
@@ -462,7 +483,7 @@ describe('automatic rebaselining', () => {
     const stale = current.monitor.evaluateAuto(next, later, state);
     await first;
     await expect(stale).rejects.toThrow('stale adaptive state');
-    expect(current.monitor.baseline.read('cpu', MON10)?.mean).toBeCloseTo(0.99);
+    expect(current.monitor.baseline.read('cpu', MON10)?.mean).toBeCloseTo(0.5);
     await current.monitor.close();
   });
 
@@ -491,7 +512,7 @@ describe('automatic rebaselining', () => {
 
   it('blocks synchronous sampling while a rebaseline snapshot is being committed', async () => {
     const current = await fixture();
-    for (let week = 0; week < 2; week++) {
+    for (let week = 0; week < 3; week++) {
       for (let i = 0; i < 8; i++) {
         await current.feed(MON10 + week * WEEK + i * 60_000, week * WEEK + i * 60_000, 0.99);
       }
@@ -508,7 +529,7 @@ describe('automatic rebaselining', () => {
       if (
         !release &&
         tuner.log.some(
-          (entry) => entry.by === 'auto' && entry.status === 'applied' && entry.param.startsWith('baseline:'),
+          (entry) => entry.by === 'user' && entry.status === 'applied' && entry.param.startsWith('baseline:'),
         )
       ) {
         started?.();
@@ -517,7 +538,8 @@ describe('automatic rebaselining', () => {
         });
       }
     });
-    const committing = current.feed(MON10 + 2 * WEEK, 2 * WEEK, 0.99);
+    current.asUser();
+    const committing = current.monitor.acceptRebaseline(current.monitor.rebaselineSuggestions[0].id);
     await began;
     if (!release) throw new Error('commit did not start');
     try {
@@ -533,7 +555,7 @@ describe('automatic rebaselining', () => {
     await current.monitor.close();
   });
 
-  it('uses the global tuning budget and retries on a later alerting date after the budget expires', async () => {
+  it('allows user acceptance even when the global AI budget is exhausted', async () => {
     const specs = Object.fromEntries(Array.from({ length: 24 }, (_, i) => [`p${i}`, { value: 10 }]));
     const current = await fixture(specs);
     for (let week = 0; week < 2; week++) {
@@ -545,10 +567,8 @@ describe('automatic rebaselining', () => {
     for (let i = 0; i < 24; i++) expect((await current.tuner.propose({ param: `p${i}`, to: 11 })).applied).toBe(true);
     await current.feed(MON10 + 2 * WEEK, 2 * WEEK, 0.99);
     expect(current.monitor.baseline.read('cpu', MON10)?.mean).toBeCloseTo(0.5);
-    expect(
-      current.tuner.logs.some((entry) => entry.by === 'auto' && entry.rejectionReason === 'global daily change limit'),
-    ).toBe(true);
-    await current.feed(MON10 + 3 * WEEK, 3 * WEEK, 0.99);
+    current.asUser();
+    expect((await current.monitor.acceptRebaseline(current.monitor.rebaselineSuggestions[0].id)).applied).toBe(true);
     expect(current.monitor.baseline.read('cpu', MON10)?.mean).toBeCloseTo(0.99);
     await current.monitor.close();
   });

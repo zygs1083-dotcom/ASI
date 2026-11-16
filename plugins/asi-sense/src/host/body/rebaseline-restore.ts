@@ -1,5 +1,5 @@
 import type { AnomalyRule } from './anomaly.ts';
-import { type Candidate, decode, keyOf, paramOf, validate } from './rebaseline-candidate.ts';
+import { type Candidate, decode, keyOf, type MetricState, paramOf, validate } from './rebaseline-candidate.ts';
 import { type AdaptiveState, BODY_HISTORY } from './state.ts';
 import type { Tuner } from './tuner.ts';
 
@@ -10,6 +10,7 @@ export interface Undo {
   metric: string;
   slot: number;
   backup: string;
+  previous?: MetricState;
 }
 
 export function restoreProgress(
@@ -61,6 +62,26 @@ export function restoreProgress(
       )
         return undefined;
       decode(u.backup, u.slot as number);
+      if (u.previous !== undefined) {
+        const p = u.previous as MetricState;
+        if (
+          !p ||
+          typeof p !== 'object' ||
+          !p.latch ||
+          !p.streaks ||
+          typeof p.latch !== 'object' ||
+          typeof p.streaks !== 'object' ||
+          Array.isArray(p.latch) ||
+          Array.isArray(p.streaks) ||
+          Object.values(p.latch).some((v) => v !== 'normal' && v !== 'warn') ||
+          Object.values(p.streaks).some((v) => !Number.isSafeInteger(v) || v < 0) ||
+          Object.keys(p.latch).some((key) => !key.startsWith('baseline:') || !Object.hasOwn(p.streaks, key.slice(9))) ||
+          Object.keys(p.streaks).some((key) => !Object.hasOwn(p.latch, `baseline:${key}`))
+        )
+          return undefined;
+      } else {
+        return undefined;
+      }
       undos.push(u as unknown as Undo);
     }
   } catch {

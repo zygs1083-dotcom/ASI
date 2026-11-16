@@ -31,8 +31,8 @@ export interface ValidatedState {
   idPrefix: string;
   nextId: number;
   wallHighwater: number;
-  /** Persisted kill switch: a restore-failed marker can never unlock AI tuning. */
-  disabled?: true;
+  /** Persisted kill switch; only storage failures permit user recovery. */
+  disabled?: 'restore-failed' | 'storage-failed';
 }
 
 const pairs = (v: unknown): [unknown, unknown][] | undefined =>
@@ -68,7 +68,7 @@ export function validateSnapshot(json: string, parameters: Record<string, Parame
   try {
     const d = JSON.parse(json) as Record<string, unknown>;
     if (d === null || typeof d !== 'object' || Array.isArray(d) || d.version !== 2) return undefined;
-    if (d.disabled === 'restore-failed') {
+    if (d.disabled === 'restore-failed' && d.values === undefined) {
       return {
         values: [],
         locked: [],
@@ -82,9 +82,11 @@ export function validateSnapshot(json: string, parameters: Record<string, Parame
         idPrefix: '',
         nextId: 1,
         wallHighwater: 0,
-        disabled: true,
+        disabled: 'restore-failed',
       };
     }
+    if (d.disabled !== undefined && d.disabled !== 'restore-failed' && d.disabled !== 'storage-failed')
+      return undefined;
     const specs = new Map(Object.entries(parameters).map(([k, s]) => [k, validateSpec(k, s)]));
     if (
       typeof d.idPrefix !== 'string' ||
@@ -111,6 +113,7 @@ export function validateSnapshot(json: string, parameters: Record<string, Parame
       idPrefix: prefix,
       nextId: d.nextId as number,
       wallHighwater: d.wallHighwater as number,
+      disabled: d.disabled as ValidatedState['disabled'],
     };
 
     const values = pairs(d.values);
@@ -179,12 +182,14 @@ export function validateSnapshot(json: string, parameters: Record<string, Parame
 
     const ids = new Set<number>();
     const readLog = (v: unknown, appliedOnly: boolean): TuningLog[] | undefined => {
-      // The display log is capped; applied records are retained in full —
+      // The display is capped; durable history retains its time/count window —
       // a flood of rejects must never evict a revertable change.
-      if (!Array.isArray(v) || (!appliedOnly && v.length > LOG_CAP)) return undefined;
+      if (!Array.isArray(v)) return undefined;
       const out: TuningLog[] = [];
+      let rejected = 0;
       for (const e of v) {
         if (!isLogEntry(e)) return undefined;
+        if (e.status === 'rejected' && ++rejected > LOG_CAP) return undefined;
         const n = seqOf(e.id, prefix);
         if (!Number.isSafeInteger(n) || ids.has(n) || n >= st.nextId) return undefined;
         if (appliedOnly && (e.status !== 'applied' || (e.operation !== 'propose' && e.operation !== 'revert'))) {

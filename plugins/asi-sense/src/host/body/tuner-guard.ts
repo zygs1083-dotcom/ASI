@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import type { TuningChange, TuningValue } from '@asi/sense-types';
 import {
   DAILY_CAP,
@@ -56,7 +57,7 @@ export class TunerGuard {
   /** Appends an audit entry (nonfinite scalars JSON-safed) and returns it. */
   audit(fields: Omit<TuningLog, 'id'>): TuningResult {
     const entry = {
-      id: `${this.store.idPrefix}-${this.store.nextId++}`,
+      id: fields.status === 'rejected' ? `volatile-${randomUUID()}` : `${this.store.idPrefix}-${this.store.nextId++}`,
       ...fields,
       from: safeAuditValue(fields.from),
       to: safeAuditValue(fields.to),
@@ -184,24 +185,17 @@ export class TunerGuard {
   rebaseline(param: string, from: number, to: number, undoId?: string): TuningResult {
     const now = this.deps.mono();
     const wall = this.deps.wall();
-    const actor = undoId ? this.actor() : 'auto';
+    const actor = this.actor();
     const prior = undoId ? this.store.applied.find((entry) => entry.id === undoId) : undefined;
     let why: string | undefined;
     if (!Number.isFinite(now) || !Number.isFinite(wall) || !Number.isFinite(from) || !Number.isFinite(to)) {
       why = 'nonfinite';
-    } else if (undoId && actor !== 'user') {
-      why = 'rebaseline revert requires trusted user';
+    } else if (actor !== 'user') {
+      why = 'rebaseline requires trusted user';
     } else if (undoId && (!prior || prior.param !== param || this.store.lastApplied.get(param) !== undoId)) {
       why = 'stale rebaseline';
     } else if (!undoId) {
       if (this.store.specs.has(param)) why = 'rebaseline parameter conflicts with whitelist';
-      else if (this.store.syncWindows(now, wall)) why = 'frozen: wall clock behind saved highwater';
-      else {
-        const [hour, day, all] = this.store.counts(param, now);
-        if (hour >= HOURLY_CAP) why = 'hourly change limit';
-        else if (day >= DAILY_CAP) why = 'daily change limit';
-        else if (all >= GLOBAL_DAILY_CAP) why = 'global daily change limit';
-      }
     }
     if (wall > this.store.wallHighwater) this.store.wallHighwater = wall;
     const result = this.audit({
@@ -209,7 +203,7 @@ export class TunerGuard {
       from,
       to,
       by: actor ?? 'agent',
-      reason: undoId ? `revert ${undoId}` : 'auto: sustained new workload',
+      reason: undoId ? `revert ${undoId}` : 'user: accept rebaseline suggestion',
       at: this.auditAt(),
       operation: undoId ? 'revert' : 'propose',
       status: why ? 'rejected' : 'applied',
@@ -217,7 +211,6 @@ export class TunerGuard {
       ...(why ? { rejectionReason: why } : {}),
     });
     if (!why) {
-      if (!undoId) this.store.recordChange(param, now);
       this.store.applied.push({ ...result.change });
       this.store.lastApplied.set(param, result.change.id);
     }

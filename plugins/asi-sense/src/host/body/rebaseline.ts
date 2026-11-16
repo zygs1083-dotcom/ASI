@@ -1,19 +1,20 @@
 import type { BodyEvaluation, BodyThresholdSample, BodyThresholdState } from '@asi/sense-types';
 import type { AnomalyRule } from './anomaly.ts';
-import { BASELINE_MIN_COUNT, BASELINE_MIN_DATES, type Baseline } from './baseline.ts';
 import { formatter, slotOf } from './baseline-time.ts';
-import { readMetrics } from './metrics.ts';
 import {
   build,
   type Candidate,
-  clearMetric,
+  candidateId,
   decode,
   encode,
   keyOf,
+  metricState,
   paramOf,
-  record,
+  sampleCount,
   withBaseline,
+  withMetricState,
 } from './rebaseline-candidate.ts';
+import { detectCandidates } from './rebaseline-detect.ts';
 import { restoreProgress, type Undo } from './rebaseline-restore.ts';
 import { type AdaptiveState, BODY_HISTORY } from './state.ts';
 import type { Tuner, TuningResult } from './tuner.ts';
@@ -29,9 +30,20 @@ export interface AutomaticBodyEvaluation extends BodyEvaluation {
 
 interface Context {
   state: AdaptiveState;
-  revised: Baseline;
   key: string;
   undo: Omit<Undo, 'id'>;
+  resultState: AdaptiveState;
+}
+
+export interface RebaselineSuggestion {
+  id: string;
+  stream: string;
+  metric: string;
+  slot: number;
+  from: number;
+  to: number;
+  samples: number;
+  dates: number;
 }
 
 export interface RebaselineStage {
@@ -43,7 +55,6 @@ export class RebaselineManager {
   private candidates = new Map<string, Candidate>();
   private undos: Undo[] = [];
   private pending?: Context;
-  private retry = new Map<string, number>();
   private watermarks = new Map<string, number>();
   private active = false;
   private tail: Promise<void> = Promise.resolve();
@@ -63,7 +74,6 @@ export class RebaselineManager {
   onSynchronousSample(): void {
     if (this.active) return;
     this.candidates.clear();
-    this.retry.clear();
     this.watermarks.clear();
   }
 
@@ -100,12 +110,13 @@ export class RebaselineManager {
         this.active = false;
       }
       this.watermarks.set(next.source.id, next.monotonicAt);
-      try {
-        return { ...result, state: await this.evaluate(next, result.state as AdaptiveState) };
-      } catch (tuningError) {
-        if (this.tuner.tuningDisabled !== 'storage-failed') throw tuningError;
-        return { ...result, state: this.current() ?? result.state, tuningError };
-      }
+      return {
+        ...result,
+        signals: [
+          ...result.signals,
+          ...detectCandidates(next, result.state as AdaptiveState, this.rules, this.candidates),
+        ],
+      };
     });
   }
 
@@ -130,60 +141,54 @@ export class RebaselineManager {
     return true;
   }
 
-  async evaluate(next: BodyThresholdSample, initial: AdaptiveState): Promise<AdaptiveState> {
-    let state = initial;
-    const metrics = readMetrics(next);
-    const seen = new Set<string>();
-    for (const rule of this.rules) {
-      if (seen.has(rule.metric)) continue;
-      seen.add(rule.metric);
-      const history = state[BODY_HISTORY]?.[next.source.id]?.anomaly;
-      const baseline = history?.baseline;
-      const value = metrics.get(rule.metric)?.value;
-      const stat = value === undefined ? undefined : baseline?.read(rule.metric, next.at);
-      if (
-        !baseline ||
-        value === undefined ||
-        !stat ||
-        history.lastAt !== next.monotonicAt ||
-        stat.count < BASELINE_MIN_COUNT ||
-        stat.dates < BASELINE_MIN_DATES
-      )
-        continue;
-      const zone = baseline.timeZone;
-      const local = slotOf(formatter(zone), next.at);
-      const key = keyOf(next.source.id, rule.metric, local.index);
-      const deviation = Math.abs(value - stat.mean) / stat.scale;
-      const breaches = this.rules.filter((candidate) => {
-        if (candidate.metric !== rule.metric) return false;
-        const fallback = candidate.sigma ?? 3;
-        const resolved = candidate.param ? this.tuner.number(candidate.param, fallback) : fallback;
-        const sigma = Number.isFinite(resolved) && resolved > 0 ? resolved : fallback;
-        return deviation > sigma * (2 - stat.confidence);
-      });
-      if (!breaches.some((candidate) => history.latch[`baseline:${candidate.id}`] === 'warn')) {
-        if (breaches.length === 0) clearMetric(this.candidates, this.retry, next.source.id, rule.metric);
-        continue;
-      }
-      let candidate = this.candidates.get(key);
-      if (!candidate) {
-        if (this.candidates.size >= 1024) {
-          const first = this.candidates.keys().next().value;
-          if (first !== undefined) {
-            this.candidates.delete(first);
-            this.retry.delete(first);
-          }
-        }
-        candidate = { stream: next.source.id, metric: rule.metric, slot: local.index, days: [] };
-        this.candidates.set(key, candidate);
-      }
-      if (!record(candidate, local.date, baseline.elapsed, next.monotonicAt, { at: next.at, value, zone })) continue;
-      if (candidate.days.length < 3 || next.monotonicAt < (this.retry.get(key) ?? Number.NEGATIVE_INFINITY)) continue;
-      const old = baseline.bucket(rule.metric, local.index);
-      if (!old) continue;
+  get suggestions(): RebaselineSuggestion[] {
+    const state = this.current();
+    return [...this.candidates.values()].flatMap((candidate) => {
+      const baseline = state?.[BODY_HISTORY]?.[candidate.stream]?.anomaly?.baseline;
+      const old = baseline?.bucket(candidate.metric, candidate.slot);
+      if (!candidate.suggested || !baseline || !old) return [];
+      return [
+        {
+          id: candidateId(candidate),
+          stream: candidate.stream,
+          metric: candidate.metric,
+          slot: candidate.slot,
+          from: old.mean,
+          to: build(candidate, baseline.scaleMinimum(candidate.metric)).mean,
+          samples: sampleCount(candidate),
+          dates: candidate.days.length,
+        },
+      ];
+    });
+  }
+
+  accept(id: string): Promise<TuningResult> {
+    return this.enqueue(async () => {
+      const candidate = [...this.candidates.values()].find((entry) => entry.suggested && candidateId(entry) === id);
+      const state = this.current();
+      const baseline = candidate && state?.[BODY_HISTORY]?.[candidate.stream]?.anomaly?.baseline;
+      const old = candidate && baseline?.bucket(candidate.metric, candidate.slot);
+      if (!candidate || !state || !baseline || !old) throw new Error('rebaseline: unknown or expired suggestion');
       const revised = baseline.clone();
-      const replacement = build(candidate, baseline.scaleMinimum(rule.metric));
-      revised.replace(rule.metric, local.index, replacement);
+      const replacement = build(candidate, baseline.scaleMinimum(candidate.metric));
+      revised.replace(candidate.metric, candidate.slot, replacement);
+      const rules = this.rules.filter((r) => r.metric === candidate.metric);
+      const previous = metricState(state, candidate.stream, rules);
+      const current = structuredClone(previous);
+      const sample = candidate.latest ?? candidate.days.at(-1)?.samples.at(-1);
+      const stat = sample && revised.read(candidate.metric, sample.at);
+      if (sample && stat && slotOf(formatter(sample.zone), sample.at).index === candidate.slot)
+        for (const rule of rules) {
+          const sigma = rule.param ? this.tuner.number(rule.param, rule.sigma ?? 3) : (rule.sigma ?? 3);
+          const deviation = Math.abs(sample.value - stat.mean) / stat.scale;
+          const k = sigma * (2 - stat.confidence);
+          current.streaks[rule.id] = deviation > k ? Math.max(1, current.streaks[rule.id]) : 0;
+          const key = `baseline:${rule.id}`;
+          const active =
+            current.streaks[rule.id] >= (rule.consecutive ?? 3) ||
+            (previous.latch[key] === 'warn' && deviation >= 0.8 * k);
+          current.latch[key] = active ? 'warn' : 'normal';
+        }
       const param = paramOf(candidate.stream, candidate.metric, candidate.slot);
       const undo = {
         param,
@@ -191,20 +196,22 @@ export class RebaselineManager {
         metric: candidate.metric,
         slot: candidate.slot,
         backup: encode(old),
+        previous,
       };
-      const context = { state, revised, key, undo };
+      const resultState = withMetricState(withBaseline(state, candidate.stream, revised), candidate.stream, current);
+      const context = {
+        state,
+        key: keyOf(candidate.stream, candidate.metric, candidate.slot),
+        undo,
+        resultState,
+      };
       this.pending = context;
       try {
-        const result = await this.tuner.rebaseline(this, param, old.mean, replacement.mean, context);
-        if (result.applied) {
-          this.retry.delete(key);
-          state = this.current() ?? withBaseline(state, candidate.stream, revised);
-        } else this.retry.set(key, next.monotonicAt + 3_600_000);
+        return await this.tuner.rebaseline(this, param, old.mean, replacement.mean, context);
       } finally {
         this.pending = undefined;
       }
-    }
-    return state;
+    });
   }
 
   async revert(id: string, state: AdaptiveState): Promise<TuningResult> {
@@ -219,9 +226,26 @@ export class RebaselineManager {
     revised.replace(undo.metric, undo.slot, replacement);
     const context = {
       state,
-      revised,
       key: keyOf(undo.stream, undo.metric, undo.slot),
-      undo: { ...undo, backup: encode(old) },
+      undo: {
+        ...undo,
+        backup: encode(old),
+        previous: metricState(
+          state,
+          undo.stream,
+          this.rules.filter((r) => r.metric === undo.metric),
+        ),
+      },
+      resultState: withMetricState(
+        withBaseline(state, undo.stream, revised),
+        undo.stream,
+        undo.previous ??
+          metricState(
+            state,
+            undo.stream,
+            this.rules.filter((r) => r.metric === undo.metric),
+          ),
+      ),
     };
     this.pending = context;
     try {
@@ -242,7 +266,7 @@ export class RebaselineManager {
     snapshot.candidates = snapshot.candidates.filter((item) => keyOf(item.stream, item.metric, item.slot) !== c.key);
     snapshot.undos = snapshot.undos.filter((item) => item.param !== c.undo.param);
     snapshot.undos.push({ ...c.undo, id: outcome.change.id });
-    return { state: withBaseline(c.state, c.undo.stream, c.revised), snapshot };
+    return { state: c.resultState, snapshot };
   }
 
   publish(stage: RebaselineStage): AdaptiveState {

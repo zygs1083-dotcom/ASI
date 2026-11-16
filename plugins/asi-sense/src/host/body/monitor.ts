@@ -7,7 +7,7 @@ import type { BodySignal } from './metrics.ts';
 import { serializeMonitor, validateSamples } from './monitor-snapshot.ts';
 import { type BodyPersistence, PersistScheduler } from './persistence.ts';
 import { RateEvaluator, type RateRule } from './rate.ts';
-import { type AutomaticBodyEvaluation, RebaselineManager } from './rebaseline.ts';
+import { type AutomaticBodyEvaluation, RebaselineManager, type RebaselineSuggestion } from './rebaseline.ts';
 import { defaultAnomalyRules, defaultRateRules, floorTable } from './rules.ts';
 import { type AdaptiveState, BODY_HISTORY, parseHistory, validLatch } from './state.ts';
 import type { Tuner } from './tuner.ts';
@@ -101,9 +101,10 @@ export class BodyMonitor implements BodyEvaluator {
         () => save(this.serialize()),
         this.clock,
         10_000,
-        () => {
+        async () => {
           this.tuningDisabled = 'storage-failed';
           this.tuner?.disableStorage();
+          await save(this.serialize()).catch(() => {});
         },
       );
       // With a combined store the tuner's AI is blocked from CONSTRUCTION
@@ -115,18 +116,14 @@ export class BodyMonitor implements BodyEvaluator {
         const stage = context === undefined ? undefined : this.rebaser?.stage(context, result);
         if (context !== undefined && !stage)
           return Promise.reject(new Error('monitor: invalid rebaseline transaction'));
-        return this.scheduler
-          .commit(
-            () => save(this.serialize(snapshot(), stage?.state, stage?.snapshot)),
-            () => {
-              publish();
-              if (stage) this.latest = this.rebaser?.publish(stage);
-            },
-          )
-          .catch((error) => {
-            this.tuningDisabled = 'storage-failed';
-            throw error;
-          });
+        return this.scheduler.commit(
+          () => save(this.serialize(snapshot(), stage?.state, stage?.snapshot)),
+          () => {
+            publish();
+            this.tuningDisabled = this.tuner?.tuningDisabled;
+            if (stage) this.latest = this.rebaser?.publish(stage);
+          },
+        );
       });
       if (this.tuner) this.rebaser = new RebaselineManager(this.tuner, this.anomalyRules ?? [], () => this.latest);
     }
@@ -135,6 +132,13 @@ export class BodyMonitor implements BodyEvaluator {
   /** The state to resume feeding back — restored snapshot or latest emitted. */
   get restoredState(): AdaptiveState | undefined {
     return this.latest;
+  }
+  get rebaselineSuggestions(): RebaselineSuggestion[] {
+    return this.rebaser?.suggestions ?? [];
+  }
+  acceptRebaseline(id: string) {
+    if (!this.rebaser) return Promise.reject(new Error('monitor: persistent tuner required'));
+    return this.rebaser.accept(id);
   }
 
   /** Current effective baseline for the anomaly layer (seed or latest fork). */
@@ -179,7 +183,7 @@ export class BodyMonitor implements BodyEvaluator {
     next: BodyThresholdSample,
     state: BodyThresholdState,
   ): Promise<AutomaticBodyEvaluation> {
-    if (!this.rebaser) return Promise.reject(new Error('monitor: automatic rebaseline requires persistent tuner'));
+    if (!this.rebaser) return Promise.reject(new Error('monitor: rebaseline suggestions require persistent tuner'));
     validateSamples(prev, next);
     return this.rebaser.run(next, state, () => this.evaluate(prev, next, state));
   }
@@ -230,7 +234,7 @@ export class BodyMonitor implements BodyEvaluator {
     // missing pieces are malformed input, never a silent first install.
     if (
       d?.version !== 1 ||
-      d.disabled === 'restore-failed' ||
+      (d.disabled !== undefined && d.disabled !== 'restore-failed' && d.disabled !== 'storage-failed') ||
       typeof d.baseline !== 'string' ||
       (this.tuner && typeof d.tuner !== 'string')
     ) {
@@ -241,17 +245,13 @@ export class BodyMonitor implements BodyEvaluator {
       await fail();
       return;
     }
+    if (this.tuner && d.disabled !== this.tuner.tuningDisabled) return fail();
+    this.tuningDisabled = this.tuner?.tuningDisabled ?? (d.disabled as 'restore-failed' | 'storage-failed' | undefined);
     const b = Baseline.deserialize(d.baseline, this.baselineOptions());
-    if (b.restoreFailed) {
-      await fail();
-      return;
-    }
+    if (b.restoreFailed) return fail();
     const history = parseHistory(d.history, this.baselineOptions());
     const latch = validLatch(d.latch);
-    if (history === undefined || latch === undefined) {
-      await fail();
-      return;
-    }
+    if (history === undefined || latch === undefined) return fail();
     this.seed = b;
     this.rebuildAnomaly();
     this.latest = { ...latch, [BODY_HISTORY]: history };

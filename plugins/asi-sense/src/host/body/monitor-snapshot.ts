@@ -18,7 +18,7 @@ export function serializeMonitor(
   for (const k of Object.keys(latest ?? {})) latch[k] = (latest as AdaptiveState)[k];
   return JSON.stringify({
     version: 1,
-    disabled: disabled ?? tuner?.tuningDisabled,
+    disabled: tunerSnapshot === undefined ? (disabled ?? tuner?.tuningDisabled) : JSON.parse(tunerSnapshot).disabled,
     tuner: tunerSnapshot ?? tuner?.serialize(),
     baseline: current.serialize(),
     latch,

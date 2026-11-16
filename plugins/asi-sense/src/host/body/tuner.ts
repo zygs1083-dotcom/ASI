@@ -27,7 +27,7 @@ export interface TunerOptions {
  * and `auto` are bound by locks, ±50% amplitude vs the CURRENT value,
  * tighten direction and sliding monotonic budgets 2/param/hour,
  * 6/param/day, 24 all-params/day. The 500-entry display log is display
- * only: every applied change is retained separately so reject floods
+ * only: undoable changes are retained separately so reject floods
  * cannot evict a revertable entry. With persistence configured AI stays
  * blocked until {@link restore}; a corrupt/unknown snapshot sets
  * `tuningDisabled` and a `restore-failed` marker is persisted so a later
@@ -62,7 +62,10 @@ export class Tuner {
         () => save(this.serialize()),
         this.clock,
         10_000,
-        () => this.disableStorage(),
+        async () => {
+          this.disableStorage();
+          await save(this.serialize()).catch(() => {});
+        },
       );
       this.scheduler = scheduler;
       this.commit = (snapshot, publish) => scheduler.commit(() => save(snapshot()), publish);
@@ -89,9 +92,9 @@ export class Tuner {
     return typeof v === 'number' && finiteNum(v) && v > 0 ? v : fallback;
   }
 
-  /** Display audit log (capped at 500); applied changes are never lost. */
+  /** Display audit log (capped at 500); undoable changes are retained separately. */
   get logs(): TuningLog[] {
-    return this.store.log.map((e) => ({ ...e }));
+    return this.store.log.slice(-500).map((e) => ({ ...e }));
   }
 
   get undoableChanges(): TuningLog[] {
@@ -134,6 +137,12 @@ export class Tuner {
   /** Consumes an alert registration once; three noise streaks auto-tune. */
   feedback(alertId: string, verdict: 'useful' | 'noise'): Promise<TuningResult> {
     return this.mutate((store, guard) => feedback(store, guard, this.clock, this.wallClock, alertId, verdict));
+  }
+
+  async resumeTuning(): Promise<void> {
+    if (this.actor() !== 'user') throw new Error('tuner: resume requires trusted user');
+    if (this.store.disabled !== 'storage-failed') throw new Error('tuner: storage recovery unavailable');
+    await this.mutate((store) => store.resume(), undefined, 'user', true);
   }
 
   setRebaselineHost(host: { revertChange: (id: string) => Promise<TuningResult> }): void {
@@ -189,13 +198,14 @@ export class Tuner {
       return 'fresh';
     }
     const v = validateSnapshot(data, Object.fromEntries(this.store.specs));
-    if (v === undefined || v.disabled) {
+    if (v === undefined || (v.disabled === 'restore-failed' && v.values.length === 0)) {
       this.store.disabled = 'restore-failed';
       this.store.resetIds();
       this.store.restored = true;
       return 'failed';
     }
     applySnapshot(this.store, v, this.clock(), this.wallClock());
+    this.store.disabled = v.disabled;
     this.store.restored = true;
     return 'ok';
   }
@@ -234,12 +244,13 @@ export class Tuner {
     action: (store: TunerStore, guard: TunerGuard) => T,
     context?: unknown,
     identity = this.actor(),
+    recovery = false,
   ): Promise<T> {
     if (this.closed) return Promise.reject(new Error('tuner: closed'));
     const operation = this.tail.then(async () => {
       if (!this.store.restored) throw new Error('tuner: restore pending');
       if (!this.commit) throw new Error('tuner: persistence required');
-      if (this.store.disabled) throw new Error(`tuner: tuning disabled: ${this.store.disabled}`);
+      if (this.store.disabled && !recovery) throw new Error(`tuner: tuning disabled: ${this.store.disabled}`);
       if (!finiteNum(this.clock()) || !finiteNum(this.wallClock())) throw new TypeError('tuner: clocks must be finite');
       const staged = this.store.clone();
       const guard = new TunerGuard(staged, {
@@ -249,13 +260,18 @@ export class Tuner {
         onChange: () => {},
       });
       const result = action(staged, guard);
+      if (result === false || (result && typeof result === 'object' && 'applied' in result && !result.applied)) {
+        if (result !== false) this.store.appendLog((result as TuningResult).change);
+        return result;
+      }
       try {
         await this.commit(
           () => {
-            if (this.store.disabled) throw new Error(`tuner: tuning disabled: ${this.store.disabled}`);
+            if (this.store.disabled && !recovery) throw new Error(`tuner: tuning disabled: ${this.store.disabled}`);
             const mono = this.clock();
             const wall = this.wallClock();
             if (!finiteNum(mono) || !finiteNum(wall)) throw new TypeError('tuner: clocks must be finite');
+            staged.pruneApplied(wall);
             return serializeTuner(staged, mono, wall);
           },
           () => {

@@ -148,15 +148,18 @@ model requests, watches files or delivers attention intents.
   state (object spread does); JSON persistence uses the dedicated monitor
   snapshot instead. Retry a failed evaluation with its original input state.
   After restore, resume with `monitor.restoredState ?? {}`.
-- For durable automatic rebaselining, wire a tuner and combined persistence,
+- For rebaseline suggestions, wire a tuner and combined persistence,
   then await `monitor.evaluateAuto(prev, next, state)` for each sample. Thread
   the exact returned state into the next call; stale concurrent state is
-  rejected. Three distinct alerting dates in one bucket, separated by elapsed
-  monotonic days, trigger a budgeted `auto` change using recent readings.
-  Floor and rate rules remain active. The pure synchronous `evaluate` seam
-  does not schedule automatic changes. If an automatic save fails, the result
-  contains `tuningError` alongside any floor/rate signals; deliver those
-  signals and surface the error rather than discarding the sample.
+  rejected. A bucket with three distinct alerting local dates within 21 days
+  and at least eight alert samples yields one context-level `body.anomaly`
+  with `data.type === 'rebaseline-suggestion'`; missing samples do not interrupt
+  the candidate, but a non-alert reading in that bucket does. Incomplete
+  candidates expire after 21 days. Suggestions are available through
+  `monitor.rebaselineSuggestions`; they never replace buckets automatically.
+  The pure synchronous `evaluate` seam clears existing suggestion evidence and
+  does not collect new evidence.
+  Floor and rate rules remain active.
 
 ### Trusted Tuning Boundary
 
@@ -164,7 +167,8 @@ Construct `new Tuner(whitelist, { actor, clock, wallClock })`; `actor()` is a
 **trusted host resolver**, defaulting to `agent`. Only authenticated sidebar
 user calls may resolve to `user`; never forward a tool's `by`/`actor` field
 into that resolver. `propose({ param, to, reason })`, `lock`, `unlock`,
-`revert(id)` and `feedback` do not accept caller-declared identity.
+`revert(id)`, `feedback`, `resumeTuning()` and `monitor.acceptRebaseline(id)`
+do not accept caller-declared identity.
 
 Every `floor.*` spec needs a finite numeric value and `tighten: 'up'|'down'`;
 known free-disk/context/battery floors must use `'up'`. AI checks against the
@@ -175,16 +179,25 @@ those AI limits but retain whitelist/type/bounds checks and audit records;
 only users can lock/unlock or loosen floors. User revert also bypasses a
 lock; agent revert uses the same AI guards. Superseded IDs cannot be reverted.
 The 500-entry display log is separate from retained applied/undo history.
+Rejected attempts stay in memory only, do not write or consume durable IDs,
+and disappear on restart. Applied history retains 30 days or 200 changes,
+whichever is greater, plus every currently undoable change.
 `tuner.undoableChanges` lists the currently reversible changes, including
-automatic rebaselines. Await `tuner.revert(id)` for a sidebar undo, then
-resume sampling from `monitor.restoredState`. Only a trusted user may undo
-a rebaseline.
+accepted rebaselines. Only a trusted user may call
+`monitor.acceptRebaseline(id)` or undo a rebaseline. User acceptance is logged,
+bypasses AI limits and immediately rejudges the affected latch. Await
+`tuner.revert(id)` for a sidebar undo, then resume sampling from
+`monitor.restoredState`; undo restores the earlier metric latch and streak.
 
 ### Persistence And Clocks
 
 Supply `BodyPersistence` with `load(): Promise<string | undefined>` and
 `save(data: string): Promise<void>`. `undefined` means first installation.
-The host owns local access control and **atomic temp-file + rename writes**;
+The host owns local access control and **atomic temp-file + rename writes**.
+`save` must resolve only after installation and reject only when the new
+snapshot was not installed; rename must be the last step that can reject.
+Report any post-rename directory fsync or
+other errors separately, never by rejecting `save`.
 M3 will connect the port to DSH `storageDomain`. Pass the port to the monitor
 for one versioned snapshot containing baseline, installation time, zone,
 latches, tuner values, locks, audits, quota windows and ID lineage. Do not
@@ -198,6 +211,14 @@ or return success. Non-critical baseline statistics may coalesce to 10-second
 saves. `persist()` explicitly flushes, and shutdown must await `monitor.close()`
 (or standalone `tuner.close()`). Any save failure rejects its caller where
 applicable and disables tuning with `tuningDisabled === 'storage-failed'`.
+The core makes one best-effort write of the last confirmed state with a
+disabled marker; if that write also fails, a crash leaves the previous snapshot
+intact and the rejected change absent. When a disabled snapshot is restored,
+AI stays disabled until a trusted user calls and awaits `tuner.resumeTuning()`;
+the marker is removed only after a successful save. The host must surface the
+failure and recovery status to the user.
+Legacy automatic-rebaseline undo snapshots without the former metric latch and
+streak fail closed; the host must explicitly repair or reset those snapshots.
 
 Malformed/unknown-version/non-finite snapshots fail closed:
 `tuningDisabled === 'restore-failed'` is exposed for the sidebar, baseline
