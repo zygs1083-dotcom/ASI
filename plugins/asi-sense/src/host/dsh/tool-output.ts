@@ -18,21 +18,21 @@ export function modelText(value: string, hostname = os.hostname()): string {
 }
 
 export function modelTitle(value: string, hostname = os.hostname()): string {
-  const paths: string[] = [];
+  const hidden: string[] = [];
+  const hide = () => `\0${hidden.push('<host>') - 1}\0`;
   const escapedHost = hostname.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const noUrl = value
-    .replace(/\b[a-z][a-z\d+.-]*:\/\/[^\s"'<>]+/gi, () => `\0${paths.push('<host>') - 1}\0`)
-    .replace(/(?<![\w])(?:[A-Za-z]:\\|\/)(?:[^\s"'<>/\\]+[/\\])*[^\s"'<>/\\]*/g, (path) => {
+  const projected = value
+    .replace(/\b[a-z][a-z\d+.-]*:\/\/[^\s"'<>]+/gi, hide)
+    .replace(/(?<![\w])(?:[A-Za-z]:\\|\/|[\p{L}\p{N}._-]+\/)(?:[^\s"'<>/\\]+[/\\])*[^\s"'<>/\\]*/gu, (path) => {
       const parts = path.split(/[\\/]/).filter(Boolean);
-      const name = parts.at(-1) ?? '[path]';
-      return `\0${paths.push(hostname ? name.replace(new RegExp(escapedHost, 'gi'), '<host>') : name) - 1}\0`;
-    });
-  const withoutLocalHost = hostname ? noUrl.replace(new RegExp(escapedHost, 'gi'), '<host>') : noUrl;
-  return withoutLocalHost
-    .replace(/\b(?:[a-z\d-]+\.)+[a-z\d-]+\b(?::\d+)?/gi, '<host>')
-    .replace(/\b(?:localhost|(?:\d{1,3}\.){3}\d{1,3})(?::\d+)?\b/gi, '<host>')
-    .replace(/\[[\da-f:]+\](?::\d+)?|(?<![\w:])(?:[\da-f]{0,4}:){2,}[\da-f]{0,4}(?![\w:])/gi, '<host>')
-    .replace(/\0(\d+)\0/g, (_match, index: string) => paths[Number(index)] ?? '[path]');
+      return parts.at(-1) ?? '[path]';
+    })
+    .replace(/\b[\w.+%-]+@(?:\[[\da-f:.]+\]|[\w.-]+)(?::\d+)?/gi, hide)
+    .replace(/\[[\da-f:.]+\](?::\d+)?|(?<![\w:])(?:[\da-f]{0,4}:){2,}[\da-f]{0,4}(?![\w:])/gi, hide)
+    .replace(/\b(?:\d{1,3}\.){3}\d{1,3}(?::\d+)?\b/gi, hide)
+    .replace(/\b[a-z\d_-]+(?:\.[a-z\d_-]+)*:\d+\b/gi, hide);
+  const withoutLocalHost = hostname ? projected.replace(new RegExp(escapedHost, 'gi'), hide) : projected;
+  return withoutLocalHost.replace(/\0(\d+)\0/g, (_match, index: string) => hidden[Number(index)] ?? '<host>');
 }
 
 function minimize(value: JsonValue, hostname: string, title = false): JsonValue {
@@ -224,6 +224,11 @@ export function modelTune(value: unknown): JsonValue {
       'file.burst.windowMs',
       'file.burst.maxChanges',
       'file.burst.maxDeleted',
+      'mergeWindowMs',
+      'fileMergeWindowMs',
+      'deliveryLevel.body.rate',
+      'deliveryLevel.body.anomaly',
+      'deliveryLevel.file.burst',
       ...['disk', 'context', 'battery'].flatMap((metric) =>
         ['warn', 'critical'].map((severity) => `floor.${metric}.${severity}`),
       ),
@@ -257,7 +262,12 @@ export function modelTune(value: unknown): JsonValue {
     }
     for (const key of ['from', 'to']) {
       const item = Reflect.get(change, key);
-      if (typeof item === 'number' || typeof item === 'boolean') fields[key] = item;
+      if (
+        typeof item === 'number' ||
+        typeof item === 'boolean' ||
+        (typeof item === 'string' && ['record', 'context', 'wake'].includes(item))
+      )
+        fields[key] = item;
     }
     result.change = fields;
   }
@@ -317,7 +327,7 @@ export function environmentDetail(runtime: Runtime, app?: string, window?: strin
   const front = env.frontApp.value;
   const title = env.focusedWindow.value?.title;
   const matchesApp = front === null ? null : app === undefined || app === front.name || app === front.bundleId;
-  const matchesWindow = window === undefined ? true : title === undefined ? null : title === window;
+  const matchesWindow = window === undefined ? true : title === undefined ? null : modelTitle(title) === window;
   const available = matchesApp === true && matchesWindow === true;
   const mismatch = matchesApp === false || matchesWindow === false;
   const events = available

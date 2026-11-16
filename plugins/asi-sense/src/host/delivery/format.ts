@@ -77,7 +77,20 @@ function changeLines(ch: EnvChange, includeTitles: boolean, includeJobCommands: 
     main = `${esc(s.kind)}: ${esc(s.subject)}`;
     if (typeof s.data.ruleId === 'string') main += ` ruleId=${esc(s.data.ruleId)}`;
     if (typeof s.data.severity === 'string') main += ` ${esc(s.data.severity)}`;
-    for (const key of ['value', 'slope', 'delta', 'etaToFloorMs', 'created', 'modified', 'deleted']) {
+    for (const key of [
+      'value',
+      'baseline',
+      'deviation',
+      'slope',
+      'delta',
+      'etaToFloorMs',
+      'windowMs',
+      'created',
+      'modified',
+      'deleted',
+      'externalDeleted',
+      'agentDeleted',
+    ]) {
       const value = s.data[key];
       if (typeof value === 'number' && Number.isFinite(value)) main += ` ${key}=${value}`;
     }

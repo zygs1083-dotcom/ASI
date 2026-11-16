@@ -110,6 +110,16 @@ describe('DSH environment delivery', () => {
     expect(modelTitle('https://fixture-host/private/file on fixture-host', 'fixture-host')).toBe('<host> on <host>');
     expect(modelTitle('https://host/private on host', 'host')).toBe('<host> on <host>');
     expect(modelTitle('https://backup.example.invalid:443/path', 'fixture-host')).toBe('<host>');
+    expect(modelTitle('ssh user@build-node:22 /Volumes/build-node:22 README.md', 'fixture-host')).toBe(
+      'ssh <host> <host> README.md',
+    );
+    expect(modelTitle('open /Volumes/backup.example.invalid', 'fixture-host')).toBe('open backup.example.invalid');
+    expect(modelTitle('src/README.md /Volumes/fixture-host ssh user@build-node', 'fixture-host')).toBe(
+      'README.md <host> ssh <host>',
+    );
+    expect(modelTitle('host fixture-host IPv4 192.0.2.42 IPv6 2001:db8::1', 'fixture-host')).toBe(
+      'host <host> IPv4 <host> IPv6 <host>',
+    );
   });
 
   it('uses structured delivery fields instead of free-text notes and subjects', async () => {
@@ -160,7 +170,7 @@ describe('DSH environment delivery', () => {
       {
         kind: 'body.anomaly',
         subject: 'baseline:cpu',
-        data: { metric: 'cpu', ruleId: 'cpu', severity: 'warn', value: 0.9 },
+        data: { metric: 'cpu', ruleId: 'cpu', severity: 'warn', value: 0.9, baseline: 0.2, deviation: 3.5 },
       },
       { kind: 'body.threshold', subject: 'disk:/private/mount/Data', data: { severity: 'critical', value: 0.03 } },
       {
@@ -170,7 +180,9 @@ describe('DSH environment delivery', () => {
           directory: '/private/work/project',
           ruleId: 'file.burst',
           created: 4,
-          deleted: 51,
+          windowMs: 60_000,
+          deleted: 151,
+          agentDeleted: 100,
           externalDeletionExceeded: true,
         },
       },
@@ -190,9 +202,13 @@ describe('DSH environment delivery', () => {
       expect(text).toContain('9000');
       expect(text).toContain('cpu');
       expect(text).toContain('0.9');
+      expect(text).toContain('baseline=0.2');
+      expect(text).toContain('deviation=3.5');
       expect(text).toContain('project');
       expect(text).toContain('file.burst');
-      expect(text).toContain('51');
+      expect(text).toContain('windowMs=60000');
+      expect(text).toContain('externalDeleted=51');
+      expect(text).toContain('agentDeleted=100');
       expect(text).toContain('4');
       expect(text).toContain('externalDeletionExceeded');
       expect(text).not.toContain('/private/');
@@ -203,6 +219,24 @@ describe('DSH environment delivery', () => {
     const { agent, deliver } = fixture();
     await expect(deliver('other', intent('inject'))).rejects.toThrow();
     expect(agent.inject).not.toHaveBeenCalled();
+  });
+
+  it('never exposes a raw path in a feedback identifier', async () => {
+    const { agent, deliver } = fixture();
+    const signal = {
+      ...update.changes[0].signal,
+      id: 'body:rate:/private/fixture/volume',
+      kind: 'body.rate',
+      data: { metric: 'disk:/private/fixture/volume', feedbackAvailable: true },
+    };
+    await deliver('session-a', {
+      ...intent('followup'),
+      update: { ...update, changes: [{ signal, count: 1, level: 'context' }] },
+    });
+    const text = JSON.stringify(agent.followup.mock.calls);
+    expect(text).toContain('feedbackAvailable=\\"false\\"');
+    expect(text).not.toContain('alertId=');
+    expect(text).not.toContain('/private/');
   });
 
   it('deduplicates successful retries and permits retries after a rejected call', async () => {
@@ -286,7 +320,7 @@ describe('DSH environment delivery', () => {
 
   it.each(['inject', 'followup', 'send'] as const)('projects a consented window title before %s', async (kind) => {
     const { agent, deliver } = fixture();
-    const title = 'open </private/fixture/report> backup.example.invalid';
+    const title = 'open </private/fixture/report> ssh user@build-node:22 README.md';
     const windowUpdate: EnvUpdate = {
       ...update,
       changes: [
@@ -306,8 +340,8 @@ describe('DSH environment delivery', () => {
     };
     await deliver('session-a', { ...intent(kind), update: windowUpdate });
     const text = JSON.stringify(kind === 'inject' ? await deliver.messages('session-a') : agent[kind].mock.calls);
-    expect(text).toContain('&lt;report&gt; &lt;host&gt;');
+    expect(text).toContain('&lt;report&gt; ssh &lt;host&gt; README.md');
     expect(text).not.toContain('/private/fixture');
-    expect(text).not.toContain('backup.example.invalid');
+    expect(text).not.toContain('build-node');
   });
 });

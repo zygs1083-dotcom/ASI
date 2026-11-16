@@ -41,6 +41,9 @@ function modelUpdate(update: EnvUpdate): EnvUpdate {
     changes: update.changes.map(({ signal, count, level, ruleId }) => {
       const data: typeof signal.data = {};
       let subject = 'observation';
+      if (typeof signal.data.feedbackAvailable === 'boolean') {
+        data.feedbackAvailable = signal.data.feedbackAvailable && /^[\w.:-]+$/.test(signal.id);
+      }
       if (signal.kind === 'app.activated') {
         if (typeof signal.data.name === 'string') data.name = modelLabel(signal.data.name);
         if (typeof signal.data.previousName === 'string') data.previousName = modelLabel(signal.data.previousName);
@@ -65,10 +68,31 @@ function modelUpdate(update: EnvUpdate): EnvUpdate {
         const ruleId = signal.data.ruleId;
         if (typeof ruleId === 'string' && (/^[\w-]+$/.test(ruleId) || ruleId === 'file.burst')) data.ruleId = ruleId;
         if (['normal', 'warn', 'critical'].includes(String(signal.data.severity))) data.severity = signal.data.severity;
-        for (const key of ['value', 'slope', 'delta', 'etaToFloorMs', 'created', 'modified', 'deleted']) {
+        for (const key of [
+          'value',
+          'baseline',
+          'deviation',
+          'slope',
+          'delta',
+          'etaToFloorMs',
+          'windowMs',
+          'created',
+          'modified',
+          'agentDeleted',
+        ]) {
           const value = signal.data[key];
           if (typeof value === 'number' && Number.isFinite(value)) data[key] = value;
         }
+        const { deleted, agentDeleted } = signal.data;
+        if (
+          typeof deleted === 'number' &&
+          Number.isFinite(deleted) &&
+          typeof agentDeleted === 'number' &&
+          Number.isFinite(agentDeleted) &&
+          agentDeleted >= 0 &&
+          deleted >= agentDeleted
+        )
+          data.externalDeleted = deleted - agentDeleted;
         if (signal.data.externalDeletionExceeded === true) data.externalDeletionExceeded = true;
       }
       const kinds = [

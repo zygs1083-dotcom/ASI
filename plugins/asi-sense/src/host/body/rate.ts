@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import type { Body, BodyEvaluation, BodyEvaluator, BodyThresholdSample, BodyThresholdState } from '@asi/sense-types';
 import { type BodySignal, type Metric, readMetrics } from './metrics.ts';
 import { type AdaptiveState, BODY_HISTORY, type RateHistory, type RateWindow } from './state.ts';
@@ -318,7 +319,17 @@ export class RateEvaluator implements BodyEvaluator {
       data.etaToFloorMs = data.timeToFloorMs = eta;
     }
     return {
-      id: `${next.source.id}:${latchKey}:${next.monotonicAt}:${severity}${key === 'context' && contextSession ? `:${contextSession}` : ''}`,
+      id: `body.rate:${createHash('sha256')
+        .update(
+          JSON.stringify([
+            next.source.id,
+            latchKey,
+            next.monotonicAt,
+            severity,
+            key === 'context' ? contextSession : undefined,
+          ]),
+        )
+        .digest('hex')}`,
       kind: 'body.rate',
       at: evaluation.wall,
       source: next.source,

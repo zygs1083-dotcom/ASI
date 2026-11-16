@@ -9,7 +9,8 @@ import { executeToolFixture } from '@deepseek-ai/dsh-tool-testkit';
 import ToolsService from '@deepseek-ai/dsh-tools';
 import { describe, expect, it, onTestFinished, vi } from 'vitest';
 import { FileBurstDetector } from '../../src/host/body/burst.ts';
-import { formatEnvUpdate } from '../../src/host/delivery/format.ts';
+import { createDelivery } from '../../src/host/dsh/deliver.ts';
+import { modelTune } from '../../src/host/dsh/tool-output.ts';
 import { registerSenseTools } from '../../src/host/dsh/tools.ts';
 import { createSenseRuntime } from '../../src/host/runtime/index.ts';
 import type { AgentEvent, JobEvent, SensePorts, ToolEvent } from '../../src/host/runtime/ports.ts';
@@ -238,8 +239,8 @@ describe('model-facing tools', () => {
 
   it('projects consented titles and excludes arbitrary notes and colliding private paths', async () => {
     const h = await fixture();
-    const title = 'open </private/fixture/report> backup.example.invalid';
-    const projected = 'open <report> <host>';
+    const title = 'open </private/fixture/report> ssh user@build-node:22 README.md';
+    const projected = 'open <report> ssh <host> README.md';
     h.state.env.focusedWindow.value = { title };
     if (!h.state.env.frontApp.value) throw new Error('fixture missing');
     h.state.env.frontApp.value.bundleId = 'backup.example.invalid';
@@ -261,6 +262,13 @@ describe('model-facing tools', () => {
       'backup.example.invalid',
     );
     expect((await h.call('env_detail', {})).value).toMatchObject({ window: { value: { title: projected } } });
+    expect((await h.call('env_detail', { window: projected })).value).toMatchObject({
+      current: true,
+      match: 'current',
+      window: { value: { title: projected } },
+      recentEvents: [{ kind: 'window.focused' }],
+    });
+    expect((await h.call('env_detail', { window: title })).value).toMatchObject({ match: 'not-current' });
     const result = await h.call('env_watch', {
       action: 'add',
       rule: {
@@ -390,6 +398,26 @@ describe('model-facing tools', () => {
     expect(h.live.body.tuner.logs.at(-1)).toMatchObject({ by: 'agent', status: 'rejected' });
   });
 
+  it('preserves allowed runtime tuning parameters and level values without exposing arbitrary strings', async () => {
+    const h = await fixture();
+    for (const [param, to, from] of [
+      ['mergeWindowMs', 2500, 2000],
+      ['fileMergeWindowMs', 6000, 5000],
+      ['deliveryLevel.body.rate', 'record', 'context'],
+      ['deliveryLevel.body.anomaly', 'record', 'context'],
+      ['deliveryLevel.file.burst', 'context', 'wake'],
+    ] as const) {
+      expect(await h.call('body_tune', { param, to })).toMatchObject({
+        isError: false,
+        value: { applied: true, change: { param, from, to } },
+      });
+    }
+    expect(modelTune({ applied: true, change: { param: 'secret', from: '/private/file', to: 'secret' } })).toEqual({
+      applied: true,
+      change: { param: '[redacted]' },
+    });
+  });
+
   it('round-trips a special-character file burst alert from formatted delivery to feedback', async () => {
     const h = await fixture();
     const detector = new FileBurstDetector({ roots: ['/fixture/R&D'], maxDeleted: 1 });
@@ -410,14 +438,26 @@ describe('model-facing tools', () => {
     if (!alert) throw new Error('fixture alert missing');
     expect(await h.live.body.tuner.registerAlert(alert.id, 'file.burst', 'file.burst.maxDeleted')).toBe(true);
     alert.data.feedbackAvailable = true;
-    const text = formatEnvUpdate({
+    const update = {
       since: 1_000,
       at: 1_000,
       suppressed: 0,
-      changes: [{ signal: alert, count: 1, level: 'context' }],
-    });
+      changes: [{ signal: alert, count: 1, level: 'context' as const }],
+    };
+    const agent = { inject: vi.fn(), followup: vi.fn(), send: vi.fn() };
+    const deliver = createDelivery(
+      () => agent,
+      () => true,
+      async () => false,
+    );
+    await deliver('session-a', { kind: 'followup', sessionId: 'session-a', update });
+    const text = JSON.stringify(agent.followup.mock.calls).replaceAll('\\"', '"');
     const encoded = /alertId="([A-Za-z0-9_-]+)"/.exec(text)?.[1];
     expect(encoded).toBeDefined();
+    expect(text).toContain('feedbackAvailable="true"');
+    const decoded = Buffer.from(encoded as string, 'base64url').toString('utf8');
+    expect(decoded).toBe(alert.id);
+    expect(decoded).not.toContain('/fixture/');
     expect(await h.call('body_tune', { action: 'feedback', alertId: encoded, verdict: 'useful' })).toMatchObject({
       isError: false,
       value: { applied: true },

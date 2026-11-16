@@ -212,6 +212,7 @@ export function RulesSection(props: SensePanelProps & { tuningReq?: number; oper
         />
         <EyeOffIcon />
         窗口标题发给模型
+        <span>标题可能包含主机名等信息。</span>
       </label>
 
       <div className={css.viewSwitch} role="group" aria-label="规则视图">
