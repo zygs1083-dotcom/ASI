@@ -140,7 +140,10 @@ export function projectEvents(
         subject: hidden ? '' : entry.subject,
         data: evidenceAt === undefined ? {} : { evidenceAt },
       },
-      level: entry.reason === 'wake-budget' || entry.reason === 'no-session' ? 'suppressed' : entry.level,
+      level:
+        entry.reason === 'wake-budget' || entry.reason === 'no-session' || entry.reason === 'self-caused'
+          ? 'suppressed'
+          : entry.level,
       reason: hidden ? '' : (entry.reason ?? ''),
       cause: entry.cause ?? 'unknown',
       ...(!hidden && entry.ruleId ? { ruleName: entry.ruleId } : {}),
