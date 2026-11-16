@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import type { TunerGuard, TuningResult } from './tuner-guard.ts';
 import { ALERT_CAP, finiteNum } from './tuner-spec.ts';
 import type { TunerStore } from './tuner-state.ts';
@@ -18,10 +19,26 @@ export function register(
     !finiteNum(clock()) ||
     !finiteNum(wallClock()) ||
     !store.specs.has(param) ||
-    store.alerts.has(alertId) ||
-    store.alerts.size >= ALERT_CAP
+    store.alerts.has(alertId)
   )
     return false;
+  if (store.alerts.size >= ALERT_CAP) {
+    const oldest = store.alerts.keys().next().value as string;
+    const binding = store.alerts.get(oldest);
+    store.alerts.delete(oldest);
+    store.appendLog({
+      id: `volatile-${randomUUID()}`,
+      param: binding?.param ?? '',
+      from: '',
+      to: '',
+      by: 'auto',
+      reason: `alert ${oldest}`,
+      at: wallClock(),
+      operation: 'feedback',
+      status: 'rejected',
+      rejectionReason: 'evicted',
+    });
+  }
   store.alerts.set(alertId, { ruleId, param });
   return true;
 }

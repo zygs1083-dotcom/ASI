@@ -19,9 +19,15 @@ function pipelineWith(clock: FakeClock, deliver: (intent: DeliveryIntent) => Pro
 
 let jobSeq = 0;
 const started = (job: string, at: number) =>
-  sig({ id: `st-${job}-${at}-${jobSeq++}`, kind: 'job.started', at, subject: job, data: { command: job } });
+  sig({
+    id: `st-${job}-${at}-${jobSeq++}`,
+    kind: 'job.started',
+    at,
+    subject: job,
+    data: { command: job, sequence: at },
+  });
 const exited = (job: string, at: number) =>
-  sig({ id: `ex-${job}-${at}-${jobSeq++}`, kind: 'job.exited', at, subject: job, data: { exitCode: 0 } });
+  sig({ id: `ex-${job}-${at}-${jobSeq++}`, kind: 'job.exited', at, subject: job, data: { exitCode: 0, sequence: at } });
 const jobIds = (st: StateStore) => (st.snapshot().env.activeJobs.value ?? []).map((j) => j.id);
 
 describe('delivery failures and stable identity', () => {
@@ -124,7 +130,7 @@ describe('reentrant pipeline intake ordering', () => {
 
 describe('job tracking', () => {
   const factUpdate = (id: string, at: number, value: unknown) =>
-    sig({ id, kind: 'fact.updated', at, data: { path: 'env.activeJobs', value } });
+    sig({ id, kind: 'fact.updated', at, data: { path: 'env.activeJobs', value, sequence: at } });
   it('blocks pre-snapshot starts for replaced and unknown ids but accepts independent late jobs', () => {
     const c = new FakeClock();
     const st = new StateStore(c.time, 1000, c.time);

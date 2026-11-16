@@ -6,6 +6,22 @@ const file = (id: string, at: number, subject = '/w/a.ts', extra: Partial<Signal
   sig({ id, kind: 'file.changed', at, subject, ...extra });
 
 describe('AttentionPipeline merging', () => {
+  it('reclaims disposed session state after ten minutes of monotonic time', () => {
+    const c = new FakeClock();
+    const { pipeline } = pipe(c);
+    const sessions = (pipeline as unknown as { sessions: Map<string, unknown> }).sessions;
+    for (let i = 0; i < 300; i++) {
+      pipeline.setSession(sess({ id: `disposed-${i}` }));
+      pipeline.disposeSession(`disposed-${i}`);
+    }
+    pipeline.setSession(sess({ id: 'live' }));
+    c.advance(599_999);
+    pipeline.pruneSessions();
+    expect(sessions.size).toBe(301);
+    c.advance(1);
+    pipeline.pruneSessions();
+    expect([...sessions.keys()]).toEqual(['live']);
+  });
   it('merges repeated file saves (count=3) into an early pre-step inject', async () => {
     const c = new FakeClock();
     const { intents, pipeline } = pipe(c);
@@ -220,7 +236,7 @@ describe('source status transitions', () => {
     const c = new FakeClock();
     const { intents, pipeline } = pipe(c);
     const st = (id: string, at: number, status: string, sid = 's1') =>
-      pipeline.accept(sig({ id, kind: 'source.status', at, data: { status } }), sess({ id: sid }));
+      pipeline.accept(sig({ id, kind: 'source.status', at, data: { status, sequence: at } }), sess({ id: sid }));
     await st('a', 10, 'denied');
     await st('b', 10, 'denied', 's2'); // separate session is notified too
     await st('ok', 20, 'ok');
@@ -236,5 +252,44 @@ describe('source status transitions', () => {
           .map((ch) => `${i.sessionId}:${ch.signal.id}`),
       );
     expect(deniedBySession.sort()).toEqual(['s1:a', 's2:b']);
+  });
+
+  it('recognizes source-health transitions in receipt order after a wall-clock rollback', async () => {
+    const c = new FakeClock();
+    const { pipeline, intents, store } = pipe(c);
+    await pipeline.accept(sig({ id: 'ok', kind: 'source.status', at: 100_000, data: { status: 'ok' } }), sess());
+    await pipeline.accept(sig({ id: 'denied', kind: 'source.status', at: 90_000, data: { status: 'denied' } }), sess());
+    expect(store.snapshot().observation.sources.fs?.status).toBe('denied');
+    await pipeline.preStep('s1');
+    expect(intents.flatMap((item) => item.update.changes).map((item) => item.signal.id)).toContain('denied');
+  });
+
+  it('does not enqueue a wake for an explicitly older job event', async () => {
+    const c = new FakeClock();
+    const { pipeline, intents } = pipe(c);
+    await pipeline.accept(
+      sig({
+        id: 'new',
+        kind: 'job.exited',
+        subject: 'job',
+        at: 10,
+        data: { exitCode: 1, sequence: 10 },
+      }),
+      sess(),
+    );
+    const stale = await pipeline.accept(
+      sig({
+        id: 'old',
+        kind: 'job.exited',
+        subject: 'job',
+        at: 20,
+        data: { exitCode: 1, sequence: 5 },
+      }),
+      sess(),
+    );
+    expect(stale).toMatchObject({ level: 'record', reason: 'older-sequence' });
+    c.advance(2001);
+    await pipeline.flush();
+    expect(intents.flatMap((item) => item.update.changes)).toMatchObject([{ signal: { id: 'new' }, count: 1 }]);
   });
 });

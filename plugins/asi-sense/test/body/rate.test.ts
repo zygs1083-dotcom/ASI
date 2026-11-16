@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import type { BodyThresholdState, Signal } from '@asi/sense-types';
 import { describe, expect, it } from 'vitest';
-import { RateEvaluator, type RateRule } from '../../src/host/body/rate.ts';
+import { captureRateTimes, RateEvaluator, type RateRule } from '../../src/host/body/rate.ts';
 import { type AdaptiveState, BODY_HISTORY } from '../../src/host/body/state.ts';
 import { SRC } from '../helpers.ts';
 import {
@@ -27,6 +27,19 @@ const deltaRule = (over: Partial<RateRule> = {}): RateRule =>
   }) as RateRule;
 const ev = (rules: readonly RateRule[], thr?: (p: string, f: number) => number) => new RateEvaluator(rules, thr);
 const GIB = 1024 ** 3;
+
+it('stamps the first occurrence of each reading on the monotonic observation timeline', () => {
+  const body = diskBody(500);
+  body.disks.observedAt = 1_000;
+  const first = captureRateTimes(body, 5_000, 1_000, {});
+  expect(first['disk:/']).toEqual({ wall: 0, mono: 4_000 });
+  const cached = captureRateTimes(body, 7_000, 3_000, first);
+  expect(cached['disk:/']).toEqual(first['disk:/']);
+  if (!body.disks.value) throw new Error('missing disk');
+  body.disks.value[0].observedAt = 2_000;
+  const next = captureRateTimes(body, 7_000, 3_000, cached);
+  expect(next['disk:/']).toEqual({ wall: 2_000, mono: 6_000 });
+});
 
 const run = (e: RateEvaluator, frames: [number, number, number][] /* [at, mono, rss] */) => {
   let state: BodyThresholdState = {};
@@ -74,6 +87,19 @@ describe('RateEvaluator maxDelta', () => {
 });
 
 describe('RateEvaluator maxRatio + maxEtaMs', () => {
+  it('clamps an already elapsed observation ETA to zero at evaluation', () => {
+    const e = ev([{ id: 'c', metric: 'context', windowMs: 300_000, direction: 'down', maxEtaMs: 5_000, floor: 0 }]);
+    const prev = { ...sample(ctxBody(1000, 985), 0, undefined, 0), rateTimes: { context: { mono: 0, wall: 0 } } };
+    const next = {
+      ...sample(ctxBody(1000, 995), 20_000, undefined, 20_000),
+      rateTimes: { context: { mono: 10_000, wall: 10_000 } },
+    };
+    expect(e.evaluate(prev, next, {}).signals[0]).toMatchObject({
+      at: 20_000,
+      data: { evidenceAt: 10_000, timeToFloorMs: 0, etaToFloorMs: 0, severity: 'warn' },
+    });
+  });
+
   it('includes the exact ten-minute context ETA boundary', () => {
     const e = ev([{ id: 'c', metric: 'context', windowMs: 300_000, direction: 'down', maxEtaMs: 600_000, floor: 0 }]);
     const p = sample(ctxBody(601_000, 0), 0, undefined, 0);

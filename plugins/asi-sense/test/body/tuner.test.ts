@@ -59,6 +59,15 @@ class FakePersist implements BodyPersistence {
 }
 
 describe('Tuner actor trust', () => {
+  it('evicts the oldest unfeedbacked alert at capacity and records the eviction', async () => {
+    const t = mk(specs, { persistence: new FakePersist() });
+    await t.restore();
+    for (let i = 0; i < 501; i++) expect(await t.registerAlert(`alert-${i}`, 'rule1', 'cpu.sigma')).toBe(true);
+    expect(t.logs).toContainEqual(expect.objectContaining({ rejectionReason: 'evicted' }));
+    expect((await t.feedback('alert-0', 'useful')).applied).toBe(false);
+    expect((await t.feedback('alert-500', 'useful')).applied).toBe(true);
+    await t.close();
+  });
   it('defaults to agent and resolves the actor only through the injected resolver', async () => {
     mono = 0;
     wall = T;

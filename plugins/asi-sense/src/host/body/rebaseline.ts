@@ -100,10 +100,15 @@ export class RebaselineManager {
     next: BodyThresholdSample,
     previous: BodyThresholdState,
     evaluate: () => BodyEvaluation,
+    commit?: (result: AutomaticBodyEvaluation) => void,
   ): Promise<AutomaticBodyEvaluation> {
     return this.enqueue(async () => {
       const last = this.watermarks.get(next.source.id);
-      if (last !== undefined && next.monotonicAt <= last) return { signals: [], state: this.current() ?? previous };
+      if (last !== undefined && next.monotonicAt <= last) {
+        const result = { signals: [], state: this.current() ?? previous };
+        commit?.(result);
+        return result;
+      }
       const current = this.current();
       if (current && previous !== current) throw new Error('monitor: stale adaptive state');
       this.active = true;
@@ -114,13 +119,15 @@ export class RebaselineManager {
         this.active = false;
       }
       this.watermarks.set(next.source.id, next.monotonicAt);
-      return {
+      const evaluated = {
         ...result,
         signals: [
           ...result.signals,
           ...detectCandidates(next, result.state as AdaptiveState, this.rules, this.candidates),
         ],
       };
+      commit?.(evaluated);
+      return evaluated;
     });
   }
 

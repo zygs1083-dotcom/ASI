@@ -13,7 +13,7 @@ export const BODY_HISTORY: unique symbol = Symbol('asi.body.history');
 
 /** One metric's monotonic-clock point window (rate layer). */
 export interface RateWindow {
-  points: { at: number; value: number }[];
+  points: { at: number; value: number; wall?: number }[];
   /** Monotonic stamp of the newest accepted point for the stream. */
   lastMono: number;
 }

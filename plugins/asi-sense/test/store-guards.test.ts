@@ -65,7 +65,7 @@ describe('StateStore isolation', () => {
     st.apply(sig({ id: '1', kind: 'app.activated', at: 90, data: { name: 'Late' } }));
     expect(st.snapshot().env.frontApp.value?.name).toBe('Late');
     st.apply(sig({ id: '2', kind: 'app.activated', at: 80, data: { name: 'Older' } }));
-    expect(st.snapshot().env.frontApp.value?.name).toBe('Late');
+    expect(st.snapshot().env.frontApp.value?.name).toBe('Older');
     st.apply(sig({ id: 'file', kind: 'file.changed', at: 90, subject: '/r/late' }));
     expect(st.snapshot().env.watchedPaths.observedAt).toBe(90);
   });
