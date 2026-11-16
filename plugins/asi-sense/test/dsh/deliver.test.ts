@@ -120,6 +120,46 @@ describe('DSH environment delivery', () => {
     expect(modelTitle('host fixture-host IPv4 192.0.2.42 IPv6 2001:db8::1', 'fixture-host')).toBe(
       'host <host> IPv4 <host> IPv6 <host>',
     );
+    expect(modelTitle('ssh user@build-node:22/tmp/report', 'fixture-host')).toBe('ssh <host>');
+    expect(modelTitle('ssh build-node:22/tmp/report', 'fixture-host')).toBe('ssh <host>');
+    expect(modelTitle('connect 192.0.2.42:22/tmp/report', 'fixture-host')).toBe('connect <host>');
+    expect(modelTitle('connect [2001:db8::1]:22/tmp/report', 'fixture-host')).toBe('connect <host>');
+  });
+
+  it('projects host-port paths and punctuated app names in delivery', async () => {
+    const { agent, deliver } = fixture();
+    const changes: EnvUpdate['changes'] = [
+      { kind: 'app.activated', data: { name: 'Fixture (Preview)' } },
+      { kind: 'window.focused', data: { title: 'ssh build-node:22/tmp/report' } },
+    ].map((item, index) => ({
+      count: 1,
+      level: 'context',
+      signal: {
+        ...item,
+        id: String(index),
+        at: update.at,
+        subject: 'fixture',
+        source: { id: 'fixture', api: 'test', host: 'local' },
+      },
+    }));
+    await deliver('session-a', { ...intent('followup'), update: { ...update, changes } });
+    const text = JSON.stringify(agent.followup.mock.calls);
+    expect(text).toContain('Fixture (Preview)');
+    expect(text).toContain('ssh &lt;host&gt;');
+    expect(text).not.toContain('build-node');
+    expect(text).not.toContain('/tmp/');
+  });
+
+  it('uses the bounded application name even if stripping controls leaves it empty', async () => {
+    const { agent, deliver } = fixture();
+    const change = {
+      ...update.changes[0],
+      signal: { ...update.changes[0].signal, kind: 'app.activated', data: { name: '\n' } },
+    };
+    await deliver('session-a', { ...intent('followup'), update: { ...update, changes: [change] } });
+    const text = JSON.stringify(agent.followup.mock.calls);
+    expect(text).toContain('front-app: \\n');
+    expect(text).not.toContain('front-app: observation');
   });
 
   it('uses structured delivery fields instead of free-text notes and subjects', async () => {

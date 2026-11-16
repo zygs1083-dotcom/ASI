@@ -5,7 +5,7 @@ import { freezeMessage, MessageId, type UserMessage } from '@deepseek-ai/dsh-llm
 import { DeliveryFailure } from '../attention/drain.ts';
 import type { DeliveryIntent } from '../attention/pipeline.ts';
 import { formatEnvUpdate } from '../delivery/format.ts';
-import { modelLabel, modelPath, modelTitle } from './tool-output.ts';
+import { modelAppName, modelLabel, modelPath, modelTitle } from './tool-output.ts';
 
 declare module '@deepseek-ai/dsh-llm' {
   interface MessageSourceMap {
@@ -45,8 +45,8 @@ function modelUpdate(update: EnvUpdate): EnvUpdate {
         data.feedbackAvailable = signal.data.feedbackAvailable && /^[\w.:-]+$/.test(signal.id);
       }
       if (signal.kind === 'app.activated') {
-        if (typeof signal.data.name === 'string') data.name = modelLabel(signal.data.name);
-        if (typeof signal.data.previousName === 'string') data.previousName = modelLabel(signal.data.previousName);
+        if (typeof signal.data.name === 'string') data.name = modelAppName(signal.data.name);
+        if (typeof signal.data.previousName === 'string') data.previousName = modelAppName(signal.data.previousName);
       } else if (signal.kind === 'window.focused' || signal.kind === 'window.title-changed') {
         if (typeof signal.data.title === 'string') data.title = modelTitle(signal.data.title);
       } else if (signal.kind === 'file.changed') {

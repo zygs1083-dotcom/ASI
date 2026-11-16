@@ -6,6 +6,25 @@ import type { createSenseRuntime } from '../runtime/index.ts';
 import type { JsonValue } from './wire-types.ts';
 
 const MAX_BYTES = 32_768;
+const FIXED_IDENTIFIERS = new Set([
+  'accessibility',
+  'other',
+  'helper',
+  'helper.ax',
+  'helper.window',
+  'ndjson',
+  'dsh',
+  'events',
+  'registry',
+  'files',
+  'watch',
+  'body',
+  'probe',
+  'tokens',
+  'delivery',
+  'local',
+  'node',
+]);
 
 export function modelText(value: string, hostname = os.hostname()): string {
   const safe = value
@@ -23,30 +42,42 @@ export function modelTitle(value: string, hostname = os.hostname()): string {
   const escapedHost = hostname.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const projected = value
     .replace(/\b[a-z][a-z\d+.-]*:\/\/[^\s"'<>]+/gi, hide)
+    .replace(/\b[\w.+%-]+@(?:\[[\da-f:.]+\]|[\w.-]+)(?::\d+)?(?:[/\\][^\s"'<>]*)?/gi, hide)
+    .replace(
+      /\[[\da-f:.]+\](?::\d+)?(?:[/\\][^\s"'<>]*)?|(?<![\w:])(?:[\da-f]{0,4}:){2,}[\da-f]{0,4}(?![\w:])(?:[/\\][^\s"'<>]*)?/gi,
+      hide,
+    )
+    .replace(/\b(?:\d{1,3}\.){3}\d{1,3}(?::\d+)?\b(?:[/\\][^\s"'<>]*)?/gi, hide)
+    .replace(/\b[a-z\d_-]+(?:\.[a-z\d_-]+)*:\d+\b(?:[/\\][^\s"'<>]*)?/gi, hide)
     .replace(/(?<![\w])(?:[A-Za-z]:\\|\/|[\p{L}\p{N}._-]+\/)(?:[^\s"'<>/\\]+[/\\])*[^\s"'<>/\\]*/gu, (path) => {
       const parts = path.split(/[\\/]/).filter(Boolean);
       return parts.at(-1) ?? '[path]';
-    })
-    .replace(/\b[\w.+%-]+@(?:\[[\da-f:.]+\]|[\w.-]+)(?::\d+)?/gi, hide)
-    .replace(/\[[\da-f:.]+\](?::\d+)?|(?<![\w:])(?:[\da-f]{0,4}:){2,}[\da-f]{0,4}(?![\w:])/gi, hide)
-    .replace(/\b(?:\d{1,3}\.){3}\d{1,3}(?::\d+)?\b/gi, hide)
-    .replace(/\b[a-z\d_-]+(?:\.[a-z\d_-]+)*:\d+\b/gi, hide);
+    });
   const withoutLocalHost = hostname ? projected.replace(new RegExp(escapedHost, 'gi'), hide) : projected;
   return withoutLocalHost.replace(/\0(\d+)\0/g, (_match, index: string) => hidden[Number(index)] ?? '<host>');
 }
 
-function minimize(value: JsonValue, hostname: string, title = false): JsonValue {
-  if (title && typeof value === 'string') return modelTitle(value, hostname);
-  if (typeof value === 'string') return modelText(value, hostname);
-  if (Array.isArray(value)) return value.map((item) => minimize(item, hostname));
+function minimize(value: JsonValue, hostname: string, path = '', appNamePaths: readonly string[] = []): JsonValue {
+  if (typeof value === 'string') {
+    if (
+      appNamePaths.includes(path) ||
+      ((path.endsWith('.source.id') || path.endsWith('.source.api')) && FIXED_IDENTIFIERS.has(value))
+    )
+      return value;
+    return path === 'title' || path.endsWith('.title') ? modelTitle(value, hostname) : modelText(value, hostname);
+  }
+  if (Array.isArray(value)) return value.map((item) => minimize(item, hostname, path, appNamePaths));
   if (value === null || typeof value !== 'object') return value;
   const entries: Record<string, JsonValue> = Object.create(null);
   for (const [key, child] of Object.entries(value)) {
     if (key === 'host' || key === 'endpoint' || key === 'command' || key === 'userSession') continue;
-    const base = modelText(key, hostname);
+    const fixedKey =
+      (path === 'sources' || path === 'observation.sources' || path.endsWith('permissions.value')) &&
+      FIXED_IDENTIFIERS.has(key);
+    const base = fixedKey ? key : modelText(key, hostname);
     let name = base;
     for (let n = 2; Object.hasOwn(entries, name); n++) name = `${base} (${n})`;
-    entries[name] = minimize(child, hostname, key === 'title');
+    entries[name] = minimize(child, hostname, path ? `${path}.${key}` : key, appNamePaths);
   }
   return entries;
 }
@@ -60,8 +91,18 @@ export function modelLabel(value: string): string {
   return /^[\p{L}\p{N}_ -]+$/u.test(value) ? modelText(value) : '[redacted]';
 }
 
+export function modelAppName(value: string): string {
+  return Array.from(value.replace(/\p{Cc}/gu, ''))
+    .slice(0, 256)
+    .join('');
+}
+
 function identifier(value: string): string {
   return /^[\w-]+$/.test(value) ? modelText(value) : '[redacted]';
+}
+
+function sourceIdentifier(value: string): string {
+  return FIXED_IDENTIFIERS.has(value) ? value : identifier(value);
 }
 
 function pick(value: object, keys: readonly string[]): Record<string, unknown> {
@@ -74,7 +115,7 @@ function fact<T>(input: Fact<T>, project: (value: T) => unknown): object {
   return {
     value: input.value === null ? null : project(input.value),
     status: input.status,
-    source: { id: identifier(input.source.id), api: identifier(input.source.api) },
+    source: { id: sourceIdentifier(input.source.id), api: sourceIdentifier(input.source.api) },
     observedAt: input.observedAt,
     ttlMs: input.ttlMs,
   };
@@ -93,7 +134,7 @@ function dictionary<T>(values: Record<string, T>, key: (value: string) => string
 
 function observations(state: SenseState['observation']) {
   return {
-    sources: dictionary(state.sources, identifier, (source) => pick(source, ['status', 'lastSignalAt'])),
+    sources: dictionary(state.sources, sourceIdentifier, (source) => pick(source, ['status', 'lastSignalAt'])),
   };
 }
 
@@ -105,7 +146,14 @@ export function modelState(state: SenseState, now: number, section?: 'self' | 'e
       activity: fact(self.activity, (value) => value),
       pending: fact(self.pending, (value) => pick(value, ['inbox', 'jobs'])),
       tools: fact(self.tools, (value) => value.map(identifier)),
-      permissions: fact(self.permissions, (value) => dictionary(value, identifier, (status) => status)),
+      permissions: fact(self.permissions, (value) =>
+        dictionary(
+          value,
+          (key) =>
+            key === '辅助功能' ? 'accessibility' : key === '其他权限（DSH 未提供）' ? 'other' : identifier(key),
+          (status) => status,
+        ),
+      ),
       body: {
         cpu: fact(body.cpu, (value) => pick(value, ['usage', 'perCore', 'load1', 'load5', 'load15'])),
         memory: fact(body.memory, (value) => pick(value, ['total', 'used', 'pressure', 'swapUsed'])),
@@ -137,7 +185,7 @@ export function modelState(state: SenseState, now: number, section?: 'self' | 'e
         observed: fact(env.where.observed, () => ({})),
         toolExec: fact(env.where.toolExec, (value) => ({ cwd: modelPath(value.cwd) })),
       },
-      frontApp: fact(env.frontApp, (value) => ({ name: modelLabel(value.name) })),
+      frontApp: fact(env.frontApp, (value) => ({ name: modelAppName(value.name) })),
       focusedWindow: fact(env.focusedWindow, (value) => ({ title: value.title })),
       activeJobs: fact(env.activeJobs, (value) =>
         value.map((job) => ({ ...pick(job, ['startedAt', 'status', 'exitCode']), id: identifier(job.id) })),
@@ -148,7 +196,7 @@ export function modelState(state: SenseState, now: number, section?: 'self' | 'e
     },
     observation: observations(state.observation),
   };
-  return modelOutput(section ? projected[section] : projected, now);
+  return modelOutput(section ? projected[section] : projected, now, ['env.frontApp.value.name', 'frontApp.value.name']);
 }
 
 export function modelRules(rules: WatchRule[]): JsonValue {
@@ -308,8 +356,8 @@ function ages(value: JsonValue, now: number): JsonValue {
   return entries;
 }
 
-export function modelOutput(value: unknown, now?: number): JsonValue {
-  const normalized = minimize(json(value), os.hostname());
+export function modelOutput(value: unknown, now?: number, appNamePaths: readonly string[] = []): JsonValue {
+  const normalized = minimize(json(value), os.hostname(), '', appNamePaths);
   const result = now === undefined ? normalized : ages(normalized, now);
   if (Buffer.byteLength(JSON.stringify(result), 'utf8') <= MAX_BYTES) return result;
   return {
@@ -334,7 +382,8 @@ export function environmentDetail(
   const axStatus = observation.sources['helper.ax']?.status;
   const countDenied = axStatus === 'denied' || axStatus === 'unsupported';
   const title = env.focusedWindow.value?.title;
-  const matchesApp = front === null ? null : app === undefined || app === front.name || app === front.bundleId;
+  const matchesApp =
+    front === null ? null : app === undefined || app === modelAppName(front.name) || app === front.bundleId;
   const matchesWindow = window === undefined ? true : title === undefined ? null : modelTitle(title) === window;
   const available = matchesApp === true && matchesWindow === true;
   const mismatch = matchesApp === false || matchesWindow === false;
@@ -359,20 +408,24 @@ export function environmentDetail(
         .slice(-20)
         .map(({ kind, at, level }) => ({ kind, at, level }))
     : [];
-  return modelOutput({
-    current: available,
-    match: mismatch ? 'not-current' : available ? 'current' : 'unknown',
-    app: mismatch
-      ? null
-      : fact(env.frontApp, (value) => ({
-          name: modelLabel(value.name),
-          ...pick(value, ['pid', ...(countFresh && !countDenied ? ['windowCount'] : [])]),
-        })),
-    window: mismatch ? null : fact(env.focusedWindow, (value) => ({ title: value.title })),
-    pid,
-    windowCount,
-    recentEvents: events,
-    sources: observations(observation).sources,
-    guidance: '如需查看窗口内容，请使用当前会话可用的 computer-use 工具（需经其授权流程）',
-  });
+  return modelOutput(
+    {
+      current: available,
+      match: mismatch ? 'not-current' : available ? 'current' : 'unknown',
+      app: mismatch
+        ? null
+        : fact(env.frontApp, (value) => ({
+            name: modelAppName(value.name),
+            ...pick(value, ['pid', ...(countFresh && !countDenied ? ['windowCount'] : [])]),
+          })),
+      window: mismatch ? null : fact(env.focusedWindow, (value) => ({ title: value.title })),
+      pid,
+      windowCount,
+      recentEvents: events,
+      sources: observations(observation).sources,
+      guidance: '如需查看窗口内容，请使用当前会话可用的 computer-use 工具（需经其授权流程）',
+    },
+    undefined,
+    ['app.value.name'],
+  );
 }

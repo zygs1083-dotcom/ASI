@@ -1,3 +1,4 @@
+import os from 'node:os';
 import type { SenseState } from '@asi/sense-types';
 import { Context } from '@deepseek-ai/cordis';
 import type { Agent } from '@deepseek-ai/dsh-agent';
@@ -217,6 +218,72 @@ describe('model-facing tools', () => {
     expect(JSON.stringify(hidden.value)).not.toContain('Synthetic title');
   });
 
+  it('exposes stable permission and source keys to model tools', async () => {
+    const h = await fixture();
+    h.state.self.permissions.value = { 辅助功能: 'denied', '其他权限（DSH 未提供）': 'unknown' };
+    h.state.self.permissions.source = { id: 'helper.ax', api: 'accessibility', host: 'local' };
+    h.state.observation.sources['helper.ax'] = { status: 'denied', lastSignalAt: 990 };
+    h.state.observation.sources['helper.window'] = { status: 'unknown', lastSignalAt: 990 };
+    const state = await h.call('env_state', {});
+    expect(state.value).toMatchObject({
+      self: {
+        permissions: {
+          value: { accessibility: 'denied', other: 'unknown' },
+          source: { id: 'helper.ax', api: 'accessibility' },
+        },
+      },
+      observation: { sources: { 'helper.ax': { status: 'denied' }, 'helper.window': { status: 'unknown' } } },
+    });
+    expect((await h.call('env_detail', {})).value).toMatchObject({
+      sources: { 'helper.ax': { status: 'denied' }, 'helper.window': { status: 'unknown' } },
+    });
+  });
+
+  it('retains fixed source keys without exempting matching window titles from host redaction', async () => {
+    const hostname = vi.spyOn(os, 'hostname').mockReturnValue('helper');
+    try {
+      const h = await fixture();
+      h.state.self.permissions.value = { 辅助功能: 'granted', '其他权限（DSH 未提供）': 'unknown' };
+      h.state.self.permissions.source = { id: 'helper.ax', api: 'accessibility', host: 'local' };
+      h.state.observation.sources['helper.ax'] = { status: 'ok', lastSignalAt: 990 };
+      h.state.env.focusedWindow.value = { title: 'helper' };
+      expect((await h.call('env_state', {})).value).toMatchObject({
+        self: { permissions: { source: { id: 'helper.ax' }, value: { accessibility: 'granted', other: 'unknown' } } },
+        observation: { sources: { helper: { status: 'ok' }, 'helper.ax': { status: 'ok' } } },
+        env: { focusedWindow: { value: { title: '<host>' } } },
+      });
+      expect((await h.call('env_detail', { window: '<host>' })).value).toMatchObject({
+        current: true,
+        sources: { helper: { status: 'ok' }, 'helper.ax': { status: 'ok' } },
+      });
+    } finally {
+      hostname.mockRestore();
+    }
+  });
+
+  it('preserves bounded application names and matches the name visible to the model', async () => {
+    const h = await fixture();
+    if (!h.state.env.frontApp.value) throw new Error('fixture missing');
+    h.state.env.frontApp.value.name = 'Fixture (Preview)';
+    expect((await h.call('env_state', { section: 'env' })).value).toMatchObject({
+      frontApp: { value: { name: 'Fixture (Preview)' } },
+    });
+    expect((await h.call('env_detail', { app: 'Fixture (Preview)' })).value).toMatchObject({
+      current: true,
+      app: { value: { name: 'Fixture (Preview)' } },
+    });
+    expect((await h.call('env_detail', { app: 'org.fixture.app' })).value).toMatchObject({ current: true });
+    h.state.env.frontApp.value.name = `Fixture\n(App) /fixture/preview ${'x'.repeat(300)}`;
+    const env = (await h.call('env_state', { section: 'env' })).value as { frontApp: { value: { name: string } } };
+    const name = env.frontApp.value.name;
+    expect(name.startsWith('Fixture(App) /fixture/preview ')).toBe(true);
+    expect(Array.from(name).length).toBeLessThanOrEqual(256);
+    expect((await h.call('env_detail', { app: name })).value).toMatchObject({
+      current: true,
+      app: { value: { name } },
+    });
+  });
+
   it('minimizes machine, endpoint, paths, and foreign job commands in model output', async () => {
     const h = await fixture();
     h.state.env.where.harness.value = { host: 'fixture-host.invalid', os: 'FixtureOS', pid: 123 };
@@ -294,6 +361,18 @@ describe('model-facing tools', () => {
     expect(JSON.stringify(result.value)).not.toContain('backup.example.invalid');
     h.setTitles(false);
     expect(JSON.stringify((await h.call('env_state', {})).value)).not.toContain(title);
+  });
+
+  it('hides a host with port and following path in both model tools', async () => {
+    const h = await fixture();
+    h.state.env.focusedWindow.value = { title: 'ssh build-node:22/tmp/report' };
+    expect((await h.call('env_state', { section: 'env' })).value).toMatchObject({
+      focusedWindow: { value: { title: 'ssh <host>' } },
+    });
+    expect((await h.call('env_detail', { window: 'ssh <host>' })).value).toMatchObject({
+      current: true,
+      window: { value: { title: 'ssh <host>' } },
+    });
   });
 
   it('isolates actual model state by caller and selects the local panel session', async () => {
@@ -510,8 +589,7 @@ describe('model-facing tools', () => {
 
   it('bounds complete results and removes tool and prompt contributions on disposal', async () => {
     const h = await fixture();
-    if (!h.state.env.frontApp.value) throw new Error('fixture missing');
-    h.state.env.frontApp.value.name = '汉'.repeat(20_000);
+    h.state.env.focusedWindow.value = { title: '汉'.repeat(20_000) };
     const result = await h.call('env_state', { section: 'env' });
     expect(result).toMatchObject({ isError: false, value: { truncated: true } });
     expect(Buffer.byteLength(JSON.stringify(result.value), 'utf8')).toBeLessThan(32_768);

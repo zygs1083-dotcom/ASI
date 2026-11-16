@@ -52,7 +52,7 @@ function changeLines(ch: EnvChange, includeTitles: boolean, includeJobCommands: 
   const s = ch.signal;
   let main: string;
   if (s.kind === 'app.activated') {
-    main = `front-app: ${esc(str(s.data.name) || s.subject)}`;
+    main = `front-app: ${esc(typeof s.data.name === 'string' ? s.data.name : s.subject)}`;
     const prev = str(s.data.previousName);
     if (prev) main += ` (was: ${esc(prev)})`;
   } else if (WINDOW_KINDS.has(s.kind)) {
