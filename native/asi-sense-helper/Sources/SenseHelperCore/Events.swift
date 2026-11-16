@@ -23,9 +23,12 @@ public struct HelloEvent: Encodable {
   public var v = 1; public var type = "hello"; public var at: Int64
   public var version = "0.1.0"
   public var pid: Int32
+  // Random per-process stream id: the host learns it here and requires the
+  // same value on every titles.ack before trusting that ack.
+  public var session: String
   public var permissions: Permissions
-  public init(at: Int64, pid: Int32, permissions: Permissions) {
-    self.at = at; self.pid = pid; self.permissions = permissions }
+  public init(at: Int64, pid: Int32, session: String, permissions: Permissions) {
+    self.at = at; self.pid = pid; self.session = session; self.permissions = permissions }
 }
 
 public struct AppEvent: Encodable {
@@ -93,14 +96,18 @@ public struct ErrorEvent: Encodable {
 }
 
 // Confirms a `titles` command was applied; `gen` is the privacy generation the
-// ack belongs to. `id` echoes the command's correlation id when supplied.
+// ack belongs to. `id` echoes the command's correlation id when supplied and
+// `session` echoes the value hello advertised, so the host can reject acks
+// from a stale helper stream.
 public struct TitlesAckEvent: Encodable {
   public var v = 1; public var type = "titles.ack"; public var at: Int64
+  public var session: String
   public var id: CommandID?
   public var enabled: Bool
   public var gen: Int
-  public init(at: Int64, id: CommandID? = nil, enabled: Bool, gen: Int) {
-    self.at = at; self.id = id; self.enabled = enabled; self.gen = gen }
+  public init(at: Int64, session: String, id: CommandID? = nil, enabled: Bool, gen: Int) {
+    self.at = at; self.session = session; self.id = id
+    self.enabled = enabled; self.gen = gen }
 }
 
 public struct SnapshotEvent: Encodable {

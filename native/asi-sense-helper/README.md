@@ -32,15 +32,17 @@ helper (bounds and semantics: PROTOCOL.md):
 
 - **stdin**: nonblocking reader, 16KiB chunks, <=64KiB physical-line framing,
   <=256KiB ordinary pending, serialized commands. Valid `titles`/`quit`
-  commands are controls that jump the backlog (newest per class) even while a
-  snapshot is in flight; ordinary drops report `input_overflow` with
+  commands apply individually in order, bypassing a snapshot in flight;
+  synchronous consumption backpressures stdin without a pending control queue.
+  Parsing stops at quit; ordinary drops report `input_overflow` with
   per-type counts.
 - **stdout**: nonblocking bounded writer (1024 lines / 1MiB); oldest
   noncritical evictions report one coalesced `output_overflow`
   (`dropped`/`droppedTypes`) as the next whole line; criticals
   (`hello`,`error`,`app.terminated`,`ax.unsupported`,`snapshot`,`titles.ack`)
   never drop - a full critical queue fails fast.
-- **privacy**: `titles` applies synchronously (privacy generation bump),
+- **privacy**: titles start off; hello/acks share a random per-process session.
+  The host waits for its latest intent's matching ack. `titles` applies synchronously (saturating generation bump),
   flips the central encoder (recursive `title`-key stripping), purges queued
   title lines and emits a critical `titles.ack` - the host's privacy fence.
   Title lines are <=PIPE_BUF (512B on Darwin) and write atomically - either
@@ -48,7 +50,8 @@ helper (bounds and semantics: PROTOCOL.md):
   prefix on the wire.
 - **AX**: all IPC on a serial queue with a 0.5s timeout; app/window/privacy
   generation checks drop stale results; one coalesced privacy job applies the
-  latest generation regardless of toggle storms.
+  latest generation regardless of toggle storms. Source titles are truncated
+  to 1024 Characters on the AX queue before encoding.
 - `CommandChannel` owns the stdin/privacy/stdout plumbing shared by the real
   runtime and the `Tests/PipeFixture` synthetic process used by pipe-level
   regression tests.

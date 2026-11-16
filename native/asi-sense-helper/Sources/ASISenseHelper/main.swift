@@ -47,6 +47,7 @@ final class HelperRuntime {
   }
   private func emitHello() {
     emit(HelloEvent(at: nowMs(), pid: ProcessInfo.processInfo.processIdentifier,
+                    session: channel.session,
                     permissions: .init(accessibility: permissionState())))
   }
   private func emitApp(_ type: String, _ a: NSRunningApplication) {

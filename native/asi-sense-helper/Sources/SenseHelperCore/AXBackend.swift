@@ -22,6 +22,22 @@ public struct AXObserverCreateError: Error {
   public init(axError: AXError) { self.axError = axError }
 }
 
+public extension AXBackend {
+  // AX supplies the source string; bound downstream work on the AX queue
+  // before it reaches events, the debouncer or the main-thread encoder.
+  static var sourceTitleLimit: Int { 1024 }
+  func boundedTitle(_ window: Element) -> (AXError, String?) {
+    let (err, t) = title(window)
+    guard let t else { return (err, t) }
+    // One Character can contain unbounded scalars. Cap those first, then drop
+    // the possibly incomplete final grapheme before the Character limit.
+    let scalars = t.unicodeScalars.prefix(2048)
+    var bounded = String(scalars)
+    if scalars.endIndex != t.unicodeScalars.endIndex { bounded = String(bounded.dropLast()) }
+    return (err, String(bounded.prefix(Self.sourceTitleLimit)))
+  }
+}
+
 // Production backend: 0.5s messaging timeout on app and window elements;
 // the callback forwards (observer, element, name) to the session.
 public final class SystemAXBackend: AXBackend {

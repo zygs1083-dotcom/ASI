@@ -198,8 +198,10 @@ private final class FixtureProcess {
     return false
   }
   @discardableResult
-  func waitStderr(_ marker: String, timeout: TimeInterval = 10) -> Bool {
-    waitFor(timeout) { self.stderrText().contains(marker) }
+  func waitStderr(_ marker: String, count: Int = 1, timeout: TimeInterval = 10) -> Bool {
+    waitFor(timeout) {
+      self.stderrText().components(separatedBy: marker).count - 1 >= count
+    }
   }
   @discardableResult
   func waitForLine(containing needle: String, timeout: TimeInterval = 10) -> String? {
@@ -207,6 +209,15 @@ private final class FixtureProcess {
     _ = waitFor(timeout) {
       found = self.snapshotLines().first { $0.contains(needle) }
       return found != nil
+    }
+    return found
+  }
+  func waitForLines(containing needle: String, count: Int = 1, timeout: TimeInterval = 10) -> [String]? {
+    var found: [String]?
+    _ = waitFor(timeout) {
+      let m = self.snapshotLines().filter { $0.contains(needle) }
+      if m.count >= count { found = m; return true }
+      return false
     }
     return found
   }
@@ -411,11 +422,15 @@ final class ProcessTests: XCTestCase {
   // bypasses the whole stuck pipeline.
   func testFixtureAControlBypassesBlockedSnapshotAndOverflow() throws {
     let p = try launchFixture(["--gate-fw-from=2", "--release-delay-ms=2500"])
+    XCTAssertNotNil(p.waitForLine(containing: "window.focused"))
+    p.send("{\"cmd\":\"titles\",\"enabled\":true,\"id\":\"A-enable\"}\n")
+    XCTAssertNotNil(p.waitForLine(containing: "\"id\":\"A-enable\""))
+    XCTAssertTrue(p.waitStderr("fixture:title-read"))
     p.send("{\"cmd\":\"snapshot\"}\n")
     XCTAssertTrue(p.waitStderr("fixture:gate-hold"), "first snapshot must reach the gated AX read")
     p.send(String(repeating: "{\"cmd\":\"snapshot\"}\n", count: 15000)) // ~270KiB
     p.send("{\"cmd\":\"titles\",\"enabled\":false,\"id\":\"A1\"}\n")
-    guard let ack = p.waitForLine(containing: "titles.ack", timeout: 10) else {
+    guard let ack = p.waitForLine(containing: "\"id\":\"A1\"", timeout: 10) else {
       return XCTFail("ack must arrive while the backlog and AX read are still blocked")
     }
     XCTAssertFalse(p.stderrText().contains("fixture:gate-release"),
@@ -444,6 +459,10 @@ final class ProcessTests: XCTestCase {
   // titles hook), so the completed snapshot must carry no title.
   func testFixtureBAckPrecedesGateReleaseSnapshotHasNoTitle() throws {
     let p = try launchFixture(["--gate-fw-from=2", "--release-delay-ms=750"])
+    XCTAssertNotNil(p.waitForLine(containing: "window.focused"))
+    p.send("{\"cmd\":\"titles\",\"enabled\":true,\"id\":\"B-enable\"}\n")
+    XCTAssertNotNil(p.waitForLine(containing: "\"id\":\"B-enable\""))
+    XCTAssertTrue(p.waitStderr("fixture:title-read"))
     p.send("{\"cmd\":\"snapshot\"}\n")
     XCTAssertTrue(p.waitStderr("fixture:gate-hold"))
     p.send("{\"cmd\":\"titles\",\"enabled\":false,\"id\":\"B1\"}\n")
@@ -469,6 +488,10 @@ final class ProcessTests: XCTestCase {
     let p = try launchFixture(["--title-len=60000"], prefillStdout: true,
                               drainStdout: false)
     XCTAssertGreaterThan(p.stdoutBuffered(), 16 * 1024, "pipe must start full")
+    // Titles default off: enable first so the snapshot is actually titled.
+    p.send("{\"cmd\":\"titles\",\"enabled\":true,\"id\":\"C0\"}\n")
+    XCTAssertTrue(p.waitStderr("fixture:titles-applied"),
+                  "privacy enable must apply before the titled snapshot")
     p.send("{\"cmd\":\"snapshot\"}\n")
     XCTAssertTrue(p.waitStderr("fixture:snapshot-done"),
                   "the title-bearing snapshot must be queued in the writer")
@@ -477,7 +500,7 @@ final class ProcessTests: XCTestCase {
     p.send("{\"cmd\":\"titles\",\"enabled\":false,\"id\":\"C1\"}\n")
     // The marker is emitted only after the full control applied: the purge and
     // the ack enqueue are already done when stdout starts draining.
-    XCTAssertTrue(p.waitStderr("fixture:titles-applied"),
+    XCTAssertTrue(p.waitStderr("fixture:titles-applied", count: 2),
                   "privacy applies while stdout is still blocked")
     p.startDraining()
     guard let ack = p.waitForLine(containing: "\"id\":\"C1\"", timeout: 10) else {
@@ -511,5 +534,98 @@ final class ProcessTests: XCTestCase {
   // title bytes - hello/thermal may consume the hole, nothing else fits.
   func testFixtureC2PartialFreeSpaceTitleNeverWritten() throws {
     try fixturePrivacyPurgeFlow(prefreeBytes: 64)
+  }
+  private func jsonDict(_ line: String) -> [String: Any]? {
+    (try? JSONSerialization.jsonObject(with: Data(line.utf8))) as? [String: Any]
+  }
+  // One write produces three ordered acks in the hello session.
+  func testFixtureTitlesControlsAckEachInOrderWithSession() throws {
+    let p = try launchFixture()
+    guard let hello = p.waitForLine(containing: "\"type\":\"hello\""),
+          let session = jsonDict(hello)?["session"] as? String, !session.isEmpty else {
+      return XCTFail("hello must carry a nonempty session")
+    }
+    XCTAssertNotNil(UUID(uuidString: session), "session must be a UUID")
+    p.send("{\"cmd\":\"titles\",\"enabled\":true,\"id\":\"A\"}\n" +
+           "{\"cmd\":\"titles\",\"enabled\":false,\"id\":\"B\"}\n" +
+           "{\"cmd\":\"titles\",\"enabled\":true,\"id\":\"C\"}\n")
+    guard let acks = p.waitForLines(containing: "titles.ack", count: 3) else {
+      return XCTFail("every titles control gets its own ack")
+    }
+    var gens: [Int] = []
+    for (i, want) in [("A", true), ("B", false), ("C", true)].enumerated() {
+      guard let d = jsonDict(acks[i]) else { return XCTFail("ack must be JSON") }
+      XCTAssertEqual(d["id"] as? String, want.0)
+      XCTAssertEqual(d["enabled"] as? Bool, want.1)
+      XCTAssertEqual(d["session"] as? String, session, "ack session must match hello")
+      guard let g = d["gen"] as? Int else { return XCTFail("ack must carry gen") }
+      gens.append(g)
+    }
+    XCTAssertEqual(gens, gens.sorted())
+    XCTAssertEqual(Set(gens).count, 3, "gens strictly increase per control")
+    p.send("{\"cmd\":\"quit\"}\n")
+    XCTAssertEqual(p.waitExit(), 0)
+  }
+  // Default-off focus and a real enabled -> disabled -> enabled interval.
+  func testFixtureDefaultOffAndDisabledSnapshotInterval() throws {
+    let p = try launchFixture()
+    guard let focused = p.waitForLine(containing: "window.focused") else {
+      return XCTFail("initial focus must arrive")
+    }
+    XCTAssertFalse(focused.contains("\"title\""), "default-off focus is title-free")
+    XCTAssertFalse(p.stderrText().contains("fixture:title-read"),
+                   "no AXTitle read while titles are off")
+    p.send("{\"cmd\":\"titles\",\"enabled\":true,\"id\":\"A2\"}\n")
+    XCTAssertNotNil(p.waitForLine(containing: "\"id\":\"A2\""))
+    XCTAssertTrue(p.waitStderr("fixture:title-read"))
+    p.send("{\"cmd\":\"titles\",\"enabled\":false,\"id\":\"B2\"}\n")
+    XCTAssertNotNil(p.waitForLine(containing: "\"id\":\"B2\""))
+    p.send("{\"cmd\":\"snapshot\"}\n")
+    guard let snap = p.waitForLine(containing: "\"type\":\"snapshot\"") else {
+      return XCTFail("snapshot must arrive")
+    }
+    XCTAssertTrue(snap.contains("\"status\":\"ok\""),
+                  "attached window reports ok even while titles are off")
+    XCTAssertFalse(snap.contains("\"title\""), "no nested title while disabled")
+    p.send("{\"cmd\":\"titles\",\"enabled\":true,\"id\":\"C2\"}\n")
+    XCTAssertNotNil(p.waitForLine(containing: "\"id\":\"C2\""))
+    p.send("{\"cmd\":\"quit\"}\n")
+    XCTAssertEqual(p.waitExit(), 0)
+  }
+  // Quit terminates parsing in the same write.
+  func testFixtureQuitTerminatesParsingSameWrite() throws {
+    let p = try launchFixture()
+    p.send("{\"cmd\":\"quit\"}\n" +
+           "{\"cmd\":\"titles\",\"enabled\":true,\"id\":\"after\"}\n" +
+           "{\"cmd\":\"quit\"}\n")
+    XCTAssertEqual(p.waitExit(), 0)
+    XCTAssertFalse(p.snapshotLines().contains { $0.contains("\"id\":\"after\"") },
+                   "nothing after quit is parsed or acked")
+  }
+  func testFixtureSessionsDifferAcrossLaunches() throws {
+    let p1 = try launchFixture(), p2 = try launchFixture()
+    guard let h1 = p1.waitForLine(containing: "\"type\":\"hello\""),
+          let h2 = p2.waitForLine(containing: "\"type\":\"hello\""),
+          let s1 = jsonDict(h1)?["session"] as? String,
+          let s2 = jsonDict(h2)?["session"] as? String else {
+      return XCTFail("both launches must emit a session in hello")
+    }
+    XCTAssertNotEqual(s1, s2)
+    p1.send("{\"cmd\":\"quit\"}\n"); p2.send("{\"cmd\":\"quit\"}\n")
+    XCTAssertEqual(p1.waitExit(), 0)
+    XCTAssertEqual(p2.waitExit(), 0)
+  }
+  func testFixtureLargeSourceQuitLatency() throws {
+    let p = try launchFixture(["--title-len=52428800"])
+    XCTAssertNotNil(p.waitForLine(containing: "window.focused"))
+    p.send("{\"cmd\":\"titles\",\"enabled\":true,\"id\":\"large\"}\n")
+    XCTAssertNotNil(p.waitForLine(containing: "\"id\":\"large\""))
+    XCTAssertNotNil(p.waitForLine(containing: "window.title"))
+    p.send("{\"cmd\":\"snapshot\"}\n")
+    Thread.sleep(forTimeInterval: 0.05)
+    let start = ProcessInfo.processInfo.systemUptime
+    p.send("{\"cmd\":\"quit\"}\n")
+    XCTAssertEqual(p.waitExit(timeout: 1), 0)
+    XCTAssertLessThanOrEqual(ProcessInfo.processInfo.systemUptime - start, 0.2)
   }
 }

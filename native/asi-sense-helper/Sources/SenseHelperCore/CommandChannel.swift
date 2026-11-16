@@ -17,13 +17,16 @@ public final class CommandChannel {
   private let nowMs: () -> Int64
   private var encoder: LineEncoder
   private var titlesEnabled: Bool
+  // Fixed for the life of the process; hello advertises it and every
+  // titles.ack echoes it so the host can match acks to this exact stream.
+  public let session = UUID().uuidString
   public let reader: InputReader
   public let writer: OutputWriter
 
   public init(inputFD: Int32 = STDIN_FILENO, outputFD: Int32 = STDOUT_FILENO,
               queue: DispatchQueue = .main,
               nowMs: @escaping () -> Int64 = { Int64(Date().timeIntervalSince1970 * 1000) },
-              titlesEnabled: Bool = true) {
+              titlesEnabled: Bool = false) {
     self.nowMs = nowMs
     self.titlesEnabled = titlesEnabled
     encoder = LineEncoder(titlesEnabled: titlesEnabled)
@@ -84,19 +87,34 @@ public final class CommandChannel {
     switch cmd {
     case .titles(let on, let id):
       let gen = onTitles?(on) ?? -1 // session generation, bumped synchronously
+      guard gen != Int.max else { privacyExhausted(); return }
       titlesEnabled = on
       encoder.titlesEnabled = on
       if !on { writer.purgeUnstartedTitles(stripCritical: LineEncoder.stripTitles(fromLine:)) }
-      send(TitlesAckEvent(at: nowMs(), id: id, enabled: on, gen: gen))
+      send(TitlesAckEvent(at: nowMs(), session: session, id: id, enabled: on, gen: gen))
     case .quit:
       // Invalidates the privacy generation so in-flight title work dies, and
       // purges queued titles before the bounded shutdown drain.
-      _ = onTitles?(false)
+      let gen = onTitles?(false) ?? -1
+      guard gen != Int.max else { privacyExhausted(); return }
       titlesEnabled = false
       encoder.titlesEnabled = false
       writer.purgeUnstartedTitles(stripCritical: LineEncoder.stripTitles(fromLine:))
       onQuit?()
     default: break
     }
+  }
+  // Saturated privacy generations are fatal: the generation can never wrap
+  // back into a stale value, so the helper dies loudly instead of acking a
+  // max/wrapped gen. No titles.ack is emitted for the exhausting command.
+  private func privacyExhausted() {
+    titlesEnabled = false
+    encoder.titlesEnabled = false
+    writer.purgeUnstartedTitles(stripCritical: LineEncoder.stripTitles(fromLine:))
+    emitError("privacy-generation-exhausted",
+              "privacy generation counter saturated; helper must be rebuilt")
+    stopInput()
+    flushOutput()
+    onFatal?()
   }
 }

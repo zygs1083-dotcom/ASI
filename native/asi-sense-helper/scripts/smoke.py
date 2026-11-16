@@ -72,6 +72,14 @@ def main():
             print("FAIL: no hello event")
             return 1
         hello = next(e for e in events if e.get("type") == "hello")
+        session = hello.get("session")
+        send({"cmd": "titles", "enabled": True, "id": "smoke-enable"})
+        if not session or not wait_for(lambda: any(
+                e.get("type") == "titles.ack" and e.get("session") == session
+                and e.get("id") == "smoke-enable" and e.get("enabled") is True
+                for e in events), 5):
+            print("FAIL: no current-session enable ack")
+            return 1
         ax_ok = hello.get("permissions", {}).get("accessibility") == "granted"
         if not ax_ok:
             print("accessibility denied: skipping real app switching "
@@ -96,11 +104,14 @@ def main():
         # The fence is the matching titles.ack; all events at/after it must be
         # title-free.
         wait_for(lambda: any(e.get("type") == "titles.ack"
+                             and e.get("session") == session
                              and e.get("id") == "smoke-fence"
                              and e.get("enabled") is False
                              for e in events), 5)
         fence_idx = next((i for i, e in enumerate(events)
                           if e.get("type") == "titles.ack"
+                          and e.get("session") == session
+                          and e.get("enabled") is False
                           and e.get("id") == "smoke-fence"), None)
         wait_for(lambda: fence_idx is not None and any(
             e.get("type") == "window.focused" for e in events[fence_idx:]), 8)

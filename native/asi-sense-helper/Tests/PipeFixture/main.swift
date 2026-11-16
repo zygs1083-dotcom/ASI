@@ -4,8 +4,7 @@ import SenseHelperCore
 
 // Test-only synthetic helper: the SAME CommandChannel + AXSession wiring as the
 // real helper, driven by a deterministic fake AX backend. argv flags configure
-// a semaphore gate on focusedWindow calls and a synthetic title; fixed
-// non-sensitive markers go to stderr for parent-side synchronization.
+// a focusedWindow gate and a synthetic title; markers contain no title bytes.
 private func nowMs() -> Int64 { Int64(Date().timeIntervalSince1970 * 1000) }
 private func note(_ s: String) { FileHandle.standardError.write(Data((s + "\n").utf8)) }
 
@@ -28,7 +27,10 @@ final class SyntheticAX: AXBackend {
     }
     return (.success, window)
   }
-  func title(_ window: El) -> (AXError, String?) { (.success, title) }
+  func title(_ window: El) -> (AXError, String?) {
+    note("fixture:title-read")
+    return (.success, title)
+  }
   func equal(_ a: El, _ b: El) -> Bool { a.id == b.id }
   func equalObserver(_ a: Obs, _ b: Obs) -> Bool { a === b }
   func detach(_ o: Obs) {}
@@ -43,7 +45,8 @@ for arg in CommandLine.arguments.dropFirst() {
 }
 
 let synthetic = SyntheticAX()
-synthetic.title = "FIXTLEAK-BEGIN-" + String(repeating: "x", count: titleLen) + "-FIXTLEAK-END"
+synthetic.title = titleLen > 1024 * 1024 ? String(repeating: "x", count: titleLen)
+  : "FIXTLEAK-BEGIN-" + String(repeating: "x", count: titleLen) + "-FIXTLEAK-END"
 if gateFrom > 0 { synthetic.gateFrom = gateFrom; synthetic.gate = DispatchSemaphore(value: 0) }
 
 let channel = CommandChannel(queue: .main, nowMs: nowMs)
@@ -57,7 +60,7 @@ channel.onTitles = { on in
   DispatchQueue.main.async { note("fixture:titles-applied") }
   // The gate releases on an independent delay AFTER the toggle (and after the
   // ack is enqueued), never before it.
-  if let g = synthetic.gate {
+  if !on, let g = synthetic.gate {
     DispatchQueue.global().asyncAfter(deadline: .now() + .milliseconds(releaseMs)) { g.signal() }
   }
   return gen
@@ -75,6 +78,7 @@ channel.onCommand = { cmd, done in
     }
   case .recheckPermissions:
     channel.send(HelloEvent(at: nowMs(), pid: ProcessInfo.processInfo.processIdentifier,
+                            session: channel.session,
                             permissions: .init(accessibility: "granted")))
     done()
   default: done()
@@ -94,6 +98,7 @@ channel.onEOFDetected = { controlQueue.asyncAfter(deadline: .now() + 0.75) { exi
 channel.onFatal = { exit(1) }
 
 channel.send(HelloEvent(at: nowMs(), pid: ProcessInfo.processInfo.processIdentifier,
+                        session: channel.session,
                         permissions: .init(accessibility: "granted")))
 channel.send(ThermalEvent(at: nowMs(), state: "nominal"))
 channel.start()

@@ -8,6 +8,7 @@ private final class FakeAX: AXBackend {
   final class Obs { let pid: Int32; init(_ pid: Int32) { self.pid = pid } }
   var windows: [Int32: El] = [:], titles: [Int: String] = [:], errors: [String: AXError] = [:]
   var titleOnce: [Int: String] = [:] // consumed on the first read per window
+  var addOnce: [String: AXError] = [:] // consumed on the first matching add
   var adds: [(Int, String)] = [], removes: [(Int, String)] = []
   var detachCount = 0, fwCalls = 0, titleCalls = 0
   var fwApps: [Int] = [] // app element id per focusedWindow call
@@ -24,7 +25,9 @@ private final class FakeAX: AXBackend {
   func add(observer: Obs, element: El, notification: String) -> AXError {
     adds.append((element.id, notification))
     if let g = addEntered { g.signal(); addRelease?.wait(); addEntered = nil; addRelease = nil }
-    return errors["add:\(element.id):\(notification)"] ?? .success
+    let k = "add:\(element.id):\(notification)"
+    if let e = addOnce.removeValue(forKey: k) { return e }
+    return errors[k] ?? .success
   }
   func remove(observer: Obs, element: El, notification: String) {
     removes.append((element.id, notification))
@@ -54,7 +57,8 @@ final class AXSessionTests: XCTestCase {
   private var events: [[String: Any]] = [], scheduled: [(TimeInterval, DispatchWorkItem)] = []
   private var trusted = true, clock: TimeInterval = 0
   private var pending: [() -> Void] = []
-  private func makeSession(captureMain: Bool = false) {
+  // Titles default OFF; pass titles: false to exercise the startup state.
+  private func makeSession(captureMain: Bool = false, titles: Bool = true) {
     fake = FakeAX(); events = []; scheduled = []; clock = 0; pending = []
     axQ = DispatchQueue(label: "test.ax")
     session = S(backend: fake, isTrusted: { [self] in trusted }, nowMs: { 7 },
@@ -62,6 +66,7 @@ final class AXSessionTests: XCTestCase {
                 queue: axQ, toMain: captureMain ? { [self] in pending.append($0) } : { $0() },
                 uptime: { [self] in clock },
                 scheduler: { [self] d, i in scheduled.append((clock + d, i)) })
+    if titles { session.setTitlesEnabled(true); drain() }
   }
   private static func dict(_ e: any Encodable) -> [String: Any] {
     ((try? JSONSerialization.jsonObject(with: (try! JSONEncoder().encode(e)))) as? [String: Any]) ?? [:]
@@ -584,5 +589,161 @@ final class AXSessionTests: XCTestCase {
     advance(1.0)
     XCTAssertTrue(ofType("ax.unsupported").isEmpty)
     XCTAssertTrue(session.isAttached, "optional title failure never detaches")
+  }
+  // Startup is fail-closed.
+  func testTitlesDefaultOffNoReadsNoTitle() {
+    makeSession(titles: false)
+    attach(7, win: 1, title: "A")
+    let fw = ofType("window.focused")
+    XCTAssertEqual(fw.count, 1)
+    XCTAssertNil(fw.first?["title"], "default-off focus carries no title")
+    XCTAssertEqual(fake.titleCalls, 0, "no AXTitle read while titles are off")
+    var result: (String, String?)?
+    session.snapshot(pid: 7, bundleId: "b.x") { s, t in result = (s, t) }; drain()
+    XCTAssertEqual(result?.0, "ok")
+    XCTAssertNil(result?.1)
+    XCTAssertEqual(fake.titleCalls, 0)
+  }
+  // A stale main-bound post does not poison dedup.
+  func testUndeliveredFocusRepostedOnceAfterPrivacyFlip() {
+    makeSession(captureMain: true)
+    attach(7, win: 1, title: "A")
+    XCTAssertEqual(pending.count, 1, "the focus post is held on main")
+    session.setTitlesEnabled(false)
+    let stale = pending; pending = []
+    stale.forEach { $0() } // stale-epoch delivery dies
+    XCTAssertTrue(ofType("window.focused").isEmpty)
+    drain() // the queued privacy apply re-posts the unreported focus
+    XCTAssertFalse(pending.isEmpty, "unreported focus must be re-posted")
+    let current = pending; pending = []
+    current.forEach { $0() }
+    let fw = ofType("window.focused")
+    XCTAssertEqual(fw.count, 1, "the recovered focus delivers exactly once")
+    XCTAssertNil(fw.first?["title"], "titles off: the repost carries no title")
+    session.notify(S.focusedNotification, observer: obs, element: .init(1)); drain()
+    XCTAssertTrue(pending.isEmpty, "delivered focus dedups against the generation")
+  }
+  // A title-blocked initial focus recovers without leaking its title.
+  func testFocusDeliveredTitleFreeAfterBlockedReadFlip() {
+    makeSession()
+    fake.windows[7] = .init(1); fake.titles[1] = "A"
+    race({ [self] in fake.titleEntered = $0; fake.titleRelease = $1 },
+         label: "initial title read must reach IPC",
+         start: { self.session.activate(pid: 7, bundleId: "b.x") },
+         body: { self.session.setTitlesEnabled(false) })
+    let fw = ofType("window.focused")
+    XCTAssertEqual(fw.count, 1, "the focus event must not be lost to the flip")
+    XCTAssertNil(fw.first?["title"])
+    session.setTitlesEnabled(true); drain()
+    session.notify(S.focusedNotification, observer: obs, element: .init(1)); drain()
+    XCTAssertEqual(ofType("window.focused").count, 1, "delivered focus dedups")
+    advance(0.3)
+    XCTAssertEqual(ofType("window.title").first?["title"] as? String, "A")
+  }
+  func testChangedWindowFocusRecoversAfterBlockedTitleFlip() {
+    makeSession()
+    attach(7, win: 1, title: "A")
+    fake.windows[7] = .init(2); fake.titles[2] = "B"
+    race({ [self] in fake.titleEntered = $0; fake.titleRelease = $1 },
+         label: "changed window title read",
+         start: { self.session.notify(S.focusedNotification, observer: self.obs, element: .init(2)) },
+         body: { self.session.setTitlesEnabled(false) })
+    XCTAssertEqual(ofType("window.focused").count, 2)
+    XCTAssertNil(ofType("window.focused").last?["title"])
+    session.notify(S.focusedNotification, observer: obs, element: .init(2)); drain()
+    XCTAssertEqual(ofType("window.focused").count, 2)
+  }
+  func testUndeliveredWindowlessFocusRecoversOnEnable() {
+    makeSession(captureMain: true, titles: false)
+    attach(7)
+    session.setTitlesEnabled(true); drain()
+    let deliveries = pending; pending = []
+    deliveries.forEach { $0() }
+    XCTAssertEqual(ofType("window.focused").count, 1)
+    XCTAssertTrue(ofType("window.focused").first?["window"] is NSNull)
+  }
+  // Required add failures retry under the current privacy epoch.
+  func testRequiredAddStaleEpochRequeuesThenUnsupported() {
+    makeSession()
+    fake.errors["add:\(-7):\(S.focusedNotification)"] = .notificationUnsupported
+    raceThroughAdd(
+      start: { self.session.activate(pid: 7, bundleId: "b.x") },
+      body: { self.session.setTitlesEnabled(false) })
+    XCTAssertEqual(
+      fake.adds.filter { $0.0 == -7 && $0.1 == S.focusedNotification }.count, 2,
+      "the stale-epoch failure requeues one attach under the current epoch")
+    XCTAssertFalse(session.isAttached)
+    XCTAssertEqual(ofType("ax.unsupported").count, 1)
+    var result: (String, String?)?
+    session.snapshot(pid: 7, bundleId: "b.x") { s, t in result = (s, t) }; drain()
+    XCTAssertEqual(result?.0, "unsupported",
+                   "the unsupported cache still answers snapshot")
+  }
+  func testRequiredAddStaleEpochRequeueSucceeds() {
+    makeSession()
+    fake.addOnce["add:\(-7):\(S.focusedNotification)"] = .notificationUnsupported
+    raceThroughAdd(
+      start: { self.session.activate(pid: 7, bundleId: "b.x") },
+      body: { self.session.setTitlesEnabled(false) })
+    XCTAssertEqual(fake.adds.filter { $0.0 == -7 && $0.1 == S.focusedNotification }.count, 2)
+    XCTAssertTrue(session.isAttached, "the current-epoch retry attaches")
+    XCTAssertTrue(ofType("ax.unsupported").isEmpty, "stale-epoch error is never recorded")
+  }
+  func testRequiredAddStaleEpochRequeueRetryable() {
+    makeSession()
+    fake.errors["add:\(-7):\(S.focusedNotification)"] = .cannotComplete
+    raceThroughAdd(
+      start: { self.session.activate(pid: 7, bundleId: "b.x") },
+      body: { self.session.setTitlesEnabled(false) })
+    XCTAssertFalse(session.isAttached)
+    let e = ofType("error").filter { $0["code"] as? String == "ax-retryable" }
+    XCTAssertEqual(e.count, 1, "the current-epoch retryable reports once")
+    XCTAssertTrue(ofType("ax.unsupported").isEmpty)
+  }
+  func testRegistrationErrorDroppedOnMainRetriesCurrentPrivacy() {
+    makeSession(captureMain: true)
+    fake.errors["add:\(-7):\(S.focusedNotification)"] = .notificationUnsupported
+    attach(7)
+    XCTAssertEqual(pending.count, 1)
+    session.setTitlesEnabled(false)
+    let stale = pending; pending = []
+    stale.forEach { $0() }
+    drain()
+    let current = pending; pending = []
+    current.forEach { $0() }
+    XCTAssertEqual(ofType("ax.unsupported").count, 1)
+    XCTAssertEqual(fake.adds.filter { $0.0 == -7 && $0.1 == S.focusedNotification }.count, 2)
+  }
+  func testSnapshotWithoutAttachedObserverIsUnknown() {
+    makeSession()
+    attach(7, win: 1, title: "A")
+    var result: (String, String?)?
+    let calls = fake.fwCalls
+    session.snapshot(pid: 8, bundleId: "b.8") { s, t in result = (s, t) }; drain()
+    XCTAssertEqual(result?.0, "unknown")
+    XCTAssertNil(result?.1)
+    XCTAssertEqual(fake.fwCalls, calls, "no observer for that app: no direct read")
+  }
+  // Events are already source-bounded before reaching an encoder.
+  func testSourceBoundTitleTruncatesBeforeEncoding() throws {
+    makeSession()
+    fake.titles[1] = String(repeating: "x", count: 50 * 1024 * 1024)
+    attach(7, win: 1)
+    let t = try XCTUnwrap(ofType("window.focused").first?["title"] as? String)
+    XCTAssertEqual(t.count, 1024, "the source bound applies before any encode")
+    var result: (String, String?)?
+    session.snapshot(pid: 7, bundleId: "b.x") { s, tt in result = (s, tt) }; drain()
+    XCTAssertEqual(result?.0, "ok")
+    XCTAssertEqual(result?.1?.count, 1024)
+    let enc = try LineEncoder(titlesEnabled: true).encodeLine(
+      WindowEvent(type: "window.focused", at: 0, pid: 7, bundleId: "b.x", title: t))
+    XCTAssertLessThanOrEqual(enc.line.count, LineEncoder.maxTitleLineBytes)
+    fake.titles[2] = String(repeating: "\u{301}", count: 100_000)
+    let (_, pathological) = fake.boundedTitle(.init(2))
+    XCTAssertLessThanOrEqual(pathological?.utf8.count ?? .max, 8192)
+  }
+  func testPrivacyGenerationSaturates() {
+    XCTAssertEqual(S.nextPrivacyGeneration(Int.max - 1), Int.max)
+    XCTAssertEqual(S.nextPrivacyGeneration(Int.max), Int.max)
   }
 }

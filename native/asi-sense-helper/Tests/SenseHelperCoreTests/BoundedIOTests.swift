@@ -242,7 +242,7 @@ final class CommandChannelTests: PipeCase {
     channel.send(SnapshotEvent(at: 0, frontApp: nil, focusedWindow: nil,
                                thermal: "nominal",
                                permissions: .init(accessibility: "denied")))
-    channel.send(TitlesAckEvent(at: 0, id: .string("k"), enabled: false, gen: 3))
+    channel.send(TitlesAckEvent(at: 0, session: "sess-1", id: .string("k"), enabled: false, gen: 3))
     var text = ""
     drainUntil({ text += String(decoding: $0, as: UTF8.self) },
                { text.contains("\"type\":\"titles.ack\"") })
@@ -253,6 +253,47 @@ final class CommandChannelTests: PipeCase {
     XCTAssertTrue(text.contains("output_overflow"), "evicted noncriticals are reported")
     XCTAssertLessThan(text.components(separatedBy: "\"type\":\"window.title\"").count - 1,
                       2000, "noncriticals are evicted under pressure")
+  }
+  // A saturated privacy generation is fatal: the encoder goes off, title
+  // records are purged, one fixed error is emitted, input stops and onFatal
+  // fires - an ack carrying the max/wrapped generation is never emitted.
+  func testPrivacyGenerationExhaustedGoesFatal() {
+    var inf = [Int32](repeating: 0, count: 2)
+    XCTAssertEqual(pipe(&inf), 0)
+    defer { close(inf[0]); close(inf[1]) }
+    makePipe(); defer { closeEnds() }
+    var fatal = 0
+    let channel = CommandChannel(inputFD: inf[0], outputFD: fds.w,
+                                 queue: DispatchQueue(label: "test.ch3"), nowMs: { 0 })
+    channel.onTitles = { _ in Int.max }
+    channel.onFatal = { [self] in lock.lock(); fatal += 1; lock.unlock() }
+    channel.start()
+    defer { channel.stopInput() }
+    let cmd = #"{"cmd":"titles","enabled":true,"id":"x"}"# + "\n"
+    let bytes = Array(cmd.utf8)
+    XCTAssertEqual(Darwin.write(inf[1], bytes, bytes.count), bytes.count)
+    XCTAssertTrue(waitFor { fatal == 1 }, "exhaustion must invoke onFatal")
+    var text = ""
+    drainUntil({ text += String(decoding: $0, as: UTF8.self) },
+               { text.contains("privacy-generation-exhausted") })
+    XCTAssertFalse(text.contains("titles.ack"), "no ack may carry the max/wrapped gen")
+    XCTAssertTrue(text.contains("\"code\":\"privacy-generation-exhausted\""))
+    channel.closeOutput()
+  }
+  // Titles default off: events sent before any enable are stripped even
+  // when the session has not yet been touched.
+  func testChannelTitlesDefaultOff() {
+    makePipe(); defer { closeEnds() }
+    let devNull = open("/dev/null", O_RDONLY); defer { close(devNull) }
+    let channel = CommandChannel(inputFD: devNull, outputFD: fds.w,
+                                 queue: DispatchQueue(label: "test.ch4"), nowMs: { 0 })
+    defer { channel.stopInput() }
+    channel.send(WindowEvent(type: "window.focused", at: 0, pid: 1,
+                             bundleId: "b", title: "SECRET"))
+    var text = ""
+    drainUntil({ text += String(decoding: $0, as: UTF8.self) }, { !text.isEmpty })
+    XCTAssertFalse(text.contains("SECRET"), "default-off: title stripped before encode")
+    channel.closeOutput()
   }
 }
 
@@ -384,22 +425,61 @@ final class InputReaderTests: PipeCase {
     lock.unlock()
     XCTAssertEqual(dones.count, 1, "the ordinary command is still serialized")
   }
-  // Newest-of-class supersession: only the latest titles control is delivered.
-  func testControlSupersessionKeepsLatestPerClass() {
-    writeAll("held\n")
-    XCTAssertTrue(waitFor { lines.count == 1 })
+  // Every control is delivered synchronously in arrival order - no
+  // newest-wins supersession: all three titles commands must be seen.
+  func testEveryControlDeliversInArrivalOrder() {
     writeAll(#"{"cmd":"titles","enabled":false}"# + "\n" +
              #"{"cmd":"titles","enabled":true,"id":"x"}"# + "\n" +
              #"{"cmd":"titles","enabled":false,"id":"y"}"# + "\n")
-    // Controls flush per chunk; all three may arrive in one readiness batch, in
-    // which case only the newest survives. Worst case: more than one batch.
-    XCTAssertTrue(waitFor { !controls.isEmpty })
+    XCTAssertTrue(waitFor { controls.count == 3 })
     lock.lock()
-    XCTAssertFalse(controls.isEmpty)
-    if let last = controls.last, case .titles(let on, let id) = last {
-      XCTAssertEqual(on, false, "latest titles control always wins")
-      XCTAssertEqual(id, .string("y"))
-    } else { XCTFail("expected a titles control") }
+    XCTAssertEqual(controls, [.titles(false), .titles(true, id: .string("x")),
+                              .titles(false, id: .string("y"))])
+    lock.unlock()
+  }
+  // A parsed quit terminates input immediately: nothing after it - in the
+  // same chunk or later - is parsed, delivered or queued.
+  func testQuitStopsParsingWithinAndAfterChunk() {
+    writeAll(#"{"cmd":"quit"}"# + "\n" +
+             #"{"cmd":"titles","enabled":true,"id":"after"}"# + "\n" +
+             #"{"cmd":"quit"}"# + "\n")
+    XCTAssertTrue(waitFor { !controls.isEmpty })
+    Thread.sleep(forTimeInterval: 0.1)
+    lock.lock()
+    XCTAssertEqual(controls, [.quit], "no control after quit may be parsed")
+    lock.unlock()
+    writeAll("more\n")
+    Thread.sleep(forTimeInterval: 0.1)
+    lock.lock()
+    XCTAssertTrue(lines.isEmpty, "input stays dead after quit")
+    XCTAssertEqual(controls, [.quit])
+    lock.unlock()
+  }
+  // A control callback that blocks stops all further stdin consumption
+  // (bounded to the <=16KiB already-read chunk by natural backpressure);
+  // later controls wait - none is overwritten or coalesced.
+  func testBlockedControlCallbackStopsStdinConsumption() {
+    let blocked = DispatchSemaphore(value: 0), entered = DispatchSemaphore(value: 0)
+    reader.onControlLine = { [weak self] c in
+      guard let self else { return }
+      self.lock.lock()
+      self.controls.append(c)
+      let first = self.controls.count == 1
+      self.lock.unlock()
+      if first { entered.signal(); blocked.wait() }
+    }
+    writeAll(#"{"cmd":"titles","enabled":true,"id":"first"}"# + "\n" +
+             #"{"cmd":"titles","enabled":false,"id":"second"}"# + "\n")
+    XCTAssertEqual(entered.wait(timeout: .now() + 5), .success)
+    Thread.sleep(forTimeInterval: 0.1)
+    lock.lock()
+    XCTAssertEqual(controls.count, 1, "no next control is delivered while blocked")
+    lock.unlock()
+    blocked.signal()
+    XCTAssertTrue(waitFor { controls.count == 2 })
+    lock.lock()
+    XCTAssertEqual(controls, [.titles(true, id: .string("first")),
+                              .titles(false, id: .string("second"))])
     lock.unlock()
   }
   // Controls are never charged to (or dropped by) the ordinary pending cap.

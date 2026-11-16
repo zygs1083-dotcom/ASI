@@ -10,7 +10,7 @@ Payload fields are flattened into the event object (no `data` wrapper).
 
 Startup order:
 
-1. `hello` - `{version:"0.1.0", pid, permissions:{accessibility:"granted"|"denied"}}`
+1. `hello` - `{version:"0.1.0", pid, session, permissions:{accessibility:"granted"|"denied"}}`
 2. `thermal` - `{state:"nominal"|"fair"|"serious"|"critical"}`
 3. initial `window.focused` for the current front app, only if Accessibility is
    granted. `app.activated` is **never** fabricated - only real `NSWorkspace`
@@ -18,11 +18,11 @@ Startup order:
 
 | type | extra fields | source |
 |---|---|---|
-| `hello` | `version`,`pid`,`permissions` | startup + `recheck-permissions` |
+| `hello` | `version`,`pid`,`session`,`permissions` | startup + `recheck-permissions`; random UUID `session` is fixed for this process |
 | `app.activated` / `app.launched` / `app.terminated` | `name`,`bundleId`,`pid` (missing strings -> `""`) | NSWorkspace |
 | `window.focused` | `pid`,`bundleId`,`title?`,`window` | AX focused/main window change; `title` absent if unreadable, no focused window, or titles disabled; `window` is explicitly `null` when the focused app currently has no window (windowless focus, deduplicated while focus stays windowless) |
 | `window.title` | `pid`,`bundleId`,`title?` | AX title change, debounced 250ms trailing, latest wins, same-as-emitted suppressed per focused-window context |
-| `titles.ack` | `id?`,`enabled`,`gen` | confirms a `titles` command was applied: `enabled` echoes the new state, `gen` is the privacy generation the switch produced, `id` echoes the command's correlation id when one was supplied (string or integer) |
+| `titles.ack` | `session`,`id?`,`enabled`,`gen` | confirms each `titles` command: same session as hello, echoed state/id, strictly increasing process-local privacy generation |
 | `ax.unsupported` | `bundleId`,`pid`,`notification`,`error` (raw AXError code) | a required AX registration failed with a *permanent* unsupported error; at most once per app key per run (see AX semantics) |
 | `thermal` | `state` | ProcessInfo |
 | `power.sleep`/`power.wake`, `screen.locked`/`screen.unlocked`, `session.active`/`session.inactive` | - | NSWorkspace + DNC |
@@ -37,9 +37,9 @@ event (`code:"thermal-state"`) is emitted instead of an invented state.
 `{frontApp:{name,bundleId,pid}, focusedWindow:{pid,bundleId,status,title?}, thermal, permissions}`
 
 - `frontApp`/`focusedWindow`: omitted when no front app exists.
-- `focusedWindow.status`: `ok` (a focused window was read), `denied` (no
+- `focusedWindow.status`: `ok` (attached observer and a focused window was read), `denied` (no
   Accessibility trust), `unsupported` (the app rejected AX observation),
-  `unknown` (trusted but no focused window - e.g. a windowless foreground app;
+  `unknown` (trusted but no attached observer or focused window;
   `noValue` maps here, never to `unsupported`).
 - `focusedWindow.title`: present only when readable and titles are on.
 - `thermal`: `nominal`/`fair`/`serious`/`critical`; on an unrecognized state it
@@ -60,17 +60,15 @@ One per line, <=64KiB; partial lines and CRLF handled. Optional `v` must equal
 | `{"cmd":"recheck-permissions"}` | fresh `hello`; reconciles AX state: attaches when trusted and not yet observing, detaches the live observer when trust was revoked; never prompts |
 | `{"cmd":"quit"}` | clean shutdown, exit 0 |
 
-**Controls.** `titles` and `quit` are *control* commands: the reader keeps a
-newest-of-each-class slot and delivers them ahead of every queued ordinary
-command - even while a `snapshot` is in flight or the ordinary backlog is
-saturated. When several same-class controls arrive inside one read batch only
-the latest is delivered (superseded controls need not ack); between classes,
-arrival order is preserved. `titles` is applied synchronously when delivered:
-the privacy generation bumps *per delivered command* (even redundant ones),
-the encoder state flips, queued title lines are purged, and a critical
-`titles.ack` is enqueued - every delivered `titles` command gets exactly one
-ack. `quit` disables titles (invalidating in-flight title work), purges queued
-title lines, then performs the bounded clean shutdown.
+**Controls.** Every `titles`/`quit` is applied synchronously in arrival order,
+at its complete physical line, before parsing the next line. Controls bypass
+queued ordinary commands and an in-flight snapshot. No controls are coalesced
+or silently discarded: each `titles`, including redundant ones, increments
+the privacy generation, flips the encoder, purges queued titles when disabling,
+and enqueues its own critical `titles.ack`. Only actual AX title work coalesces.
+`quit` increments the privacy generation, disables titles and purges queued
+titles before bounded shutdown. Parsing stops at the first `quit`: no later
+commands, controls or errors are processed, even in the same write/read chunk.
 
 Errors (`error` event, process keeps running unless noted):
 
@@ -86,6 +84,7 @@ Errors (`error` event, process keeps running unless noted):
 | `output_overflow` | queued output hit the bounds below and noncritical events were evicted; `dropped`/`droppedTypes` count evictions per event type. Emitted as the next whole record, not at queue-empty |
 | `ax-retryable` | an AX operation failed with a retryable error (`cannotComplete`, `apiDisabled`, `failure`, `invalidUIElement`, ...); carries `pid`/`bundleId` of the affected app; the app is *not* marked unsupported and the next activation/`recheck-permissions` retries |
 | `thermal-state` | OS reported an unrecognized thermal state |
+| `privacy-generation-exhausted` | privacy generation saturated at `Int.max`; titles forced off, fixed error emitted, exit 1 (bounded drain); host must rebuild helper, never reuse the exhausted generation |
 
 ## Input bounds
 
@@ -98,12 +97,11 @@ Errors (`error` event, process keeps running unless noted):
   each entry charged `max(64, bytes+1)` to cover framing overhead so empty
   lines cannot queue unbounded records; anything beyond the cap is dropped
   and counted in a coalesced `input_overflow` per readiness batch.
-- Valid `titles`/`quit` commands are controls: they live in dedicated slots
-  (never charged to the cap, newest per class wins), are flushed after every
-  read chunk, and are delivered ahead of the next ordinary command even while
-  one is in flight - so `titles:false` and `quit` cannot be serialized behind
-  a blocked snapshot or a flooded backlog.
-- Commands run strictly one at a time (next delivered only after the previous
+- Control capacity is one in service, **zero pending**: the synchronous
+  callback must finish before framing another line or reading stdin again.
+  A busy control consumer naturally backpressures the pipe; only the current
+  <=16KiB read chunk and <=64KiB line scratch are retained. No overwrite/drop.
+- Ordinary commands run one at a time (next delivered only after the previous
   completion, including the async `snapshot` read); a flood cannot queue
   unbounded work.
 - EOF: buffered complete commands run normally and a trailing partial line
@@ -163,12 +161,17 @@ Errors (`error` event, process keeps running unless noted):
   producing app+privacy generations and the target's identity before any
   teardown; at delivery a stale generation drops the event entirely - errors
   are never relabeled with a newer context.
+  A required registration failure under a changed privacy epoch retries
+  once under the current epoch while the app is still desired; a repeated
+  failure then reports current `ax.unsupported` or `ax-retryable` normally.
 - The internal dedup key is the bundle id, or `pid:<n>` when the app has none -
   two bundle-less apps never share unsupported state; on the wire `bundleId`
   serializes as `""` for missing identifiers.
 - On a focused-window refresh the window identity is compared first (`CFEqual`
   in production): the same window keeps the pending title debounce and emits
-  no extra `window.focused`; a different window unsubscribes the old title
+  no extra `window.focused` only after successful stamped delivery; a focus
+  discarded on a privacy transition is reposted (title-free when disabled).
+  A different window unsubscribes the old title
   observation, resets the debounce, subscribes the new one (only when titles
   are on) and emits one `window.focused`.
 - When the observed app terminates, the session detaches logically at once
@@ -186,21 +189,23 @@ Errors (`error` event, process keeps running unless noted):
 
 ## Privacy
 
-Titles default **on**. The host and the helper share a *privacy barrier*: the
-moment the host decides to hide titles it **sends `titles:false` and
-immediately strips every `title` key recursively** from anything it would
-display or forward - without waiting. The barrier closes when the matching
-`titles.ack` arrives (`id` and `enabled` match; `gen` is monotonically
-increasing so the host can record the latest applied generation): from that
-point on the helper guarantees no title-bearing output until an explicit
-later `titles:true` (the host must still wait for its enable ack before
-rendering titles).
+Titles default **off (fail-closed)** in every new helper process. The host
+starts with recursive title stripping enabled, learns `session` from hello,
+sends its current intent with a unique `id`, and waits for a matching ack.
+An ack is accepted only for the **current session and latest intent**:
+`session`, `id` and `enabled` must match, and `gen` increases within that
+session only. Never compare generations across helper restarts. An old enable
+ack cannot clear a newer pending disable. Missing ack, EOF, stream failure or
+generation exhaustion keeps titles closed and requires rebuilding the helper
+and repeating this handshake; never infer that a missing ack means success.
 
 ```text
 host:  id = unique(); discardTitles = true        // strip recursively NOW
        send {"cmd":"titles","enabled":false,"id":id}
 host:  strip title keys from every subsequent event until the matching ack
-host:  on titles.ack where ack.id == id && ack.enabled == false:
+host:  on titles.ack where ack.session == currentSession &&
+           ack.id == latestIntent.id && ack.enabled == false &&
+           latestIntent.enabled == false:
            barrier closed - no title may arrive until an explicit true;
            record ack.gen (privacy gens are monotonically increasing)
 host:  titles:true takes helper-side effect at once, but the host must not
@@ -219,9 +224,8 @@ On the helper side, a delivered `titles` command:
    with every `title` key stripped rather than dropped,
 4. enqueues the critical `titles.ack`.
 
-Every delivered `titles` command gets its own ack (its own `gen`), including
-redundant ones; a same-batch-superseded control may never be delivered and
-therefore need not ack - the latest control is always delivered.
+Every parsed `titles` before quit gets its own ack and generation, including
+redundant ones and consecutive controls in a single write; none is superseded.
 
 Residual risk, explicitly: a COMPLETE title line already accepted into the
 kernel buffer before the toggle cannot be recalled. That is the only possible
@@ -230,6 +234,10 @@ to complete, so no truncated title or title suffix can ever follow the ack.
 
 - `titles:true` resets title dedup and re-reads through the normal 250ms
   debounce. While titles are off the helper does not read `AXTitle`.
+- After each AXTitle result, the AX queue bounds the source to 2048 Unicode
+  scalars, discards a possibly partial final grapheme, then limits to 1024
+  Characters before events/encoding; even one giant grapheme stays bounded.
+  AX may itself allocate the source.
 - Only two AX attributes are ever read: `AXFocusedWindow` and `AXTitle`.
   `AXIsProcessTrusted` only - never prompts.
 

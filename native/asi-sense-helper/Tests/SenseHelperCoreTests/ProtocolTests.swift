@@ -14,13 +14,14 @@ final class ProtocolTests: XCTestCase {
     return try decode(data)
   }
   func testEnvelopeAndHelloFields() throws {
-    let d = try encode(HelloEvent(at: 123, pid: 42, permissions: Permissions(accessibility: "granted")))
+    let d = try encode(HelloEvent(at: 123, pid: 42, session: "sess-1", permissions: Permissions(accessibility: "granted")))
     XCTAssertEqual(d["v"] as? Int, 1)
     XCTAssertEqual(d["type"] as? String, "hello")
     XCTAssertEqual(d["at"] as? Int, 123)
     XCTAssertEqual(d["version"] as? String, "0.1.0")
     XCTAssertEqual(d["pid"] as? Int, 42)
     XCTAssertEqual((d["permissions"] as? [String: Any])?["accessibility"] as? String, "granted")
+    XCTAssertNotNil(d["session"] as? String, "hello carries the helper session")
   }
   func testAppAndThermalFields() throws {
     let app = try encode(AppEvent(type: "app.activated", at: 2, name: "TextEdit", bundleId: "com.apple.TextEdit", pid: 7))
@@ -59,14 +60,15 @@ final class ProtocolTests: XCTestCase {
   // titles.ack echoes the command's correlation id (string or integer) and
   // the privacy generation it was applied under.
   func testTitlesAckRoundTripsIds() throws {
-    let s = try encode(TitlesAckEvent(at: 9, id: .string("abc-1"), enabled: false, gen: 3))
+    let s = try encode(TitlesAckEvent(at: 9, session: "sess-1", id: .string("abc-1"), enabled: false, gen: 3))
     XCTAssertEqual(s["type"] as? String, "titles.ack")
     XCTAssertEqual(s["id"] as? String, "abc-1")
     XCTAssertEqual(s["enabled"] as? Bool, false)
     XCTAssertEqual(s["gen"] as? Int, 3)
-    let i = try encode(TitlesAckEvent(at: 9, id: .int(42), enabled: true, gen: 4))
+    XCTAssertNotNil(s["session"] as? String, "every ack carries the helper session")
+    let i = try encode(TitlesAckEvent(at: 9, session: "sess-1", id: .int(42), enabled: true, gen: 4))
     XCTAssertEqual(i["id"] as? Int, 42)
-    let none = try encode(TitlesAckEvent(at: 9, enabled: true, gen: 5))
+    let none = try encode(TitlesAckEvent(at: 9, session: "sess-1", enabled: true, gen: 5))
     XCTAssertNil(none["id"], "no id key when the command carried none")
     XCTAssertEqual(none["enabled"] as? Bool, true)
   }
