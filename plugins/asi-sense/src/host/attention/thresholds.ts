@@ -144,14 +144,26 @@ export function bodyThresholdSignals(
   thresholds: BodyThresholds = BODY_THRESHOLDS,
 ): { signals: Signal[]; state: BodyThresholdState } {
   const state: BodyThresholdState = { ...prev.state };
+  const sessions = (next as BodyThresholdSample & { contextSessions?: string[] }).contextSessions;
+  if (sessions) {
+    for (const key of Object.keys(state))
+      if (key.startsWith('context@') && !sessions.includes(key.slice('context@'.length))) delete state[key];
+  }
   const signals: Signal[] = [];
   const keys = new Set([...metricKeys(next.body, next.at), ...Object.keys(state)]);
   for (const key of keys) {
+    if (key.startsWith('context@')) continue;
     const nextReading = read(next.body, next.at, key, thresholds);
     if (!nextReading) continue;
-    let prior = state[key];
+    const session = (next as BodyThresholdSample & { contextSession?: string }).contextSession;
+    const previousSession = (prev as BodyThresholdSample & { contextSession?: string }).contextSession;
+    const latchKey = key === 'context' && session ? `context@${session}` : key;
+    let prior = state[latchKey];
     if (prior === undefined) {
-      prior = read(prev.body, prev.at, key, thresholds)?.severity ?? 'normal';
+      prior =
+        key === 'context' && session !== previousSession
+          ? 'normal'
+          : (read(prev.body, prev.at, key, thresholds)?.severity ?? 'normal');
     }
     const ratioKey = key === 'context' || key === 'battery' ? key : key.split(':')[0];
     const level =
@@ -164,9 +176,10 @@ export function bodyThresholdSignals(
           )
         : nextReading.severity;
     state[key] = level;
+    state[latchKey] = level;
     if (level === prior) continue;
     signals.push({
-      id: `${next.source.id}:${key}:${next.at}:${level}`,
+      id: `${next.source.id}:${key}:${next.at}:${level}${key === 'context' && session ? `:${session}` : ''}`,
       kind: 'body.threshold',
       at: next.at,
       source: next.source,

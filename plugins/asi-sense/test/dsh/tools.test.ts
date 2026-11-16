@@ -59,7 +59,7 @@ async function fixture(liveState = false, isolated = false) {
     nowReadings: (session?: string) =>
       isolated
         ? {
-            'env.activeJobs': { value: jobs.filter((job) => job.owner === session) },
+            'env.activeJobs': { value: jobs },
             'self.activity': { value: session === 'session-a' ? 'tool' : 'thinking' },
             'self.pending': { value: { inbox: session === 'session-a' ? 1 : 2, jobs: 1 } },
             'self.tools': { value: [session === 'session-a' ? 'a-tool' : 'b-tool'] },
@@ -67,7 +67,7 @@ async function fixture(liveState = false, isolated = false) {
               value: { provider: session === 'session-a' ? 'provider-a' : 'provider-b', endpoint: '', local: true },
             },
           }
-        : { 'env.activeJobs': { value: jobs.filter((job) => job.owner === session) } },
+        : { 'env.activeJobs': { value: jobs } },
     modelJobs: (session: string) =>
       jobs.filter((job) => job.owner === session).map(({ id, status, startedAt }) => ({ id, status, startedAt })),
   });
@@ -234,9 +234,10 @@ describe('model-facing tools', () => {
     expect(JSON.stringify((await h.call('env_detail', {})).value)).not.toContain('fixture-host.invalid');
   });
 
-  it('preserves consented titles but excludes arbitrary notes and colliding private paths', async () => {
+  it('projects consented titles and excludes arbitrary notes and colliding private paths', async () => {
     const h = await fixture();
-    const title = 'open </private/fixture/report> "backup.example.invalid"';
+    const title = 'open </private/fixture/report> backup.example.invalid';
+    const projected = 'open <report> <host>';
     h.state.env.focusedWindow.value = { title };
     if (!h.state.env.frontApp.value) throw new Error('fixture missing');
     h.state.env.frontApp.value.bundleId = 'backup.example.invalid';
@@ -248,7 +249,7 @@ describe('model-facing tools', () => {
     };
     const state = await h.call('env_state', { section: 'env' });
     expect(state.value).toMatchObject({
-      focusedWindow: { value: { title } },
+      focusedWindow: { value: { title: projected } },
       watchedPaths: { value: { project: { changes: 1 }, 'project (2)': { changes: 2 }, '[path]': { changes: 3 } } },
     });
     expect(Object.hasOwn((state.value as unknown as SenseState['env']).watchedPaths.value ?? {}, '__proto__')).toBe(
@@ -257,7 +258,7 @@ describe('model-facing tools', () => {
     expect(JSON.stringify((state.value as unknown as SenseState['env']).frontApp)).not.toContain(
       'backup.example.invalid',
     );
-    expect((await h.call('env_detail', {})).value).toMatchObject({ window: { value: { title } } });
+    expect((await h.call('env_detail', {})).value).toMatchObject({ window: { value: { title: projected } } });
     const result = await h.call('env_watch', {
       action: 'add',
       rule: {
@@ -279,7 +280,8 @@ describe('model-facing tools', () => {
     await h.agentEvent({ type: 'created', sessionId: 'session-b' });
     await h.agentEvent({ type: 'pre-step', sessionId: 'session-b' });
     expect(JSON.stringify(h.live.state().env.activeJobs)).toContain('private-b-command');
-    expect(JSON.stringify(h.live.state().env.activeJobs)).not.toContain('private-orphan-command');
+    expect(JSON.stringify(h.live.state().env.activeJobs)).toContain('private-orphan-command');
+    expect(JSON.stringify(h.live.state().env.activeJobs)).toContain('private-a-command');
     for (const [session, own, foreign] of [
       ['session-a', 'a-job', 'b-job'],
       ['session-b', 'b-job', 'a-job'],
@@ -314,12 +316,12 @@ describe('model-facing tools', () => {
     await h.agentEvent({ type: 'post-step', sessionId: 'session-b' });
     await h.jobEvent({ type: 'exited', id: 'orphan', command: 'orphan-private-command', exitCode: 1 });
     expect(h.live.state().self.body.tokens.value?.contextUsed).toBe(11);
-    expect(h.live.state().env.activeJobs.value?.map((job) => job.id)).toEqual(['a-job']);
+    expect(h.live.state().env.activeJobs.value?.map((job) => job.id)).toEqual(['a-job', 'b-job', 'orphan']);
     for (const item of seen) {
       if (!item.session) continue;
       const own = item.session === 'session-a' ? 'a' : 'b';
       expect(item.used === undefined || item.used === (own === 'a' ? 11 : 22)).toBe(true);
-      expect(item.jobs.every((job) => job === `${own}-job`)).toBe(true);
+      expect(item.jobs.every((job) => ['a-job', 'b-job', 'orphan'].includes(job))).toBe(true);
     }
     off();
     for (const [session, own, other, used, activity] of [

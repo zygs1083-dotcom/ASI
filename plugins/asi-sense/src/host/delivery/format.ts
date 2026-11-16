@@ -73,6 +73,15 @@ function changeLines(ch: EnvChange, includeTitles: boolean, includeJobCommands: 
     const v = s.data.value;
     if (typeof v === 'number' && Number.isFinite(v)) main += ` ${v}`;
     else if (typeof v === 'string') main += ` ${esc(v)}`;
+  } else if (s.kind === 'body.rate' || s.kind === 'body.anomaly' || s.kind === 'file.burst') {
+    main = `${esc(s.kind)}: ${esc(s.subject)}`;
+    if (typeof s.data.ruleId === 'string') main += ` ruleId=${esc(s.data.ruleId)}`;
+    if (typeof s.data.severity === 'string') main += ` ${esc(s.data.severity)}`;
+    for (const key of ['value', 'slope', 'delta', 'etaToFloorMs', 'created', 'modified', 'deleted']) {
+      const value = s.data[key];
+      if (typeof value === 'number' && Number.isFinite(value)) main += ` ${key}=${value}`;
+    }
+    if (s.data.externalDeletionExceeded === true) main += ' externalDeletionExceeded=true';
   } else if (s.kind === 'fact.updated') {
     // Internal seam: a focused-window fact update still carries a title —
     // hide it entirely when titles are disabled.

@@ -60,7 +60,7 @@ export function runtimeTools(
 ) {
   return {
     envState: (section?: 'self' | 'env' | 'observation', sessionId?: string) => {
-      const state = sessionId === undefined ? attention.state() : dshSource.stateFor(sessionId, attention.state());
+      const state = dshSource.stateFor(sessionId ?? attention.currentSessionId(), attention.state());
       if (!titlesAllowed()) state.env.focusedWindow.value = null;
       if (sessionId !== undefined) {
         try {

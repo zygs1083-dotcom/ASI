@@ -1419,7 +1419,18 @@ describe('presenter', () => {
       onResetTuning: async () => {},
       onAcceptRebaseline: async () => {},
     };
-    expect(renderToString(React.createElement(ui.SensePanel, props))).toContain('环境感知');
+    props.model.state.env.activeJobs = {
+      ...props.model.state.env.activeJobs,
+      status: 'ok',
+      value: [
+        { id: 'owned', name: 'owned fixture', owner: 'session-a', status: 'running' },
+        { id: 'orphan', name: 'orphan fixture', status: 'running' },
+      ],
+    };
+    const html = renderToString(React.createElement(ui.SensePanel, props));
+    expect(html).toContain('环境感知');
+    expect(html).toContain('owned fixture（running）');
+    expect(html).toContain('orphan fixture（running · 无主）');
     h.presenter.close();
     await h.runtime.stop();
   });

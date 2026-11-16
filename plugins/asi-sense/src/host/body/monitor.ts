@@ -14,6 +14,7 @@ import { defaultAnomalyRules, defaultRateRules, floorTable } from './rules.ts';
 import { type AdaptiveState, BODY_HISTORY, parseHistory, validLatch } from './state.ts';
 import type { Tuner } from './tuner.ts';
 export interface BodyMonitorOptions {
+  contextSession?: () => string | undefined;
   /** Injected MONOTONIC clock for installation and persistence bookkeeping. */
   clock?: () => number;
   /** Wall clock for the baseline seed + persistence bookkeeping. */
@@ -45,6 +46,7 @@ const BAD = '\x00invalid';
  * for persistence only, never for detection.
  */
 export class BodyMonitor implements BodyEvaluator {
+  private readonly contextSession?: () => string | undefined;
   private readonly clock: () => number;
   private readonly wallClock: () => number;
   private readonly timeZone?: string;
@@ -68,6 +70,7 @@ export class BodyMonitor implements BodyEvaluator {
   tuningDisabled: 'restore-failed' | 'storage-failed' | undefined;
 
   constructor(options: BodyMonitorOptions = {}) {
+    this.contextSession = options.contextSession;
     for (const k of ['clock', 'wallClock'] as const) {
       if (options[k] !== undefined && typeof options[k] !== 'function') {
         throw new TypeError(`monitor: options.${k} must be a function`);
@@ -142,13 +145,12 @@ export class BodyMonitor implements BodyEvaluator {
     return this.view.current ? this.view.current.suggestions : (this.rebaser?.suggestions ?? []);
   }
   parameters = () => this.tuner?.parameters() ?? [];
-  rateEvidence = (metric: string) =>
-    rateEvidence(
-      this.restoredState,
-      this.rateRules,
-      this.view.current ? this.view.current.sample : this.rateSample,
-      metric,
-    );
+  rateEvidence = (metric: string) => {
+    const sample = this.view.current ? this.view.current.sample : this.rateSample;
+    if (metric === 'context' && this.contextSession && sample?.contextSession !== this.contextSession())
+      return { latched: false, points: [] };
+    return rateEvidence(this.restoredState, this.rateRules, sample, metric);
+  };
   acceptRebaseline = (id: string) =>
     this.rebaser?.accept(id) ?? Promise.reject(new Error('monitor: persistent tuner required'));
   /** Current effective baseline for the anomaly layer (seed or latest fork). */
@@ -178,7 +180,12 @@ export class BodyMonitor implements BodyEvaluator {
         (prior === undefined || n.monotonicAt > prior) &&
         (r.state as AdaptiveState)[BODY_HISTORY]?.[n.source.id]?.rate?.lastMono === n.monotonicAt
       )
-        this.rateSample = { stream: n.source.id, mono: n.monotonicAt, wall: n.at };
+        this.rateSample = {
+          stream: n.source.id,
+          mono: n.monotonicAt,
+          wall: n.at,
+          contextSession: (n as BodyThresholdSample & { contextSession?: string }).contextSession,
+        };
       acc = r.state;
       signals.push(...r.signals);
     }

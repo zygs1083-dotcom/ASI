@@ -244,7 +244,7 @@ export function NowSection({ model, onOpenPermissionSettings }: Panel) {
         {env.activeJobs.value &&
           (env.activeJobs.value.length === 0
             ? '无'
-            : env.activeJobs.value.map((j) => `${j.name}（${j.status}）`).join('、'))}
+            : env.activeJobs.value.map((j) => `${j.name}（${j.status}${j.owner ? '' : ' · 无主'}）`).join('、'))}
       </Item>
       <Item label="关注路径" fact={env.watchedPaths} now={now} onOpenPermissionSettings={ops}>
         {env.watchedPaths.value &&

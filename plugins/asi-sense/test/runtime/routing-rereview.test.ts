@@ -17,7 +17,7 @@ const signal = (id: string, kind: string): Signal => ({
   data: {},
 });
 
-function harness(failFirst: boolean, configuredRules = rules, blockFirst = true) {
+function harness(failFirst: boolean, configuredRules = rules, blockFirst = true, staged = false) {
   let now = 0;
   let release!: () => void;
   let entered!: () => void;
@@ -38,6 +38,7 @@ function harness(failFirst: boolean, configuredRules = rules, blockFirst = true)
         if (failFirst) throw new Error('unconfirmed');
       }
     },
+    ...(staged ? { onDeliveryCommitted: () => () => {} } : {}),
   } satisfies Pick<DshPort, 'deliver'>;
   const attention = new RuntimeAttention(
     clock,
@@ -60,6 +61,43 @@ function harness(failFirst: boolean, configuredRules = rules, blockFirst = true)
 }
 
 describe('in-flight session ownership', () => {
+  it('keeps staged private token buckets separate when ordinary context transfers', async () => {
+    const configured = [
+      ...rules,
+      {
+        id: 'body-warn',
+        match: { kind: 'body.threshold' },
+        level: 'context' as const,
+        createdBy: 'user' as const,
+        approved: true,
+      },
+    ];
+    const h = harness(false, configured, false, true);
+    h.attention.create('a');
+    h.attention.create('b');
+    await h.attention.preStep('a');
+    await h.attention.accept({
+      ...signal('private', 'body.threshold'),
+      subject: 'context',
+      data: { sessionId: 'a', sessionToken: h.attention.sessionToken('a'), severity: 'warn', value: 0.1 },
+    });
+    await h.attention.accept({ ...signal('ordinary', 'context'), subject: 'context' });
+    await h.attention.preStep('a');
+    await h.attention.preStep('b');
+    const b = h.delivered.filter((item) => item.sessionId === 'b').flatMap((item) => item.update.changes);
+    expect(b.map((change) => change.signal.id)).toEqual(['ordinary']);
+    h.attention.dispose('a');
+    h.attention.create('a');
+    await h.attention.preStep('a');
+    expect(
+      h.delivered
+        .filter((item) => item.sessionId === 'a')
+        .flatMap((item) => item.update.changes)
+        .filter((change) => change.signal.id === 'private'),
+    ).toHaveLength(1);
+    await h.attention.stop();
+  });
+
   it('moves the due wake after an in-flight context delivery changes session', async () => {
     const h = harness(false);
     h.attention.create('a');

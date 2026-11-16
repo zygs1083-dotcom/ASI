@@ -6,6 +6,7 @@ import {
   bucketLevel,
   bucketSince,
   byChangeAtId,
+  privateBucket,
   upsertBucket,
 } from './buckets.ts';
 import {
@@ -66,6 +67,7 @@ export class BucketDrain {
   nextDeadline(): number | undefined {
     let min: number | undefined;
     for (const b of this.pending.values()) {
+      if (privateBucket(b) && !this.isCurrent()(b.sessionId)) continue;
       if (min === undefined || b.deadline < min) min = b.deadline;
     }
     return min;
@@ -79,6 +81,29 @@ export class BucketDrain {
   }
   confirm(id: string): void {
     confirmBatch(this.batches, id);
+  }
+  discardPrivate(id: string, token?: string): void {
+    const matches = (bucket: Bucket) =>
+      bucket.sessionId === id &&
+      privateBucket(bucket) &&
+      (token === undefined ||
+        [...bucket.details.values()].every((detail) => detail.latest.data.sessionToken === token));
+    for (const [key, bucket] of this.pending) {
+      if (matches(bucket)) this.pending.delete(key);
+    }
+    const ready = this.ready.get(id)?.filter((bucket) => !matches(bucket));
+    if (ready?.length) this.ready.set(id, ready);
+    else this.ready.delete(id);
+    const batches = this.batches.get(id);
+    if (batches) {
+      for (const batch of [...batches]) {
+        const retained = batch.buckets.filter((bucket) => !matches(bucket));
+        if (!retained.length) batches.splice(batches.indexOf(batch), 1);
+        else if (retained.length !== batch.buckets.length)
+          batches.splice(batches.indexOf(batch), 1, this.buildInjectBatch(id, retained, batch.intent.update.at));
+      }
+      if (!batches.length) this.batches.delete(id);
+    }
   }
   suspend(id: string): InjectBatch[] {
     const batches = this.batches.get(id) ?? [];
@@ -168,7 +193,7 @@ export class BucketDrain {
   /** Due buckets attempted independently; failures restore the sealed bucket for a same-payload retry. */
   private async attemptDue(now: number, errors: unknown[], current: (id: string) => boolean): Promise<void> {
     for (const b of [...this.pending.values()]) {
-      if (!current(b.sessionId)) break;
+      if (!current(b.sessionId)) continue;
       if (now < b.deadline) continue;
       this.pending.delete(b.id);
       b.sealed = true;
@@ -249,7 +274,9 @@ export class BucketDrain {
     const loose = this.ready.get(sessionId);
     if (loose !== undefined && loose.length > 0) {
       this.ready.delete(sessionId);
-      this.list(this.batches, sessionId).push(this.buildInjectBatch(sessionId, loose));
+      for (const group of [loose.filter(privateBucket), loose.filter((bucket) => !privateBucket(bucket))]) {
+        if (group.length) this.list(this.batches, sessionId).push(this.buildInjectBatch(sessionId, group));
+      }
     }
     const batches = this.batches.get(sessionId);
     if (batches === undefined) return;
@@ -262,7 +289,8 @@ export class BucketDrain {
       } catch (e) {
         if (!(e instanceof DeliveryFailure) || e.cause !== undefined)
           errors.push(e instanceof DeliveryFailure ? e.cause : e);
-        if (e instanceof DeliveryFailure && e.kind !== 'deferred') batches.splice(batches.indexOf(batch), 1);
+        if (e instanceof DeliveryFailure && e.kind !== 'deferred' && batches.includes(batch))
+          batches.splice(batches.indexOf(batch), 1);
         continue;
       }
       for (const b of batch.buckets) {
@@ -271,7 +299,7 @@ export class BucketDrain {
           b.splitFrom.alreadyInjected = (b.splitFrom.alreadyInjected ?? 0) + n;
         }
       }
-      batches.splice(batches.indexOf(batch), 1);
+      if (batches.includes(batch)) batches.splice(batches.indexOf(batch), 1);
     }
     if (batches.length === 0) this.batches.delete(sessionId);
   }

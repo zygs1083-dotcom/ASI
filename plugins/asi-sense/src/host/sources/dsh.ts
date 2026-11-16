@@ -131,6 +131,7 @@ export class DshSource {
   }
   stateFor(session: string | undefined, state: SenseState): SenseState {
     const store = session === undefined ? undefined : this.sessions.get(session);
+    const view = store ?? new StateStore(() => this.clock.wall());
     const extended = this.port as DshPort & { nowReadings?: (sessionId?: string) => NowReadings };
     const paths = [
       'self.activity',
@@ -140,7 +141,7 @@ export class DshSource {
       'env.where.toolExec',
       'env.activeJobs',
     ];
-    if (store) {
+    if (store || extended.nowReadings) {
       let readings: NowReadings = {};
       try {
         readings = extended.nowReadings?.(session) ?? {};
@@ -148,9 +149,10 @@ export class DshSource {
         readings = Object.fromEntries(paths.map((path) => [path, { value: null, status: 'unavailable' }]));
       }
       for (const path of paths) {
+        if (!store && path !== 'env.activeJobs') continue;
         const reading = readings[path];
         if (!reading) continue;
-        store.apply({
+        view.apply({
           id: this.attention.id(),
           kind: 'fact.updated',
           at: this.clock.wall(),
@@ -160,7 +162,7 @@ export class DshSource {
         });
       }
     }
-    const own = store?.snapshot() ?? new StateStore(() => this.clock.wall()).snapshot();
+    const own = view.snapshot();
     if (!store) {
       const reason = session === undefined ? '没有活动会话' : '会话不可用';
       for (const fact of [
@@ -170,9 +172,9 @@ export class DshSource {
         own.self.body.tokens,
         own.env.where.model,
         own.env.where.toolExec,
-        own.env.activeJobs,
       ])
         fact.reason = reason;
+      if (!extended.nowReadings) own.env.activeJobs.reason = reason;
     }
     state.self.activity = own.self.activity;
     state.self.pending = own.self.pending;

@@ -29,8 +29,10 @@ function fixture() {
   let failJobs = false;
   let failTools = false;
   let agents = [agent];
+  let sessions = [{ id: agent.id }];
   const ctx = {
     agents: { list: () => agents, get: (id: string) => agents.find((item) => item.id === id) },
+    sessions: { list: () => sessions },
     jobs: {
       list: (id?: string) => {
         if (failJobs) throw new Error('private fixture details');
@@ -63,6 +65,10 @@ function fixture() {
     jobs,
     setAgents: (value: typeof agents) => {
       agents = value;
+      sessions = value.map(({ id }) => ({ id }));
+    },
+    setSessions: (ids: string[]) => {
+      sessions = ids.map((id) => ({ id }));
     },
     setSettings: (value: unknown) => {
       settings = value;
@@ -99,7 +105,7 @@ describe('DSH now facts', () => {
     expect(facts['self.pending']).toEqual({ value: { inbox: 3, jobs: 1 } });
     expect(facts['self.tools']).toEqual({ value: ['allowed'] });
     expect(facts['env.activeJobs']).toEqual({
-      value: [{ id: 'job-1', command: 'fixture-job', startedAt: 10, status: 'running' }],
+      value: [{ id: 'job-1', owner: f.agent.id, command: 'fixture-job', startedAt: 10, status: 'running' }],
     });
   });
 
@@ -145,7 +151,7 @@ describe('DSH now facts', () => {
     expect(JSON.stringify(facts)).not.toContain('private fixture details');
   });
 
-  it('counts only the selected session jobs, not unowned jobs', () => {
+  it('lists all active jobs in the sidebar but counts only the selected session', () => {
     const f = fixture();
     f.jobs.push({
       id: 'unowned',
@@ -156,7 +162,28 @@ describe('DSH now facts', () => {
     });
     const facts = nowReadings(f.ctx, f.agent.id, new Map(), new Set());
     expect(facts['self.pending']).toEqual({ value: { inbox: 3, jobs: 1 } });
-    expect(facts['env.activeJobs'].value).toHaveLength(1);
+    expect(facts['env.activeJobs'].value).toEqual([
+      expect.objectContaining({ id: 'unowned', owner: undefined }),
+      expect.objectContaining({ id: 'job-1', owner: f.agent.id }),
+    ]);
+    expect(nowReadings(f.ctx, undefined, new Map(), new Set())['env.activeJobs'].value).toHaveLength(2);
+  });
+
+  it('includes jobs belonging to live sessions without an active agent', () => {
+    const f = fixture();
+    f.setSessions([f.agent.id, 'session-without-agent']);
+    f.jobs.push({
+      id: 'detached-job',
+      owner: 'session-without-agent',
+      status: 'running',
+      startedAt: 40,
+      label: 'fixture-detached-job',
+    });
+    const facts = nowReadings(f.ctx, f.agent.id, new Map(), new Set());
+    expect(facts['env.activeJobs'].value).toContainEqual(
+      expect.objectContaining({ id: 'detached-job', owner: 'session-without-agent' }),
+    );
+    expect(facts['self.pending']).toEqual({ value: { inbox: 3, jobs: 1 } });
   });
 
   it('reads only owned job summaries for each model session', () => {

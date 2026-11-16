@@ -98,7 +98,9 @@ export class AttentionPipeline {
     this.disposed.delete(session.id);
     this.session(session.id).context = session;
   }
-  disposeSession(id: string): void {
+  disposeSession(id: string, token?: string): void {
+    this.drain.discardPrivate(id, token);
+    void this.enqueueDrain(async () => this.drain.discardPrivate(id, token));
     if (this.sessions.has(id)) this.disposed.set(id, this.clock() + 600_000);
   }
   retentionDeadline(): number | undefined {

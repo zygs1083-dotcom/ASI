@@ -1,6 +1,17 @@
 import type { DeliveryLevel, EnvChange, Signal, WatchRule } from '@asi/sense-types';
 import { LEVEL_RANK } from './rules.ts';
 
+export function isSessionContext(signal: Signal): boolean {
+  return (
+    (signal.kind === 'body.threshold' && signal.subject === 'context') ||
+    (signal.kind === 'body.rate' && signal.data.metric === 'context')
+  );
+}
+
+export function privateBucket(bucket: Bucket): boolean {
+  return [...bucket.details.values()].some((detail) => isSessionContext(detail.latest));
+}
+
 /**
  * One (kind, effective-level) pair's contribution inside a merge bucket:
  * merged `count`, earliest `signal.at`, and the representative — newest
@@ -89,6 +100,11 @@ export function upsertBucket(
       !candidate.sealed &&
       candidate.sessionId === sessionId &&
       candidate.subject === signal.subject &&
+      privateBucket(candidate) === isSessionContext(signal) &&
+      (!isSessionContext(signal) ||
+        [...candidate.details.values()].every(
+          (detail) => detail.latest.data.sessionToken === signal.data.sessionToken,
+        )) &&
       candidate.deadline > now
     ) {
       b = candidate;

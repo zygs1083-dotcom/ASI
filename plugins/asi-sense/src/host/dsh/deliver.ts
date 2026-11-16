@@ -5,12 +5,31 @@ import { freezeMessage, MessageId, type UserMessage } from '@deepseek-ai/dsh-llm
 import { DeliveryFailure } from '../attention/drain.ts';
 import type { DeliveryIntent } from '../attention/pipeline.ts';
 import { formatEnvUpdate } from '../delivery/format.ts';
-import { modelLabel, modelPath } from './tool-output.ts';
+import { modelLabel, modelPath, modelTitle } from './tool-output.ts';
 
 declare module '@deepseek-ai/dsh-llm' {
   interface MessageSourceMap {
     environment: { kind: 'environment' };
   }
+}
+
+function metric(value: unknown): string {
+  if (typeof value !== 'string') return 'body';
+  if (value.startsWith('disk:')) return `disk:${modelPath(value.slice(5))}`;
+  return [
+    'cpu',
+    'memory',
+    'disk',
+    'battery',
+    'context',
+    'network',
+    'network.rx',
+    'network.tx',
+    'thermal',
+    'rss',
+  ].includes(value)
+    ? value
+    : 'body';
 }
 
 function modelUpdate(update: EnvUpdate): EnvUpdate {
@@ -19,14 +38,14 @@ function modelUpdate(update: EnvUpdate): EnvUpdate {
     at: update.at,
     suppressed: update.suppressed,
     alreadyInjected: update.alreadyInjected,
-    changes: update.changes.map(({ signal, count, level }) => {
+    changes: update.changes.map(({ signal, count, level, ruleId }) => {
       const data: typeof signal.data = {};
       let subject = 'observation';
       if (signal.kind === 'app.activated') {
         if (typeof signal.data.name === 'string') data.name = modelLabel(signal.data.name);
         if (typeof signal.data.previousName === 'string') data.previousName = modelLabel(signal.data.previousName);
       } else if (signal.kind === 'window.focused' || signal.kind === 'window.title-changed') {
-        if (typeof signal.data.title === 'string') data.title = signal.data.title;
+        if (typeof signal.data.title === 'string') data.title = modelTitle(signal.data.title);
       } else if (signal.kind === 'file.changed') {
         data.path = modelPath(typeof signal.data.path === 'string' ? signal.data.path : signal.subject);
       } else if (signal.kind === 'job.exited' || signal.kind === 'process.exited') {
@@ -35,10 +54,22 @@ function modelUpdate(update: EnvUpdate): EnvUpdate {
         if (typeof signal.data.durationMs === 'number') data.durationMs = signal.data.durationMs;
         if (typeof signal.data.startedAt === 'number') data.startedAt = signal.data.startedAt;
       } else if (signal.kind === 'body.threshold') {
-        const metrics = ['cpu', 'memory', 'disk', 'battery', 'context', 'network', 'thermal'];
-        subject = metrics.includes(signal.subject) ? signal.subject : 'body';
+        subject = metric(signal.subject);
         if (['normal', 'warn', 'critical'].includes(String(signal.data.severity))) data.severity = signal.data.severity;
-        if (typeof signal.data.value === 'number') data.value = signal.data.value;
+        if (typeof signal.data.value === 'number' && Number.isFinite(signal.data.value)) data.value = signal.data.value;
+      } else if (signal.kind === 'body.rate' || signal.kind === 'body.anomaly' || signal.kind === 'file.burst') {
+        subject =
+          signal.kind === 'file.burst'
+            ? modelPath(typeof signal.data.directory === 'string' ? signal.data.directory : signal.subject)
+            : metric(signal.data.metric);
+        const ruleId = signal.data.ruleId;
+        if (typeof ruleId === 'string' && (/^[\w-]+$/.test(ruleId) || ruleId === 'file.burst')) data.ruleId = ruleId;
+        if (['normal', 'warn', 'critical'].includes(String(signal.data.severity))) data.severity = signal.data.severity;
+        for (const key of ['value', 'slope', 'delta', 'etaToFloorMs', 'created', 'modified', 'deleted']) {
+          const value = signal.data[key];
+          if (typeof value === 'number' && Number.isFinite(value)) data[key] = value;
+        }
+        if (signal.data.externalDeletionExceeded === true) data.externalDeletionExceeded = true;
       }
       const kinds = [
         'app.activated',
@@ -56,6 +87,12 @@ function modelUpdate(update: EnvUpdate): EnvUpdate {
       return {
         count,
         level,
+        ...(signal.kind === 'body.threshold' &&
+        (subject === 'disk' || subject.startsWith('disk:')) &&
+        typeof ruleId === 'string' &&
+        /^[\w-]+$/.test(ruleId)
+          ? { ruleId }
+          : {}),
         signal: {
           id: signal.id,
           kind: kinds.includes(signal.kind) ? signal.kind : 'observation',

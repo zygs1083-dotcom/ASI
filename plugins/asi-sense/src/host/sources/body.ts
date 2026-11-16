@@ -12,7 +12,7 @@ import {
 import { captureRateTimes, type RateTimes } from '../body/rate.ts';
 import type { RuntimeAttention } from '../runtime/attention.ts';
 import type { FactExpiry } from '../runtime/expiry.ts';
-import type { Clock, DshPort, ProbeFactory, StoragePort } from '../runtime/ports.ts';
+import type { Clock, DshPort, ProbeFactory, StoragePort, TokenSnapshot } from '../runtime/ports.ts';
 import { TokenFacts } from './token-facts.ts';
 
 const source = { id: 'body', api: 'probe', host: 'local' };
@@ -54,6 +54,7 @@ export class BodySource {
   private burstRoots = '';
   private detector = new FileBurstDetector();
   private rateTimes: RateTimes = {};
+  private rateSession?: string;
 
   constructor(
     factory: ProbeFactory,
@@ -87,6 +88,7 @@ export class BodySource {
     });
     this.monitor = new BodyMonitor({
       tuner: this.tuner,
+      contextSession: () => attention.sessionToken(attention.currentSessionId()),
       clock: () => clock.mono(),
       wallClock: () => clock.wall(),
       persistence: { load: () => storage.load('body'), save: (value) => storage.save('body', value) },
@@ -102,7 +104,12 @@ export class BodySource {
     this.off = this.probe.onSample((body) => {
       const at = this.clock.wall();
       const mono = this.clock.mono();
-      this.enqueue(() => this.sample(body, at, mono));
+      const sessionId = this.attention.currentSessionId();
+      const contextSession = this.attention.sessionToken(sessionId);
+      const tokens = this.tokenFacts.hasReading ? this.attention.state().self.body.tokens : undefined;
+      const tokenTime = tokens && this.expiry.factMeta('/self/body/tokens');
+      const tokenSource = this.tokenFacts.source;
+      this.enqueue(() => this.sample(body, at, mono, { sessionId, contextSession, tokens, tokenTime, tokenSource }));
     });
     this.intervalMs = intervalMs;
     await this.setPaused(this.paused());
@@ -199,16 +206,35 @@ export class BodySource {
       },
     });
   }
-  private async sample(body: Body, at: number, mono: number): Promise<void> {
+  private async sample(
+    body: Body,
+    at: number,
+    mono: number,
+    captured: {
+      sessionId?: string;
+      contextSession?: string;
+      tokens?: Body['tokens'];
+      tokenTime?: ReturnType<FactExpiry['factMeta']>;
+      tokenSource: TokenSnapshot['contextWindowSource'];
+    },
+  ): Promise<void> {
     if (this.stopped || this.paused()) return;
-    const current = this.tokenFacts.hasReading || this.thermal ? this.attention.state().self.body : undefined;
-    if (this.tokenFacts.hasReading && current) body.tokens = current.tokens;
+    const { sessionId, contextSession, tokens, tokenTime, tokenSource } = captured;
+    const current = this.thermal ? this.attention.state().self.body : undefined;
+    if (tokens) body.tokens = tokens;
     if (this.thermal && current) body.thermal = current.thermal;
-    const tokenTime = this.tokenFacts.hasReading && this.expiry.factMeta('/self/body/tokens');
-    if (tokenTime && current?.tokens.status === 'ok')
-      this.rateTimes.context = { wall: current.tokens.observedAt, mono: tokenTime.observedMono };
+    if (this.rateSession !== contextSession) {
+      delete this.rateTimes.context;
+      this.rateSession = contextSession;
+    }
+    if (tokenTime && tokens?.status === 'ok')
+      this.rateTimes.context = { wall: tokens.observedAt, mono: tokenTime.observedMono };
     this.rateTimes = captureRateTimes(body, mono, at, this.rateTimes);
     const evaluated = structuredClone(body);
+    if (contextSession && this.attention.sessionToken(sessionId) !== contextSession) {
+      evaluated.tokens.value = null;
+      evaluated.tokens.status = 'unknown';
+    }
     for (const [key, metric] of Object.entries({
       cpu: 'cpu',
       memory: 'memory',
@@ -231,11 +257,19 @@ export class BodySource {
     if (this.thermal && evaluated.thermal.status === 'ok') evaluated.thermal.observedAt = at;
     if (
       evaluated.tokens.value &&
-      (this.tokenFacts.source === 'fallback' ||
+      (tokenSource === 'fallback' ||
         ('contextWindowSource' in evaluated.tokens.value && evaluated.tokens.value.contextWindowSource === 'fallback'))
     )
       delete evaluated.tokens.value.contextWindow;
-    const next = { body: evaluated, at, monotonicAt: mono, source, rateTimes: this.rateTimes };
+    const next = {
+      body: evaluated,
+      at,
+      monotonicAt: mono,
+      source,
+      rateTimes: this.rateTimes,
+      contextSession,
+      contextSessions: this.attention.activeSessionTokens(),
+    };
     this.sync();
     const pending: Promise<void>[] = [];
     let signals: Signal[] = [];
@@ -256,11 +290,18 @@ export class BodySource {
       this.expiry.withObservationTimes(this.rateTimes, () =>
         this.attention.batch(() => {
           for (const key of Object.keys(body) as (keyof Body)[]) {
-            if ((key === 'tokens' && this.tokenFacts.hasReading) || (key === 'thermal' && this.thermal)) continue;
+            if ((key === 'tokens' && tokens) || (key === 'thermal' && this.thermal)) continue;
             this.write(key, key === 'tokens' ? this.tokenFacts.decorate(body.tokens) : body[key]);
           }
           for (const signal of signals) {
             signal.data.feedbackAvailable = false;
+            if (
+              (signal.kind === 'body.threshold' && signal.subject === 'context') ||
+              (signal.kind === 'body.rate' && signal.data.metric === 'context')
+            ) {
+              signal.data.sessionId = sessionId;
+              signal.data.sessionToken = contextSession;
+            }
             pending.push(this.attention.accept(signal));
           }
           this.changed();

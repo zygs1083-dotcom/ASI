@@ -134,6 +134,7 @@ function harness(
       sample(body);
       await vi.advanceTimersByTimeAsync(0);
     },
+    sampleRaw: (body = mkBody()) => sample(body),
     watcherCount: () => watchers,
     probeCount: () => probes,
     advance: async (ms: number) => {
@@ -144,6 +145,204 @@ function harness(
 }
 
 describe('host runtime', () => {
+  it('keeps pending token alerts with their source session and drops closed generations', async () => {
+    const h = harness();
+    const usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+    let a = 0;
+    h.ports.dsh.tokenSnapshot = async (session) => ({
+      contextWindow: 1000,
+      contextUsed: session === 'a' ? a : 0,
+      sessionUsage: usage,
+    });
+    await h.runtime.start();
+    await h.agent({ type: 'created', sessionId: 'a' });
+    await h.agent({ type: 'created', sessionId: 'b' });
+    await h.agent({ type: 'pre-step', sessionId: 'a' });
+    await h.sample();
+    await h.advance(1000);
+    a = 900;
+    await h.agent({ type: 'post-step', sessionId: 'a' });
+    await h.sample();
+    expect(h.runtime.events().some((event) => event.kind === 'body.threshold' && event.subject === 'context')).toBe(
+      true,
+    );
+    await h.advance(2_000);
+    await h.agent({ type: 'pre-step', sessionId: 'b' });
+    expect(
+      h.delivered.filter((intent) => intent.sessionId === 'b').flatMap((intent) => intent.update.changes),
+    ).not.toContainEqual(
+      expect.objectContaining({ signal: expect.objectContaining({ kind: 'body.threshold', subject: 'context' }) }),
+    );
+    expect(
+      h.delivered.filter((intent) => intent.sessionId === 'b').flatMap((intent) => intent.update.changes),
+    ).not.toContainEqual(
+      expect.objectContaining({
+        signal: expect.objectContaining({ kind: 'body.rate', data: expect.objectContaining({ metric: 'context' }) }),
+      }),
+    );
+    await h.agent({ type: 'pre-step', sessionId: 'a' });
+    expect(
+      h.delivered.filter((intent) => intent.sessionId === 'a').flatMap((intent) => intent.update.changes),
+    ).toContainEqual(
+      expect.objectContaining({ signal: expect.objectContaining({ kind: 'body.threshold', subject: 'context' }) }),
+    );
+    await h.agent({ type: 'disposed', sessionId: 'a' });
+    await h.agent({ type: 'created', sessionId: 'a' });
+    await h.agent({ type: 'pre-step', sessionId: 'a' });
+    expect(
+      h.delivered
+        .filter((intent) => intent.sessionId === 'a')
+        .flatMap((intent) => intent.update.changes)
+        .filter(({ signal }) => signal.kind === 'body.threshold' && signal.subject === 'context'),
+    ).toHaveLength(1);
+    await h.runtime.stop();
+  });
+
+  it('keeps token rate windows and latches separate across interleaved sessions', async () => {
+    const h = harness();
+    const used: Record<string, number> = { a: 200, b: 600 };
+    h.ports.dsh.tokenSnapshot = async (session) => ({
+      contextWindow: 1000,
+      contextUsed: used[session],
+      sessionUsage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    });
+    await h.runtime.start();
+    for (const sessionId of ['a', 'b']) await h.agent({ type: 'created', sessionId });
+    for (const sessionId of ['a', 'b']) {
+      await h.agent({ type: 'pre-step', sessionId });
+      await h.sample();
+      await h.advance(1000);
+    }
+    expect(
+      h.runtime.events().filter((event) => event.kind === 'body.rate' && event.detail?.metric === 'context'),
+    ).toHaveLength(0);
+    used.a = 300;
+    await h.agent({ type: 'pre-step', sessionId: 'a' });
+    await h.sample();
+    await h.advance(1000);
+    used.b = 610;
+    await h.agent({ type: 'pre-step', sessionId: 'b' });
+    await h.sample();
+    expect(
+      h.runtime.events().filter((event) => event.kind === 'body.rate' && event.detail?.metric === 'context'),
+    ).toHaveLength(2);
+    await h.runtime.stop();
+  });
+
+  it('discards a delayed token sample from a disposed session generation', async () => {
+    const h = harness();
+    let used = 0;
+    h.ports.dsh.tokenSnapshot = async () => ({
+      contextWindow: 1000,
+      contextUsed: used,
+      sessionUsage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    });
+    await h.runtime.start();
+    await h.agent({ type: 'created', sessionId: 'a' });
+    await h.agent({ type: 'pre-step', sessionId: 'a' });
+    await h.sample();
+    await h.advance(1000);
+    used = 900;
+    await h.agent({ type: 'post-step', sessionId: 'a' });
+    let release!: () => void;
+    let entered!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    const waiting = new Promise<void>((resolve) => (entered = resolve));
+    const original = h.runtime.body.monitor.evaluateAuto;
+    vi.spyOn(h.runtime.body.monitor, 'evaluateAuto').mockImplementationOnce(async (...args) => {
+      entered();
+      await gate;
+      return original(...args);
+    });
+    h.sampleRaw();
+    await waiting;
+    await h.agent({ type: 'disposed', sessionId: 'a' });
+    used = 0;
+    await h.agent({ type: 'created', sessionId: 'a' });
+    await h.agent({ type: 'pre-step', sessionId: 'a' });
+    release();
+    await vi.advanceTimersByTimeAsync(0);
+    await h.agent({ type: 'pre-step', sessionId: 'a' });
+    expect(h.runtime.events()).toContainEqual(
+      expect.objectContaining({
+        kind: 'body.threshold',
+        subject: 'context',
+        level: 'record',
+        reason: 'session-private',
+      }),
+    );
+    expect(
+      h.delivered
+        .flatMap((intent) => intent.update.changes)
+        .some(({ signal }) => signal.kind === 'body.threshold' && signal.subject === 'context'),
+    ).toBe(false);
+    await h.runtime.stop();
+  });
+
+  it('keeps a delayed token alert with its live source after another session pre-steps', async () => {
+    const h = harness();
+    let a = 0;
+    h.ports.dsh.tokenSnapshot = async (session) => ({
+      contextWindow: 1000,
+      contextUsed: session === 'a' ? a : 0,
+      sessionUsage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    });
+    await h.runtime.start();
+    for (const sessionId of ['a', 'b']) await h.agent({ type: 'created', sessionId });
+    await h.agent({ type: 'pre-step', sessionId: 'a' });
+    await h.sample();
+    await h.advance(1000);
+    a = 900;
+    await h.agent({ type: 'post-step', sessionId: 'a' });
+    let release!: () => void;
+    let entered!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    const waiting = new Promise<void>((resolve) => (entered = resolve));
+    const original = h.runtime.body.monitor.evaluateAuto;
+    vi.spyOn(h.runtime.body.monitor, 'evaluateAuto').mockImplementationOnce(async (...args) => {
+      entered();
+      await gate;
+      return original(...args);
+    });
+    h.sampleRaw();
+    await waiting;
+    await h.agent({ type: 'pre-step', sessionId: 'b' });
+    release();
+    await vi.advanceTimersByTimeAsync(0);
+    await h.agent({ type: 'pre-step', sessionId: 'b' });
+    expect(
+      h.delivered
+        .filter((intent) => intent.sessionId === 'b')
+        .flatMap((intent) => intent.update.changes)
+        .some(({ signal }) => signal.kind === 'body.threshold' && signal.subject === 'context'),
+    ).toBe(false);
+    await h.agent({ type: 'pre-step', sessionId: 'a' });
+    expect(
+      h.delivered
+        .filter((intent) => intent.sessionId === 'a')
+        .flatMap((intent) => intent.update.changes)
+        .some(({ signal }) => signal.kind === 'body.threshold' && signal.subject === 'context'),
+    ).toBe(true);
+    await h.runtime.stop();
+  });
+
+  it('projects session state for expiry notifications after a foreign job event', async () => {
+    const h = harness(undefined, { rules: [] });
+    await h.runtime.start();
+    await h.agent({ type: 'created', sessionId: 'a' });
+    await h.agent({ type: 'created', sessionId: 'b' });
+    await h.agent({ type: 'pre-step', sessionId: 'b' });
+    await h.sample(mkBody());
+    await h.job({ type: 'started', id: 'foreign-job', sessionId: 'a', command: 'foreign-private-command' });
+    const states: SenseState[] = [];
+    const off = h.runtime.subscribe((state) => states.push(state));
+    await h.advance(60_000);
+    expect(states.length).toBeGreaterThan(0);
+    for (const state of states) expect(JSON.stringify(state)).not.toContain('foreign-private-command');
+    off();
+    await h.runtime.stop();
+  });
+
   it('isolates concurrent session facts and restores the selected token on disposal', async () => {
     const values = {
       a: { activity: 'tool', pending: { inbox: 1, jobs: 1 }, tools: ['a-tool'], provider: 'provider-a', used: 11 },

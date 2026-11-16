@@ -3,7 +3,7 @@ import { validateSamples } from './monitor-snapshot.ts';
 import type { AutomaticBodyEvaluation, RebaselineManager, RebaselineSuggestion } from './rebaseline.ts';
 import type { AdaptiveState } from './state.ts';
 
-export type RateSample = { stream: string; mono: number; wall: number };
+export type RateSample = { stream: string; mono: number; wall: number; contextSession?: string };
 type View = { state?: AdaptiveState; sample?: RateSample; suggestions: RebaselineSuggestion[] };
 type Commit = (result: AutomaticBodyEvaluation, publish: () => void) => void;
 

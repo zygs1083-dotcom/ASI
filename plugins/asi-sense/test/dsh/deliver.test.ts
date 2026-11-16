@@ -2,7 +2,7 @@ import type { EnvUpdate } from '@asi/sense-types';
 import { describe, expect, it, vi } from 'vitest';
 import type { DeliveryIntent } from '../../src/host/attention/pipeline.ts';
 import { createDelivery } from '../../src/host/dsh/deliver.ts';
-import { modelText } from '../../src/host/dsh/tool-output.ts';
+import { modelText, modelTitle } from '../../src/host/dsh/tool-output.ts';
 
 const update: EnvUpdate = {
   since: Date.UTC(2026, 0, 1, 12, 1, 3),
@@ -104,6 +104,12 @@ describe('DSH environment delivery', () => {
     expect(modelText('open </private/fixture/report> and "/private/a/file"', 'fixture-host.invalid')).toBe(
       'open <report> and "file"',
     );
+    expect(modelTitle('open /private/fixture/report.txt on [2001:db8::1]:443', 'fixture-host')).toBe(
+      'open report.txt on <host>',
+    );
+    expect(modelTitle('https://fixture-host/private/file on fixture-host', 'fixture-host')).toBe('<host> on <host>');
+    expect(modelTitle('https://host/private on host', 'host')).toBe('<host> on <host>');
+    expect(modelTitle('https://backup.example.invalid:443/path', 'fixture-host')).toBe('<host>');
   });
 
   it('uses structured delivery fields instead of free-text notes and subjects', async () => {
@@ -135,6 +141,62 @@ describe('DSH environment delivery', () => {
     expect(text).not.toContain('backup.example.invalid');
     expect(text).not.toContain('/private/a');
     expect(text).toContain('file.ts');
+  });
+
+  it('projects useful body and deletion alerts without paths in context and wake messages', async () => {
+    const { agent, deliver } = fixture();
+    const changes: EnvUpdate['changes'] = [
+      {
+        kind: 'body.rate',
+        subject: 'rate:disk-drop:/private/mount/Data',
+        data: {
+          metric: 'disk:/private/mount/Data',
+          ruleId: 'disk-drop',
+          severity: 'warn',
+          slope: -42,
+          etaToFloorMs: 9000,
+        },
+      },
+      {
+        kind: 'body.anomaly',
+        subject: 'baseline:cpu',
+        data: { metric: 'cpu', ruleId: 'cpu', severity: 'warn', value: 0.9 },
+      },
+      { kind: 'body.threshold', subject: 'disk:/private/mount/Data', data: { severity: 'critical', value: 0.03 } },
+      {
+        kind: 'file.burst',
+        subject: '/private/work/project',
+        data: {
+          directory: '/private/work/project',
+          ruleId: 'file.burst',
+          created: 4,
+          deleted: 51,
+          externalDeletionExceeded: true,
+        },
+      },
+    ].map((item, index) => ({
+      count: 1,
+      level: index === 3 ? 'wake' : 'context',
+      ...(index === 2 ? { ruleId: 'disk-critical' } : {}),
+      signal: { ...item, id: String(index), at: update.at, source: { id: 'fixture', api: 'test', host: 'local' } },
+    }));
+    for (const kind of ['inject', 'followup'] as const) {
+      await deliver('session-a', { ...intent(kind, kind), update: { ...update, changes } });
+      const text = JSON.stringify(kind === 'inject' ? await deliver.messages('session-a') : agent.followup.mock.calls);
+      expect(text).toContain('disk:Data');
+      expect(text).toContain('disk-drop');
+      expect(text).toContain('rule: disk-critical');
+      expect(text).toContain('-42');
+      expect(text).toContain('9000');
+      expect(text).toContain('cpu');
+      expect(text).toContain('0.9');
+      expect(text).toContain('project');
+      expect(text).toContain('file.burst');
+      expect(text).toContain('51');
+      expect(text).toContain('4');
+      expect(text).toContain('externalDeletionExceeded');
+      expect(text).not.toContain('/private/');
+    }
   });
 
   it('rejects unknown or mismatched sessions rather than broadcasting', async () => {
@@ -222,7 +284,7 @@ describe('DSH environment delivery', () => {
     expect(JSON.stringify(await deliver.messages('session-a'))).not.toContain('synthetic title');
   });
 
-  it('preserves a consented window title without applying the text fallback', async () => {
+  it.each(['inject', 'followup', 'send'] as const)('projects a consented window title before %s', async (kind) => {
     const { agent, deliver } = fixture();
     const title = 'open </private/fixture/report> backup.example.invalid';
     const windowUpdate: EnvUpdate = {
@@ -242,8 +304,10 @@ describe('DSH environment delivery', () => {
         },
       ],
     };
-    await deliver('session-a', { ...intent('followup'), update: windowUpdate });
-    const text = JSON.stringify(agent.followup.mock.calls);
-    expect(text).toContain('&lt;/private/fixture/report&gt; backup.example.invalid');
+    await deliver('session-a', { ...intent(kind), update: windowUpdate });
+    const text = JSON.stringify(kind === 'inject' ? await deliver.messages('session-a') : agent[kind].mock.calls);
+    expect(text).toContain('&lt;report&gt; &lt;host&gt;');
+    expect(text).not.toContain('/private/fixture');
+    expect(text).not.toContain('backup.example.invalid');
   });
 });

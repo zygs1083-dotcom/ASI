@@ -105,7 +105,7 @@ export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}
   async function tick(): Promise<void> {
     if (!running) return;
     if (expiry.expire()) {
-      listeners.notify(attention.state());
+      listeners.notify(dsh.stateFor(attention.currentSessionId(), attention.state()));
       changed();
     }
     if (clock.mono() >= nextToken) {

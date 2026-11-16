@@ -149,7 +149,7 @@ export function makeState(over: Partial<SenseState> = {}): SenseState {
       },
       frontApp: fact({ name: 'Terminal', bundleId: 'com.demo.terminal' }),
       focusedWindow: fact({ title: 'demo.ts — project' }),
-      activeJobs: fact([{ id: 'job-1', name: 'pnpm test', status: 'running' }]),
+      activeJobs: fact([{ id: 'job-1', name: 'pnpm test', owner: 'fixture-session', status: 'running' }]),
       watchedPaths: fact({ 'src/**': { lastChange: T0 - 32_000, changes: 7 } }),
     },
     observation: {

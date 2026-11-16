@@ -68,6 +68,7 @@ export interface Signal {
 /** Summary of a tracked job/process. */
 export interface JobSummary {
   id: string;
+  owner?: string;
   startedAt: number;
   command?: string;
   pid?: number;
