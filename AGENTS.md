@@ -17,8 +17,8 @@ ASI 是一组 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness
 |---|---|---|
 | 负责人 | 用户 | 产品决策、批准对外操作（push GitHub、发布插件） |
 | 协调端 | U2 上的 Claude（仓库 `/home/desktop/pro/ASI`） | 设计、写契约和任务说明、派发、裁决评审、合并 `main`、汇报 |
-| 开发 worker | MacPro 上的 devin，模型 `gpt-6-1-terra-xhigh`（2026-11-16 起；原 Fusion 免费额度会限流） | 在自己的工作树/分支实现、自测、提交、push 到 hub |
-| 测试/评审 worker | MacPro 上的 devin，模型 `gpt-6-1-terra-xhigh` | 写测试、在真实 DSH 里验收、独立评审（只读代码） |
+| 开发 worker | MacPro 上的 devin，模型 `swe-2`（2026-11-17 起；terra 已从 devin 下架） | 在自己的工作树/分支实现、自测、提交、push 到 hub |
+| 测试/评审 worker | MacPro 上的 devin，模型 `swe-2`；另有 U1 上的 agy（Gemini 4 Carbon High / Hydrogen XHigh，`ASI_HOST=U1`） | 写测试、在真实 DSH 里验收、独立评审（只读代码） |
 
 - worker 只在 **MacPro** 上运行（插件依赖 macOS API 和本机 DSH），**同时最多 5 个**。
 - 协调端不在 worker 工作树里改代码；worker 不替负责人做产品决策，口径不清用 `orca orchestration ask` 问。
