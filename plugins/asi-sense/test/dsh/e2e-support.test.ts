@@ -1,9 +1,40 @@
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
-import { access, writeFile } from 'node:fs/promises';
+import { access, rm, writeFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
-import { stop, temporaryProfile, wakeDiagnostics } from '../../scripts/e2e-support.ts';
+import {
+  failureDetails,
+  stop,
+  targetTurnOutcome,
+  temporaryProfile,
+  wakeDiagnostics,
+} from '../../scripts/e2e-support.ts';
+
+describe('private failure diagnostics', () => {
+  it('reports assertion values without copying arbitrary error or matcher content', () => {
+    const error = Object.assign(new Error('private message'), {
+      matcherResult: { expected: 1, actual: 2, message: 'private matcher content' },
+    });
+    const details = failureDetails(error);
+    expect(details).toMatchObject({ name: 'Error', expected: 1, actual: 2 });
+    expect(JSON.stringify(details)).not.toContain('private');
+    expect(failureDetails(new Error('target assertion selected count: expected=1, actual=2'))).toMatchObject({
+      assertion: 'target assertion selected count: expected=1, actual=2',
+    });
+  });
+
+  it('distinguishes the fixture budget gate from real model failures', () => {
+    const end = (kind: string, message?: string) => ({
+      type: 'turn/end',
+      data: { reason: { kind, error: message ? { code: 'UNKNOWN', message } : undefined } },
+    });
+    expect(targetTurnOutcome([end('completed')], 1)).toBeUndefined();
+    expect(targetTurnOutcome([end('completed')], 0)).toBe('completed');
+    expect(targetTurnOutcome([end('error', 'E2E model request budget exhausted')], 0)).toBe('budget-exhausted');
+    expect(targetTurnOutcome([end('error', 'provider failed')], 0)).toBe('failed');
+  });
+});
 
 describe('woken model turn diagnostics', () => {
   const start = (turn: number) => ({ type: 'turn/start', data: { turn } });
@@ -112,6 +143,22 @@ describe('woken model turn diagnostics', () => {
 });
 
 describe('private DSH fixture profile', () => {
+  it('retains a failed fixture until explicitly removed after exit', async () => {
+    let root = '';
+    try {
+      await (async () => {
+        await using profile = await temporaryProfile();
+        root = profile.root;
+        await writeFile(`${root}/fixture`, 'invented data');
+        profile.retain();
+      })();
+      await expect(access(`${root}/fixture`)).resolves.toBeUndefined();
+    } finally {
+      if (root) await rm(root, { recursive: true, force: true });
+    }
+    await expect(access(root)).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
   it.each(['success', 'execution failure', 'initialization failure'])('removes the profile after %s', async (phase) => {
     let profile = '';
     const run = (async () => {

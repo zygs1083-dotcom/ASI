@@ -5,9 +5,17 @@ import { join } from 'node:path';
 
 export async function temporaryProfile() {
   const root = await mkdtemp(join(tmpdir(), 'asi-sense-dsh-e2e-'));
+  let retained = false;
   return {
     root,
+    retain() {
+      retained = true;
+    },
     async [Symbol.asyncDispose]() {
+      if (retained) {
+        console.error(`Temporary profile retained after failure: ${root}`);
+        return;
+      }
       await rm(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
       const remains = await access(root).then(
         () => true,
@@ -19,6 +27,28 @@ export async function temporaryProfile() {
       if (remains) throw new Error('Temporary profile still exists');
       console.log('Temporary profile removed: yes');
     },
+  };
+}
+
+export function failureDetails(error: unknown) {
+  if (!(error instanceof Error)) return { name: 'unknown error' };
+  const assertion = /^target assertion [a-z0-9 -]+: expected=(?:true|false|\d+), actual=(?:true|false|\d+)$/.test(
+    error.message,
+  )
+    ? error.message
+    : undefined;
+  const result = record('matcherResult' in error ? error.matcherResult : undefined);
+  const safe = (value: unknown) =>
+    typeof value === 'number' || typeof value === 'boolean' || value === null ? value : undefined;
+  const location =
+    error.stack?.match(/scripts\/e2e-target\.ts:\d+:\d+/)?.[0] ??
+    error.stack?.match(/(?:scripts|test)\/[\w./-]+\.ts:\d+:\d+/)?.[0];
+  return {
+    name: error.name,
+    ...(assertion ? { assertion } : {}),
+    ...(safe(result.expected) !== undefined ? { expected: safe(result.expected) } : {}),
+    ...(safe(result.actual) !== undefined ? { actual: safe(result.actual) } : {}),
+    ...(location ? { location } : {}),
   };
 }
 
@@ -128,6 +158,17 @@ export function envMessages(log: Record<string, unknown>[]): Record<string, unkn
   return log.filter(
     (event) => event.type === 'user/message' && record(record(event.data).source).kind === 'environment',
   );
+}
+
+export function targetTurnOutcome(log: Record<string, unknown>[], previousEnds: number) {
+  const ends = log.filter((event) => event.type === 'turn/end');
+  if (ends.length <= previousEnds) return undefined;
+  const reason = record(record(ends[ends.length - 1].data).reason);
+  if (reason.kind === 'completed') return 'completed';
+  const error = record(reason.error);
+  if (reason.kind === 'error' && error.code === 'UNKNOWN' && error.message === 'E2E model request budget exhausted')
+    return 'budget-exhausted';
+  return 'failed';
 }
 
 function envInbox(log: Record<string, unknown>[], target: string): Record<string, unknown>[] {
