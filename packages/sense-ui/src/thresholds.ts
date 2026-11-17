@@ -64,7 +64,7 @@ const FLOOR_DEFAULTS: Record<
   memory: { warn: 0.85, critical: 0.95, direction: 'above' },
   'disk:*': { warn: 0.9, critical: 0.95, direction: 'above' },
   battery: { warn: 15, critical: 5, direction: 'below' },
-  thermal: { warn: 1, critical: 3, direction: 'above' },
+  thermal: { warn: 2, critical: 3, direction: 'above' },
   processCpu: { warn: 0.75, critical: 0.9, direction: 'above' },
 }
 

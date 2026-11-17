@@ -71,6 +71,7 @@ describe('事实状态契约', () => {
     model.state.self.body.disks = disksFixture([
       { mount: '/', total: 100, free: 2, ...(mode === 'explicit' ? { status: 'ok' as const } : {}) },
     ], { ageMs: 1_000, ttlMs: 5_000 })
+    model.insights = { ...model.insights, 'disk:/': { sources: ['floor'], triggered: ['floor'], severity: 'critical' } }
     const { props, view } = renderPanel(model)
     const tile = openDiskTile()
     const detail = () => tile.querySelector('[class*="detailFact"]')!
@@ -202,6 +203,7 @@ describe('事实状态契约', () => {
     model.state.self.body.disks = disksFixture([
       { mount: '/', total: 100, free: 2, status: 'ok', staleInMs: 2_000 },
     ])
+    model.insights = { ...model.insights, 'disk:/': { sources: ['floor'], triggered: ['floor'], severity: 'critical' } }
     const { view } = renderPanel(model)
     act(() => vi.advanceTimersByTime(1_000))
     expect(document.querySelector('details[data-tile="cpu"] [data-status="stale"]')).toBeTruthy()

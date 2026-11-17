@@ -110,7 +110,7 @@ function evalMemory(body: Body, now: number): RowResult {
   return { severity: maxSeverity(pressureSev, ratioSev), hidden: false }
 }
 
-function evalDisks(body: Body, now: number): RowResult {
+function evalDisks(body: Body, now: number, insights?: Partial<Record<MetricKey, MetricInsight>>): RowResult {
   const f = effectiveDisks(body.disks, now)
   const values = f.value ?? []
   // 只聚合新鲜可用卷：stale/unknown/unavailable/无效读数不告警；
@@ -119,7 +119,10 @@ function evalDisks(body: Body, now: number): RowResult {
   if (fresh.length === 0) return unusable()
   let severity: Severity = 'good'
   for (const d of fresh) {
-    severity = maxSeverity(severity, diskSeverity(d.free / d.total))
+    const insight = insights?.[`disk:${d.mount}`]
+    severity = maxSeverity(severity, insight?.sources.includes('floor')
+      ? effectiveSeverity(insight)
+      : maxSeverity(diskSeverity(d.free / d.total), effectiveSeverity(insight)))
   }
   const partial =
     f.indeterminateMounts.length > 0 || values.some((d) => !diskValid(d))
@@ -144,7 +147,7 @@ function evalThermal(body: Body, now: number): RowResult {
   if (!isUsable(f, now)) return unusable()
   const t = f.value!
   const severity: Severity =
-    t === 'critical' ? 'critical' : t === 'serious' || t === 'fair' ? 'warn' : 'good'
+    t === 'critical' ? 'critical' : t === 'serious' ? 'warn' : 'good'
   return { severity, hidden: false }
 }
 
@@ -253,11 +256,13 @@ export function evaluateBody(
 ): BodyEvaluation {
   const rows = {} as Record<BodyRowKey, RowResult>
   for (const key of BODY_ROW_PRIORITY) {
-    const r = ROW_EVALUATORS[key](body, now)
+    const r = key === 'disks' ? evalDisks(body, now, insights) : ROW_EVALUATORS[key](body, now)
     if (insights && !r.hidden && rowUsable(key, body, now)) {
       for (const mk of rowMetricKeys(key, body, now)) {
         const sev = effectiveSeverity(insights[mk])
-        if (sev !== 'good') r.severity = maxSeverity(r.severity, sev)
+        if ((key === 'battery' || key === 'tokens') && insights[mk]?.sources.includes('floor')) {
+          r.severity = sev
+        } else if (sev !== 'good') r.severity = maxSeverity(r.severity, sev)
       }
     }
     rows[key] = r

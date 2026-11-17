@@ -65,9 +65,11 @@ export function rateBadge(
 
 function diskSev(d: Disk, insights: Insights, fresh: boolean): Severity {
   const freeRatio = d.total > 0 ? d.free / d.total : 0
+  const insight = fresh ? insights[`disk:${d.mount}`] : undefined
+  if (insight?.sources.includes('floor')) return effectiveSeverity(insight)
   return maxSeverity(
     diskSeverity(freeRatio),
-    fresh ? effectiveSeverity(insights[`disk:${d.mount}`]) : 'good',
+    effectiveSeverity(insight),
   )
 }
 

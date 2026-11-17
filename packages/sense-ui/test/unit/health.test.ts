@@ -14,6 +14,25 @@ function bodyWith(patch: Partial<Body>): Body {
   return { ...makeBody(), ...patch }
 }
 
+it('温控 fair 正常，宿主底线生效后不再使用旧的磁盘、电池和 token 阈值', () => {
+  const body = bodyWith({
+    thermal: fact('fair'),
+    disks: disksFixture([{ mount: '/', total: 100, free: 4 }]),
+    battery: fact({ percent: 4, charging: false }),
+    tokens: fact({ contextWindow: 100, contextUsed: 96, sessionUsage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } }),
+  })
+  const normal = { sources: ['floor'] as const, triggered: [] }
+  const result = evaluateBody(body, T0, {
+    'disk:/': { ...normal, sources: ['floor'] },
+    battery: { ...normal, sources: ['floor'] },
+    tokens: { ...normal, sources: ['floor'] },
+  })
+  expect(result.rows.thermal.severity).toBe('good')
+  expect(result.rows.disks.severity).toBe('good')
+  expect(result.rows.battery.severity).toBe('good')
+  expect(result.rows.tokens.severity).toBe('good')
+})
+
 describe('effectiveStatus', () => {
   it('ok 且未超 TTL 保持 ok', () => {
     expect(effectiveStatus(fact(1, { ageMs: 4_000, ttlMs: 5_000 }), T0)).toBe('ok')
@@ -89,7 +108,7 @@ describe('单项阈值', () => {
 
   it('温控与网络', () => {
     expect(sev(bodyWith({ thermal: fact('nominal') })).rows.thermal.severity).toBe('good')
-    expect(sev(bodyWith({ thermal: fact('fair') })).rows.thermal.severity).toBe('warn')
+    expect(sev(bodyWith({ thermal: fact('fair') })).rows.thermal.severity).toBe('good')
     expect(sev(bodyWith({ thermal: fact('serious') })).rows.thermal.severity).toBe('warn')
     expect(sev(bodyWith({ thermal: fact('critical') })).rows.thermal.severity).toBe('critical')
     expect(

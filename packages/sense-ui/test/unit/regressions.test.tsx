@@ -43,6 +43,18 @@ it('仅对宿主允许反馈的事件展示按钮', () => {
   }
 })
 
+it('磁盘逐卷明细遵循宿主放宽后的底线', async () => {
+  const state = makeState()
+  state.self.body.disks = disksFixture([{ mount: '/', total: 100, free: 4 }])
+  const model = makeScenario('healthy')
+  model.state = state
+  model.insights = { 'disk:/': { sources: ['floor'], triggered: [], thresholds: { floor: { value: 0.97, source: 'floor' } } } }
+  renderPanel(model)
+  const tile = await openTile('disks')
+  expect(tile.getAttribute('data-sev')).toBe('good')
+  expect([...tile.querySelectorAll('[data-sev]')].some((el) => el.textContent?.includes('/') && el.getAttribute('data-sev') === 'critical')).toBe(false)
+})
+
 function renderPanel(model: SensePanelModel, over: Partial<SensePanelProps> = {}) {
   const props: SensePanelProps = {
     model,
