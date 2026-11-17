@@ -53,8 +53,9 @@ function modelUpdate(update: EnvUpdate): EnvUpdate {
       } else if (signal.kind === 'file.changed') {
         data.path = modelPath(typeof signal.data.path === 'string' ? signal.data.path : signal.subject);
         if (
+          typeof signal.data.change === 'string' &&
           ['add', 'create', 'created', 'modify', 'save', 'saved', 'delete', 'deleted', 'rename', 'renamed'].includes(
-            String(signal.data.change),
+            signal.data.change,
           )
         ) {
           data.change = signal.data.change;
@@ -76,7 +77,11 @@ function modelUpdate(update: EnvUpdate): EnvUpdate {
             : undefined);
         subject =
           signal.kind === 'file.burst'
-            ? modelPath(typeof signal.data.directory === 'string' ? signal.data.directory : signal.subject)
+            ? modelPath(
+                typeof signal.data.directory === 'string' && signal.data.directory.trim()
+                  ? signal.data.directory
+                  : signal.subject,
+              )
             : metric(rawMetric);
         if (signal.kind === 'body.anomaly' && signal.data.type === 'rebaseline-suggestion') {
           data.type = 'rebaseline-suggestion';
@@ -176,6 +181,7 @@ export function createDelivery(
   getAgent: (sessionId: string) => Pick<Agent, 'inject' | 'followup' | 'send'> | undefined,
   sendTitles: () => boolean,
   accepted: (sessionId: string, id: string) => Promise<boolean>,
+  onSkipped?: (sessionId: string, id: string, kind: DeliveryIntent['kind']) => void | Promise<void>,
 ) {
   type Step = { turn: number; step: number };
   const delivered = new Map<string, Set<string>>();
@@ -228,6 +234,7 @@ export function createDelivery(
     const text = render(intent);
     if (!text) {
       recordFor(sessionId, id);
+      await onSkipped?.(sessionId, id, intent.kind);
       return;
     }
     try {
@@ -262,12 +269,13 @@ export function createDelivery(
     }
   };
   return Object.assign(deliver, {
-    async messages(sessionId: string): Promise<UserMessage[]> {
+    async messages(sessionId: string, isActive?: () => boolean): Promise<UserMessage[]> {
       const pending = staged.get(sessionId);
       if (!pending) return [];
       const messages: UserMessage[] = [];
       for (const [id, entry] of pending) {
         const wasAccepted = await accepted(sessionId, id);
+        if (isActive && !isActive()) break;
         if (pending.get(id) !== entry) continue;
         if (wasAccepted) pending.delete(id);
         else if (!entry.returned) {
@@ -275,6 +283,7 @@ export function createDelivery(
           if (!text) {
             pending.delete(id);
             recordFor(sessionId, id);
+            await onSkipped?.(sessionId, id, entry.intent.kind);
           } else {
             messages.push(message(id, text));
           }

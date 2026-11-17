@@ -104,7 +104,11 @@ function changeLines(ch: EnvChange, includeTitles: boolean, includeJobCommands: 
     const target = str(s.data.metric) || s.subject.replace(/^(?:rebaseline|baseline):/, '') || s.subject;
     main = `建议重新基线：${esc(target)}`;
   } else if (s.kind === 'body.rate' || s.kind === 'body.anomaly' || s.kind === 'file.burst') {
-    const head = s.kind === 'file.burst' ? str(s.data.directory) || s.subject : s.subject;
+    const directory =
+      s.kind === 'file.burst' && typeof s.data?.directory === 'string' && s.data.directory.trim()
+        ? s.data.directory
+        : '';
+    const head = s.kind === 'file.burst' ? directory || str(s.subject) || '[path]' : str(s.subject);
     main = `${esc(s.kind)}: ${esc(head)}`;
     if (s.kind !== 'file.burst' && typeof s.data.metric === 'string' && s.data.metric && s.data.metric !== s.subject) {
       main += ` metric=${esc(s.data.metric)}`;

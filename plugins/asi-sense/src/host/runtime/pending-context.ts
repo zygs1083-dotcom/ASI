@@ -66,6 +66,41 @@ export class PendingContext {
     }
   }
 
+  unstage(intent: DeliveryIntent): void {
+    if (!intent.deliveryId) return;
+    const key = intent.deliveryId.replace(/^asi-sense:/, '');
+    this.staged.delete(JSON.stringify([intent.sessionId, key]));
+    for (const outcome of injectOutcomes(intent)) {
+      for (const id of outcome.ids) {
+        for (const signalId of this.merged.get(id) ?? [id]) {
+          this.forget(signalId);
+          if (this.retained(signalId)) this.reported.add(signalId);
+        }
+      }
+    }
+    this.confirmed.add(key);
+    if (this.confirmed.size > 1024) this.confirmed.delete(this.confirmed.values().next().value as string);
+    this.confirm(key);
+  }
+
+  skipped(session: string, id: string, pipeline: AttentionPipeline): Promise<void> {
+    const key = id.replace(/^asi-sense:/, '');
+    const stagedKey = JSON.stringify([session, key]);
+    const outcomes = this.staged.get(stagedKey) ?? [];
+    this.staged.delete(stagedKey);
+    for (const outcome of outcomes) {
+      for (const signalId of outcome.ids) {
+        if (this.reported.has(signalId)) continue;
+        this.forget(signalId);
+        if (this.retained(signalId)) this.reported.add(signalId);
+      }
+    }
+    this.confirmed.add(key);
+    if (this.confirmed.size > 1024) this.confirmed.delete(this.confirmed.values().next().value as string);
+    this.confirm(key);
+    return pipeline.confirm(`\0skip:${key}`);
+  }
+
   committed(session: string, id: string, pipeline: AttentionPipeline): Promise<void> {
     const key = id.replace(/^asi-sense:/, '');
     const stagedKey = JSON.stringify([session, key]);

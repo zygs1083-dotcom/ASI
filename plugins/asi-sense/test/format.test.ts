@@ -315,4 +315,41 @@ describe('formatEnvUpdate', () => {
       ['<env-update since="12:01:03" source="asi-sense">', '建议重新基线：cpu', '</env-update>'].join('\n'),
     );
   });
+
+  it('formats file.burst safely when directory is missing, blank or non-string', () => {
+    const out = formatEnvUpdate(
+      update([
+        change({
+          signal: sig({
+            id: 'missing',
+            kind: 'file.burst',
+            at: T0,
+            subject: 'subject-dir',
+            data: { deleted: 10 },
+          }),
+        }),
+        change({
+          signal: sig({
+            id: 'non-string',
+            kind: 'file.burst',
+            at: T0 + 1,
+            subject: 'array-fallback',
+            data: { directory: ['not-a-string'], deleted: 20 },
+          }),
+        }),
+        change({
+          signal: sig({
+            id: 'blank',
+            kind: 'file.burst',
+            at: T0 + 2,
+            subject: '',
+            data: { directory: '   ', deleted: 30 },
+          }),
+        }),
+      ]),
+    );
+    expect(out).toContain('file.burst: subject-dir deleted=10');
+    expect(out).toContain('file.burst: array-fallback deleted=20');
+    expect(out).toContain('file.burst: [path] deleted=30');
+  });
 });

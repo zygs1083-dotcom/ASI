@@ -1121,4 +1121,191 @@ describe('uncommitted context routing', () => {
     pending.committed('session-1', 'asi-sense:delivery-1', h.attention.pipeline);
     expect(mark).not.toHaveBeenCalled();
   });
+
+  it.each([false, true])(
+    'removes a skipped hidden-window inject batch from batches and staged without repeating on the next pre-step (runtimeTitles=%s)',
+    async (runtimeTitles) => {
+      const { ctx, agent } = await fixture();
+      let portSendTitles = false;
+      const port = createDshPort(ctx, () => portSendTitles);
+      const deliverSpy = vi.spyOn(port, 'deliver');
+      const clock = { wall: () => 1_000, mono: () => 1_000 };
+      const attention = new RuntimeAttention(
+        clock,
+        port,
+        () => [
+          {
+            id: 'win-ctx',
+            match: { kind: 'window.focused' },
+            level: 'context',
+            createdBy: 'user',
+            approved: true,
+          },
+        ],
+        () => {},
+        () => runtimeTitles,
+        () => {},
+        new FactExpiry(clock),
+      );
+      const off = port.onAgentEvent(async (event) => {
+        if (event.type === 'created') attention.create(event.sessionId);
+        if (event.type === 'disposed') attention.dispose(event.sessionId);
+        if (event.type === 'pre-step') await attention.preStep(event.sessionId, event.userInitiated);
+        if (event.type === 'post-step') attention.postStep(event.sessionId);
+      });
+      const unregister = await ctx.agents.register(agent);
+      onTestFinished(async () => {
+        off();
+        await attention.stop();
+        await unregister();
+      });
+      const user = createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text: 'fixture' }] });
+      const step = async (turn: number) => {
+        const decision = await agentEvents(ctx, agent).waterfall(
+          'agent/pre-step',
+          {
+            turn,
+            step: 1,
+            messages: [user],
+            signal: new AbortController().signal,
+            modelSelection: { provider: 'fixture', model: 'fixture' },
+          },
+          async () => ({ kind: 'enter' as const, messages: [user] }),
+        );
+        if (decision.kind !== 'enter') throw new Error('expected an entered step');
+        return decision;
+      };
+      await step(1);
+      await attention.accept({
+        id: 'hidden-window-1',
+        kind: 'window.focused',
+        at: 1_000,
+        subject: 'fixture.app',
+        source: { id: 'helper.ax', api: 'ax', host: 'local' },
+        data: { title: 'Synthetic hidden window' },
+      });
+      deliverSpy.mockClear();
+      const first = await step(2);
+      expect(first.messages).toEqual([user]);
+      const pending = Reflect.get(attention, 'pending') as PendingContext;
+      const staged = Reflect.get(pending, 'staged') as Map<string, unknown>;
+      const drain = Reflect.get(attention.pipeline, 'drain') as object;
+      const batches = Reflect.get(drain, 'batches') as Map<string, unknown[]>;
+      expect(staged.size).toBe(0);
+      expect(batches.size).toBe(0);
+
+      deliverSpy.mockClear();
+      portSendTitles = true;
+      const second = await step(3);
+      expect(second.messages).toEqual([user]);
+      expect(deliverSpy).not.toHaveBeenCalled();
+      expect(staged.size).toBe(0);
+      expect(batches.size).toBe(0);
+    },
+  );
+
+  it.each([false, true])(
+    'does not charge wakeTimes for skipped empty window followup/send wakes (runtimeTitles=%s)',
+    async (runtimeTitles) => {
+      const { ctx, agent } = await fixture();
+      const port = createDshPort(ctx, () => false);
+      let now = 1_000;
+      const clock = { wall: () => now, mono: () => now };
+      const attention = new RuntimeAttention(
+        clock,
+        port,
+        () => [
+          {
+            id: 'win-wake',
+            match: { kind: 'window.focused' },
+            level: 'wake',
+            createdBy: 'user',
+            approved: true,
+          },
+          {
+            id: 'job-wake',
+            match: { kind: 'job.exited' },
+            level: 'wake',
+            createdBy: 'user',
+            approved: true,
+          },
+        ],
+        () => {},
+        () => runtimeTitles,
+        () => {},
+        new FactExpiry(clock),
+      );
+      const off = port.onAgentEvent(async (event) => {
+        if (event.type === 'created') attention.create(event.sessionId);
+        if (event.type === 'pre-step') await attention.preStep(event.sessionId, event.userInitiated);
+        if (event.type === 'post-step') attention.postStep(event.sessionId);
+      });
+      const unregister = await ctx.agents.register(agent);
+      onTestFinished(async () => {
+        off();
+        await attention.stop();
+        await unregister();
+      });
+      const user = createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text: 'fixture' }] });
+      await agentEvents(ctx, agent).waterfall(
+        'agent/pre-step',
+        {
+          turn: 1,
+          step: 1,
+          messages: [user],
+          signal: new AbortController().signal,
+          modelSelection: { provider: 'fixture', model: 'fixture' },
+        },
+        async () => ({ kind: 'enter' as const, messages: [user] }),
+      );
+      const sessions = Reflect.get(attention.pipeline, 'sessions') as Map<string, { wakeTimes: number[] }>;
+
+      // Busy session -> empty 'send' wake
+      await attention.accept({
+        id: 'empty-send',
+        kind: 'window.focused',
+        at: now,
+        subject: 'fixture.app',
+        source: { id: 'helper.ax', api: 'ax', host: 'local' },
+        data: { title: 'Synthetic hidden send' },
+      });
+      now += 2_000;
+      await attention.flush();
+      expect(agent.send).not.toHaveBeenCalled();
+      expect(sessions.get(agent.id)?.wakeTimes).toEqual([]);
+
+      // Idle session -> three empty 'followup' wakes within the 10-minute / 60s budget window
+      agentEvents(ctx, agent).emit('agent/status', { status: 'idle' });
+      for (let i = 0; i < 3; i++) {
+        await attention.accept({
+          id: `empty-followup-${i}`,
+          kind: 'window.focused',
+          at: now,
+          subject: `fixture-${i}.app`,
+          source: { id: 'helper.ax', api: 'ax', host: 'local' },
+          data: { title: `Synthetic hidden followup ${i}` },
+        });
+        now += 2_000;
+        await attention.flush();
+      }
+      expect(agent.followup).not.toHaveBeenCalled();
+      expect(sessions.get(agent.id)?.wakeTimes).toEqual([]);
+      expect(attention.pipeline.suppressed).toBe(0);
+
+      // Real wake immediately afterwards is not throttled by the 60s gap or 3-wake cap
+      await attention.accept({
+        id: 'real-wake',
+        kind: 'job.exited',
+        at: now,
+        subject: 'fixture-job',
+        source: { id: 'fixture', api: 'test', host: 'local' },
+        data: { id: 'fixture-job', exitCode: 1 },
+      });
+      now += 2_000;
+      await attention.flush();
+      expect(agent.followup).toHaveBeenCalledTimes(1);
+      expect(sessions.get(agent.id)?.wakeTimes).toHaveLength(1);
+      expect(attention.pipeline.suppressed).toBe(0);
+    },
+  );
 });

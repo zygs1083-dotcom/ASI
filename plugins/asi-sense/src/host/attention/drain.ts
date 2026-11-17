@@ -26,7 +26,7 @@ const WAKE_MAX = 3;
 const WAKE_MIN_GAP_MS = 60_000;
 export class DeliveryFailure extends Error {
   constructor(
-    readonly kind: 'deferred' | 'exhausted' | 'unknown',
+    readonly kind: 'deferred' | 'exhausted' | 'unknown' | 'skipped',
     readonly retryAt = 0,
     cause?: unknown,
   ) {
@@ -131,6 +131,17 @@ export class BucketDrain {
     );
   }
   confirm(id: string): void {
+    if (id.startsWith('\0skip:')) {
+      const target = id.slice('\0skip:'.length);
+      for (const [session, entries] of this.batches) {
+        for (const batch of [...entries]) {
+          if (batch.intent.deliveryId !== target && !batch.aliases?.includes(target)) continue;
+          entries.splice(entries.indexOf(batch), 1);
+        }
+        if (!entries.length) this.batches.delete(session);
+      }
+      return;
+    }
     confirmBatch(this.batches, id);
   }
   discardPrivate(id: string, token?: string): void {

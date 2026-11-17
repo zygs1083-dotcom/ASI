@@ -538,4 +538,41 @@ describe('DSH environment delivery', () => {
     expect(text).not.toContain('服务器');
     expect(text).not.toContain('/tmp/');
   });
+
+  it('requires string file.changed change values and safely falls back for non-string or blank file.burst directories', async () => {
+    const { agent, deliver } = fixture();
+    const changes: EnvUpdate['changes'] = [
+      {
+        kind: 'file.changed',
+        subject: '/synthetic/dir/array-change.ts',
+        data: { path: '/synthetic/dir/array-change.ts', change: ['add'] },
+      },
+      {
+        kind: 'file.burst',
+        subject: '/synthetic/work/fallback-dir',
+        data: { directory: ['/synthetic/private'], deleted: 12 },
+      },
+      {
+        kind: 'file.burst',
+        subject: '/synthetic/work/blank-dir',
+        data: { directory: '   ', deleted: 8 },
+      },
+    ].map((item, index) => ({
+      count: 1,
+      level: 'context' as const,
+      signal: {
+        ...item,
+        id: `edge-${index}`,
+        at: update.at + index,
+        source: { id: 'fixture', api: 'test', host: 'local' },
+      },
+    }));
+    await deliver('session-a', { ...intent('followup', 'edge-check'), update: { ...update, changes } });
+    const text = JSON.stringify(agent.followup.mock.calls);
+    expect(text).toContain('file: array-change.ts saved');
+    expect(text).not.toContain('array-change.ts created');
+    expect(text).toContain('file.burst: fallback-dir deleted=12');
+    expect(text).toContain('file.burst: blank-dir deleted=8');
+    expect(text).not.toContain('/synthetic/');
+  });
 });

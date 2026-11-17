@@ -5,6 +5,7 @@ import { DeliveryFailure } from '../attention/drain.ts';
 import { injectOutcomes } from '../attention/drain-transfer.ts';
 import { AttentionPipeline, type SessionContext } from '../attention/pipeline.ts';
 import { isRuleApproved } from '../attention/rules.ts';
+import { formatEnvUpdate } from '../delivery/format.ts';
 import { sourceObservation } from '../state/source-health.ts';
 import { StateStore } from '../state/store.ts';
 import { eventDetail } from './event-detail.ts';
@@ -42,6 +43,7 @@ export class RuntimeAttention {
   private readonly recent: string[] = [];
   private readonly closed = new Map<string, boolean>();
   private readonly inflight = new Set<Promise<void>>();
+  private readonly activeWakeSkips = new Map<string, boolean>();
   private selected?: string;
   private pinned?: string;
   private readonly steps = new Map<string, symbol>();
@@ -50,6 +52,7 @@ export class RuntimeAttention {
   private stopped = false;
   private readonly prefix = randomUUID();
   private readonly offCommit?: () => void;
+  private readonly offSkip?: () => void;
   private readonly offDiscard?: () => void;
 
   constructor(
@@ -63,7 +66,12 @@ export class RuntimeAttention {
     private readonly ensureTarget?: () => void,
     private readonly canEnsureTarget?: () => boolean,
   ) {
-    const staged = dsh as DshPort & { onDeliveryCommitted?: (cb: (session: string, id: string) => void) => () => void };
+    const staged = dsh as DshPort & {
+      onDeliveryCommitted?: (cb: (session: string, id: string) => void) => () => void;
+      onDeliverySkipped?: (
+        cb: (session: string, id: string, kind: 'inject' | 'followup' | 'send') => void | Promise<void>,
+      ) => () => void;
+    };
     this.store = new StateStore(
       () => clock.wall(),
       60_000,
@@ -111,15 +119,42 @@ export class RuntimeAttention {
               delete signal.data.sessionToken;
             }
           }
-          if (!this.titlesAllowed()) {
-            for (const change of safe.update.changes) {
-              change.signal.data = withoutTitles(change.signal.data) as Signal['data'];
+          const includeWindowTitles = this.titlesAllowed();
+          if (!includeWindowTitles) {
+            safe.update.changes = safe.update.changes
+              .filter(
+                ({ signal }) =>
+                  signal.kind !== 'window.focused' &&
+                  signal.kind !== 'window.title-changed' &&
+                  !(signal.kind === 'fact.updated' && signal.data.path === 'env.focusedWindow'),
+              )
+              .map((change) => ({
+                ...change,
+                signal: { ...change.signal, data: withoutTitles(change.signal.data) as Signal['data'] },
+              }));
+          }
+          const empty =
+            !includeWindowTitles &&
+            !formatEnvUpdate(safe.update, { includeWindowTitles: false, includeJobCommands: false });
+          if (empty && (intent.kind !== 'inject' || !staged.onDeliverySkipped)) {
+            if (intent.kind === 'inject' && this.offCommit) this.pending.unstage(intent);
+            if (!this.offCommit) {
+              for (const outcome of injectOutcomes(intent)) {
+                for (const id of outcome.ids) this.mark(id, undefined, 'record');
+              }
             }
+            throw new DeliveryFailure('skipped');
           }
           if (intent.kind === 'inject' && this.offCommit) this.pending.stage(intent);
           const token = this.sessionTokens.get(intent.sessionId);
           const isCurrent = () =>
             this.hasSession(intent.sessionId) && this.sessionTokens.get(intent.sessionId) === token;
+          const skipKey =
+            intent.kind !== 'inject' && intent.deliveryId
+              ? JSON.stringify([intent.sessionId, `asi-sense:${intent.deliveryId}`])
+              : undefined;
+          if (skipKey) this.activeWakeSkips.set(skipKey, false);
+          let wakeSkipped = false;
           const delivery = dsh.deliver(intent.sessionId, safe, isCurrent);
           this.inflight.add(delivery);
           try {
@@ -133,6 +168,18 @@ export class RuntimeAttention {
             throw error;
           } finally {
             this.inflight.delete(delivery);
+            if (skipKey) {
+              wakeSkipped = this.activeWakeSkips.get(skipKey) === true;
+              this.activeWakeSkips.delete(skipKey);
+            }
+          }
+          if (wakeSkipped) {
+            if (!this.offCommit) {
+              for (const outcome of injectOutcomes(intent)) {
+                for (const id of outcome.ids) this.mark(id, undefined, 'record');
+              }
+            }
+            throw new DeliveryFailure('skipped');
           }
           if (intent.kind === 'inject' && staged.onDeliveryCommitted) throw new DeliveryFailure('deferred');
           if (this.stopped) return;
@@ -144,6 +191,16 @@ export class RuntimeAttention {
     });
     this.offCommit = staged.onDeliveryCommitted?.((session, id) => {
       void this.pending.committed(session, id, this.pipeline).then(() => {
+        if (!this.stopped) this.reschedule();
+      });
+    });
+    this.offSkip = staged.onDeliverySkipped?.((session, id, kind) => {
+      if (kind !== 'inject') {
+        const key = JSON.stringify([session, id]);
+        if (this.activeWakeSkips.has(key)) this.activeWakeSkips.set(key, true);
+        return;
+      }
+      return this.pending.skipped(session, id, this.pipeline).then(() => {
         if (!this.stopped) this.reschedule();
       });
     });
@@ -270,6 +327,7 @@ export class RuntimeAttention {
   stop(): Promise<void> {
     this.stopped = true;
     this.offCommit?.();
+    this.offSkip?.();
     this.offDiscard?.();
     return Promise.allSettled([...this.inflight, this.pending.settled()]).then(() => {});
   }

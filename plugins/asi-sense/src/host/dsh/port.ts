@@ -27,6 +27,9 @@ export function createDshPort(
   pinned: () => boolean = () => false,
 ): DshPort & {
   onDeliveryCommitted(cb: (sessionId: string, id: string) => void): () => void;
+  onDeliverySkipped(
+    cb: (sessionId: string, id: string, kind: 'inject' | 'followup' | 'send') => void | Promise<void>,
+  ): () => void;
   nowReadings(sessionId?: string): NowReadings;
   onNowChanged(cb: () => void): () => void;
 } {
@@ -39,6 +42,9 @@ export function createDshPort(
   let selected: string | undefined;
   const steps = new Map<string, { turn: number; step: number }>();
   const committed = new Set<(sessionId: string, id: string) => void>();
+  const skipped = new Set<
+    (sessionId: string, id: string, kind: 'inject' | 'followup' | 'send') => void | Promise<void>
+  >();
   const discarded = new Set<() => void>();
   const jobs = new JobEventCorrelator(activeTools);
   const accepted = ctx.sessionProjections.register({
@@ -55,11 +61,18 @@ export function createDshPort(
       return added.length ? [...ids, ...added.map((message) => message.id)] : ids;
     },
   });
-  const deliver = createDelivery(resolve, sendTitles, async (id, messageId) => {
-    const agent = resolve(id);
-    if (!agent) throw new Error('delivery session unavailable');
-    return (await accepted).stateOf(agent.session).includes(messageId);
-  });
+  const deliver = createDelivery(
+    resolve,
+    sendTitles,
+    async (id, messageId) => {
+      const agent = resolve(id);
+      if (!agent) throw new Error('delivery session unavailable');
+      return (await accepted).stateOf(agent.session).includes(messageId);
+    },
+    async (sessionId, messageId, kind) => {
+      for (const listener of skipped) await listener(sessionId, messageId, kind);
+    },
+  );
   const warn = () => ctx.logger.warn('asi-sense event delivery failed');
   const call = <T>(cb: (event: T) => Promise<void>, event: T): void => {
     void cb(event).catch(warn);
@@ -196,6 +209,10 @@ export function createDshPort(
       committed.add(cb);
       return () => committed.delete(cb);
     },
+    onDeliverySkipped(cb) {
+      skipped.add(cb);
+      return () => skipped.delete(cb);
+    },
     onAgentEvent(cb) {
       const turns = new Map<string, { turn: number; user: boolean }>();
       const offCreated = ctx.on('agent/created', async ({ agent }) => {
@@ -257,8 +274,9 @@ export function createDshPort(
           return decision;
         }
         try {
-          const messages = await deliver.messages(payload.agent.id);
-          if (payload.signal.aborted || steps.get(payload.agent.id) !== step || messages.length === 0) {
+          const isActive = () => !payload.signal.aborted && steps.get(payload.agent.id) === step;
+          const messages = await deliver.messages(payload.agent.id, isActive);
+          if (!isActive() || messages.length === 0) {
             deliver.finish(payload.agent.id, step);
             for (const listener of discarded) listener();
             return decision;
