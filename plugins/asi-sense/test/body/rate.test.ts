@@ -38,6 +38,16 @@ it('uses the current disk critical floor for rate event ETA', () => {
   expect(result.signals[0]?.data.timeToFloorMs).toBeCloseTo(3_000);
 });
 
+it('honours a legal zero disk critical floor instead of falling back to 5%', () => {
+  const evaluator = ev(
+    [{ id: 'disk', metric: 'disk:*', windowMs: 10_000, direction: 'down', maxDelta: 1 }],
+    (param, fallback) => (param === 'floor.disk.critical' ? 0 : fallback),
+  );
+  const result = evaluator.evaluate(sample(diskBody(100), 0), sample(diskBody(80), 1_000), {});
+  // 80 units left at -20/s to a 0 floor → 4s, not the 5%-floor ~3.9s.
+  expect(result.signals[0]?.data.timeToFloorMs).toBeCloseTo(4_000);
+});
+
 it('keeps soft and hard context ETA latches independent across session generations', () => {
   const evaluator = ev([
     { id: 'c', metric: 'context', windowMs: 30_000, direction: 'down', maxEtaMs: 20_000, hardEtaMs: 5_000, floor: 0 },

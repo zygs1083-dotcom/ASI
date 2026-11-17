@@ -89,10 +89,11 @@ export class Tuner {
     return !this.closed && this.store.restored && !this.store.disabled && this.store.alerts.has(id);
   }
   parameters = () => parameters(this.store);
-  /** Positive finite numeric value, else the caller's fallback. */
+  /** Positive finite numeric value — or 0 when the spec declares `min: 0` — else the caller's fallback. */
   number(param: string, fallback: number): number {
     const v = this.store.values.get(param);
-    return typeof v === 'number' && finiteNum(v) && v > 0 ? v : fallback;
+    if (typeof v !== 'number' || !finiteNum(v)) return fallback;
+    return v > 0 || (v === 0 && this.store.specs.get(param)?.min === 0) ? v : fallback;
   }
   /** Display audit log (capped at 500); undoable changes are retained separately. */
   get logs(): TuningLog[] {
@@ -111,13 +112,22 @@ export class Tuner {
       .filter((entry) => {
         if (this.store.lastApplied.get(entry.param) !== entry.id) return false;
         const spec = this.store.specs.get(entry.param);
-        return (
+        const inBounds =
           !spec ||
           ((!spec.choices || spec.choices.includes(entry.from)) &&
             (typeof entry.from !== 'number' ||
               ((spec.min === undefined || entry.from >= spec.min) &&
-                (spec.max === undefined || entry.from <= spec.max))))
-        );
+                (spec.max === undefined || entry.from <= spec.max))));
+        if (!inBounds) return false;
+        // A revert that would invert critical > warn is not undoable either.
+        if (/^floor\..+\.(warn|critical)$/.test(entry.param) && typeof entry.from === 'number') {
+          const critical = entry.param.endsWith('.critical');
+          const other = this.store.values.get(
+            entry.param.replace(/\.(warn|critical)$/, critical ? '.warn' : '.critical'),
+          );
+          if (typeof other === 'number' && (critical ? entry.from > other : entry.from < other)) return false;
+        }
+        return true;
       })
       .map((entry) => ({ ...entry }));
   }

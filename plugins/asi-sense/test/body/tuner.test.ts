@@ -128,6 +128,51 @@ describe('Tuner guard matrix', () => {
     await t.close();
   });
 
+  it('honours a legal zero when the spec minimum is zero', async () => {
+    const t = mk({ 'floor.disk.critical': { value: 0.05, min: 0, max: 1, tighten: 'up' } });
+    asUser();
+    expect((await t.propose({ param: 'floor.disk.critical', to: 0 })).applied).toBe(true);
+    expect(t.number('floor.disk.critical', 0.05)).toBe(0);
+    await t.close();
+  });
+
+  it('hides undo entries whose revert would invert floor ordering', async () => {
+    const t = mk({
+      'floor.disk.warn': { value: 0.15, min: 0, max: 1, tighten: 'up' },
+      'floor.disk.critical': { value: 0.05, min: 0, max: 1, tighten: 'up' },
+    });
+    asUser();
+    const tighten = await t.propose({ param: 'floor.disk.critical', to: 0.02 });
+    expect(tighten.applied).toBe(true);
+    expect((await t.propose({ param: 'floor.disk.warn', to: 0.03 })).applied).toBe(true);
+    // Reverting critical → 0.05 would exceed warn 0.03 → not undoable.
+    expect(t.undoableChanges.map((c) => c.id)).not.toContain(tighten.change.id);
+    const widen = await t.propose({ param: 'floor.disk.warn', to: 0.2 });
+    expect((await t.propose({ param: 'floor.disk.critical', to: 0.18 })).applied).toBe(true);
+    // Reverting warn → 0.03 would fall below critical 0.18 → not undoable.
+    expect(t.undoableChanges.map((c) => c.id)).not.toContain(widen.change.id);
+    await t.close();
+  });
+
+  it('rejects a snapshot whose critical floor exceeds its warn floor', async () => {
+    const floorSpecs: Record<string, ParameterSpec> = {
+      'floor.disk.warn': { value: 0.15, min: 0, max: 1, tighten: 'up' },
+      'floor.disk.critical': { value: 0.05, min: 0, max: 1, tighten: 'up' },
+    };
+    const p = new FakePersist();
+    const t = mk(floorSpecs, { persistence: p });
+    await t.restore();
+    asUser();
+    await t.propose({ param: 'floor.disk.warn', to: 0.2 });
+    await t.persist();
+    const d = JSON.parse(p.data as string) as { values: [string, number][] };
+    d.values.find((e) => e[0] === 'floor.disk.critical')![1] = 0.5;
+    p.data = JSON.stringify(d);
+    const t2 = mk(floorSpecs, { persistence: p });
+    await t2.restore();
+    expect(t2.tuningDisabled).toBe('restore-failed');
+  });
+
   it('binds agent/auto to amplitude, direction, lock and budgets; user bypasses AI guards', async () => {
     const t = mk();
     expect((await t.propose({ param: 'plain', to: 15 })).applied).toBe(true); // +50% ok
