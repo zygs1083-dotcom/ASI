@@ -72,6 +72,7 @@ export class FileStoragePort implements StoragePort {
       let complete = false;
       try {
         let existing = false;
+        let hashDamaged = false;
         for (const name of await this.fs.readdir(this.root)) {
           if (!name.startsWith(prefix)) continue;
           const suffix = name.slice(prefix.length);
@@ -83,7 +84,10 @@ export class FileStoragePort implements StoragePort {
             existing = true;
             break;
           }
-          if (suffix === hash) throw Object.assign(new Error('backup content mismatch'), { code: 'EEXIST' });
+          if (suffix === hash) hashDamaged = true;
+        }
+        if (!existing && hashDamaged) {
+          path = `${target}.bak-${Date.now()}-${randomUUID()}`;
         }
         if (existing) {
           handle = await this.fs.open(path, 'r');
