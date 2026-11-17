@@ -1,7 +1,7 @@
 /** 场景补充：上下文接近满/回退估值与卷级新鲜度混杂的磁盘场景。 */
 
 import type { SensePanelModel } from '../view-model';
-import { fact, makeBody, makeHistory, makeState, panelModel, series, T0 } from './fixtures';
+import { fact, makeBody, makeHistory, makeInsights, makeState, panelModel, series, T0 } from './fixtures';
 
 export function contextAlmostFull(): SensePanelModel {
   const body = makeBody();
@@ -15,6 +15,16 @@ export function contextAlmostFull(): SensePanelModel {
   });
   return panelModel(makeState({ self: { ...makeState().self, body } }), {
     history: makeHistory({ tokens: series(60, 5_000, (i) => 90_000 + i * 470) }),
+    // 宿主在该读数下 floor 层确会触发 warn（剩余 7.4% < 12%），
+    // 否则 sources 含 floor 而 triggered 为空会把行压回 good。
+    insights: makeInsights({
+      tokens: {
+        baseline: { low: 30_000, high: 60_000 },
+        sources: ['floor', 'baseline'],
+        triggered: ['floor'],
+        severity: 'warn',
+      },
+    }),
   });
 }
 

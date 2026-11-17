@@ -52,7 +52,7 @@ function classify(v: number, t: Ratio): ThresholdSeverity {
 }
 
 /** Latched lower-is-worse transition: recover only past threshold+hysteresis. */
-function latchRatio(prior: ThresholdSeverity, v: number, t: Ratio, hyst: number): ThresholdSeverity {
+export function latchRatio(prior: ThresholdSeverity, v: number, t: Ratio, hyst: number): ThresholdSeverity {
   // Decimal percentage boundaries can differ by one floating-point ULP.
   const recovered = (threshold: number) => v + Number.EPSILON >= threshold + hyst;
   if (prior === 'critical') {

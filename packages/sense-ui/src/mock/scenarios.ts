@@ -119,7 +119,7 @@ function learning(): SensePanelModel {
 function rapidChange(): SensePanelModel {
   const events = [
     makeEvent(1, {
-      signal: { kind: 'body.rate', subject: '磁盘 /' },
+      signal: { kind: 'body.rate', subject: '磁盘 /', data: { feedbackAvailable: true } },
       level: 'wake',
       reason: '磁盘可用空间变化率触发',
       detail: {
@@ -132,7 +132,7 @@ function rapidChange(): SensePanelModel {
       },
     }),
     makeEvent(2, {
-      signal: { kind: 'body.anomaly', subject: '网络下行' },
+      signal: { kind: 'body.anomaly', subject: '网络下行', data: { feedbackAvailable: true } },
       level: 'context',
       reason: '网络下行偏离基线',
       detail: {
@@ -145,7 +145,7 @@ function rapidChange(): SensePanelModel {
       },
     }),
     makeEvent(3, {
-      signal: { kind: 'file.burst', subject: '/demo/project/tmp' },
+      signal: { kind: 'file.burst', subject: '/demo/project/tmp', data: { feedbackAvailable: true } },
       level: 'wake',
       reason: '目录突发大量删除',
       detail: {

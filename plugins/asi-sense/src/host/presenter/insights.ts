@@ -1,5 +1,7 @@
 import type { Body } from '@asi/sense-types';
 import type { BodyHistory, MetricInsight, MetricKey, ThresholdLayer } from '@asi/sense-ui/model';
+import { latchRatio } from '../attention/thresholds.ts';
+import { floorTable } from '../body/rules.ts';
 import type { Clock } from '../runtime/index.ts';
 import type { Runtime } from './project.ts';
 
@@ -131,16 +133,44 @@ export function projectInsights(
     const floorKey = disk ? key : key === 'tokens' ? 'context' : key;
     if (disk || key === 'tokens' || key === 'battery' || key === 'memory' || key === 'thermal') {
       sources.push('floor');
-      const latched = latches[floorKey];
-      if (latched === 'warn' || latched === 'critical') {
-        triggered.push('floor');
-        severity = latched;
+      if (key === 'tokens') {
+        // Per-session latches live under `context@<token>` — the bare
+        // `context` key is only the last sampled session's overwrite. The
+        // tokens fact can also refresh between samples, so classify the
+        // CURRENT reading against this session's own latch instead.
+        const session = monitor.contextSessionToken();
+        const used = token?.contextUsed;
+        const win = token?.contextWindow;
+        const prior = latches[session ? `context@${session}` : 'context'];
+        if (typeof used === 'number' && Number.isFinite(used) && used >= 0 && typeof win === 'number' && win > 0) {
+          const t = floorTable(tuner);
+          const level = latchRatio(
+            prior === 'warn' || prior === 'critical' ? prior : 'normal',
+            (win - used) / win,
+            t.context,
+            t.hysteresis,
+          );
+          if (level !== 'normal') {
+            triggered.push('floor');
+            severity = level;
+          }
+        } else if (prior === 'warn' || prior === 'critical') {
+          triggered.push('floor');
+          severity = prior;
+        }
+      } else {
+        const latched = latches[floorKey];
+        if (latched === 'warn' || latched === 'critical') {
+          triggered.push('floor');
+          severity = latched;
+        }
       }
     }
     const rateKey = disk ? `rate:disk-drop:${key}` : rate[key] ? `rate:${rate[key]}` : undefined;
     if (rateKey) {
       sources.push('rate');
-      if (latches[rateKey] === 'warn') {
+      const latched = key === 'tokens' ? monitor.rateEvidence('context').latched : latches[rateKey] === 'warn';
+      if (latched) {
         triggered.push('rate');
         severity ??= 'warn';
       }
