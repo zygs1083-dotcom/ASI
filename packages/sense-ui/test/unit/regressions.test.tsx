@@ -22,6 +22,15 @@ import { evaluateBody } from '../../src/health'
 
 afterEach(cleanup)
 
+it('显示异常偏离的标准差倍数而不是百分比', () => {
+  const event = makeEvent(1, {
+    level: 'wake',
+    detail: { kind: 'body.anomaly', metric: 'cpu', current: 0.9, baseline: 0.5, deviation: 3.5, unit: 'ratio' },
+  })
+  renderPanel({ ...makeScenario('healthy'), events: [event] })
+  expect(screen.getByText(/偏离 3.5σ/)).toBeTruthy()
+})
+
 function renderPanel(model: SensePanelModel, over: Partial<SensePanelProps> = {}) {
   const props: SensePanelProps = {
     model,

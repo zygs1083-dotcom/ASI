@@ -4,7 +4,6 @@ import {
   formatDuration,
   formatMetricValue,
   formatMinute,
-  formatPercent,
   formatSignedDelta,
 } from '../format'
 import {
@@ -61,7 +60,7 @@ function DetailLine({ d }: { d: EventDetail }) {
       return (
         <span className={css.detailLine}>
           指标 {d.metric} · 当前 {formatMetricValue(d.current, d.unit)} · 基线{' '}
-          {formatMetricValue(d.baseline, d.unit)} · 偏离 {formatPercent(d.deviation)}
+          {formatMetricValue(d.baseline, d.unit)} · 偏离 {d.deviation}σ
         </span>
       )
     case 'file.burst':
