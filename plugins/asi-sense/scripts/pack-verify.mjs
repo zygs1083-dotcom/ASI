@@ -98,7 +98,7 @@ try {
   const extracted = spawnSync('tar', ['-xzf', artifact, '-C', temp], { stdio: 'inherit' });
   assert.equal(extracted.status, 0, 'Could not extract the distribution');
   const root = join(temp, 'package');
-  assert.deepEqual((await readdir(root)).sort(), ['README.md', 'cordis.patch.yml', 'lib', 'package.json', 'scripts']);
+  assert.deepEqual((await readdir(root)).sort(), ['LICENSE', 'cordis.patch.yml', 'lib', 'package.json', 'scripts']);
   assert.deepEqual((await readdir(join(root, 'lib'))).sort(), [
     'asi-sense-helper',
     'client.js',

@@ -32,12 +32,15 @@ Desktop profile 须已由 Desktop 初始化；若尚未初始化，先打开一�
 当前 tgz 是本地文件源，**不会自动发现 GitHub 新版本**。发布新包后，需取得新 tgz，
 完全退出 Desktop，再用上述 CLI 的 `plugin --profile desktop add` 指向新文件安装。
 
-最可行的后续方案：经负责人批准后，从 GitHub 的每个正式版本标签构建并验证 macOS
-arm64 发行包，以递增的稳定 semver 发布到 npm（先确认包名可用及发布权限），
-并将用户的安装源切换到同名 npm 包。DSH「插件」页会查询 registry 中比已装版本新的
-兼容版本，显示更新按钮并要求确认；不是直接追踪 GitHub 每个提交，也不是零确认的
-自动更新。预发布版不会成为默认推荐版本。发布流程尚未建立，当前没有发布。
+负责人批准发布后，可按[发布指南](release.md)将发行包发布到 npm 或受控自建 registry，
+并先移除本地 tgz 安装、再从相同包名安装。DSH「插件」页查询所配置 registry 中比
+已装版本新的兼容版本，显示更新按钮并要求确认；不是直接追踪 GitHub 每个提交，
+也不是零确认的自动更新。预发布版不会成为默认推荐版本；尚未执行公网发布。
 Desktop 应用菜单里的「检查更新」检查的是 Desktop 本身，不是插件更新。
+
+更新页遵循 profile 的 pnpm 默认 registry 或 DSH plugin-manager 的显式 registry
+配置；仅在 add 命令传 `--registry` 不会持久改变更新源。自建 registry 的部署、
+profile 配置及离线验证见[发布指南](release.md#自建-registry-方案)。
 
 DSH 也接受目录、本地或 HTTP(S) tgz、npm 包名、Git URL 和 GitHub 等简写；
 `plugin --profile <名称> update` / `upgrade` 是转发给 pnpm 的命令，不是独立的
@@ -51,7 +54,9 @@ GitHub 最新版检查。Git 更新接口要求同一仓库目录的完整 commi
 - profile 默认位置：`packages/util/home-paths/src/index.ts:11-18,66-71,124-136`、
   `packages/boot/app-boot/src/profile.ts:5`。
 - 更新限制和 registry 查询：`packages/boot/plugin-manager/src/index.ts:187-205,688-704,727-741,817-826`、
-  `packages/boot/plugin-manager/src/versions.ts:32-55`。
+  `packages/boot/plugin-manager/src/versions.ts:32-55`、
+  `packages/boot/plugin-manager/src/operations.ts:642-686`、
+  `packages/boot/plugin-manager/src/registry.ts:39-75`。
 - 界面与推荐版本：`packages/client/ui-plugin-manager/src/client/index.ts:82-90`、
   `packages/client/ui-plugin-manager/src/client/versions.tsx:230-248`、
   `packages/client/ui-plugin-manager/src/client/PluginManagerPage.tsx:530-540,759-783`、
