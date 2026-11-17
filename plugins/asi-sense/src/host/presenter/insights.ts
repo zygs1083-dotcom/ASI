@@ -80,6 +80,7 @@ function etaFor(
   body: Body,
   interval: number,
   at: (mono: number) => number,
+  diskFloor: number,
 ): MetricInsight['currentEta'] {
   const metric = key.startsWith('disk:') ? key : natural[key];
   if (!metric || (!key.startsWith('disk:') && key !== 'tokens')) return undefined;
@@ -89,7 +90,7 @@ function etaFor(
   if (!evidence.latched || evidence.points.length < 3 || !last || evidence.asOf === undefined || loss <= 0)
     return undefined;
   const total = key.startsWith('disk:') ? body.disks.value?.find((disk) => disk.mount === key.slice(5))?.total : 0;
-  const floor = key === 'tokens' ? 0 : total !== undefined && total > 0 ? total * 0.05 : undefined;
+  const floor = key === 'tokens' ? 0 : total !== undefined && total > 0 ? total * diskFloor : undefined;
   if (floor === undefined) return undefined;
   const timeToThresholdMs = (Math.max(0, last.value - floor) / loss) * 60_000;
   if (!Number.isFinite(timeToThresholdMs)) return undefined;
@@ -195,7 +196,10 @@ export function projectInsights(
     }
     const defaultInterval = disk ? 10_000 : key === 'battery' ? 30_000 : 2_000;
     const interval = intervals[key] ?? defaultInterval;
-    const eta = etaFor(key, monitor, body, Number.isFinite(interval) && interval > 0 ? interval : defaultInterval, at);
+    const eta = etaFor(
+      key, monitor, body, Number.isFinite(interval) && interval > 0 ? interval : defaultInterval, at,
+      tuner.number('floor.disk.critical', 0.05),
+    );
     if (eta) item.currentEta = eta;
     insights[key] = item;
   }

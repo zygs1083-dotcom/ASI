@@ -28,7 +28,7 @@ const inRange = (v: unknown, lo: number, hi: number): v is number => finite(v) &
  * (`contextProjected` is a forecast and never read); `battery` exists only
  * while discharging.
  */
-export function readMetrics(sample: BodyThresholdSample): Map<string, Metric> {
+export function readMetrics(sample: BodyThresholdSample, diskFloor = 0.05): Map<string, Metric> {
   const { body, at } = sample;
   const out = new Map<string, Metric>();
   const cpu = okFact(body.cpu, at);
@@ -41,7 +41,7 @@ export function readMetrics(sample: BodyThresholdSample): Map<string, Metric> {
   }
   for (const d of effectiveDisks(body.disks, at).value ?? []) {
     if (d.status === 'ok' && finite(d.total) && d.total > 0 && inRange(d.free, 0, d.total)) {
-      out.set(`disk:${d.mount}`, { value: d.free, floor: d.total * 0.05 });
+      out.set(`disk:${d.mount}`, { value: d.free, floor: d.total * diskFloor });
     }
   }
   const tok = okFact(body.tokens, at);

@@ -151,7 +151,10 @@ export class RateEvaluator implements BodyEvaluator {
       return { signals: [], state: pub };
     }
     const evaluation = (next as RateSample).evaluatedAt ?? { mono, wall: next.at };
-    const metrics = readMetrics({ ...next, at: next.at + Math.max(0, evaluation.mono - mono) });
+    const metrics = readMetrics(
+      { ...next, at: next.at + Math.max(0, evaluation.mono - mono) },
+      this.liveLimit(0.05, 'floor.disk.critical'),
+    );
     const contextSession = (next as RateSample).contextSession;
     const sessions = (next as RateSample).contextSessions;
     const storageKey = (key: string) => (key === 'context' && contextSession ? `context@${contextSession}` : key);

@@ -100,6 +100,22 @@ async function harness() {
 }
 
 describe('presenter', () => {
+  it('uses the current disk critical floor in projected ETA', async () => {
+    const h = await harness();
+    expect((await h.runtime.body.tuner.propose({ param: 'floor.disk.critical', to: 0.075 })).applied).toBe(true);
+    const gib = 1024 ** 3;
+    for (const free of [80, 76, 75]) {
+      const disks = diskFact([{ mount: '/', total: 100 * gib, free: free * gib, observedAt: Date.now() }]);
+      disks.observedAt = Date.now();
+      await h.sample(mkBody({ disks }));
+      if (free !== 75) await h.advance(10_000);
+    }
+    const eta = h.presenter.snapshot().insights?.['disk:/']?.currentEta;
+    expect(eta?.timeToThresholdMs).toBeCloseTo(((75 - 7.5) / 15) * 60_000, 3);
+    h.presenter.close();
+    await h.runtime.stop();
+  });
+
   it.each([-61_000, 0, 61_000])(
     'shows freshly sampled memory and network trends without lag across a %i ms wall jump, then shows real lag',
     async (jump) => {
