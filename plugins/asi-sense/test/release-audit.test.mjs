@@ -1,7 +1,20 @@
+import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import { auditFiles, registryUrl, registryVersionAvailable } from '../scripts/release-audit.mjs';
 
 describe('release audit', () => {
+  it('keeps every source workspace private', () => {
+    for (const path of [
+      '../../../package.json',
+      '../../../packages/body-probe/package.json',
+      '../../../packages/sense-types/package.json',
+      '../../../packages/sense-ui/package.json',
+      '../package.json',
+    ]) {
+      expect(JSON.parse(readFileSync(new URL(path, import.meta.url))).private).toBe(true);
+    }
+  });
+
   it('accepts only the intended files without local paths or usernames', () => {
     expect(() => auditFiles([{ path: 'lib/index.js' }], () => Buffer.from('safe'), 'exampleuser')).not.toThrow();
     for (const path of ['.env', 'lib/secrets.env', 'lib/index.test.js', 'docs/reviews/result.md']) {
@@ -10,6 +23,59 @@ describe('release audit', () => {
     for (const text of ['/Users/example/file', '/home/example/file', 'exampleuser']) {
       expect(() => auditFiles([{ path: 'lib/index.js' }], () => Buffer.from(text), 'exampleuser')).toThrow();
     }
+  });
+
+  it('rejects synthetic credentials, email addresses and absolute paths in text and binaries', () => {
+    const samples = [
+      `npm_${'a'.repeat(24)}`,
+      `ghp_${'b'.repeat(36)}`,
+      `sk-${'c'.repeat(32)}`,
+      `AKIA${'D'.repeat(16)}`,
+      '-----BEGIN PRIVATE KEY-----',
+      'invented.person@example.invalid',
+      '/UsErS/other/build/file',
+      '/Users/',
+      '/HOME/other/file',
+      '/OPT/build/file',
+      '/PRIVATE/VAR/build/file',
+      '/arbitrary/build/file',
+      'C:\\build\\file',
+      String.raw`C:\\Users\\other\\file`,
+      String.raw`\/Users\/other\/file`,
+      'file:///opt/build/file',
+    ];
+    for (const sample of samples) {
+      const le = Buffer.from(sample, 'utf16le');
+      const be = Buffer.from(le).swap16();
+      for (const bytes of [Buffer.from(sample), le, be]) {
+        for (const path of ['lib/index.js', 'lib/asi-sense-helper']) {
+          expect(() => auditFiles([{ path }], () => Buffer.concat([Buffer.from([0xff]), bytes]), '')).toThrow();
+        }
+      }
+    }
+  });
+
+  it('rejects embedded and external source maps instead of trusting encoded contents', () => {
+    const map = Buffer.from(JSON.stringify({ sources: ['/opt/build/file'], sourcesContent: ['private'] })).toString(
+      'base64',
+    );
+    for (const text of [
+      `//# sourceMappingURL=data:application/json;base64,${map}`,
+      '//# sourceMappingURL=index.js.map',
+    ]) {
+      const le = Buffer.from(text, 'utf16le');
+      for (const bytes of [Buffer.from(text), le, Buffer.from(le).swap16()]) {
+        for (const path of ['lib/index.js', 'lib/asi-sense-helper']) {
+          expect(() => auditFiles([{ path }], () => bytes, '')).toThrow();
+        }
+      }
+    }
+  });
+
+  it('allows only explicitly listed benign paths in their intended files', () => {
+    expect(() => auditFiles([{ path: 'scripts/dsh.sh' }], () => Buffer.from('/dev/null'), '')).not.toThrow();
+    expect(() => auditFiles([{ path: 'lib/index.js' }], () => Buffer.from('/dev/null'), '')).toThrow();
+    expect(() => auditFiles([{ path: 'scripts/dsh.sh' }], () => Buffer.from('/dev/null/secret'), '')).toThrow();
   });
 
   it('accepts a registry 404 but fails closed on existing versions and other errors', () => {

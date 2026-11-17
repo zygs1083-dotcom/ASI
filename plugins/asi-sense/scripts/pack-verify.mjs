@@ -106,6 +106,8 @@ try {
     'typert.host.js',
   ]);
   const manifest = JSON.parse(await readFile(join(root, 'package.json'), 'utf8'));
+  assert.equal(source.private, true);
+  assert.notEqual(manifest.private, true);
   assert.equal(manifest.engines.dsh, '0.2.2-rc.3');
   assert.equal(JSON.stringify(manifest).includes('workspace:'), false);
   assert.deepEqual(manifest.dependencies ?? {}, {});

@@ -33,14 +33,15 @@ Desktop profile 须已由 Desktop 初始化；若尚未初始化，先打开一�
 完全退出 Desktop，再用上述 CLI 的 `plugin --profile desktop add` 指向新文件安装。
 
 负责人批准发布后，可按[发布指南](release.md)将发行包发布到 npm 或受控自建 registry，
-并先移除本地 tgz 安装、再从相同包名安装。DSH「插件」页查询所配置 registry 中比
+并在备份和持久配置 profile registry 后原位替换本地 tgz 来源，无需移除插件；
+迁移和回退均需核对启用状态及 bundle 顺序。DSH「插件」页查询所配置 registry 中比
 已装版本新的兼容版本，显示更新按钮并要求确认；不是直接追踪 GitHub 每个提交，
 也不是零确认的自动更新。预发布版不会成为默认推荐版本；尚未执行公网发布。
 Desktop 应用菜单里的「检查更新」检查的是 Desktop 本身，不是插件更新。
 
 更新页遵循 profile 的 pnpm 默认 registry 或 DSH plugin-manager 的显式 registry
-配置；仅在 add 命令传 `--registry` 不会持久改变更新源。自建 registry 的部署、
-profile 配置及离线验证见[发布指南](release.md#自建-registry-方案)。
+配置；仅在 add 命令传 `--registry` 不会持久改变更新源。公网及自建 registry 的
+profile 配置、操作命令和离线验证见[发布指南](release.md#将用户安装源切到-registry)。
 
 DSH 也接受目录、本地或 HTTP(S) tgz、npm 包名、Git URL 和 GitHub 等简写；
 `plugin --profile <名称> update` / `upgrade` 是转发给 pnpm 的命令，不是独立的

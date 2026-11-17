@@ -11,17 +11,26 @@ registry 的 404 不保证包名尚未被他人抢先注册。
 ```sh
 pnpm install --frozen-lockfile
 pnpm check
+pnpm -r publish --dry-run --no-git-checks
 pnpm --filter asi-sense release:check
 ```
 
 `release:check` 构建并验证 Swift helper、签名和精简 tgz，再用
-`npm pack --dry-run` 列出文件及大小，检查包内路径、当前用户名和意外文件，
+`npm pack --dry-run` 列出文件及大小，检查包内内容、当前用户名和意外文件，
 最后向 npm 公网查询当前版本。仅明确的 E404 视为版本不存在；其他查询错误会失败。
 检查不读取 npm 用户配置或 token，不能验证需要认证才能读取的 registry。
 
 发布物是 `plugins/asi-sense/dist/asi-sense-<version>.tgz`，而不是含 workspace
 依赖和源码的插件源码目录。包包含 MIT LICENSE；helper 构建时删除含本机构建路径的
 调试符号并重新 ad-hoc 签名。`npm pack` 清单及源码不会进入发行包。
+源码 manifest 保持 `private: true`，递归发布 dry-run 应显示没有包可发布；只有通过
+`release:check` 的发行 tgz 才能用于发布。检查后不要替换或修改该 tgz。
+
+审计拒绝未允许的文件、常见凭据形态、邮箱、绝对路径和 sourcemap 引用，包括
+内联 base64 sourcemap；逐文件扫描单字节字符串和两种字节序的 UTF-16，包括 helper
+二进制中的字符串。对必要的系统库、命令路径和非文件路径仅按文件及完整匹配值显式
+放行（见 `scripts/release-audit.mjs`）；其中 Xcode 工具链路径是构建机环境信息。
+审计不能识别所有秘密、压缩或其他编码，发布前仍须人工审查产物及白名单。
 
 ## 发布到 npm 公网
 
@@ -42,18 +51,67 @@ npm view "asi-sense@$VERSION" version --registry=https://registry.npmjs.org/
 ## 将用户安装源切到 registry
 
 仅在目标包已经发布并验证后，由用户完全退出 Desktop；确认 CLI 与 Desktop 使用同一
-`DSH_HOME`，并确保 Desktop profile 已初始化。公网示例：
+`DSH_HOME`，并确保 Desktop profile 已初始化。以下示例中的版本必须替换为已验证的
+registry 版本，旧 tgz 必须继续保留以备回退。先备份 profile 文件并持久设置更新源：
 
 ```sh
 DSH="/Applications/DeepSeek Harness.app/Contents/Resources/runtime/cli/bin/dsh"
-"$DSH" plugin --profile desktop remove asi-sense
-"$DSH" plugin --profile desktop add asi-sense --registry=https://registry.npmjs.org/
+PROFILE="${DSH_HOME:-$HOME/.dsh}/profiles/desktop"
+REGISTRY=https://registry.npmjs.org/
+VERSION=0.1.2
+test -f "$PROFILE/package.json" || { echo "Desktop profile 未初始化" >&2; exit 1; }
+umask 077
+BACKUP=$(mktemp -d "${TMPDIR:-/tmp}/asi-profile-backup.XXXXXX")
+cp -p "$PROFILE/package.json" "$BACKUP/package.json"
+test ! -f "$PROFILE/pnpm-lock.yaml" || cp -p "$PROFILE/pnpm-lock.yaml" "$BACKUP/pnpm-lock.yaml"
+test ! -f "$PROFILE/.npmrc" || cp -p "$PROFILE/.npmrc" "$BACKUP/npmrc"
+npm --prefix "$PROFILE" config set registry "$REGISTRY" --location=project
+pnpm --dir "$PROFILE" config get registry
 ```
 
-先卸载是为了将原 `file:` tgz 依赖换成同名 registry 依赖。安装失败时不要假定旧包
-仍然存在：可用保留的旧 tgz 重新 `add`，确认原因后再试。重启 Desktop 后，在「插件」
-页进入 asi-sense；只要 registry 有更新的兼容稳定版，详情会出现更新按钮，并需确认。
-通过 tgz 回退后，不会继续自动发现 registry 更新，须再次切回包名安装。
+确认最后一行是所选 registry，再原位替换依赖，不要 `remove`：
+
+```sh
+"$DSH" plugin --profile desktop add "asi-sense@$VERSION"
+node - "$PROFILE/package.json" "$BACKUP/package.json" "$VERSION" <<'NODE'
+const fs = require('node:fs');
+const [current, before] = process.argv.slice(2, 4).map(path => JSON.parse(fs.readFileSync(path, 'utf8')));
+const spec = current.dependencies?.['asi-sense'];
+if (spec?.replace(/^[~^]/, '') !== process.argv[4] ||
+    JSON.stringify(current.dsh?.profile?.bundles) !== JSON.stringify(before.dsh?.profile?.bundles)) {
+  throw new Error('安装源、启用状态或 bundle 顺序不符；不要重启，先检查备份');
+}
+console.log('registry 依赖、启用状态和 bundle 顺序已核对');
+NODE
+```
+
+必须指定版本：实测无版本的 `add asi-sense` 可能保留已有 `file:` 源。原位替换不
+删除依赖名；成功后仍应核对上述状态及插件数据。若任一步失败，不要假定安装未变：
+先检查 profile、依赖和诊断，再用旧包原位回退并再次对比保存的 bundle 列表：
+
+```sh
+OLD_TGZ="/absolute/path/to/previous-asi-sense.tgz"
+"$DSH" plugin --profile desktop add "$OLD_TGZ"
+node - "$PROFILE/package.json" "$BACKUP/package.json" <<'NODE'
+const fs = require('node:fs');
+const [current, before] = process.argv.slice(2).map(path => JSON.parse(fs.readFileSync(path, 'utf8')));
+if (!current.dependencies?.['asi-sense']?.startsWith('file:') ||
+    JSON.stringify(current.dsh?.profile?.bundles) !== JSON.stringify(before.dsh?.profile?.bundles)) {
+  throw new Error('回退后的来源或 bundle 列表不符；不要重启，先检查备份');
+}
+console.log('tgz 来源、启用状态和 bundle 顺序已核对');
+NODE
+```
+
+如果核对失败，停止并保留备份供排查，不要覆盖其他用户更改。备份可能含凭据，应
+限制权限并按本机保密要求处理。重启 Desktop 后，在「插件」页进入 asi-sense；只要
+registry 有更新的兼容稳定版，详情会出现更新按钮，并需确认。通过 tgz 回退后，
+不会继续自动发现 registry 更新，须再次原位切回包名安装。
+
+`asi-sense` 没有 npm 作用域，不能仅给该包设置 scope registry；上述命令修改此
+profile 的默认 registry，可能影响其他无作用域包，但会保留其他 `.npmrc` 设置和
+凭据。先评估其他包和代理；如单独配置了 DSH plugin-manager 的 `registry`，其首选源
+也须与目标一致。一次性 `--registry` 不会持久改变重启后的更新源。
 
 ## 自建 registry 方案
 
@@ -112,13 +170,8 @@ npm publish "./asi-sense-$VERSION.tgz" --registry="$REGISTRY" --access=public
 npm view "asi-sense@$VERSION" version --registry="$REGISTRY"
 ```
 
-在 MacPro，负责人在退出 Desktop 后，**手工**在 Desktop 实际使用的
-`$DSH_HOME/profiles/desktop/.npmrc` 中设置 `registry=http://100.108.45.41:4873/`
-（未设置 `DSH_HOME` 时为 `~/.dsh/profiles/desktop/.npmrc`）；不要覆盖已有内容或
-凭据。然后按上节 remove/add，将 add 的 `--registry` 换成此地址，重启并检查「插件」
-页。安装时的一次性 `--registry` 不会永久设置重启后的更新源；profile 配置须保持。
-这会改变该 profile 中其他**未限定作用域**包的默认 registry，需考虑上面的代理限制。
-如另设 DSH plugin-manager 的 `registry`，它优先作为管理页的首选源，应与之保持一致。
+在 MacPro，负责人退出 Desktop 后，按上节备份、设置 profile `.npmrc`、原位迁移和
+核对；将 `REGISTRY` 换成自建地址，并检查其他包的代理限制。重启后再检查「插件」页。
 凭据只由负责人在自己的终端输入和保存，不写入仓库、命令示例或聊天。
 
 ## 后续版本
@@ -133,10 +186,11 @@ npm view "asi-sense@$VERSION" version --registry="$REGISTRY"
 本地无发布的回归验证：设置 `DSH_ROOT` 指向固定版 DSH 源码，先运行
 `pnpm --filter asi-sense pack:dist`，再运行 `pnpm --filter asi-sense e2e:registry`。
 测试在本地只读模拟 registry 提供构建出的当前版本和临时下一 patch 版本，
-在独立 `DSH_HOME` 用包名安装，断言更新按钮、确认后安装版本及无模型请求，
+在独立 `DSH_HOME` 验证从 tgz 原位迁移、回退及失败后保持启用状态和顺序，
+更改已有私有默认源并保留其他配置，重启后断言更新按钮、确认后安装版本及无模型请求，
 随后关闭进程并删除临时目录；不会调用 `npm publish`。
-在固定版 DSH 上已实测 `0.1.2 → 0.1.3`：profile `.npmrc` 指向模拟 registry，
-页面出现 `Update to 0.1.3`，确认后磁盘中的插件版本为 `0.1.3`。
+在固定版 DSH 上已实测原本禁用的 `0.1.2 → 0.1.3`：profile `.npmrc` 指向模拟
+registry，重启后页面出现 `Update to 0.1.3`，确认后磁盘版本为 `0.1.3` 且仍禁用。
 测试用稳定版本才能触发默认推荐；`0.1.3` 只存在于临时模拟数据。
 
 ## 固定版 DSH 的依据
@@ -145,6 +199,10 @@ npm view "asi-sense@$VERSION" version --registry="$REGISTRY"
 
 - CLI 的 `plugin --profile <p> add` 将参数转给 profile 内的 pnpm：
   `apps/cli/src/args.ts:187-201`、`apps/cli/src/plugin.ts:71-98`。
+- 原位替换：`packages/boot/plugin-manager/src/operations.ts:323-326,386-387,495-505`
+  将同一依赖名的 add 转给 pnpm 并检查结果；`:96-107,119-125` 仅把新增依赖
+  追加到 bundle 列表，同名依赖保留现有选择和顺序。安装失败或后置检查拒绝时
+  不应假定所有文件都未变（`:289-301,544-563`），所以步骤中保留备份和核对。
 - 更新只接受 profile 中以自身包名安装的 registry 依赖：
   `packages/boot/plugin-manager/src/index.ts:187-205`。打开详情触发检查
   (`packages/client/ui-plugin-manager/src/client/versions.tsx:230-248`)；
