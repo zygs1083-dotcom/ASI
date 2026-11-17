@@ -8,6 +8,30 @@ import type { JsonValue } from './wire-types.ts';
 
 const MAX_BYTES = 32_768;
 const MAX_TITLE_LENGTH = 512;
+const PLACEHOLDERS = ['<host>', '[host]', '[endpoint]', '[path]'] as const;
+const DELIMITER_RE = /[\s"'<>]+/gu;
+const HAS_DELIMITER_RE = /[\s"'<>]/u;
+const COMBINING_MARK_RE = /^\p{M}$/u;
+const NEEDS_CLUSTER_NFC_RE = /[\p{M}\u1100-\u11ff\ud7b0-\ud7ff]/u;
+
+const SENTINEL_HOST = '\0';
+const SENTINEL_ENDPOINT = '\u0004';
+const SENTINEL_PATH = '\u0005';
+const ESCAPE_CHAR = '\u0001';
+
+const TEXT_ENDPOINT_RE = /https?:\/\/[^\s"'<>]+/gi;
+const TEXT_PATH_RE = /(?<![\w])(?:[A-Za-z]:\\|\/)(?:[^\s"'<>/\\]+[/\\])*[^\s"'<>/\\]*/g;
+
+const TITLE_SCHEME_RE = /(?<![a-z\d+.-])[a-z\d+.-]+:\/\/[^\s"'<>]+/gi;
+const TITLE_EMAIL_RE =
+  /(?<![\p{L}\p{M}\p{N}_.+%-])[\p{L}\p{M}\p{N}_.+%-]+@(?:\[[\da-f:.]+\]|[\p{L}\p{M}\p{N}_.-]+)(?::\d+)?(?:[/\\][^\s"'<>]*)?/giu;
+const TITLE_IPV6_RE =
+  /\[[\da-f:.]+\](?::\d+)?(?:[/\\][^\s"'<>]*)?|(?<![\w:])(?:[\da-f]{0,4}:){2,}[\da-f]{0,4}(?![\w:])(?:[/\\][^\s"'<>]*)?/gi;
+const TITLE_IPV4_RE = /\b(?:\d{1,3}\.){3}\d{1,3}(?::\d+)?\b(?:[/\\][^\s"'<>]*)?/gi;
+const TITLE_HOST_PORT_RE = /(?<![\p{L}\p{M}\p{N}_.:-])[\p{L}\p{M}\p{N}_.-]+:\d+\b(?:[/\\][^\s"'<>]*)?/giu;
+const TITLE_PATH_RE =
+  /(?<![\p{L}\p{M}\p{N}._-])(?:[A-Za-z]:\\|\/|[\p{L}\p{M}\p{N}._-]+\/)(?:[^\s"'<>/\\]+[/\\])*[^\s"'<>/\\]*/gu;
+
 const FIXED_IDENTIFIERS = new Set([
   'accessibility',
   'other',
@@ -30,50 +54,423 @@ const FIXED_IDENTIFIERS = new Set([
   'node',
 ]);
 
-function boundedText(value: string, limit: number): string {
-  if (value.length <= limit) return value;
-  const prefix = value.slice(0, limit);
-  if (/[\s"'<>]/u.test(value[limit])) return prefix;
-  let end = prefix.length;
-  while (end > 0 && !/[\s"'<>]/u.test(prefix[end - 1])) end--;
-  return prefix.slice(0, end);
+function countCodePoints(text: string): number {
+  let count = 0;
+  for (let i = 0; i < text.length; ) {
+    const cp = text.codePointAt(i) ?? 0;
+    count++;
+    i += cp > 0xffff ? 2 : 1;
+  }
+  return count;
+}
+
+function sliceByCodePoints(text: string, maxCodePoints: number): string {
+  if (maxCodePoints <= 0) return '';
+  if (text.length <= maxCodePoints) return text;
+  let cps = 0;
+  let i = 0;
+  while (i < text.length) {
+    const cp = text.codePointAt(i) ?? 0;
+    if (cps + 1 > maxCodePoints) break;
+    cps += 1;
+    i += cp > 0xffff ? 2 : 1;
+  }
+  return i === text.length ? text : text.slice(0, i);
+}
+
+function truncateRedacted(text: string, limit: number): string {
+  if (text.length <= limit) return text;
+  let cps = 0;
+  let i = 0;
+  while (i < text.length) {
+    const ch = text[i];
+    if (ch === '<' || ch === '[') {
+      let matched: string | undefined;
+      for (const token of PLACEHOLDERS) {
+        if (text.startsWith(token, i)) {
+          matched = token;
+          break;
+        }
+      }
+      if (matched !== undefined) {
+        if (cps + matched.length > limit) break;
+        cps += matched.length;
+        i += matched.length;
+        continue;
+      }
+    }
+    const cp = text.codePointAt(i) ?? 0;
+    if (cps + 1 > limit) break;
+    cps += 1;
+    i += cp > 0xffff ? 2 : 1;
+  }
+  return i === text.length ? text : text.slice(0, i);
+}
+
+function lastPathSegment(value: string, fallback: string): string {
+  let end = value.length;
+  while (end > 0 && (value[end - 1] === '/' || value[end - 1] === '\\')) end--;
+  if (end === 0) return fallback;
+  let start = end;
+  while (start > 0 && value[start - 1] !== '/' && value[start - 1] !== '\\') start--;
+  return value.slice(start, end);
+}
+
+function needsSentinelEscape(text: string): boolean {
+  return (
+    text.includes(SENTINEL_HOST) ||
+    text.includes(ESCAPE_CHAR) ||
+    text.includes(SENTINEL_ENDPOINT) ||
+    text.includes(SENTINEL_PATH)
+  );
+}
+
+function escapeSentinels(text: string): string {
+  return text
+    .replaceAll(ESCAPE_CHAR, `${ESCAPE_CHAR}\u0002`)
+    .replaceAll(SENTINEL_HOST, `${ESCAPE_CHAR}\u0003`)
+    .replaceAll(SENTINEL_ENDPOINT, `${ESCAPE_CHAR}\u0006`)
+    .replaceAll(SENTINEL_PATH, `${ESCAPE_CHAR}\u0007`);
+}
+
+function unescapeSentinels(text: string): string {
+  return text
+    .replaceAll(`${ESCAPE_CHAR}\u0007`, SENTINEL_PATH)
+    .replaceAll(`${ESCAPE_CHAR}\u0006`, SENTINEL_ENDPOINT)
+    .replaceAll(`${ESCAPE_CHAR}\u0003`, SENTINEL_HOST)
+    .replaceAll(`${ESCAPE_CHAR}\u0002`, ESCAPE_CHAR);
+}
+
+function isClusterContinuation(text: string, index: number, cp: number, len: number): boolean {
+  if (index === 0) return false;
+  if (cp < 0x0300 || (cp >= 0x4e00 && cp <= 0x9fff) || (cp >= 0xac00 && cp <= 0xd7a3)) return false;
+  if (cp >= 0x1160 && cp <= 0x11ff) return true;
+  if (cp >= 0xd7b0 && cp <= 0xd7ff) return true;
+  return COMBINING_MARK_RE.test(text.slice(index, index + len));
+}
+
+function sliceToClusterBound(text: string, maxClusters: number): string {
+  if (text.length <= maxClusters) return text;
+  const candidate = text.slice(0, maxClusters);
+  if (!NEEDS_CLUSTER_NFC_RE.test(candidate) && !/[\ud800-\udfff]/.test(candidate)) {
+    const nextCp = text.codePointAt(maxClusters) ?? 0;
+    const nextLen = nextCp > 0xffff ? 2 : 1;
+    if (!isClusterContinuation(text, maxClusters, nextCp, nextLen)) return candidate;
+  }
+  let clusters = 0;
+  let i = 0;
+  let clusterCps = 0;
+  const maxSingleClusterCps = Math.max(maxClusters * 4, 8192);
+  while (i < text.length) {
+    const code = text.charCodeAt(i);
+    if (code < 0x300 || (code >= 0x4e00 && code <= 0x9fff) || (code >= 0xac00 && code <= 0xd7a3)) {
+      if (i > 0 && ++clusters >= maxClusters) return text.slice(0, i);
+      clusterCps = 1;
+      i += 1;
+      continue;
+    }
+    const cp = text.codePointAt(i) ?? 0;
+    const len = cp > 0xffff ? 2 : 1;
+    if (isClusterContinuation(text, i, cp, len)) {
+      clusterCps++;
+      if (clusters === 0 && clusterCps >= maxSingleClusterCps) return text.slice(0, i + len);
+      i += len;
+      continue;
+    }
+    if (i > 0 && ++clusters >= maxClusters) return text.slice(0, i);
+    clusterCps = 1;
+    i += len;
+  }
+  return text;
+}
+
+function segmentNfcClusters(text: string): { rawStarts: number[]; nfcStarts: number[]; nfc: string } {
+  const normCache = new Map<string, string>();
+  const rawStarts: number[] = [];
+  const nfcStarts: number[] = [];
+  const nfcParts: string[] = [];
+  let nfcLen = 0;
+  let segStart = 0;
+  const pushCluster = (end: number) => {
+    rawStarts.push(segStart);
+    nfcStarts.push(nfcLen);
+    const seg = text.slice(segStart, end);
+    let norm: string;
+    if (seg.length === 1 && seg.charCodeAt(0) < 0x0300) {
+      norm = seg;
+    } else {
+      const cached = normCache.get(seg);
+      if (cached !== undefined) {
+        norm = cached;
+      } else {
+        norm = seg.normalize('NFC');
+        if (normCache.size < 2048) normCache.set(seg, norm);
+      }
+    }
+    nfcParts.push(norm);
+    nfcLen += norm.length;
+    segStart = end;
+  };
+  for (let i = 0; i < text.length; ) {
+    const cp = text.codePointAt(i) ?? 0;
+    const len = cp > 0xffff ? 2 : 1;
+    if (!isClusterContinuation(text, i, cp, len) && i > segStart) pushCluster(i);
+    i += len;
+  }
+  if (text.length > segStart) pushCluster(text.length);
+  rawStarts.push(text.length);
+  nfcStarts.push(nfcLen);
+  return { rawStarts, nfcStarts, nfc: nfcParts.join('') };
+}
+
+/**
+ * Replaces case-insensitive NFC-equivalent matches of `hostNfc` in `text`
+ * without altering non-matching NFD sequences or splitting combining clusters.
+ */
+function replaceHostNfc(text: string, hostNfc: string, replacement: string, limit?: number): string {
+  if (!hostNfc || !text) return text;
+  const hostCps = countCodePoints(hostNfc);
+  // By pigeonhole principle, any match beyond this cluster count cannot enter the final `limit`.
+  const bounded =
+    limit === undefined
+      ? text
+      : sliceToClusterBound(text, (Math.ceil(limit / replacement.length) + 1) * Math.max(hostCps, 1) + limit + hostCps);
+  const hostRe = new RegExp(hostNfc.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'giu');
+  if (!NEEDS_CLUSTER_NFC_RE.test(bounded) && bounded.normalize('NFC') === bounded) {
+    if (limit === undefined || bounded.length <= limit * 2) return bounded.replace(hostRe, replacement);
+    let out = '';
+    let last = 0;
+    let outCps = 0;
+    hostRe.lastIndex = 0;
+    for (let match = hostRe.exec(bounded); match !== null; match = hostRe.exec(bounded)) {
+      const gap = bounded.slice(last, match.index);
+      out += gap + replacement;
+      outCps += countCodePoints(gap) + replacement.length;
+      last = match.index + match[0].length;
+      if (match[0].length === 0) hostRe.lastIndex++;
+      if (outCps >= limit) return out;
+    }
+    return last === 0 ? bounded : out + bounded.slice(last);
+  }
+  const { rawStarts, nfcStarts, nfc } = segmentNfcClusters(bounded);
+  let out = '';
+  let lastRaw = 0;
+  let segCursor = 0;
+  const numSegs = nfcStarts.length - 1;
+  hostRe.lastIndex = 0;
+  for (let match = hostRe.exec(nfc); match !== null; match = hostRe.exec(nfc)) {
+    if (match[0].length === 0) {
+      hostRe.lastIndex++;
+      continue;
+    }
+    const mStart = match.index;
+    const mEnd = mStart + match[0].length;
+    while (segCursor < numSegs && nfcStarts[segCursor] < mStart) segCursor++;
+    if (segCursor > numSegs || nfcStarts[segCursor] !== mStart) continue;
+    let endCursor = segCursor;
+    while (endCursor <= numSegs && nfcStarts[endCursor] < mEnd) endCursor++;
+    if (endCursor > numSegs || nfcStarts[endCursor] !== mEnd) continue;
+    const rawFrom = rawStarts[segCursor];
+    const rawTo = rawStarts[endCursor];
+    if (rawFrom < lastRaw) continue;
+    out += bounded.slice(lastRaw, rawFrom) + replacement;
+    lastRaw = rawTo;
+    segCursor = endCursor;
+  }
+  return lastRaw === 0 ? bounded : out + bounded.slice(lastRaw);
+}
+
+/**
+ * Replaces regex matches up to an early-stop bound once irreversible sentinel placeholders
+ * already exceed `limit` code points, avoiding full-string work on 1 MB inputs.
+ */
+function replaceBounded(
+  str: string,
+  re: RegExp,
+  replacer: (match: string) => string,
+  limit: number,
+  allowEarlyStop: boolean,
+  countMatch: (replaced: string) => boolean = () => true,
+): string {
+  if (str.length <= 65_536 || !allowEarlyStop) {
+    return str.replace(re, replacer);
+  }
+  const maxPlaceholders = Math.ceil(limit / 6) + 2;
+  re.lastIndex = 0;
+  let out = '';
+  let last = 0;
+  let count = 0;
+  for (let match = re.exec(str); match !== null; match = re.exec(str)) {
+    const replaced = replacer(match[0]);
+    out += str.slice(last, match.index) + replaced;
+    last = match.index + match[0].length;
+    if (match[0].length === 0) re.lastIndex++;
+    if (countMatch(replaced) && ++count >= maxPlaceholders) return out;
+  }
+  return last === 0 ? str : out + str.slice(last);
+}
+
+function nextSentinel(text: string, from: number): { index: number; code: number } {
+  let best = -1;
+  let code = -1;
+  for (const [sentinel, value] of [
+    [SENTINEL_HOST, 0],
+    [SENTINEL_ENDPOINT, 4],
+    [SENTINEL_PATH, 5],
+  ] as const) {
+    const idx = text.indexOf(sentinel, from);
+    if (idx !== -1 && (best === -1 || idx < best)) {
+      best = idx;
+      code = value;
+    }
+  }
+  return { index: best, code };
+}
+
+function redactPlainSegment(
+  plain: string,
+  escapedHost: string,
+  hostPlaceholder: string,
+  remaining: number,
+  escaped: boolean,
+): string {
+  const withHost = escapedHost
+    ? replaceHostNfc(plain, escapedHost, hostPlaceholder, escaped ? remaining * 2 + 24 : remaining + 12)
+    : plain;
+  const restored = escaped ? unescapeSentinels(withHost) : withHost;
+  return sliceByCodePoints(restored, remaining + 12);
+}
+
+function expandAndRedactHost(
+  text: string,
+  hostNfc: string,
+  hostPlaceholder: string,
+  limit: number,
+  escaped: boolean,
+): string {
+  const escapedHost = escaped ? escapeSentinels(hostNfc) : hostNfc;
+  const first = nextSentinel(text, 0);
+  if (first.index === -1) {
+    return redactPlainSegment(text, escapedHost, hostPlaceholder, limit, escaped);
+  }
+  const out: string[] = [];
+  let cps = 0;
+  let start = 0;
+  let current = first;
+  while (true) {
+    const end = current.index === -1 ? text.length : current.index;
+    if (end > start) {
+      const boundedPart = redactPlainSegment(
+        text.slice(start, end),
+        escapedHost,
+        hostPlaceholder,
+        Math.max(1, limit - cps),
+        escaped,
+      );
+      out.push(boundedPart);
+      if (current.index === -1) break;
+      cps += countCodePoints(boundedPart);
+      if (cps >= limit) break;
+    }
+    if (current.index === -1) break;
+    const placeholder = current.code === 0 ? hostPlaceholder : current.code === 4 ? '[endpoint]' : '[path]';
+    out.push(placeholder);
+    cps += placeholder.length;
+    if (cps >= limit) break;
+    start = current.index + 1;
+    current = nextSentinel(text, start);
+  }
+  return out.join('');
+}
+
+function redactTextChunk(chunk: string, hostNfc: string, limit: number): string {
+  const escaped = needsSentinelEscape(chunk) || needsSentinelEscape(hostNfc);
+  let r = escaped ? escapeSentinels(chunk) : chunk;
+  if (r.includes('://')) r = r.replace(TEXT_ENDPOINT_RE, SENTINEL_ENDPOINT);
+  if (r.includes('/') || r.includes('\\')) {
+    r = replaceBounded(
+      r,
+      TEXT_PATH_RE,
+      (match) => lastPathSegment(match, SENTINEL_PATH),
+      limit,
+      true,
+      (seg) => seg === SENTINEL_PATH,
+    );
+  }
+  return expandAndRedactHost(r, hostNfc, '[host]', limit, escaped);
+}
+
+function redactTitleChunk(chunk: string, hostNfc: string, limit: number): string {
+  const escaped = needsSentinelEscape(chunk) || needsSentinelEscape(hostNfc);
+  let r = escaped ? escapeSentinels(chunk) : chunk;
+  // When no path separator exists, TITLE_PATH_RE cannot collapse earlier tokens.
+  const canStopEarly = !r.includes('/') && !r.includes('\\');
+  const toHost = () => SENTINEL_HOST;
+  if (r.includes('://')) r = replaceBounded(r, TITLE_SCHEME_RE, toHost, limit, canStopEarly);
+  if (r.includes('@')) r = replaceBounded(r, TITLE_EMAIL_RE, toHost, limit, canStopEarly);
+  if (r.includes(':')) r = replaceBounded(r, TITLE_IPV6_RE, toHost, limit, canStopEarly);
+  if (r.includes('.')) r = replaceBounded(r, TITLE_IPV4_RE, toHost, limit, canStopEarly);
+  if (r.includes(':')) r = replaceBounded(r, TITLE_HOST_PORT_RE, toHost, limit, canStopEarly);
+  if (!canStopEarly) {
+    r = replaceBounded(
+      r,
+      TITLE_PATH_RE,
+      (match) => lastPathSegment(match, SENTINEL_PATH),
+      limit,
+      true,
+      (seg) => seg === SENTINEL_PATH,
+    );
+  }
+  return expandAndRedactHost(r, hostNfc, '<host>', limit, escaped);
+}
+
+function projectModelString(
+  value: string,
+  hostname: string,
+  limit: number,
+  redactChunk: (chunk: string, hostNfc: string, limit: number) => string,
+): string {
+  if (!value) return value;
+  const hostNfc = hostname ? hostname.normalize('NFC') : '';
+  const batchSize = Math.max(limit * 4, 4096);
+  if (value.length <= batchSize || (hostNfc && HAS_DELIMITER_RE.test(hostNfc))) {
+    return truncateRedacted(redactChunk(value, hostNfc, limit), limit);
+  }
+  const chunks: string[] = [];
+  let outCps = 0;
+  let pos = 0;
+  while (pos < value.length && outCps < limit) {
+    const targetEnd = pos + batchSize;
+    if (targetEnd >= value.length) {
+      chunks.push(redactChunk(value.slice(pos), hostNfc, limit - outCps));
+      break;
+    }
+    DELIMITER_RE.lastIndex = targetEnd;
+    const match = DELIMITER_RE.exec(value);
+    if (match === null) {
+      chunks.push(redactChunk(value.slice(pos), hostNfc, limit - outCps));
+      break;
+    }
+    if (match.index > pos) {
+      const redacted = redactChunk(value.slice(pos, match.index), hostNfc, limit - outCps);
+      chunks.push(redacted);
+      outCps += countCodePoints(redacted);
+      if (outCps >= limit) break;
+    }
+    const delim = sliceByCodePoints(match[0], limit - outCps + 12);
+    chunks.push(delim);
+    outCps += countCodePoints(delim);
+    pos = match.index + match[0].length;
+  }
+  return truncateRedacted(chunks.join(''), limit);
 }
 
 export function modelText(value: string, hostname = os.hostname()): string {
-  const safe = boundedText(value, MAX_BYTES)
-    .replace(/https?:\/\/[^\s"'<>]+/gi, '[endpoint]')
-    .replace(/(?<![\w])(?:[A-Za-z]:\\|\/)(?:[^\s"'<>/\\]+[/\\])*[^\s"'<>/\\]*/g, (path) => {
-      const parts = path.split(/[\\/]/).filter(Boolean);
-      return parts.at(-1) ?? '[path]';
-    });
-  return hostname ? safe.replace(new RegExp(hostname.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi'), '[host]') : safe;
+  return projectModelString(value, hostname, MAX_BYTES, redactTextChunk);
 }
 
 export function modelTitle(value: string, hostname = os.hostname()): string {
-  const hidden: string[] = [];
-  const hide = () => `\0${hidden.push('<host>') - 1}\0`;
-  const escapedHost = hostname.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const projected = boundedText(value, MAX_TITLE_LENGTH)
-    .replace(/(?<![a-z\d+.-])[a-z\d+.-]+:\/\/[^\s"'<>]+/gi, hide)
-    .replace(
-      /(?<![\p{L}\p{N}_.+%-])[\p{L}\p{N}_.+%-]+@(?:\[[\da-f:.]+\]|[\p{L}\p{N}_.-]+)(?::\d+)?(?:[/\\][^\s"'<>]*)?/giu,
-      hide,
-    )
-    .replace(
-      /\[[\da-f:.]+\](?::\d+)?(?:[/\\][^\s"'<>]*)?|(?<![\w:])(?:[\da-f]{0,4}:){2,}[\da-f]{0,4}(?![\w:])(?:[/\\][^\s"'<>]*)?/gi,
-      hide,
-    )
-    .replace(/\b(?:\d{1,3}\.){3}\d{1,3}(?::\d+)?\b(?:[/\\][^\s"'<>]*)?/gi, hide)
-    .replace(/(?<![\p{L}\p{N}_.:-])[\p{L}\p{N}_.-]+:\d+\b(?:[/\\][^\s"'<>]*)?/giu, hide)
-    .replace(
-      /(?<![\p{L}\p{N}._-])(?:[A-Za-z]:\\|\/|[\p{L}\p{N}._-]+\/)(?:[^\s"'<>/\\]+[/\\])*[^\s"'<>/\\]*/gu,
-      (path) => {
-        const parts = path.split(/[\\/]/).filter(Boolean);
-        return parts.at(-1) ?? '[path]';
-      },
-    );
-  const withoutLocalHost = hostname ? projected.replace(new RegExp(escapedHost, 'gi'), hide) : projected;
-  return withoutLocalHost.replace(/\0(\d+)\0/g, (_match, index: string) => hidden[Number(index)] ?? '<host>');
+  return projectModelString(value, hostname, MAX_TITLE_LENGTH, redactTitleChunk);
 }
 
 function minimize(value: JsonValue, hostname: string, path = '', appNamePaths: readonly string[] = []): JsonValue {
