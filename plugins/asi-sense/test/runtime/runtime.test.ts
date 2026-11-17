@@ -161,6 +161,149 @@ function harness(
 }
 
 describe('host runtime', () => {
+  it('never watches pending or expired rules and closes a root on expiration', async () => {
+    const now = 1_700_000_000_000;
+    const h = harness(undefined, {
+      rules: [
+        {
+          id: 'pending',
+          match: { kind: 'file.changed', subject: '/pending/**' },
+          level: 'wake',
+          createdBy: 'agent',
+          approved: false,
+        },
+        {
+          id: 'expired',
+          match: { kind: 'file.changed', subject: '/expired/**' },
+          level: 'context',
+          createdBy: 'user',
+          approved: true,
+          expiresAt: now - 1,
+        },
+        {
+          id: 'temporary',
+          match: { kind: 'file.changed', subject: '/temporary/**' },
+          level: 'context',
+          createdBy: 'user',
+          approved: true,
+          expiresAt: now + 1_000,
+        },
+      ],
+    });
+    const watched = new Set<string>();
+    h.ports.files.watch = (path) => {
+      watched.add(path);
+      return {
+        close: () => {
+          watched.delete(path);
+        },
+      };
+    };
+    await h.runtime.start();
+    expect([...watched]).toEqual(['/temporary/']);
+    await h.advance(1_000);
+    expect([...watched]).toEqual([]);
+    await h.runtime.stop();
+  });
+
+  it('does not stage an unapproved agent watch before confirmation', async () => {
+    const h = harness(undefined, { rules: [] });
+    await h.runtime.start();
+    await h.runtime.tools.envWatch({
+      action: 'add',
+      rule: { id: 'pending', match: { kind: 'file.changed', subject: '/missing/**' }, level: 'wake' },
+    });
+    expect(h.watcherCount()).toBe(0);
+    await h.runtime.actions.confirmRule('pending');
+    expect(h.watcherCount()).toBe(1);
+    await h.runtime.stop();
+  });
+
+  it('watches a directory named by a file.burst rule without file.changed rules', async () => {
+    const h = harness(undefined, {
+      rules: [
+        {
+          id: 'burst',
+          match: { kind: 'file.burst', subject: '/workspace' },
+          level: 'wake',
+          createdBy: 'user',
+          approved: true,
+        },
+      ],
+    });
+    await h.runtime.start();
+    expect(h.watcherCount()).toBe(1);
+    for (let i = 0; i < 51; i++) h.fileRaw({ path: `/workspace/${i}.json`, change: 'delete' });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(h.runtime.events().find((item) => item.kind === 'file.burst')?.detail?.deleted).toBe(51);
+    await h.runtime.stop();
+  });
+
+  it('counts unmatched files within an approved watch root toward burst detection', async () => {
+    const h = harness(undefined, {
+      rules: [
+        {
+          id: 'ts',
+          match: { kind: 'file.changed', subject: '/workspace/*.ts' },
+          level: 'context',
+          createdBy: 'user',
+          approved: true,
+        },
+        ...defaultBodyRules(),
+      ],
+    });
+    await h.runtime.start();
+    for (let i = 0; i < 51; i++) h.fileRaw({ path: `/workspace/${i}.json`, change: 'delete' });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(h.runtime.events().filter((item) => item.kind === 'file.changed')).toHaveLength(0);
+    expect(h.runtime.events().find((item) => item.kind === 'file.burst')?.detail?.deleted).toBe(51);
+    await h.runtime.stop();
+  });
+
+  it('does not count unrelated ancestor events toward a burst', async () => {
+    const h = harness(undefined, {
+      rules: [
+        {
+          id: 'target',
+          match: { kind: 'file.changed', subject: '/workspace/target/**' },
+          level: 'context',
+          createdBy: 'user',
+          approved: true,
+        },
+        ...defaultBodyRules(),
+      ],
+    });
+    await h.runtime.start();
+    for (let i = 0; i < 51; i++) h.fileRaw({ path: `/workspace/sibling/${i}`, change: 'delete' });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(h.runtime.events().filter((item) => item.kind === 'file.burst')).toHaveLength(0);
+    await h.runtime.stop();
+  });
+
+  it('preserves burst history for unchanged roots across rule refresh', async () => {
+    const h = harness();
+    const watches = new Map<string, (event: FileChange) => void>();
+    h.ports.files.watch = (path, callback) => {
+      watches.set(path, callback);
+      return {
+        close: () => {
+          watches.delete(path);
+        },
+      };
+    };
+    await h.runtime.start();
+    for (let i = 0; i < 25; i++) watches.get('/workspace/')?.({ path: `/workspace/${i}`, change: 'delete' });
+    await vi.advanceTimersByTimeAsync(0);
+    await h.runtime.tools.envWatch({
+      action: 'add',
+      rule: { id: 'other', match: { kind: 'file.changed', subject: '/other/**' }, level: 'context' },
+    });
+    for (let i = 25; i < 51; i++) watches.get('/workspace/')?.({ path: `/workspace/${i}`, change: 'delete' });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(h.runtime.events().find((item) => item.kind === 'file.burst')?.detail?.deleted).toBe(51);
+    await h.runtime.stop();
+  });
+
   it('routes unowned signals automatically during recovery and ignores a late restored archived target', async () => {
     const h = harness();
     const saved = new Map<string, string>();

@@ -60,7 +60,9 @@ export class BodySource {
   private thermal?: Body['thermal'];
   private thermalRecovering = false;
   private burstRoots = '';
-  private detector = new FileBurstDetector();
+  private readonly detector = new FileBurstDetector({
+    threshold: (param, fallback) => this.tuner.number(param, fallback),
+  });
   private rateTimes: RateTimes = {};
   private rateSession?: string;
 
@@ -219,10 +221,7 @@ export class BodySource {
     const key = JSON.stringify(ordered);
     if (key === this.burstRoots) return;
     this.burstRoots = key;
-    this.detector = new FileBurstDetector({
-      ...(ordered.length ? { roots: ordered } : {}),
-      threshold: (param, fallback) => this.tuner.number(param, fallback),
-    });
+    this.detector.setRoots(ordered);
   }
   async burst(signal: Signal): Promise<void> {
     if (this.stopped) return;

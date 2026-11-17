@@ -64,7 +64,7 @@ export class FileBurstDetector {
   private readonly windowMs: number;
   private readonly maxChanges: number;
   private readonly maxDeleted: number;
-  private readonly roots?: readonly string[];
+  private roots?: readonly string[];
   private readonly threshold: (param: string, fallback: number) => number;
   private readonly dirs = new Map<string, DirState>();
   private readonly maxDirectories: number;
@@ -100,6 +100,15 @@ export class FileBurstDetector {
       }
       this.roots = options.roots.map((r) => (r === '/' ? r : r.replace(/\/+$/, '')));
     }
+  }
+
+  setRoots(roots: readonly string[]): void {
+    if (!roots.every((r) => typeof r === 'string' && r.startsWith('/'))) {
+      throw new TypeError('file.burst: roots must be absolute paths');
+    }
+    this.roots = roots.map((r) => (r === '/' ? r : r.replace(/\/+$/, '')));
+    const retained = new Set(this.roots);
+    for (const dir of this.dirs.keys()) if (!retained.has(dir)) this.dirs.delete(dir);
   }
 
   /** Live limits: the resolver is consulted per accept; bad reads fall back to config. */

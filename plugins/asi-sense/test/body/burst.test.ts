@@ -132,6 +132,17 @@ describe('FileBurstDetector external vs agent counts', () => {
 });
 
 describe('FileBurstDetector watched roots', () => {
+  it('keeps unchanged root windows but drops removed roots even if re-added', () => {
+    const d = new FileBurstDetector({ roots: ['/a', '/b'], maxDeleted: 1 });
+    d.accept(del(0, '/a/one'));
+    d.accept(del(1, '/b/one'));
+    d.setRoots(['/a', '/c']);
+    expect(d.accept(del(2, '/a/two'))[0]?.data.deleted).toBe(2);
+    d.setRoots(['/a', '/b']);
+    expect(d.accept(del(3, '/b/two'))).toHaveLength(0);
+    expect(d.accept(del(4, '/b/three'))[0]?.data.deleted).toBe(2);
+  });
+
   it('aggregates scattered child dirs under the longest matching root', () => {
     const d = new FileBurstDetector({ roots: ['/fixture/work'], maxDeleted: 3 });
     expect(d.accept(del(0, '/outside/f'))).toHaveLength(0); // outside roots → ignored

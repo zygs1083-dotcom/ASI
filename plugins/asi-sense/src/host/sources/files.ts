@@ -25,6 +25,7 @@ export class FileSource {
   private readonly failedWatches = new WeakSet<object>();
   private readonly dispatch = new Map<string, Map<string, number>>();
   private clearDispatch?: ReturnType<typeof setImmediate>;
+  private expiryTimer?: ReturnType<typeof setTimeout>;
   constructor(
     private readonly watcher: FileWatcher,
     private readonly clock: Clock,
@@ -35,9 +36,15 @@ export class FileSource {
     private readonly burst: (signal: Signal) => Promise<void>,
     private readonly setRoots: (roots: string[]) => void,
   ) {}
+  private eligible(rule: WatchRule): boolean {
+    return rule.approved && (rule.expiresAt === undefined || this.clock.wall() < rule.expiresAt);
+  }
   private roots(): Set<string> {
     const patterns = (this.stopped || this.paused() ? [] : this.rules())
-      .filter((r) => r.match.kind === 'file.changed' && r.match.subject)
+      .filter(
+        (r) =>
+          this.eligible(r) && (r.match.kind === 'file.changed' || r.match.kind === 'file.burst') && r.match.subject,
+      )
       .map((r) => r.match.subject as string);
     return new Set(patterns.map(root).filter((value): value is string => value !== undefined));
   }
@@ -64,7 +71,12 @@ export class FileSource {
     } finally {
       if (this.active && !this.paused()) {
         for (const rule of this.rules()) {
-          if (rule.match.kind === 'file.changed' && rule.match.subject && root(rule.match.subject) === watched) {
+          if (
+            this.eligible(rule) &&
+            (rule.match.kind === 'file.changed' || rule.match.kind === 'file.burst') &&
+            rule.match.subject &&
+            root(rule.match.subject) === watched
+          ) {
             await this.status(rule, 'error');
           }
         }
@@ -84,10 +96,11 @@ export class FileSource {
     });
   }
   async prepare(rule: WatchRule): Promise<{ check(): void; release(): Promise<void> }> {
-    if (rule.match.kind !== 'file.changed' || rule.match.subject === undefined)
+    if ((rule.match.kind !== 'file.changed' && rule.match.kind !== 'file.burst') || rule.match.subject === undefined)
       return { check: () => {}, release: async () => {} };
     const watched = root(rule.match.subject);
     if (!watched) throw new TypeError('file watch subject must be an absolute path');
+    if (!this.eligible(rule)) return { check: () => {}, release: async () => {} };
     let staged: { close(): void | Promise<void> } | undefined;
     const run = this.tail.then(async () => {
       if (this.stopped) throw new Error('stopped');
@@ -122,6 +135,31 @@ export class FileSource {
   }
   refresh(): Promise<void> {
     const run = this.tail.then(async () => {
+      if (this.expiryTimer) clearTimeout(this.expiryTimer);
+      this.expiryTimer = undefined;
+      if (!this.stopped && !this.paused()) {
+        const now = this.clock.wall();
+        const next = Math.min(
+          ...this.rules()
+            .filter(
+              (rule) =>
+                this.eligible(rule) &&
+                (rule.match.kind === 'file.changed' || rule.match.kind === 'file.burst') &&
+                rule.match.subject &&
+                rule.expiresAt !== undefined,
+            )
+            .map((rule) => rule.expiresAt as number),
+        );
+        if (Number.isFinite(next)) {
+          this.expiryTimer = setTimeout(
+            () => {
+              void this.refresh().catch(() => {});
+            },
+            Math.min(2_147_483_647, Math.max(0, next - now)),
+          );
+          this.expiryTimer.unref?.();
+        }
+      }
       const failed = new Set<string>();
       for (;;) {
         this.active = !this.stopped && !this.paused();
@@ -145,7 +183,12 @@ export class FileSource {
       }
       if (this.active) {
         for (const rule of this.rules()) {
-          if (rule.match.kind !== 'file.changed' || rule.match.subject === undefined) continue;
+          if (
+            !this.eligible(rule) ||
+            (rule.match.kind !== 'file.changed' && rule.match.kind !== 'file.burst') ||
+            rule.match.subject === undefined
+          )
+            continue;
           const watched = root(rule.match.subject);
           const status = watched && this.watches.has(watched) ? 'ok' : 'error';
           await this.status(rule, status);
@@ -154,7 +197,9 @@ export class FileSource {
       if (!this.stopped && !this.attention.isStopped()) {
         const previous = this.attention.state().env.watchedPaths.value ?? {};
         const paths = this.rules()
-          .filter((rule) => rule.match.kind === 'file.changed' && rule.match.subject !== undefined)
+          .filter(
+            (rule) => this.eligible(rule) && rule.match.kind === 'file.changed' && rule.match.subject !== undefined,
+          )
           .map((rule) => rule.match.subject as string);
         const value = Object.fromEntries(paths.map((path) => [path, previous[path] ?? { lastChange: 0, changes: 0 }]));
         this.attention.store.apply({
@@ -180,7 +225,10 @@ export class FileSource {
     await this.refresh();
   }
   private async accept(event: FileChange, watched: string): Promise<void> {
-    if (!this.active || this.paused() || !path.isAbsolute(event.path)) return;
+    if (!this.active || this.paused() || !path.isAbsolute(event.path) || !this.roots().has(watched)) return;
+    const absolute = path.normalize(event.path);
+    const watchRoot = path.normalize(watched).replace(/\/+$/, '') || '/';
+    if (absolute !== watchRoot && !absolute.startsWith(watchRoot === '/' ? '/' : `${watchRoot}/`)) return;
     const key = JSON.stringify([path.normalize(event.path), event.change, event.at ?? this.clock.wall()]);
     const roots = this.dispatch.get(key) ?? new Map<string, number>();
     const count = (roots.get(watched) ?? 0) + 1;
@@ -203,11 +251,16 @@ export class FileSource {
       data: { path: path.normalize(event.path), change: event.change, ttlMs: 86_400_000 },
     });
     const matching = this.rules().filter(
-      (r) => r.match.kind === signal.kind && r.match.subject && matchesRule(r, signal, this.clock.wall()),
+      (r) =>
+        this.eligible(r) &&
+        r.match.kind === signal.kind &&
+        r.match.subject &&
+        matchesRule(r, signal, this.clock.wall()),
     );
-    if (!matching.length) return;
-    signal.data.watchedPaths = matching.map((rule) => rule.match.subject);
-    await this.attention.accept(signal);
-    if (this.active) await this.burst(signal);
+    if (matching.length) {
+      signal.data.watchedPaths = matching.map((rule) => rule.match.subject);
+      await this.attention.accept(signal);
+    }
+    if (this.active && this.roots().has(watched)) await this.burst(signal);
   }
 }
