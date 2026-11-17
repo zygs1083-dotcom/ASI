@@ -202,3 +202,85 @@ describe('Baseline eligibility constants', () => {
     expect(BASELINE_SLOTS).toBe(168);
   });
 });
+
+describe('Baseline time-scaled EWMA and date retention', () => {
+  const MIN = 60_000;
+  const WEEK = 7 * DAY;
+
+  it('scales EWMA step by elapsed time with a 30-minute half-life independent of sample cadence', () => {
+    const runCadence = (stepMs: number, totalMs: number) => {
+      const b = new Baseline({ timeZone: 'UTC', installedAt: 0, elapsedMs: 14 * DAY, minScale: { cpu: 1 } });
+      // Complete 8-sample warmup at 0.0 inside Mon-10, then anchor start of MON10W2 at 0.0
+      for (let i = 0; i < 8; i++) b.observe('cpu', 0, MON10 + i);
+      const start = MON10W2;
+      b.observe('cpu', 0, start);
+      for (let t = stepMs; t <= totalMs; t += stepMs) {
+        b.observe('cpu', 1, start + t);
+      }
+      return b.read('cpu', start + totalMs)?.mean;
+    };
+
+    // Entering a bucket at 2s cadence for 3 minutes must NOT wipe out 99% of history.
+    const after3Min2s = runCadence(2000, 3 * MIN);
+    expect(after3Min2s).toBeLessThan(0.1);
+
+    // 30-minute half-life: both 2s and 60s cadences move halfway (~0.5) after 30 minutes.
+    const halfLife2s = runCadence(2000, 30 * MIN);
+    const halfLife60s = runCadence(60_000, 30 * MIN);
+    expect(halfLife2s).toBeCloseTo(0.5, 2);
+    expect(halfLife60s).toBeCloseTo(0.5, 2);
+
+    // A 7-day gap before the first sample of a new week must not reset the bucket mean to 1.0.
+    const b = new Baseline({ timeZone: 'UTC', installedAt: 0, elapsedMs: 14 * DAY, minScale: { cpu: 1 } });
+    for (let i = 0; i < 8; i++) b.observe('cpu', 0, MON10 + i);
+    b.observe('cpu', 1, MON10 + WEEK);
+    expect(b.read('cpu', MON10 + WEEK)?.mean).toBeLessThan(0.2);
+  });
+
+  it('caps per-bucket dates to the most recent 8 weeks while still loading legacy snapshots', () => {
+    const b = new Baseline({ timeZone: 'UTC', installedAt: 0, elapsedMs: 90 * DAY });
+    for (let w = 0; w < 12; w++) {
+      b.observe('cpu', 0.5, MON10 + w * WEEK);
+    }
+    const parsed = JSON.parse(b.serialize()) as { metrics: { cpu: ({ dates: string[] } | null)[] } };
+    const slot = parsed.metrics.cpu.find((entry) => entry !== null);
+    expect(slot?.dates).toHaveLength(8);
+    expect(slot?.dates[0]).toBe('2026-2-2');
+    expect(slot?.dates[7]).toBe('2026-3-23');
+    expect(b.read('cpu', MON10 + 11 * WEEK)?.dates).toBe(8);
+
+    // Legacy v2 snapshot with 20 dates loads cleanly and trims to the 8 most recent on resave.
+    const legacyDates = Array.from({ length: 20 }, (_, w) => {
+      const d = new Date(MON10 + w * WEEK);
+      return `${d.getUTCFullYear()}-${d.getUTCMonth() + 1}-${d.getUTCDate()}`;
+    });
+    const legacyJson = JSON.stringify({
+      version: 2,
+      installedAt: 0,
+      elapsedMs: 150 * DAY,
+      timeZone: 'UTC',
+      metrics: {
+        cpu: Array(BASELINE_SLOTS)
+          .fill(null)
+          .map((_, i) =>
+            i === 34
+              ? {
+                  mean: 0.5,
+                  median: 0.5,
+                  mad: 0.05,
+                  count: 20,
+                  lastAt: MON10 + 19 * WEEK,
+                  zone: 'UTC',
+                  dates: legacyDates,
+                }
+              : null,
+          ),
+      },
+    });
+    const restored = Baseline.deserialize(legacyJson, { timeZone: 'UTC' });
+    expect(restored.restoreFailed).toBe(false);
+    expect(restored.read('cpu', MON10 + 19 * WEEK)?.dates).toBe(8);
+    const resaved = JSON.parse(restored.serialize()) as { metrics: { cpu: ({ dates: string[] } | null)[] } };
+    expect(resaved.metrics.cpu[34]?.dates).toEqual(legacyDates.slice(-8));
+  });
+});

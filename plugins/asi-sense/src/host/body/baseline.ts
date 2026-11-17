@@ -1,5 +1,5 @@
 import { parseBucket } from './baseline-parse.ts';
-import { advanceBucket, type Bucket } from './baseline-stat.ts';
+import { advanceBucket, type Bucket, pruneBucketDates } from './baseline-stat.ts';
 import { formatter, slotOf } from './baseline-time.ts';
 
 /**
@@ -278,7 +278,8 @@ export class Baseline {
         const slots: (Bucket | null)[] = new Array(BASELINE_SLOTS).fill(null);
         for (const [i, raw] of arr.entries()) {
           if (raw === null) continue;
-          slots[i] = parseBucket(raw, i, savedFmt, d.timeZone);
+          const bucket = parseBucket(raw, i, savedFmt, d.timeZone);
+          slots[i] = { ...bucket, dates: pruneBucketDates(bucket.dates) };
         }
         parsed.set(name, slots);
       }
