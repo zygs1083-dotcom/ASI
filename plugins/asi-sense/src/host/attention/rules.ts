@@ -160,7 +160,10 @@ export function matchesRule(rule: WatchRule, signal: Signal, now: number): boole
   if (rule.expiresAt !== undefined && now >= rule.expiresAt) return false;
   if (rule.match.kind !== signal.kind) return false;
   if (rule.match.subject !== undefined) {
-    if (typeof signal.subject !== 'string' || !globToRegExp(rule.match.subject).test(signal.subject)) {
+    const pattern = rule.match.subject;
+    const burstRoot =
+      signal.kind === 'file.burst' && pattern.endsWith('/**') && (pattern.slice(0, -3) || '/') === signal.subject;
+    if (typeof signal.subject !== 'string' || (!burstRoot && !globToRegExp(pattern).test(signal.subject))) {
       return false;
     }
   }

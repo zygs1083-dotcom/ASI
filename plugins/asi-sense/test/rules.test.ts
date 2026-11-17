@@ -38,6 +38,23 @@ describe('matchesRule', () => {
     expect(matchesRule(mk('*.log'), s('x.log'), 0)).toBe(true);
   });
 
+  it('matches a file.burst recursive directory glob at its directory without widening other kinds', () => {
+    const burst = rule({
+      id: 'burst',
+      match: { kind: 'file.burst', subject: '/src/**', where: { deleted: { '>': 50 } } },
+      expiresAt: 100,
+    });
+    const event = (subject: string, deleted = 51) => sig({ id: '1', kind: 'file.burst', subject, data: { deleted } });
+    expect(matchesRule(burst, event('/src'), 99)).toBe(true);
+    expect(matchesRule(burst, event('/src/sub'), 99)).toBe(true);
+    expect(matchesRule(burst, event('/src-other'), 99)).toBe(false);
+    expect(matchesRule(burst, event('/src', 50), 99)).toBe(false);
+    expect(matchesRule(burst, event('/src'), 100)).toBe(false);
+    const changed = rule({ id: 'changed', match: { kind: 'file.changed', subject: '/src/**' } });
+    expect(matchesRule(changed, sig({ id: '2', kind: 'file.changed', subject: '/src' }), 0)).toBe(false);
+    expect(matchesRule(changed, sig({ id: '3', kind: 'file.changed', subject: '/src/a' }), 0)).toBe(true);
+  });
+
   it('supports literal and comparison where clauses', () => {
     const s = sig({ id: '1', kind: 'k', data: { exitCode: 1, name: 't' } });
     expect(

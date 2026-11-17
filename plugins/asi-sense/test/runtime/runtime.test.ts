@@ -235,7 +235,35 @@ describe('host runtime', () => {
     expect(h.watcherCount()).toBe(1);
     for (let i = 0; i < 51; i++) h.fileRaw({ path: `/workspace/${i}.json`, change: 'delete' });
     await vi.advanceTimersByTimeAsync(0);
-    expect(h.runtime.events().find((item) => item.kind === 'file.burst')?.detail?.deleted).toBe(51);
+    expect(h.runtime.events().find((item) => item.kind === 'file.burst')).toMatchObject({
+      ruleId: 'burst',
+      level: 'wake',
+      detail: { deleted: 51 },
+    });
+    await h.runtime.stop();
+  });
+
+  it('delivers a burst rule scoped to a recursive directory glob', async () => {
+    const h = harness(undefined, {
+      rules: [
+        {
+          id: 'burst-glob',
+          match: { kind: 'file.burst', subject: '/workspace/**' },
+          level: 'wake',
+          createdBy: 'user',
+          approved: true,
+        },
+      ],
+    });
+    await h.runtime.start();
+    expect(h.watcherCount()).toBe(1);
+    for (let i = 0; i < 51; i++) h.fileRaw({ path: `/workspace/${i}.json`, change: 'delete' });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(h.runtime.events().find((item) => item.kind === 'file.burst')).toMatchObject({
+      ruleId: 'burst-glob',
+      level: 'wake',
+      detail: { deleted: 51 },
+    });
     await h.runtime.stop();
   });
 
