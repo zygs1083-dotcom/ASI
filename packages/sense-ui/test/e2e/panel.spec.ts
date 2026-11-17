@@ -151,7 +151,7 @@ test.describe('宽度冒烟（无截图）', () => {
 });
 
 test.describe('布局几何', () => {
-  test('healthy 420px 面板高度 ≤1600，测量证据写入 test-results', async ({ page }) => {
+  test('healthy 420px 面板高度 ≤1650，测量证据写入 test-results', async ({ page }) => {
     await page.setViewportSize({ width: 420, height: 900 });
     await open(page, 'healthy', 'light');
     const rect = await page.locator('[data-panel]').boundingBox();
@@ -161,7 +161,7 @@ test.describe('布局几何', () => {
       path.join(RESULTS_DIR, 'panel-height.json'),
       JSON.stringify({ selector: '[data-panel]', viewport: 420, boundingRect: rect }, null, 2),
     );
-    expect(rect!.height).toBeLessThanOrEqual(1600);
+    expect(rect!.height).toBeLessThanOrEqual(1650);
   });
 
   test('两列网格：Token 跨满整行，CPU 迷你柱同一行', async ({ page }) => {

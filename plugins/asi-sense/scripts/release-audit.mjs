@@ -66,7 +66,10 @@ const safeMatches = new Set(
   }).flatMap(([path, matches]) => matches.map((match) => `${path}:${match}`)),
 );
 const sensitive = [
-  ['credential', /(?:npm_|ghp_)[a-z0-9_-]{8,}|sk-[a-z0-9_-]{8,}|\b(?:AKIA|ASIA)[A-Z0-9]{16}\b|-----BEGIN\b/gi],
+  [
+    'credential',
+    /(?:npm_|ghp_|github_pat_)[a-z0-9_-]{8,}|glpat-[a-z0-9_-]{8,}|xox[abprs]-[a-z0-9-]{8,}|AIza[a-z0-9_-]{8,}|sk-[a-z0-9_-]{8,}|\b(?:AKIA|ASIA)[A-Z0-9]{16}\b|-----BEGIN\b/gi,
+  ],
   ['email', /\b[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}\b/gi],
   [
     'absolute path',

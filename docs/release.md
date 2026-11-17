@@ -26,9 +26,10 @@ pnpm --filter asi-sense release:check
 源码 manifest 保持 `private: true`，递归发布 dry-run 应显示没有包可发布；只有通过
 `release:check` 的发行 tgz 才能用于发布。检查后不要替换或修改该 tgz。
 
-审计拒绝未允许的文件、常见凭据形态、邮箱、绝对路径和 sourcemap 引用，包括
-内联 base64 sourcemap；逐文件扫描单字节字符串和两种字节序的 UTF-16，包括 helper
-二进制中的字符串。对必要的系统库、命令路径和非文件路径仅按文件及完整匹配值显式
+审计拒绝未允许的文件、凭据形态（`npm_` / `ghp_` / `github_pat_` / `glpat-` /
+`xox[abprs]-` / `AIza` / `sk-` 令牌、`AKIA`/`ASIA` AWS 密钥、`-----BEGIN` 私钥头）、
+邮箱、绝对路径和 sourcemap 引用，包括内联 base64 sourcemap；逐文件扫描单字节字符串
+和两种字节序的 UTF-16，包括 helper 二进制中的字符串。对必要的系统库、命令路径和非文件路径仅按文件及完整匹配值显式
 放行（见 `scripts/release-audit.mjs`）；其中 Xcode 工具链路径是构建机环境信息。
 审计不能识别所有秘密、压缩或其他编码，发布前仍须人工审查产物及白名单。
 
