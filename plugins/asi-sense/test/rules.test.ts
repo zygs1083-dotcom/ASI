@@ -55,20 +55,63 @@ describe('matchesRule', () => {
     expect(matchesRule(changed, sig({ id: '3', kind: 'file.changed', subject: '/src/a' }), 0)).toBe(true);
   });
 
-  it('matches a normalized file.burst root across literal, slash, glob and prefix spellings', () => {
+  it('matches an untagged file.burst subject across literal, slash and prefix spellings', () => {
     const burstAt = (subject: string) => sig({ id: 'b', kind: 'file.burst', subject });
     const mk = (subject: string) => rule({ id: 'r', match: { kind: 'file.burst', subject } });
-    // All these spellings root at /dir; the emitted subject is the
-    // normalized root — never a trailing slash.
-    for (const subject of ['/dir', '/dir/', '/dir/**', '/dir/*', '/dir/pkg-*/**']) {
+    // Literal and `<base>/**` spellings cover the root itself plus burst dirs
+    // anywhere in their subtree (`/dir/**/` normalizes to `/dir/**`).
+    for (const subject of ['/dir', '/dir/', '/dir/**', '/dir/**/']) {
       expect(matchesRule(mk(subject), burstAt('/dir'), 0)).toBe(true);
+      expect(matchesRule(mk(subject), burstAt('/dir/sub'), 0)).toBe(true);
     }
-    // Bursts at a nested root stay inside each spelling's own matchable set —
+    // A bare `/dir` subject is not inside any glob spelling's own matchable
+    // set — only a scope-tagged signal can attribute it (see next test).
+    expect(matchesRule(mk('/dir/*'), burstAt('/dir'), 0)).toBe(false);
+    expect(matchesRule(mk('/dir/pkg-*/**'), burstAt('/dir'), 0)).toBe(false);
     // `/dir/sub` is itself a direct child match for `/dir/*`.
     expect(matchesRule(mk('/dir/*'), burstAt('/dir/sub'), 0)).toBe(true);
     expect(matchesRule(mk('/dir/pkg-*/**'), burstAt('/dir/pkg-a'), 0)).toBe(true);
     expect(matchesRule(mk('/dir/pkg-*/**'), burstAt('/dir/other'), 0)).toBe(false);
     expect(matchesRule(mk('/dir/**'), burstAt('/other'), 0)).toBe(false);
+  });
+
+  it('matches a scope-tagged file.burst only to the identical canonical scope', () => {
+    const tagged = (subject: string, scope: string) => sig({ id: 'b', kind: 'file.burst', subject, data: { scope } });
+    const mk = (subject: string) => rule({ id: 'r', match: { kind: 'file.burst', subject } });
+    // `/demo`, `/demo/` and `/demo/**` are the same canonical scope — all
+    // spellings match the scope's own burst.
+    for (const subject of ['/demo', '/demo/', '/demo/**', '/demo/**/']) {
+      expect(matchesRule(mk(subject), tagged('/demo', 'dir:/demo'), 0)).toBe(true);
+    }
+    // Sibling globs on one watch root keep independent scopes: a burst in
+    // tmp-1 must not wake proj-*.
+    expect(matchesRule(mk('/demo/proj-*/**'), tagged('/demo/proj-b1', 'glob:/demo/proj-*/**'), 0)).toBe(true);
+    expect(matchesRule(mk('/demo/proj-*/**'), tagged('/demo/tmp-1', 'glob:/demo/tmp-*/**'), 0)).toBe(false);
+    // A single-level glob must not claim a burst emitted by a deeper subtree.
+    expect(matchesRule(mk('/workspace/*'), tagged('/workspace/sub', 'dir:/workspace/sub'), 0)).toBe(false);
+    // Sibling file-name globs on the same dir keep their own scopes too.
+    expect(matchesRule(mk('/w/*.lock'), tagged('/w', 'glob:/w/*.lock'), 0)).toBe(true);
+    expect(matchesRule(mk('/w/*.tmp'), tagged('/w', 'glob:/w/*.lock'), 0)).toBe(false);
+    expect(matchesRule(mk('/w/*.tmp'), tagged('/w', 'glob:/w/*.tmp'), 0)).toBe(true);
+  });
+
+  it('keeps raw glob semantics for non-file signal subjects', () => {
+    const mk = (kind: string, subject: string) => rule({ id: 'r', match: { kind, subject } });
+    const s = (kind: string, subject: string) => sig({ id: '1', kind, subject });
+    // `./` prefixes and `://` URLs must not be path-normalized away.
+    expect(matchesRule(mk('job.exited', './scripts/deploy.sh'), s('job.exited', './scripts/deploy.sh'), 0)).toBe(true);
+    expect(
+      matchesRule(mk('job.exited', '*http://127.0.0.1:3425/*'), s('job.exited', 'curl http://127.0.0.1:3425/v1'), 0),
+    ).toBe(true);
+    expect(matchesRule(mk('window.title-changed', '*https://*'), s('window.title-changed', 'open https://x'), 0)).toBe(
+      true,
+    );
+    // An empty subject stays empty — never rewritten to `'.'`.
+    expect(matchesRule(mk('job.exited', ''), s('job.exited', ''), 0)).toBe(true);
+    expect(matchesRule(mk('job.exited', ''), s('job.exited', '.'), 0)).toBe(false);
+    // File kinds DO normalize: `a/./b` collapses to `a/b`, `<p>/**/` to `<p>/**`.
+    expect(matchesRule(mk('file.changed', '/a/./b'), s('file.changed', '/a/b'), 0)).toBe(true);
+    expect(matchesRule(mk('file.changed', '/w/**/'), s('file.changed', '/w/x/y'), 0)).toBe(true);
   });
 
   it('supports literal and comparison where clauses', () => {

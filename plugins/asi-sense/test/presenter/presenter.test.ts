@@ -1210,6 +1210,22 @@ describe('presenter', () => {
     await h.runtime.stop();
   });
 
+  it('labels a last-applied change blocked by floor ordering as other, not superseded', async () => {
+    const h = await harness();
+    const warn = await h.runtime.tools.bodyTune({ param: 'floor.disk.warn', to: 0.14 });
+    expect(warn.applied).toBe(true);
+    // Raise critical in ±50% steps past warn's `from` — reverting warn to 0.1
+    // would then violate critical<=warn, but warn is still the last applied
+    // change for its parameter: blocked, never superseded.
+    for (const to of [0.07, 0.105]) {
+      expect((await h.runtime.tools.bodyTune({ param: 'floor.disk.critical', to })).applied).toBe(true);
+    }
+    const entry = h.presenter.snapshot().tuning.log.find((e) => e.id === warn.change.id);
+    expect(entry).toMatchObject({ status: 'other', undoable: false, reverted: false });
+    h.presenter.close();
+    await h.runtime.stop();
+  });
+
   it('projects floor severity and rate thresholds but waits for three samples before estimating', async () => {
     const h = await harness();
     const gib = 1024 ** 3;

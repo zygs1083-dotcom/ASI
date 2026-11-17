@@ -1,6 +1,6 @@
 import type { Signal } from '@asi/sense-types';
 import { describe, expect, it } from 'vitest';
-import { FileBurstDetector as Detector } from '../../src/host/body/burst.ts';
+import { type BurstTarget, FileBurstDetector as Detector } from '../../src/host/body/burst.ts';
 import { fileChanged } from './helpers.ts';
 
 let seq = 0;
@@ -11,7 +11,7 @@ const add = (at: number, path: string, cause?: 'agent') => ev(at, path, 'add', c
 const mod = (at: number, path: string, cause?: 'agent') => ev(at, path, 'modify', cause);
 
 class FileBurstDetector extends Detector {
-  accept(signal: Signal, receivedAt = signal.at, dirs?: readonly string[]) {
+  accept(signal: Signal, receivedAt = signal.at, dirs?: readonly BurstTarget[]) {
     return super.accept(signal, receivedAt, dirs);
   }
 }
@@ -136,9 +136,9 @@ describe('FileBurstDetector watched roots', () => {
     const d = new FileBurstDetector({ roots: ['/a', '/b'], maxDeleted: 1 });
     d.accept(del(0, '/a/one'));
     d.accept(del(1, '/b/one'));
-    d.setRoots(['/a', '/c']);
+    d.setScopes(['dir:/a', 'dir:/c']);
     expect(d.accept(del(2, '/a/two'))[0]?.data.deleted).toBe(2);
-    d.setRoots(['/a', '/b']);
+    d.setScopes(['dir:/a', 'dir:/b']);
     expect(d.accept(del(3, '/b/two'))).toHaveLength(0);
     expect(d.accept(del(4, '/b/three'))[0]?.data.deleted).toBe(2);
   });
@@ -161,14 +161,49 @@ describe('FileBurstDetector watched roots', () => {
     expect(d.accept(del(2, '/rish/f'))).toHaveLength(0); // prefix-only is NOT a match
   });
 
-  it('accepts explicit dir attribution covering several roots', () => {
+  it('accepts explicit (scope, dir) attribution covering several roots', () => {
     const d = new FileBurstDetector({ maxDeleted: 1 });
-    d.setRoots(['/r', '/r/sub']);
-    const out = d.accept(del(0, '/r/sub/f'), 0, ['/r', '/r/sub']);
+    d.setScopes(['dir:/r', 'dir:/r/sub']);
+    const out = d.accept(del(0, '/r/sub/f'), 0, [
+      { scope: 'dir:/r', dir: '/r' },
+      { scope: 'dir:/r/sub', dir: '/r/sub' },
+    ]);
     expect(out).toHaveLength(0);
-    const out2 = d.accept(del(1, '/r/sub/g'), 1, ['/r/sub']);
+    const out2 = d.accept(del(1, '/r/sub/g'), 1, [{ scope: 'dir:/r/sub', dir: '/r/sub' }]);
     expect(out2.map((s) => s.subject)).toEqual(['/r/sub']);
     const out3 = d.accept(del(2, '/r/sub/h'), 2, []);
     expect(out3).toHaveLength(0);
+  });
+});
+
+describe('FileBurstDetector per-scope windows', () => {
+  it('keeps sibling glob scopes on one watch root latched independently', () => {
+    const d = new FileBurstDetector({ maxDeleted: 2 });
+    const tmp = { scope: 'glob:/demo/tmp-*/**', dir: '/demo/tmp-1' };
+    const proj = { scope: 'glob:/demo/proj-*/**', dir: '/demo/proj-b1' };
+    // tmp-1 bursts and latches its own scope only.
+    const first = [];
+    for (let i = 0; i < 3; i++) first.push(...d.accept(del(i, '/demo/tmp-1/f'), i, [tmp]));
+    expect(first).toHaveLength(1);
+    expect(first[0]).toMatchObject({ subject: '/demo/tmp-1', data: { scope: 'glob:/demo/tmp-*/**' } });
+    // A fresh burst in proj-b1 is not masked by tmp-1's latch.
+    const second = [];
+    for (let i = 0; i < 3; i++) second.push(...d.accept(del(10 + i, '/demo/proj-b1/f'), 10 + i, [proj]));
+    expect(second).toHaveLength(1);
+    expect(second[0]).toMatchObject({ subject: '/demo/proj-b1', data: { scope: 'glob:/demo/proj-*/**', deleted: 3 } });
+  });
+
+  it('counts the same directory in distinct scopes independently', () => {
+    const d = new FileBurstDetector({ maxDeleted: 2 });
+    const dirScope = { scope: 'dir:/w', dir: '/w' };
+    const globScope = { scope: 'glob:/w/*', dir: '/w' };
+    // Each scope only sees the events attributed to it.
+    d.accept(del(0, '/w/a'), 0, [dirScope]);
+    d.accept(del(1, '/w/b'), 1, [globScope]);
+    const out = d.accept(del(2, '/w/c'), 2, [dirScope, globScope]);
+    expect(out).toHaveLength(0); // each scope has just 2 deletes — below the limit
+    const out2 = d.accept(del(3, '/w/d'), 3, [dirScope, globScope]);
+    expect(out2).toHaveLength(2); // 3rd delete in EACH scope → two tagged signals
+    expect(out2.map((s) => s.data.scope).sort()).toEqual(['dir:/w', 'glob:/w/*']);
   });
 });

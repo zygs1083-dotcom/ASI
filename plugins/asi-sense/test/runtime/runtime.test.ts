@@ -354,7 +354,7 @@ describe('host runtime', () => {
     for (let i = 0; i < 51; i++) h.fileRaw({ path: `/demo/proj-x/${i}`, change: 'delete' });
     await vi.advanceTimersByTimeAsync(0);
     expect(h.runtime.events().find((item) => item.kind === 'file.burst')).toMatchObject({
-      subject: '/demo',
+      subject: '/demo/proj-x',
       detail: { deleted: 51 },
     });
     await h.runtime.stop();
@@ -401,10 +401,11 @@ describe('host runtime', () => {
   });
 
   it.each([
-    ['/workspace/', '/workspace/x'],
-    ['/workspace/*', '/workspace'],
-    ['/workspace/pkg-*/**', '/workspace/pkg-a/x'],
-  ])('delivers a file.burst to a directory rule spelled %s', async (subject, dir) => {
+    ['/workspace/', '/workspace/x', '/workspace'],
+    ['/workspace/*', '/workspace', '/workspace'],
+    ['/workspace/pkg-*/**', '/workspace/pkg-a/x', '/workspace/pkg-a'],
+    ['/workspace/**/', '/workspace', '/workspace'],
+  ])('delivers a file.burst to a directory rule spelled %s', async (subject, dir, emitted) => {
     const h = harness(undefined, {
       rules: [
         {
@@ -421,9 +422,77 @@ describe('host runtime', () => {
     await vi.advanceTimersByTimeAsync(0);
     expect(h.runtime.events().find((item) => item.kind === 'file.burst')).toMatchObject({
       ruleId: 'burst',
-      subject: '/workspace',
+      subject: emitted,
       level: 'wake',
       detail: { deleted: 51 },
+    });
+    await h.runtime.stop();
+  });
+
+  it('keeps sibling glob rules on one watch root latched independently', async () => {
+    const mk = (id: string, subject: string) => ({
+      id,
+      match: { kind: 'file.burst', subject },
+      level: 'wake' as const,
+      createdBy: 'user' as const,
+      approved: true,
+    });
+    const h = harness(undefined, {
+      rules: [mk('tmp-burst', '/demo/tmp-*/**'), mk('proj-burst', '/demo/proj-*/**')],
+    });
+    await h.runtime.start();
+    // tmp-1 bursts first and latches its own scope only.
+    for (let i = 0; i < 51; i++) h.fileRaw({ path: `/demo/tmp-1/${i}`, change: 'delete' });
+    await vi.advanceTimersByTimeAsync(0);
+    // The burst is attributed to tmp's scope — the proj rule must not wake on it.
+    expect(h.runtime.events().filter((item) => item.kind === 'file.burst')).toEqual([
+      expect.objectContaining({ ruleId: 'tmp-burst', subject: '/demo/tmp-1' }),
+    ]);
+    // A fresh burst in proj-b1 is not masked by tmp-1's latch (old shared-bucket bug).
+    for (let i = 0; i < 51; i++) h.fileRaw({ path: `/demo/proj-b1/${i}`, change: 'delete' });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(h.runtime.events().filter((item) => item.kind === 'file.burst')).toEqual([
+      expect.objectContaining({ ruleId: 'tmp-burst', subject: '/demo/tmp-1' }),
+      expect.objectContaining({ ruleId: 'proj-burst', subject: '/demo/proj-b1' }),
+    ]);
+    await h.runtime.stop();
+  });
+
+  it('does not let a single-level glob rule claim a deeper subtree burst', async () => {
+    const h = harness(undefined, {
+      rules: [
+        {
+          id: 'burst',
+          match: { kind: 'file.burst', subject: '/workspace/*' },
+          level: 'wake',
+          createdBy: 'user',
+          approved: true,
+        },
+        {
+          id: 'deep',
+          match: { kind: 'file.changed', subject: '/workspace/sub/**' },
+          level: 'record',
+          createdBy: 'user',
+          approved: true,
+        },
+      ],
+    });
+    await h.runtime.start();
+    // Deletes deep inside /workspace/sub burst under the `dir:/workspace/sub`
+    // scope — `/workspace/*` only covers one level, so the burst is claimed
+    // by the catch-all system rule and never by the single-level glob.
+    for (let i = 0; i < 51; i++) h.fileRaw({ path: `/workspace/sub/deep/${i}`, change: 'delete' });
+    await vi.advanceTimersByTimeAsync(0);
+    const deepBursts = h.runtime.events().filter((item) => item.kind === 'file.burst');
+    expect(deepBursts).toHaveLength(1);
+    expect(deepBursts.some((item) => item.ruleId === 'burst')).toBe(false);
+    // A burst directly under /workspace does belong to the single-level scope.
+    for (let i = 0; i < 51; i++) h.fileRaw({ path: `/workspace/${i}.f`, change: 'delete' });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(h.runtime.events().find((item) => item.kind === 'file.burst' && item.ruleId === 'burst')).toMatchObject({
+      ruleId: 'burst',
+      subject: '/workspace',
+      level: 'wake',
     });
     await h.runtime.stop();
   });

@@ -27,7 +27,22 @@ interface FileEvent {
   agent: boolean;
 }
 
+/**
+ * One burst bucket an event legitimately belongs to: `scope` is the canonical
+ * {@link burstScopeId} of the observing rule (so sibling globs on the same
+ * watch root keep independent windows and latches), `dir` the concrete bucket
+ * directory that becomes the emitted `file.burst` subject.
+ */
+export interface BurstTarget {
+  scope: string;
+  dir: string;
+}
+
 interface DirState {
+  /** Scope id this window belongs to (retention + emitted `data.scope`). */
+  scope: string;
+  /** Concrete bucket directory (emitted as `subject`/`data.directory`). */
+  dir: string;
   win: TimeWindow<FileEvent>;
   lastAt: number;
   /** External-burst wake latch. */
@@ -102,13 +117,13 @@ export class FileBurstDetector {
     }
   }
 
-  setRoots(roots: readonly string[]): void {
-    if (!roots.every((r) => typeof r === 'string' && r.startsWith('/'))) {
-      throw new TypeError('file.burst: roots must be absolute paths');
-    }
-    this.roots = roots.map((r) => (r === '/' ? r : r.replace(/\/+$/, '')));
-    const retained = new Set(this.roots);
-    for (const dir of this.dirs.keys()) if (!retained.has(dir)) this.dirs.delete(dir);
+  /**
+   * Retains windows whose scope id is listed, dropping all others — a removed
+   * or expired rule's history never revives if its scope returns.
+   */
+  setScopes(scopes: readonly string[]): void {
+    const retained = new Set(scopes);
+    for (const [key, entry] of this.dirs) if (!retained.has(entry.scope)) this.dirs.delete(key);
   }
 
   /** Live limits: the resolver is consulted per accept; bad reads fall back to config. */
@@ -125,21 +140,21 @@ export class FileBurstDetector {
   }
 
   /** Every watched root containing `path`, or `[dirname]` without roots. */
-  private groups(path: string): string[] {
-    if (!this.roots) return [posix.dirname(path)];
-    const out: string[] = [];
+  private groups(path: string): BurstTarget[] {
+    if (!this.roots) return [{ scope: `dir:${posix.dirname(path)}`, dir: posix.dirname(path) }];
+    const out: BurstTarget[] = [];
     for (const r of this.roots) {
-      if (path === r || path.startsWith(r === '/' ? '/' : `${r}/`)) out.push(r);
+      if (path === r || path.startsWith(r === '/' ? '/' : `${r}/`)) out.push({ scope: `dir:${r}`, dir: r });
     }
     return out;
   }
 
   /**
-   * `dirs` overrides auto-grouping: the caller supplies the (normalized,
-   * deduplicated) burst scopes the event legitimately belongs to — an empty
-   * list means the event counts toward no scope at all.
+   * `dirs` overrides auto-grouping: the caller supplies the (scope, dir)
+   * buckets the event legitimately belongs to — an empty list means the
+   * event counts toward no scope at all.
    */
-  accept(signal: Signal, receivedAt: number, dirs?: readonly string[]): BodySignal[] {
+  accept(signal: Signal, receivedAt: number, dirs?: readonly BurstTarget[]): BodySignal[] {
     // All cheap validation first: a malformed or backward event must never
     // touch (and thereby erase) healthy per-directory history.
     if (!Number.isFinite(receivedAt)) throw new TypeError('file.burst: receivedAt must be finite');
@@ -147,7 +162,10 @@ export class FileBurstDetector {
     const change = signal.data.change as Change | undefined;
     if (change !== 'add' && change !== 'modify' && change !== 'delete') return [];
     const path = typeof signal.data.path === 'string' ? signal.data.path : signal.subject;
-    const targets = dirs === undefined ? this.groups(path) : [...new Set(dirs)];
+    const targets =
+      dirs === undefined
+        ? this.groups(path)
+        : [...new Map(dirs.map((t) => [`${t.scope}${t.dir}`, t] as const)).values()];
     if (targets.length === 0) return []; // outside every watched scope
     const lim = this.limits();
     this.lastReceived = receivedAt;
@@ -156,8 +174,8 @@ export class FileBurstDetector {
       if (entry.win.size === 0) this.dirs.delete(key);
     }
     const out: BodySignal[] = [];
-    for (const dir of targets) {
-      const emitted = this.record(dir, signal, change, receivedAt, lim);
+    for (const target of targets) {
+      const emitted = this.record(target, signal, change, receivedAt, lim);
       if (emitted) out.push(emitted);
     }
     return out;
@@ -165,18 +183,19 @@ export class FileBurstDetector {
 
   /** Counts one event against a single scope window; emits on a new crossing. */
   private record(
-    dir: string,
+    target: BurstTarget,
     signal: Signal,
     change: Change,
     receivedAt: number,
     lim: { windowMs: number; maxChanges: number; maxDeleted: number },
   ): BodySignal | undefined {
-    let st = this.dirs.get(dir);
+    const key = `${target.scope}${target.dir}`;
+    let st = this.dirs.get(key);
     if (st && receivedAt < st.lastAt) return undefined; // backward per-directory event
     if (st) {
       st.win.prune(receivedAt - lim.windowMs);
       if (st.win.size === 0) {
-        this.dirs.delete(dir);
+        this.dirs.delete(key);
         st = undefined; // expired under its own watermark: fresh state
       }
     }
@@ -184,22 +203,24 @@ export class FileBurstDetector {
       if (this.dirs.size >= this.maxDirectories) {
         let oldestKey: string | undefined;
         let oldest = Number.POSITIVE_INFINITY;
-        for (const [key, entry] of this.dirs) {
+        for (const [k, entry] of this.dirs) {
           if (entry.lastAt < oldest) {
-            oldestKey = key;
+            oldestKey = k;
             oldest = entry.lastAt;
           }
         }
         if (oldestKey !== undefined) this.dirs.delete(oldestKey);
       }
       st = {
+        scope: target.scope,
+        dir: target.dir,
         win: new TimeWindow<FileEvent>(),
         lastAt: Number.NEGATIVE_INFINITY,
         wake: false,
         deletion: false,
         agentOnly: false,
       };
-      this.dirs.set(dir, st);
+      this.dirs.set(key, st);
     }
     st.lastAt = receivedAt;
     st.win.push({ at: receivedAt, change, agent: signal.cause === 'agent' });
@@ -214,7 +235,7 @@ export class FileBurstDetector {
     if (externalDeletionExceeded) st.deletion = true;
     else if (extDeleted < lim.maxDeleted * REARM) st.deletion = false;
     if (extTotal > lim.maxChanges || externalDeletionExceeded) {
-      if (totalCrossed || deletionCrossed) return this.emit(signal, dir, 'wake', counts, lim, externalDeletionExceeded);
+      if (totalCrossed || deletionCrossed) return this.emit(signal, st, 'wake', counts, lim, externalDeletionExceeded);
       return undefined;
     }
     // Pure self-cause crossing: totals only breach through agent events.
@@ -222,7 +243,7 @@ export class FileBurstDetector {
     if (total > lim.maxChanges || counts.deleted > lim.maxDeleted) {
       if (!st.agentOnly) {
         st.agentOnly = true;
-        return this.emit(signal, dir, 'record', counts, lim, externalDeletionExceeded, 'agent');
+        return this.emit(signal, st, 'record', counts, lim, externalDeletionExceeded, 'agent');
       }
     } else if (st.agentOnly && total < lim.maxChanges * REARM && counts.deleted < lim.maxDeleted * REARM) {
       st.agentOnly = false;
@@ -249,7 +270,7 @@ export class FileBurstDetector {
 
   private emit(
     src: Signal,
-    dir: string,
+    st: DirState,
     level: 'wake' | 'record',
     c: Counts,
     lim: { windowMs: number; maxDeleted: number },
@@ -258,12 +279,12 @@ export class FileBurstDetector {
   ): BodySignal {
     return {
       id: `file.burst:${createHash('sha256')
-        .update(JSON.stringify([src.source.id, dir, src.at, src.id, level]))
+        .update(JSON.stringify([src.source.id, st.scope, st.dir, src.at, src.id, level]))
         .digest('hex')}`,
       kind: 'file.burst',
       at: src.at,
       source: src.source,
-      subject: dir,
+      subject: st.dir,
       layer: 'rate',
       ...(cause ? { cause } : {}),
       data: {
@@ -271,7 +292,8 @@ export class FileBurstDetector {
         level,
         wake: level === 'wake',
         ruleId: 'file.burst',
-        directory: dir,
+        directory: st.dir,
+        scope: st.scope,
         windowMs: lim.windowMs,
         externalDeletionExceeded,
         ...c,

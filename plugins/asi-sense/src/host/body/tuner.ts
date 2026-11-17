@@ -132,6 +132,11 @@ export class Tuner {
       .map((entry) => ({ ...entry }));
   }
 
+  /** True while `entry` is still its parameter's last applied change (not superseded). */
+  isLatestApplied(entry: TuningLog): boolean {
+    return this.store.lastApplied.get(entry.param) === entry.id;
+  }
+
   propose(req: { param: string; to: TuningValue; reason?: string }): Promise<TuningResult> {
     return this.mutate((_store, guard) => guard.attempt('propose', req.param, req.to, String(req.reason ?? '')));
   }

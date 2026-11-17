@@ -1,6 +1,7 @@
 import path from 'node:path';
 import type { Signal, WatchRule } from '@asi/sense-types';
-import { matchesRule, subjectNeedsDeep, subjectScope, watchRootOf } from '../attention/rules.ts';
+import { burstScopeId, matchesRule, subjectNeedsDeep, subjectScope } from '../attention/rules.ts';
+import type { BurstTarget } from '../body/burst.ts';
 import type { RuntimeAttention } from '../runtime/attention.ts';
 import type { Clock, FileChange, FileWatcher } from '../runtime/ports.ts';
 import type { DshSource } from './dsh.ts';
@@ -23,12 +24,22 @@ function root(pattern: string): string | undefined {
 }
 
 interface WatchScope {
-  /** Path sets this root may observe (union over its rules' subjects). */
-  readonly scope: RegExp[];
+  /** Distinct observable scopes on this root, keyed by canonical scope id. */
+  readonly scopes: { id: string; re: RegExp; subtree: boolean }[];
   /** Whether any rule on this root can see below the root's first level. */
   deep: boolean;
-  /** Normalized burst dir this root's events aggregate under. */
-  readonly burst: string;
+}
+
+/**
+ * The concrete burst bucket directory a `glob:`-scoped event counts toward:
+ * the first-level directory under the literal root that contains it (the
+ * root itself for direct children), so events under `proj-b1` and `proj-b2`
+ * keep independent windows.
+ */
+function firstLevelDir(base: string, absolute: string): string {
+  const rest = base === '/' ? absolute.slice(1) : absolute.slice(base.length + 1);
+  const slash = rest.indexOf('/');
+  return slash < 0 ? base : `${base === '/' ? '' : base}/${rest.slice(0, slash)}`;
 }
 
 export class FileSource {
@@ -50,18 +61,19 @@ export class FileSource {
     private readonly dsh: DshSource,
     private readonly rules: () => WatchRule[],
     private readonly paused: () => boolean,
-    private readonly burst: (signal: Signal, dirs: readonly string[]) => Promise<void>,
-    private readonly setRoots: (roots: string[]) => void,
+    private readonly burst: (signal: Signal, dirs: readonly BurstTarget[]) => Promise<void>,
+    private readonly setScopes: (scopes: string[]) => void,
   ) {}
   private eligible(rule: WatchRule): boolean {
     return rule.approved && (rule.expiresAt === undefined || this.clock.wall() < rule.expiresAt);
   }
   /**
-   * Every watch root's effective observation scope — the strict union of its
-   * eligible rules' matchable sets (dir subjects contribute their whole
-   * subtree; plain globs only their own matches). Events outside every scope
-   * are dropped before they can reach attention or the burst detector, so a
-   * wildcard rule never observes an unapproved sibling or child subtree.
+   * Every watch root's effective observation scopes — one entry per distinct
+   * canonical scope id among its eligible rules (dir subjects contribute
+   * their whole subtree; plain globs only their own matches). Events outside
+   * every scope are dropped before they can reach attention or the burst
+   * detector, so a wildcard rule never observes an unapproved sibling or
+   * child subtree, and each scope keeps an independent burst window.
    */
   private scopes(): Map<string, WatchScope> {
     const out = new Map<string, WatchScope>();
@@ -74,15 +86,15 @@ export class FileSource {
         continue;
       const watched = root(rule.match.subject);
       const scope = subjectScope(rule.match.subject);
-      const burst = watchRootOf(rule.match.subject);
-      if (watched === undefined || scope === undefined || burst === undefined) continue;
-      const entry = out.get(watched);
-      if (entry) {
-        entry.scope.push(scope);
-        entry.deep ||= subjectNeedsDeep(rule.match.subject);
-      } else {
-        out.set(watched, { scope: [scope], deep: subjectNeedsDeep(rule.match.subject), burst });
+      const id = burstScopeId(rule.match.subject);
+      if (watched === undefined || scope === undefined || id === undefined) continue;
+      let entry = out.get(watched);
+      if (!entry) {
+        entry = { scopes: [], deep: false };
+        out.set(watched, entry);
       }
+      if (!entry.scopes.some((s) => s.id === id)) entry.scopes.push({ id, re: scope, subtree: id.startsWith('dir:') });
+      entry.deep ||= subjectNeedsDeep(rule.match.subject);
     }
     return out;
   }
@@ -152,9 +164,13 @@ export class FileSource {
       if (this.stopped) throw new Error('stopped');
       if (this.paused()) {
         let failed = false;
-        const temporary = this.watcher.watch(watched, (event) => {
-          if ('watchError' in event && event.watchError === true) failed = true;
-        });
+        const temporary = this.watcher.watch(
+          watched,
+          (event) => {
+            if ('watchError' in event && event.watchError === true) failed = true;
+          },
+          { recursive: deep },
+        );
         await temporary.close();
         if (failed) throw new Error('file watch activation failed');
       } else {
@@ -210,7 +226,7 @@ export class FileSource {
       for (;;) {
         this.active = !this.stopped && !this.paused();
         const scopes = this.scopes();
-        this.setRoots([...new Set([...scopes.values()].map((s) => s.burst))]);
+        this.setScopes([...new Set([...scopes.values()].flatMap((e) => e.scopes.map((s) => s.id)))]);
         const obsolete = [...this.watches].find(
           ([watched]) => !scopes.has(watched) && (!this.active || !this.leases.has(watched)),
         );
@@ -288,13 +304,19 @@ export class FileSource {
     const scopes = this.scopes();
     if (!scopes.has(watched)) return;
     const absolute = path.normalize(event.path);
-    // Strict scope: an event counts only toward roots whose eligible rules
-    // can observe it — a wildcard root never absorbs sibling/child subtrees
-    // it cannot match, and nested roots aggregate with their ancestors.
-    const dirs: string[] = [];
-    for (const entry of scopes.values()) {
-      if (entry.scope.some((re) => re.test(absolute)) && !dirs.includes(entry.burst)) {
-        dirs.push(entry.burst);
+    // Strict scope: an event counts only toward scopes whose eligible rules
+    // can observe it — each scope keeps its own bucket (subtree scopes at
+    // their root, globs at the concrete first-level directory), so sibling
+    // globs on one watch root never share a window or a latch.
+    const dirs: BurstTarget[] = [];
+    const seen = new Set<string>();
+    for (const [base, entry] of scopes) {
+      for (const scope of entry.scopes) {
+        if (!scope.re.test(absolute)) continue;
+        const dir = scope.subtree ? base : firstLevelDir(base, absolute);
+        if (seen.has(`${scope.id}${dir}`)) continue;
+        seen.add(`${scope.id}${dir}`);
+        dirs.push({ scope: scope.id, dir });
       }
     }
     if (dirs.length === 0) return;

@@ -3,6 +3,7 @@ import type { Body, BodyThresholdSample, BodyThresholdState, Fact, Signal } from
 import { BODY_THRESHOLDS } from '../attention/thresholds.ts';
 import {
   BodyMonitor,
+  type BurstTarget,
   defaultAnomalyRules,
   defaultRateRules,
   FileBurstDetector,
@@ -59,7 +60,7 @@ export class BodySource {
   private readonly tokenFacts: TokenFacts;
   private thermal?: Body['thermal'];
   private thermalRecovering = false;
-  private burstRoots = '';
+  private burstScopes = '';
   private readonly detector = new FileBurstDetector({
     threshold: (param, fallback) => this.tuner.number(param, fallback),
   });
@@ -216,16 +217,15 @@ export class BodySource {
   finishThermalRecovery(): void {
     this.thermalRecovering = false;
   }
-  setRoots(roots: string[]): void {
-    // Normalize + dedupe so trailing-slash or duplicate spellings cannot
-    // split burst windows or break prefix containment.
-    const ordered = [...new Set(roots.map((r) => r.replace(/[/]+$/, '') || '/'))].sort();
+  setScopes(scopes: string[]): void {
+    // Dedupe so a spellings-union cannot split burst windows.
+    const ordered = [...new Set(scopes)].sort();
     const key = JSON.stringify(ordered);
-    if (key === this.burstRoots) return;
-    this.burstRoots = key;
-    this.detector.setRoots(ordered);
+    if (key === this.burstScopes) return;
+    this.burstScopes = key;
+    this.detector.setScopes(ordered);
   }
-  async burst(signal: Signal, dirs?: readonly string[]): Promise<void> {
+  async burst(signal: Signal, dirs?: readonly BurstTarget[]): Promise<void> {
     if (this.stopped) return;
     for (const burst of this.detector.accept(signal, this.clock.mono(), dirs)) {
       burst.data.feedbackAvailable = false;

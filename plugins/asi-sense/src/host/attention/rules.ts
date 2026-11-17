@@ -51,22 +51,31 @@ function dirBoundaryRegExp(pattern: string): RegExp {
 }
 
 /**
- * The normalized literal root a subject pattern lives under: the pattern
- * itself when literal, else the directory above the first wildcard.
- * `file.burst` signals carry this as their `subject` — never a trailing `/`.
+ * Normalizes a file-rule subject spelling: `path.normalize` plus stripping
+ * redundant trailing slashes, so a `<p>` subtree spelled with a trailing
+ * slash collapses to `<p>` and `<p>` itself is preserved. `/` stays `/`.
  */
-export function watchRootOf(subject: string): string | undefined {
-  if (!path.isAbsolute(subject)) return undefined;
-  const wildcard = subject.search(/[*?]/);
-  if (wildcard < 0) {
-    const normalized = path.normalize(subject).replace(/[/]+$/, '');
-    return normalized || '/';
+export function normalizeFileSubject(subject: string): string {
+  const pattern = path.normalize(subject);
+  return pattern.length > 1 ? pattern.replace(/[/]+$/, '') : pattern;
+}
+
+/**
+ * Canonical identity of the path set a file rule observes: `dir:<base>` for
+ * the whole-subtree spellings (`<base>`, `<base>/`, `<base>/**`), otherwise
+ * `glob:<normalized>`. `file.burst` signals carry this id in `data.scope` —
+ * every scope keeps its own sliding window and latches, so a burst under one
+ * scope can never wake or mask a sibling scope on the same watch root.
+ */
+export function burstScopeId(subject: string): string | undefined {
+  const pattern = normalizeFileSubject(subject);
+  if (!path.isAbsolute(pattern)) return undefined;
+  if (!/[*?]/.test(pattern)) return `dir:${pattern}`;
+  if (pattern.endsWith('/**')) {
+    const base = pattern.slice(0, -3);
+    if (!/[*?]/.test(base)) return `dir:${base || '/'}`;
   }
-  const prefix = subject.slice(0, wildcard);
-  if (!prefix.includes('/')) return '/';
-  const base = prefix.endsWith('/') ? path.normalize(prefix) : path.dirname(prefix);
-  const normalized = base.replace(/[/]+$/, '');
-  return normalized || '/';
+  return `glob:${pattern}`;
 }
 
 /**
@@ -78,9 +87,9 @@ export function watchRootOf(subject: string): string | undefined {
  * glob's own matches. A rule can never observe outside this set.
  */
 export function subjectScope(subject: string): RegExp | undefined {
-  const pattern = path.normalize(subject);
+  const pattern = normalizeFileSubject(subject);
   if (!path.isAbsolute(pattern)) return undefined;
-  if (!/[*?]/.test(pattern)) return subtreeRegExp(pattern.replace(/[/]+$/, '') || '/');
+  if (!/[*?]/.test(pattern)) return subtreeRegExp(pattern);
   if (pattern.endsWith('/**')) {
     const base = pattern.slice(0, -3);
     if (!/[*?]/.test(base)) return subtreeRegExp(base || '/');
@@ -94,7 +103,7 @@ export function subjectScope(subject: string): RegExp | undefined {
  * segment need a recursive native watcher; single-level globs do not.
  */
 export function subjectNeedsDeep(subject: string): boolean {
-  const pattern = path.normalize(subject);
+  const pattern = normalizeFileSubject(subject);
   if (!/[*?]/.test(pattern)) return true;
   return /\*\*/.test(pattern) || pattern.search(/[*?]/) < pattern.lastIndexOf('/');
 }
@@ -222,17 +231,30 @@ export function matchesRule(rule: WatchRule, signal: Signal, now: number): boole
   if (rule.expiresAt !== undefined && now >= rule.expiresAt) return false;
   if (rule.match.kind !== signal.kind) return false;
   if (rule.match.subject !== undefined) {
-    const pattern = path.normalize(rule.match.subject);
+    // Only file signals carry paths — normalize their subject spelling; every
+    // other kind (job.*, window.*, …) keeps raw glob semantics.
+    const pattern =
+      signal.kind === 'file.changed' || signal.kind === 'file.burst'
+        ? normalizeFileSubject(rule.match.subject)
+        : rule.match.subject;
     const subject = signal.subject;
-    let matched = typeof subject === 'string' && globToRegExp(pattern).test(subject);
-    // A file.burst subject is a normalized watch root (e.g. `/w`), which the
-    // raw glob misses for `<dir>/`, `<dir>/*`, `<dir>/**` and `<dir>/pkg-*/**`
-    // spellings: compare the pattern's own watch root, plus a boundary-
-    // inclusive `P/**` scope so deeper burst roots inside `P` still match.
-    if (!matched && signal.kind === 'file.burst' && typeof subject === 'string') {
-      matched =
-        watchRootOf(pattern) === subject ||
-        (pattern.endsWith('/**') && dirBoundaryRegExp(pattern.slice(0, -3) || '/').test(subject));
+    // A file.burst signal carrying `data.scope` attributes the burst to one
+    // canonical scope id — it matches only the identical scope, never a
+    // sibling glob on the same watch root (even when the emitted dir happens
+    // to match that glob textually). Untagged signals fall back to directory
+    // semantics: a literal dir covers bursts anywhere in its subtree and
+    // `<base>/**` covers base plus deeper burst dirs.
+    const scope = signal.kind === 'file.burst' && isPlainObject(signal.data) ? signal.data.scope : undefined;
+    let matched: boolean;
+    if (typeof scope === 'string') {
+      matched = burstScopeId(rule.match.subject) === scope;
+    } else {
+      matched = typeof subject === 'string' && globToRegExp(pattern).test(subject);
+      if (!matched && signal.kind === 'file.burst' && typeof subject === 'string') {
+        matched =
+          (!/[*?]/.test(pattern) && subtreeRegExp(pattern).test(subject)) ||
+          (pattern.endsWith('/**') && dirBoundaryRegExp(pattern.slice(0, -3) || '/').test(subject));
+      }
     }
     if (!matched) return false;
   }

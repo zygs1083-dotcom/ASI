@@ -95,7 +95,7 @@ export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}
     () => settings.enabled(),
     isPaused,
     (signal, dirs) => body.burst(signal, dirs),
-    (roots) => body.setRoots(roots),
+    (scopes) => body.setScopes(scopes),
   );
   const helper = new HelperSource(
     ports.helper,
