@@ -334,10 +334,11 @@ describe('user-confirmed rebaselining', () => {
     for (let i = 0; i < 501; i++) {
       expect((await current.tuner.propose({ param: 'unknown', to: i })).applied).toBe(false);
     }
-    expect(current.tuner.logs.some((entry) => entry.id === change.id)).toBe(false);
+    expect(current.tuner.logs.some((entry) => entry.id === change.id)).toBe(true);
     await current.monitor.persist();
     const restored = await reload(current.persistence);
     expect(restored.tuner.undoableChanges.map((entry) => entry.id)).toContain(change.id);
+    expect(restored.tuner.logs.some((entry) => entry.id === change.id)).toBe(true);
     restored.asUser();
     expect((await restored.tuner.revert(change.id)).applied).toBe(true);
     expect(restored.monitor.baseline.read('cpu', MON10)?.mean).toBeCloseTo(0.5);
