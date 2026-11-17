@@ -217,15 +217,17 @@ export class BodySource {
     this.thermalRecovering = false;
   }
   setRoots(roots: string[]): void {
-    const ordered = [...roots].sort();
+    // Normalize + dedupe so trailing-slash or duplicate spellings cannot
+    // split burst windows or break prefix containment.
+    const ordered = [...new Set(roots.map((r) => r.replace(/[/]+$/, '') || '/'))].sort();
     const key = JSON.stringify(ordered);
     if (key === this.burstRoots) return;
     this.burstRoots = key;
     this.detector.setRoots(ordered);
   }
-  async burst(signal: Signal): Promise<void> {
+  async burst(signal: Signal, dirs?: readonly string[]): Promise<void> {
     if (this.stopped) return;
-    for (const burst of this.detector.accept(signal, this.clock.mono())) {
+    for (const burst of this.detector.accept(signal, this.clock.mono(), dirs)) {
       burst.data.feedbackAvailable = false;
       await this.attention.accept(burst);
       this.register(burst);

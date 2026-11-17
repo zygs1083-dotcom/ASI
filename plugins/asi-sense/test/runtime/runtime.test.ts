@@ -200,7 +200,7 @@ describe('host runtime', () => {
       };
     };
     await h.runtime.start();
-    expect([...watched]).toEqual(['/temporary/']);
+    expect([...watched]).toEqual(['/temporary']);
     await h.advance(1_000);
     expect([...watched]).toEqual([]);
     await h.runtime.stop();
@@ -267,12 +267,35 @@ describe('host runtime', () => {
     await h.runtime.stop();
   });
 
-  it('counts unmatched files within an approved watch root toward burst detection', async () => {
+  it('ignores files outside a glob rule scope for burst detection', async () => {
     const h = harness(undefined, {
       rules: [
         {
           id: 'ts',
           match: { kind: 'file.changed', subject: '/workspace/*.ts' },
+          level: 'context',
+          createdBy: 'user',
+          approved: true,
+        },
+        ...defaultBodyRules(),
+      ],
+    });
+    await h.runtime.start();
+    for (let i = 0; i < 51; i++) h.fileRaw({ path: `/workspace/${i}.json`, change: 'delete' });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(h.runtime.events().filter((item) => item.kind === 'file.changed')).toHaveLength(0);
+    // `.json` siblings are unobservable to `/workspace/*.ts`: they must not
+    // feed the burst window (a glob rule's scope is its own matchable set).
+    expect(h.runtime.events().filter((item) => item.kind === 'file.burst')).toHaveLength(0);
+    await h.runtime.stop();
+  });
+
+  it('counts unmatched files within an approved directory rule toward burst detection', async () => {
+    const h = harness(undefined, {
+      rules: [
+        {
+          id: 'dir',
+          match: { kind: 'file.changed', subject: '/workspace' },
           level: 'context',
           createdBy: 'user',
           approved: true,
@@ -308,6 +331,136 @@ describe('host runtime', () => {
     await h.runtime.stop();
   });
 
+  it('scopes an in-segment prefix glob to matching subtrees only', async () => {
+    const h = harness(undefined, {
+      rules: [
+        {
+          id: 'proj',
+          match: { kind: 'file.changed', subject: '/demo/proj-*/**' },
+          level: 'context',
+          createdBy: 'user',
+          approved: true,
+        },
+        ...defaultBodyRules(),
+      ],
+    });
+    await h.runtime.start();
+    // Unapproved sibling subtree: the recursive /demo watch may deliver these,
+    // but they must never reach attention or the burst detector.
+    for (let i = 0; i < 51; i++) h.fileRaw({ path: `/demo/cache/${i}`, change: 'delete' });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(h.runtime.events().filter((item) => item.kind === 'file.changed')).toHaveLength(0);
+    expect(h.runtime.events().filter((item) => item.kind === 'file.burst')).toHaveLength(0);
+    for (let i = 0; i < 51; i++) h.fileRaw({ path: `/demo/proj-x/${i}`, change: 'delete' });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(h.runtime.events().find((item) => item.kind === 'file.burst')).toMatchObject({
+      subject: '/demo',
+      detail: { deleted: 51 },
+    });
+    await h.runtime.stop();
+  });
+
+  it('requests non-recursive watches for single-level globs and recursive ones for deep subjects', async () => {
+    const h = harness(undefined, {
+      rules: [
+        {
+          id: 'flat',
+          match: { kind: 'file.changed', subject: '/workspace/*.ts' },
+          level: 'context',
+          createdBy: 'user',
+          approved: true,
+        },
+        {
+          id: 'prefix',
+          match: { kind: 'file.changed', subject: '/demo/proj-*/**' },
+          level: 'context',
+          createdBy: 'user',
+          approved: true,
+        },
+        {
+          id: 'dir',
+          match: { kind: 'file.changed', subject: '/plain' },
+          level: 'context',
+          createdBy: 'user',
+          approved: true,
+        },
+      ],
+    });
+    const calls: { path: string; recursive?: boolean }[] = [];
+    h.ports.files.watch = (path, _callback, opts) => {
+      calls.push({ path, recursive: opts?.recursive });
+      return { close: () => {} };
+    };
+    await h.runtime.start();
+    expect(calls).toEqual([
+      { path: '/workspace', recursive: false },
+      { path: '/demo', recursive: true },
+      { path: '/plain', recursive: true },
+    ]);
+    await h.runtime.stop();
+  });
+
+  it.each([
+    ['/workspace/', '/workspace/x'],
+    ['/workspace/*', '/workspace'],
+    ['/workspace/pkg-*/**', '/workspace/pkg-a/x'],
+  ])('delivers a file.burst to a directory rule spelled %s', async (subject, dir) => {
+    const h = harness(undefined, {
+      rules: [
+        {
+          id: 'burst',
+          match: { kind: 'file.burst', subject },
+          level: 'wake',
+          createdBy: 'user',
+          approved: true,
+        },
+      ],
+    });
+    await h.runtime.start();
+    for (let i = 0; i < 51; i++) h.fileRaw({ path: `${dir}/${i}.f`, change: 'delete' });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(h.runtime.events().find((item) => item.kind === 'file.burst')).toMatchObject({
+      ruleId: 'burst',
+      subject: '/workspace',
+      level: 'wake',
+      detail: { deleted: 51 },
+    });
+    await h.runtime.stop();
+  });
+
+  it('aggregates child-root events into the parent burst window', async () => {
+    const h = harness(undefined, {
+      rules: [
+        {
+          id: 'burst',
+          match: { kind: 'file.burst', subject: '/workspace' },
+          level: 'wake',
+          createdBy: 'user',
+          approved: true,
+        },
+        {
+          id: 'src',
+          match: { kind: 'file.changed', subject: '/workspace/src/**' },
+          level: 'context',
+          createdBy: 'user',
+          approved: true,
+        },
+      ],
+    });
+    await h.runtime.start();
+    // 30 deletes each under two nested roots: exclusive longest-root
+    // bucketing would split 60 into two sub-threshold windows.
+    for (let i = 0; i < 30; i++) h.fileRaw({ path: `/workspace/a/${i}.f`, change: 'delete' });
+    for (let i = 0; i < 30; i++) h.fileRaw({ path: `/workspace/src/${i}.f`, change: 'delete' });
+    await vi.advanceTimersByTimeAsync(0);
+    // The parent window aggregates both roots and emits at the 51st delete —
+    // exclusive longest-root bucketing would split 30+30 below threshold.
+    expect(
+      h.runtime.events().find((item) => item.kind === 'file.burst' && item.subject === '/workspace'),
+    ).toMatchObject({ ruleId: 'burst', level: 'wake', detail: { deleted: 51 } });
+    await h.runtime.stop();
+  });
+
   it('preserves burst history for unchanged roots across rule refresh', async () => {
     const h = harness();
     const watches = new Map<string, (event: FileChange) => void>();
@@ -320,13 +473,13 @@ describe('host runtime', () => {
       };
     };
     await h.runtime.start();
-    for (let i = 0; i < 25; i++) watches.get('/workspace/')?.({ path: `/workspace/${i}`, change: 'delete' });
+    for (let i = 0; i < 25; i++) watches.get('/workspace')?.({ path: `/workspace/${i}`, change: 'delete' });
     await vi.advanceTimersByTimeAsync(0);
     await h.runtime.tools.envWatch({
       action: 'add',
       rule: { id: 'other', match: { kind: 'file.changed', subject: '/other/**' }, level: 'context' },
     });
-    for (let i = 25; i < 51; i++) watches.get('/workspace/')?.({ path: `/workspace/${i}`, change: 'delete' });
+    for (let i = 25; i < 51; i++) watches.get('/workspace')?.({ path: `/workspace/${i}`, change: 'delete' });
     await vi.advanceTimersByTimeAsync(0);
     expect(h.runtime.events().find((item) => item.kind === 'file.burst')?.detail?.deleted).toBe(51);
     await h.runtime.stop();
@@ -1367,7 +1520,11 @@ describe('host runtime', () => {
     await h.runtime.stop();
   });
 
-  it('stops retrying after ten failures, reports degradation and recovers after a later delivery', async () => {
+  // Ten backoff rounds each await several fake-timer flushes; under CPU load
+  // the accumulated microtask drain can exceed vitest's default 5s timeout.
+  it('stops retrying after ten failures, reports degradation and recovers after a later delivery', {
+    timeout: 20_000,
+  }, async () => {
     const h = harness();
     let attempts = 0;
     let failing = true;
@@ -2002,7 +2159,7 @@ describe('host runtime', () => {
       return {
         close: async () => {
           watched.delete(path);
-          if (path === '/workspace/') {
+          if (path === '/workspace') {
             closing();
             await new Promise<void>((resolve) => {
               release = resolve;
@@ -2045,7 +2202,7 @@ describe('host runtime', () => {
     const h = harness(JSON.stringify({ version: 1, paused: false, sendTitles: true, rules, disabled: [] }));
     let good: ((event: FileChange) => void) | undefined;
     h.ports.files.watch = (path, callback) => {
-      if (path === '/bad/') throw new Error('synthetic watch failure');
+      if (path === '/bad') throw new Error('synthetic watch failure');
       good = callback;
       return { close: () => {} };
     };
@@ -2077,12 +2234,12 @@ describe('host runtime', () => {
       rule: { id: 'other', match: { kind: 'file.changed', subject: '/other/**' }, level: 'context' },
     });
     const error = { path: '/other', change: 'modify' as const, watchError: true };
-    callbacks.get('/other/')?.(error);
+    callbacks.get('/other')?.(error);
     await vi.advanceTimersByTimeAsync(0);
-    expect(closed.has('/other/')).toBe(true);
+    expect(closed.has('/other')).toBe(true);
     expect(h.runtime.state().observation.sources['files:other']?.status).toBe('unavailable');
     expect(h.runtime.state().observation.sources['files:files-wake']?.status).toBe('ok');
-    callbacks.get('/workspace/')?.({ path: '/workspace/synthetic.txt', change: 'add' });
+    callbacks.get('/workspace')?.({ path: '/workspace/synthetic.txt', change: 'add' });
     await vi.advanceTimersByTimeAsync(0);
     expect(h.runtime.state().env.watchedPaths.value?.['/workspace/synthetic.txt']?.changes).toBe(1);
     await h.runtime.stop();
@@ -2101,10 +2258,10 @@ describe('host runtime', () => {
     });
     let first = true;
     h.ports.files.watch = (path, emit) => {
-      if (path === '/workspace/') callback = emit;
+      if (path === '/workspace') callback = emit;
       return {
         close: async () => {
-          if (path === '/workspace/' && first) {
+          if (path === '/workspace' && first) {
             first = false;
             entered();
             await barrier;
@@ -2133,7 +2290,7 @@ describe('host runtime', () => {
       if (key === 'settings') settingsWrites++;
     };
     h.ports.files.watch = (path) => {
-      if (path === '/bad/') throw new Error('synthetic watch failure');
+      if (path === '/bad') throw new Error('synthetic watch failure');
       return { close: () => {} };
     };
     await h.runtime.start();
@@ -2161,7 +2318,7 @@ describe('host runtime', () => {
       if (key === 'settings') settingsWrites++;
     };
     h.ports.files.watch = (path, callback) => {
-      if (path === '/bad/') {
+      if (path === '/bad') {
         const event = { path: '/bad', change: 'modify' as const, watchError: true };
         void Promise.resolve().then(() => callback(event));
       }
@@ -2203,7 +2360,7 @@ describe('host runtime', () => {
       }
     };
     h.ports.files.watch = (path, emit) => {
-      if (path === '/bad/') {
+      if (path === '/bad') {
         callback = emit;
         watching();
       }
@@ -2247,7 +2404,7 @@ describe('host runtime', () => {
         rule: { id: 'new', match: { kind: 'file.changed', subject: '/new/**' }, level: 'context' },
       }),
     ).rejects.toThrow('uninstalled');
-    expect(watched.has('/new/')).toBe(false);
+    expect(watched.has('/new')).toBe(false);
     expect(h.runtime.rules.list().some((rule) => rule.id === 'new')).toBe(false);
     h.failSave(false);
     await h.runtime.stop();
@@ -2292,7 +2449,7 @@ describe('host runtime', () => {
     expect(h.runtime.rules.settings().paused).toBe(true);
     expect(watched.size).toBe(0);
     await h.runtime.actions.pause(false);
-    expect([...watched].sort()).toEqual(['/new/', '/workspace/']);
+    expect([...watched].sort()).toEqual(['/new', '/workspace']);
     await h.runtime.stop();
   });
 
@@ -2314,8 +2471,8 @@ describe('host runtime', () => {
     });
     for (let i = 0; i < 26; i++) {
       const event: FileChange = { path: `/workspace/src/${i}.ts`, change: 'delete', at: Date.now() };
-      watches.get('/workspace/')?.(event);
-      watches.get('/workspace/src/')?.(event);
+      watches.get('/workspace')?.(event);
+      watches.get('/workspace/src')?.(event);
     }
     await vi.advanceTimersByTimeAsync(0);
     expect(h.runtime.events().filter((event) => event.kind === 'file.changed')).toHaveLength(26);
@@ -2340,10 +2497,10 @@ describe('host runtime', () => {
       rule: { id: 'nested', match: { kind: 'file.changed', subject: '/workspace/src/**' }, level: 'context' },
     });
     const event: FileChange = { path: '/workspace/src/synthetic.ts', change: 'delete', at: Date.now() };
-    watches.get('/workspace/')?.(event);
-    watches.get('/workspace/')?.(event);
-    watches.get('/workspace/src/')?.(event);
-    watches.get('/workspace/src/')?.(event);
+    watches.get('/workspace')?.(event);
+    watches.get('/workspace')?.(event);
+    watches.get('/workspace/src')?.(event);
+    watches.get('/workspace/src')?.(event);
     await vi.advanceTimersByTimeAsync(0);
     expect(h.runtime.events().filter((item) => item.kind === 'file.changed')).toHaveLength(2);
     expect(h.runtime.state().env.watchedPaths.value?.[event.path]?.changes).toBe(2);

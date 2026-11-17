@@ -1,6 +1,6 @@
 import path from 'node:path';
 import type { Signal, WatchRule } from '@asi/sense-types';
-import { matchesRule } from '../attention/rules.ts';
+import { matchesRule, subjectNeedsDeep, subjectScope, watchRootOf } from '../attention/rules.ts';
 import type { RuntimeAttention } from '../runtime/attention.ts';
 import type { Clock, FileChange, FileWatcher } from '../runtime/ports.ts';
 import type { DshSource } from './dsh.ts';
@@ -9,14 +9,31 @@ const source = { id: 'files', api: 'watch', host: 'local' };
 
 function root(pattern: string): string | undefined {
   if (!path.isAbsolute(pattern)) return undefined;
+  // Normalize to a single spelling per directory so `/a` and `/a/` share one
+  // watch and one scope entry (path.normalize keeps a trailing separator).
+  const base = (p: string) => {
+    const r = path.parse(p).root;
+    return p.length > r.length ? p.replace(/[/\\]+$/, '') : p;
+  };
   const wildcard = pattern.search(/[*?]/);
-  if (wildcard < 0) return path.normalize(pattern);
+  if (wildcard < 0) return base(path.normalize(pattern));
   const prefix = pattern.slice(0, wildcard);
-  return prefix.endsWith(path.sep) ? path.normalize(prefix) : path.dirname(prefix);
+  if (!prefix.includes(path.sep)) return path.sep;
+  return prefix.endsWith(path.sep) ? base(path.normalize(prefix)) : path.dirname(prefix);
+}
+
+interface WatchScope {
+  /** Path sets this root may observe (union over its rules' subjects). */
+  readonly scope: RegExp[];
+  /** Whether any rule on this root can see below the root's first level. */
+  deep: boolean;
+  /** Normalized burst dir this root's events aggregate under. */
+  readonly burst: string;
 }
 
 export class FileSource {
   private readonly watches = new Map<string, { close(): void | Promise<void> }>();
+  private readonly depth = new Map<string, boolean>();
   private active = false;
   private stopped = false;
   private tail = Promise.resolve();
@@ -33,39 +50,66 @@ export class FileSource {
     private readonly dsh: DshSource,
     private readonly rules: () => WatchRule[],
     private readonly paused: () => boolean,
-    private readonly burst: (signal: Signal) => Promise<void>,
+    private readonly burst: (signal: Signal, dirs: readonly string[]) => Promise<void>,
     private readonly setRoots: (roots: string[]) => void,
   ) {}
   private eligible(rule: WatchRule): boolean {
     return rule.approved && (rule.expiresAt === undefined || this.clock.wall() < rule.expiresAt);
   }
-  private roots(): Set<string> {
-    const patterns = (this.stopped || this.paused() ? [] : this.rules())
-      .filter(
-        (r) =>
-          this.eligible(r) && (r.match.kind === 'file.changed' || r.match.kind === 'file.burst') && r.match.subject,
+  /**
+   * Every watch root's effective observation scope — the strict union of its
+   * eligible rules' matchable sets (dir subjects contribute their whole
+   * subtree; plain globs only their own matches). Events outside every scope
+   * are dropped before they can reach attention or the burst detector, so a
+   * wildcard rule never observes an unapproved sibling or child subtree.
+   */
+  private scopes(): Map<string, WatchScope> {
+    const out = new Map<string, WatchScope>();
+    for (const rule of this.stopped || this.paused() ? [] : this.rules()) {
+      if (
+        !this.eligible(rule) ||
+        (rule.match.kind !== 'file.changed' && rule.match.kind !== 'file.burst') ||
+        rule.match.subject === undefined
       )
-      .map((r) => r.match.subject as string);
-    return new Set(patterns.map(root).filter((value): value is string => value !== undefined));
-  }
-  private watch(watched: string): void {
-    let handle: { close(): void | Promise<void> } | undefined;
-    handle = this.watcher.watch(watched, (event) => {
-      if (!handle || this.watches.get(watched) !== handle) return;
-      if ('watchError' in event && event.watchError === true) {
-        const current = handle;
-        this.failedWatches.add(current);
-        const run = this.tail.then(() => this.failed(watched, current));
-        this.tail = run.catch(() => {});
+        continue;
+      const watched = root(rule.match.subject);
+      const scope = subjectScope(rule.match.subject);
+      const burst = watchRootOf(rule.match.subject);
+      if (watched === undefined || scope === undefined || burst === undefined) continue;
+      const entry = out.get(watched);
+      if (entry) {
+        entry.scope.push(scope);
+        entry.deep ||= subjectNeedsDeep(rule.match.subject);
       } else {
-        void this.accept(event, watched).catch(() => {});
+        out.set(watched, { scope: [scope], deep: subjectNeedsDeep(rule.match.subject), burst });
       }
-    });
+    }
+    return out;
+  }
+  private watch(watched: string, deep: boolean): void {
+    let handle: { close(): void | Promise<void> } | undefined;
+    handle = this.watcher.watch(
+      watched,
+      (event) => {
+        if (!handle || this.watches.get(watched) !== handle) return;
+        if ('watchError' in event && event.watchError === true) {
+          const current = handle;
+          this.failedWatches.add(current);
+          const run = this.tail.then(() => this.failed(watched, current));
+          this.tail = run.catch(() => {});
+        } else {
+          void this.accept(event, watched).catch(() => {});
+        }
+      },
+      { recursive: deep },
+    );
     this.watches.set(watched, handle);
+    this.depth.set(watched, deep);
   }
   private async failed(watched: string, handle: { close(): void | Promise<void> }): Promise<void> {
     if (this.watches.get(watched) !== handle) return;
     this.watches.delete(watched);
+    this.depth.delete(watched);
     try {
       await handle.close();
     } finally {
@@ -98,9 +142,11 @@ export class FileSource {
   async prepare(rule: WatchRule): Promise<{ check(): void; release(): Promise<void> }> {
     if ((rule.match.kind !== 'file.changed' && rule.match.kind !== 'file.burst') || rule.match.subject === undefined)
       return { check: () => {}, release: async () => {} };
-    const watched = root(rule.match.subject);
+    const subject = rule.match.subject;
+    const watched = root(subject);
     if (!watched) throw new TypeError('file watch subject must be an absolute path');
     if (!this.eligible(rule)) return { check: () => {}, release: async () => {} };
+    const deep = subjectNeedsDeep(subject);
     let staged: { close(): void | Promise<void> } | undefined;
     const run = this.tail.then(async () => {
       if (this.stopped) throw new Error('stopped');
@@ -112,7 +158,7 @@ export class FileSource {
         await temporary.close();
         if (failed) throw new Error('file watch activation failed');
       } else {
-        if (!this.watches.has(watched)) this.watch(watched);
+        if (!this.watches.has(watched)) this.watch(watched, deep);
         this.leases.set(watched, (this.leases.get(watched) ?? 0) + 1);
         staged = this.watches.get(watched);
       }
@@ -163,20 +209,33 @@ export class FileSource {
       const failed = new Set<string>();
       for (;;) {
         this.active = !this.stopped && !this.paused();
-        const roots = this.roots();
-        this.setRoots([...roots]);
+        const scopes = this.scopes();
+        this.setRoots([...new Set([...scopes.values()].map((s) => s.burst))]);
         const obsolete = [...this.watches].find(
-          ([watched]) => !roots.has(watched) && (!this.active || !this.leases.has(watched)),
+          ([watched]) => !scopes.has(watched) && (!this.active || !this.leases.has(watched)),
         );
         if (obsolete) {
           this.watches.delete(obsolete[0]);
+          this.depth.delete(obsolete[0]);
           await obsolete[1].close();
           continue;
         }
-        const missing = [...roots].find((watched) => !this.watches.has(watched) && !failed.has(watched));
+        // A shallow watch (e.g. lease-staged for `/a/*`) must be re-watched
+        // recursively once a deep rule lands on the same root.
+        const shallow = [...this.watches.keys()].find(
+          (watched) => scopes.has(watched) && this.depth.get(watched) !== scopes.get(watched)?.deep,
+        );
+        if (shallow !== undefined) {
+          const handle = this.watches.get(shallow);
+          this.watches.delete(shallow);
+          this.depth.delete(shallow);
+          await handle?.close();
+          continue;
+        }
+        const missing = [...scopes.keys()].find((watched) => !this.watches.has(watched) && !failed.has(watched));
         if (!missing) break;
         try {
-          this.watch(missing);
+          this.watch(missing, scopes.get(missing)?.deep ?? true);
         } catch {
           failed.add(missing);
         }
@@ -225,11 +284,21 @@ export class FileSource {
     await this.refresh();
   }
   private async accept(event: FileChange, watched: string): Promise<void> {
-    if (!this.active || this.paused() || !path.isAbsolute(event.path) || !this.roots().has(watched)) return;
+    if (!this.active || this.paused() || !path.isAbsolute(event.path)) return;
+    const scopes = this.scopes();
+    if (!scopes.has(watched)) return;
     const absolute = path.normalize(event.path);
-    const watchRoot = path.normalize(watched).replace(/\/+$/, '') || '/';
-    if (absolute !== watchRoot && !absolute.startsWith(watchRoot === '/' ? '/' : `${watchRoot}/`)) return;
-    const key = JSON.stringify([path.normalize(event.path), event.change, event.at ?? this.clock.wall()]);
+    // Strict scope: an event counts only toward roots whose eligible rules
+    // can observe it — a wildcard root never absorbs sibling/child subtrees
+    // it cannot match, and nested roots aggregate with their ancestors.
+    const dirs: string[] = [];
+    for (const entry of scopes.values()) {
+      if (entry.scope.some((re) => re.test(absolute)) && !dirs.includes(entry.burst)) {
+        dirs.push(entry.burst);
+      }
+    }
+    if (dirs.length === 0) return;
+    const key = JSON.stringify([absolute, event.change, event.at ?? this.clock.wall()]);
     const roots = this.dispatch.get(key) ?? new Map<string, number>();
     const count = (roots.get(watched) ?? 0) + 1;
     const duplicate = [...roots].some(([other, seen]) => other !== watched && seen >= count);
@@ -247,8 +316,8 @@ export class FileSource {
       kind: 'file.changed',
       at: event.at ?? this.clock.wall(),
       source,
-      subject: path.normalize(event.path),
-      data: { path: path.normalize(event.path), change: event.change, ttlMs: 86_400_000 },
+      subject: absolute,
+      data: { path: absolute, change: event.change, ttlMs: 86_400_000 },
     });
     const matching = this.rules().filter(
       (r) =>
@@ -261,6 +330,6 @@ export class FileSource {
       signal.data.watchedPaths = matching.map((rule) => rule.match.subject);
       await this.attention.accept(signal);
     }
-    if (this.active && this.roots().has(watched)) await this.burst(signal);
+    if (this.active && this.scopes().has(watched)) await this.burst(signal, dirs);
   }
 }

@@ -55,6 +55,22 @@ describe('matchesRule', () => {
     expect(matchesRule(changed, sig({ id: '3', kind: 'file.changed', subject: '/src/a' }), 0)).toBe(true);
   });
 
+  it('matches a normalized file.burst root across literal, slash, glob and prefix spellings', () => {
+    const burstAt = (subject: string) => sig({ id: 'b', kind: 'file.burst', subject });
+    const mk = (subject: string) => rule({ id: 'r', match: { kind: 'file.burst', subject } });
+    // All these spellings root at /dir; the emitted subject is the
+    // normalized root — never a trailing slash.
+    for (const subject of ['/dir', '/dir/', '/dir/**', '/dir/*', '/dir/pkg-*/**']) {
+      expect(matchesRule(mk(subject), burstAt('/dir'), 0)).toBe(true);
+    }
+    // Bursts at a nested root stay inside each spelling's own matchable set —
+    // `/dir/sub` is itself a direct child match for `/dir/*`.
+    expect(matchesRule(mk('/dir/*'), burstAt('/dir/sub'), 0)).toBe(true);
+    expect(matchesRule(mk('/dir/pkg-*/**'), burstAt('/dir/pkg-a'), 0)).toBe(true);
+    expect(matchesRule(mk('/dir/pkg-*/**'), burstAt('/dir/other'), 0)).toBe(false);
+    expect(matchesRule(mk('/dir/**'), burstAt('/other'), 0)).toBe(false);
+  });
+
   it('supports literal and comparison where clauses', () => {
     const s = sig({ id: '1', kind: 'k', data: { exitCode: 1, name: 't' } });
     expect(

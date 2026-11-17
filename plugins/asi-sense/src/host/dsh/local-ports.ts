@@ -22,7 +22,7 @@ export function localPorts(ctx: Context, storageRoot: string): Omit<SensePorts, 
     helper: { spawn: (path) => spawn(path, [], { stdio: 'pipe' }) },
     probe: { create: () => new BodyProbe() },
     files: {
-      watch(root, callback) {
+      watch(root, callback, opts?: { recursive?: boolean }) {
         const target = resolve(root);
         const startedAt = Date.now();
         let watcher: ReturnType<typeof watch>;
@@ -48,7 +48,10 @@ export function localPorts(ctx: Context, storageRoot: string): Omit<SensePorts, 
               const base = candidate;
               const next = watch(
                 base,
-                { recursive: base === target || base !== dirname(target) },
+                // `recursive:false` only applies at the target dir itself: an
+                // ancestor fallback still needs recursion to observe the
+                // target's appearance; delivered events stay inside(target).
+                { recursive: base === target ? opts?.recursive !== false : base !== dirname(target) },
                 (event, filename) => {
                   if (closed || watcher !== next) return;
                   const path = !directory || filename === null ? base : resolve(base, filename.toString());

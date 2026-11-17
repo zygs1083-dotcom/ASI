@@ -11,8 +11,8 @@ const add = (at: number, path: string, cause?: 'agent') => ev(at, path, 'add', c
 const mod = (at: number, path: string, cause?: 'agent') => ev(at, path, 'modify', cause);
 
 class FileBurstDetector extends Detector {
-  accept(signal: Signal, receivedAt = signal.at) {
-    return super.accept(signal, receivedAt);
+  accept(signal: Signal, receivedAt = signal.at, dirs?: readonly string[]) {
+    return super.accept(signal, receivedAt, dirs);
   }
 }
 
@@ -153,11 +153,22 @@ describe('FileBurstDetector watched roots', () => {
     expect(out[0]).toMatchObject({ subject: '/fixture/work', data: { externalDeletionExceeded: true, wake: true } });
   });
 
-  it('prefers the longest matching root and treats root==path as a member', () => {
+  it('counts an event toward every covering root and treats root==path as a member', () => {
     const d = new FileBurstDetector({ roots: ['/r', '/r/sub'], maxDeleted: 1 });
-    expect(d.accept(del(0, '/r/sub/deep/f'))).toHaveLength(0); // groups under /r/sub → count 1
-    const out = d.accept(del(1, '/r/sub')); // path == root counts under /r/sub → 2 > 1
-    expect(out[0]?.subject).toBe('/r/sub');
+    expect(d.accept(del(0, '/r/sub/deep/f'))).toHaveLength(0); // both /r and /r/sub → count 1 each
+    const out = d.accept(del(1, '/r/sub')); // path == root member of both → 2 > 1 each
+    expect(out.map((s) => s.subject).sort()).toEqual(['/r', '/r/sub']);
     expect(d.accept(del(2, '/rish/f'))).toHaveLength(0); // prefix-only is NOT a match
+  });
+
+  it('accepts explicit dir attribution covering several roots', () => {
+    const d = new FileBurstDetector({ maxDeleted: 1 });
+    d.setRoots(['/r', '/r/sub']);
+    const out = d.accept(del(0, '/r/sub/f'), 0, ['/r', '/r/sub']);
+    expect(out).toHaveLength(0);
+    const out2 = d.accept(del(1, '/r/sub/g'), 1, ['/r/sub']);
+    expect(out2.map((s) => s.subject)).toEqual(['/r/sub']);
+    const out3 = d.accept(del(2, '/r/sub/h'), 2, []);
+    expect(out3).toHaveLength(0);
   });
 });

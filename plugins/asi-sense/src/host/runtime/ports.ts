@@ -79,7 +79,17 @@ export interface FileChange {
   at?: number;
 }
 export interface FileWatcher {
-  watch(path: string, cb: (event: FileChange) => void): { close(): void | Promise<void> };
+  /**
+   * `recursive: false` limits delivery to the watch root's direct children —
+   * single-level glob rules must not observe deeper unapproved subtrees.
+   * Absent/`true`, the platform watcher decides (recursive whenever the
+   * watched target is or becomes a directory).
+   */
+  watch(
+    path: string,
+    cb: (event: FileChange) => void,
+    opts?: { recursive?: boolean },
+  ): { close(): void | Promise<void> };
 }
 export interface SensePorts {
   dsh: DshPort;
