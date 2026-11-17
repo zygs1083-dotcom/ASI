@@ -1,6 +1,14 @@
 import type {
-  BatteryValue, Body, CpuValue, DisksFact, DisksValue, Fact, MemoryValue,
-  NetworkValue, ProcessValue, TokenSource,
+  BatteryValue,
+  Body,
+  CpuValue,
+  DisksFact,
+  DisksValue,
+  Fact,
+  MemoryValue,
+  NetworkValue,
+  ProcessValue,
+  TokenSource,
 } from './types.js';
 
 export interface ProbeCollectors {
@@ -13,13 +21,13 @@ export interface ProbeCollectors {
 }
 
 export interface SamplingCadence {
-  memoryMs: number;   // MemorySampler invocation period
-  networkMs: number;  // NetworkSampler invocation period
+  memoryMs: number; // MemorySampler invocation period
+  networkMs: number; // NetworkSampler invocation period
   pressureMs: number; // sysctl kern.memorystatus_vm_pressure_level period
-  swapMs: number;     // sysctl vm.swapusage period
-  routeMs: number;    // /sbin/route probe period per address family
-  batteryMs: number;  // BatterySampler (pmset) invocation period
-  disksMs: number;    // DiskSampler invocation period
+  swapMs: number; // sysctl vm.swapusage period
+  routeMs: number; // /sbin/route probe period per address family
+  batteryMs: number; // BatterySampler (pmset) invocation period
+  disksMs: number; // DiskSampler invocation period
 }
 
 export interface StartOptions {
@@ -31,7 +39,7 @@ export interface StartOptions {
 }
 
 export interface SamplePoint {
-  at: number;   // wall clock of the sample
+  at: number; // wall clock of the sample
   body: Body;
 }
 

@@ -1,4 +1,4 @@
-import { defineConfig } from 'vitest/config'
+import { defineConfig } from 'vitest/config';
 
 export default defineConfig({
   esbuild: { jsx: 'automatic' },
@@ -13,4 +13,4 @@ export default defineConfig({
       instances: [{ browser: 'chromium', launch: { channel: 'chrome' } }],
     },
   },
-})
+});

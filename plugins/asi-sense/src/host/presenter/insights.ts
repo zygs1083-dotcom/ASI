@@ -197,7 +197,11 @@ export function projectInsights(
     const defaultInterval = disk ? 10_000 : key === 'battery' ? 30_000 : 2_000;
     const interval = intervals[key] ?? defaultInterval;
     const eta = etaFor(
-      key, monitor, body, Number.isFinite(interval) && interval > 0 ? interval : defaultInterval, at,
+      key,
+      monitor,
+      body,
+      Number.isFinite(interval) && interval > 0 ? interval : defaultInterval,
+      at,
       tuner.number('floor.disk.critical', 0.05),
     );
     if (eta) item.currentEta = eta;

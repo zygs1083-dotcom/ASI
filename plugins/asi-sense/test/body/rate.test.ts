@@ -32,7 +32,7 @@ const GIB = 1024 ** 3;
 it('uses the current disk critical floor for rate event ETA', () => {
   const evaluator = ev(
     [{ id: 'disk', metric: 'disk:*', windowMs: 10_000, direction: 'down', maxDelta: 1 }],
-    (param, fallback) => param === 'floor.disk.critical' ? 0.02 : fallback,
+    (param, fallback) => (param === 'floor.disk.critical' ? 0.02 : fallback),
   );
   const result = evaluator.evaluate(sample(diskBody(100), 0), sample(diskBody(80), 1_000), {});
   expect(result.signals[0]?.data.timeToFloorMs).toBeCloseTo(3_000);

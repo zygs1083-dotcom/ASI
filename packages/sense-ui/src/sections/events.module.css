@@ -39,24 +39,20 @@
   background: var(--dsw-alias-border-l4, rgba(0, 0, 0, 0.16));
 }
 
-.event[data-level='wake'] {
-  background: color-mix(
-    in srgb,
-    var(--sev-critical, #ec1313) 8%,
-    transparent
-  );
+.event[data-level="wake"] {
+  background: color-mix(in srgb, var(--sev-critical, #ec1313) 8%, transparent);
   font-weight: 500;
 }
 
-.event[data-level='wake'] .sevLine {
+.event[data-level="wake"] .sevLine {
   background: var(--sev-critical, #ec1313);
 }
 
-.event[data-level='suppressed'] .sevLine {
+.event[data-level="suppressed"] .sevLine {
   background: var(--sev-warn, #f59e0b);
 }
 
-.event[data-level='context'] .sevLine {
+.event[data-level="context"] .sevLine {
   background: var(--dsw-alias-state-business-primary, #4176e6);
 }
 
@@ -72,27 +68,27 @@
   color: var(--dsw-alias-label-secondary, #61666b);
 }
 
-.event[data-level='wake'] .level {
+.event[data-level="wake"] .level {
   color: var(--sev-critical, #ec1313);
 }
 
-.event[data-level='wake'] .levelText {
+.event[data-level="wake"] .levelText {
   color: var(--sev-critical-ink);
 }
 
-.event[data-level='context'] .level {
+.event[data-level="context"] .level {
   color: var(--dsw-alias-state-business-primary, #4176e6);
 }
 
-.event[data-level='context'] .levelText {
+.event[data-level="context"] .levelText {
   color: var(--sev-business-ink);
 }
 
-.event[data-level='suppressed'] .level {
+.event[data-level="suppressed"] .level {
   color: var(--sev-warn, #f59e0b);
 }
 
-.event[data-level='suppressed'] .levelText {
+.event[data-level="suppressed"] .levelText {
   color: var(--sev-warn-ink);
 }
 
@@ -146,7 +142,7 @@
 }
 
 .minuteSummary::before {
-  content: '';
+  content: "";
   width: 0;
   height: 0;
   border-left: 4px solid currentColor;
@@ -232,12 +228,8 @@
   cursor: pointer;
 }
 
-.feedback .fbBtn[aria-pressed='true'] {
+.feedback .fbBtn[aria-pressed="true"] {
   border-color: var(--dsw-alias-state-business-primary, #4176e6);
   color: var(--sev-business-ink);
-  background: color-mix(
-    in srgb,
-    var(--dsw-alias-state-business-primary, #4176e6) 12%,
-    transparent
-  );
+  background: color-mix(in srgb, var(--dsw-alias-state-business-primary, #4176e6) 12%, transparent);
 }

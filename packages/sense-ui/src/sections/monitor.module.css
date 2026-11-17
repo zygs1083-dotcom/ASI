@@ -10,15 +10,15 @@
   border-radius: var(--dsw-radius-sm, 8px);
 }
 
-.monitor[data-sev='warn'] {
+.monitor[data-sev="warn"] {
   border-left-color: var(--sev-warn, #f59e0b);
 }
 
-.monitor[data-sev='critical'] {
+.monitor[data-sev="critical"] {
   border-left-color: var(--sev-critical, #ec1313);
 }
 
-.monitor[data-sev='unknown'] {
+.monitor[data-sev="unknown"] {
   border-left-color: var(--sev-unknown, #81858c);
 }
 
@@ -43,17 +43,17 @@
   animation: ecgMove var(--ecg-dur, 2.4s) linear infinite;
 }
 
-.monitor[data-sev='warn'] .ecgPulse {
+.monitor[data-sev="warn"] .ecgPulse {
   stroke: var(--sev-warn, #f59e0b);
   --ecg-dur: 1.6s;
 }
 
-.monitor[data-sev='critical'] .ecgPulse {
+.monitor[data-sev="critical"] .ecgPulse {
   stroke: var(--sev-critical, #ec1313);
   --ecg-dur: 0.9s;
 }
 
-.monitor[data-sev='unknown'] .ecgPulse {
+.monitor[data-sev="unknown"] .ecgPulse {
   stroke: var(--sev-unknown, #81858c);
   --ecg-dur: 3.6s;
 }
@@ -76,19 +76,19 @@
   line-height: 20px;
 }
 
-.monitor[data-sev='good'] .monitorWord {
+.monitor[data-sev="good"] .monitorWord {
   color: var(--sev-good-ink);
 }
 
-.monitor[data-sev='warn'] .monitorWord {
+.monitor[data-sev="warn"] .monitorWord {
   color: var(--sev-warn-ink);
 }
 
-.monitor[data-sev='critical'] .monitorWord {
+.monitor[data-sev="critical"] .monitorWord {
   color: var(--sev-critical-ink);
 }
 
-.monitor[data-sev='unknown'] .monitorWord {
+.monitor[data-sev="unknown"] .monitorWord {
   color: var(--dsw-alias-label-secondary, #61666b);
 }
 
@@ -120,7 +120,6 @@
   height: 4px;
   accent-color: var(--dsw-alias-state-business-primary, #4176e6);
 }
-
 
 /* 减弱动态时 ECG 显示为整根静态线（全局 animation:none 之外再取消虚线分段）。 */
 @media (prefers-reduced-motion: reduce) {

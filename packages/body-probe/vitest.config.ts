@@ -7,8 +7,14 @@ export default defineConfig({
     // clock, and the fake is hrtime-based so setSystemTime() cannot rewind it.
     fakeTimers: {
       toFake: [
-        'setTimeout', 'clearTimeout', 'setInterval', 'clearInterval',
-        'setImmediate', 'clearImmediate', 'Date', 'performance',
+        'setTimeout',
+        'clearTimeout',
+        'setInterval',
+        'clearInterval',
+        'setImmediate',
+        'clearImmediate',
+        'Date',
+        'performance',
       ],
     },
   },

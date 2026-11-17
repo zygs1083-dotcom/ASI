@@ -15,11 +15,11 @@
   padding: var(--sense-gap, 6px) var(--sense-pad-row, 8px);
 }
 
-.tile[data-sev='warn'] {
+.tile[data-sev="warn"] {
   border-color: var(--sev-warn, #f59e0b);
 }
 
-.tile[data-sev='critical'] {
+.tile[data-sev="critical"] {
   border-color: var(--sev-critical, #ec1313);
 }
 
@@ -33,9 +33,7 @@
  * 只对最后一个整行卡（span2/open）之后的尾部序列按非整行卡奇偶计数。
  */
 .tiles
-  > .tile:last-child:nth-child(
-    odd of .tile:not([data-span2]):not([open]):not(:has(~ .tile:is([data-span2], [open])))
-  ) {
+  > .tile:last-child:nth-child(odd of .tile:not([data-span2]):not([open]):not(:has(~ .tile:is([data-span2], [open])))) {
   grid-column: 1 / -1;
 }
 
@@ -60,11 +58,11 @@
   color: var(--dsw-alias-label-secondary, #61666b);
 }
 
-.tile[data-sev='warn'] .tileHead {
+.tile[data-sev="warn"] .tileHead {
   color: var(--sev-warn, #f59e0b);
 }
 
-.tile[data-sev='critical'] .tileHead {
+.tile[data-sev="critical"] .tileHead {
   color: var(--sev-critical, #ec1313);
 }
 
@@ -138,11 +136,11 @@
   font-variant-numeric: tabular-nums;
 }
 
-.detailLine[data-sev='warn'] {
+.detailLine[data-sev="warn"] {
   color: var(--sev-warn-ink);
 }
 
-.detailLine[data-sev='critical'] {
+.detailLine[data-sev="critical"] {
   color: var(--sev-critical-ink);
 }
 
@@ -228,15 +226,15 @@
   margin-left: auto;
 }
 
-.sevTag[data-sev='warn'] {
+.sevTag[data-sev="warn"] {
   color: var(--sev-warn-ink);
 }
 
-.sevTag[data-sev='critical'] {
+.sevTag[data-sev="critical"] {
   color: var(--sev-critical-ink);
 }
 
-.sevTag[data-sev='unknown'] {
+.sevTag[data-sev="unknown"] {
   color: var(--dsw-alias-label-secondary, #61666b);
 }
 

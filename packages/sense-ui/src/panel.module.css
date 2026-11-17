@@ -13,12 +13,16 @@
   --sev-good-ink: color-mix(in srgb, var(--sev-good) 35%, var(--dsw-alias-label-primary, #0f1115));
   --sev-warn-ink: color-mix(in srgb, var(--sev-warn) 35%, var(--dsw-alias-label-primary, #0f1115));
   --sev-critical-ink: color-mix(in srgb, var(--sev-critical) 75%, var(--dsw-alias-label-primary, #0f1115));
-  --sev-business-ink: color-mix(in srgb, var(--dsw-alias-state-business-primary, #4176e6) 60%, var(--dsw-alias-label-primary, #0f1115));
+  --sev-business-ink: color-mix(
+    in srgb,
+    var(--dsw-alias-state-business-primary, #4176e6) 60%,
+    var(--dsw-alias-label-primary, #0f1115)
+  );
   /* DSH 无 13/12px 字号角色令牌（见 THEME.md），尺寸为本地常量。 */
   --sense-fs: 13px;
   --sense-fs-s: 12px;
 
-  font-family: var(--dsw-font-family, -apple-system, 'PingFang SC', 'Segoe UI', sans-serif);
+  font-family: var(--dsw-font-family, -apple-system, "PingFang SC", "Segoe UI", sans-serif);
   font-size: var(--sense-fs);
   line-height: 20px;
   font-weight: 400;
@@ -61,7 +65,7 @@
   overflow-y: auto;
 }
 
-.panel:has(.notices [role='alert']) button {
+.panel:has(.notices [role="alert"]) button {
   scroll-margin-top: calc(40vh + 44px);
 }
 
@@ -102,14 +106,13 @@
 }
 
 .section > summary::before {
-  content: '';
+  content: "";
   width: 0;
   height: 0;
   border-left: 4px solid var(--dsw-alias-label-secondary, #61666b);
   border-top: 3.5px solid transparent;
   border-bottom: 3.5px solid transparent;
-  transition: transform var(--ds-transition-duration-fast, 0.1s)
-    var(--ds-ease-in-out, cubic-bezier(0.4, 0, 0.2, 1));
+  transition: transform var(--ds-transition-duration-fast, 0.1s) var(--ds-ease-in-out, cubic-bezier(0.4, 0, 0.2, 1));
 }
 
 .section[open] > summary::before {
@@ -191,7 +194,7 @@
   cursor: default;
 }
 
-.panel input[type='checkbox'] {
+.panel input[type="checkbox"] {
   accent-color: var(--sev-business-ink);
   margin: 0;
 }

@@ -1,9 +1,8 @@
 import { describe, expect, it, vi } from 'vitest';
-import { ExternalProcessSampler, SelfProcessSampler, parseElapsed, parsePsRow } from '../src/process.js';
 import type { RunFn } from '../src/command.js';
+import { ExternalProcessSampler, parseElapsed, parsePsRow, SelfProcessSampler } from '../src/process.js';
 
-const mem = (rss: number): NodeJS.MemoryUsage =>
-  ({ rss, heapTotal: 0, heapUsed: 0, external: 0, arrayBuffers: 0 });
+const mem = (rss: number): NodeJS.MemoryUsage => ({ rss, heapTotal: 0, heapUsed: 0, external: 0, arrayBuffers: 0 });
 const res = (user: number, system: number, maxRSS = 999): NodeJS.ResourceUsage =>
   ({ userCPUTime: user, systemCPUTime: system, maxRSS }) as NodeJS.ResourceUsage;
 
@@ -17,9 +16,11 @@ describe('parseElapsed', () => {
     expect(parseElapsed(s)).toBe(expected);
   });
   it.each(['abc', '1:99', '61:00', '2-25:00:00', '99999999999999999999:59', 'x:y'])(
-    'rejects invalid etime %s', (bad) => {
+    'rejects invalid etime %s',
+    (bad) => {
       expect(() => parseElapsed(bad)).toThrow();
-    });
+    },
+  );
 
   it('allows ordinary h:mm:ss hours above 23 when no day prefix exists', () => {
     expect(parseElapsed('30:00:00')).toBe(108000);
@@ -29,7 +30,9 @@ describe('parseElapsed', () => {
 describe('parsePsRow', () => {
   it('converts KiB rss, %cpu and etime', () => {
     expect(parsePsRow('  12345    2.5  01:02:03')).toEqual({
-      rss: 12345 * 1024, cpu: 0.025, uptimeSec: 3723,
+      rss: 12345 * 1024,
+      cpu: 0.025,
+      uptimeSec: 3723,
     });
   });
   it('rejects malformed rows', () => {
@@ -43,7 +46,11 @@ describe('SelfProcessSampler', () => {
     const usages = [res(1_000_000, 500_000), res(2_000_000, 1_000_000)];
     let i = 0;
     const s = new SelfProcessSampler({
-      now: () => (t += 1000) - 1000,
+      now: () => {
+        const result = t;
+        t += 1000;
+        return result;
+      },
       memoryUsage: () => mem(48 * 1024 * 1024),
       resourceUsage: () => usages[Math.min(i++, usages.length - 1)]!,
       uptime: () => 120,
@@ -62,7 +69,9 @@ describe('SelfProcessSampler', () => {
 describe('SelfProcessSampler errors', () => {
   it('returns unavailable when an OS call throws', () => {
     const s = new SelfProcessSampler({
-      resourceUsage: () => { throw new Error('ru dead'); },
+      resourceUsage: () => {
+        throw new Error('ru dead');
+      },
       memoryUsage: () => mem(1),
       uptime: () => 1,
     });
@@ -76,7 +85,11 @@ describe('SelfProcessSampler errors', () => {
     const usages = [res(0, 0), res(1000, 0)];
     let t = 0;
     const s = new SelfProcessSampler({
-      now: () => (t += 1000) - 1000,
+      now: () => {
+        const result = t;
+        t += 1000;
+        return result;
+      },
       resourceUsage: () => usages[Math.min(i++, usages.length - 1)]!,
       memoryUsage: () => mem(Number.NaN),
       uptime: () => 10,
@@ -88,7 +101,10 @@ describe('SelfProcessSampler errors', () => {
 });
 
 describe('ExternalProcessSampler', () => {
-  const run = (stdout: string): RunFn => async () => stdout;
+  const run =
+    (stdout: string): RunFn =>
+    async () =>
+      stdout;
 
   it('samples another pid via ps including day-format etime', async () => {
     const s = new ExternalProcessSampler(4242, { run: run('  20480   12.5  2-03:04:05\n') });
@@ -112,7 +128,11 @@ describe('ExternalProcessSampler', () => {
   });
 
   it('returns unavailable when the pid is gone or ps fails', async () => {
-    const s = new ExternalProcessSampler(4242, { run: async () => { throw new Error('exit 1'); } });
+    const s = new ExternalProcessSampler(4242, {
+      run: async () => {
+        throw new Error('exit 1');
+      },
+    });
     expect((await s.sample()).status).toBe('unavailable');
   });
 });

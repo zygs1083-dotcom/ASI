@@ -1,11 +1,11 @@
 // 共享契约在 @asi/sense-types（docs/DESIGN.md §2.2 / §2.2b）；本包只保留
 // memory.cached 这一处本机扩投影和 TokenSource 接口。
 
-import type { Body as SharedBody, Fact } from '@asi/sense-types';
+import type { Fact, Body as SharedBody } from '@asi/sense-types';
 
 export type {
-  DiskVolume,
   DisksFact,
+  DiskVolume,
   Fact,
   FactStatus,
   SourceRef,

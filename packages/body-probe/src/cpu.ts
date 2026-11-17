@@ -1,6 +1,6 @@
 import os from 'node:os';
-import type { CpuValue, Fact, SourceRef } from './types.js';
 import * as fact from './fact.js';
+import type { CpuValue, Fact, SourceRef } from './types.js';
 
 export interface CoreTimes {
   user: number;
@@ -16,7 +16,10 @@ export function snapshotTimes(cpus: readonly os.CpuInfo[]): CoreTimes[] {
 
 const FIELDS: readonly (keyof CoreTimes)[] = ['user', 'nice', 'sys', 'idle', 'irq'];
 
-export function deltaUsage(prev: readonly CoreTimes[], next: readonly CoreTimes[]): {
+export function deltaUsage(
+  prev: readonly CoreTimes[],
+  next: readonly CoreTimes[],
+): {
   perCore: number[];
   overall: number;
 } | null {
@@ -71,7 +74,11 @@ export class CpuSampler {
       if (![load1, load5, load15].every((n) => Number.isFinite(n))) {
         return fact.fail('unavailable', this.src, ttlMs);
       }
-      return fact.ok({ usage: delta.overall, perCore: delta.perCore, load1: load1!, load5: load5!, load15: load15! }, this.src, ttlMs);
+      return fact.ok(
+        { usage: delta.overall, perCore: delta.perCore, load1: load1!, load5: load5!, load15: load15! },
+        this.src,
+        ttlMs,
+      );
     } catch (err) {
       this.prev = undefined;
       return fact.fail(fact.errorStatus(err), this.src, ttlMs);

@@ -1,13 +1,16 @@
-import { describe, expect, it, vi } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { drainCommands, runCommand, type ExecFn } from '../src/command.js';
+import { describe, expect, it, vi } from 'vitest';
+import { drainCommands, type ExecFn, runCommand } from '../src/command.js';
 
 function deferred<T>() {
   let resolve!: (v: T) => void;
   let reject!: (e: unknown) => void;
-  const promise = new Promise<T>((res, rej) => { resolve = res; reject = rej; });
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
   return { promise, resolve, reject };
 }
 
@@ -25,10 +28,7 @@ describe('runCommand', () => {
 
   it('does not alias args that collapse under string join', async () => {
     const exec = vi.fn<ExecFn>(async () => ({ stdout: 'x' }));
-    await Promise.all([
-      runCommand('/bin/fake', ['a b'], exec),
-      runCommand('/bin/fake', ['a', 'b'], exec),
-    ]);
+    await Promise.all([runCommand('/bin/fake', ['a b'], exec), runCommand('/bin/fake', ['a', 'b'], exec)]);
     expect(exec).toHaveBeenCalledTimes(2);
   });
 
@@ -39,9 +39,7 @@ describe('runCommand', () => {
   });
 
   it('removes the in-flight entry so a retry after error calls exec again', async () => {
-    const exec = vi.fn<ExecFn>()
-      .mockRejectedValueOnce(new Error('boom'))
-      .mockResolvedValue({ stdout: 'ok' });
+    const exec = vi.fn<ExecFn>().mockRejectedValueOnce(new Error('boom')).mockResolvedValue({ stdout: 'ok' });
     await expect(runCommand('/bin/fake', [], exec)).rejects.toThrow('boom');
     expect(await runCommand('/bin/fake', [], exec)).toBe('ok');
     expect(exec).toHaveBeenCalledTimes(2);
@@ -64,7 +62,9 @@ describe('runCommand', () => {
   });
 
   it('rejects when exec rejects (collectors convert to facts)', async () => {
-    const exec = vi.fn<ExecFn>(async () => { throw Object.assign(new Error('killed'), { code: 'SIGKILL' }); });
+    const exec = vi.fn<ExecFn>(async () => {
+      throw Object.assign(new Error('killed'), { code: 'SIGKILL' });
+    });
     await expect(runCommand('/bin/fake', [], exec)).rejects.toThrow('killed');
   });
 });
@@ -72,7 +72,11 @@ describe('runCommand', () => {
 describe('runCommand cancellation', () => {
   it('serializes an identical command across different signals, retrying after settle', async () => {
     const execs: ReturnType<typeof deferred<{ stdout: string }>>[] = [];
-    const exec = vi.fn<ExecFn>(() => { const d = deferred<{ stdout: string }>(); execs.push(d); return d.promise; });
+    const exec = vi.fn<ExecFn>(() => {
+      const d = deferred<{ stdout: string }>();
+      execs.push(d);
+      return d.promise;
+    });
     const p1 = runCommand('/bin/f', ['a'], exec, new AbortController().signal);
     const p2 = runCommand('/bin/f', ['a'], exec, new AbortController().signal);
     expect(exec).toHaveBeenCalledTimes(1);
@@ -108,10 +112,17 @@ describe('runCommand cancellation', () => {
   it('drainCommands waits only for commands under the drained signal', async () => {
     const d = deferred<{ stdout: string }>();
     const c = new AbortController();
-    const pending = runCommand('/bin/f', [], vi.fn<ExecFn>(() => d.promise), c.signal);
+    const pending = runCommand(
+      '/bin/f',
+      [],
+      vi.fn<ExecFn>(() => d.promise),
+      c.signal,
+    );
     pending.catch(() => {});
     let drained = false;
-    const draining = drainCommands(c.signal).then(() => { drained = true; });
+    const draining = drainCommands(c.signal).then(() => {
+      drained = true;
+    });
     await Promise.resolve();
     expect(drained).toBe(false);
     d.resolve({ stdout: 'ok' });
@@ -123,20 +134,34 @@ describe('runCommand cancellation', () => {
   it('rejects an aborted real command only after the child exits', async () => {
     const pidFile = path.join(os.tmpdir(), `body-probe-${process.pid}.pid`);
     const controller = new AbortController();
-    const pending = runCommand(process.execPath, [
-      '-e',
-      `require('node:fs').writeFileSync(${JSON.stringify(pidFile)}, String(process.pid)); setInterval(() => {}, 6e4);`,
-    ], undefined, controller.signal);
+    const pending = runCommand(
+      process.execPath,
+      [
+        '-e',
+        `require('node:fs').writeFileSync(${JSON.stringify(pidFile)}, String(process.pid)); setInterval(() => {}, 6e4);`,
+      ],
+      undefined,
+      controller.signal,
+    );
     pending.catch(() => {});
     let pid = 0;
     try {
-      await vi.waitFor(() => { pid = Number(fs.readFileSync(pidFile, 'utf8')); }, { timeout: 5000, interval: 20 });
+      await vi.waitFor(
+        () => {
+          pid = Number(fs.readFileSync(pidFile, 'utf8'));
+        },
+        { timeout: 5000, interval: 20 },
+      );
       controller.abort();
       await expect(pending).rejects.toThrow();
       expect(() => process.kill(pid, 0)).toThrowError(/ESRCH/);
     } finally {
       controller.abort();
-      try { if (pid) process.kill(pid, 'SIGKILL'); } catch { /* already gone */ }
+      try {
+        if (pid) process.kill(pid, 'SIGKILL');
+      } catch {
+        /* already gone */
+      }
       fs.rmSync(pidFile, { force: true });
     }
   });

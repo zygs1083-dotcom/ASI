@@ -18,15 +18,25 @@ export function parsePmsetBatt(text: string): BatteryValue | null {
   const ac = /Now drawing from 'AC Power'/.test(text);
   const onBattery = /Now drawing from 'Battery Power'/.test(text);
   const powerState = ac
-    ? m[2]!.trim() === 'charged' || minutes === 0 ? 'charged' : charging ? 'charging' : 'external'
-    : onBattery ? 'battery' : undefined;
+    ? m[2]!.trim() === 'charged' || minutes === 0
+      ? 'charged'
+      : charging
+        ? 'charging'
+        : 'external'
+    : onBattery
+      ? 'battery'
+      : undefined;
   return {
     percent,
     charging,
     ...(powerState ? { powerState } : {}),
     ...(powerState !== 'charged' && /\(no estimate\)/i.test(m[3]!) ? { estimatePending: true } : {}),
     ...((powerState === 'battery' || powerState === 'charging') &&
-      minutes !== undefined && Number.isSafeInteger(minutes) && minutes > 0 ? { minutesLeft: minutes } : {}),
+    minutes !== undefined &&
+    Number.isSafeInteger(minutes) &&
+    minutes > 0
+      ? { minutesLeft: minutes }
+      : {}),
   };
 }
 
@@ -48,7 +58,10 @@ export class BatterySampler {
       return Promise.resolve(fact.fail('unavailable', this.src, ttlMs));
     }
     const run = this.deps.run ?? defaultRun;
-    return fact.collect(this.src, async () =>
-      parsePmsetBatt(await run('/usr/bin/pmset', ['-g', 'batt'], signal)), ttlMs);
+    return fact.collect(
+      this.src,
+      async () => parsePmsetBatt(await run('/usr/bin/pmset', ['-g', 'batt'], signal)),
+      ttlMs,
+    );
   }
 }

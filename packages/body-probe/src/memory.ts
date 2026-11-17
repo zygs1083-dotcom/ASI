@@ -60,8 +60,8 @@ export interface MemoryDeps {
   run?: RunFn;
   platform?: NodeJS.Platform;
   totalmem?: () => number;
-  now?: () => number;   // monotonic clock for cache eligibility
-  wall?: () => number;  // wall clock stamped on cache entries and facts
+  now?: () => number; // monotonic clock for cache eligibility
+  wall?: () => number; // wall clock stamped on cache entries and facts
   src?: SourceRef;
 }
 
@@ -71,8 +71,8 @@ export interface MemoryPeriods {
 }
 
 interface Cached<T> {
-  at: number;          // monotonic stamp used for expiry
-  observedAt: number;  // wall stamp of the cached observation
+  at: number; // monotonic stamp used for expiry
+  observedAt: number; // wall stamp of the cached observation
   value: T;
 }
 
@@ -102,8 +102,8 @@ export class MemorySampler {
     const pressureMs = Math.max(periods.pressureMs ?? PRESSURE_CACHE_MS, ttlMs / 3);
     try {
       const swap = this.swapCache && now() - this.swapCache.at < swapMs ? this.swapCache : undefined;
-      const pressure = this.pressureCache && now() - this.pressureCache.at < pressureMs
-        ? this.pressureCache : undefined;
+      const pressure =
+        this.pressureCache && now() - this.pressureCache.at < pressureMs ? this.pressureCache : undefined;
       // Simultaneously-due sysctl OIDs share one invocation; output lines
       // come back in argument order.
       const sysctlKeys = [
@@ -113,7 +113,9 @@ export class MemorySampler {
       const stamp = (value: string) => ({ value, observedAt: wall(), at: now() });
       const [vmR, sysctlR] = await Promise.allSettled([
         run('/usr/bin/vm_stat', [], signal).then(stamp),
-        sysctlKeys.length ? run('/usr/sbin/sysctl', ['-n', ...sysctlKeys], signal).then(stamp) : Promise.resolve(undefined),
+        sysctlKeys.length
+          ? run('/usr/sbin/sysctl', ['-n', ...sysctlKeys], signal).then(stamp)
+          : Promise.resolve(undefined),
       ]);
       // A fast failure still waits for the slower sibling: the process may be
       // lingering until here, so only map the error after all have settled.
@@ -121,8 +123,8 @@ export class MemorySampler {
       if (sysctlR.status === 'rejected') throw sysctlR.reason;
       if (signal?.aborted) throw signal.reason;
       const sysctlLines = (sysctlR.value?.value ?? '').trim().split('\n');
-      const pressureText = pressure ? '' : sysctlLines.shift() ?? '';
-      const swapText = swap ? '' : sysctlLines.shift() ?? '';
+      const pressureText = pressure ? '' : (sysctlLines.shift() ?? '');
+      const swapText = swap ? '' : (sysctlLines.shift() ?? '');
       const { observedAt: wallNow, at: monoNow } = sysctlR.value ?? vmR.value;
       // The fact uses the vm reading's wall time and expires at the earliest
       // absolute constituent deadline (vm's period is ttl/3).
@@ -147,13 +149,18 @@ export class MemorySampler {
         parts.push({ observedAt: wallNow, periodMs: pressureMs, at: monoNow });
       }
       const meta = fact.oldestMeta(parts);
-      const f = fact.ok({
-        total: totalmem(),
-        used: (Math.max(0, vm.anonymous - vm.purgeable) + vm.wired + vm.compressorOccupied) * vm.pageSize,
-        cached: (vm.fileBacked + vm.purgeable) * vm.pageSize,
-        pressure: level,
-        swapUsed,
-      }, this.src, Math.max(0, meta.expiresAt! - vmR.value.at), vmR.value.observedAt);
+      const f = fact.ok(
+        {
+          total: totalmem(),
+          used: (Math.max(0, vm.anonymous - vm.purgeable) + vm.wired + vm.compressorOccupied) * vm.pageSize,
+          cached: (vm.fileBacked + vm.purgeable) * vm.pageSize,
+          pressure: level,
+          swapUsed,
+        },
+        this.src,
+        Math.max(0, meta.expiresAt! - vmR.value.at),
+        vmR.value.observedAt,
+      );
       if (meta.expiresAt !== undefined) fact.trackDeadline(f, meta.expiresAt);
       return f;
     } catch (err) {

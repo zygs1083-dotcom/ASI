@@ -82,7 +82,9 @@ export class TunerGuard {
     const current = this.store.values.get(param);
     const floor = /^floor\..+\.(warn|critical)$/.test(param);
     const critical = param.endsWith('.critical');
-    const other = floor ? this.store.values.get(param.replace(/\.(warn|critical)$/, critical ? '.warn' : '.critical')) : undefined;
+    const other = floor
+      ? this.store.values.get(param.replace(/\.(warn|critical)$/, critical ? '.warn' : '.critical'))
+      : undefined;
     let why: string | null = null;
     // Nonfinite clocks reject EVERYTHING — no value/window mutation, ever.
     if (!finiteNum(now) || !finiteNum(wall)) why = 'nonfinite clock';

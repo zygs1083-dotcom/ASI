@@ -15,11 +15,11 @@ import type {
   SenseState,
   Signal,
   SourceRef,
-} from '../view-model'
+} from '../view-model';
 
-export const T0 = 1_763_300_000_000
+export const T0 = 1_763_300_000_000;
 
-export const src = (api: string): SourceRef => ({ id: api, api, host: 'demo-host' })
+export const src = (api: string): SourceRef => ({ id: api, api, host: 'demo-host' });
 
 export function fact<T>(
   value: T | null,
@@ -32,33 +32,29 @@ export function fact<T>(
     observedAt: T0 - (opts.ageMs ?? 1_000),
     ttlMs: opts.ttlMs ?? 5_000,
     reason: opts.reason,
-  }
+  };
 }
 
 /** 无值的事实（denied/unavailable/unsupported/unknown/stale-null），T 由赋值上下文推断。 */
 export function emptyFact<T>(status: FactStatus, reason?: string): Fact<T> {
-  return fact<T>(null, { status, reason })
+  return fact<T>(null, { status, reason });
 }
 
 export function disksFixture(value: DiskVolume[] | null, opts: Parameters<typeof fact>[1] = {}): DisksFact {
-  return { ...fact(value, opts), kind: 'disks' }
+  return { ...fact(value, opts), kind: 'disks' };
 }
 
-export const denied = <T>(reason: string): Fact<T> => emptyFact<T>('denied', reason)
+export const denied = <T>(reason: string): Fact<T> => emptyFact<T>('denied', reason);
 
-export function series(
-  points: number,
-  stepMs: number,
-  fn: (i: number) => number,
-): MetricPoint[] {
+export function series(points: number, stepMs: number, fn: (i: number) => number): MetricPoint[] {
   return Array.from({ length: points }, (_, i) => ({
     at: T0 - (points - 1 - i) * stepMs,
     value: fn(i),
-  }))
+  }));
 }
 
 const sine = (base: number, amp: number, period: number) => (i: number) =>
-  Math.max(0, Math.min(1, base + amp * Math.sin(i / period)))
+  Math.max(0, Math.min(1, base + amp * Math.sin(i / period)));
 
 export function makeHistory(over: Partial<BodyHistory> = {}): BodyHistory {
   return {
@@ -76,7 +72,7 @@ export function makeHistory(over: Partial<BodyHistory> = {}): BodyHistory {
       '/demo/vol': series(60, 5_000, sine(0.4, 0.004, 20)),
     },
     ...over,
-  }
+  };
 }
 
 /** 已就绪场景的基线区间（与 history 同单位）；learning 场景自行提供无 band 的版本。 */
@@ -96,13 +92,19 @@ export function makeInsights(
     'disk:/': { baseline: { low: 0.55, high: 0.7 }, sources: ['floor', 'baseline'], triggered: [] },
     'disk:/demo/vol': { baseline: { low: 0.35, high: 0.45 }, sources: ['floor'], triggered: [] },
     ...over,
-  }
+  };
 }
 
 export function makeBody(): SenseState['self']['body'] {
-  const battery = { percent: 76, charging: false, powerState: 'battery' as const, minutesLeft: 240 }
+  const battery = { percent: 76, charging: false, powerState: 'battery' as const, minutesLeft: 240 };
   return {
-    cpu: fact({ usage: 0.34, perCore: [0.3, 0.5, 0.28, 0.42, 0.36, 0.31, 0.4, 0.29], load1: 2.1, load5: 1.8, load15: 1.6 }),
+    cpu: fact({
+      usage: 0.34,
+      perCore: [0.3, 0.5, 0.28, 0.42, 0.36, 0.31, 0.4, 0.29],
+      load1: 2.1,
+      load5: 1.8,
+      load15: 1.6,
+    }),
     memory: fact({
       total: 32e9,
       used: 19.4e9,
@@ -128,7 +130,7 @@ export function makeBody(): SenseState['self']['body'] {
       compressionThreshold: 115_200,
       contextGrowthPerMinute: 720,
     }),
-  }
+  };
 }
 
 export function makeState(over: Partial<SenseState> = {}): SenseState {
@@ -159,7 +161,7 @@ export function makeState(over: Partial<SenseState> = {}): SenseState {
         'dsh-events': { status: 'ok', lastSignalAt: T0 - 1_000 },
       },
     },
-  }
+  };
   return {
     self: { ...base.self, ...over.self },
     env: {
@@ -168,22 +170,22 @@ export function makeState(over: Partial<SenseState> = {}): SenseState {
       where: { ...base.env.where, ...over.env?.where },
     },
     observation: { ...base.observation, ...over.observation },
-  }
+  };
 }
 
 export function makeEvent(
   i: number,
   over: Partial<Omit<SenseEvent, 'signal'>> & { signal?: Partial<Signal> } = {},
 ): SenseEvent {
-  const { signal: sigOver, ...rest } = over
-  const kinds = ['app.activated', 'window.focused', 'file.changed', 'job.exited']
-  const kind = kinds[i % kinds.length]!
+  const { signal: sigOver, ...rest } = over;
+  const kinds = ['app.activated', 'window.focused', 'file.changed', 'job.exited'];
+  const kind = kinds[i % kinds.length]!;
   const subjects: Record<string, string> = {
     'app.activated': 'com.demo.browser',
     'window.focused': 'demo.ts — project',
     'file.changed': '/demo/project/src/a.ts',
     'job.exited': 'job-7',
-  }
+  };
   return {
     signal: {
       id: `sig-${i}`,
@@ -199,14 +201,11 @@ export function makeEvent(
     reason: '默认记录规则',
     cause: 'user',
     ...rest,
-  }
+  };
 }
 
 /** 面板模型：默认空事件、默认规则、now=T0、默认历史与 insight。 */
-export function panelModel(
-  state: SenseState,
-  over: Partial<SensePanelModel> = {},
-): SensePanelModel {
+export function panelModel(state: SenseState, over: Partial<SensePanelModel> = {}): SensePanelModel {
   return {
     state,
     events: over.events ?? [],
@@ -217,7 +216,7 @@ export function panelModel(
     history: makeHistory(),
     insights: makeInsights(),
     ...over,
-  }
+  };
 }
 
 export function makeRules(): SenseRule[] {
@@ -250,5 +249,5 @@ export function makeRules(): SenseRule[] {
       level: 'record',
       createdBy: 'user',
     },
-  ]
+  ];
 }

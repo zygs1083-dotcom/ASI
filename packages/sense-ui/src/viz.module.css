@@ -70,11 +70,7 @@
 }
 
 .sparkBand {
-  fill: color-mix(
-    in srgb,
-    var(--dsw-alias-state-business-primary, #4176e6) 16%,
-    transparent
-  );
+  fill: color-mix(in srgb, var(--dsw-alias-state-business-primary, #4176e6) 16%, transparent);
 }
 
 .sparkEmpty {
@@ -105,11 +101,7 @@
 }
 
 .thrLabel {
-  background: color-mix(
-    in srgb,
-    var(--dsw-specific-sidebar-fill, #f9fafb) 72%,
-    transparent
-  );
+  background: color-mix(in srgb, var(--dsw-specific-sidebar-fill, #f9fafb) 72%, transparent);
 }
 
 .axisYMax {
@@ -126,11 +118,11 @@
   transform: translateY(-50%);
 }
 
-.thrLabel[data-sev='warn'] {
+.thrLabel[data-sev="warn"] {
   color: var(--sev-warn-ink);
 }
 
-.thrLabel[data-sev='critical'] {
+.thrLabel[data-sev="critical"] {
   color: var(--sev-critical-ink);
 }
 
@@ -166,15 +158,14 @@
 
 .ringFill {
   stroke: var(--dsw-alias-state-business-primary, #4176e6);
-  transition: stroke var(--ds-transition-duration, 0.2s)
-    var(--ds-ease-in-out, cubic-bezier(0.4, 0, 0.2, 1));
+  transition: stroke var(--ds-transition-duration, 0.2s) var(--ds-ease-in-out, cubic-bezier(0.4, 0, 0.2, 1));
 }
 
-[data-sev='warn'] .ringFill {
+[data-sev="warn"] .ringFill {
   stroke: var(--dsw-alias-state-warn-primary, #f59e0b);
 }
 
-[data-sev='critical'] .ringFill {
+[data-sev="critical"] .ringFill {
   stroke: var(--dsw-alias-state-error-primary, #ec1313);
 }
 

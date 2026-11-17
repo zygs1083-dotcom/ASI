@@ -32,8 +32,8 @@ ASI_PERF_STRICT=1 pnpm --filter @asi/sense-ui exec vitest run --browser.headless
 ## 使用
 
 ```tsx
-import { SensePanel } from '@asi/sense-ui'
-import type { SensePanelModel, SensePanelProps } from '@asi/sense-ui'
+import { SensePanel } from '@asi/sense-ui';
+import type { SensePanelModel, SensePanelProps } from '@asi/sense-ui';
 ```
 
 `package.json` 的 `exports["."]` 指向 `src/index.ts` 源码与类型——Vite 消费方直接编译源码，本包不预构建库产物。
@@ -71,20 +71,20 @@ import type { SensePanelModel, SensePanelProps } from '@asi/sense-ui'
 
 ## 评审修复对应测试
 
-| 评审发现 | 回归测试 |
-|---|---|
-| 触发无 severity 误判健康 | `health.test.ts` 缺省严重度用例、`regressions.test.tsx`「宿主未给严重度」 |
-| fallback 容量与真容量不分 | `regressions.test.tsx`「容量未确认」用例、`panel.spec.ts`「容量未确认」截图 |
-| 父级磁盘状态一票否决新鲜卷 | `health.test.ts`「卷级磁盘状态」、`regressions.test.tsx`「磁盘卷级新鲜度」、`panel.spec.ts`「disk-partial」截图 |
-| 磁盘父级状态及新鲜卷期限 | body-probe `disks.test.ts`「aggregates parent metadata only over fresh volumes」 |
-| 根 stale + /data 剩余 2% 与 /net 不可读 | `regressions.test.tsx`「根卷 stale、/data 剩余 2%」「根卷新鲜且 /net 无法读取」 |
-| 时钟推进重算图形/明细早挂载 | `chart-perf.test.tsx`（sampleHistory/buildSpark spy）、`panel.test.tsx` 懒挂载断言 |
-| 标注半透明底不可读 | `panel.spec.ts`「标注底色不透明」alpha=1 断言 |
-| 历史事件 ETA 冒充当前 | `attention.test.ts`「insight 无 currentEta 时不从事件 detail 推导见底时间」等 |
-| stale 仍称「当前速度」 | `regressions.test.tsx`「过期事实禁用当前推算」 |
-| 极小增速溢出 Infinity | `format.test.ts`「formatDuration 边界」、`regressions.test.tsx`「fillMinutes 结果护栏」 |
-| 阈值层/单位/边界/线型 | `attention.test.ts`「阈值解析」、`panel.spec.ts`「告警线为虚线、严重线为实线」 |
-| 大 history 渲染崩溃/磁贴重复渲染 | `sparkline.test.tsx`「sampleHistory 降采样」200k 用例、`regressions.test.tsx`「磁贴渲染隔离」 |
-| 无效磁盘读数误报健康 | `health.test.ts` diskValid 用例、`regressions.test.tsx`「无有效磁盘读数」 |
-| 工具栏无 landmark | `panel.spec.ts` axeCheck（region 也拒绝） |
-| 标签拥挤/末位半空行 | `panel.spec.ts`「不与标签重叠」「末位配对」 |
+| 评审发现                                | 回归测试                                                                                                        |
+| --------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
+| 触发无 severity 误判健康                | `health.test.ts` 缺省严重度用例、`regressions.test.tsx`「宿主未给严重度」                                       |
+| fallback 容量与真容量不分               | `regressions.test.tsx`「容量未确认」用例、`panel.spec.ts`「容量未确认」截图                                     |
+| 父级磁盘状态一票否决新鲜卷              | `health.test.ts`「卷级磁盘状态」、`regressions.test.tsx`「磁盘卷级新鲜度」、`panel.spec.ts`「disk-partial」截图 |
+| 磁盘父级状态及新鲜卷期限                | body-probe `disks.test.ts`「aggregates parent metadata only over fresh volumes」                                |
+| 根 stale + /data 剩余 2% 与 /net 不可读 | `regressions.test.tsx`「根卷 stale、/data 剩余 2%」「根卷新鲜且 /net 无法读取」                                 |
+| 时钟推进重算图形/明细早挂载             | `chart-perf.test.tsx`（sampleHistory/buildSpark spy）、`panel.test.tsx` 懒挂载断言                              |
+| 标注半透明底不可读                      | `panel.spec.ts`「标注底色不透明」alpha=1 断言                                                                   |
+| 历史事件 ETA 冒充当前                   | `attention.test.ts`「insight 无 currentEta 时不从事件 detail 推导见底时间」等                                   |
+| stale 仍称「当前速度」                  | `regressions.test.tsx`「过期事实禁用当前推算」                                                                  |
+| 极小增速溢出 Infinity                   | `format.test.ts`「formatDuration 边界」、`regressions.test.tsx`「fillMinutes 结果护栏」                         |
+| 阈值层/单位/边界/线型                   | `attention.test.ts`「阈值解析」、`panel.spec.ts`「告警线为虚线、严重线为实线」                                  |
+| 大 history 渲染崩溃/磁贴重复渲染        | `sparkline.test.tsx`「sampleHistory 降采样」200k 用例、`regressions.test.tsx`「磁贴渲染隔离」                   |
+| 无效磁盘读数误报健康                    | `health.test.ts` diskValid 用例、`regressions.test.tsx`「无有效磁盘读数」                                       |
+| 工具栏无 landmark                       | `panel.spec.ts` axeCheck（region 也拒绝）                                                                       |
+| 标签拥挤/末位半空行                     | `panel.spec.ts`「不与标签重叠」「末位配对」                                                                     |

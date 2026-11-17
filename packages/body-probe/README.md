@@ -10,13 +10,15 @@ probe-local extensions (e.g. memory `cached`) are declared here.
 ```ts
 import { BodyProbe } from '@asi/body-probe';
 
-const probe = new BodyProbe();          // optional: (collectors, { now, wall, platform })
-const off = probe.onSample((body) => { /* render gauges */ });
-probe.start({ intervalMs: 2000 });          // immediate tick, then every 2s
+const probe = new BodyProbe(); // optional: (collectors, { now, wall, platform })
+const off = probe.onSample((body) => {
+  /* render gauges */
+});
+probe.start({ intervalMs: 2000 }); // immediate tick, then every 2s
 // probe.start({ intervalMs: 2000, cadence: { memoryMs: 10_000 } }); // cadence override
-probe.latest();                             // freshest Body | null (stale-marked)
-probe.history(120);                         // chronological { at, body }[], <= 300s
-await probe.stop();                         // cancels cadence, bounded wait
+probe.latest(); // freshest Body | null (stale-marked)
+probe.history(120); // chronological { at, body }[], <= 300s
+await probe.stop(); // cancels cadence, bounded wait
 off();
 ```
 

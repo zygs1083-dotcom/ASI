@@ -13,24 +13,24 @@
 
 fallback 取自 DSH light 值，仅用于脱离宿主预览兜底。
 
-| 用途 | 令牌 | light fallback | dark 对应值（design-platform.css） |
-|---|---|---|---|
-| 正文色 | `--dsw-alias-label-primary` | `#0f1115` | `#f9fafb` |
-| 次级文本 | `--dsw-alias-label-secondary` | `#61666b` | `#cfd3d6` |
-| 弱化文本 | `--dsw-alias-label-tertiary` | `#81858c` | `#adb2b8` |
-| 面板底色 | `--dsw-specific-sidebar-fill` | `#f9fafb` | `#1b1b1c` |
-| 弱分隔线 | `--dsw-alias-border-l1` | `rgba(0,0,0,.04)` | `rgba(255,255,255,.06)` |
-| 分隔线 | `--dsw-alias-border-l2` | `rgba(0,0,0,.1)` | `rgba(255,255,255,.12)` |
-| 按钮描边 | `--dsw-alias-border-l4` | `rgba(0,0,0,.16)` | `rgba(255,255,255,.2)` |
-| 按钮底 | `--dsw-alias-bg-layer-1` | `#fff` | `#232324` |
-| 主色/链接/焦点 | `--dsw-alias-state-business-primary` | `#4176e6` | `#7aaaff` |
-| 错误 | `--dsw-alias-state-error-primary` | `#ec1313` | `#f25a5a` |
-| 成功 | `--dsw-alias-state-success-primary` | `#22c55e` | `#22c55e` |
-| 警告 | `--dsw-alias-state-warn-primary` | `#f59e0b` | `#f59e0b` |
-| 正文字体 | `--dsw-font-family` | `-apple-system …` | 同 |
-| 等宽 | `--ds-font-family-code` | SF Mono … | 同 |
-| 圆角 | `--dsw-radius-xs` / `--dsw-radius-sm` | `4px` / `8px` | 同 |
-| 过渡 | `--ds-transition-duration(-fast)`、`--ds-ease-in-out` | `.2s`/`.1s`、`cubic-bezier(.4,0,.2,1)` | 同 |
+| 用途           | 令牌                                                  | light fallback                         | dark 对应值（design-platform.css） |
+| -------------- | ----------------------------------------------------- | -------------------------------------- | ---------------------------------- |
+| 正文色         | `--dsw-alias-label-primary`                           | `#0f1115`                              | `#f9fafb`                          |
+| 次级文本       | `--dsw-alias-label-secondary`                         | `#61666b`                              | `#cfd3d6`                          |
+| 弱化文本       | `--dsw-alias-label-tertiary`                          | `#81858c`                              | `#adb2b8`                          |
+| 面板底色       | `--dsw-specific-sidebar-fill`                         | `#f9fafb`                              | `#1b1b1c`                          |
+| 弱分隔线       | `--dsw-alias-border-l1`                               | `rgba(0,0,0,.04)`                      | `rgba(255,255,255,.06)`            |
+| 分隔线         | `--dsw-alias-border-l2`                               | `rgba(0,0,0,.1)`                       | `rgba(255,255,255,.12)`            |
+| 按钮描边       | `--dsw-alias-border-l4`                               | `rgba(0,0,0,.16)`                      | `rgba(255,255,255,.2)`             |
+| 按钮底         | `--dsw-alias-bg-layer-1`                              | `#fff`                                 | `#232324`                          |
+| 主色/链接/焦点 | `--dsw-alias-state-business-primary`                  | `#4176e6`                              | `#7aaaff`                          |
+| 错误           | `--dsw-alias-state-error-primary`                     | `#ec1313`                              | `#f25a5a`                          |
+| 成功           | `--dsw-alias-state-success-primary`                   | `#22c55e`                              | `#22c55e`                          |
+| 警告           | `--dsw-alias-state-warn-primary`                      | `#f59e0b`                              | `#f59e0b`                          |
+| 正文字体       | `--dsw-font-family`                                   | `-apple-system …`                      | 同                                 |
+| 等宽           | `--ds-font-family-code`                               | SF Mono …                              | 同                                 |
+| 圆角           | `--dsw-radius-xs` / `--dsw-radius-sm`                 | `4px` / `8px`                          | 同                                 |
+| 过渡           | `--ds-transition-duration(-fast)`、`--ds-ease-in-out` | `.2s`/`.1s`、`cubic-bezier(.4,0,.2,1)` | 同                                 |
 
 **字号说明**：DSH 源码里没有 13/12px 的字号角色令牌（`base.css` 仅定义 `--dsw-font-family`/`-brand` 与 markdown 排版变量；`rg -- '--dsw-font-'` 验证无 `--dsw-font-xs-13`/`--dsw-font-xxs-12` 这类令牌）。组件因此在 `.panel` 上定义本地常量 `--sense-fs: 13px` / `--sense-fs-s: 12px`，字体族仍消费 `--dsw-font-family`。
 

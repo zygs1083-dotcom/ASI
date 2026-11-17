@@ -1,9 +1,14 @@
-import { describe, expect, it } from 'vitest';
-import { CpuSampler, deltaUsage, type CoreTimes } from '../src/cpu.js';
 import type { CpuInfo } from 'node:os';
+import { describe, expect, it } from 'vitest';
+import { type CoreTimes, CpuSampler, deltaUsage } from '../src/cpu.js';
 
-const t = (user: number, nice: number, sys: number, idle: number, irq: number): CoreTimes =>
-  ({ user, nice, sys, idle, irq });
+const t = (user: number, nice: number, sys: number, idle: number, irq: number): CoreTimes => ({
+  user,
+  nice,
+  sys,
+  idle,
+  irq,
+});
 
 const cpus = (...cores: CoreTimes[]): CpuInfo[] =>
   cores.map((times) => ({ model: 'fake', speed: 2400, times })) as CpuInfo[];
@@ -42,10 +47,7 @@ describe('deltaUsage', () => {
 
 describe('CpuSampler', () => {
   it('returns unknown baseline on first sample then ratios', () => {
-    const seq = [
-      cpus(t(0, 0, 0, 0, 0), t(0, 0, 0, 0, 0)),
-      cpus(t(10, 5, 10, 75, 0), t(50, 0, 50, 100, 0)),
-    ];
+    const seq = [cpus(t(0, 0, 0, 0, 0), t(0, 0, 0, 0, 0)), cpus(t(10, 5, 10, 75, 0), t(50, 0, 50, 100, 0))];
     let i = 0;
     const s = new CpuSampler({ cpus: () => seq[Math.min(i++, seq.length - 1)]!, loadavg: () => [1.5, 2.5, 3.5] });
     const first = s.sample();
@@ -62,7 +64,7 @@ describe('CpuSampler', () => {
     const seq = [
       cpus(t(100, 0, 0, 100, 0)),
       cpus(t(200, 0, 0, 200, 0)),
-      cpus(t(1, 0, 0, 1, 0)),   // reset
+      cpus(t(1, 0, 0, 1, 0)), // reset
       cpus(t(21, 0, 0, 41, 0)), // delta total 60 busy 20
     ];
     let i = 0;
@@ -78,7 +80,12 @@ describe('CpuSampler', () => {
   });
 
   it('returns unavailable when the OS call throws', () => {
-    const s = new CpuSampler({ cpus: () => { throw new Error('os dead'); }, loadavg: () => [0, 0, 0] });
+    const s = new CpuSampler({
+      cpus: () => {
+        throw new Error('os dead');
+      },
+      loadavg: () => [0, 0, 0],
+    });
     const f = s.sample();
     expect(f.status).toBe('unavailable');
     expect(f.value).toBeNull();

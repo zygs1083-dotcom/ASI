@@ -1,8 +1,7 @@
 /** 八个演示场景，供预览与 e2e 截图使用。 */
 
-import type { SenseEvent, SensePanelModel } from '../view-model'
+import type { SenseEvent, SensePanelModel } from '../view-model';
 import {
-  T0,
   denied,
   emptyFact,
   fact,
@@ -13,8 +12,9 @@ import {
   makeState,
   panelModel,
   series,
-} from './fixtures'
-import { contextAlmostFull, diskPartial, tokenFallback } from './scenarios-extra'
+  T0,
+} from './fixtures';
+import { contextAlmostFull, diskPartial, tokenFallback } from './scenarios-extra';
 
 export const SCENARIOS = [
   'healthy',
@@ -29,9 +29,9 @@ export const SCENARIOS = [
   'disk-partial',
   'tuning-disabled',
   'rebaseline-suggested',
-] as const
+] as const;
 
-export type ScenarioName = (typeof SCENARIOS)[number]
+export type ScenarioName = (typeof SCENARIOS)[number];
 
 function healthy(): SensePanelModel {
   const events = [
@@ -39,70 +39,64 @@ function healthy(): SensePanelModel {
     makeEvent(2),
     makeEvent(3, { cause: 'agent', reason: 'Agent 工具写入', level: 'record' }),
     makeEvent(4, { level: 'wake', reason: '任务非 0 退出', ruleName: '测试失败时唤醒' }),
-  ]
-  return panelModel(makeState(), { events })
+  ];
+  return panelModel(makeState(), { events });
 }
 
 function memoryPressure(): SensePanelModel {
-  const body = makeBody()
-  body.memory = fact(
-    { total: 32e9, used: 29.1e9, pressure: 'warn', swapUsed: 3.2e9 },
-    { api: 'vm_stat' },
-  )
+  const body = makeBody();
+  body.memory = fact({ total: 32e9, used: 29.1e9, pressure: 'warn', swapUsed: 3.2e9 }, { api: 'vm_stat' });
   return panelModel(makeState({ self: { ...makeState().self, body } }), {
     history: makeHistory({ memory: series(60, 5_000, (i) => 0.82 + 0.09 * Math.sin(i / 8)) }),
-  })
+  });
 }
 
 function permissionDenied(): SensePanelModel {
-  const state = makeState()
-  state.env.focusedWindow = denied('未授予辅助功能权限')
-  state.env.frontApp = fact(
-    { name: 'Finder', bundleId: 'com.demo.finder' },
-    { status: 'stale', ageMs: 120_000 },
-  )
-  state.self.permissions = fact({ 辅助功能: 'denied', 完全磁盘访问: 'granted' })
-  const body = makeBody()
-  body.thermal = emptyFact('unavailable', 'helper 未上报温控')
-  body.battery = emptyFact('unknown')
-  body.network = emptyFact('unsupported', '非 macOS 无此信号源')
-  body.disks = { ...emptyFact('stale'), kind: 'disks' }
-  state.self.body = body
+  const state = makeState();
+  state.env.focusedWindow = denied('未授予辅助功能权限');
+  state.env.frontApp = fact({ name: 'Finder', bundleId: 'com.demo.finder' }, { status: 'stale', ageMs: 120_000 });
+  state.self.permissions = fact({ 辅助功能: 'denied', 完全磁盘访问: 'granted' });
+  const body = makeBody();
+  body.thermal = emptyFact('unavailable', 'helper 未上报温控');
+  body.battery = emptyFact('unknown');
+  body.network = emptyFact('unsupported', '非 macOS 无此信号源');
+  body.disks = { ...emptyFact('stale'), kind: 'disks' };
+  state.self.body = body;
   state.observation.sources['macos-helper'] = {
     status: 'denied',
     lastSignalAt: T0 - 180_000,
     error: 'AX 订阅失败',
-  }
-  return panelModel(state)
+  };
+  return panelModel(state);
 }
 
 function busyEvents(): SensePanelModel {
   const events: SenseEvent[] = Array.from({ length: 237 }, (_, i) => {
-    const n = 237 - i
-    const over: Partial<SenseEvent> = {}
+    const n = 237 - i;
+    const over: Partial<SenseEvent> = {};
     if (n % 11 === 0) {
-      over.level = 'suppressed'
-      over.reason = '唤醒预算超限已抑制'
+      over.level = 'suppressed';
+      over.reason = '唤醒预算超限已抑制';
     } else if (n % 7 === 0) {
-      over.level = 'context'
-      over.reason = '命中保存合并'
-      over.ruleName = 'src 下文件保存'
-      over.count = 3
+      over.level = 'context';
+      over.reason = '命中保存合并';
+      over.ruleName = 'src 下文件保存';
+      over.count = 3;
     } else if (n % 13 === 0) {
-      over.level = 'wake'
-      over.reason = '任务非 0 退出'
-      over.ruleName = '测试失败时唤醒'
+      over.level = 'wake';
+      over.reason = '任务非 0 退出';
+      over.ruleName = '测试失败时唤醒';
     }
-    if (n % 5 === 0) over.cause = 'agent'
-    return makeEvent(n, over)
-  })
-  return panelModel(makeState(), { events })
+    if (n % 5 === 0) over.cause = 'agent';
+    return makeEvent(n, over);
+  });
+  return panelModel(makeState(), { events });
 }
 
 function desktopNoBattery(): SensePanelModel {
-  const body = makeBody()
-  body.battery = fact(null)
-  return panelModel(makeState({ self: { ...makeState().self, body } }))
+  const body = makeBody();
+  body.battery = fact(null);
+  return panelModel(makeState({ self: { ...makeState().self, body } }));
 }
 
 /**
@@ -118,7 +112,7 @@ function learning(): SensePanelModel {
       'disk:/': { sources: ['floor', 'rate'], triggered: [] },
       tokens: { sources: ['floor'], triggered: [] },
     },
-  })
+  });
 }
 
 /** 快速变化：速率/异常/文件爆发告警 + 调整日志（含各操作者与一条锁定参数）。 */
@@ -165,7 +159,7 @@ function rapidChange(): SensePanelModel {
       },
     }),
     makeEvent(4),
-  ]
+  ];
   return panelModel(makeState(), {
     events,
     insights: makeInsights({
@@ -226,29 +220,65 @@ function rapidChange(): SensePanelModel {
         },
       ],
     },
-  })
+  });
 }
 
 function tuningDisabled(): SensePanelModel {
-  const model = rapidChange()
-  return { ...model, tuning: { ...model.tuning!, disabled: { reason: 'restore-failed' } } }
+  const model = rapidChange();
+  return { ...model, tuning: { ...model.tuning!, disabled: { reason: 'restore-failed' } } };
 }
 
 function rebaselineSuggested(): SensePanelModel {
-  const model = rapidChange()
+  const model = rapidChange();
   return {
     ...model,
     tuning: {
       ...model.tuning!,
       disabled: { reason: 'storage-failed' },
       suggestions: [
-        { id: 'baseline-cpu', metric: 'cpu', unit: 'ratio', slotLabel: '周二 14 时', from: 0.2, to: 0.68, samples: 12, dates: 3 },
-        { id: 'baseline-network', metric: 'networkRx', unit: 'bytes-per-second', slotLabel: '周五 10 时', from: 400_000, to: 1_400_000, samples: 9, dates: 3 },
-        { id: 'baseline-disk', metric: 'disk:/demo', unit: 'bytes', slotLabel: '周三 9 时', from: 80 * 1024 ** 3, to: 60 * 1024 ** 3, samples: 10, dates: 3 },
-        { id: 'baseline-context', metric: 'tokens', unit: 'tokens', slotLabel: '周四 11 时', from: 50_000, to: 30_000, samples: 11, dates: 3 },
+        {
+          id: 'baseline-cpu',
+          metric: 'cpu',
+          unit: 'ratio',
+          slotLabel: '周二 14 时',
+          from: 0.2,
+          to: 0.68,
+          samples: 12,
+          dates: 3,
+        },
+        {
+          id: 'baseline-network',
+          metric: 'networkRx',
+          unit: 'bytes-per-second',
+          slotLabel: '周五 10 时',
+          from: 400_000,
+          to: 1_400_000,
+          samples: 9,
+          dates: 3,
+        },
+        {
+          id: 'baseline-disk',
+          metric: 'disk:/demo',
+          unit: 'bytes',
+          slotLabel: '周三 9 时',
+          from: 80 * 1024 ** 3,
+          to: 60 * 1024 ** 3,
+          samples: 10,
+          dates: 3,
+        },
+        {
+          id: 'baseline-context',
+          metric: 'tokens',
+          unit: 'tokens',
+          slotLabel: '周四 11 时',
+          from: 50_000,
+          to: 30_000,
+          samples: 11,
+          dates: 3,
+        },
       ],
     },
-  }
+  };
 }
 
 const BUILDERS: Record<ScenarioName, () => SensePanelModel> = {
@@ -264,8 +294,8 @@ const BUILDERS: Record<ScenarioName, () => SensePanelModel> = {
   'disk-partial': diskPartial,
   'tuning-disabled': tuningDisabled,
   'rebaseline-suggested': rebaselineSuggested,
-}
+};
 
 export function makeScenario(name: ScenarioName): SensePanelModel {
-  return BUILDERS[name]()
+  return BUILDERS[name]();
 }

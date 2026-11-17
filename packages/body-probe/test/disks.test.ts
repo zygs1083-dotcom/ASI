@@ -1,13 +1,15 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { DiskSampler, collectDisks, type DisksDeps, type StatFsResult } from '../src/disks.js';
 import type { Body, Fact, SourceRef } from '@asi/sense-types';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { bodyThresholdSignals } from '../../../plugins/asi-sense/src/host/attention/thresholds.js';
+import { collectDisks, DiskSampler, type DisksDeps, type StatFsResult } from '../src/disks.js';
 
 const statfs = (r: StatFsResult) => async () => r;
 
 function deferred<T>() {
   let resolve!: (v: T) => void;
-  const promise = new Promise<T>((res) => { resolve = res; });
+  const promise = new Promise<T>((res) => {
+    resolve = res;
+  });
   return { promise, resolve };
 }
 
@@ -34,17 +36,24 @@ describe('collectDisks', () => {
   });
 
   it('propagates inspection failures', async () => {
-    await expect(collectDisks('/work', {
-      stat: async () => ({ dev: 1 }),
-      statfs: async () => { throw new Error('statfs failed'); },
-      resolve: (p) => p,
-    })).rejects.toThrow('statfs failed');
+    await expect(
+      collectDisks('/work', {
+        stat: async () => ({ dev: 1 }),
+        statfs: async () => {
+          throw new Error('statfs failed');
+        },
+        resolve: (p) => p,
+      }),
+    ).rejects.toThrow('statfs failed');
   });
 });
 
 describe('DiskSampler', () => {
   let t = 0;
-  beforeEach(() => { t = 0; vi.useFakeTimers(); });
+  beforeEach(() => {
+    t = 0;
+    vi.useFakeTimers();
+  });
   afterEach(() => vi.useRealTimers());
 
   const flush = async () => {
@@ -63,8 +72,14 @@ describe('DiskSampler', () => {
       wall: () => t,
       ...over,
       // wrap after spreading so call recording always covers user overrides
-      stat: async (p) => { stats.push(p); return stat(p); },
-      statfs: async (p) => { statfss.push(p); return statfs(p); },
+      stat: async (p) => {
+        stats.push(p);
+        return stat(p);
+      },
+      statfs: async (p) => {
+        statfss.push(p);
+        return statfs(p);
+      },
     });
     return { s, stats, statfss };
   };
@@ -174,7 +189,8 @@ describe('DiskSampler', () => {
   });
 
   it.each(['timeout', 'stop'] as const)(
-    'marks retained numbers stale as soon as a refresh fails via %s', async (how) => {
+    'marks retained numbers stale as soon as a refresh fails via %s',
+    async (how) => {
       let wedged = false;
       const { s } = make({
         stat: async (p) => {
@@ -195,7 +211,7 @@ describe('DiskSampler', () => {
       const f = await s.sample('/w', 30_000);
       const cwd = f.value?.find((v) => v.mount === '/w');
       expect(cwd?.status).toBe('stale'); // failed refresh -> stale immediately
-      expect(cwd?.total).toBe(40960);    // numbers retained, never fabricated
+      expect(cwd?.total).toBe(40960); // numbers retained, never fabricated
       expect(f.value?.find((v) => v.mount === '/')?.status).toBe('ok');
       // 根卷刚刷新成功：父事实保持 ok，且元数据只聚合新鲜卷
       expect(f.status).toBe('ok');
@@ -215,18 +231,18 @@ describe('DiskSampler', () => {
     let f = await s.sample('/b', 30_000);
     expect(f.status).toBe('ok');
     expect(f.value?.map((v) => v.mount)).toEqual(['/', '/b']);
-    expect(f.observedAt).toBe(0);   // 最旧新鲜观察
-    expect(f.ttlMs).toBe(6000);     // 最早新鲜过期 6000 − 最旧观察 0
+    expect(f.observedAt).toBe(0); // 最旧新鲜观察
+    expect(f.ttlMs).toBe(6000); // 最早新鲜过期 6000 − 最旧观察 0
     t = 6500; // '/' 越过 6000 截止 -> stale；'/b' 仍新鲜
     f = await s.sample('/b', 30_000);
-    expect(f.status).toBe('ok');    // 有新鲜兄弟卷，父事实不降级
+    expect(f.status).toBe('ok'); // 有新鲜兄弟卷，父事实不降级
     expect(f.value?.find((v) => v.mount === '/')?.status).toBe('stale');
     expect(f.observedAt).toBe(2000); // stale 根卷的更旧时间戳不进入父元数据
-    expect(f.ttlMs).toBe(30_000);    // 最早新鲜过期 32_000 − 观察 2000
+    expect(f.ttlMs).toBe(30_000); // 最早新鲜过期 32_000 − 观察 2000
     t = 33_000; // '/b' 也越过 32_000 截止 -> 全部失鲜
     f = await s.sample('/b', 30_000);
     expect(f.status).toBe('stale');
-    expect(f.observedAt).toBe(0);    // 无新鲜卷时回落到全部记录元数据
+    expect(f.observedAt).toBe(0); // 无新鲜卷时回落到全部记录元数据
   });
 
   it('keeps sampler-produced stale and unreadable volumes out of floor transitions', async () => {
@@ -245,14 +261,28 @@ describe('DiskSampler', () => {
     await flush();
     const disk = await s.sample('/data', 30000);
     expect(disk.kind).toBe('disks');
-    expect(disk.value).toMatchObject([{ mount: '/', status: 'stale' }, { mount: '/data', status: 'ok' }]);
+    expect(disk.value).toMatchObject([
+      { mount: '/', status: 'stale' },
+      { mount: '/data', status: 'ok' },
+    ]);
     const source: SourceRef = { id: 'test', api: 'fixture', host: 'fake' };
     const missing: Fact<never> = { value: null, status: 'unknown', source, observedAt: 0, ttlMs: 1 };
     const body: Body = {
-      cpu: missing, memory: missing, disks: disk, battery: missing, thermal: missing,
-      network: missing, harnessProcess: missing, tokens: missing,
+      cpu: missing,
+      memory: missing,
+      disks: disk,
+      battery: missing,
+      thermal: missing,
+      network: missing,
+      harnessProcess: missing,
+      tokens: missing,
     };
-    const previous = { body: { ...body, disks: { ...missing, kind: 'disks' as const } }, at: 0, monotonicAt: 0, source };
+    const previous = {
+      body: { ...body, disks: { ...missing, kind: 'disks' as const } },
+      at: 0,
+      monotonicAt: 0,
+      source,
+    };
     const next = { body, at: t, monotonicAt: t, source };
     expect(bodyThresholdSignals(previous, next).signals).toEqual([]);
     const held = bodyThresholdSignals({ ...previous, state: { 'disk:/': 'critical' } }, next);
@@ -300,7 +330,7 @@ describe('DiskSampler', () => {
     t = 7000; // original 6s deadline passed; a wider caller ttl must not revive it
     const f = await s.sample('/w', 90_000);
     const cwd = f.value?.find((v) => v.mount === '/w');
-    expect(cwd?.ttlMs).toBe(6000);   // the read keeps its own ttl
+    expect(cwd?.ttlMs).toBe(6000); // the read keeps its own ttl
     expect(cwd?.status).toBe('stale');
     expect(f.status).toBe('stale');
   });

@@ -55,8 +55,15 @@ export class SelfProcessSampler {
       const at = (this.deps.now ?? (() => globalThis.performance.now()))();
       const rss = (this.deps.memoryUsage ?? (() => process.memoryUsage()))().rss;
       const uptimeSec = (this.deps.uptime ?? (() => process.uptime()))();
-      if (!Number.isFinite(micros) || micros < 0 || !Number.isFinite(at)
-        || !Number.isFinite(rss) || rss < 0 || !Number.isFinite(uptimeSec) || uptimeSec < 0) {
+      if (
+        !Number.isFinite(micros) ||
+        micros < 0 ||
+        !Number.isFinite(at) ||
+        !Number.isFinite(rss) ||
+        rss < 0 ||
+        !Number.isFinite(uptimeSec) ||
+        uptimeSec < 0
+      ) {
         return fact.fail('unavailable', this.src, ttlMs);
       }
       const prev = this.prev;
@@ -77,7 +84,10 @@ export class SelfProcessSampler {
 export class ExternalProcessSampler {
   private readonly src: SourceRef;
 
-  constructor(private readonly pid: number, private readonly deps: ProcessDeps = {}) {
+  constructor(
+    private readonly pid: number,
+    private readonly deps: ProcessDeps = {},
+  ) {
     this.src = deps.src ?? fact.source('harnessProcess', '/bin/ps');
   }
 
@@ -86,7 +96,10 @@ export class ExternalProcessSampler {
       return Promise.resolve(fact.fail('unavailable', this.src, ttlMs));
     }
     const run = this.deps.run ?? defaultRun;
-    return fact.collect(this.src, async () =>
-      parsePsRow(await run('/bin/ps', ['-o', 'rss=,%cpu=,etime=', '-p', String(this.pid)], signal)), ttlMs);
+    return fact.collect(
+      this.src,
+      async () => parsePsRow(await run('/bin/ps', ['-o', 'rss=,%cpu=,etime=', '-p', String(this.pid)], signal)),
+      ttlMs,
+    );
   }
 }

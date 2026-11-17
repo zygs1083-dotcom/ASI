@@ -1,10 +1,10 @@
-export { SensePanel } from './SensePanel'
+export { SensePanel } from './SensePanel';
 export type {
   Body,
   BodyHistory,
   DetailUnit,
-  DiskVolume,
   DisksFact,
+  DiskVolume,
   EventDetail,
   EventLevel,
   Fact,
@@ -27,5 +27,5 @@ export type {
   TuningEntry,
   TuningParam,
   TuningState,
-} from './view-model'
-export { THERMAL_ORDINAL } from './view-model'
+} from './view-model';
+export { THERMAL_ORDINAL } from './view-model';
