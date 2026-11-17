@@ -19,8 +19,8 @@ export function ok<T>(
 
 export interface FactMeta {
   observedAt: number; // wall clock when the constituent was observed
-  periodMs: number;   // sampling period that produced the observation
-  at?: number;        // monotonic clock reading for the same observation
+  periodMs: number; // sampling period that produced the observation
+  at?: number; // monotonic clock reading for the same observation
 }
 
 // A composite fact (built from readings with different cadences) keeps the
@@ -70,13 +70,15 @@ interface FactLike {
 function isFactLike(o: unknown): o is FactLike & object {
   if (typeof o !== 'object' || o === null) return false;
   const r = o as { status?: unknown; observedAt?: unknown; ttlMs?: unknown };
-  return typeof r.status === 'string' && typeof r.observedAt === 'number'
-    && typeof r.ttlMs === 'number';
+  return typeof r.status === 'string' && typeof r.observedAt === 'number' && typeof r.ttlMs === 'number';
 }
 
 function deadlineOf(o: FactLike & object, now: number, wall: number): number {
   let d = deadlines.get(o);
-  if (d === undefined) deadlines.set(o, (d = now + (o.observedAt + o.ttlMs - wall)));
+  if (d === undefined) {
+    d = now + (o.observedAt + o.ttlMs - wall);
+    deadlines.set(o, d);
+  }
   return d;
 }
 
@@ -98,19 +100,24 @@ export function ingest(f: FactLike & object, now: number, wall: number): void {
 export function disksAt(f: DisksFact, now: number, wall: number): DisksFact {
   const ttlMs = (o: object, observedAt: number, originalTtl: number) =>
     (deadlines.get(o) ?? now + observedAt + originalTtl - wall) - now + wall - observedAt;
-  return effectiveDisks({
-    ...f,
-    ttlMs: ttlMs(f, f.observedAt, f.ttlMs),
-    value: f.value?.map((v) => ({
-      ...v,
-      ttlMs: ttlMs(v, v.observedAt ?? f.observedAt, v.ttlMs ?? f.ttlMs),
-    })) ?? null,
-  }, wall);
+  return effectiveDisks(
+    {
+      ...f,
+      ttlMs: ttlMs(f, f.observedAt, f.ttlMs),
+      value:
+        f.value?.map((v) => ({
+          ...v,
+          ttlMs: ttlMs(v, v.observedAt ?? f.observedAt, v.ttlMs ?? f.ttlMs),
+        })) ?? null,
+    },
+    wall,
+  );
 }
 
 const mark = <T extends FactLike>(o: T, now: number, wall: number): T =>
   o.status === 'ok' && ttlStatusAt({ status: 'ok', observedAt: deadlineOf(o, now, wall), ttlMs: 0 }, now) === 'stale'
-    ? ({ ...o, status: 'stale' } as T) : o;
+    ? ({ ...o, status: 'stale' } as T)
+    : o;
 
 // Marks an ok fact stale once it outlives its tracked deadline (`now` is
 // monotonic, `wall` the wall reading of the same instant), plus fact-like

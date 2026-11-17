@@ -202,7 +202,9 @@ export function projectTuning(runtime: Runtime, time: (key: string, at: number) 
             : canUndo
               ? 'undoable'
               : entry.operation === 'propose' || entry.operation === 'revert'
-                ? 'superseded'
+                ? tuner.isLatestApplied(entry)
+                  ? 'other'
+                  : 'superseded'
                 : 'other';
       const suffix =
         status === 'rejected'

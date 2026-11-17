@@ -94,8 +94,8 @@ export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}
     dsh,
     () => settings.enabled(),
     isPaused,
-    (signal) => body.burst(signal),
-    (roots) => body.setRoots(roots),
+    (signal, dirs) => body.burst(signal, dirs),
+    (scopes) => body.setScopes(scopes),
   );
   const helper = new HelperSource(
     ports.helper,

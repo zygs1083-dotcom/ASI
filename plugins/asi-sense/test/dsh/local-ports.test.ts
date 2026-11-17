@@ -99,6 +99,36 @@ describe('missing file watcher roots', () => {
     expect(closed).toContain('/sandbox/parent/target');
   });
 
+  it('passes a shallow-watch request through only at the target directory', () => {
+    fsMocks.statSync.mockReturnValue({ isDirectory: () => true });
+    fsMocks.watch.mockReturnValue({ on: vi.fn(), close: vi.fn() });
+    const ports = localPorts({ logger: { warn: vi.fn() } } as unknown as Context, '/storage');
+    const shallow = ports.files.watch('/sandbox', () => {}, { recursive: false });
+    expect(fsMocks.watch.mock.calls[0]?.[1]).toEqual({ recursive: false });
+    shallow.close();
+    fsMocks.watch.mockClear();
+    const deep = ports.files.watch('/sandbox', () => {});
+    expect(fsMocks.watch.mock.calls[0]?.[1]).toEqual({ recursive: true });
+    deep.close();
+  });
+
+  it('keeps ancestor fallback watches recursive even for shallow subjects', () => {
+    const existing = new Set(['/sandbox']);
+    fsMocks.existsSync.mockImplementation((path: string) => existing.has(path));
+    fsMocks.statSync.mockImplementation((path: string) => {
+      if (!existing.has(path)) throw Object.assign(new Error('missing'), { code: 'ENOENT' });
+      return { isDirectory: () => true };
+    });
+    fsMocks.watch.mockReturnValue({ on: vi.fn(), close: vi.fn() });
+    const ports = localPorts({ logger: { warn: vi.fn() } } as unknown as Context, '/storage');
+    const watcher = ports.files.watch('/sandbox/a/b', () => {}, { recursive: false });
+    // Ancestor fallback must stay recursive so the intermediate dirs'
+    // appearance is still observed (delivered events stay inside the target).
+    expect(fsMocks.watch.mock.calls[0]?.[0]).toBe('/sandbox');
+    expect(fsMocks.watch.mock.calls[0]?.[1]).toEqual({ recursive: true });
+    watcher.close();
+  });
+
   it('reports an asynchronous native watcher error without fabricating a file change', () => {
     let fail!: () => void;
     fsMocks.statSync.mockReturnValue({ isDirectory: () => true });

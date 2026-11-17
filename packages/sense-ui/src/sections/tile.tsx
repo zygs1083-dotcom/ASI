@@ -1,44 +1,37 @@
-import { useState, type ReactNode } from 'react'
-import { FactMeta, FactValue } from '../fact'
-import { formatClock } from '../format'
-import { effectiveStatus, isUsable, type Severity } from '../health'
-import { Sparkline } from '../sparkline'
-import { chartThresholds, thresholdRowText } from '../thresholds'
-import type {
-  Fact,
-  MetricInsight,
-  MetricKey,
-  MetricPoint,
-  SenseEvent,
-  ThresholdLayer,
-} from '../view-model'
-import css from './body.module.css'
-import dcss from './tile.module.css'
+import { type ReactNode, useState } from 'react';
+import { FactMeta, FactValue } from '../fact';
+import { formatClock } from '../format';
+import { effectiveStatus, isUsable, type Severity } from '../health';
+import { Sparkline } from '../sparkline';
+import { chartThresholds, thresholdRowText } from '../thresholds';
+import type { Fact, MetricInsight, MetricKey, MetricPoint, SenseEvent, ThresholdLayer } from '../view-model';
+import css from './body.module.css';
+import dcss from './tile.module.css';
 
 export const SEV_TAG: Record<string, string> = {
   warn: '注意',
   critical: '紧急',
   unknown: '未知',
-}
+};
 
 export const LAYER_TEXT: Record<ThresholdLayer, string> = {
   floor: '底线',
   rate: '变化率',
   baseline: '基线',
-}
+};
 
-const LAYERS: ThresholdLayer[] = ['floor', 'rate', 'baseline']
+const LAYERS: ThresholdLayer[] = ['floor', 'rate', 'baseline'];
 
 export interface TileProps {
-  tileKey: string
-  icon: ReactNode
-  label: string
-  sev: Severity
+  tileKey: string;
+  icon: ReactNode;
+  label: string;
+  sev: Severity;
   /** Token 等宽卡片跨两列。 */
-  span2?: boolean
+  span2?: boolean;
   /** 展开区内容（图/阈值/触发/来源）；不传则卡片没有明细。 */
-  detail?: ReactNode
-  children: ReactNode
+  detail?: ReactNode;
+  children: ReactNode;
 }
 
 /**
@@ -47,16 +40,8 @@ export interface TileProps {
  * 展开时卡片跨满整行宽。detail 仅在打开时挂载（收起不付出明细渲染开销），
  * 开合状态由原生 toggle 事件镜像，不反向控制 open 属性。
  */
-export function Tile({
-  tileKey,
-  icon,
-  label,
-  sev,
-  span2,
-  detail,
-  children,
-}: TileProps) {
-  const [open, setOpen] = useState(false)
+export function Tile({ tileKey, icon, label, sev, span2, detail, children }: TileProps) {
+  const [open, setOpen] = useState(false);
   return (
     <details
       className={css.tile}
@@ -74,13 +59,7 @@ export function Tile({
               {SEV_TAG[sev]}
             </span>
           )}
-          <svg
-            className={css.chev}
-            width="8"
-            height="8"
-            viewBox="0 0 8 8"
-            aria-hidden="true"
-          >
+          <svg className={css.chev} width="8" height="8" viewBox="0 0 8 8" aria-hidden="true">
             <path
               d="M2.5 1l3 3-3 3"
               fill="none"
@@ -93,81 +72,60 @@ export function Tile({
         </span>
         {children}
       </summary>
-      {open && detail != null && (
-        <div className={dcss.tileDetail}>{detail}</div>
-      )}
+      {open && detail != null && <div className={dcss.tileDetail}>{detail}</div>}
     </details>
-  )
+  );
 }
 
 export interface DetailMetric {
-  key: MetricKey
-  label: string
-  points: MetricPoint[]
-  format: (v: number) => string
+  key: MetricKey;
+  label: string;
+  points: MetricPoint[];
+  format: (v: number) => string;
   /** 当前值文案；事实不可用时省略显示「未提供」。 */
-  valueText?: string
+  valueText?: string;
   /** 宿主事件投影的变化徽标（如 −2.1 GB/分）；未提供不显示。 */
-  badge?: string
-  insight?: MetricInsight
-  severity?: Severity
+  badge?: string;
+  insight?: MetricInsight;
+  severity?: Severity;
   /** tokens 的动态窗口（默认底线按窗口计算）。 */
-  tokenWindow?: number
+  tokenWindow?: number;
   /**
    * 指标自己的事实（如磁盘按挂载点各算新鲜度）；缺省沿用卡片父事实，
    * 用于表头/消毒判定。
    */
-  fact?: Fact<unknown>
+  fact?: Fact<unknown>;
 }
 
 /** 最近一次匹配指标的触发事件：忽略未来/非法时间戳（历史更早的事件仍算）。 */
-function latestTriggerEvent(
-  key: MetricKey,
-  events: SenseEvent[],
-  now: number,
-): SenseEvent | null {
-  let latest: SenseEvent | null = null
+function latestTriggerEvent(key: MetricKey, events: SenseEvent[], now: number): SenseEvent | null {
+  let latest: SenseEvent | null = null;
   for (const e of events) {
-    const d = e.detail
-    if (!d || d.kind === 'file.burst') continue
-    if (d.metric !== key) continue
-    const at = e.signal.at
-    if (!Number.isFinite(at) || at > now) continue
-    if (!latest || at > latest.signal.at) latest = e
+    const d = e.detail;
+    if (!d || d.kind === 'file.burst') continue;
+    if (d.metric !== key) continue;
+    const at = e.signal.at;
+    if (!Number.isFinite(at) || at > now) continue;
+    if (!latest || at > latest.signal.at) latest = e;
   }
-  return latest
+  return latest;
 }
 
-type HeadText = 'current' | 'stale' | 'none'
+type HeadText = 'current' | 'stale' | 'none';
 
 const HEAD_PREFIX: Record<HeadText, string> = {
   current: '当前 ',
   stale: '上次读数 ',
   none: '',
-}
+};
 
-function MetricBlock({
-  m,
-  now,
-  events,
-  head,
-}: {
-  m: DetailMetric
-  now: number
-  events: SenseEvent[]
-  head: HeadText
-}) {
+function MetricBlock({ m, now, events, head }: { m: DetailMetric; now: number; events: SenseEvent[]; head: HeadText }) {
   // 只有当前读数才画阈值线：stale/none 不再生成默认显示底线
   //（历史保留值上重画「当前」阈值会伪装成新鲜投影）。
-  const chart =
-    head === 'current'
-      ? chartThresholds(m.key, m.insight, m.tokenWindow)
-      : { lines: [] }
-  const layers = (ls: ThresholdLayer[]) =>
-    ls.length ? ls.map((l) => LAYER_TEXT[l]).join(' / ') : '未触发'
-  const lastEvent = latestTriggerEvent(m.key, events, now)
-  const missingSev =
-    (m.insight?.triggered?.length ?? 0) > 0 && !m.insight?.severity
+  const chart = head === 'current' ? chartThresholds(m.key, m.insight, m.tokenWindow) : { lines: [] };
+  const layers = (ls: ThresholdLayer[]) => (ls.length ? ls.map((l) => LAYER_TEXT[l]).join(' / ') : '未触发');
+  const lastEvent = latestTriggerEvent(m.key, events, now);
+  const missingSev = (m.insight?.triggered?.length ?? 0) > 0 && !m.insight?.severity;
   return (
     <div
       className={dcss.metricBlock}
@@ -185,7 +143,8 @@ function MetricBlock({
         </span>
       </div>
       <Sparkline
-        metric={m.key} expanded
+        metric={m.key}
+        expanded
         points={m.points}
         now={now}
         label={m.label}
@@ -198,9 +157,7 @@ function MetricBlock({
         {LAYERS.map((layer) => (
           <div key={layer} className={dcss.metricRow}>
             <span className={dcss.metricRowKey}>{LAYER_TEXT[layer]}</span>
-            <span>
-              {thresholdRowText(m.key, layer, m.insight, m.tokenWindow, m.format)}
-            </span>
+            <span>{thresholdRowText(m.key, layer, m.insight, m.tokenWindow, m.format)}</span>
           </div>
         ))}
       </div>
@@ -213,7 +170,7 @@ function MetricBlock({
         </span>
       </div>
     </div>
-  )
+  );
 }
 
 /**
@@ -230,38 +187,30 @@ export function TileDetail({
   onOpenPermissionSettings,
   extra,
 }: {
-  fact: Fact<unknown>
-  now: number
-  metrics: DetailMetric[]
-  events: SenseEvent[]
-  onAdjust?: () => void
-  onOpenPermissionSettings: () => void
-  extra?: ReactNode
+  fact: Fact<unknown>;
+  now: number;
+  metrics: DetailMetric[];
+  events: SenseEvent[];
+  onAdjust?: () => void;
+  onOpenPermissionSettings: () => void;
+  extra?: ReactNode;
 }) {
-  const usable = isUsable(fact, now)
+  const usable = isUsable(fact, now);
   const headOf = (f: Fact<unknown>): HeadText =>
-    isUsable(f, now)
-      ? 'current'
-      : effectiveStatus(f, now) === 'stale' && f.value !== null
-        ? 'stale'
-        : 'none'
-  const head = headOf(fact)
+    isUsable(f, now) ? 'current' : effectiveStatus(f, now) === 'stale' && f.value !== null ? 'stale' : 'none';
+  const head = headOf(fact);
   return (
     <>
       <div className={dcss.detailFact}>
-        <FactValue
-          fact={fact}
-          now={now}
-          onOpenPermissionSettings={onOpenPermissionSettings}
-        >
+        <FactValue fact={fact} now={now} onOpenPermissionSettings={onOpenPermissionSettings}>
           {() => null}
         </FactValue>
       </div>
       {metrics.map((m) => {
         // 指标自带事实（磁盘卷）时按自身新鲜度判定；否则沿用父事实
-        const mf = m.fact ?? fact
-        const mHead = m.fact ? headOf(mf) : head
-        const mUsable = m.fact ? mHead === 'current' : usable
+        const mf = m.fact ?? fact;
+        const mHead = m.fact ? headOf(mf) : head;
+        const mUsable = m.fact ? mHead === 'current' : usable;
         return (
           <MetricBlock
             key={m.key}
@@ -281,7 +230,7 @@ export function TileDetail({
             events={events}
             head={mHead}
           />
-        )
+        );
       })}
       {extra}
       <div className={dcss.detailMeta}>
@@ -296,5 +245,5 @@ export function TileDetail({
         )}
       </div>
     </>
-  )
+  );
 }

@@ -5,16 +5,21 @@ import { DiskSampler } from './disks.js';
 import * as fact from './fact.js';
 import { MemorySampler } from './memory.js';
 import { NetworkSampler } from './network.js';
-import { ExternalProcessSampler, SelfProcessSampler } from './process.js';
 import {
-  DEFAULT_CADENCE, HISTORY_WINDOW_MS,
-  type CacheMap, type ProbeClock, type ProbeCollectors, type RingPoint,
-  type SamplePoint, type SamplingCadence, type StartOptions,
+  type CacheMap,
+  DEFAULT_CADENCE,
+  HISTORY_WINDOW_MS,
+  type ProbeClock,
+  type ProbeCollectors,
+  type RingPoint,
+  type SamplePoint,
+  type SamplingCadence,
+  type StartOptions,
 } from './probe-options.js';
-import type {
-  Body, DisksFact, Fact, ThermalValue, TokenSource,
-} from './types.js';
+import { ExternalProcessSampler, SelfProcessSampler } from './process.js';
 import { readTokens } from './token-reader.js';
+import type { Body, DisksFact, Fact, ThermalValue, TokenSource } from './types.js';
+
 export type { ProbeClock, ProbeCollectors, SamplePoint, SamplingCadence, StartOptions } from './probe-options.js';
 
 export class BodyProbe {
@@ -51,19 +56,21 @@ export class BodyProbe {
     const self = new SelfProcessSampler({ now: this.clockNow });
     const defaults: ProbeCollectors = {
       cpu: (ttl) => Promise.resolve(cpu.sample(ttl)),
-      memory: (ttl, signal) => memory.sample(ttl, signal, {
-        pressureMs: this.cadence.pressureMs,
-        swapMs: this.cadence.swapMs,
-      }),
+      memory: (ttl, signal) =>
+        memory.sample(ttl, signal, {
+          pressureMs: this.cadence.pressureMs,
+          swapMs: this.cadence.swapMs,
+        }),
       // The default disk collector runs every tick and resolves immediately:
       // DiskSampler enforces disksMs per volume internally and its background
       // jobs must outlive (never be bound to) the tick's abort signal.
       disks: (cwd, ttl) => disks.sample(cwd, ttl),
       battery: (ttl, signal) => battery.sample(ttl, signal),
       network: (ttl, signal) => network.sample(ttl, signal, { routeMs: this.cadence.routeMs }),
-      process: (pid, ttl, signal) => (pid === process.pid
-        ? Promise.resolve(self.sample(ttl))
-        : new ExternalProcessSampler(pid, { now: this.clockNow }).sample(ttl, signal)),
+      process: (pid, ttl, signal) =>
+        pid === process.pid
+          ? Promise.resolve(self.sample(ttl))
+          : new ExternalProcessSampler(pid, { now: this.clockNow }).sample(ttl, signal),
     };
     this.collectors = { ...defaults, ...collectors };
     this.customDisks = collectors.disks !== undefined;
@@ -151,9 +158,9 @@ export class BodyProbe {
     // deadlines keyed by object identity survive; clone only afterwards.
     const body = {} as Record<keyof Body, Fact<unknown>>;
     for (const key of Object.keys(point.body) as (keyof Body)[]) {
-      body[key] = structuredClone(key === 'disks'
-        ? fact.disksAt(point.body.disks, now, wall)
-        : fact.stale(point.body[key], now, wall));
+      body[key] = structuredClone(
+        key === 'disks' ? fact.disksAt(point.body.disks, now, wall) : fact.stale(point.body[key], now, wall),
+      );
     }
     return body as Body;
   }
@@ -163,9 +170,7 @@ export class BodyProbe {
       throw new RangeError(`seconds must be a finite number > 0, got ${seconds}`);
     }
     const cutoff = this.clockNow() - Math.min(seconds * 1000, HISTORY_WINDOW_MS);
-    return this.ring
-      .filter((p) => p.mono >= cutoff)
-      .map((p) => ({ at: p.at, body: structuredClone(p.body) }));
+    return this.ring.filter((p) => p.mono >= cutoff).map((p) => ({ at: p.at, body: structuredClone(p.body) }));
   }
 
   private launch(generation: number): void {
@@ -204,9 +209,14 @@ export class BodyProbe {
     if (!facts || generation !== this.generation || !this.running) return;
     const [cpu, memory, disks, battery, network, harnessProcess, tokens] = facts;
     const body: Body = {
-      cpu, memory, disks, battery,
+      cpu,
+      memory,
+      disks,
+      battery,
       thermal: fact.fail<ThermalValue>('unavailable', fact.source('thermal', 'ProcessInfo.thermalState'), ttl),
-      network, harnessProcess, tokens,
+      network,
+      harnessProcess,
+      tokens,
     };
     const mono = this.clockNow();
     const wall = this.clockWall();
@@ -243,8 +253,7 @@ export class BodyProbe {
       if (!signal.aborted) {
         const at = this.clockNow();
         fact.ingest(f, at, this.clockWall());
-        (this.caches as Record<keyof CacheMap, { at: number; fact: Fact<unknown> } | undefined>)[key] =
-          { at, fact: f };
+        (this.caches as Record<keyof CacheMap, { at: number; fact: Fact<unknown> } | undefined>)[key] = { at, fact: f };
       }
       return f;
     });
@@ -268,12 +277,7 @@ export class BodyProbe {
     });
   }
 
-  private async call<T>(
-    fn: () => Promise<Fact<T>>,
-    id: string,
-    ttlMs: number,
-    signal: AbortSignal,
-  ): Promise<Fact<T>> {
+  private async call<T>(fn: () => Promise<Fact<T>>, id: string, ttlMs: number, signal: AbortSignal): Promise<Fact<T>> {
     // An earlier collector may synchronously stop the probe mid-tick; once
     // the tick's signal is aborted no later collector may start.
     if (signal.aborted) return fact.fail('unavailable', fact.source(id, 'collector'), ttlMs);

@@ -1,22 +1,24 @@
-import { createRoot } from 'react-dom/client'
-import { SensePanel } from '../../src/SensePanel'
-import { makeScenario } from '../../src/mock/scenarios'
-import '../../src/preview/preview.css'
+import { createRoot } from 'react-dom/client';
+import { makeScenario } from '../../src/mock/scenarios';
+import { SensePanel } from '../../src/SensePanel';
+import '../../src/preview/preview.css';
 
-const model = makeScenario('rebaseline-suggested')
-let resolve: () => void
-let reject: () => void
-let rejectSuggestion: () => void
-window.addEventListener('test-resolve', () => resolve())
-window.addEventListener('test-reject', () => reject())
-window.addEventListener('test-reject-suggestion', () => rejectSuggestion())
-const pending = () => new Promise<void>((done, fail) => {
-  resolve = done
-  reject = () => fail(new Error('test failure'))
-})
-const pendingSuggestion = () => new Promise<void>((_, fail) => {
-  rejectSuggestion = () => fail(new Error('test failure'))
-})
+const model = makeScenario('rebaseline-suggested');
+let resolve: () => void;
+let reject: () => void;
+let rejectSuggestion: () => void;
+window.addEventListener('test-resolve', () => resolve());
+window.addEventListener('test-reject', () => reject());
+window.addEventListener('test-reject-suggestion', () => rejectSuggestion());
+const pending = () =>
+  new Promise<void>((done, fail) => {
+    resolve = done;
+    reject = () => fail(new Error('test failure'));
+  });
+const pendingSuggestion = () =>
+  new Promise<void>((_, fail) => {
+    rejectSuggestion = () => fail(new Error('test failure'));
+  });
 
 createRoot(document.getElementById('root')!).render(
   <main className="stage">
@@ -36,4 +38,4 @@ createRoot(document.getElementById('root')!).render(
       onAcceptRebaseline={pendingSuggestion}
     />
   </main>,
-)
+);

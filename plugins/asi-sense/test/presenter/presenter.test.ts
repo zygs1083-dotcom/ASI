@@ -100,6 +100,22 @@ async function harness() {
 }
 
 describe('presenter', () => {
+  it('uses the current disk critical floor in projected ETA', async () => {
+    const h = await harness();
+    expect((await h.runtime.body.tuner.propose({ param: 'floor.disk.critical', to: 0.075 })).applied).toBe(true);
+    const gib = 1024 ** 3;
+    for (const free of [80, 76, 75]) {
+      const disks = diskFact([{ mount: '/', total: 100 * gib, free: free * gib, observedAt: Date.now() }]);
+      disks.observedAt = Date.now();
+      await h.sample(mkBody({ disks }));
+      if (free !== 75) await h.advance(10_000);
+    }
+    const eta = h.presenter.snapshot().insights?.['disk:/']?.currentEta;
+    expect(eta?.timeToThresholdMs).toBeCloseTo(((75 - 7.5) / 15) * 60_000, 3);
+    h.presenter.close();
+    await h.runtime.stop();
+  });
+
   it.each([-61_000, 0, 61_000])(
     'shows freshly sampled memory and network trends without lag across a %i ms wall jump, then shows real lag',
     async (jump) => {
@@ -684,6 +700,40 @@ describe('presenter', () => {
     await h.runtime.stop();
   });
 
+  it('attributes tokens floor severity to the current session latch only', async () => {
+    const h = await harness();
+    const snapshot = (used: number) => ({
+      contextWindow: 1_000,
+      contextUsed: used,
+      contextWindowSource: 'configured' as const,
+      sessionUsage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    });
+    // Session A at 96%: its own context latch goes critical.
+    await h.agent({ type: 'created', sessionId: 'a' });
+    h.tokens(snapshot(960));
+    await h.agent({ type: 'pre-step', sessionId: 'a' });
+    await h.agent({ type: 'post-step', sessionId: 'a' });
+    await h.sample(mkBody());
+    expect(h.presenter.snapshot().insights?.tokens?.severity).toBe('critical');
+    // Session B at 5%: the token fact refreshes before B's first body
+    // sample — A's critical latch must not bleed into B's insight.
+    await h.agent({ type: 'created', sessionId: 'b' });
+    h.tokens(snapshot(50));
+    await h.agent({ type: 'pre-step', sessionId: 'b' });
+    await h.agent({ type: 'post-step', sessionId: 'b' });
+    expect(h.presenter.snapshot().state.self.body.tokens.value?.contextUsed).toBe(50);
+    expect(h.presenter.snapshot().insights?.tokens?.severity).toBeUndefined();
+    await h.sample(mkBody());
+    expect(h.presenter.snapshot().insights?.tokens?.severity).toBeUndefined();
+    // Back on A: its own latch (not a stale global) still projects critical.
+    h.tokens(snapshot(960));
+    await h.agent({ type: 'pre-step', sessionId: 'a' });
+    await h.agent({ type: 'post-step', sessionId: 'a' });
+    expect(h.presenter.snapshot().insights?.tokens?.severity).toBe('critical');
+    h.presenter.close();
+    await h.runtime.stop();
+  });
+
   it('exposes only old or complete body snapshots to synchronous reentrant readers during commit', async () => {
     const h = await harness();
     const body = (cpu: number, pressure: 'normal' | 'critical') =>
@@ -1156,6 +1206,22 @@ describe('presenter', () => {
       status: 'superseded',
       reverted: false,
     });
+    h.presenter.close();
+    await h.runtime.stop();
+  });
+
+  it('labels a last-applied change blocked by floor ordering as other, not superseded', async () => {
+    const h = await harness();
+    const warn = await h.runtime.tools.bodyTune({ param: 'floor.disk.warn', to: 0.14 });
+    expect(warn.applied).toBe(true);
+    // Raise critical in ±50% steps past warn's `from` — reverting warn to 0.1
+    // would then violate critical<=warn, but warn is still the last applied
+    // change for its parameter: blocked, never superseded.
+    for (const to of [0.07, 0.105]) {
+      expect((await h.runtime.tools.bodyTune({ param: 'floor.disk.critical', to })).applied).toBe(true);
+    }
+    const entry = h.presenter.snapshot().tuning.log.find((e) => e.id === warn.change.id);
+    expect(entry).toMatchObject({ status: 'other', undoable: false, reverted: false });
     h.presenter.close();
     await h.runtime.stop();
   });

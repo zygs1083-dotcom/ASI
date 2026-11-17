@@ -1,31 +1,31 @@
-import { memo, useRef } from 'react'
-import { useClock, useSampling } from './clock'
-import { formatAge } from './format'
-import type { Severity } from './health'
-import { buildSpark, sameThresholds } from './geometry'
-import type { SparkThreshold } from './thresholds'
-import type { MetricInsight, MetricKey, MetricPoint } from './view-model'
-import css from './viz.module.css'
+import { memo, useRef } from 'react';
+import { useClock, useSampling } from './clock';
+import { formatAge } from './format';
+import { buildSpark, sameThresholds } from './geometry';
+import type { Severity } from './health';
+import type { SparkThreshold } from './thresholds';
+import type { MetricInsight, MetricKey, MetricPoint } from './view-model';
+import css from './viz.module.css';
 
-export { HISTORY_WINDOW_MS, sampleHistory } from './history'
+export { HISTORY_WINDOW_MS, sampleHistory } from './history';
 
 interface SparklineProps {
-  points: MetricPoint[]
-  now: number
-  sampleIntervalMs?: number
-  metric?: MetricKey
-  paused?: boolean
-  label: string
-  format: (v: number) => string
+  points: MetricPoint[];
+  now: number;
+  sampleIntervalMs?: number;
+  metric?: MetricKey;
+  paused?: boolean;
+  label: string;
+  format: (v: number) => string;
   /** 严重度决定容器 data-sev 与末点标记（颜色只作用于越界段，不整体染色）。 */
-  severity?: Severity
+  severity?: Severity;
   /** 与 points 同单位的基线区间；未提供不画带、不虚构。 */
-  baseline?: MetricInsight['baseline']
+  baseline?: MetricInsight['baseline'];
   /** 阈值线；未提供不画线。 */
-  thresholds?: SparkThreshold[]
+  thresholds?: SparkThreshold[];
   /** 展开图（约 110px）：附加 y 极值、-5min/now 坐标与阈值标注。 */
-  expanded?: boolean
-  className?: string
+  expanded?: boolean;
+  className?: string;
 }
 
 const SEV_WORD: Record<Severity, string> = {
@@ -33,15 +33,15 @@ const SEV_WORD: Record<Severity, string> = {
   warn: '注意',
   critical: '紧急',
   unknown: '未知',
-}
+};
 
 interface GeoKey {
-  points: MetricPoint[]
-  thresholds: SparkThreshold[]
-  baseLow?: number
-  baseHigh?: number
-  severity?: Severity
-  expanded: boolean
+  points: MetricPoint[];
+  thresholds: SparkThreshold[];
+  baseLow?: number;
+  baseHigh?: number;
+  severity?: Severity;
+  expanded: boolean;
 }
 
 function sameGeoKey(a: GeoKey | undefined, b: GeoKey): boolean {
@@ -53,7 +53,7 @@ function sameGeoKey(a: GeoKey | undefined, b: GeoKey): boolean {
     a.severity === b.severity &&
     a.expanded === b.expanded &&
     sameThresholds(a.thresholds, b.thresholds)
-  )
+  );
 }
 
 /**
@@ -86,38 +86,36 @@ function SparklineBase({
     baseHigh: baseline?.high,
     severity,
     expanded,
-  }
-  const clock = useClock(now)
-  const sampling = useSampling(metric, sampleIntervalMs)
-  const cache = useRef<{ key: GeoKey; anchor: number; built: ReturnType<typeof buildSpark> }>()
+  };
+  const clock = useClock(now);
+  const sampling = useSampling(metric, sampleIntervalMs);
+  const cache = useRef<{ key: GeoKey; anchor: number; built: ReturnType<typeof buildSpark> }>();
   if (!sameGeoKey(cache.current?.key, key)) {
-    const anchor = cache.current?.key.points === points ? cache.current.anchor : now
+    const anchor = cache.current?.key.points === points ? cache.current.anchor : now;
     cache.current = {
       key,
       anchor,
       built: buildSpark(points, anchor, { baseline, thresholds, severity, expanded }),
-    }
+    };
   }
-  const built = cache.current!.built
+  const built = cache.current!.built;
 
-  if (!built) return <span className={css.sparkEmpty}>暂无趋势数据</span>
-  const { g } = built
-  const paused = pausedProp ?? sampling.paused
-  const lagging = !paused && clock - g.last.at > 3 * sampling.interval
-  const historical = paused || lagging
-  const age = formatAge(clock, g.last.at)
-  const historyText = `${paused ? '采集暂停' : '数据滞后'} · 最后 ${age}`
+  if (!built) return <span className={css.sparkEmpty}>暂无趋势数据</span>;
+  const { g } = built;
+  const paused = pausedProp ?? sampling.paused;
+  const lagging = !paused && clock - g.last.at > 3 * sampling.interval;
+  const historical = paused || lagging;
+  const age = formatAge(clock, g.last.at);
+  const historyText = `${paused ? '采集暂停' : '数据滞后'} · 最后 ${age}`;
 
   const summary =
     `${label}${historical ? `历史 5 分钟趋势，${historyText}：上次` : '最近 5 分钟趋势：当前'} ${format(g.last.value)}，最高 ${format(g.dataMax)}，` +
     `最低 ${format(g.dataMin)}` +
     (g.band ? `，基线区间 ${format(g.band.low)} 至 ${format(g.band.high)}` : '') +
     (thresholds.length
-      ? `，阈值 ${thresholds
-          .map((t) => `${t.label ?? '底线'} ${format(t.value)}`)
-          .join(' / ')}`
+      ? `，阈值 ${thresholds.map((t) => `${t.label ?? '底线'} ${format(t.value)}`).join(' / ')}`
       : '') +
-    (severity && !historical ? `，当前状态${SEV_WORD[severity]}` : '')
+    (severity && !historical ? `，当前状态${SEV_WORD[severity]}` : '');
 
   return (
     <div className={expanded ? css.chartBoxExpanded : css.chartBox}>
@@ -141,9 +139,10 @@ function SparklineBase({
           )}
           {thresholds
             .filter((t) => Number.isFinite(t.value))
-            .map((t, i) => (
+            .map((t, i) => ({ t, id: `threshold-${i}` }))
+            .map(({ t, id }) => (
               <line
-                key={i}
+                key={id}
                 data-threshold={t.sev}
                 className={t.sev === 'critical' ? css.thrCritical : css.thrWarn}
                 x1={0}
@@ -153,11 +152,7 @@ function SparklineBase({
                 vectorEffect="non-scaling-stroke"
               />
             ))}
-          <path
-            className={css.segNormal}
-            d={g.normalSegs.join(' ')}
-            vectorEffect="non-scaling-stroke"
-          />
+          <path className={css.segNormal} d={g.normalSegs.join(' ')} vectorEffect="non-scaling-stroke" />
           {g.warnSegs.length > 0 && (
             <path
               className={css.segWarn}
@@ -177,9 +172,7 @@ function SparklineBase({
           {!historical && (severity === 'warn' || severity === 'critical') && (
             <circle
               data-current={severity}
-              className={
-                severity === 'critical' ? css.curCritical : css.curWarn
-              }
+              className={severity === 'critical' ? css.curCritical : css.curWarn}
               cx={g.xOf(g.last.at)}
               cy={g.yOf(g.last.value)}
               r={1.5}
@@ -191,17 +184,14 @@ function SparklineBase({
           <>
             <span className={css.axisYMax}>{format(g.max)}</span>
             <span className={css.axisYMin}>{format(g.min)}</span>
-            {g.thrMarks.map(({ t, y }, i) => (
-              <span
-                key={i}
-                className={css.thrLabel}
-                data-sev={t.sev}
-                style={{ top: `${y}%` }}
-              >
-                {t.label ? `${t.label} ` : ''}
-                {format(t.value)}
-              </span>
-            ))}
+            {g.thrMarks
+              .map((mark, i) => ({ ...mark, id: `threshold-${i}` }))
+              .map(({ t, y, id }) => (
+                <span key={id} className={css.thrLabel} data-sev={t.sev} style={{ top: `${y}%` }}>
+                  {t.label ? `${t.label} ` : ''}
+                  {format(t.value)}
+                </span>
+              ))}
           </>
         )}
       </div>
@@ -211,10 +201,14 @@ function SparklineBase({
           <span>{historical ? historyText : '现在'}</span>
         </div>
       )}
-      {historical && !expanded && <div className={css.axisX} aria-hidden="true">{historyText}</div>}
+      {historical && !expanded && (
+        <div className={css.axisX} aria-hidden="true">
+          {historyText}
+        </div>
+      )}
       <span className={css.srOnly}>{summary}</span>
     </div>
-  )
+  );
 }
 
 // 纯时钟推进（now 变化但数据/语义相同）不重渲：重渲条件为 points 引用、
@@ -235,4 +229,4 @@ export const Sparkline = memo(
     a.baseline?.low === b.baseline?.low &&
     a.baseline?.high === b.baseline?.high &&
     sameThresholds(a.thresholds ?? [], b.thresholds ?? []),
-)
+);

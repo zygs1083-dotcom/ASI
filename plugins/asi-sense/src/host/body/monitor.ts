@@ -154,6 +154,8 @@ export class BodyMonitor implements BodyEvaluator {
     return this.view.current ? this.view.current.suggestions : (this.rebaser?.suggestions ?? []);
   }
   parameters = () => this.tuner?.parameters() ?? [];
+  /** Session token current `context` readings and their latches are attributed to. */
+  contextSessionToken = () => this.contextSession?.();
   rateEvidence = (metric: string) => {
     const sample = this.view.current ? this.view.current.sample : this.rateSample;
     if (metric === 'context' && this.contextSession && sample?.contextSession !== this.contextSession())

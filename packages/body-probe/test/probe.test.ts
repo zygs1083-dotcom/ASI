@@ -1,15 +1,15 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { BodyProbe, type ProbeCollectors } from '../src/probe.js';
+import { effectiveDisks, factStatusAt } from '@asi/sense-types';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as command from '../src/command.js';
-import { runCommand, type ExecFn, type RunFn } from '../src/command.js';
+import { type ExecFn, type RunFn, runCommand } from '../src/command.js';
+import * as fact from '../src/fact.js';
 import { MemorySampler } from '../src/memory.js';
 import { NetworkSampler } from '../src/network.js';
-import * as fact from '../src/fact.js';
+import { BodyProbe, type ProbeCollectors } from '../src/probe.js';
 import type { Body, Fact, TokensValue } from '../src/types.js';
-import { effectiveDisks, factStatusAt } from '@asi/sense-types';
 
 const src = (api: string) => fact.source('test', api);
 const ok = <T>(v: T, api = 'fake'): Fact<T> => fact.ok(v, src(api));
@@ -29,15 +29,18 @@ const tokenFact = (ttl = 12345): Fact<TokensValue> =>
 
 function deferred<T>() {
   let resolve!: (v: T) => void;
-  const promise = new Promise<T>((res) => { resolve = res; });
+  const promise = new Promise<T>((res) => {
+    resolve = res;
+  });
   return { promise, resolve };
 }
 
 const flush = () => vi.advanceTimersByTimeAsync(0);
 
-const fakeEn0 = () => vi.spyOn(os, 'networkInterfaces').mockReturnValue({
-  en0: [{ address: '10.0.0.1', netmask: '255.0.0.0', family: 'IPv4', mac: 'aa', internal: false, cidr: null }],
-});
+const fakeEn0 = () =>
+  vi.spyOn(os, 'networkInterfaces').mockReturnValue({
+    en0: [{ address: '10.0.0.1', netmask: '255.0.0.0', family: 'IPv4', mac: 'aa', internal: false, cidr: null }],
+  });
 
 describe('BodyProbe', () => {
   beforeEach(() => vi.useFakeTimers());
@@ -64,7 +67,10 @@ describe('BodyProbe', () => {
       const collectors = baseCollectors();
       collectors.disks = async () => {
         if (fails) throw new Error('fixture failure');
-        return Object.freeze({ ...fact.ok([{ mount: '/', total: 10, free: 5 }], src('disks')), kind: 'disks' as const });
+        return Object.freeze({
+          ...fact.ok([{ mount: '/', total: 10, free: 5 }], src('disks')),
+          kind: 'disks' as const,
+        });
       };
       const probe = new BodyProbe(collectors);
       probe.start();
@@ -112,7 +118,10 @@ describe('BodyProbe', () => {
         { mount: '/', total: 100, free: 2, status: 'ok', observedAt: t0, ttlMs: 6000 },
         { mount: '/b', total: 100, free: 90, status: 'ok', observedAt: t0 + 2000, ttlMs: 30000 },
       ],
-      status: 'ok', source: src('disks'), observedAt: t0, ttlMs: 6000,
+      status: 'ok',
+      source: src('disks'),
+      observedAt: t0,
+      ttlMs: 6000,
       unavailableMounts: ['/missing'],
     });
     const probe = new BodyProbe(collectors);
@@ -121,14 +130,18 @@ describe('BodyProbe', () => {
     await probe.stop();
     const original = probe.history()[0]!.body.disks;
     expect(effectiveDisks(original, t0 + 6500)).toMatchObject({
-      status: 'ok', observedAt: t0 + 2000, ttlMs: 30000,
+      status: 'ok',
+      observedAt: t0 + 2000,
+      ttlMs: 30000,
       indeterminateMounts: ['/', '/missing'],
     });
     await vi.advanceTimersByTimeAsync(6000);
     expect(probe.latest()!.disks.value?.[0]?.status).toBe('stale');
     await vi.advanceTimersByTimeAsync(500);
     expect(probe.latest()!.disks).toMatchObject({
-      status: 'ok', observedAt: t0 + 2000, ttlMs: 30000,
+      status: 'ok',
+      observedAt: t0 + 2000,
+      ttlMs: 30000,
       value: [{ status: 'stale' }, { status: 'ok' }],
     });
     await vi.advanceTimersByTimeAsync(25500);
@@ -138,7 +151,9 @@ describe('BodyProbe', () => {
     expect(effectiveDisks({ ...original, value: null }, t0 + 6500).status).toBe('unknown');
     expect(effectiveDisks({ ...original, value: null }, t0 + 6500).status).toBe('unknown');
     expect(effectiveDisks({ ...original, value: [] }, t0 + 6500).status).toBe('unknown');
-    expect(factStatusAt({ value: [], status: 'ok', source: original.source, observedAt: t0, ttlMs: 30000 }, t0 + 6500)).toBe('ok');
+    expect(
+      factStatusAt({ value: [], status: 'ok', source: original.source, observedAt: t0, ttlMs: 30000 }, t0 + 6500),
+    ).toBe('ok');
     expect(probe.history()[0]!.body.disks).toEqual(original);
   });
 
@@ -152,7 +167,14 @@ describe('BodyProbe', () => {
       ttlMs: 30_000,
       value: [
         { mount: '/stale', total: 100, free: 50, status: 'stale' as const, observedAt: at - 10_000, ttlMs: 10_000 },
-        { mount: '/missing', total: 100, free: 50, status: 'unavailable' as const, observedAt: at - 20_000, ttlMs: 1_000 },
+        {
+          mount: '/missing',
+          total: 100,
+          free: 50,
+          status: 'unavailable' as const,
+          observedAt: at - 20_000,
+          ttlMs: 1_000,
+        },
       ],
     };
     expect(fact.disksAt(disks, 0, at)).toMatchObject({ status: 'stale', observedAt: at - 10_000, ttlMs: 10_000 });
@@ -168,7 +190,10 @@ describe('BodyProbe', () => {
         { mount: '/', total: 100, free: 2, status: 'ok', observedAt: t0, ttlMs: 6000 },
         { mount: '/b', total: 100, free: 90, status: 'ok', observedAt: t0, ttlMs: 30000 },
       ],
-      status: 'ok', source: src('disks'), observedAt: t0, ttlMs: 6000,
+      status: 'ok',
+      source: src('disks'),
+      observedAt: t0,
+      ttlMs: 6000,
     });
     const probe = new BodyProbe(collectors);
     probe.start({ intervalMs: 2000 });
@@ -187,7 +212,10 @@ describe('BodyProbe', () => {
   it('unsubscribes listeners and isolates thrown errors and mutations', async () => {
     const probe = new BodyProbe(baseCollectors());
     const seen: number[] = [];
-    probe.onSample((b) => { b.cpu.value!.usage = 999; throw new Error('listener bug'); });
+    probe.onSample((b) => {
+      b.cpu.value!.usage = 999;
+      throw new Error('listener bug');
+    });
     probe.onSample((b) => seen.push(b.cpu.value!.usage));
     const off = probe.onSample(() => seen.push(-1));
     off();
@@ -205,7 +233,9 @@ describe('BodyProbe', () => {
     const collectors = baseCollectors();
     collectors.cpu = (ttl) => {
       calls += 1;
-      return new Promise<Fact<never>>((res) => { resolveCpu = res; });
+      return new Promise<Fact<never>>((res) => {
+        resolveCpu = res;
+      });
     };
     const probe = new BodyProbe(collectors);
     const seen: Body[] = [];
@@ -222,7 +252,10 @@ describe('BodyProbe', () => {
   it('suppresses samples that finish after stop()', async () => {
     let resolveCpu!: (f: Fact<never>) => void;
     const collectors = baseCollectors();
-    collectors.cpu = () => new Promise<Fact<never>>((res) => { resolveCpu = res; });
+    collectors.cpu = () =>
+      new Promise<Fact<never>>((res) => {
+        resolveCpu = res;
+      });
     const probe = new BodyProbe(collectors);
     const seen: Body[] = [];
     probe.onSample((b) => seen.push(b));
@@ -270,7 +303,14 @@ describe('BodyProbe', () => {
     await probe.stop();
 
     const rejecting = new BodyProbe(baseCollectors());
-    rejecting.start({ intervalMs: 2000, tokenSource: { read: async () => { throw new Error('meter down'); } } });
+    rejecting.start({
+      intervalMs: 2000,
+      tokenSource: {
+        read: async () => {
+          throw new Error('meter down');
+        },
+      },
+    });
     await flush();
     expect(rejecting.latest()?.tokens.status).toBe('unavailable');
     await rejecting.stop();
@@ -279,7 +319,12 @@ describe('BodyProbe', () => {
     let released!: () => void;
     hanging.start({
       intervalMs: 2000,
-      tokenSource: { read: () => new Promise<Fact<TokensValue>>((res) => { released = () => res(tokenFact()); }) },
+      tokenSource: {
+        read: () =>
+          new Promise<Fact<TokensValue>>((res) => {
+            released = () => res(tokenFact());
+          }),
+      },
     });
     await vi.advanceTimersByTimeAsync(1001);
     expect(hanging.latest()?.tokens.status).toBe('unavailable');
@@ -316,9 +361,12 @@ describe('BodyProbe', () => {
     collectors.cpu = (ttl) => {
       calls += 1;
       return calls === 1
-        ? new Promise<Fact<never>>((res) => { resolveFirst = res; })
-        : Promise.resolve(fact.ok(
-          { usage: 0.9, perCore: [], load1: 0, load5: 0, load15: 0 }, src('cpu'), ttl) as never);
+        ? new Promise<Fact<never>>((res) => {
+            resolveFirst = res;
+          })
+        : Promise.resolve(
+            fact.ok({ usage: 0.9, perCore: [], load1: 0, load5: 0, load15: 0 }, src('cpu'), ttl) as never,
+          );
     };
     const probe = new BodyProbe(collectors);
     const seen: number[] = [];
@@ -392,10 +440,15 @@ describe('BodyProbe', () => {
     await probe.stop();
   });
 
-  it('stop() waits only for its own generation\'s commands, not unrelated signals', async () => {
+  it("stop() waits only for its own generation's commands, not unrelated signals", async () => {
     const foreign = new AbortController();
     const d = deferred<{ stdout: string }>();
-    const pending = runCommand('/bin/f', [], vi.fn<ExecFn>(() => d.promise), foreign.signal);
+    const pending = runCommand(
+      '/bin/f',
+      [],
+      vi.fn<ExecFn>(() => d.promise),
+      foreign.signal,
+    );
     pending.catch(() => {});
     try {
       const probe = new BodyProbe(baseCollectors());
@@ -412,7 +465,8 @@ describe('BodyProbe', () => {
   it('leaves no timers when a collector synchronously stops the probe mid-tick', async () => {
     const collectors = baseCollectors();
     let probe!: BodyProbe;
-    collectors.memory = () => { // reentrant stop: aborts the tick mid-setup
+    collectors.memory = () => {
+      // reentrant stop: aborts the tick mid-setup
       void probe.stop();
       return new Promise<Fact<never>>(() => {});
     };
@@ -431,22 +485,36 @@ describe('BodyProbe', () => {
     const pidFile = path.join(os.tmpdir(), `body-probe-probe-${process.pid}.pid`);
     const collectors = baseCollectors();
     collectors.memory = async (ttl, signal) => {
-      await runCommand(process.execPath, [
-        '-e',
-        `require('node:fs').writeFileSync(${JSON.stringify(pidFile)}, String(process.pid)); setInterval(() => {}, 6e4);`,
-      ], undefined, signal);
+      await runCommand(
+        process.execPath,
+        [
+          '-e',
+          `require('node:fs').writeFileSync(${JSON.stringify(pidFile)}, String(process.pid)); setInterval(() => {}, 6e4);`,
+        ],
+        undefined,
+        signal,
+      );
       return fact.ok({ total: 1, used: 1, pressure: 'normal', swapUsed: 0 }, src('mem'), ttl);
     };
     const probe = new BodyProbe(collectors);
     let pid = 0;
     try {
       probe.start({ intervalMs: 60_000 });
-      await vi.waitFor(() => { pid = Number(fs.readFileSync(pidFile, 'utf8')); }, { timeout: 5000, interval: 20 });
+      await vi.waitFor(
+        () => {
+          pid = Number(fs.readFileSync(pidFile, 'utf8'));
+        },
+        { timeout: 5000, interval: 20 },
+      );
       await probe.stop(); // drains the aborted command through child close
       expect(() => process.kill(pid, 0)).toThrowError(/ESRCH/);
     } finally {
       await probe.stop();
-      try { if (pid) process.kill(pid, 'SIGKILL'); } catch { /* already gone */ }
+      try {
+        if (pid) process.kill(pid, 'SIGKILL');
+      } catch {
+        /* already gone */
+      }
       fs.rmSync(pidFile, { force: true });
     }
   });
@@ -509,7 +577,7 @@ describe('BodyProbe', () => {
     await probe.stop();
     probe.start({ intervalMs: 2000 }); // defaults apply again
     await flush();
-    expect(calls).toBe(3);             // the outer cache resets on start
+    expect(calls).toBe(3); // the outer cache resets on start
     await vi.advanceTimersByTimeAsync(4000); // t=4 < default 5s: cached
     expect(calls).toBe(3);
     await probe.stop();
@@ -524,7 +592,8 @@ describe('BodyProbe', () => {
       vi.spyOn(collectors, 'process'),
     ];
     let probe!: BodyProbe;
-    collectors.memory = () => { // reentrant stop: aborts the tick mid-setup
+    collectors.memory = () => {
+      // reentrant stop: aborts the tick mid-setup
       void probe.stop();
       return new Promise<Fact<never>>(() => {});
     };
@@ -556,7 +625,8 @@ describe('BodyProbe', () => {
   });
 
   it.each(['stat', 'statfs'] as const)(
-    'a never-settling disk %s keeps one hung op per path across 8 stop/starts', async (op) => {
+    'a never-settling disk %s keeps one hung op per path across 8 stop/starts',
+    async (op) => {
       let statCalls = 0;
       let statfsCalls = 0;
       vi.spyOn(fs.promises, 'stat').mockImplementation(async (p) => {
@@ -589,7 +659,8 @@ describe('BodyProbe', () => {
   );
 
   it.each(['stat', 'statfs'] as const)(
-    'publishes every tick while a resolved-cwd disk %s hangs; root keeps refreshing', async (op) => {
+    'publishes every tick while a resolved-cwd disk %s hangs; root keeps refreshing',
+    async (op) => {
       let free = 10;
       vi.spyOn(fs.promises, 'stat').mockImplementation(async (p) => {
         if (op === 'stat' && String(p) === '/wedge') return new Promise<never>(() => {});
@@ -618,7 +689,7 @@ describe('BodyProbe', () => {
       await vi.advanceTimersByTimeAsync(4000); // two more ticks past the timeout
       const last = seen.at(-1)!;
       const root2 = last.disks.value?.find((v) => v.mount === '/');
-      expect(seen).toHaveLength(4);            // ticks never wait on the wedge
+      expect(seen).toHaveLength(4); // ticks never wait on the wedge
       expect(root2?.free).toBeGreaterThan(root1?.free ?? -1); // root refreshed
       expect(root2?.observedAt).toBeGreaterThan(root1?.observedAt ?? 0);
       expect(last.disks.unavailableMounts).toEqual(['/wedge']);
@@ -643,9 +714,10 @@ describe('BodyProbe', () => {
       }
       if (file.endsWith('vm_stat')) return fx('vm_stat.txt');
       if (file.endsWith('sysctl')) {
-        return args.slice(1).map((key) =>
-          key === 'vm.swapusage' ? fx('swapusage.txt').trimEnd() : '1',
-        ).join('\n');
+        return args
+          .slice(1)
+          .map((key) => (key === 'vm.swapusage' ? fx('swapusage.txt').trimEnd() : '1'))
+          .join('\n');
       }
       return '1\n';
     });
@@ -676,9 +748,10 @@ describe('BodyProbe', () => {
       if (file.endsWith('sysctl')) {
         if (args.includes('kern.memorystatus_vm_pressure_level')) pressureCalls += 1;
         if (args.includes('vm.swapusage')) swapCalls += 1;
-        return args.slice(1).map((key) =>
-          key === 'vm.swapusage' ? swapOut.trimEnd() : pressureOut.trimEnd(),
-        ).join('\n');
+        return args
+          .slice(1)
+          .map((key) => (key === 'vm.swapusage' ? swapOut.trimEnd() : pressureOut.trimEnd()))
+          .join('\n');
       }
       if (file.endsWith('netstat')) return fx('netstat_1.txt');
       return '';
@@ -713,12 +786,16 @@ describe('BodyProbe', () => {
       if (file.endsWith('sysctl')) {
         if (args.includes('kern.memorystatus_vm_pressure_level')) pressureCalls += 1;
         if (args.includes('vm.swapusage')) swapCalls += 1;
-        return args.slice(1).map((key) =>
-          key === 'vm.swapusage' ? fx('swapusage.txt').trimEnd() : '1',
-        ).join('\n');
+        return args
+          .slice(1)
+          .map((key) => (key === 'vm.swapusage' ? fx('swapusage.txt').trimEnd() : '1'))
+          .join('\n');
       }
       if (file.endsWith('netstat')) return fx('netstat_1.txt');
-      if (file.endsWith('route')) { routeCalls += 1; return ''; }
+      if (file.endsWith('route')) {
+        routeCalls += 1;
+        return '';
+      }
       return '1\n';
     });
     fakeEn0();
@@ -791,9 +868,10 @@ describe('BodyProbe', () => {
       if (file.endsWith('vm_stat')) return fx('vm_stat.txt');
       if (file.endsWith('netstat')) return fx('netstat_1.txt');
       if (file.endsWith('sysctl')) {
-        return args.slice(1).map((key) =>
-          key === 'vm.swapusage' ? fx('swapusage.txt').trimEnd() : '1',
-        ).join('\n');
+        return args
+          .slice(1)
+          .map((key) => (key === 'vm.swapusage' ? fx('swapusage.txt').trimEnd() : '1'))
+          .join('\n');
       }
       return '1\n'; // route success output is unused
     };

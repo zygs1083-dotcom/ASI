@@ -218,6 +218,14 @@ export function validateSnapshot(json: string, parameters: Record<string, Parame
       if (spec.tighten === undefined || v === spec.value) continue;
       if (!applied.some((e) => e.param === k && e.to === v)) return undefined;
     }
+    // The guard's floor ordering applies to stored values too: a snapshot
+    // whose critical exceeds its warn is as untrusted as any other forgery.
+    const stored = new Map(st.values);
+    for (const [k, v] of stored) {
+      if (!/^floor\..+\.critical$/.test(k) || typeof v !== 'number') continue;
+      const warn = stored.get(k.replace(/\.critical$/, '.warn'));
+      if (typeof warn === 'number' && v > warn) return undefined;
+    }
     return st;
   } catch {
     return undefined;

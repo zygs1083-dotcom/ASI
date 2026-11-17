@@ -80,6 +80,11 @@ export class TunerGuard {
     const actor = actorOverride ?? this.actor();
     const spec = this.store.specs.get(param);
     const current = this.store.values.get(param);
+    const floor = /^floor\..+\.(warn|critical)$/.test(param);
+    const critical = param.endsWith('.critical');
+    const other = floor
+      ? this.store.values.get(param.replace(/\.(warn|critical)$/, critical ? '.warn' : '.critical'))
+      : undefined;
     let why: string | null = null;
     // Nonfinite clocks reject EVERYTHING — no value/window mutation, ever.
     if (!finiteNum(now) || !finiteNum(wall)) why = 'nonfinite clock';
@@ -94,7 +99,9 @@ export class TunerGuard {
       ((spec.min !== undefined && to < spec.min) || (spec.max !== undefined && to > spec.max))
     ) {
       why = 'out of bounds';
-    } else if (actor === undefined) why = 'untrusted actor';
+    } else if (typeof to === 'number' && typeof other === 'number' && (critical ? to > other : to < other))
+      why = 'critical exceeds warn';
+    else if (actor === undefined) why = 'untrusted actor';
     else if (this.store.locked.has(param) && !(actor === 'user' && operation === 'revert')) why = 'param locked';
     else if (actor !== 'user' && param.startsWith('deliveryLevel.') && to === 'wake')
       why = 'wake requires user approval';

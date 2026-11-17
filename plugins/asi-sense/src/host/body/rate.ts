@@ -140,6 +140,12 @@ export class RateEvaluator implements BodyEvaluator {
     return Number.isFinite(v) && v > 0 ? v : configured;
   }
 
+  /** Live floor bound: a legal `min: 0` override (0 = only when exhausted). */
+  private liveFloor(configured: number, param: string): number {
+    const v = this.threshold(param, configured);
+    return Number.isFinite(v) && v >= 0 ? v : configured;
+  }
+
   evaluate(prev: BodyThresholdSample, next: BodyThresholdSample, state: BodyThresholdState): BodyEvaluation {
     if (!Number.isFinite(prev.monotonicAt) || !Number.isFinite(next.monotonicAt)) {
       throw new TypeError('rate: monotonicAt must be finite');
@@ -151,7 +157,10 @@ export class RateEvaluator implements BodyEvaluator {
       return { signals: [], state: pub };
     }
     const evaluation = (next as RateSample).evaluatedAt ?? { mono, wall: next.at };
-    const metrics = readMetrics({ ...next, at: next.at + Math.max(0, evaluation.mono - mono) });
+    const metrics = readMetrics(
+      { ...next, at: next.at + Math.max(0, evaluation.mono - mono) },
+      this.liveFloor(0.05, 'floor.disk.critical'),
+    );
     const contextSession = (next as RateSample).contextSession;
     const sessions = (next as RateSample).contextSessions;
     const storageKey = (key: string) => (key === 'context' && contextSession ? `context@${contextSession}` : key);

@@ -1,42 +1,37 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
-import { formatTimestamp, formatTuningValue } from '../format'
-import { EyeOffIcon, PauseIcon } from '../icons'
-import { RebaselineSuggestions, TuningDisabled } from './tuning-actions'
-import type { TuningOperations } from './tuning-operation'
-import type {
-  SensePanelProps,
-  SenseRule,
-  TuningParam,
-} from '../view-model'
-import css from './rules.module.css'
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { formatTimestamp, formatTuningValue } from '../format';
+import { EyeOffIcon, PauseIcon } from '../icons';
+import type { SensePanelProps, SenseRule, TuningParam } from '../view-model';
+import css from './rules.module.css';
+import { RebaselineSuggestions, TuningDisabled } from './tuning-actions';
+import type { TuningOperations } from './tuning-operation';
 
-const LEVEL_TEXT = { record: '记录', context: '注入', wake: '唤醒' } as const
-const BY_TEXT = { agent: 'Agent', user: '用户', auto: '自动' } as const
+const LEVEL_TEXT = { record: '记录', context: '注入', wake: '唤醒' } as const;
+const BY_TEXT = { agent: 'Agent', user: '用户', auto: '自动' } as const;
 
 function isPending(r: SenseRule): boolean {
-  return r.createdBy === 'agent' && r.level === 'wake' && !r.confirmed
+  return r.createdBy === 'agent' && r.level === 'wake' && !r.confirmed;
 }
 
 function UndoButton({ onClick }: { onClick: () => void }) {
-  const button = useRef<HTMLButtonElement | null>(null)
+  const button = useRef<HTMLButtonElement | null>(null);
   const ref = useCallback((node: HTMLButtonElement | null) => {
-    if (!node && button.current === document.activeElement) button.current?.parentElement?.focus()
-    button.current = node
-  }, [])
-  return <button ref={ref} type="button" onClick={onClick}>撤销</button>
+    if (!node && button.current === document.activeElement) button.current?.parentElement?.focus();
+    button.current = node;
+  }, []);
+  return (
+    <button ref={ref} type="button" onClick={onClick}>
+      撤销
+    </button>
+  );
 }
 
-function RuleList({
-  model,
-  onToggleRule,
-  onConfirmRule,
-  onDeleteRule,
-}: SensePanelProps) {
+function RuleList({ model, onToggleRule, onConfirmRule, onDeleteRule }: SensePanelProps) {
   return (
     <ul className={css.rules}>
       {model.rules.length === 0 && <li className={css.empty}>暂无规则</li>}
       {model.rules.map((r) => {
-        const pending = isPending(r)
+        const pending = isPending(r);
         return (
           <li key={r.id} className={css.rule} data-pending={pending || undefined}>
             <div className={css.ruleMain}>
@@ -46,8 +41,7 @@ function RuleList({
               </span>
               <span className={css.ruleDesc}>
                 {r.match.kind}
-                {r.match.subject ? ` · ${r.match.subject}` : ''} ·{' '}
-                {LEVEL_TEXT[r.level]}
+                {r.match.subject ? ` · ${r.match.subject}` : ''} · {LEVEL_TEXT[r.level]}
                 {r.createdBy === 'agent' ? ' · Agent 提议' : ''}
               </span>
               {r.note && <span className={css.ruleNote}>{r.note}</span>}
@@ -80,10 +74,10 @@ function RuleList({
               )}
             </div>
           </li>
-        )
+        );
       })}
     </ul>
-  )
+  );
 }
 
 /**
@@ -96,13 +90,14 @@ function TuningView({
   onRevertTuning,
   onAcceptRebaseline,
   operations,
-}: Pick<SensePanelProps, 'model' | 'onLockParam' | 'onRevertTuning' | 'onAcceptRebaseline'> & { operations: TuningOperations }) {
-  const tuning = model.tuning
-  const params: TuningParam[] = tuning?.parameters ?? []
-  const log = tuning?.log ?? []
-  const unitOf = (key: string) => params.find((p) => p.key === key)?.unit
-  const labelOf = (key: string) =>
-    params.find((p) => p.key === key)?.label ?? key
+}: Pick<SensePanelProps, 'model' | 'onLockParam' | 'onRevertTuning' | 'onAcceptRebaseline'> & {
+  operations: TuningOperations;
+}) {
+  const tuning = model.tuning;
+  const params: TuningParam[] = tuning?.parameters ?? [];
+  const log = tuning?.log ?? [];
+  const unitOf = (key: string) => params.find((p) => p.key === key)?.unit;
+  const labelOf = (key: string) => params.find((p) => p.key === key)?.label ?? key;
 
   return (
     <>
@@ -136,6 +131,7 @@ function TuningView({
               <span>
                 {labelOf(e.paramKey)} ·{' '}
                 <span
+                  role="img"
                   className={css.tunePrev}
                   aria-label={`原值 ${formatTuningValue(e.previous, unitOf(e.paramKey))}`}
                 >
@@ -146,6 +142,7 @@ function TuningView({
                   →{' '}
                 </span>
                 <span
+                  role="img"
                   className={css.tuneNext}
                   aria-label={`新值 ${formatTuningValue(e.next, unitOf(e.paramKey))}`}
                 >
@@ -168,71 +165,60 @@ function TuningView({
         ))}
       </ul>
     </>
-  )
+  );
 }
 
 export function RulesSection(props: SensePanelProps & { tuningReq?: number; operations: TuningOperations }) {
-  const { model, onPause, onToggleTitles, tuningReq, operations } = props
-  const [view, setView] = useState<'rules' | 'tuning'>('rules')
-  const tuneRef = useRef<HTMLDivElement | null>(null)
-  const rulesButton = useRef<HTMLButtonElement | null>(null)
-  const tuningButton = useRef<HTMLButtonElement | null>(null)
-  const focusView = () => (view === 'rules' ? rulesButton : tuningButton).current?.focus()
+  const { model, onPause, onToggleTitles, tuningReq, operations } = props;
+  const [view, setView] = useState<'rules' | 'tuning'>('rules');
+  const tuneRef = useRef<HTMLDivElement | null>(null);
+  const rulesButton = useRef<HTMLButtonElement | null>(null);
+  const tuningButton = useRef<HTMLButtonElement | null>(null);
+  const focusView = () => (view === 'rules' ? rulesButton : tuningButton).current?.focus();
   // 「调整」入口：分区被打开后切到调整日志并把焦点带过去
   useEffect(() => {
-    if (tuningReq) setView('tuning')
-  }, [tuningReq])
+    if (tuningReq) setView('tuning');
+  }, [tuningReq]);
   // tuningReq 也进依赖：已在调整视图时再点卡片「调整」仍重新聚焦
   useEffect(() => {
-    if (view === 'tuning') tuneRef.current?.focus()
-  }, [view, tuningReq])
+    void tuningReq;
+    if (view === 'tuning') tuneRef.current?.focus();
+  }, [view, tuningReq]);
 
   return (
     <>
       <TuningDisabled
         {...props}
         operations={operations}
-        onResumeTuning={() => { focusView(); return props.onResumeTuning() }}
-        onResetTuning={() => { focusView(); return props.onResetTuning() }}
+        onResumeTuning={() => {
+          focusView();
+          return props.onResumeTuning();
+        }}
+        onResetTuning={() => {
+          focusView();
+          return props.onResetTuning();
+        }}
       />
       <label className={css.switch}>
-        <input
-          type="checkbox"
-          checked={model.paused}
-          onChange={(e) => onPause(e.target.checked)}
-        />
+        <input type="checkbox" checked={model.paused} onChange={(e) => onPause(e.target.checked)} />
         <PauseIcon />
         暂停感知
       </label>
       <label className={css.switch}>
-        <input
-          type="checkbox"
-          checked={model.sendTitles}
-          onChange={(e) => onToggleTitles(e.target.checked)}
-        />
+        <input type="checkbox" checked={model.sendTitles} onChange={(e) => onToggleTitles(e.target.checked)} />
         <EyeOffIcon />
         窗口标题发给模型
         <span>标题可能包含主机名等信息。</span>
       </label>
 
-      <div className={css.viewSwitch} role="group" aria-label="规则视图">
-        <button
-          ref={rulesButton}
-          type="button"
-          aria-pressed={view === 'rules'}
-          onClick={() => setView('rules')}
-        >
+      <fieldset className={css.viewSwitch} aria-label="规则视图">
+        <button ref={rulesButton} type="button" aria-pressed={view === 'rules'} onClick={() => setView('rules')}>
           规则列表
         </button>
-        <button
-          ref={tuningButton}
-          type="button"
-          aria-pressed={view === 'tuning'}
-          onClick={() => setView('tuning')}
-        >
+        <button ref={tuningButton} type="button" aria-pressed={view === 'tuning'} onClick={() => setView('tuning')}>
           调整日志
         </button>
-      </div>
+      </fieldset>
 
       {view === 'rules' ? (
         <RuleList {...props} />
@@ -241,10 +227,13 @@ export function RulesSection(props: SensePanelProps & { tuningReq?: number; oper
           <TuningView
             {...props}
             operations={operations}
-            onAcceptRebaseline={(id) => { tuningButton.current?.focus(); return props.onAcceptRebaseline(id) }}
+            onAcceptRebaseline={(id) => {
+              tuningButton.current?.focus();
+              return props.onAcceptRebaseline(id);
+            }}
           />
         </div>
       )}
     </>
-  )
+  );
 }

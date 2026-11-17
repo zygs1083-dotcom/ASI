@@ -10,7 +10,7 @@ export interface FileBurstOptions {
   maxDeleted?: number;
   maxDirectories?: number;
   /**
-   * Watched roots: an event groups under the LONGEST matching root
+   * Watched roots: an event counts toward EVERY root containing it
    * (`path === root` or `path` under `root/`); events outside every root
    * are ignored. Absent: each event groups under its own dirname.
    */
@@ -27,7 +27,22 @@ interface FileEvent {
   agent: boolean;
 }
 
+/**
+ * One burst bucket an event legitimately belongs to: `scope` is the canonical
+ * {@link burstScopeId} of the observing rule (so sibling globs on the same
+ * watch root keep independent windows and latches), `dir` the concrete bucket
+ * directory that becomes the emitted `file.burst` subject.
+ */
+export interface BurstTarget {
+  scope: string;
+  dir: string;
+}
+
 interface DirState {
+  /** Scope id this window belongs to (retention + emitted `data.scope`). */
+  scope: string;
+  /** Concrete bucket directory (emitted as `subject`/`data.directory`). */
+  dir: string;
   win: TimeWindow<FileEvent>;
   lastAt: number;
   /** External-burst wake latch. */
@@ -64,7 +79,7 @@ export class FileBurstDetector {
   private readonly windowMs: number;
   private readonly maxChanges: number;
   private readonly maxDeleted: number;
-  private readonly roots?: readonly string[];
+  private roots?: readonly string[];
   private readonly threshold: (param: string, fallback: number) => number;
   private readonly dirs = new Map<string, DirState>();
   private readonly maxDirectories: number;
@@ -102,6 +117,15 @@ export class FileBurstDetector {
     }
   }
 
+  /**
+   * Retains windows whose scope id is listed, dropping all others — a removed
+   * or expired rule's history never revives if its scope returns.
+   */
+  setScopes(scopes: readonly string[]): void {
+    const retained = new Set(scopes);
+    for (const [key, entry] of this.dirs) if (!retained.has(entry.scope)) this.dirs.delete(key);
+  }
+
   /** Live limits: the resolver is consulted per accept; bad reads fall back to config. */
   private limits(): { windowMs: number; maxChanges: number; maxDeleted: number } {
     const r = (param: string, fallback: number) => {
@@ -115,19 +139,22 @@ export class FileBurstDetector {
     };
   }
 
-  /** Longest watched root containing `path`, or its dirname without roots. */
-  private group(path: string): string | undefined {
-    if (!this.roots) return posix.dirname(path);
-    let best: string | undefined;
+  /** Every watched root containing `path`, or `[dirname]` without roots. */
+  private groups(path: string): BurstTarget[] {
+    if (!this.roots) return [{ scope: `dir:${posix.dirname(path)}`, dir: posix.dirname(path) }];
+    const out: BurstTarget[] = [];
     for (const r of this.roots) {
-      if (path === r || path.startsWith(r === '/' ? '/' : `${r}/`)) {
-        if (best === undefined || r.length > best.length) best = r;
-      }
+      if (path === r || path.startsWith(r === '/' ? '/' : `${r}/`)) out.push({ scope: `dir:${r}`, dir: r });
     }
-    return best;
+    return out;
   }
 
-  accept(signal: Signal, receivedAt: number): BodySignal[] {
+  /**
+   * `dirs` overrides auto-grouping: the caller supplies the (scope, dir)
+   * buckets the event legitimately belongs to — an empty list means the
+   * event counts toward no scope at all.
+   */
+  accept(signal: Signal, receivedAt: number, dirs?: readonly BurstTarget[]): BodySignal[] {
     // All cheap validation first: a malformed or backward event must never
     // touch (and thereby erase) healthy per-directory history.
     if (!Number.isFinite(receivedAt)) throw new TypeError('file.burst: receivedAt must be finite');
@@ -135,21 +162,40 @@ export class FileBurstDetector {
     const change = signal.data.change as Change | undefined;
     if (change !== 'add' && change !== 'modify' && change !== 'delete') return [];
     const path = typeof signal.data.path === 'string' ? signal.data.path : signal.subject;
-    const dir = this.group(path);
-    if (dir === undefined) return []; // outside every watched root
-    const existing = this.dirs.get(dir);
-    if (existing && receivedAt < existing.lastAt) return []; // backward per-directory event
+    const targets =
+      dirs === undefined
+        ? this.groups(path)
+        : [...new Map(dirs.map((t) => [`${t.scope}${t.dir}`, t] as const)).values()];
+    if (targets.length === 0) return []; // outside every watched scope
     const lim = this.limits();
     this.lastReceived = receivedAt;
     for (const [key, entry] of this.dirs) {
       entry.win.prune(receivedAt - lim.windowMs);
       if (entry.win.size === 0) this.dirs.delete(key);
     }
-    let st = this.dirs.get(dir);
+    const out: BodySignal[] = [];
+    for (const target of targets) {
+      const emitted = this.record(target, signal, change, receivedAt, lim);
+      if (emitted) out.push(emitted);
+    }
+    return out;
+  }
+
+  /** Counts one event against a single scope window; emits on a new crossing. */
+  private record(
+    target: BurstTarget,
+    signal: Signal,
+    change: Change,
+    receivedAt: number,
+    lim: { windowMs: number; maxChanges: number; maxDeleted: number },
+  ): BodySignal | undefined {
+    const key = `${target.scope}${target.dir}`;
+    let st = this.dirs.get(key);
+    if (st && receivedAt < st.lastAt) return undefined; // backward per-directory event
     if (st) {
       st.win.prune(receivedAt - lim.windowMs);
       if (st.win.size === 0) {
-        this.dirs.delete(dir);
+        this.dirs.delete(key);
         st = undefined; // expired under its own watermark: fresh state
       }
     }
@@ -157,22 +203,24 @@ export class FileBurstDetector {
       if (this.dirs.size >= this.maxDirectories) {
         let oldestKey: string | undefined;
         let oldest = Number.POSITIVE_INFINITY;
-        for (const [key, entry] of this.dirs) {
+        for (const [k, entry] of this.dirs) {
           if (entry.lastAt < oldest) {
-            oldestKey = key;
+            oldestKey = k;
             oldest = entry.lastAt;
           }
         }
         if (oldestKey !== undefined) this.dirs.delete(oldestKey);
       }
       st = {
+        scope: target.scope,
+        dir: target.dir,
         win: new TimeWindow<FileEvent>(),
         lastAt: Number.NEGATIVE_INFINITY,
         wake: false,
         deletion: false,
         agentOnly: false,
       };
-      this.dirs.set(dir, st);
+      this.dirs.set(key, st);
     }
     st.lastAt = receivedAt;
     st.win.push({ at: receivedAt, change, agent: signal.cause === 'agent' });
@@ -180,7 +228,6 @@ export class FileBurstDetector {
     const extDeleted = counts.deleted - counts.agentDeleted;
     const extTotal = counts.created + counts.modified + counts.deleted - extCounts(counts);
     const externalDeletionExceeded = extDeleted > lim.maxDeleted;
-    const out: BodySignal[] = [];
     const totalCrossed = extTotal > lim.maxChanges && !st.wake;
     const deletionCrossed = externalDeletionExceeded && !st.deletion;
     if (extTotal > lim.maxChanges) st.wake = true;
@@ -188,21 +235,20 @@ export class FileBurstDetector {
     if (externalDeletionExceeded) st.deletion = true;
     else if (extDeleted < lim.maxDeleted * REARM) st.deletion = false;
     if (extTotal > lim.maxChanges || externalDeletionExceeded) {
-      if (totalCrossed || deletionCrossed)
-        out.push(this.emit(signal, dir, 'wake', counts, lim, externalDeletionExceeded));
-    } else {
-      // Pure self-cause crossing: totals only breach through agent events.
-      const total = counts.created + counts.modified + counts.deleted;
-      if (total > lim.maxChanges || counts.deleted > lim.maxDeleted) {
-        if (!st.agentOnly) {
-          st.agentOnly = true;
-          out.push(this.emit(signal, dir, 'record', counts, lim, externalDeletionExceeded, 'agent'));
-        }
-      } else if (st.agentOnly && total < lim.maxChanges * REARM && counts.deleted < lim.maxDeleted * REARM) {
-        st.agentOnly = false;
-      }
+      if (totalCrossed || deletionCrossed) return this.emit(signal, st, 'wake', counts, lim, externalDeletionExceeded);
+      return undefined;
     }
-    return out;
+    // Pure self-cause crossing: totals only breach through agent events.
+    const total = counts.created + counts.modified + counts.deleted;
+    if (total > lim.maxChanges || counts.deleted > lim.maxDeleted) {
+      if (!st.agentOnly) {
+        st.agentOnly = true;
+        return this.emit(signal, st, 'record', counts, lim, externalDeletionExceeded, 'agent');
+      }
+    } else if (st.agentOnly && total < lim.maxChanges * REARM && counts.deleted < lim.maxDeleted * REARM) {
+      st.agentOnly = false;
+    }
+    return undefined;
   }
 
   private count(win: TimeWindow<FileEvent>): Counts {
@@ -224,7 +270,7 @@ export class FileBurstDetector {
 
   private emit(
     src: Signal,
-    dir: string,
+    st: DirState,
     level: 'wake' | 'record',
     c: Counts,
     lim: { windowMs: number; maxDeleted: number },
@@ -233,12 +279,12 @@ export class FileBurstDetector {
   ): BodySignal {
     return {
       id: `file.burst:${createHash('sha256')
-        .update(JSON.stringify([src.source.id, dir, src.at, src.id, level]))
+        .update(JSON.stringify([src.source.id, st.scope, st.dir, src.at, src.id, level]))
         .digest('hex')}`,
       kind: 'file.burst',
       at: src.at,
       source: src.source,
-      subject: dir,
+      subject: st.dir,
       layer: 'rate',
       ...(cause ? { cause } : {}),
       data: {
@@ -246,7 +292,8 @@ export class FileBurstDetector {
         level,
         wake: level === 'wake',
         ruleId: 'file.burst',
-        directory: dir,
+        directory: st.dir,
+        scope: st.scope,
         windowMs: lim.windowMs,
         externalDeletionExceeded,
         ...c,

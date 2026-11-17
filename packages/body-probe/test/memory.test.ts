@@ -1,8 +1,8 @@
 import { readFileSync } from 'node:fs';
 import { describe, expect, it, vi } from 'vitest';
-import { MemorySampler, parsePressureLevel, parseSwapUsage, parseVmStat } from '../src/memory.js';
-import * as fact from '../src/fact.js';
 import type { RunFn } from '../src/command.js';
+import * as fact from '../src/fact.js';
+import { MemorySampler, parsePressureLevel, parseSwapUsage, parseVmStat } from '../src/memory.js';
 
 const fx = (name: string) => readFileSync(new URL(`./fixtures/${name}`, import.meta.url), 'utf8');
 
@@ -11,11 +11,14 @@ const run =
   async (file, args = []) => {
     if (file.endsWith('vm_stat')) return vmStat;
     if (file.endsWith('sysctl')) {
-      return args.slice(1).map((key) => {
-        if (key === 'kern.memorystatus_vm_pressure_level') return pressure.trimEnd();
-        if (key === 'vm.swapusage') return swap.trimEnd();
-        throw new Error(`unexpected sysctl key ${key}`);
-      }).join('\n');
+      return args
+        .slice(1)
+        .map((key) => {
+          if (key === 'kern.memorystatus_vm_pressure_level') return pressure.trimEnd();
+          if (key === 'vm.swapusage') return swap.trimEnd();
+          throw new Error(`unexpected sysctl key ${key}`);
+        })
+        .join('\n');
     }
     throw new Error(`unexpected command ${file} ${args.join(' ')}`);
   };
@@ -57,7 +60,11 @@ describe('parseSwapUsage', () => {
 });
 
 describe('parsePressureLevel', () => {
-  it.each([[1, 'normal'], [2, 'warn'], [4, 'critical']] as const)('maps %s to %s', (n, expected) => {
+  it.each([
+    [1, 'normal'],
+    [2, 'warn'],
+    [4, 'critical'],
+  ] as const)('maps %s to %s', (n, expected) => {
     expect(parsePressureLevel(String(n))).toBe(expected);
   });
   it.each([3, 0, 5, NaN])('rejects unknown code %s', (n) => {
@@ -83,44 +90,51 @@ describe('MemorySampler', () => {
     });
   });
 
-  it.each([-20_000, 0, 20_000])('timestamps fresh memory independently of cached sysctls after a %i ms wall jump', async (jump) => {
-    let mono = 0;
-    let wall = 100_000;
-    let sysctlCalls = 0;
-    const baseRun = run(fx('vm_stat.txt'), '1\n', fx('swapusage.txt'));
-    const s = new MemorySampler({
-      platform: 'darwin',
-      run: async (file, args, signal) => {
-        if (file.endsWith('sysctl')) sysctlCalls++;
-        return baseRun(file, args, signal);
-      },
-      totalmem: () => 128 * 1024 ** 3,
-      now: () => mono,
-      wall: () => wall,
-    });
-    const periods = { pressureMs: 10_000, swapMs: 10_000 };
-    await s.sample(30_000, undefined, periods);
-    mono = 9_000;
-    wall += 9_000 + jump;
-    const result = await s.sample(30_000, undefined, periods);
-    expect(result.status).toBe('ok');
-    expect(result.observedAt).toBe(wall);
-    expect(result.ttlMs).toBe(21_000);
-    expect(sysctlCalls).toBe(1);
-    expect(fact.stale(result, 29_999, wall).status).toBe('ok');
-    expect(fact.stale(result, 30_000, wall).status).toBe('stale');
-  });
+  it.each([-20_000, 0, 20_000])(
+    'timestamps fresh memory independently of cached sysctls after a %i ms wall jump',
+    async (jump) => {
+      let mono = 0;
+      let wall = 100_000;
+      let sysctlCalls = 0;
+      const baseRun = run(fx('vm_stat.txt'), '1\n', fx('swapusage.txt'));
+      const s = new MemorySampler({
+        platform: 'darwin',
+        run: async (file, args, signal) => {
+          if (file.endsWith('sysctl')) sysctlCalls++;
+          return baseRun(file, args, signal);
+        },
+        totalmem: () => 128 * 1024 ** 3,
+        now: () => mono,
+        wall: () => wall,
+      });
+      const periods = { pressureMs: 10_000, swapMs: 10_000 };
+      await s.sample(30_000, undefined, periods);
+      mono = 9_000;
+      wall += 9_000 + jump;
+      const result = await s.sample(30_000, undefined, periods);
+      expect(result.status).toBe('ok');
+      expect(result.observedAt).toBe(wall);
+      expect(result.ttlMs).toBe(21_000);
+      expect(sysctlCalls).toBe(1);
+      expect(fact.stale(result, 29_999, wall).status).toBe('ok');
+      expect(fact.stale(result, 30_000, wall).status).toBe('stale');
+    },
+  );
 
   it.each(['vm_stat', 'sysctl'])('stamps each constituent when it completes if %s finishes first', async (first) => {
     let mono = 0;
     let wall = 100_000;
     let resolveVm!: (value: string) => void;
     let resolveSysctl!: (value: string) => void;
-    const vm = new Promise<string>((resolve) => { resolveVm = resolve; });
-    const sysctl = new Promise<string>((resolve) => { resolveSysctl = resolve; });
+    const vm = new Promise<string>((resolve) => {
+      resolveVm = resolve;
+    });
+    const sysctl = new Promise<string>((resolve) => {
+      resolveSysctl = resolve;
+    });
     const s = new MemorySampler({
       platform: 'darwin',
-      run: async (file) => file.endsWith('vm_stat') ? vm : sysctl,
+      run: async (file) => (file.endsWith('vm_stat') ? vm : sysctl),
       totalmem: () => 128 * 1024 ** 3,
       now: () => mono,
       wall: () => wall,
@@ -143,10 +157,12 @@ describe('MemorySampler', () => {
   it('keeps ttl nonnegative when an earlier constituent expires before vm_stat finishes', async () => {
     let mono = 0;
     let resolveVm!: (value: string) => void;
-    const vm = new Promise<string>((resolve) => { resolveVm = resolve; });
+    const vm = new Promise<string>((resolve) => {
+      resolveVm = resolve;
+    });
     const s = new MemorySampler({
       platform: 'darwin',
-      run: async (file) => file.endsWith('vm_stat') ? vm : `1\n${fx('swapusage.txt')}`,
+      run: async (file) => (file.endsWith('vm_stat') ? vm : `1\n${fx('swapusage.txt')}`),
       now: () => mono,
       wall: () => 100_000 + mono,
     });
@@ -175,12 +191,17 @@ describe('MemorySampler', () => {
     let resolveSwap!: (s: string) => void;
     const runFn: RunFn = async (file, args = []) => {
       if (file.endsWith('vm_stat')) throw Object.assign(new Error('nope'), { code: 'EACCES' });
-      if (args.includes('vm.swapusage')) return new Promise<string>((res) => { resolveSwap = res; });
+      if (args.includes('vm.swapusage'))
+        return new Promise<string>((res) => {
+          resolveSwap = res;
+        });
       return '1\n';
     };
     let settled = false;
-    const p = new MemorySampler({ platform: 'darwin', run: runFn }).sample()
-      .then((f) => { settled = true; return f; });
+    const p = new MemorySampler({ platform: 'darwin', run: runFn }).sample().then((f) => {
+      settled = true;
+      return f;
+    });
     await new Promise((r) => setImmediate(r));
     expect(settled).toBe(false); // still pending on the slow swap command
     resolveSwap(fx('swapusage.txt'));
@@ -194,13 +215,16 @@ describe('MemorySampler', () => {
     const runFn: RunFn = async (file, args = []) => {
       if (file.endsWith('vm_stat')) return fx('vm_stat.txt');
       if (args.includes('vm.swapusage')) calls += 1;
-      return args.slice(1).map((key) => {
-        if (key === 'vm.swapusage') {
-          if (fail) throw new Error('swap down');
-          return fx('swapusage.txt').trimEnd();
-        }
-        return '1';
-      }).join('\n');
+      return args
+        .slice(1)
+        .map((key) => {
+          if (key === 'vm.swapusage') {
+            if (fail) throw new Error('swap down');
+            return fx('swapusage.txt').trimEnd();
+          }
+          return '1';
+        })
+        .join('\n');
     };
     const s = new MemorySampler({ platform: 'darwin', run: runFn, now: () => t });
     expect((await s.sample()).status).toBe('unavailable');
@@ -208,36 +232,41 @@ describe('MemorySampler', () => {
     expect((await s.sample()).status).toBe('ok'); // rejected runs are retried
     t = 29_999;
     await s.sample();
-    expect(calls).toBe(2);                       // success is cached
+    expect(calls).toBe(2); // success is cached
     t = 30_000;
     await s.sample();
-    expect(calls).toBe(3);                       // and expires at 30s
+    expect(calls).toBe(3); // and expires at 30s
   });
 
   it('caches the pressure reading for 5s, never a rejected one', async () => {
-    let t = 0, calls = 0, fail = true;
+    let t = 0,
+      calls = 0,
+      fail = true;
     const runFn: RunFn = async (file, args = []) => {
       if (file.endsWith('vm_stat')) return fx('vm_stat.txt');
       if (args.includes('kern.memorystatus_vm_pressure_level')) calls += 1;
-      return args.slice(1).map((key) => {
-        if (key === 'kern.memorystatus_vm_pressure_level') {
-          if (fail) throw new Error('pressure down');
-          return '1';
-        }
-        return fx('swapusage.txt').trimEnd();
-      }).join('\n');
+      return args
+        .slice(1)
+        .map((key) => {
+          if (key === 'kern.memorystatus_vm_pressure_level') {
+            if (fail) throw new Error('pressure down');
+            return '1';
+          }
+          return fx('swapusage.txt').trimEnd();
+        })
+        .join('\n');
     };
     const s = new MemorySampler({ platform: 'darwin', run: runFn, now: () => t });
     expect((await s.sample()).status).toBe('unavailable'); // rejected: not cached
     fail = false;
     await s.sample();
-    expect(calls).toBe(2);   // success caches at t=0
+    expect(calls).toBe(2); // success caches at t=0
     t = 4_999;
     await s.sample();
-    expect(calls).toBe(2);   // inside the 5s window
+    expect(calls).toBe(2); // inside the 5s window
     t = 5_000;
     await s.sample();
-    expect(calls).toBe(3);   // boundary expiry re-runs
+    expect(calls).toBe(3); // boundary expiry re-runs
   });
 
   it('uses the vm observation time and earliest monotonic constituent deadline', async () => {
@@ -252,17 +281,19 @@ describe('MemorySampler', () => {
     });
     const first = await s.sample(6000); // all constituents fresh at wall 1000
     expect(first.observedAt).toBe(1000);
-    expect(first.ttlMs).toBe(6000);     // earliest expiry: vm read at 1000 + 3*2000
+    expect(first.ttlMs).toBe(6000); // earliest expiry: vm read at 1000 + 3*2000
 
-    wall = 9_000; mono = 4_000;         // pressure & swap caches still valid
+    wall = 9_000;
+    mono = 4_000; // pressure & swap caches still valid
     const second = await s.sample(6000);
     expect(second.observedAt).toBe(9_000); // fresh vm observation
-    expect(second.ttlMs).toBe(6_000);     // expires 6s after the fresh vm read
+    expect(second.ttlMs).toBe(6_000); // expires 6s after the fresh vm read
 
-    wall = 40_000; mono = 25_000;       // pressure expired (>5s), swap still cached
+    wall = 40_000;
+    mono = 25_000; // pressure expired (>5s), swap still cached
     const third = await s.sample(6000);
     expect(third.observedAt).toBe(40_000); // fresh vm observation
-    expect(third.ttlMs).toBe(6_000);      // expires 6s after the fresh vm read
+    expect(third.ttlMs).toBe(6_000); // expires 6s after the fresh vm read
     // the tracked monotonic deadline matches: vm part observed at mono 25000 + 6s
     expect(fact.stale(third, 30_999, 40_000).status).toBe('ok');
     expect(fact.stale(third, 31_001, 40_000).status).toBe('stale');
@@ -276,9 +307,10 @@ describe('MemorySampler', () => {
     const runFn: RunFn = async (file, args = []) => {
       if (file.endsWith('vm_stat')) return fx('vm_stat.txt');
       if (args.includes('kern.memorystatus_vm_pressure_level')) pressureCalls += 1;
-      return args.slice(1).map((key) =>
-        key === 'kern.memorystatus_vm_pressure_level' ? '1' : fx('swapusage.txt').trimEnd(),
-      ).join('\n');
+      return args
+        .slice(1)
+        .map((key) => (key === 'kern.memorystatus_vm_pressure_level' ? '1' : fx('swapusage.txt').trimEnd()))
+        .join('\n');
     };
     const s = new MemorySampler({ platform: 'darwin', run: runFn, now: () => mono });
     const periods = { pressureMs: 60_000, swapMs: 60_000 };
@@ -301,7 +333,12 @@ describe('MemorySampler', () => {
   });
 
   it('returns unavailable when a command fails', async () => {
-    const s = new MemorySampler({ platform: 'darwin', run: async () => { throw new Error('spawn failed'); } });
+    const s = new MemorySampler({
+      platform: 'darwin',
+      run: async () => {
+        throw new Error('spawn failed');
+      },
+    });
     expect((await s.sample()).status).toBe('unavailable');
   });
 
@@ -324,9 +361,10 @@ describe('MemorySampler', () => {
       if (file.endsWith('vm_stat')) return fx('vm_stat.txt');
       calls.push([...args]);
       signals.push(signal);
-      return args.slice(1).map((key) =>
-        key === 'vm.swapusage' ? fx('swapusage.txt') : '1',
-      ).join('\n');
+      return args
+        .slice(1)
+        .map((key) => (key === 'vm.swapusage' ? fx('swapusage.txt') : '1'))
+        .join('\n');
     };
     const s = new MemorySampler({ platform: 'darwin', run: runFn, now: () => t });
     const controller = new AbortController();

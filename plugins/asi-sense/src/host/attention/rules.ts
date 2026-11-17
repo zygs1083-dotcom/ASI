@@ -1,3 +1,4 @@
+import path from 'node:path';
 import type { DeliveryLevel, Signal, WatchRule } from '@asi/sense-types';
 
 /** Ordering of delivery levels for rule priority. */
@@ -16,7 +17,7 @@ const REGEX_SPECIALS = /[.*+?^${}()|[\]\\]/g;
  * characters, `**` matches across `/`, `?` matches a single non-`/` char.
  * Everything else is literal.
  */
-function globToRegExp(pattern: string): RegExp {
+export function globToRegExp(pattern: string): RegExp {
   let re = '';
   for (let i = 0; i < pattern.length; i++) {
     const ch = pattern[i] as string;
@@ -35,6 +36,76 @@ function globToRegExp(pattern: string): RegExp {
     }
   }
   return new RegExp(`^${re}$`);
+}
+
+/** `/w` itself plus everything below it. */
+function subtreeRegExp(dir: string): RegExp {
+  const escaped = (dir === '/' ? '' : dir).replace(REGEX_SPECIALS, '\\$&');
+  return new RegExp(`^${escaped}(?:/.*)?$`);
+}
+
+/** The glob pattern `P` itself and everything below it (`P` may contain wildcards). */
+function dirBoundaryRegExp(pattern: string): RegExp {
+  const inner = globToRegExp(pattern).source;
+  return new RegExp(`${inner.slice(0, -1)}(?:/.*)?$`);
+}
+
+/**
+ * Normalizes a file-rule subject spelling: `path.normalize` plus stripping
+ * redundant trailing slashes, so a `<p>` subtree spelled with a trailing
+ * slash collapses to `<p>` and `<p>` itself is preserved. `/` stays `/`.
+ */
+export function normalizeFileSubject(subject: string): string {
+  const pattern = path.normalize(subject);
+  return pattern.length > 1 ? pattern.replace(/[/]+$/, '') : pattern;
+}
+
+/**
+ * Canonical identity of the path set a file rule observes: `dir:<base>` for
+ * the whole-subtree spellings (`<base>`, `<base>/`, `<base>/**`), otherwise
+ * `glob:<normalized>`. `file.burst` signals carry this id in `data.scope` —
+ * every scope keeps its own sliding window and latches, so a burst under one
+ * scope can never wake or mask a sibling scope on the same watch root.
+ */
+export function burstScopeId(subject: string): string | undefined {
+  const pattern = normalizeFileSubject(subject);
+  if (!path.isAbsolute(pattern)) return undefined;
+  if (!/[*?]/.test(pattern)) return `dir:${pattern}`;
+  if (pattern.endsWith('/**')) {
+    const base = pattern.slice(0, -3);
+    if (!/[*?]/.test(base)) return `dir:${base || '/'}`;
+  }
+  return `glob:${pattern}`;
+}
+
+/**
+ * The set of paths a file rule legitimately observes — a literal path or a
+ * `<literal-dir>/**` subject covers the whole subtree (dir semantics), any
+ * other wildcard subject is limited to its own matchable set: single-level
+ * globs see direct children only, in-segment prefix wildcards see only
+ * matching first-level entries, and `/**`-containing globs see only their
+ * glob's own matches. A rule can never observe outside this set.
+ */
+export function subjectScope(subject: string): RegExp | undefined {
+  const pattern = normalizeFileSubject(subject);
+  if (!path.isAbsolute(pattern)) return undefined;
+  if (!/[*?]/.test(pattern)) return subtreeRegExp(pattern);
+  if (pattern.endsWith('/**')) {
+    const base = pattern.slice(0, -3);
+    if (!/[*?]/.test(base)) return subtreeRegExp(base || '/');
+  }
+  return globToRegExp(pattern);
+}
+
+/**
+ * Whether the subject's scope can reach below the watch root's first level:
+ * literal dirs and any subject containing `**` or a wildcard in a non-last
+ * segment need a recursive native watcher; single-level globs do not.
+ */
+export function subjectNeedsDeep(subject: string): boolean {
+  const pattern = normalizeFileSubject(subject);
+  if (!/[*?]/.test(pattern)) return true;
+  return /\*\*/.test(pattern) || pattern.search(/[*?]/) < pattern.lastIndexOf('/');
 }
 
 /** Valid `where` operand: null, or a finite number, string or boolean. */
@@ -160,9 +231,32 @@ export function matchesRule(rule: WatchRule, signal: Signal, now: number): boole
   if (rule.expiresAt !== undefined && now >= rule.expiresAt) return false;
   if (rule.match.kind !== signal.kind) return false;
   if (rule.match.subject !== undefined) {
-    if (typeof signal.subject !== 'string' || !globToRegExp(rule.match.subject).test(signal.subject)) {
-      return false;
+    // Only file signals carry paths — normalize their subject spelling; every
+    // other kind (job.*, window.*, …) keeps raw glob semantics.
+    const pattern =
+      signal.kind === 'file.changed' || signal.kind === 'file.burst'
+        ? normalizeFileSubject(rule.match.subject)
+        : rule.match.subject;
+    const subject = signal.subject;
+    // A file.burst signal carrying `data.scope` attributes the burst to one
+    // canonical scope id — it matches only the identical scope, never a
+    // sibling glob on the same watch root (even when the emitted dir happens
+    // to match that glob textually). Untagged signals fall back to directory
+    // semantics: a literal dir covers bursts anywhere in its subtree and
+    // `<base>/**` covers base plus deeper burst dirs.
+    const scope = signal.kind === 'file.burst' && isPlainObject(signal.data) ? signal.data.scope : undefined;
+    let matched: boolean;
+    if (typeof scope === 'string') {
+      matched = burstScopeId(rule.match.subject) === scope;
+    } else {
+      matched = typeof subject === 'string' && globToRegExp(pattern).test(subject);
+      if (!matched && signal.kind === 'file.burst' && typeof subject === 'string') {
+        matched =
+          (!/[*?]/.test(pattern) && subtreeRegExp(pattern).test(subject)) ||
+          (pattern.endsWith('/**') && dirBoundaryRegExp(pattern.slice(0, -3) || '/').test(subject));
+      }
     }
+    if (!matched) return false;
   }
   if (rule.match.where !== undefined) {
     const data = isPlainObject(signal.data) ? signal.data : {};

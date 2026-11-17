@@ -2,9 +2,9 @@
    数值取自 dsh packages/client/ui-theme/src/styles/{base,design-platform}.css。 */
 
 :root {
-  --dsw-font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC',
-    'Hiragino Sans GB', 'Microsoft YaHei', sans-serif;
-  --ds-font-family-code: 'SF Mono', 'JetBrains Mono', Consolas, monospace;
+  --dsw-font-family:
+    -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+  --ds-font-family-code: "SF Mono", "JetBrains Mono", Consolas, monospace;
   --dsw-font-xxs-12-font-size: 12px;
   --dsw-font-xs-13-font-size: 13px;
   --dsw-radius-xs: 4px;

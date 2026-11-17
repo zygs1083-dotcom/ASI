@@ -1,6 +1,6 @@
-import { defineConfig } from '@playwright/test'
+import { defineConfig } from '@playwright/test';
 
-const PORT = 4173
+const PORT = 4173;
 
 export default defineConfig({
   testDir: './test/e2e',
@@ -22,4 +22,4 @@ export default defineConfig({
     reuseExistingServer: false,
     timeout: 60_000,
   },
-})
+});

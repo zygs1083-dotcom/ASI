@@ -1,5 +1,7 @@
 import type { Body } from '@asi/sense-types';
 import type { BodyHistory, MetricInsight, MetricKey, ThresholdLayer } from '@asi/sense-ui/model';
+import { latchRatio } from '../attention/thresholds.ts';
+import { floorTable } from '../body/rules.ts';
 import type { Clock } from '../runtime/index.ts';
 import type { Runtime } from './project.ts';
 
@@ -80,6 +82,7 @@ function etaFor(
   body: Body,
   interval: number,
   at: (mono: number) => number,
+  diskFloor: number,
 ): MetricInsight['currentEta'] {
   const metric = key.startsWith('disk:') ? key : natural[key];
   if (!metric || (!key.startsWith('disk:') && key !== 'tokens')) return undefined;
@@ -89,7 +92,7 @@ function etaFor(
   if (!evidence.latched || evidence.points.length < 3 || !last || evidence.asOf === undefined || loss <= 0)
     return undefined;
   const total = key.startsWith('disk:') ? body.disks.value?.find((disk) => disk.mount === key.slice(5))?.total : 0;
-  const floor = key === 'tokens' ? 0 : total !== undefined && total > 0 ? total * 0.05 : undefined;
+  const floor = key === 'tokens' ? 0 : total !== undefined && total > 0 ? total * diskFloor : undefined;
   if (floor === undefined) return undefined;
   const timeToThresholdMs = (Math.max(0, last.value - floor) / loss) * 60_000;
   if (!Number.isFinite(timeToThresholdMs)) return undefined;
@@ -130,16 +133,44 @@ export function projectInsights(
     const floorKey = disk ? key : key === 'tokens' ? 'context' : key;
     if (disk || key === 'tokens' || key === 'battery' || key === 'memory' || key === 'thermal') {
       sources.push('floor');
-      const latched = latches[floorKey];
-      if (latched === 'warn' || latched === 'critical') {
-        triggered.push('floor');
-        severity = latched;
+      if (key === 'tokens') {
+        // Per-session latches live under `context@<token>` — the bare
+        // `context` key is only the last sampled session's overwrite. The
+        // tokens fact can also refresh between samples, so classify the
+        // CURRENT reading against this session's own latch instead.
+        const session = monitor.contextSessionToken();
+        const used = token?.contextUsed;
+        const win = token?.contextWindow;
+        const prior = latches[session ? `context@${session}` : 'context'];
+        if (typeof used === 'number' && Number.isFinite(used) && used >= 0 && typeof win === 'number' && win > 0) {
+          const t = floorTable(tuner);
+          const level = latchRatio(
+            prior === 'warn' || prior === 'critical' ? prior : 'normal',
+            (win - used) / win,
+            t.context,
+            t.hysteresis,
+          );
+          if (level !== 'normal') {
+            triggered.push('floor');
+            severity = level;
+          }
+        } else if (prior === 'warn' || prior === 'critical') {
+          triggered.push('floor');
+          severity = prior;
+        }
+      } else {
+        const latched = latches[floorKey];
+        if (latched === 'warn' || latched === 'critical') {
+          triggered.push('floor');
+          severity = latched;
+        }
       }
     }
     const rateKey = disk ? `rate:disk-drop:${key}` : rate[key] ? `rate:${rate[key]}` : undefined;
     if (rateKey) {
       sources.push('rate');
-      if (latches[rateKey] === 'warn') {
+      const latched = key === 'tokens' ? monitor.rateEvidence('context').latched : latches[rateKey] === 'warn';
+      if (latched) {
         triggered.push('rate');
         severity ??= 'warn';
       }
@@ -195,7 +226,14 @@ export function projectInsights(
     }
     const defaultInterval = disk ? 10_000 : key === 'battery' ? 30_000 : 2_000;
     const interval = intervals[key] ?? defaultInterval;
-    const eta = etaFor(key, monitor, body, Number.isFinite(interval) && interval > 0 ? interval : defaultInterval, at);
+    const eta = etaFor(
+      key,
+      monitor,
+      body,
+      Number.isFinite(interval) && interval > 0 ? interval : defaultInterval,
+      at,
+      tuner.number('floor.disk.critical', 0.05),
+    );
     if (eta) item.currentEta = eta;
     insights[key] = item;
   }

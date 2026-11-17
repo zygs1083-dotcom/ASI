@@ -5,6 +5,5 @@ export function smokeProgressOk(samples: number, ok: ReadonlySet<string>, expect
 }
 
 export function cpuWithinBudget(user: number, sys: number, real: number): boolean {
-  return [user, sys, real].every((n) => Number.isFinite(n) && n >= 0)
-    && real > 0 && 100 * (user + sys) / real <= 0.6;
+  return [user, sys, real].every((n) => Number.isFinite(n) && n >= 0) && real > 0 && (100 * (user + sys)) / real <= 0.6;
 }

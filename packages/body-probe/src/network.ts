@@ -14,7 +14,10 @@ export interface IfaceCounters {
 // than the header. Rows are re-aligned by inserting an empty Address so the
 // Ibytes/Obytes header indexes stay correct.
 export function parseNetstatIB(text: string): Map<string, IfaceCounters> {
-  const lines = text.split('\n').map((l) => l.trim()).filter((l) => l !== '');
+  const lines = text
+    .split('\n')
+    .map((l) => l.trim())
+    .filter((l) => l !== '');
   const header = (lines[0] ?? '').split(/\s+/);
   const iName = header.indexOf('Name');
   const iNet = header.indexOf('Network');
@@ -86,8 +89,8 @@ export interface NetworkDeps {
   run?: RunFn;
   platform?: NodeJS.Platform;
   interfaces?: () => IfaceMap;
-  now?: () => number;   // monotonic clock for cache eligibility
-  wall?: () => number;  // wall clock stamped on cache entries and facts
+  now?: () => number; // monotonic clock for cache eligibility
+  wall?: () => number; // wall clock stamped on cache entries and facts
   src?: SourceRef;
 }
 
@@ -106,9 +109,9 @@ const ROUTE_CACHE_MS = 30_000;
 const MAX_BPS = 10_000_000_000 / 8;
 
 interface RouteEntry {
-  at: number;          // monotonic stamp used for expiry
-  observedAt: number;  // wall stamp of the cached route observation
-  value: boolean;      // success (true) or known-offline (false); unknown is never cached
+  at: number; // monotonic stamp used for expiry
+  observedAt: number; // wall stamp of the cached route observation
+  value: boolean; // success (true) or known-offline (false); unknown is never cached
 }
 
 // The only recognized no-route diagnostic: `route -n get` prints
@@ -177,10 +180,7 @@ export class NetworkSampler {
       if (rxBps > MAX_BPS || txBps > MAX_BPS || rxBps + txBps > MAX_BPS) {
         return fact.fail('unknown', this.src, ttlMs);
       }
-      const meta = fact.oldestMeta([
-        { observedAt: wallNow, periodMs: ttlMs / 3, at: now },
-        ...online.parts,
-      ]);
+      const meta = fact.oldestMeta([{ observedAt: wallNow, periodMs: ttlMs / 3, at: now }, ...online.parts]);
       const f = fact.ok({ online: online.verdict, rxBps, txBps }, this.src, meta.expiresAt! - now, wallNow);
       if (meta.expiresAt !== undefined) fact.trackDeadline(f, meta.expiresAt);
       return f;
