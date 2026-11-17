@@ -105,6 +105,29 @@ describe('Tuner actor trust', () => {
 });
 
 describe('Tuner guard matrix', () => {
+  it('keeps undoable changes in the displayed audit after rejected proposals flood the log', async () => {
+    const t = mk();
+    asUser();
+    const change = await t.propose({ param: 'plain', to: 12 });
+    for (let i = 0; i < 510; i++) await t.propose({ param: 'plain', to: 12 });
+    expect(t.undoableChanges.map((item) => item.id)).toContain(change.change.id);
+    expect(t.logs.map((item) => item.id)).toContain(change.change.id);
+    expect((await t.revert(change.change.id)).applied).toBe(true);
+    await t.close();
+  });
+
+  it.each(['disk', 'context', 'battery'])('rejects inverted %s critical and warning floors', async (metric) => {
+    const t = mk({
+      [`floor.${metric}.warn`]: { value: 0.15, min: 0.01, max: 0.5, tighten: 'up' },
+      [`floor.${metric}.critical`]: { value: 0.05, min: 0.01, max: 0.5, tighten: 'up' },
+    });
+    asUser();
+    expect((await t.propose({ param: `floor.${metric}.critical`, to: 0.2 })).applied).toBe(false);
+    expect((await t.propose({ param: `floor.${metric}.warn`, to: 0.03 })).applied).toBe(false);
+    expect((await t.propose({ param: `floor.${metric}.critical`, to: 0.15 })).applied).toBe(true);
+    await t.close();
+  });
+
   it('binds agent/auto to amplitude, direction, lock and budgets; user bypasses AI guards', async () => {
     const t = mk();
     expect((await t.propose({ param: 'plain', to: 15 })).applied).toBe(true); // +50% ok

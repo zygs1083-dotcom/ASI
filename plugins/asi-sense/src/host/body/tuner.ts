@@ -96,7 +96,14 @@ export class Tuner {
   }
   /** Display audit log (capped at 500); undoable changes are retained separately. */
   get logs(): TuningLog[] {
-    return this.store.log.slice(-500).map((e) => ({ ...e }));
+    const undoable = this.undoableChanges;
+    const ids = new Set(undoable.map((entry) => entry.id));
+    const capacity = Math.max(0, 500 - ids.size);
+    const recent = capacity ? this.store.log.filter((entry) => !ids.has(entry.id)).slice(-capacity) : [];
+    for (const entry of recent) ids.add(entry.id);
+    const visible = this.store.log.filter((entry) => ids.has(entry.id));
+    const present = new Set(visible.map((entry) => entry.id));
+    return [...undoable.filter((entry) => !present.has(entry.id)), ...visible].map((e) => ({ ...e }));
   }
 
   get undoableChanges(): TuningLog[] {
