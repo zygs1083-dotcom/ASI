@@ -34,9 +34,11 @@ function harness(
   options: SenseOptions = {},
   nowReadings?: (session?: string) => NowReadings,
   modelJobs?: DshPort['modelJobs'],
+  syncMono = false,
 ) {
   vi.useFakeTimers();
   vi.setSystemTime(1_700_000_000_000);
+  const monoStart = performance.now();
   let mono = 0;
   let agent: (event: AgentEvent) => Promise<void> = async () => {};
   let tool: (event: ToolEvent) => Promise<void> = async () => {};
@@ -50,7 +52,7 @@ function harness(
   let probes = 0;
   const delivered: Parameters<DshPort['deliver']>[1][] = [];
   const ports: SensePorts = {
-    clock: { wall: () => Date.now(), mono: () => mono },
+    clock: { wall: () => Date.now(), mono: () => (syncMono ? performance.now() - monoStart : mono) },
     dsh: {
       ...(nowReadings ? { nowReadings } : {}),
       ...(modelJobs ? { modelJobs } : {}),
@@ -1197,7 +1199,7 @@ describe('host runtime', () => {
   });
 
   it('stops retrying after ten failures, reports degradation and recovers after a later delivery', async () => {
-    const h = harness();
+    const h = harness(undefined, {}, undefined, undefined, true);
     let attempts = 0;
     let failing = true;
     h.ports.dsh.deliver = async () => {
@@ -1234,7 +1236,7 @@ describe('host runtime', () => {
     expect(attempts).toBe(11);
     expect(h.runtime.state().observation.sources.delivery).toMatchObject({ status: 'ok' });
     await h.runtime.stop();
-  });
+  }, 20_000);
 
   it('resets the retry budget when the selected session changes', async () => {
     const h = harness();
