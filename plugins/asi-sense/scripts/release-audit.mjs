@@ -58,6 +58,9 @@ const safeMatches = new Set(
       '/usr/sbin/netstat',
       '/sbin/route',
       '/bin/ps',
+      // Bundled regex literal `/^\s*interface:\s*(\S+)/m` — the audit's
+      // Windows-path arm matches from the `e:` inside `interface:`.
+      'e:\\s*(\\S+)/m.exec(text)?.[1];',
       '/-/g',
       '/_/g',
     ],

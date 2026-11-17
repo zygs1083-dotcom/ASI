@@ -96,7 +96,11 @@ export async function stop(child: ChildProcess, graceMs = 10_000): Promise<void>
       process.kill(group, value);
       return true;
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ESRCH') return false;
+      const code = (error as NodeJS.ErrnoException).code;
+      // EPERM means the pid was recycled as a foreign process group — a
+      // group containing only our own same-uid processes can never EPERM,
+      // so treat it like ESRCH (nothing of ours left to signal).
+      if (code === 'ESRCH' || code === 'EPERM') return false;
       throw error;
     }
   };
