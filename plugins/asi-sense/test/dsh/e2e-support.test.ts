@@ -173,7 +173,9 @@ describe('private DSH fixture profile', () => {
     await expect(access(profile)).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
-  it('removes the actual fixture profile when DSH initialization fails', async () => {
+  // Spawns a real `tsx` subprocess; under CPU load the startup alone can
+  // exceed vitest's default 5s timeout.
+  it('removes the actual fixture profile when DSH initialization fails', { timeout: 30_000 }, async () => {
     const child = spawn(
       process.execPath,
       ['--import', import.meta.resolve('tsx/esm'), fileURLToPath(new URL('../../scripts/e2e-dsh.ts', import.meta.url))],
@@ -190,7 +192,8 @@ describe('private DSH fixture profile', () => {
     expect(output).toContain('Temporary profile removed: yes');
   });
 
-  it('removes the danger fixture profile when initialization fails', async () => {
+  // Same reason as above: real `tsx` subprocess startup under load.
+  it('removes the danger fixture profile when initialization fails', { timeout: 30_000 }, async () => {
     const child = spawn(
       process.execPath,
       ['--import', import.meta.resolve('tsx/esm'), fileURLToPath(new URL('./danger-e2e.ts', import.meta.url))],
