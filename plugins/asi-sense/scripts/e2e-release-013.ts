@@ -628,7 +628,88 @@ async function phaseModel(): Promise<void> {
   }
 }
 
+/** Install the release tarball into a fresh DSH_HOME: sidebar + version, then uninstall. */
+async function phasePack(tgz: string): Promise<void> {
+  await using profile = await temporaryProfile();
+  const root = await realpath(profile.root);
+  const home = join(root, 'home');
+  const workspace = join(root, 'deepseek-harness/default-workspace');
+  await mkdir(workspace, { recursive: true, mode: 0o700 });
+  const env = {
+    ...process.env,
+    DSH_HOME: home,
+    DSH_TELEMETRY_DISABLED: '1',
+    ASI_MAGPIE_PLACEHOLDER: 'magpie',
+    TSX_TSCONFIG_PATH: join(dsh, 'tsconfig.json'),
+  };
+  const st: RunState = { phase: 'profile setup' };
+  try {
+    await run(
+      process.execPath,
+      [...args, '--profile', 'asi-dev', '--from-default-profile', 'web', '--dump-config'],
+      workspace,
+      env,
+    );
+    st.phase = 'plugin add tarball';
+    await run(process.execPath, [...args, 'plugin', '--profile', 'asi-dev', 'add', tgz], workspace, env);
+    const installed = join(home, 'profiles/asi-dev/node_modules/asi-sense/package.json');
+    const manifest = JSON.parse(await readFile(installed, 'utf8')) as Record<string, unknown>;
+    console.log(`installed package: ${manifest.name}@${manifest.version}`);
+    expect(manifest.version).toBe('0.1.3');
+
+    st.phase = 'sidebar opens';
+    const server = spawn(
+      process.execPath,
+      [...args, '--profile', 'asi-dev', '--patch', picker, '--no-open', '--host', '127.0.0.1', '--port', '0'],
+      { cwd: workspace, env, detached: true, stdio: ['ignore', 'pipe', 'pipe'] },
+    );
+    st.server = server;
+    st.watchdog = setTimeout(() => {
+      console.error('pack phase exceeded the 4-minute limit; stopping owned processes');
+      void Promise.allSettled([st.browser?.close() ?? Promise.resolve(), stop(server)]).then(() => process.exit(1));
+    }, 240_000);
+    const url = await webUrl(server);
+    server.stdout?.resume();
+    server.stderr?.resume();
+    console.log(`Owned DSH PID: ${server.pid}`);
+    console.log(`Owned helper PIDs: ${(await waitHelper()).join(',')}`);
+    st.browser = await chromium.launch({ headless: true });
+    st.context = await st.browser.newContext({ viewport: { width: 1440, height: 900 } });
+    const panelPage = await st.context.newPage();
+    const panel = await openPanel(panelPage, url);
+    await expect(panel.getByRole('heading', { name: '环境感知' })).toBeVisible();
+    await expect(panel.locator('[data-tile="cpu"]')).toContainText(/\d/, { timeout: 25_000 });
+    console.log('sidebar opens from the installed tarball; cpu tile live: yes');
+
+    st.phase = 'plugin remove';
+    await run(process.execPath, [...args, 'plugin', '--profile', 'asi-dev', 'remove', 'asi-sense'], workspace, env);
+    await expect(access(installed)).rejects.toMatchObject({ code: 'ENOENT' });
+    console.log('uninstalled; installed package directory removed: yes');
+    await stop(st.server);
+    st.server = undefined;
+  } catch (error) {
+    profile.retain();
+    console.error(`pack phase failed during ${st.phase}`);
+    console.error('details:', JSON.stringify(failureDetails(error)));
+    process.exitCode = 1;
+  } finally {
+    if (st.watchdog) clearTimeout(st.watchdog);
+    await Promise.allSettled([
+      st.browser?.close() ?? Promise.resolve(),
+      st.server ? stop(st.server) : Promise.resolve(),
+    ]);
+    const remaining = helperPids();
+    console.log(`pgrep owned helper after stop: ${remaining.length ? remaining.join(' ') : '(none)'}`);
+    if (remaining.length) {
+      profile.retain();
+      process.exitCode = 1;
+    }
+  }
+}
+
 const phase = process.argv[2] ?? 'all';
+const tgz = process.argv[3] ?? join(pkg, 'dist/asi-sense-0.1.3.tgz');
 if (phase === 'body' || phase === 'all') await phaseBody();
 if (phase === 'model' || (phase === 'all' && process.exitCode !== 1)) await phaseModel();
-if (!['body', 'model', 'all'].includes(phase)) throw new Error(`unknown phase ${phase}`);
+if (phase === 'pack') await phasePack(await realpath(tgz));
+if (!['body', 'model', 'pack', 'all'].includes(phase)) throw new Error(`unknown phase ${phase}`);
