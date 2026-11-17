@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { NetworkSampler } from '@asi/body-probe';
 import type { BodyThresholdState, Signal } from '@asi/sense-types';
 import { describe, expect, it } from 'vitest';
 import { AnomalyEvaluator, type AnomalyRule } from '../../src/host/body/anomaly.ts';
@@ -340,5 +341,64 @@ describe('AnomalyEvaluator contamination + purity', () => {
     expect(w1.signals).toHaveLength(0);
     expect(w2.signals).toHaveLength(0);
     expect(w3.signals[0]).toMatchObject({ kind: 'body.anomaly', data: { severity: 'warn', metric: 'memory' } });
+  });
+
+  it('does not reset anomaly streak when network traffic bursts above 10 Gbps', async () => {
+    const b = new Baseline({ timeZone: TZ, installedAt: INSTALL, elapsedMs: 14 * DAY });
+    for (const wk of [0, WEEK]) {
+      for (let i = 0; i < 8; i++) b.observe('network.rx', 100_000, SLOT10 + wk + i * 60_000);
+    }
+    const e = new AnomalyEvaluator(b, [{ id: 'net-rx', metric: 'network.rx', sigma: 3, consecutive: 3 }]);
+    let mono = 0;
+    let wall = EVAL;
+    let rxCounter = 1000;
+    // Deltas across 1s ticks: 9 Gbps, 9 Gbps, then 12 Gbps (>10 Gbps) — streak must reach 3 and warn.
+    const deltas = [0, 1_125_000_000, 1_125_000_000, 1_500_000_000];
+    let step = 0;
+    const sampler = new NetworkSampler({
+      platform: 'darwin',
+      now: () => mono,
+      wall: () => wall,
+      interfaces: () => ({
+        en0: [
+          {
+            address: '10.0.0.1',
+            netmask: '255.0.0.0',
+            family: 'IPv4',
+            mac: 'aa:bb:cc:dd:ee:ff',
+            internal: false,
+            cidr: null,
+          },
+        ],
+      }),
+      run: async (file) => {
+        if (!file.endsWith('netstat')) return '   interface: en0\n';
+        rxCounter += deltas[step++] ?? 0;
+        return [
+          'Name  Mtu   Network       Address            Ipkts Ierrs     Ibytes    Opkts Oerrs     Obytes    Coll',
+          `en0   1500  <Link#4>    aa:bb:cc:dd:ee:ff     5000     0   ${rxCounter}     4000     0       2000      0`,
+        ].join('\n');
+      },
+    });
+    const baselineSample = await sampler.sample(6000);
+    expect(baselineSample.status).toBe('unknown');
+
+    let prev = sample(mkBody({ network: baselineSample }), wall, undefined, mono);
+    let state: BodyThresholdState = {};
+    const signals: Signal[] = [];
+    for (let i = 1; i <= 3; i++) {
+      mono += 1000;
+      wall += 1000;
+      const netFact = await sampler.sample(6000);
+      expect(netFact.status).toBe('ok');
+      const next = sample(mkBody({ network: netFact }), wall, undefined, mono);
+      const res = e.evaluate(prev, next, state);
+      signals.push(...res.signals);
+      state = res.state;
+      prev = next;
+    }
+    expect((state as AdaptiveState)[BODY_HISTORY]?.fs?.anomaly?.streaks['net-rx']).toBe(3);
+    expect(signals).toHaveLength(1);
+    expect(signals[0]).toMatchObject({ kind: 'body.anomaly', data: { severity: 'warn', metric: 'network.rx' } });
   });
 });
