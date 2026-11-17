@@ -1,7 +1,7 @@
 {
   "name": "@asi/sense-ui",
   "private": true,
-  "version": "0.1.1",
+  "version": "0.1.2",
   "type": "module",
   "description": "asi-sense 侧栏面板：React 纯 props 组件 + Vite 预览",
   "engines": {
