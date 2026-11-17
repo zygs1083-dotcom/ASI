@@ -40,6 +40,7 @@ describe('Baseline buckets', () => {
     b.observe('cpu', 0.9, Number.NaN);
     b.observe('cpu', 0.9, MON10); // same stamp
     b.observe('cpu', 0.9, MON10 - 1); // backward
+    b.observe('cpu', 0.9, MON10, MON10 + 5000); // same wall stamp even with receivedAt
     expect(b.read('cpu', MON10)?.count).toBe(1);
   });
 
