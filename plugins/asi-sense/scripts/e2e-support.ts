@@ -160,6 +160,17 @@ export function envMessages(log: Record<string, unknown>[]): Record<string, unkn
   );
 }
 
+export function targetTurnOutcome(log: Record<string, unknown>[], previousEnds: number) {
+  const ends = log.filter((event) => event.type === 'turn/end');
+  if (ends.length <= previousEnds) return undefined;
+  const reason = record(record(ends[ends.length - 1].data).reason);
+  if (reason.kind === 'completed') return 'completed';
+  const error = record(reason.error);
+  if (reason.kind === 'error' && error.code === 'UNKNOWN' && error.message === 'E2E model request budget exhausted')
+    return 'budget-exhausted';
+  return 'failed';
+}
+
 function envInbox(log: Record<string, unknown>[], target: string): Record<string, unknown>[] {
   return log.filter((event) => {
     const data = record(event.data);

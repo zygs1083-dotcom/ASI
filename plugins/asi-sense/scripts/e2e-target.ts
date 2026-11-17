@@ -1,7 +1,7 @@
 import { readdir, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { expect, type Locator, type Page } from '@playwright/test';
-import { delay, envInjections, envMessages, record, waitFor } from './e2e-support.ts';
+import { delay, envInjections, envMessages, record, targetTurnOutcome, waitFor } from './e2e-support.ts';
 
 async function sessionEvents(root: string, id: string): Promise<Record<string, unknown>[]> {
   async function scan(dir: string): Promise<Record<string, unknown>[] | undefined> {
@@ -59,6 +59,7 @@ function summary(log: Record<string, unknown>[]) {
   return {
     turns: ends.length,
     lastTurn: ['completed', 'error', 'aborted'].includes(String(reason)) ? reason : 'other',
+    lastTurnBudgetExhausted: targetTurnOutcome(log, Math.max(0, ends.length - 1)) === 'budget-exhausted',
     environmentMessages: envMessages(log).length,
     environmentInjections: envInjections(log).length,
     settledJobs: settled.length,
@@ -83,6 +84,7 @@ export async function checkTargetDelivery(
   panel: Locator,
   sessionRoot: string,
   workspace: string,
+  budgetExhausted: () => Promise<boolean>,
 ): Promise<void> {
   let older = '';
   let newer = '';
@@ -202,17 +204,19 @@ export async function checkTargetDelivery(
     );
     check('older automatic file', false, summary(await sessionEvents(sessionRoot, older)).autoFile);
     check('newer automatic file', true, summary(await sessionEvents(sessionRoot, newer)).autoFile);
-    await waitFor(
-      async () => {
-        const ends = (await sessionEvents(sessionRoot, newer)).filter((event) => event.type === 'turn/end');
-        return ends.length > turns + 1 && record(record(ends[ends.length - 1].data).reason).kind === 'completed'
-          ? true
-          : undefined;
-      },
+    const outcome = await waitFor(
+      async () => targetTurnOutcome(await sessionEvents(sessionRoot, newer), turns + 1),
       120_000,
       'automatic target turn completion',
     );
-    console.log('target e2e: automatic mode sent unowned file context to newer active session, not older');
+    check(
+      'automatic turn outcome',
+      true,
+      outcome === 'completed' || (outcome === 'budget-exhausted' && (await budgetExhausted())),
+    );
+    await delay(4_000);
+    check('older automatic file after turn', false, summary(await sessionEvents(sessionRoot, older)).autoFile);
+    console.log(`target e2e: automatic file context reached newer, not older; final turn ${outcome}`);
   } catch (error) {
     const oldLog = older ? await sessionEvents(sessionRoot, older) : [];
     const newLog = newer ? await sessionEvents(sessionRoot, newer) : [];
@@ -220,7 +224,7 @@ export async function checkTargetDelivery(
       phase === 'background failure'
         ? { expectedJob: true, jobMessage: true, pinnedFile: true, turnsAtLeast: 2 }
         : phase === 'automatic target delivery'
-          ? { oldAutoFile: false, newAutoFile: true }
+          ? { oldAutoFile: false, newAutoFile: true, finalTurn: 'completed or fixture budget exhausted' }
           : undefined;
     console.error(
       'target diagnostics:',

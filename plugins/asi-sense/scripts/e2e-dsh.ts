@@ -222,7 +222,7 @@ try {
   }
   if (process.env.ASI_E2E_ONLY_TARGET === '1') {
     phase = 'target conversation delivery';
-    await checkTargetDelivery(chat, panel, sessionRoot, workspace);
+    await checkTargetDelivery(chat, panel, sessionRoot, workspace, async () => (await count()) === limit);
   }
   if (
     process.env.ASI_E2E_ONLY_TARGET !== '1' &&
