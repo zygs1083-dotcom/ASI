@@ -79,6 +79,12 @@ export class SelfProcessSampler {
       return fact.fail(fact.errorStatus(err), this.src, ttlMs);
     }
   }
+
+  // Drops the previous CPU usage snapshot so a stop/restart re-baselines
+  // instead of averaging across the stopped interval.
+  reset(): void {
+    this.prev = undefined;
+  }
 }
 
 export class ExternalProcessSampler {

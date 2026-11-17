@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { NetworkSampler } from '@asi/body-probe';
 import type { BodyThresholdState, Signal } from '@asi/sense-types';
 import { describe, expect, it } from 'vitest';
 import { AnomalyEvaluator, type AnomalyRule } from '../../src/host/body/anomaly.ts';
@@ -276,5 +277,128 @@ describe('AnomalyEvaluator contamination + purity', () => {
     assert(hB && hA);
     expect(hB.baseline?.read('cpu', EVAL)?.mean).toBe(hA.baseline?.read('cpu', EVAL)?.mean);
     expect(hB.latch['baseline:cpu']).toBe('normal');
+  });
+
+  it('evaluates and trains each real observation once despite 2s cached republications', () => {
+    // Baseline has natural variance around 0.5 (values 0.48 and 0.52 alternating).
+    const b = new Baseline({ timeZone: TZ, installedAt: INSTALL, elapsedMs: 14 * DAY, minScale: { memory: 0.01 } });
+    for (const wk of [0, WEEK]) {
+      for (let i = 0; i < 8; i++) b.observe('memory', i % 2 ? 0.52 : 0.48, SLOT10 + wk + i * 60_000);
+    }
+    const before = b.read('memory', EVAL);
+    assert(before);
+    const e = new AnomalyEvaluator(b, [{ id: 'mem', metric: 'memory', sigma: 3, consecutive: 3 }]);
+
+    const frame = (at: number, mono: number, memUsed: number, obsAt = at, obsMono = mono) => ({
+      ...sample(
+        mkBody({
+          memory: {
+            ...cpuBody(0.5).cpu,
+            value: { total: 100, used: memUsed, pressure: 'normal' as const, swapUsed: 0 },
+            observedAt: obsAt,
+          },
+        }),
+        at,
+        undefined,
+        mono,
+      ),
+      rateTimes: { memory: { wall: obsAt, mono: obsMono } },
+    });
+
+    // 1. Single spike at mono=2000, then republished cached at mono=4000 and mono=6000:
+    //    must NOT reach consecutive=3 and must NOT fire a false warning.
+    const f0 = frame(EVAL, 0, 50);
+    const f1 = frame(EVAL + 2000, 2000, 99, EVAL + 2000, 2000);
+    const f2Cached = frame(EVAL + 4000, 4000, 99, EVAL + 2000, 2000);
+    const f3Cached = frame(EVAL + 6000, 6000, 99, EVAL + 2000, 2000);
+    const r1 = e.evaluate(f0, f1, {});
+    const r2 = e.evaluate(f1, f2Cached, r1.state);
+    const r3 = e.evaluate(f2Cached, f3Cached, r2.state);
+    expect([r1, r2, r3].flatMap((r) => r.signals)).toHaveLength(0);
+    expect((r3.state as AdaptiveState)[BODY_HISTORY]?.fs?.anomaly?.streaks.mem).toBe(1);
+
+    // 2. Normal fresh observation at mono=8000, then republished 5 times from cache:
+    //    count must increase by exactly 1 (16 -> 17), not 6, and MAD/scale must not collapse.
+    const f4Normal = frame(EVAL + 8000, 8000, 50, EVAL + 8000, 8000);
+    let st = e.evaluate(f3Cached, f4Normal, r3.state).state;
+    let prev = f4Normal;
+    for (let tick = 1; tick <= 5; tick++) {
+      const cached = frame(EVAL + 8000 + tick * 2000, 8000 + tick * 2000, 50, EVAL + 8000, 8000);
+      st = e.evaluate(prev, cached, st).state;
+      prev = cached;
+    }
+    const trainedAfter = (st as AdaptiveState)[BODY_HISTORY]?.fs?.anomaly?.baseline?.read('memory', EVAL);
+    expect(trainedAfter?.count).toBe(before.count + 1);
+    expect(trainedAfter?.scale).toBeCloseTo(before.scale, 2);
+
+    // 3. Three genuinely distinct observations (mono 20000, 26000, 32000) DO fire warn.
+    const s1 = frame(EVAL + 20_000, 20_000, 99, EVAL + 20_000, 20_000);
+    const s2 = frame(EVAL + 26_000, 26_000, 99, EVAL + 26_000, 26_000);
+    const s3 = frame(EVAL + 32_000, 32_000, 99, EVAL + 32_000, 32_000);
+    const w1 = e.evaluate(prev, s1, st);
+    const w2 = e.evaluate(s1, s2, w1.state);
+    const w3 = e.evaluate(s2, s3, w2.state);
+    expect(w1.signals).toHaveLength(0);
+    expect(w2.signals).toHaveLength(0);
+    expect(w3.signals[0]).toMatchObject({ kind: 'body.anomaly', data: { severity: 'warn', metric: 'memory' } });
+  });
+
+  it('does not reset anomaly streak when network traffic bursts above 10 Gbps', async () => {
+    const b = new Baseline({ timeZone: TZ, installedAt: INSTALL, elapsedMs: 14 * DAY });
+    for (const wk of [0, WEEK]) {
+      for (let i = 0; i < 8; i++) b.observe('network.rx', 100_000, SLOT10 + wk + i * 60_000);
+    }
+    const e = new AnomalyEvaluator(b, [{ id: 'net-rx', metric: 'network.rx', sigma: 3, consecutive: 3 }]);
+    let mono = 0;
+    let wall = EVAL;
+    let rxCounter = 1000;
+    // Deltas across 1s ticks: 9 Gbps, 9 Gbps, then 12 Gbps (>10 Gbps) — streak must reach 3 and warn.
+    const deltas = [0, 1_125_000_000, 1_125_000_000, 1_500_000_000];
+    let step = 0;
+    const sampler = new NetworkSampler({
+      platform: 'darwin',
+      now: () => mono,
+      wall: () => wall,
+      interfaces: () => ({
+        en0: [
+          {
+            address: '10.0.0.1',
+            netmask: '255.0.0.0',
+            family: 'IPv4',
+            mac: 'aa:bb:cc:dd:ee:ff',
+            internal: false,
+            cidr: null,
+          },
+        ],
+      }),
+      run: async (file) => {
+        if (!file.endsWith('netstat')) return '   interface: en0\n';
+        rxCounter += deltas[step++] ?? 0;
+        return [
+          'Name  Mtu   Network       Address            Ipkts Ierrs     Ibytes    Opkts Oerrs     Obytes    Coll',
+          `en0   1500  <Link#4>    aa:bb:cc:dd:ee:ff     5000     0   ${rxCounter}     4000     0       2000      0`,
+        ].join('\n');
+      },
+    });
+    const baselineSample = await sampler.sample(6000);
+    expect(baselineSample.status).toBe('unknown');
+
+    let prev = sample(mkBody({ network: baselineSample }), wall, undefined, mono);
+    let state: BodyThresholdState = {};
+    const signals: Signal[] = [];
+    for (let i = 1; i <= 3; i++) {
+      mono += 1000;
+      wall += 1000;
+      const netFact = await sampler.sample(6000);
+      expect(netFact.status).toBe('ok');
+      const next = sample(mkBody({ network: netFact }), wall, undefined, mono);
+      const res = e.evaluate(prev, next, state);
+      signals.push(...res.signals);
+      state = res.state;
+      prev = next;
+    }
+    expect((state as AdaptiveState)[BODY_HISTORY]?.fs?.anomaly?.streaks['net-rx']).toBe(3);
+    expect(signals).toHaveLength(1);
+    expect(signals[0]).toMatchObject({ kind: 'body.anomaly', data: { severity: 'warn', metric: 'network.rx' } });
   });
 });

@@ -1,7 +1,11 @@
 import type { BodyEvaluation, BodyEvaluator, BodyThresholdSample, BodyThresholdState } from '@asi/sense-types';
 import { BASELINE_MIN_COUNT, BASELINE_MIN_DATES, type Baseline } from './baseline.ts';
 import { type BodySignal, readMetrics } from './metrics.ts';
-import { type AdaptiveState, BODY_HISTORY } from './state.ts';
+import type { RateTimes } from './rate.ts';
+import { type AdaptiveState, type AnomalyHistory, BODY_HISTORY } from './state.ts';
+
+type AnomalySample = BodyThresholdSample & { rateTimes?: RateTimes };
+type TrackedAnomaly = AnomalyHistory & { observedMono?: Record<string, number> };
 
 /** A baseline-deviation rule (DESIGN §2.2c, layer `baseline`). */
 export interface AnomalyRule {
@@ -75,6 +79,18 @@ export class AnomalyEvaluator implements BodyEvaluator {
     baseline.advance(next.monotonicAt);
     const metrics = readMetrics(next);
     const gated = baseline.mature(next.monotonicAt);
+    const prevObserved = (inHist as TrackedAnomaly | undefined)?.observedMono ?? {};
+    const observedMono: Record<string, number> = { ...prevObserved };
+    const observations = new Map<string, { mono: number; wall: number; fresh: boolean }>();
+    for (const name of metrics.keys()) {
+      const stamp = (next as AnomalySample).rateTimes?.[name];
+      const mono = stamp && Number.isFinite(stamp.mono) ? stamp.mono : next.monotonicAt;
+      const wall = stamp && Number.isFinite(stamp.wall) ? stamp.wall : next.at;
+      const prior = prevObserved[name];
+      const fresh = prior === undefined || mono > prior;
+      if (fresh) observedMono[name] = mono;
+      observations.set(name, { mono, wall, fresh });
+    }
     const signals: BodySignal[] = [];
     const streaks: Record<string, number> = {};
     // Per-stream latch (authoritative); `pub` keys are last-writer projections.
@@ -85,9 +101,16 @@ export class AnomalyEvaluator implements BodyEvaluator {
     for (const rule of this.rules) {
       const key = `baseline:${rule.id}`;
       const metric = metrics.get(rule.metric);
-      const stat = metric ? baseline.read(rule.metric, next.at) : undefined;
+      const obs = metric ? observations.get(rule.metric) : undefined;
+      if (metric && obs && !obs.fresh) {
+        const previous = inHist?.streaks[rule.id] ?? 0;
+        streaks[rule.id] = previous;
+        if (previous > 0 || streamLatch[key] === 'warn') contaminating.add(rule.metric);
+        continue;
+      }
+      const stat = metric && obs ? baseline.read(rule.metric, obs.wall) : undefined;
       const eligible = stat !== undefined && stat.count >= BASELINE_MIN_COUNT && stat.dates >= BASELINE_MIN_DATES;
-      if (!metric || !stat || !gated || !eligible) {
+      if (!metric || !obs || !stat || !gated || !eligible) {
         const previous = inHist?.streaks[rule.id] ?? 0;
         streaks[rule.id] = metric ? previous : 0; // no evidence: streak cleared, latch kept
         if (metric && (previous > 0 || streamLatch[key] === 'warn')) contaminating.add(rule.metric);
@@ -127,14 +150,22 @@ export class AnomalyEvaluator implements BodyEvaluator {
         },
       });
     }
-    // Train on every valid non-contaminating reading, once per accepted
-    // sample — on a fork, never the seed or the caller's baseline.
+    // Train on every valid non-contaminating reading, once per real observation
+    // — on a fork, never the seed or the caller's baseline.
     const trained = baseline;
     if (metrics.size > contaminating.size) {
-      for (const [name, m] of metrics)
-        if (!contaminating.has(name)) trained.observe(name, m.value, next.at, next.monotonicAt);
+      for (const [name, m] of metrics) {
+        const obs = observations.get(name);
+        if (obs?.fresh && !contaminating.has(name)) trained.observe(name, m.value, obs.wall);
+      }
     }
-    const anomaly = { lastAt: next.monotonicAt, streaks, latch: streamLatch, baseline: trained };
+    const anomaly: TrackedAnomaly = {
+      lastAt: next.monotonicAt,
+      streaks,
+      latch: streamLatch,
+      baseline: trained,
+      observedMono,
+    };
     const stream = { ...(state as AdaptiveState)[BODY_HISTORY]?.[streamId], anomaly };
     const hist = { ...(state as AdaptiveState)[BODY_HISTORY], [streamId]: stream };
     const out: AdaptiveState = { ...pub, [BODY_HISTORY]: hist };

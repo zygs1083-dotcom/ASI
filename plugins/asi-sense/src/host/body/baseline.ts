@@ -1,5 +1,5 @@
 import { parseBucket } from './baseline-parse.ts';
-import { advanceBucket, type Bucket } from './baseline-stat.ts';
+import { advanceBucket, type Bucket, pruneBucketDates } from './baseline-stat.ts';
 import { formatter, slotOf } from './baseline-time.ts';
 
 /**
@@ -178,7 +178,7 @@ export class Baseline {
     return this.minScale.get('other') as number;
   }
 
-  observe(metric: string, value: number, at: number, receivedAt?: number): void {
+  observe(metric: string, value: number, at: number, _receivedAt?: number): void {
     if (!finite(value) || !validAt(at)) return;
     const zone = this.timeZone;
     let arr = this.buckets.get(metric);
@@ -201,7 +201,7 @@ export class Baseline {
       };
       return;
     }
-    if (receivedAt === undefined && at <= b.lastAt) return; // same or older observation: ignored
+    if (at <= b.lastAt) return; // same or older observation: ignored
     arr[index] = { ...advanceBucket(b, value, at, date, this.minFor(metric)), zone };
   }
 
@@ -278,7 +278,8 @@ export class Baseline {
         const slots: (Bucket | null)[] = new Array(BASELINE_SLOTS).fill(null);
         for (const [i, raw] of arr.entries()) {
           if (raw === null) continue;
-          slots[i] = parseBucket(raw, i, savedFmt, d.timeZone);
+          const bucket = parseBucket(raw, i, savedFmt, d.timeZone);
+          slots[i] = { ...bucket, dates: pruneBucketDates(bucket.dates) };
         }
         parsed.set(name, slots);
       }

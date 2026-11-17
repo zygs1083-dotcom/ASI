@@ -84,4 +84,10 @@ export class CpuSampler {
       return fact.fail(fact.errorStatus(err), this.src, ttlMs);
     }
   }
+
+  // Drops the previous CPU tick snapshot so a stop/restart re-baselines instead
+  // of averaging across the stopped interval.
+  reset(): void {
+    this.prev = undefined;
+  }
 }

@@ -175,7 +175,7 @@ describe('NetworkSampler', () => {
 
   it.each([
     ['<Link#5>', 1_000_000_000], // same name, new link identity, counters already higher
-    ['<Link#4>', 2_000_000_100], // same identity, implausible burst
+    ['<Link#4>', 20_000_000_100], // same identity, implausible burst (>100 Gbps ceiling)
   ])('reports unknown on a corrupt delta (link %s, rx %i) and recovers', async (link, rx) => {
     let t = 0;
     const s = sampler(
@@ -516,5 +516,120 @@ describe('NetworkSampler', () => {
     const s = new NetworkSampler({ platform: 'linux', run: runSpy });
     expect((await s.sample(0)).status).toBe('unavailable');
     expect(runSpy).not.toHaveBeenCalled();
+  });
+
+  it('invokes netstat with -ibn to avoid reverse DNS timeouts', async () => {
+    const netstatArgs: string[][] = [];
+    const s = new NetworkSampler({
+      platform: 'darwin',
+      now: () => 0,
+      interfaces: () => ({ en0: [iface({})] }),
+      run: async (file, args = []) => {
+        if (file.endsWith('netstat')) {
+          netstatArgs.push([...args]);
+          return fx('netstat_1.txt');
+        }
+        return '';
+      },
+    });
+    const first = await s.sample(0);
+    expect(first.source.api).toBe('/usr/sbin/netstat -ibn');
+    expect(netstatArgs).toEqual([['-ibn']]);
+  });
+
+  it('counts only physical NICs when utun* VPN and virtual interfaces coexist (no double counting)', async () => {
+    let t = 0;
+    const sample1 = netstat(
+      linkRow('en0', '<Link#4>', 1000, 2000),
+      'utun4 1500  <Link#20>   100     0       1000     200     0       2000      0',
+      linkRow('awdl0', '<Link#8>', 500, 500),
+      linkRow('llw0', '<Link#9>', 300, 300),
+      linkRow('bridge0', '<Link#10>', 400, 400),
+    );
+    const sample2 = netstat(
+      linkRow('en0', '<Link#4>', 2000, 4000),
+      'utun4 1500  <Link#20>   200     0       2000     300     0       4000      0',
+      linkRow('awdl0', '<Link#8>', 900, 900),
+      linkRow('llw0', '<Link#9>', 600, 600),
+      linkRow('bridge0', '<Link#10>', 800, 800),
+    );
+    // Even when default route points to utun4 (full-tunnel VPN), traffic also
+    // traverses physical en0, so counting only en0 avoids doubling VPN traffic.
+    const s = sampler(
+      [sample1, sample2],
+      () => {
+        t += 1000;
+        return t - 1000;
+      },
+      () => ({ en0: [iface({})], utun4: [iface({ address: '10.8.0.2' })] }),
+      async () => '   route to: default\n   interface: utun4\n',
+    );
+    await s.sample(0);
+    const f = await s.sample(1000);
+    expect(f.status).toBe('ok');
+    expect(f.value).toEqual({ online: true, rxBps: 1000, txBps: 2000 });
+  });
+
+  it('ignores counter resets on excluded utun* tunnels while keeping physical en0 ok', async () => {
+    let t = 0;
+    const s1 = netstat(
+      linkRow('en0', '<Link#4>', 1000, 2000),
+      'utun4 1500  <Link#20>   100     0       5000     200     0       5000      0',
+    );
+    const s2 = netstat(
+      linkRow('en0', '<Link#4>', 2500, 4500),
+      'utun4 1500  <Link#21>   10     0       100     10     0       100      0',
+    );
+    const s = sampler([s1, s2], () => {
+      t += 1000;
+      return t - 1000;
+    });
+    await s.sample(0);
+    const f = await s.sample(1000);
+    expect(f.status).toBe('ok');
+    expect(f.value).toEqual({ online: true, rxBps: 1500, txBps: 2500 });
+  });
+
+  it('selects only the default-route interface when no physical NIC is present', async () => {
+    let t = 0;
+    const s1 = netstat(
+      'utun4 1500  <Link#20>   100     0       1000     200     0       2000      0',
+      'utun5 1500  <Link#21>   100     0       9000     200     0       9000      0',
+    );
+    const s2 = netstat(
+      'utun4 1500  <Link#20>   200     0       2500     300     0       4500      0',
+      'utun5 1500  <Link#21>   200     0       19000    300     0       19000     0',
+    );
+    const s = sampler(
+      [s1, s2],
+      () => {
+        t += 1000;
+        return t - 1000;
+      },
+      () => ({ utun4: [iface({ address: '10.8.0.2' })] }),
+      async () => '   route to: default\n   interface: utun4\n',
+    );
+    await s.sample(0);
+    const f = await s.sample(1000);
+    expect(f.status).toBe('ok');
+    expect(f.value).toEqual({ online: true, rxBps: 1500, txBps: 2500 });
+  });
+
+  it('allows sustained >10 Gbps rates (10GbE full-duplex / 16 Gbps) without reporting unknown', async () => {
+    let t = 0;
+    const s = sampler(
+      [
+        netstat(linkRow('en0', '<Link#4>', 100, 200)),
+        netstat(linkRow('en0', '<Link#4>', 100 + 2_000_000_000, 200 + 1_250_000_000)),
+      ],
+      () => {
+        t += 1000;
+        return t - 1000;
+      },
+    );
+    await s.sample(0);
+    const f = await s.sample(1000);
+    expect(f.status).toBe('ok');
+    expect(f.value).toEqual({ online: true, rxBps: 2_000_000_000, txBps: 1_250_000_000 });
   });
 });
