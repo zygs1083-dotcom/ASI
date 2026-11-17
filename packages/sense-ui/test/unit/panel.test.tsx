@@ -633,7 +633,9 @@ describe('调整日志与反馈', () => {
   })
 
   it('告警事件提供 有用/噪音 图标反馈并回报 signal.id', async () => {
-    const { props } = renderPanel(makeScenario('rapid-change'))
+    const model = makeScenario('rapid-change')
+    model.events[0]!.signal.data.feedbackAvailable = true
+    const { props } = renderPanel(model)
     fireEvent.click(screen.getAllByRole('button', { name: '有用' })[0]!)
     expect(props.onFeedback).toHaveBeenCalledWith('sig-1', 'useful')
     fireEvent.click(screen.getAllByRole('button', { name: '噪音' })[0]!)

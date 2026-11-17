@@ -31,6 +31,18 @@ it('显示异常偏离的标准差倍数而不是百分比', () => {
   expect(screen.getByText(/偏离 3.5σ/)).toBeTruthy()
 })
 
+it('仅对宿主允许反馈的事件展示按钮', () => {
+  for (const available of [false, undefined, true]) {
+    const event = makeEvent(3, {
+      level: 'wake',
+      signal: { data: available === undefined ? {} : { feedbackAvailable: available } },
+    })
+    const { view } = renderPanel({ ...makeScenario('healthy'), events: [event] })
+    expect(screen.queryByRole('button', { name: '有用' }) !== null).toBe(available === true)
+    view.unmount()
+  }
+})
+
 function renderPanel(model: SensePanelModel, over: Partial<SensePanelProps> = {}) {
   const props: SensePanelProps = {
     model,
@@ -375,7 +387,7 @@ describe('调整入口与反馈标记', () => {
 
     renderPanel({
       ...makeScenario('healthy'),
-      events: [makeEvent(1, { level: 'wake' })],
+      events: [makeEvent(1, { level: 'wake', signal: { data: { feedbackAvailable: true } } })],
     })
     const li2 = document.querySelector('li[class*="event"]')!
     expect(li2.getAttribute('data-feedback')).not.toBeNull()

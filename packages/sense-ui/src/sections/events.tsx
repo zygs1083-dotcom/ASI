@@ -76,7 +76,7 @@ function DetailLine({ d }: { d: EventDetail }) {
 
 /** 只有告警类事件（结构化 detail / wake / suppressed）才展示有用/噪音反馈。 */
 function feedbackEligible(e: SenseEvent): boolean {
-  return e.detail != null || e.level === 'wake' || e.level === 'suppressed'
+  return e.signal.data.feedbackAvailable === true
 }
 
 /** 反馈图标按钮：细指针下默认透明，悬停/聚焦事件行显现；粗指针常显。 */
