@@ -30,6 +30,9 @@ const dateTimeFmt = new Intl.DateTimeFormat('zh-CN', {
 const preciseFmt = new Intl.NumberFormat('zh-CN', {
   maximumSignificantDigits: 21,
 });
+const deviationFmt = new Intl.NumberFormat('zh-CN', {
+  maximumFractionDigits: 2,
+});
 
 export function formatPercent(ratio: number): string {
   return `${intFmt.format(Math.round(ratio * 100))}%`;
@@ -111,9 +114,14 @@ export function formatTuningValue(v: number | string, unit?: string): string {
   return unit ? `${text} ${unit}` : text;
 }
 
+/** 异常偏离度：原始浮点最多两位小数。 */
+export function formatDeviation(v: number): string {
+  return deviationFmt.format(v);
+}
+
 /** 温控历史序数（0..3）→ 文案。 */
 export function formatThermalOrdinal(v: number): string {
-  return ['正常', '偏高', '偏高', '过热'][Math.max(0, Math.min(3, Math.round(v)))]!;
+  return ['正常', '略高', '偏高', '过热'][Math.max(0, Math.min(3, Math.round(v)))]!;
 }
 
 export function formatClock(at: number): string {

@@ -13,7 +13,7 @@ import { type MetricTileProps, memoTile } from './tiles-basic';
 
 const THERMAL_TEXT = {
   nominal: '正常',
-  fair: '偏高',
+  fair: '略高',
   serious: '偏高',
   critical: '过热',
 } as const;

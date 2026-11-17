@@ -1,5 +1,12 @@
 import { useEffect, useMemo, useState } from 'react';
-import { formatClock, formatDuration, formatMetricValue, formatMinute, formatSignedDelta } from '../format';
+import {
+  formatClock,
+  formatDeviation,
+  formatDuration,
+  formatMetricValue,
+  formatMinute,
+  formatSignedDelta,
+} from '../format';
 import { InfoIcon, PulseIcon, ShieldIcon, ThumbDownIcon, ThumbUpIcon, WarnIcon } from '../icons';
 import type { EventDetail, EventLevel, SenseEvent, SensePanelProps } from '../view-model';
 import css from './events.module.css';
@@ -39,7 +46,7 @@ function DetailLine({ d }: { d: EventDetail }) {
       return (
         <span className={css.detailLine}>
           指标 {d.metric} · 当前 {formatMetricValue(d.current, d.unit)} · 基线 {formatMetricValue(d.baseline, d.unit)} ·
-          偏离 {d.deviation}σ
+          偏离 {formatDeviation(d.deviation)}σ
         </span>
       );
     case 'file.burst':
@@ -52,7 +59,7 @@ function DetailLine({ d }: { d: EventDetail }) {
   }
 }
 
-/** 只有告警类事件（结构化 detail / wake / suppressed）才展示有用/噪音反馈。 */
+/** 只有宿主标记为已登记调参告警（feedbackAvailable）的事件才展示有用/噪音反馈。 */
 function feedbackEligible(e: SenseEvent): boolean {
   return e.signal.data.feedbackAvailable === true;
 }
