@@ -117,10 +117,20 @@ export class RuntimeAttention {
             }
           }
           if (intent.kind === 'inject' && this.offCommit) this.pending.stage(intent);
-          const delivery = dsh.deliver(intent.sessionId, safe);
+          const token = this.sessionTokens.get(intent.sessionId);
+          const isCurrent = () =>
+            this.hasSession(intent.sessionId) && this.sessionTokens.get(intent.sessionId) === token;
+          const delivery = dsh.deliver(intent.sessionId, safe, isCurrent);
           this.inflight.add(delivery);
           try {
             await delivery;
+          } catch (error) {
+            if (!isCurrent()) {
+              for (const outcome of injectOutcomes(intent)) {
+                for (const id of outcome.ids) this.mark(id, 'session-closed', 'record');
+              }
+            }
+            throw error;
           } finally {
             this.inflight.delete(delivery);
           }
@@ -214,7 +224,11 @@ export class RuntimeAttention {
     this.closed.set(id, false);
     this.steps.delete(id);
     if (this.selected === id) this.selectionGeneration++;
-    this.pipeline.disposeSession(id, this.sessionTokens.get(id));
+    const token = this.sessionTokens.get(id);
+    if (token !== undefined) {
+      this.sessionTokens.set(id, randomUUID());
+      this.pipeline.disposeSession(id, token);
+    }
     const index = this.recent.indexOf(id);
     if (index >= 0) this.recent.splice(index, 1);
     if (this.selected === id && this.pinned !== id) await this.setTarget(undefined);

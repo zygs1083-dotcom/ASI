@@ -1,7 +1,8 @@
 import type { Signal, WatchRule } from '@asi/sense-types';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { createDelivery } from '../../src/host/dsh/deliver.ts';
 import { RuntimeAttention } from '../../src/host/runtime/attention.ts';
+import { deliveryRetry } from '../../src/host/runtime/delivery-retry.ts';
 import { FactExpiry } from '../../src/host/runtime/expiry.ts';
 import type { Clock, DshPort } from '../../src/host/runtime/ports.ts';
 
@@ -138,6 +139,127 @@ describe('in-flight session ownership', () => {
     ]);
     await h.attention.stop();
   });
+
+  it('keeps a reopened owner wake while delayed cleanup removes the closed generation', async () => {
+    const h = harness(false, [
+      { id: 'exit', match: { kind: 'job.exited' }, level: 'wake', createdBy: 'user', approved: true },
+    ]);
+    h.attention.create('a');
+    h.attention.create('b');
+    await h.attention.preStep('b');
+    h.attention.postStep('b');
+    const job = (owner: string, id: string): Signal => ({
+      id,
+      kind: 'job.exited',
+      at: 0,
+      subject: id,
+      source: { id: 'dsh', api: 'events', host: 'local' },
+      data: { id, sessionId: owner, sessionToken: h.attention.sessionToken(owner), exitCode: 1 },
+    });
+    await h.attention.accept(job('b', 'old-b'));
+    h.advance();
+    const flushing = h.attention.flush();
+    await h.waiting;
+    const oldToken = h.attention.sessionToken('a');
+    await h.attention.closeSession('a');
+    h.attention.availableSessions(['b']);
+    h.attention.availableSessions(['a', 'b']);
+    await h.attention.accept(job('a', 'new-a'));
+    h.release();
+    await flushing;
+    await h.attention.pipeline.retarget('b');
+    h.advance();
+    await h.attention.flush();
+    expect(h.delivered.map((intent) => [intent.sessionId, intent.update.changes[0]?.signal.id])).toEqual([
+      ['b', 'old-b'],
+      ['a', 'new-a'],
+    ]);
+    expect(h.attention.sessionToken('a')).not.toBe(oldToken);
+    await h.attention.stop();
+  });
+
+  it.each(['send', 'followup'] as const)(
+    'does not %s after a closed owner reappears while acceptance is pending',
+    async (kind) => {
+      let now = 0;
+      let release!: () => void;
+      let entered!: () => void;
+      const waiting = new Promise<void>((resolve) => {
+        entered = resolve;
+      });
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const agent = { inject: vi.fn(), send: vi.fn(), followup: vi.fn() };
+      let checks = 0;
+      const deliver = createDelivery(
+        () => agent,
+        () => true,
+        async () => {
+          if (++checks === 1) {
+            entered();
+            await gate;
+          }
+          return false;
+        },
+      );
+      const clock: Clock = { wall: () => now, mono: () => now };
+      const dsh: DshPort = {
+        deliver,
+        onAgentEvent: () => () => {},
+        onTool: () => () => {},
+        onJob: () => () => {},
+        tokenSnapshot: async () => undefined,
+      };
+      let attention!: RuntimeAttention;
+      const retry = deliveryRetry(dsh, clock, () => attention);
+      attention = new RuntimeAttention(
+        clock,
+        retry,
+        () => [{ id: 'exit', match: { kind: 'job.exited' }, level: 'wake', createdBy: 'user', approved: true }],
+        () => {},
+        () => true,
+        () => {},
+        new FactExpiry(clock),
+      );
+      attention.create('a');
+      attention.create('b');
+      await attention.preStep('a');
+      if (kind === 'followup') attention.postStep('a');
+      await attention.preStep('b');
+      attention.postStep('b');
+      const job = (id: string): Signal => ({
+        id,
+        kind: 'job.exited',
+        at: now,
+        subject: id,
+        source: { id: 'dsh', api: 'events', host: 'local' },
+        data: { id, sessionId: 'a', sessionToken: attention.sessionToken('a'), exitCode: 1 },
+      });
+      await attention.accept(job('old-a'));
+      now = 2_000;
+      const flushing = attention.flush();
+      await waiting;
+      await attention.closeSession('a');
+      expect(attention.hasSession('a')).toBe(false);
+      attention.availableSessions(['b']);
+      attention.availableSessions(['a', 'b']);
+      expect(attention.hasSession('a')).toBe(true);
+      await attention.accept(job('new-a'));
+      release();
+      await flushing;
+      await attention.pipeline.retarget('b');
+      expect(agent.send).not.toHaveBeenCalled();
+      expect(agent.followup).not.toHaveBeenCalled();
+      expect(attention.events()).toContainEqual(
+        expect.objectContaining({ id: 'old-a', level: 'record', reason: 'session-closed' }),
+      );
+      now = 4_000;
+      await attention.flush();
+      expect(agent[kind]).toHaveBeenCalledTimes(1);
+      await attention.stop();
+    },
+  );
 
   it('keeps an owned job context separate from a later owned wake', async () => {
     const h = harness(

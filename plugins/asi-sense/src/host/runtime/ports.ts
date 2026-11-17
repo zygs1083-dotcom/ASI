@@ -56,7 +56,7 @@ export interface DshPort {
   onAgentEvent(cb: (event: AgentEvent) => Promise<void>): Unsubscribe;
   onTool(cb: (event: ToolEvent) => Promise<void>): Unsubscribe;
   onJob(cb: (event: JobEvent) => Promise<void>): Unsubscribe;
-  deliver(sessionId: string, intent: DeliveryIntent): Promise<void>;
+  deliver(sessionId: string, intent: DeliveryIntent, isCurrent?: () => boolean): Promise<void>;
   tokenSnapshot(sessionId: string): Promise<TokenSnapshot | undefined>;
   modelJobs?(sessionId: string): JobSummary[];
   openPermissionSettings?(): Promise<void>;

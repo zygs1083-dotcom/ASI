@@ -53,7 +53,7 @@ export function deliveryRetry(
         offCommitted?.();
       };
     },
-    deliver: async (sessionId, intent) => {
+    deliver: async (sessionId, intent, isCurrent) => {
       const owned = intent.update.changes.some(
         ({ signal }) => isSessionContext(signal) || (signal.source.id === 'dsh' && signal.kind.startsWith('job.')),
       );
@@ -71,8 +71,9 @@ export function deliveryRetry(
         throw new DeliveryFailure('exhausted');
       }
       try {
-        await port.deliver(sessionId, intent);
+        await port.deliver(sessionId, intent, isCurrent);
       } catch (error) {
+        if (error instanceof DeliveryFailure && error.kind === 'deferred' && isCurrent && !isCurrent()) throw error;
         if (error instanceof DeliveryFailure && error.kind === 'unknown') {
           attempts.delete(key);
           degraded = true;

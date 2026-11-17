@@ -180,11 +180,17 @@ export function createDelivery(
         },
       ],
     });
-  const perform = async (sessionId: string, intent: DeliveryIntent, id: string): Promise<void> => {
+  const perform = async (
+    sessionId: string,
+    intent: DeliveryIntent,
+    id: string,
+    isCurrent?: () => boolean,
+  ): Promise<void> => {
     const agent = getAgent(sessionId);
     if (!agent) throw new Error('delivery session unavailable');
     const previous = delivered.get(sessionId);
     if (previous?.has(id) || (await accepted(sessionId, id))) return;
+    if (intent.kind !== 'inject' && isCurrent && !isCurrent()) throw new DeliveryFailure('deferred');
     if (getAgent(sessionId) !== agent) throw new Error('delivery session changed');
     if (intent.kind === 'inject') {
       const pending = staged.get(sessionId) ?? new Map();
@@ -217,13 +223,13 @@ export function createDelivery(
     }
     record();
   };
-  const deliver = async (sessionId: string, intent: DeliveryIntent): Promise<void> => {
+  const deliver = async (sessionId: string, intent: DeliveryIntent, isCurrent?: () => boolean): Promise<void> => {
     if (sessionId !== intent.sessionId) throw new Error('delivery session mismatch');
     const id = `asi-sense:${intent.deliveryId ?? randomUUID()}`;
     const key = JSON.stringify([sessionId, id]);
     const prior = inflight.get(key);
     if (prior) return prior;
-    const work = perform(sessionId, intent, id);
+    const work = perform(sessionId, intent, id, isCurrent);
     inflight.set(key, work);
     try {
       await work;
