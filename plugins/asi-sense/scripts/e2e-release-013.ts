@@ -440,6 +440,9 @@ async function phaseBody(): Promise<void> {
     const bodyPath = join(rig.home, 'data/asi-sense/body.json');
     const snapshot = JSON.parse(await readFile(bodyPath, 'utf8')) as Record<string, unknown>;
     snapshot.baseline = seededBaselineJson(Date.now());
+    // The evaluator prefers the per-stream history baseline over the seed —
+    // clear it so the seeded mature baseline is authoritative after restart.
+    snapshot.history = {};
     await writeFile(bodyPath, JSON.stringify(snapshot), { mode: 0o600 });
     const restarted = await spawnDsh(rig);
     st.server = restarted.server;
