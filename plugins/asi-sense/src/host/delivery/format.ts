@@ -100,6 +100,9 @@ function changeLines(ch: EnvChange, includeTitles: boolean, includeJobCommands: 
     const v = s.data.value;
     if (typeof v === 'number' && Number.isFinite(v)) main += ` ${v}`;
     else if (typeof v === 'string') main += ` ${esc(v)}`;
+  } else if (s.kind === 'body.anomaly' && s.data.type === 'rebaseline-suggestion') {
+    const target = str(s.data.metric) || s.subject.replace(/^(?:rebaseline|baseline):/, '') || s.subject;
+    main = `建议重新基线：${esc(target)}`;
   } else if (s.kind === 'body.rate' || s.kind === 'body.anomaly' || s.kind === 'file.burst') {
     const head = s.kind === 'file.burst' ? str(s.data.directory) || s.subject : s.subject;
     main = `${esc(s.kind)}: ${esc(head)}`;
@@ -142,7 +145,7 @@ function changeLines(ch: EnvChange, includeTitles: boolean, includeJobCommands: 
     main = `${esc(s.kind)}: ${esc(s.subject)}`;
   }
   if (ch.ruleId) main += ` [rule: ${esc(ch.ruleId)} → ${ch.level}]`;
-  if (typeof s.data.feedbackAvailable === 'boolean') {
+  if (typeof s.data.feedbackAvailable === 'boolean' && s.data.type !== 'rebaseline-suggestion') {
     const bytes = Buffer.from(s.id, 'utf8');
     const available =
       s.data.feedbackAvailable && bytes.length > 0 && bytes.length <= 256 && bytes.toString('utf8') === s.id;

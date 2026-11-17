@@ -82,10 +82,11 @@ export function detectCandidates(
         at: next.at,
         layer: 'baseline',
         source: next.source,
-        subject: `baseline:${rule.metric}`,
+        subject: `rebaseline:${rule.metric}`,
         data: {
           layer: 'baseline',
           severity: 'warn',
+          metric: rule.metric,
           type: 'rebaseline-suggestion',
           suggestionId: candidateId(candidate),
         },

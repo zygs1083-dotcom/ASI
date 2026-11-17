@@ -69,10 +69,18 @@ function modelUpdate(update: EnvUpdate): EnvUpdate {
         if (['normal', 'warn', 'critical'].includes(String(signal.data.severity))) data.severity = signal.data.severity;
         if (typeof signal.data.value === 'number' && Number.isFinite(signal.data.value)) data.value = signal.data.value;
       } else if (signal.kind === 'body.rate' || signal.kind === 'body.anomaly' || signal.kind === 'file.burst') {
+        const rawMetric =
+          signal.data.metric ??
+          (signal.kind === 'body.anomaly' && signal.data.type === 'rebaseline-suggestion'
+            ? signal.subject.replace(/^(?:rebaseline|baseline):/, '')
+            : undefined);
         subject =
           signal.kind === 'file.burst'
             ? modelPath(typeof signal.data.directory === 'string' ? signal.data.directory : signal.subject)
-            : metric(signal.data.metric);
+            : metric(rawMetric);
+        if (signal.kind === 'body.anomaly' && signal.data.type === 'rebaseline-suggestion') {
+          data.type = 'rebaseline-suggestion';
+        }
         const ruleId = signal.data.ruleId;
         if (typeof ruleId === 'string' && (/^[\w-]+$/.test(ruleId) || ruleId === 'file.burst')) data.ruleId = ruleId;
         if (['normal', 'warn', 'critical'].includes(String(signal.data.severity))) data.severity = signal.data.severity;

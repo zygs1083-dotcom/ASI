@@ -292,4 +292,27 @@ describe('formatEnvUpdate', () => {
     ]);
     expect(formatEnvUpdate(u, { includeWindowTitles: false })).toBe('');
   });
+
+  it('renders an explicit rebaseline suggestion line for the model', () => {
+    const u = update([
+      change({
+        signal: sig({
+          id: 'rebaseline:cpu',
+          kind: 'body.anomaly',
+          at: T0,
+          subject: 'baseline:cpu',
+          data: {
+            layer: 'baseline',
+            severity: 'warn',
+            metric: 'cpu',
+            type: 'rebaseline-suggestion',
+            feedbackAvailable: false,
+          },
+        }),
+      }),
+    ]);
+    expect(formatEnvUpdate(u)).toBe(
+      ['<env-update since="12:01:03" source="asi-sense">', '建议重新基线：cpu', '</env-update>'].join('\n'),
+    );
+  });
 });

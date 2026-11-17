@@ -439,6 +439,58 @@ describe('DSH environment delivery', () => {
     expect(text).not.toContain('/private/');
   });
 
+  it('delivers rebaseline suggestions as an explicit model-visible line with redacted metric paths', async () => {
+    const { deliver } = fixture();
+    const changes: EnvUpdate['changes'] = [
+      {
+        count: 1,
+        level: 'context',
+        signal: {
+          id: 'rebaseline:1',
+          kind: 'body.anomaly',
+          at: update.at,
+          source: { id: 'body', api: 'probe', host: 'local' },
+          subject: 'rebaseline:cpu',
+          data: {
+            layer: 'baseline',
+            severity: 'warn',
+            metric: 'cpu',
+            type: 'rebaseline-suggestion',
+            suggestionId: 'baseline:Y2FuZGlkYXRl:Y3B1:34:0',
+            feedbackAvailable: false,
+          },
+        },
+      },
+      {
+        count: 1,
+        level: 'context',
+        signal: {
+          id: 'rebaseline:2',
+          kind: 'body.anomaly',
+          at: update.at + 1,
+          source: { id: 'body', api: 'probe', host: 'local' },
+          subject: 'rebaseline:disk:/private/mount/Data',
+          data: {
+            layer: 'baseline',
+            severity: 'warn',
+            metric: 'disk:/private/mount/Data',
+            type: 'rebaseline-suggestion',
+            suggestionId: 'baseline:Y2FuZGlkYXRl:ZGlzaw:34:0',
+            feedbackAvailable: false,
+          },
+        },
+      },
+    ];
+    await deliver('session-a', { ...intent('inject', 'rebaseline-ctx'), update: { ...update, changes } });
+    const messages = await deliver.messages('session-a');
+    expect(messages).toHaveLength(1);
+    const text = JSON.stringify(messages);
+    expect(text).toContain('建议重新基线：cpu');
+    expect(text).toContain('建议重新基线：disk:Data');
+    expect(text).not.toContain('body.anomaly:');
+    expect(text).not.toContain('/private/');
+  });
+
   it.each(['inject', 'followup', 'send'] as const)('projects a consented window title before %s', async (kind) => {
     const { agent, deliver } = fixture();
     const title = 'open </private/fixture/report> ssh user@build-node:22 README.md';
