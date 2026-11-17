@@ -37,7 +37,7 @@ export function createDshPort(
   const revisions = new WeakMap<Agent, number>();
   const waiting = new Map<string, { agent: Agent; tokens: Set<symbol> }>();
   let selected: string | undefined;
-  const steps = new Map<string, symbol>();
+  const steps = new Map<string, { turn: number; step: number }>();
   const committed = new Set<(sessionId: string, id: string) => void>();
   const discarded = new Set<() => void>();
   const jobs = new JobEventCorrelator(activeTools);
@@ -220,11 +220,18 @@ export function createDshPort(
             for (const listener of committed) listener(session.id, event.data.id);
           }
         }
+        if (
+          (event.type === 'step/end' || event.type === 'turn/end') &&
+          resolve(session.id)?.session === session &&
+          deliver.end(session.id, event.data)
+        ) {
+          for (const listener of discarded) listener();
+        }
       });
       const offStep = ctx.on('agent/pre-step', async (payload, next) => {
         const decision = await next();
         if (decision.kind === 'reject' || payload.signal.aborted) return decision;
-        const step = Symbol();
+        const step = { turn: payload.turn, step: payload.step };
         steps.set(payload.agent.id, step);
         deliver.begin(payload.agent.id, step);
         selected = payload.agent.id;
@@ -266,7 +273,10 @@ export function createDshPort(
         }
       });
       const offStatus = ctx.on('agent/status', ({ agent, status }) => {
-        if (status === 'idle') call(cb, { type: 'post-step', sessionId: agent.id });
+        if (status === 'idle') {
+          if (resolve(agent.id) === agent && deliver.end(agent.id)) for (const listener of discarded) listener();
+          call(cb, { type: 'post-step', sessionId: agent.id });
+        }
       });
       for (const agent of ctx.agents.list()) call(cb, { type: 'created', sessionId: agent.id });
       return () => {

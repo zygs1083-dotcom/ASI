@@ -289,6 +289,7 @@ export class BucketDrain {
     ownedOnly = false,
   ): Promise<void> {
     for (const b of [...this.pending.values()]) {
+      if (this.pending.get(b.id) !== b) continue;
       if (ownedOnly && (!privateBucket(b) || bucketLevel(b) !== 'wake')) continue;
       if (!this.eligible(b, current)) continue;
       if (now < b.deadline) continue;

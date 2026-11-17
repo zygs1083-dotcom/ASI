@@ -107,6 +107,38 @@ describe('in-flight session ownership', () => {
     await h.attention.stop();
   });
 
+  it('does not revive a closed owner wake from an in-flight drain after the session reappears', async () => {
+    const h = harness(false, [
+      { id: 'exit', match: { kind: 'job.exited' }, level: 'wake', createdBy: 'user', approved: true },
+    ]);
+    h.attention.create('a');
+    h.attention.create('b');
+    await h.attention.preStep('b');
+    h.attention.postStep('b');
+    for (const id of ['b', 'a']) {
+      await h.attention.accept({
+        id: `job-${id}`,
+        kind: 'job.exited',
+        at: 0,
+        subject: `fixture-${id}`,
+        source: { id: 'dsh', api: 'events', host: 'local' },
+        data: { id: `fixture-${id}`, sessionId: id, sessionToken: h.attention.sessionToken(id), exitCode: 1 },
+      });
+    }
+    h.advance();
+    const flushing = h.attention.flush();
+    await h.waiting;
+    await h.attention.closeSession('a');
+    h.attention.availableSessions(['b']);
+    h.attention.availableSessions(['a', 'b']);
+    h.release();
+    await flushing;
+    expect(h.delivered.map((intent) => [intent.sessionId, intent.update.changes[0]?.signal.id])).toEqual([
+      ['b', 'job-b'],
+    ]);
+    await h.attention.stop();
+  });
+
   it('keeps an owned job context separate from a later owned wake', async () => {
     const h = harness(
       false,

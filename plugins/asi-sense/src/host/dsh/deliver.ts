@@ -160,9 +160,10 @@ export function createDelivery(
   sendTitles: () => boolean,
   accepted: (sessionId: string, id: string) => Promise<boolean>,
 ) {
+  type Step = { turn: number; step: number };
   const delivered = new Map<string, Set<string>>();
-  const staged = new Map<string, Map<string, { intent: DeliveryIntent; step?: symbol; admitted: boolean }>>();
-  const steps = new Map<string, symbol>();
+  const staged = new Map<string, Map<string, { intent: DeliveryIntent; step?: Step; returned: boolean }>>();
+  const steps = new Map<string, Step>();
   const inflight = new Map<string, Promise<void>>();
   const message = (id: string, intent: DeliveryIntent): UserMessage =>
     freezeMessage({
@@ -187,8 +188,8 @@ export function createDelivery(
     if (getAgent(sessionId) !== agent) throw new Error('delivery session changed');
     if (intent.kind === 'inject') {
       const pending = staged.get(sessionId) ?? new Map();
-      if (pending.get(id)?.admitted) return;
-      pending.set(id, { intent: structuredClone(intent), step: steps.get(sessionId), admitted: false });
+      if (pending.get(id)?.returned) return;
+      pending.set(id, { intent: structuredClone(intent), step: steps.get(sessionId), returned: false });
       staged.set(sessionId, pending);
       return;
     }
@@ -239,7 +240,7 @@ export function createDelivery(
         const wasAccepted = await accepted(sessionId, id);
         if (pending.get(id) !== entry) continue;
         if (wasAccepted) pending.delete(id);
-        else if (!entry.admitted) messages.push(message(id, entry.intent));
+        else if (!entry.returned) messages.push(message(id, entry.intent));
       }
       if (!pending.size && staged.get(sessionId) === pending) staged.delete(sessionId);
       return messages;
@@ -261,26 +262,44 @@ export function createDelivery(
           const owned = entry.intent.update.changes.some(
             ({ signal }) => isSessionContext(signal) || (signal.source.id === 'dsh' && signal.kind.startsWith('job.')),
           );
-          if (!owned && !entry.admitted && (!entry.step || steps.get(session) !== entry.step)) pending.delete(id);
+          if (!owned && !entry.returned && (!entry.step || steps.get(session) !== entry.step)) pending.delete(id);
         }
         if (!pending.size) staged.delete(session);
       }
     },
-    begin(sessionId: string, step: symbol): void {
+    begin(sessionId: string, step: Step): void {
       steps.set(sessionId, step);
     },
-    finish(sessionId: string, step: symbol, messages?: UserMessage[]): void {
+    finish(sessionId: string, step: Step, messages?: UserMessage[]): void {
       const pending = staged.get(sessionId);
       for (const [id, entry] of pending ?? []) {
-        if (messages?.some((message) => message.id === id)) entry.admitted = true;
-        else if (!messages && entry.step === step) pending?.delete(id);
+        if (messages?.some((message) => message.id === id)) {
+          entry.step = step;
+          entry.returned = true;
+        } else if (!messages && entry.step === step) pending?.delete(id);
       }
       if (pending?.size === 0) staged.delete(sessionId);
       if (steps.get(sessionId) === step) steps.delete(sessionId);
     },
+    end(sessionId: string, position?: { turn: number; step?: number }): boolean {
+      const pending = staged.get(sessionId);
+      let discarded = false;
+      for (const [id, entry] of pending ?? []) {
+        if (
+          entry.returned &&
+          (!position ||
+            (entry.step?.turn === position.turn && (position.step === undefined || entry.step.step === position.step)))
+        ) {
+          pending?.delete(id);
+          discarded = true;
+        }
+      }
+      if (pending?.size === 0) staged.delete(sessionId);
+      return discarded;
+    },
     protected(sessionId: string, id: string): boolean {
       const entry = staged.get(sessionId)?.get(`asi-sense:${id}`);
-      return !!entry && (entry.admitted || (!!entry.step && steps.get(sessionId) === entry.step));
+      return !!entry && (entry.returned || (!!entry.step && steps.get(sessionId) === entry.step));
     },
   });
 }

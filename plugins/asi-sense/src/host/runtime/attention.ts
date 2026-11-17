@@ -80,6 +80,7 @@ export class RuntimeAttention {
         const steps = new Map(this.steps);
         return (id) =>
           !this.stopped &&
+          !this.closed.has(id) &&
           ((generation === this.selectionGeneration && this.selected === id) ||
             (steps.has(id) && steps.get(id) === this.steps.get(id))) &&
           this.sessions.has(id);
@@ -211,6 +212,9 @@ export class RuntimeAttention {
   }
   async closeSession(id: string): Promise<void> {
     this.closed.set(id, false);
+    this.steps.delete(id);
+    if (this.selected === id) this.selectionGeneration++;
+    this.pipeline.disposeSession(id, this.sessionTokens.get(id));
     const index = this.recent.indexOf(id);
     if (index >= 0) this.recent.splice(index, 1);
     if (this.selected === id && this.pinned !== id) await this.setTarget(undefined);
@@ -343,7 +347,7 @@ export class RuntimeAttention {
       const owner = typeof signal.data.sessionId === 'string' ? signal.data.sessionId : undefined;
       const token = signal.data.sessionToken;
       const session =
-        owner && typeof token === 'string' && token === this.sessionTokens.get(owner)
+        owner && !this.closed.has(owner) && typeof token === 'string' && token === this.sessionTokens.get(owner)
           ? this.sessions.get(owner)
           : undefined;
       if (session) {
@@ -357,6 +361,7 @@ export class RuntimeAttention {
           () =>
             !this.stopped &&
             owner !== undefined &&
+            !this.closed.has(owner) &&
             this.sessions.get(owner) === session &&
             this.sessionTokens.get(owner) === token,
         );
