@@ -20,6 +20,13 @@ try {
       join(staged, 'package.json'),
       JSON.stringify({
         ...manifest,
+        files: [
+          ...manifest.files,
+          'lib/typert.host.d.ts',
+          'lib/typert.remote-client.js',
+          'lib/typert.remote-client.d.ts',
+          'lib/typert.remote-client.d.ts.map',
+        ],
         exports: {
           ...manifest.exports,
           '.': { ...manifest.exports['.'], types: './src/host/dsh/remote.ts' },

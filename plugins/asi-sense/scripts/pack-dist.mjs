@@ -22,11 +22,13 @@ try {
   }
   const helper = join(stage, 'lib/asi-sense-helper');
   await chmod(helper, 0o755);
+  const stripped = spawnSync('strip', ['-S', helper], { stdio: 'inherit' });
+  if (stripped.status !== 0) throw new Error('Could not strip helper debug symbols');
   const signed = spawnSync('codesign', ['--force', '--sign', '-', helper], { stdio: 'inherit' });
   if (signed.status !== 0) throw new Error('Could not sign the macOS helper');
   await Promise.all([
     copyFile(join(pkg, 'cordis.patch.yml'), join(stage, 'cordis.patch.yml')),
-    copyFile(join(pkg, 'README.md'), join(stage, 'README.md')),
+    copyFile(join(pkg, '../../LICENSE'), join(stage, 'LICENSE')),
     copyFile(join(pkg, 'scripts/dsh.sh'), join(stage, 'scripts/dsh.sh')).then(() =>
       chmod(join(stage, 'scripts/dsh.sh'), 0o755),
     ),
@@ -36,6 +38,13 @@ try {
         {
           name: manifest.name,
           version: manifest.version,
+          description: manifest.description,
+          license: manifest.license,
+          repository: manifest.repository,
+          keywords: manifest.keywords,
+          os: manifest.os,
+          cpu: manifest.cpu,
+          publishConfig: manifest.publishConfig,
           type: manifest.type,
           main: manifest.main,
           engines: manifest.engines,

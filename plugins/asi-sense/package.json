@@ -1,7 +1,29 @@
 {
   "name": "asi-sense",
-  "private": true,
   "version": "0.1.2",
+  "private": true,
+  "description": "Local environment awareness and triggers for DeepSeek Harness.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/zygs1083-dotcom/ASI.git",
+    "directory": "plugins/asi-sense"
+  },
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "environment",
+    "macos"
+  ],
+  "os": [
+    "darwin"
+  ],
+  "cpu": [
+    "arm64"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
   "type": "module",
   "main": "./lib/index.js",
   "engines": {
@@ -29,22 +51,19 @@
     "./package.json": "./package.json"
   },
   "files": [
-    "src",
     "lib/index.js",
     "lib/client.js",
     "lib/asi-sense-helper",
-    "lib/types.js",
     "lib/typert.host.js",
-    "lib/typert.host.d.ts",
-    "lib/typert.remote-client.js",
-    "lib/typert.remote-client.d.ts",
-    "lib/typert.remote-client.d.ts.map",
     "cordis.patch.yml",
     "scripts/dsh.sh"
   ],
   "dsh": {
     "bundle": {
-      "patch": "./cordis.patch.yml"
+      "patch": "./cordis.patch.yml",
+      "platforms": [
+        "darwin"
+      ]
     },
     "client": {
       "platform": "web",
@@ -101,8 +120,10 @@
   "scripts": {
     "build": "pnpm run typecheck && node scripts/build.mjs",
     "pack:dist": "pnpm run build && node scripts/pack-dist.mjs && node scripts/pack-verify.mjs",
+    "release:check": "pnpm run pack:dist && node scripts/release-check.mjs",
     "check": "pnpm run typecheck && pnpm exec biome check . && pnpm test",
     "e2e:dsh": "pnpm run build && tsx scripts/e2e-dsh.ts",
+    "e2e:registry": "node scripts/e2e-registry.mjs",
     "generate": "node scripts/generate-typert.mjs",
     "typecheck": "pnpm run generate && tsc -p tsconfig.json",
     "test": "vitest run",
