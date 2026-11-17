@@ -23,6 +23,7 @@ import {
   webUrl,
 } from './e2e-support.ts';
 import { syntheticBundle } from './e2e-synthetic.ts';
+import { checkTargetDelivery } from './e2e-target.ts';
 import { checkPanelScroll, checkResponsive, screenshotDesktop, screenshotLocation } from './e2e-ui.ts';
 
 const pkg = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -77,6 +78,7 @@ let server: ChildProcess | undefined;
 let browser: Browser | undefined;
 let phase = 'profile setup';
 let backgroundTurn: number | undefined;
+let watchdog: ReturnType<typeof setTimeout> | undefined;
 try {
   if (helperPids().length) throw new Error('An ASI helper from this worktree is already running');
   const overlay = await setup({ root, home, workspace, sessionRoot, counter, budgetReady, services, limit });
@@ -117,6 +119,15 @@ try {
     ],
     { cwd: workspace, env, detached: true, stdio: ['ignore', 'pipe', 'pipe'] },
   );
+  watchdog = setTimeout(() => {
+    console.error('DSH e2e exceeded the 10-minute limit; stopping owned processes');
+    void Promise.allSettled([browser?.close() ?? Promise.resolve(), server ? stop(server) : Promise.resolve()]).then(
+      async () => {
+        await profile[Symbol.asyncDispose]();
+        process.exit(1);
+      },
+    );
+  }, 600_000);
   console.log(`Owned DSH PID: ${server.pid}`);
   const url = await webUrl(server);
   server.stdout?.resume();
@@ -207,7 +218,15 @@ try {
     phase = 'real DSH file monitoring and latency';
     await checkFileHost(root, workspace, sessionRoot, panel);
   }
-  if (process.env.ASI_E2E_NO_MODEL !== '1' && process.env.ASI_E2E_ONLY_BACKGROUND !== '1') {
+  if (process.env.ASI_E2E_ONLY_TARGET === '1') {
+    phase = 'target conversation delivery';
+    await checkTargetDelivery(chat, panel, sessionRoot);
+  }
+  if (
+    process.env.ASI_E2E_ONLY_TARGET !== '1' &&
+    process.env.ASI_E2E_NO_MODEL !== '1' &&
+    process.env.ASI_E2E_ONLY_BACKGROUND !== '1'
+  ) {
     phase = 'agent self-caused failure';
     await prompt(
       chat,
@@ -297,7 +316,11 @@ try {
     await expect(failedShell.first()).toContainText('已抑制');
     console.log('b1: self-caused event is shown as suppressed');
   }
-  if (process.env.ASI_E2E_NO_MODEL !== '1' && process.env.ASI_E2E_ONLY_SELF !== '1') {
+  if (
+    process.env.ASI_E2E_ONLY_TARGET !== '1' &&
+    process.env.ASI_E2E_NO_MODEL !== '1' &&
+    process.env.ASI_E2E_ONLY_SELF !== '1'
+  ) {
     const baseline = envMessages(await events(sessionRoot)).length;
     phase = 'b2 initial background command';
     await prompt(
@@ -401,6 +424,7 @@ try {
   if (serviceStatus) console.error(`DSH services: ${serviceStatus}`);
   process.exitCode = 1;
 } finally {
+  if (watchdog) clearTimeout(watchdog);
   const cleanup = await Promise.allSettled([
     browser?.close() ?? Promise.resolve(),
     server ? stop(server) : Promise.resolve(),

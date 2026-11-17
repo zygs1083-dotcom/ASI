@@ -40,11 +40,23 @@ export interface JobEvent {
 export type TokenSnapshot = NonNullable<Body['tokens']['value']> & {
   contextWindowSource?: 'configured' | 'catalog' | 'fallback';
 };
+export interface SessionRow {
+  id: string;
+  title: string;
+  updatedAt: number;
+  running: boolean;
+}
 export interface DshPort {
+  listSessions?(): Promise<SessionRow[]>;
+  ensureSession?(id: string): Promise<void>;
+  onSessionsChanged?(cb: (closed?: string) => void): Unsubscribe;
+  selectDeliveryTarget?(id: string | undefined): void;
+  isDeliveryProtected?(sessionId: string, deliveryId: string): boolean;
+  onStepDiscarded?(cb: () => void): Unsubscribe;
   onAgentEvent(cb: (event: AgentEvent) => Promise<void>): Unsubscribe;
   onTool(cb: (event: ToolEvent) => Promise<void>): Unsubscribe;
   onJob(cb: (event: JobEvent) => Promise<void>): Unsubscribe;
-  deliver(sessionId: string, intent: DeliveryIntent): Promise<void>;
+  deliver(sessionId: string, intent: DeliveryIntent, isCurrent?: () => boolean): Promise<void>;
   tokenSnapshot(sessionId: string): Promise<TokenSnapshot | undefined>;
   modelJobs?(sessionId: string): JobSummary[];
   openPermissionSettings?(): Promise<void>;
@@ -83,8 +95,11 @@ export interface SenseOptions {
   intervalMs?: number;
   rules?: WatchRule[];
   selfCauseGraceMs?: number;
+  targetStorageKey?: string;
 }
 export interface SenseActions {
+  selectTarget?(id: string | undefined): Promise<void>;
+  dismissTargetNotice?(): Promise<void>;
   toggleRule(id: string, enabled: boolean): Promise<void>;
   confirmRule(id: string): Promise<void>;
   deleteRule(id: string): Promise<void>;

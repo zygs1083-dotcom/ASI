@@ -9,6 +9,7 @@ import { createChanges, createStateListeners, observableActions, settleShutdown 
 import { deliveryRetry } from './delivery-retry.ts';
 import { FactExpiry } from './expiry.ts';
 import type { SenseActions, SenseOptions, SensePorts } from './ports.ts';
+import { createSessionTarget } from './session-target.ts';
 import { Settings } from './settings.ts';
 import { pauseAction, runtimeTools } from './tools.ts';
 
@@ -52,10 +53,36 @@ export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}
     () => allowTitles && helper.titlesEnabled(),
     changed,
     expiry,
+    () => target.ensure(),
+    () => target.canEnsure(),
   );
   const listeners = createStateListeners();
   const body = new BodySource(ports.probe, ports.dsh, ports.storage, clock, attention, expiry, isPaused, changed);
-  const dsh = new DshSource(deliveryPort, clock, attention, body, isPaused, options.selfCauseGraceMs);
+  const dsh = new DshSource(deliveryPort, clock, attention, body, isPaused, options.selfCauseGraceMs, (id) => {
+    target.unload(id);
+    attention.rescheduleDelivery();
+  });
+  const target = createSessionTarget(
+    ports.dsh,
+    ports.storage,
+    options.targetStorageKey ?? 'session-target',
+    async (id) => {
+      const transfer = attention.setTarget(id);
+      ports.dsh.selectDeliveryTarget?.(attention.currentSessionId());
+      await transfer;
+      dsh.targetChanged();
+    },
+    () => attention.recordTargetReset(),
+    changed,
+    {
+      closed: async (id) => {
+        await attention.closeSession(id);
+        ports.dsh.selectDeliveryTarget?.(attention.currentSessionId());
+        dsh.targetChanged();
+      },
+      refreshed: (rows) => attention.availableSessions(rows.map((row) => row.id)),
+    },
+  );
   const offStore = attention.store.subscribe((state) => {
     listeners.notify(dsh.stateFor(attention.currentSessionId(), state));
     schedule();
@@ -84,7 +111,7 @@ export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}
     if (timer) clearTimeout(timer);
     timer = undefined;
     if (!running) return;
-    const due = paused || !attention.current() ? undefined : attention.pipeline.nextDeadline();
+    const due = paused ? undefined : attention.pipeline.nextDeadline();
     const deadline = Math.min(
       due === undefined ? Infinity : Math.max(due, retryAfter),
       helper.nextDeadline() ?? Infinity,
@@ -145,6 +172,8 @@ export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}
     });
   }
   const unguarded: SenseActions = {
+    selectTarget: (id) => target.select(id),
+    dismissTargetNotice: async () => target.dismiss(),
     toggleRule: (id, enabled) =>
       update((draft) => {
         if (!draft.rules.some((rule) => rule.id === id)) throw new Error('unknown rule');
@@ -251,12 +280,14 @@ export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}
     if (timer) clearTimeout(timer);
     timer = undefined;
     const deliveries = attention.stop();
+    const targeting = target.stop();
     const callbacks = dsh.stop();
     offStore();
     listeners.clear();
     changes.clear();
     const work = settleShutdown([
       deliveries,
+      targeting,
       callbacks,
       guarded.wait(),
       files.stop(),
@@ -283,6 +314,8 @@ export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}
         check(epoch);
         running = true;
         dsh.start();
+        await target.start();
+        check(epoch);
         await files.refresh();
         check(epoch);
         if (!paused) helper.start(settings.sendTitles);
@@ -298,6 +331,8 @@ export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}
     },
     stop,
     currentSessionId: () => attention.currentSessionId(),
+    targetMode: () => attention.targetMode(),
+    target: () => target.snapshot(),
     state: () => dsh.stateFor(attention.currentSessionId(), attention.state()),
     factMeta: (path: string) => expiry.factMeta(path),
     subscribe: listeners.subscribe,

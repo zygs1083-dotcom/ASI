@@ -40,13 +40,17 @@ export class RuntimeAttention {
   private readonly sessions = new Map<string, SessionContext>();
   private readonly sessionTokens = new Map<string, string>();
   private readonly recent: string[] = [];
+  private readonly closed = new Map<string, boolean>();
   private readonly inflight = new Set<Promise<void>>();
   private selected?: string;
+  private pinned?: string;
+  private readonly steps = new Map<string, symbol>();
   private selectionGeneration = 0;
   private sequence = 0;
   private stopped = false;
   private readonly prefix = randomUUID();
   private readonly offCommit?: () => void;
+  private readonly offDiscard?: () => void;
 
   constructor(
     private readonly clock: Clock,
@@ -56,6 +60,8 @@ export class RuntimeAttention {
     private readonly titlesAllowed: () => boolean,
     readonly changed: () => void,
     expiry: FactExpiry,
+    private readonly ensureTarget?: () => void,
+    private readonly canEnsureTarget?: () => boolean,
   ) {
     const staged = dsh as DshPort & { onDeliveryCommitted?: (cb: (session: string, id: string) => void) => () => void };
     this.store = new StateStore(
@@ -71,9 +77,18 @@ export class RuntimeAttention {
       wallClock: () => clock.wall(),
       isCurrent: () => {
         const generation = this.selectionGeneration;
+        const steps = new Map(this.steps);
         return (id) =>
-          !this.stopped && generation === this.selectionGeneration && this.selected === id && this.sessions.has(id);
+          !this.stopped &&
+          !this.closed.has(id) &&
+          ((generation === this.selectionGeneration && this.selected === id) ||
+            (steps.has(id) && steps.get(id) === this.steps.get(id))) &&
+          this.sessions.has(id);
       },
+      isTarget: (id) => this.selected === id,
+      isDeliveryProtected: (id, deliveryId) => dsh.isDeliveryProtected?.(id, deliveryId) ?? false,
+      isWakeOwner: (id) => !this.stopped && this.sessions.has(id) && !this.closed.has(id),
+      isPendingTarget: (id) => !this.stopped && this.pinned === id && !this.closed.has(id) && !!canEnsureTarget?.(),
       deliverer: {
         deliver: async (intent) => {
           if (this.stopped) throw new Error('stopped');
@@ -102,10 +117,20 @@ export class RuntimeAttention {
             }
           }
           if (intent.kind === 'inject' && this.offCommit) this.pending.stage(intent);
-          const delivery = dsh.deliver(intent.sessionId, safe);
+          const token = this.sessionTokens.get(intent.sessionId);
+          const isCurrent = () =>
+            this.hasSession(intent.sessionId) && this.sessionTokens.get(intent.sessionId) === token;
+          const delivery = dsh.deliver(intent.sessionId, safe, isCurrent);
           this.inflight.add(delivery);
           try {
             await delivery;
+          } catch (error) {
+            if (!isCurrent()) {
+              for (const outcome of injectOutcomes(intent)) {
+                for (const id of outcome.ids) this.mark(id, 'session-closed', 'record');
+              }
+            }
+            throw error;
           } finally {
             this.inflight.delete(delivery);
           }
@@ -121,6 +146,10 @@ export class RuntimeAttention {
       void this.pending.committed(session, id, this.pipeline).then(() => {
         if (!this.stopped) this.reschedule();
       });
+    });
+    this.offDiscard = dsh.onStepDiscarded?.(() => {
+      if (this.selected && !this.stopped)
+        void this.pipeline.retarget(this.selected).then(this.reschedule, this.reschedule);
     });
   }
 
@@ -153,8 +182,63 @@ export class RuntimeAttention {
   current(): string | undefined {
     return this.currentSessionId();
   }
+  hasSession(id: string): boolean {
+    return !this.stopped && this.sessions.has(id) && !this.closed.has(id);
+  }
   currentSessionId(): string | undefined {
     return this.selected;
+  }
+  targetMode(): 'auto' | 'pinned' {
+    return this.pinned ? 'pinned' : 'auto';
+  }
+  recordTargetReset(): void {
+    this.log(
+      {
+        signal: {
+          id: this.id(),
+          kind: 'delivery.target-unavailable',
+          at: this.clock.wall(),
+          source: { id: 'delivery', api: 'dsh', host: 'local' },
+          subject: 'delivery-target',
+          data: {},
+        },
+        level: 'record',
+      },
+      this.clock.mono(),
+    );
+  }
+  async setTarget(id: string | undefined): Promise<void> {
+    if (id && (!this.sessions.has(id) || this.closed.has(id))) throw new Error('target session unavailable');
+    this.pinned = id;
+    this.selected = id ?? this.recent.at(-1);
+    const generation = ++this.selectionGeneration;
+    if (this.selected) {
+      const session = this.sessions.get(this.selected);
+      if (session) this.pipeline.setSession(session);
+      await this.transfer(this.selected, generation);
+    }
+    this.reschedule();
+    this.changed();
+  }
+  async closeSession(id: string): Promise<void> {
+    this.closed.set(id, false);
+    this.steps.delete(id);
+    if (this.selected === id) this.selectionGeneration++;
+    const token = this.sessionTokens.get(id);
+    if (token !== undefined) {
+      this.sessionTokens.set(id, randomUUID());
+      this.pipeline.disposeSession(id, token);
+    }
+    const index = this.recent.indexOf(id);
+    if (index >= 0) this.recent.splice(index, 1);
+    if (this.selected === id && this.pinned !== id) await this.setTarget(undefined);
+  }
+  availableSessions(ids: readonly string[]): void {
+    const available = new Set(ids);
+    for (const [id, absent] of this.closed) {
+      if (!available.has(id)) this.closed.set(id, true);
+      else if (absent) this.closed.delete(id);
+    }
   }
   sessionToken(id: string | undefined): string | undefined {
     return id === undefined ? undefined : this.sessionTokens.get(id);
@@ -186,6 +270,7 @@ export class RuntimeAttention {
   stop(): Promise<void> {
     this.stopped = true;
     this.offCommit?.();
+    this.offDiscard?.();
     return Promise.allSettled([...this.inflight, this.pending.settled()]).then(() => {});
   }
   create(id: string): void {
@@ -194,6 +279,7 @@ export class RuntimeAttention {
     this.sessionTokens.set(id, randomUUID());
   }
   dispose(id: string): void {
+    this.steps.delete(id);
     const token = this.sessionTokens.get(id);
     this.sessions.delete(id);
     this.sessionTokens.delete(id);
@@ -204,38 +290,57 @@ export class RuntimeAttention {
     if (this.selected === id) {
       this.selected = this.recent.at(-1);
       this.selectionGeneration++;
-      if (this.selected) void this.pipeline.retarget(this.selected);
+      if (this.selected) void this.pipeline.retarget(this.selected).then(this.reschedule, this.reschedule);
     }
     this.reschedule();
   }
   async preStep(id: string, userInitiated = false, drain = true): Promise<void> {
-    if (this.stopped) return;
+    if (this.stopped || this.closed.has(id)) return;
     const session = this.sessions.get(id);
     if (!session) return;
+    if (this.needsRestore()) this.ensureTarget?.();
     const generation = ++this.selectionGeneration;
-    this.selected = id;
+    const step = Symbol();
+    this.steps.set(id, step);
     const index = this.recent.indexOf(id);
     if (index >= 0) this.recent.splice(index, 1);
     this.recent.push(id);
+    this.selected =
+      this.pinned && this.sessions.has(this.pinned) && !this.closed.has(this.pinned) && !this.canEnsureTarget?.()
+        ? this.pinned
+        : id;
     session.busy = true;
     session.userInitiated = userInitiated;
     this.pipeline.setSession(session);
-    if (!drain) return;
+    if (!drain) {
+      if (this.steps.get(id) === step) this.steps.delete(id);
+      return;
+    }
+    const selected = this.selected;
+    try {
+      await this.transfer(selected, generation);
+      if (this.stopped || this.steps.get(id) !== step || this.sessions.get(id) !== session) return;
+      await this.pipeline.preStep(id);
+    } finally {
+      if (this.steps.get(id) === step) this.steps.delete(id);
+      this.reschedule();
+    }
+  }
+  private async transfer(id: string, generation: number): Promise<boolean> {
     await this.pending.settled();
+    if (this.stopped || generation !== this.selectionGeneration || this.selected !== id) return false;
     await this.pipeline.retarget(id);
-    if (this.stopped || generation !== this.selectionGeneration || this.selected !== id) return;
+    if (this.stopped || generation !== this.selectionGeneration || this.selected !== id) return false;
+    const session = this.sessions.get(id);
+    if (!session) return false;
     let entry = this.pending.take();
     while (entry) {
       if ('batch' in entry) await this.pipeline.restore(id, entry.batch);
       else await this.pipeline.acceptCount(entry.signal, session, entry.count, entry.other, entry.classification);
-      if (this.stopped || generation !== this.selectionGeneration || this.selected !== id) return;
+      if (this.stopped || generation !== this.selectionGeneration || this.selected !== id) return false;
       entry = this.pending.take();
     }
-    try {
-      await this.pipeline.preStep(id);
-    } finally {
-      this.reschedule();
-    }
+    return true;
   }
   postStep(id: string): void {
     const session = this.sessions.get(id);
@@ -256,7 +361,7 @@ export class RuntimeAttention {
       const owner = typeof signal.data.sessionId === 'string' ? signal.data.sessionId : undefined;
       const token = signal.data.sessionToken;
       const session =
-        owner && typeof token === 'string' && token === this.sessionTokens.get(owner)
+        owner && !this.closed.has(owner) && typeof token === 'string' && token === this.sessionTokens.get(owner)
           ? this.sessions.get(owner)
           : undefined;
       if (session) {
@@ -270,6 +375,7 @@ export class RuntimeAttention {
           () =>
             !this.stopped &&
             owner !== undefined &&
+            !this.closed.has(owner) &&
             this.sessions.get(owner) === session &&
             this.sessionTokens.get(owner) === token,
         );
@@ -290,6 +396,11 @@ export class RuntimeAttention {
       }
       return;
     }
+    if (this.needsRestore() && signal.cause !== 'agent') {
+      const level = this.pipeline.selectRule(signal, this.rules())?.level;
+      if (level && level !== 'record') this.ensureTarget?.();
+    }
+    if (this.stopped) return;
     const session = this.selected && this.sessions.get(this.selected);
     if (!session) {
       const prior = this.store.snapshot().observation.sources[signal.source.id];
@@ -336,13 +447,15 @@ export class RuntimeAttention {
   async flush(): Promise<void> {
     try {
       this.pipeline.pruneSessions();
-      if (this.selected) {
-        await this.pipeline.retarget(this.selected);
-        if (!this.stopped && this.selected) await this.pipeline.flush();
-      }
+      if (this.needsRestore()) this.ensureTarget?.();
+      if (this.selected) await this.pipeline.retarget(this.selected);
+      if (!this.stopped) await this.pipeline.flush();
     } finally {
       this.reschedule();
     }
+  }
+  private needsRestore(): boolean {
+    return !!this.pinned && (this.selected !== this.pinned || !this.sessions.has(this.pinned));
   }
   private log(change: { signal: Signal; level: DeliveryLevel; ruleId?: string; reason?: string }, mono: number): void {
     const { signal, level, ruleId, reason } = change;

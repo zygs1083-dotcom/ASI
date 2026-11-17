@@ -86,6 +86,10 @@ export class AttentionPipeline {
       clock: this.clock,
       wallClock: this.wallClock,
       isCurrent: options.isCurrent,
+      isTarget: options.isTarget,
+      isDeliveryProtected: options.isDeliveryProtected,
+      isWakeOwner: options.isWakeOwner,
+      isPendingTarget: options.isPendingTarget,
     });
   }
 
@@ -282,6 +286,11 @@ export class AttentionPipeline {
     if (this.deliveryContext.getStore()?.active) return Promise.reject(new ReentrantDeliveryError());
     const cutoff = this.cutoff(now);
     return this.enqueueDrain(() => this.drain.due(cutoff));
+  }
+  flushOwned(now: number = this.clock()): Promise<void> {
+    if (this.deliveryContext.getStore()?.active) return Promise.reject(new ReentrantDeliveryError());
+    const cutoff = this.cutoff(now);
+    return this.enqueueDrain(() => this.drain.dueOwned(cutoff));
   }
 
   /**

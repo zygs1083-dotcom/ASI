@@ -4,6 +4,8 @@ import type {} from 'asi-sense/remote';
 
 type Api = Pick<
   TypertRemoteNamespaceMap['asiSense'],
+  | 'selectTarget'
+  | 'dismissTargetNotice'
   | 'toggleRule'
   | 'confirmRule'
   | 'deleteRule'
@@ -49,6 +51,8 @@ export function createActions(api: Api) {
     }
   };
   const actions: Actions = {
+    onSelectTarget: (id) => complete(() => api.selectTarget(id ?? '')),
+    onDismissTargetNotice: () => complete(() => api.dismissTargetNotice()),
     onToggleRule: (id, enabled) => fire(api.toggleRule(id, enabled)),
     onConfirmRule: (id) => fire(api.confirmRule(id)),
     onDeleteRule: (id) => fire(api.deleteRule(id)),

@@ -10,6 +10,7 @@ import { RuntimeAttention } from '../../src/host/runtime/attention.ts';
 import { FactExpiry } from '../../src/host/runtime/expiry.ts';
 import { PendingContext } from '../../src/host/runtime/pending-context.ts';
 import type { AgentEvent } from '../../src/host/runtime/ports.ts';
+import { createSessionTarget } from '../../src/host/runtime/session-target.ts';
 
 const update = {
   since: 0,
@@ -207,6 +208,102 @@ describe('DSH agent port', () => {
     expect(agent.inject).not.toHaveBeenCalled();
   });
 
+  it.each(['cancelled', 'committed'] as const)(
+    'retries only uncommitted context after the returned step is %s',
+    async (outcome) => {
+      const { ctx, agent, port } = await fixture();
+      const unregister = await ctx.agents.register(agent);
+      onTestFinished(unregister);
+      const privateUpdate = {
+        ...update,
+        changes: [
+          {
+            ...update.changes[0],
+            signal: {
+              ...sample,
+              kind: 'job.started',
+              source: { id: 'dsh', api: 'events', host: 'local' },
+              data: { id: 'fixture-job', sessionId: agent.id },
+            },
+          },
+        ],
+      };
+      const off = port.onAgentEvent(async (event) => {
+        if (event.type === 'pre-step') {
+          await port.deliver(event.sessionId, {
+            kind: 'inject',
+            sessionId: event.sessionId,
+            deliveryId: 'private',
+            update: privateUpdate,
+          });
+        }
+      });
+      onTestFinished(off);
+      const user = createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text: 'fixture' }] });
+      const controller = new AbortController();
+      const events = agentEvents(ctx, agent);
+      const step = async (signal: AbortSignal) => {
+        const result = await events.waterfall(
+          'agent/pre-step',
+          { turn: 1, step: 1, messages: [user], signal, modelSelection: { provider: 'fixture', model: 'fixture' } },
+          async () => ({ kind: 'enter' as const, messages: [user] }),
+        );
+        if (result.kind !== 'enter') throw new Error('expected an entered step');
+        return result.messages.slice(1);
+      };
+      const first = await step(controller.signal);
+      expect(first).toHaveLength(1);
+      expect(port.isDeliveryProtected?.(agent.id, 'private')).toBe(true);
+      expect(await step(controller.signal)).toHaveLength(0);
+      if (outcome === 'committed') {
+        const event = agent.session.append('user/message', first[0], { surfaceOp: 'append' });
+        ctx.emit('session/event', agent.session, event);
+      } else controller.abort();
+      events.emit('agent/status', { status: 'idle' });
+      expect(port.isDeliveryProtected?.(agent.id, 'private')).toBe(false);
+      const retry = await step(new AbortController().signal);
+      expect(retry).toHaveLength(outcome === 'cancelled' ? 1 : 0);
+      if (outcome === 'cancelled') expect(retry[0]?.id).toBe(first[0]?.id);
+    },
+  );
+
+  it('does not release a replacement agent step on a stale idle event', async () => {
+    const { ctx, agent, port } = await fixture();
+    const off = port.onAgentEvent(async (event) => {
+      if (event.type === 'pre-step') {
+        await port.deliver(event.sessionId, { kind: 'inject', sessionId: event.sessionId, deliveryId: 'a', update });
+      }
+    });
+    onTestFinished(off);
+    const unregisterOld = await ctx.agents.register(agent);
+    await unregisterOld();
+    const replacement = { ...agent, session: Session.create(agent.id) };
+    const unregister = await ctx.agents.register(replacement);
+    onTestFinished(unregister);
+    const user = createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text: 'fixture' }] });
+    const step = async () => {
+      const result = await agentEvents(ctx, replacement).waterfall(
+        'agent/pre-step',
+        {
+          turn: 1,
+          step: 1,
+          messages: [user],
+          signal: new AbortController().signal,
+          modelSelection: { provider: 'fixture', model: 'fixture' },
+        },
+        async () => ({ kind: 'enter' as const, messages: [user] }),
+      );
+      if (result.kind !== 'enter') throw new Error('expected an entered step');
+      return result.messages;
+    };
+    expect(await step()).toHaveLength(2);
+    agentEvents(ctx, agent).emit('agent/status', { status: 'idle' });
+    expect(port.isDeliveryProtected?.(agent.id, 'a')).toBe(true);
+    expect(await step()).toHaveLength(1);
+    agentEvents(ctx, replacement).emit('agent/status', { status: 'idle' });
+    expect(await step()).toHaveLength(2);
+  });
+
   it('does not discard a newer pre-step staging for the same session', async () => {
     const { ctx, agent, port } = await fixture();
     const unregister = await ctx.agents.register(agent);
@@ -270,6 +367,310 @@ describe('DSH agent port', () => {
 });
 
 describe('uncommitted context routing', () => {
+  it('does not send an owned wake after its target is archived during injection', async () => {
+    const { ctx, agent: a, port } = await fixture();
+    const bId = SessionId('synthetic-session-b');
+    const b = { ...a, id: bId, session: Session.create(bId), send: vi.fn(), followup: vi.fn() };
+    let now = 0;
+    let release = () => {};
+    let entered = () => {};
+    const injecting = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const wrapped = {
+      ...port,
+      deliver: async (...args: Parameters<typeof port.deliver>) => {
+        await port.deliver(...args);
+        if (args[0] === a.id && args[1].kind === 'inject') {
+          entered();
+          await gate;
+        }
+      },
+    };
+    const clock = { wall: () => now, mono: () => now };
+    const attention = new RuntimeAttention(
+      clock,
+      wrapped,
+      () => [
+        { id: 'start', match: { kind: 'job.started' }, level: 'context', createdBy: 'user', approved: true },
+        { id: 'exit', match: { kind: 'job.exited' }, level: 'wake', createdBy: 'user', approved: true },
+      ],
+      () => {},
+      () => true,
+      () => {},
+      new FactExpiry(clock),
+    );
+    const off = port.onAgentEvent(async (event) => {
+      if (event.type === 'created') attention.create(event.sessionId);
+      if (event.type === 'pre-step') await attention.preStep(event.sessionId, event.userInitiated);
+    });
+    const unregisterA = await ctx.agents.register(a);
+    const unregisterB = await ctx.agents.register(b);
+    onTestFinished(async () => {
+      release();
+      off();
+      await attention.stop();
+      await unregisterA();
+      await unregisterB();
+    });
+    const user = createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text: 'fixture' }] });
+    const step = async (agent: Agent) => {
+      const result = await agentEvents(ctx, agent).waterfall(
+        'agent/pre-step',
+        {
+          turn: 1,
+          step: 1,
+          messages: [user],
+          signal: new AbortController().signal,
+          modelSelection: { provider: 'fixture', model: 'fixture' },
+        },
+        async () => ({ kind: 'enter' as const, messages: [user] }),
+      );
+      if (result.kind !== 'enter') throw new Error('expected an entered step');
+      return result;
+    };
+    await step(b);
+    await step(a);
+    await attention.setTarget(a.id);
+    const owner = { id: 'fixture-job', sessionId: a.id, sessionToken: attention.sessionToken(a.id), exitCode: 1 };
+    for (const kind of ['job.started', 'job.exited']) {
+      await attention.accept({
+        id: kind,
+        kind,
+        at: now,
+        source: { id: 'dsh', api: 'events', host: 'local' },
+        subject: 'fixture-job',
+        data: owner,
+      });
+    }
+    now += 2_000;
+    const pending = step(a);
+    await injecting;
+    await attention.closeSession(a.id);
+    const reset = attention.setTarget(undefined);
+    expect(attention.hasSession(a.id)).toBe(false);
+    await attention.accept({
+      id: 'closed-job',
+      kind: 'job.exited',
+      at: now,
+      source: { id: 'dsh', api: 'events', host: 'local' },
+      subject: 'fixture-job',
+      data: owner,
+    });
+    release();
+    await Promise.all([pending, reset]);
+    const resultB = await step(b);
+    expect(a.send).not.toHaveBeenCalled();
+    expect(a.followup).not.toHaveBeenCalled();
+    expect(b.send).not.toHaveBeenCalled();
+    expect(b.followup).not.toHaveBeenCalled();
+    expect(JSON.stringify(resultB.messages)).not.toContain('fixture-job');
+    expect(attention.events()).toContainEqual(expect.objectContaining({ id: 'job.exited', level: 'record' }));
+    expect(attention.events()).toContainEqual(
+      expect.objectContaining({ id: 'closed-job', level: 'record', reason: 'session-private' }),
+    );
+  });
+
+  it.each(['owner', 'unowned-waiting', 'unowned-started', 'unowned-aborted'] as const)(
+    'preserves the owner and routes %s correctly when a pinned target restores during injection',
+    async (scenario) => {
+      const { ctx, agent: a, port } = await fixture();
+      const bId = SessionId('synthetic-session-b');
+      const b = { ...a, id: bId, session: Session.create(bId), send: vi.fn(), followup: vi.fn() };
+      let now = 0;
+      let releaseInject = () => {};
+      let injectEntered = () => {};
+      let releaseRestore = () => {};
+      const injecting = new Promise<void>((resolve) => {
+        injectEntered = resolve;
+      });
+      const injectGate = new Promise<void>((resolve) => {
+        releaseInject = resolve;
+      });
+      const restoreGate = new Promise<void>((resolve) => {
+        releaseRestore = resolve;
+      });
+      let holdInject = false;
+      let restoring = false;
+      let steppedB = false;
+      const wrapped = {
+        ...port,
+        deliver: async (...args: Parameters<typeof port.deliver>) => {
+          await port.deliver(...args);
+          const kind =
+            scenario === 'unowned-started' || scenario === 'unowned-aborted' ? 'app.activated' : 'job.started';
+          if (
+            holdInject &&
+            args[0] === a.id &&
+            args[1].kind === 'inject' &&
+            args[1].update.changes.some((change) => change.signal.kind === kind)
+          ) {
+            injectEntered();
+            await injectGate;
+          }
+        },
+      };
+      const clock = { wall: () => now, mono: () => now };
+      const attention = new RuntimeAttention(
+        clock,
+        wrapped,
+        () => [
+          { id: 'start', match: { kind: 'job.started' }, level: 'context', createdBy: 'user', approved: true },
+          { id: 'exit', match: { kind: 'job.exited' }, level: 'wake', createdBy: 'user', approved: true },
+          { id: 'app', match: { kind: 'app.activated' }, level: 'context', createdBy: 'user', approved: true },
+        ],
+        () => {},
+        () => true,
+        () => {},
+        new FactExpiry(clock),
+        () => target.ensure(),
+        () => target.canEnsure(),
+      );
+      let unregisterB = await ctx.agents.register(b);
+      const unregisterA = await ctx.agents.register(a);
+      const target = createSessionTarget(
+        {
+          listSessions: async () => [a, b].map((agent) => ({ id: agent.id, title: '', updatedAt: 0, running: false })),
+          ensureSession: async () => {
+            if (!restoring) return;
+            await restoreGate;
+            unregisterB = await ctx.agents.register(b);
+          },
+        },
+        { load: async () => undefined, save: async () => {} },
+        'target-fixture',
+        async (id) => {
+          const transfer = attention.setTarget(id);
+          port.selectDeliveryTarget?.(attention.current());
+          await transfer;
+        },
+        () => {},
+        () => {},
+      );
+      const off = port.onAgentEvent(async (event) => {
+        if (event.type === 'created') attention.create(event.sessionId);
+        if (event.type === 'disposed') {
+          attention.dispose(event.sessionId);
+          target.unload(event.sessionId);
+        }
+        if (event.type === 'pre-step') {
+          if (event.sessionId === b.id) steppedB = true;
+          await attention.preStep(event.sessionId, event.userInitiated);
+        }
+      });
+      onTestFinished(async () => {
+        releaseInject();
+        releaseRestore();
+        off();
+        await target.stop();
+        await attention.stop();
+        await unregisterA();
+        await unregisterB();
+      });
+      await target.start();
+      await attention.preStep(a.id);
+      attention.postStep(a.id);
+      await target.select(b.id);
+      restoring = true;
+      await unregisterB();
+      const owner = { sessionId: a.id, sessionToken: attention.sessionToken(a.id), id: 'fixture-job', exitCode: 1 };
+      for (const kind of ['job.started', 'job.exited']) {
+        await attention.accept({
+          id: kind,
+          kind,
+          at: now,
+          source: { id: 'dsh', api: 'events', host: 'local' },
+          subject: 'fixture-job',
+          data: owner,
+        });
+      }
+      if (scenario !== 'owner') {
+        await attention.accept({
+          ...sample,
+          id: 'unowned',
+          data: { name: 'FixtureOrdinary' },
+        });
+      }
+      now += 2_000;
+      await attention.flush();
+      expect(a.followup).toHaveBeenCalledTimes(1);
+      const wake = vi.mocked(a.followup).mock.calls[0]?.[0];
+      if (!wake) throw new Error('missing owner wake');
+      holdInject = true;
+      const step = (agent: Agent, messages: (typeof wake)[], controller = new AbortController()) =>
+        agentEvents(ctx, agent).waterfall(
+          'agent/pre-step',
+          {
+            turn: 1,
+            step: 1,
+            messages,
+            signal: controller.signal,
+            modelSelection: { provider: 'fixture', model: 'fixture' },
+          },
+          async () => ({ kind: 'enter' as const, messages }),
+        );
+      const controller = new AbortController();
+      const pending = step(a, [wake], controller);
+      await injecting;
+      releaseRestore();
+      await vi.waitFor(() => expect(attention.current()).toBe(b.id));
+      const user = createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text: 'fixture' }] });
+      const pendingB = step(b, [user]);
+      await vi.waitFor(() => expect(steppedB).toBe(true));
+      if (scenario === 'unowned-aborted') controller.abort();
+      releaseInject();
+      const result = await pending;
+      expect(result.kind).toBe('enter');
+      if (result.kind !== 'enter') throw new Error('expected an entered step');
+      const text = JSON.stringify(result.messages);
+      expect(text.match(/`fixture-job` started/g) ?? []).toHaveLength(scenario === 'unowned-aborted' ? 0 : 1);
+      expect(JSON.stringify(result.messages).match(/`fixture-job` exited/g)).toHaveLength(1);
+      expect(text.match(/FixtureOrdinary/g) ?? []).toHaveLength(scenario === 'unowned-started' ? 1 : 0);
+      const next = await pendingB;
+      expect(next.kind).toBe('enter');
+      if (next.kind !== 'enter') throw new Error('expected an entered step');
+      const bText = JSON.stringify(next.messages);
+      expect(bText).not.toContain('fixture-job');
+      expect(bText.match(/FixtureOrdinary/g) ?? []).toHaveLength(
+        scenario === 'unowned-waiting' || scenario === 'unowned-aborted' ? 1 : 0,
+      );
+      if (scenario !== 'unowned-aborted') {
+        holdInject = false;
+        const beforeCommit = await step(a, [user]);
+        expect(beforeCommit.kind).toBe('enter');
+        if (beforeCommit.kind !== 'enter') throw new Error('expected an entered step');
+        expect(JSON.stringify(beforeCommit.messages)).not.toContain('fixture-job');
+        expect(JSON.stringify(beforeCommit.messages)).not.toContain('FixtureOrdinary');
+      }
+      for (const message of result.messages.slice(1)) {
+        const event = a.session.append('user/message', message, { surfaceOp: 'append' });
+        ctx.emit('session/event', a.session, event);
+      }
+      for (const message of next.messages.slice(1)) {
+        const event = b.session.append('user/message', message, { surfaceOp: 'append' });
+        ctx.emit('session/event', b.session, event);
+      }
+      holdInject = false;
+      const later = await step(a, [user]);
+      expect(later.kind).toBe('enter');
+      if (later.kind !== 'enter') throw new Error('expected an entered step');
+      const laterText = JSON.stringify(later.messages);
+      expect(laterText.match(/`fixture-job` started/g) ?? []).toHaveLength(scenario === 'unowned-aborted' ? 1 : 0);
+      expect(laterText).not.toContain('FixtureOrdinary');
+      const finalB = await step(b, [user]);
+      expect(finalB.kind).toBe('enter');
+      if (finalB.kind !== 'enter') throw new Error('expected an entered step');
+      expect(JSON.stringify(finalB.messages)).not.toContain('fixture-job');
+      expect(JSON.stringify(finalB.messages)).not.toContain('FixtureOrdinary');
+      expect(a.followup).toHaveBeenCalledTimes(1);
+      expect(b.followup).not.toHaveBeenCalled();
+      expect(b.send).not.toHaveBeenCalled();
+    },
+  );
+
   async function routing(wake = false, offline = 0, ownedContext = false) {
     const { ctx, agent: a, port } = await fixture();
     const bId = SessionId('synthetic-session-b');
@@ -352,6 +753,86 @@ describe('uncommitted context routing', () => {
       unregisterA,
     };
   }
+
+  it.each(['cancelled', 'failed', 'committed'] as const)(
+    'keeps private context pending until the returned step is %s',
+    async (outcome) => {
+      const h = await routing(true, 0, true);
+      await h.attention.accept({
+        id: 'private-context',
+        kind: 'job.exited',
+        at: 1_000,
+        subject: 'fixture-job',
+        source: { id: 'dsh', api: 'events', host: 'local' },
+        data: {
+          id: 'fixture-job',
+          sessionId: h.a.id,
+          sessionToken: h.attention.sessionToken(h.a.id),
+          exitCode: 0,
+        },
+      });
+      const first = await h.step(h.a);
+      const message = first.messages[1];
+      if (!message) throw new Error('missing private context');
+      expect(JSON.stringify(first.messages).match(/`fixture-job` exited/g)).toHaveLength(1);
+      expect(h.attention.events()).toContainEqual(expect.objectContaining({ id: 'private-context', level: 'record' }));
+      const unrelated = h.a.session.append('step/end', { turn: 99, step: 1 });
+      h.ctx.emit('session/event', h.a.session, unrelated);
+      expect((await h.step(h.a)).messages).toHaveLength(1);
+      if (outcome === 'committed') {
+        const committed = h.a.session.append('user/message', message, { surfaceOp: 'append' });
+        h.ctx.emit('session/event', h.a.session, committed);
+      } else if (outcome === 'cancelled') {
+        const end = h.a.session.append('turn/end', { turn: 1, reason: { kind: 'aborted', reason: { kind: 'user' } } });
+        h.ctx.emit('session/event', h.a.session, end);
+      } else {
+        const end = h.a.session.append('step/end', { turn: 1, step: 1 });
+        h.ctx.emit('session/event', h.a.session, end);
+      }
+      const retry = await h.step(h.a);
+      expect(JSON.stringify(retry.messages).match(/`fixture-job` exited/g) ?? []).toHaveLength(
+        outcome === 'committed' ? 0 : 1,
+      );
+      if (outcome !== 'committed') {
+        expect(retry.messages[1]?.id).toBe(message.id);
+        const committed = h.a.session.append('user/message', retry.messages[1], { surfaceOp: 'append' });
+        h.ctx.emit('session/event', h.a.session, committed);
+      }
+      expect(JSON.stringify((await h.step(h.a)).messages)).not.toContain('fixture-job');
+      expect(h.attention.events()).toContainEqual(expect.objectContaining({ id: 'private-context', level: 'context' }));
+    },
+  );
+
+  it('transfers only the uncommitted unowned part after a partially committed step ends', async () => {
+    const h = await routing(false, 0, true);
+    await h.attention.accept({
+      id: 'private-context',
+      kind: 'job.exited',
+      at: 1_000,
+      subject: 'fixture-job',
+      source: { id: 'dsh', api: 'events', host: 'local' },
+      data: { id: 'fixture-job', sessionId: h.a.id, sessionToken: h.attention.sessionToken(h.a.id), exitCode: 0 },
+    });
+    const first = await h.step(h.a);
+    const own = first.messages.find((message) => JSON.stringify(message).includes('fixture-job'));
+    if (!own) throw new Error('missing private context');
+    expect(first.messages).toHaveLength(3);
+    const committed = h.a.session.append('user/message', own, { surfaceOp: 'append' });
+    h.ctx.emit('session/event', h.a.session, committed);
+    await h.attention.setTarget(h.b.id);
+    const end = h.a.session.append('turn/end', { turn: 1, reason: { kind: 'aborted', reason: { kind: 'user' } } });
+    h.ctx.emit('session/event', h.a.session, end);
+    const next = await h.step(h.b);
+    expect(JSON.stringify(next.messages).match(/Fixture/g)).toHaveLength(1);
+    expect(JSON.stringify(next.messages)).not.toContain('fixture-job');
+    const transferred = next.messages[1];
+    if (!transferred) throw new Error('missing transferred context');
+    const transferredEvent = h.b.session.append('user/message', transferred, { surfaceOp: 'append' });
+    h.ctx.emit('session/event', h.b.session, transferredEvent);
+    const later = await h.step(h.a);
+    expect(JSON.stringify(later.messages)).not.toContain('fixture-job');
+    expect(JSON.stringify(later.messages)).not.toContain('Fixture');
+  });
 
   it('moves an aborted staged context to the next session without later duplication', async () => {
     const h = await routing();

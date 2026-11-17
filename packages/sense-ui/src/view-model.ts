@@ -249,6 +249,13 @@ export interface LearningState {
 }
 
 export interface SensePanelModel {
+  target?: {
+    mode: 'auto' | 'pinned'
+    sessionId?: string
+    sessions: { id: string; title: string; updatedAt: number; running: boolean }[]
+    notice?: boolean
+    unavailable?: boolean
+  }
   state: SenseState
   events: SenseEvent[]
   rules: SenseRule[]
@@ -264,6 +271,21 @@ export interface SensePanelModel {
 
 export interface SensePanelProps {
   model: SensePanelModel
+  onSelectTarget?: (id?: string) => Promise<void>
+  onDismissTargetNotice?: () => Promise<void>
+  targetCopy?: {
+    label: string
+    auto: string
+    search: string
+    empty: string
+    untitled: string
+    running: string
+    unavailable: string
+    reset: string
+    dismiss: string
+    failed: string
+    locale: string
+  }
   onToggleRule: (id: string, enabled: boolean) => void
   onConfirmRule: (id: string) => void
   onDeleteRule: (id: string) => void

@@ -1,3 +1,4 @@
+import { isSessionContext } from '../attention/buckets.ts';
 import { DeliveryFailure } from '../attention/drain.ts';
 import type { RuntimeAttention } from './attention.ts';
 import type { Clock, DshPort } from './ports.ts';
@@ -10,6 +11,7 @@ export function deliveryRetry(
   let session: string | undefined;
   let degraded = false;
   const retries = new Map<string, { count: number; first: number; next: number }>();
+  const ownedRetries = new Map<string, Map<string, { count: number; first: number; next: number }>>();
   const select = (id: string | undefined) => {
     if (session !== id) {
       session = id;
@@ -42,6 +44,7 @@ export function deliveryRetry(
         try {
           await cb(event);
         } finally {
+          if (event.type === 'disposed') ownedRetries.delete(event.sessionId);
           select(getAttention().current());
         }
       });
@@ -50,45 +53,59 @@ export function deliveryRetry(
         offCommitted?.();
       };
     },
-    deliver: async (sessionId, intent) => {
-      select(sessionId);
+    deliver: async (sessionId, intent, isCurrent) => {
+      const owned = intent.update.changes.some(
+        ({ signal }) => isSessionContext(signal) || (signal.source.id === 'dsh' && signal.kind.startsWith('job.')),
+      );
+      if (!owned) select(sessionId);
+      const attempts = owned ? (ownedRetries.get(sessionId) ?? new Map()) : retries;
+      if (owned) ownedRetries.set(sessionId, attempts);
       const key = intent.deliveryId ?? JSON.stringify(intent);
-      const retry = retries.get(key);
+      const retry = attempts.get(key);
       const now = clock.mono();
       if (retry && now < retry.next) throw new DeliveryFailure('deferred', retry.next);
       if (retry && now - retry.first >= 600_000) {
-        retries.delete(key);
+        attempts.delete(key);
         degraded = true;
         await report('unavailable', `投递失败，已暂停重试（${retry.count} 次）`);
         throw new DeliveryFailure('exhausted');
       }
       try {
-        await port.deliver(sessionId, intent);
+        await port.deliver(sessionId, intent, isCurrent);
       } catch (error) {
+        if (error instanceof DeliveryFailure && error.kind === 'deferred' && isCurrent && !isCurrent()) throw error;
         if (error instanceof DeliveryFailure && error.kind === 'unknown') {
-          retries.delete(key);
+          attempts.delete(key);
           degraded = true;
           await report('unavailable', '投递结果未知，未重试', 'delivery-unknown');
           await report('unavailable', '投递结果未知，未重试');
           throw error;
         }
-        if (session !== sessionId || getAttention().current() !== sessionId) throw error;
+        if (
+          owned
+            ? !getAttention().hasSession(sessionId)
+            : session !== sessionId || getAttention().current() !== sessionId
+        )
+          throw error;
         const count = (retry?.count ?? 0) + 1;
         const first = retry?.first ?? now;
         if (count >= 10 || clock.mono() - first >= 600_000) {
-          retries.delete(key);
+          attempts.delete(key);
           degraded = true;
           await report('unavailable', `投递失败，已暂停重试（${count} 次）`);
           throw new DeliveryFailure('exhausted', 0, error);
         }
         const next = Math.min(clock.mono() + Math.min(1_000 * 2 ** (count - 1), 60_000), first + 600_000);
-        retries.set(key, { count, first, next });
+        attempts.set(key, { count, first, next });
         degraded = true;
         await report('unavailable', `投递失败，正在重试（${count} 次）`);
         throw new DeliveryFailure('deferred', next, error);
       }
-      if (session !== sessionId || getAttention().current() !== sessionId) return;
-      retries.delete(key);
+      if (
+        owned ? !getAttention().hasSession(sessionId) : session !== sessionId || getAttention().current() !== sessionId
+      )
+        return;
+      attempts.delete(key);
       if (degraded && (intent.kind !== 'inject' || !port.onDeliveryCommitted)) {
         degraded = false;
         await report('ok');

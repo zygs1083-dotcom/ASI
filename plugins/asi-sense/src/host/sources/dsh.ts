@@ -40,6 +40,7 @@ export class DshSource {
     },
     private readonly paused: () => boolean,
     private readonly selfCauseGraceMs = 2_000,
+    private readonly onAgentDisposed?: (sessionId: string) => void,
   ) {}
   start(): void {
     this.active = true;
@@ -130,6 +131,14 @@ export class DshSource {
   }
   hasSession(session: string): boolean {
     return this.sessions.has(session);
+  }
+  targetChanged(): void {
+    const session = this.attention.currentSessionId();
+    this.body.selectSession(session);
+    this.refresh(true);
+    if (session && !this.paused()) {
+      void this.body.tokens(session, () => this.active && this.attention.currentSessionId() === session);
+    }
   }
   stateFor(session: string | undefined, state: SenseState): SenseState {
     const store = session === undefined ? undefined : this.sessions.get(session);
@@ -234,6 +243,7 @@ export class DshSource {
           this.sessions.delete(event.sessionId);
           this.body.disposeSession(event.sessionId);
           this.attention.dispose(event.sessionId);
+          this.onAgentDisposed?.(event.sessionId);
           this.body.sessionsChanged(this.instances.size > 0);
           this.body.selectSession(this.attention.currentSessionId());
           this.refresh(true);

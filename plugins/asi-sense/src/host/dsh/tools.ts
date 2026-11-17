@@ -6,7 +6,7 @@ import { defineTool, ToolArgsError, ToolContextUnavailableError, type ToolRunCon
 import type { createSenseRuntime } from '../runtime/index.ts';
 import { environmentDetail, modelRules, modelState, modelTune } from './tool-output.ts';
 
-type Runtime = Pick<ReturnType<typeof createSenseRuntime>, 'tools' | 'events' | 'rules'>;
+type Runtime = Pick<ReturnType<typeof createSenseRuntime>, 'tools' | 'events' | 'rules' | 'targetMode'>;
 
 const output = {
   schema: { type: 'json' } as const,
@@ -41,7 +41,9 @@ export function createSenseTools(runtime: Runtime, now: () => number) {
     output,
     async execute({ section }, exec) {
       requireAgent(exec);
-      return modelState(runtime.tools.envState(undefined, exec.agent?.id) as SenseState, now(), section);
+      const value = modelState(runtime.tools.envState(undefined, exec.agent?.id) as SenseState, now(), section);
+      if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('invalid environment state');
+      return { ...value, deliveryTarget: runtime.targetMode() };
     },
   });
   const envWatch = defineTool({

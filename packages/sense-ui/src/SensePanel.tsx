@@ -8,6 +8,7 @@ import { RulesSection } from './sections/rules'
 import { useTuningOperations } from './sections/tuning-operation'
 import { defaultTuningCopy, TuningBackupStatus } from './sections/tuning-actions'
 import { useFreshModel } from './freshness'
+import { SessionTarget } from './session-target'
 import rulesCss from './sections/rules.module.css'
 import css from './panel.module.css'
 
@@ -43,6 +44,9 @@ export function SensePanel(props: SensePanelProps) {
           </span>
         )}
       </header>
+
+      {model.target && props.onSelectTarget && <SessionTarget target={model.target} now={model.now}
+        onSelect={props.onSelectTarget} onDismiss={props.onDismissTargetNotice} copy={props.targetCopy} />}
 
       <div className={css.notices}>
         <TuningBackupStatus {...props} model={model} operations={operations} />

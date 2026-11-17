@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import type { EnvUpdate } from '@asi/sense-types';
 import type { Agent } from '@deepseek-ai/dsh-agent';
 import { freezeMessage, MessageId, type UserMessage } from '@deepseek-ai/dsh-llm';
+import { isSessionContext } from '../attention/buckets.ts';
 import { DeliveryFailure } from '../attention/drain.ts';
 import type { DeliveryIntent } from '../attention/pipeline.ts';
 import { formatEnvUpdate } from '../delivery/format.ts';
@@ -159,8 +160,10 @@ export function createDelivery(
   sendTitles: () => boolean,
   accepted: (sessionId: string, id: string) => Promise<boolean>,
 ) {
+  type Step = { turn: number; step: number };
   const delivered = new Map<string, Set<string>>();
-  const staged = new Map<string, Map<string, DeliveryIntent>>();
+  const staged = new Map<string, Map<string, { intent: DeliveryIntent; step?: Step; returned: boolean }>>();
+  const steps = new Map<string, Step>();
   const inflight = new Map<string, Promise<void>>();
   const message = (id: string, intent: DeliveryIntent): UserMessage =>
     freezeMessage({
@@ -177,15 +180,22 @@ export function createDelivery(
         },
       ],
     });
-  const perform = async (sessionId: string, intent: DeliveryIntent, id: string): Promise<void> => {
+  const perform = async (
+    sessionId: string,
+    intent: DeliveryIntent,
+    id: string,
+    isCurrent?: () => boolean,
+  ): Promise<void> => {
     const agent = getAgent(sessionId);
     if (!agent) throw new Error('delivery session unavailable');
     const previous = delivered.get(sessionId);
     if (previous?.has(id) || (await accepted(sessionId, id))) return;
+    if (intent.kind !== 'inject' && isCurrent && !isCurrent()) throw new DeliveryFailure('deferred');
     if (getAgent(sessionId) !== agent) throw new Error('delivery session changed');
     if (intent.kind === 'inject') {
-      const pending = staged.get(sessionId) ?? new Map<string, DeliveryIntent>();
-      pending.set(id, structuredClone(intent));
+      const pending = staged.get(sessionId) ?? new Map();
+      if (pending.get(id)?.returned) return;
+      pending.set(id, { intent: structuredClone(intent), step: steps.get(sessionId), returned: false });
       staged.set(sessionId, pending);
       return;
     }
@@ -213,13 +223,13 @@ export function createDelivery(
     }
     record();
   };
-  const deliver = async (sessionId: string, intent: DeliveryIntent): Promise<void> => {
+  const deliver = async (sessionId: string, intent: DeliveryIntent, isCurrent?: () => boolean): Promise<void> => {
     if (sessionId !== intent.sessionId) throw new Error('delivery session mismatch');
     const id = `asi-sense:${intent.deliveryId ?? randomUUID()}`;
     const key = JSON.stringify([sessionId, id]);
     const prior = inflight.get(key);
     if (prior) return prior;
-    const work = perform(sessionId, intent, id);
+    const work = perform(sessionId, intent, id, isCurrent);
     inflight.set(key, work);
     try {
       await work;
@@ -232,11 +242,13 @@ export function createDelivery(
       const pending = staged.get(sessionId);
       if (!pending) return [];
       const messages: UserMessage[] = [];
-      for (const [id, intent] of pending) {
-        if (await accepted(sessionId, id)) pending.delete(id);
-        else messages.push(message(id, intent));
+      for (const [id, entry] of pending) {
+        const wasAccepted = await accepted(sessionId, id);
+        if (pending.get(id) !== entry) continue;
+        if (wasAccepted) pending.delete(id);
+        else if (!entry.returned) messages.push(message(id, entry.intent));
       }
-      if (!pending.size) staged.delete(sessionId);
+      if (!pending.size && staged.get(sessionId) === pending) staged.delete(sessionId);
       return messages;
     },
     acknowledge(sessionId: string, id: string): void {
@@ -247,12 +259,53 @@ export function createDelivery(
     clear(sessionId: string): void {
       staged.delete(sessionId);
       delivered.delete(sessionId);
+      steps.delete(sessionId);
     },
-    select(sessionId: string): void {
-      for (const id of staged.keys()) if (id !== sessionId) staged.delete(id);
+    select(sessionId: string | undefined): void {
+      for (const [session, pending] of staged) {
+        if (session === sessionId) continue;
+        for (const [id, entry] of pending) {
+          const owned = entry.intent.update.changes.some(
+            ({ signal }) => isSessionContext(signal) || (signal.source.id === 'dsh' && signal.kind.startsWith('job.')),
+          );
+          if (!owned && !entry.returned && (!entry.step || steps.get(session) !== entry.step)) pending.delete(id);
+        }
+        if (!pending.size) staged.delete(session);
+      }
     },
-    discard(sessionId: string): void {
-      staged.delete(sessionId);
+    begin(sessionId: string, step: Step): void {
+      steps.set(sessionId, step);
+    },
+    finish(sessionId: string, step: Step, messages?: UserMessage[]): void {
+      const pending = staged.get(sessionId);
+      for (const [id, entry] of pending ?? []) {
+        if (messages?.some((message) => message.id === id)) {
+          entry.step = step;
+          entry.returned = true;
+        } else if (!messages && entry.step === step) pending?.delete(id);
+      }
+      if (pending?.size === 0) staged.delete(sessionId);
+      if (steps.get(sessionId) === step) steps.delete(sessionId);
+    },
+    end(sessionId: string, position?: { turn: number; step?: number }): boolean {
+      const pending = staged.get(sessionId);
+      let discarded = false;
+      for (const [id, entry] of pending ?? []) {
+        if (
+          entry.returned &&
+          (!position ||
+            (entry.step?.turn === position.turn && (position.step === undefined || entry.step.step === position.step)))
+        ) {
+          pending?.delete(id);
+          discarded = true;
+        }
+      }
+      if (pending?.size === 0) staged.delete(sessionId);
+      return discarded;
+    },
+    protected(sessionId: string, id: string): boolean {
+      const entry = staged.get(sessionId)?.get(`asi-sense:${id}`);
+      return !!entry && (entry.returned || (!!entry.step && steps.get(sessionId) === entry.step));
     },
   });
 }

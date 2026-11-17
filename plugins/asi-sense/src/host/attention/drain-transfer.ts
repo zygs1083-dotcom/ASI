@@ -12,6 +12,10 @@ export interface DrainHooks {
   /** Wall clock, used only for the `EnvUpdate.at` display timestamp. */
   wallClock: () => number;
   isCurrent?: () => (sessionId: string) => boolean;
+  isTarget?: (sessionId: string) => boolean;
+  isDeliveryProtected?: (sessionId: string, deliveryId: string) => boolean;
+  isWakeOwner?: (sessionId: string) => boolean;
+  isPendingTarget?: (sessionId: string) => boolean;
 }
 
 function throwCollected(errors: unknown[], label: string): void {
@@ -89,6 +93,7 @@ export function retargetBuckets(
   batches: Map<string, InjectBatch[]>,
   sessionId: string,
   build: (sessionId: string, buckets: Bucket[], at: number) => InjectBatch,
+  isProtected: (sessionId: string, deliveryId: string) => boolean,
 ): number {
   let restored = 0;
   const restore = (bucket: Bucket): boolean => {
@@ -128,6 +133,12 @@ export function retargetBuckets(
     if (old === sessionId) continue;
     batches.delete(old);
     for (const batch of entries) {
+      if (batch.intent.deliveryId && isProtected(old, batch.intent.deliveryId)) {
+        const remaining = batches.get(old) ?? [];
+        remaining.push(batch);
+        batches.set(old, remaining);
+        continue;
+      }
       const context: Bucket[] = [];
       const retained: Bucket[] = [];
       for (const bucket of batch.buckets) {

@@ -48,6 +48,21 @@ export class AsiSenseRemote extends TypertRemoteService {
   }
 
   @Remote
+  async selectTarget(id: string): Promise<void> {
+    await this.userAction(async () => {
+      if (!this.actions.selectTarget) throw new Error('Target selection unavailable');
+      await this.actions.selectTarget(id || undefined);
+    });
+  }
+
+  @Remote
+  async dismissTargetNotice(): Promise<void> {
+    await this.userAction(async () => {
+      await this.actions.dismissTargetNotice?.();
+    });
+  }
+
+  @Remote
   async toggleRule(id: string, enabled: boolean): Promise<void> {
     await this.userAction(() => this.actions.toggleRule(id, enabled));
   }

@@ -1,7 +1,8 @@
 import type { Signal, WatchRule } from '@asi/sense-types';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { createDelivery } from '../../src/host/dsh/deliver.ts';
 import { RuntimeAttention } from '../../src/host/runtime/attention.ts';
+import { deliveryRetry } from '../../src/host/runtime/delivery-retry.ts';
 import { FactExpiry } from '../../src/host/runtime/expiry.ts';
 import type { Clock, DshPort } from '../../src/host/runtime/ports.ts';
 
@@ -62,6 +63,396 @@ function harness(failFirst: boolean, configuredRules = rules, blockFirst = true,
 }
 
 describe('in-flight session ownership', () => {
+  it('drains an owner pre-step queued before the target changes', async () => {
+    const h = harness(false, [
+      ...rules,
+      { id: 'start', match: { kind: 'job.started' }, level: 'context', createdBy: 'user', approved: true },
+    ]);
+    for (const id of ['a', 'b', 'c']) h.attention.create(id);
+    await h.attention.preStep('a');
+    await h.attention.accept(signal('ordinary', 'context'));
+    const first = h.attention.preStep('a');
+    await h.waiting;
+    await h.attention.accept({
+      id: 'private',
+      kind: 'job.started',
+      at: 0,
+      subject: 'fixture-job',
+      source: { id: 'dsh', api: 'events', host: 'local' },
+      data: { id: 'fixture-job', sessionId: 'b', sessionToken: h.attention.sessionToken('b') },
+    });
+    const owner = h.attention.preStep('b');
+    const target = h.attention.setTarget('c');
+    h.release();
+    await Promise.all([first, owner, target]);
+    expect(h.delivered.filter((intent) => intent.sessionId === 'b')).toMatchObject([
+      { kind: 'inject', update: { changes: [{ signal: { id: 'private' } }] } },
+    ]);
+    expect(h.delivered.filter((intent) => intent.sessionId === 'c')).toHaveLength(0);
+    await h.attention.stop();
+  });
+
+  it('does not schedule an unowned bucket after the only target closes', async () => {
+    const h = harness(false, rules, false);
+    h.attention.create('b');
+    await h.attention.preStep('b');
+    await h.attention.setTarget('b');
+    await h.attention.accept(signal('pending', 'wake'));
+    await h.attention.closeSession('b');
+    await h.attention.setTarget(undefined);
+    expect(h.attention.currentSessionId()).toBeUndefined();
+    expect(h.attention.pipeline.nextDeadline()).toBeUndefined();
+    h.attention.create('a');
+    await h.attention.preStep('a');
+    expect(h.attention.pipeline.nextDeadline()).toBe(2_000);
+    await h.attention.stop();
+  });
+
+  it('does not revive a closed owner wake from an in-flight drain after the session reappears', async () => {
+    const h = harness(false, [
+      { id: 'exit', match: { kind: 'job.exited' }, level: 'wake', createdBy: 'user', approved: true },
+    ]);
+    h.attention.create('a');
+    h.attention.create('b');
+    await h.attention.preStep('b');
+    h.attention.postStep('b');
+    for (const id of ['b', 'a']) {
+      await h.attention.accept({
+        id: `job-${id}`,
+        kind: 'job.exited',
+        at: 0,
+        subject: `fixture-${id}`,
+        source: { id: 'dsh', api: 'events', host: 'local' },
+        data: { id: `fixture-${id}`, sessionId: id, sessionToken: h.attention.sessionToken(id), exitCode: 1 },
+      });
+    }
+    h.advance();
+    const flushing = h.attention.flush();
+    await h.waiting;
+    await h.attention.closeSession('a');
+    h.attention.availableSessions(['b']);
+    h.attention.availableSessions(['a', 'b']);
+    h.release();
+    await flushing;
+    expect(h.delivered.map((intent) => [intent.sessionId, intent.update.changes[0]?.signal.id])).toEqual([
+      ['b', 'job-b'],
+    ]);
+    await h.attention.stop();
+  });
+
+  it('keeps a reopened owner wake while delayed cleanup removes the closed generation', async () => {
+    const h = harness(false, [
+      { id: 'exit', match: { kind: 'job.exited' }, level: 'wake', createdBy: 'user', approved: true },
+    ]);
+    h.attention.create('a');
+    h.attention.create('b');
+    await h.attention.preStep('b');
+    h.attention.postStep('b');
+    const job = (owner: string, id: string): Signal => ({
+      id,
+      kind: 'job.exited',
+      at: 0,
+      subject: id,
+      source: { id: 'dsh', api: 'events', host: 'local' },
+      data: { id, sessionId: owner, sessionToken: h.attention.sessionToken(owner), exitCode: 1 },
+    });
+    await h.attention.accept(job('b', 'old-b'));
+    h.advance();
+    const flushing = h.attention.flush();
+    await h.waiting;
+    const oldToken = h.attention.sessionToken('a');
+    await h.attention.closeSession('a');
+    h.attention.availableSessions(['b']);
+    h.attention.availableSessions(['a', 'b']);
+    await h.attention.accept(job('a', 'new-a'));
+    h.release();
+    await flushing;
+    await h.attention.pipeline.retarget('b');
+    h.advance();
+    await h.attention.flush();
+    expect(h.delivered.map((intent) => [intent.sessionId, intent.update.changes[0]?.signal.id])).toEqual([
+      ['b', 'old-b'],
+      ['a', 'new-a'],
+    ]);
+    expect(h.attention.sessionToken('a')).not.toBe(oldToken);
+    await h.attention.stop();
+  });
+
+  it.each(['send', 'followup'] as const)(
+    'does not %s after a closed owner reappears while acceptance is pending',
+    async (kind) => {
+      let now = 0;
+      let release!: () => void;
+      let entered!: () => void;
+      const waiting = new Promise<void>((resolve) => {
+        entered = resolve;
+      });
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const agent = { inject: vi.fn(), send: vi.fn(), followup: vi.fn() };
+      let checks = 0;
+      const deliver = createDelivery(
+        () => agent,
+        () => true,
+        async () => {
+          if (++checks === 1) {
+            entered();
+            await gate;
+          }
+          return false;
+        },
+      );
+      const clock: Clock = { wall: () => now, mono: () => now };
+      const dsh: DshPort = {
+        deliver,
+        onAgentEvent: () => () => {},
+        onTool: () => () => {},
+        onJob: () => () => {},
+        tokenSnapshot: async () => undefined,
+      };
+      let attention!: RuntimeAttention;
+      const retry = deliveryRetry(dsh, clock, () => attention);
+      attention = new RuntimeAttention(
+        clock,
+        retry,
+        () => [{ id: 'exit', match: { kind: 'job.exited' }, level: 'wake', createdBy: 'user', approved: true }],
+        () => {},
+        () => true,
+        () => {},
+        new FactExpiry(clock),
+      );
+      attention.create('a');
+      attention.create('b');
+      await attention.preStep('a');
+      if (kind === 'followup') attention.postStep('a');
+      await attention.preStep('b');
+      attention.postStep('b');
+      const job = (id: string): Signal => ({
+        id,
+        kind: 'job.exited',
+        at: now,
+        subject: id,
+        source: { id: 'dsh', api: 'events', host: 'local' },
+        data: { id, sessionId: 'a', sessionToken: attention.sessionToken('a'), exitCode: 1 },
+      });
+      await attention.accept(job('old-a'));
+      now = 2_000;
+      const flushing = attention.flush();
+      await waiting;
+      await attention.closeSession('a');
+      expect(attention.hasSession('a')).toBe(false);
+      attention.availableSessions(['b']);
+      attention.availableSessions(['a', 'b']);
+      expect(attention.hasSession('a')).toBe(true);
+      await attention.accept(job('new-a'));
+      release();
+      await flushing;
+      await attention.pipeline.retarget('b');
+      expect(agent.send).not.toHaveBeenCalled();
+      expect(agent.followup).not.toHaveBeenCalled();
+      expect(attention.events()).toContainEqual(
+        expect.objectContaining({ id: 'old-a', level: 'record', reason: 'session-closed' }),
+      );
+      now = 4_000;
+      await attention.flush();
+      expect(agent[kind]).toHaveBeenCalledTimes(1);
+      await attention.stop();
+    },
+  );
+
+  it('keeps an owned job context separate from a later owned wake', async () => {
+    const h = harness(
+      false,
+      [
+        { id: 'start', match: { kind: 'job.started' }, level: 'context', createdBy: 'user', approved: true },
+        { id: 'exit', match: { kind: 'job.exited' }, level: 'wake', createdBy: 'user', approved: true },
+      ],
+      false,
+    );
+    h.attention.create('a');
+    h.attention.create('b');
+    await h.attention.preStep('a');
+    h.attention.postStep('a');
+    await h.attention.setTarget('b');
+    const job = (kind: string): Signal => ({
+      id: kind,
+      kind,
+      at: 0,
+      subject: 'fixture-job',
+      source: { id: 'dsh', api: 'events', host: 'local' },
+      data: { id: 'fixture-job', sessionId: 'a', sessionToken: h.attention.sessionToken('a'), exitCode: 1 },
+    });
+    await h.attention.accept(job('job.started'));
+    await h.attention.accept(job('job.exited'));
+    h.advance();
+    await h.attention.flush();
+    expect(h.delivered).toHaveLength(1);
+    expect(h.delivered[0]?.update.changes).toMatchObject([{ signal: { id: 'job.exited' }, count: 1, level: 'wake' }]);
+    await h.attention.preStep('a');
+    expect(h.delivered[1]).toMatchObject({
+      sessionId: 'a',
+      kind: 'inject',
+      update: { changes: [{ signal: { id: 'job.started' }, count: 1, level: 'context' }] },
+    });
+    await h.attention.stop();
+  });
+
+  it('charges a private wake to its owner and retains private context until that owner steps', async () => {
+    const h = harness(
+      false,
+      [
+        { id: 'jobs', match: { kind: 'job.exited' }, level: 'wake', createdBy: 'user', approved: true },
+        { id: 'ctx', match: { kind: 'body.threshold' }, level: 'context', createdBy: 'user', approved: true },
+        ...rules,
+      ],
+      false,
+    );
+    h.attention.create('a');
+    h.attention.create('b');
+    await h.attention.preStep('a');
+    h.attention.postStep('a');
+    await h.attention.setTarget('b');
+    const owner = { sessionId: 'a', sessionToken: h.attention.sessionToken('a') };
+    await h.attention.accept({
+      ...signal('private-context', 'body.threshold'),
+      subject: 'context',
+      data: owner,
+    });
+    const job = (id: string): Signal => ({
+      id,
+      kind: 'job.exited',
+      at: 0,
+      subject: id,
+      source: { id: 'dsh', api: 'events', host: 'local' },
+      data: { ...owner, id, exitCode: 1 },
+    });
+    await h.attention.accept(job('failure-1'));
+    expect(h.attention.pipeline.nextDeadline()).toBe(2_000);
+    h.advance();
+    await h.attention.flush();
+    expect(h.delivered.map((item) => [item.sessionId, item.kind])).toEqual([['a', 'followup']]);
+    await h.attention.accept(job('failure-2'));
+    await h.attention.accept(signal('b-wake', 'wake'));
+    h.advance();
+    await h.attention.flush();
+    expect(h.delivered.map((item) => [item.sessionId, item.kind])).toEqual([
+      ['a', 'followup'],
+      ['b', 'followup'],
+    ]);
+    await h.attention.preStep('a');
+    expect(h.delivered[2]).toMatchObject({
+      sessionId: 'a',
+      kind: 'inject',
+      update: {
+        changes: expect.arrayContaining([
+          expect.objectContaining({ signal: expect.objectContaining({ id: 'private-context' }) }),
+          expect.objectContaining({ reason: 'wake-budget' }),
+        ]),
+      },
+    });
+    await h.attention.stop();
+  });
+
+  it('keeps a pinned target across other pre-steps and transfers unowned buckets only once', async () => {
+    const h = harness(false, rules, false);
+    h.attention.create('a');
+    h.attention.create('b');
+    await h.attention.preStep('a');
+    await h.attention.accept(signal('global', 'wake'));
+    await h.attention.setTarget('b');
+    await h.attention.preStep('a');
+    expect(h.attention.currentSessionId()).toBe('b');
+    h.advance();
+    await h.attention.flush();
+    expect(h.delivered.map((intent) => [intent.sessionId, intent.update.changes[0]?.signal.id])).toEqual([
+      ['b', 'global'],
+    ]);
+    await h.attention.setTarget(undefined);
+    expect(h.attention.currentSessionId()).toBe('a');
+    await h.attention.flush();
+    expect(h.delivered).toHaveLength(1);
+    await h.attention.stop();
+  });
+
+  it('delivers a session-owned job only to its owner even when another target is pinned', async () => {
+    const h = harness(
+      false,
+      [{ id: 'jobs', match: { kind: 'job.exited' }, level: 'wake', createdBy: 'user', approved: true }],
+      false,
+    );
+    h.attention.create('a');
+    h.attention.create('b');
+    await h.attention.preStep('a');
+    await h.attention.setTarget('b');
+    await h.attention.accept({
+      id: 'owned',
+      kind: 'job.exited',
+      at: 0,
+      subject: 'fixture-job',
+      source: { id: 'dsh', api: 'events', host: 'local' },
+      data: { id: 'fixture-job', sessionId: 'a', sessionToken: h.attention.sessionToken('a'), exitCode: 1 },
+    });
+    h.advance();
+    await h.attention.preStep('a');
+    expect(h.attention.currentSessionId()).toBe('b');
+    expect(h.delivered).toHaveLength(1);
+    expect(h.delivered[0]?.sessionId).toBe('a');
+    await h.attention.stop();
+  });
+
+  it('keeps wake budgets separate for each pinned target', async () => {
+    const h = harness(false, rules, false);
+    h.attention.create('a');
+    h.attention.create('b');
+    await h.attention.preStep('a');
+    h.attention.postStep('a');
+    await h.attention.accept(signal('first-a', 'wake'));
+    h.advance();
+    await h.attention.flush();
+    await h.attention.setTarget('b');
+    await h.attention.accept(signal('first-b', 'wake'));
+    h.advance();
+    await h.attention.flush();
+    await h.attention.setTarget('a');
+    await h.attention.accept(signal('second-a', 'wake'));
+    h.advance();
+    await h.attention.flush();
+    expect(h.delivered.map((item) => [item.sessionId, item.kind])).toEqual([
+      ['a', 'followup'],
+      ['b', 'followup'],
+    ]);
+    await h.attention.preStep('a');
+    expect(h.delivered[2]).toMatchObject({
+      sessionId: 'a',
+      kind: 'inject',
+      update: { changes: [expect.objectContaining({ reason: 'wake-budget' })] },
+    });
+    await h.attention.stop();
+  });
+
+  it('moves a failed in-flight wake and the remaining queue on a pinned target switch', async () => {
+    const h = harness(true);
+    h.attention.create('a');
+    h.attention.create('b');
+    await h.attention.preStep('a');
+    await h.attention.accept(signal('wake-1', 'wake'));
+    await h.attention.accept(signal('wake-2', 'wake'));
+    h.advance();
+    const old = h.attention.flush().catch(() => {});
+    await h.waiting;
+    const switched = h.attention.setTarget('b');
+    h.release();
+    await Promise.all([old, switched]);
+    await h.attention.preStep('b');
+    await h.attention.preStep('b');
+    const deliveredToB = h.delivered
+      .filter((item) => item.sessionId === 'b')
+      .flatMap((item) => item.update.changes.map((change) => change.signal.id))
+      .sort();
+    expect(deliveredToB).toEqual(['wake-1', 'wake-2']);
+    await h.attention.stop();
+  });
   it('does not apply a queued job after its owner is disposed and recreated reentrantly', async () => {
     const h = harness(
       false,
@@ -195,7 +586,7 @@ describe('in-flight session ownership', () => {
     await h.attention.stop();
   });
 
-  it('keeps repeated job events and mixed levels in one bounded summary across merge windows', async () => {
+  it('keeps repeated job events in bounded summaries separated by level across merge windows', async () => {
     const configured: WatchRule[] = [
       { id: 'starts', match: { kind: 'job.started' }, level: 'context', createdBy: 'user', approved: true },
       { id: 'exits', match: { kind: 'job.exited' }, level: 'wake', createdBy: 'user', approved: true },
@@ -219,23 +610,27 @@ describe('in-flight session ownership', () => {
     }
     await h.attention.preStep('a');
     const changes = h.delivered.flatMap((intent) => intent.update.changes);
-    expect(changes).toHaveLength(1);
-    expect(changes[0]).toMatchObject({
-      count: 60,
-      level: 'wake',
-      signal: {
-        data: {
-          jobSummary: {
-            total: 60,
-            omitted: 40,
-            recent: expect.arrayContaining([
-              expect.objectContaining({ id: 'job-29', count: 1, kind: 'job.started' }),
-              expect.objectContaining({ id: 'job-29', count: 1, kind: 'job.exited' }),
-            ]),
-          },
-        },
-      },
-    });
+    expect(changes).toHaveLength(2);
+    for (const [level, kind] of [
+      ['context', 'job.started'],
+      ['wake', 'job.exited'],
+    ]) {
+      expect(changes).toContainEqual(
+        expect.objectContaining({
+          count: 30,
+          level,
+          signal: expect.objectContaining({
+            data: expect.objectContaining({
+              jobSummary: {
+                total: 30,
+                omitted: 10,
+                recent: expect.arrayContaining([expect.objectContaining({ id: 'job-29', count: 1, kind })]),
+              },
+            }),
+          }),
+        }),
+      );
+    }
     await h.attention.stop();
   });
 
@@ -261,15 +656,21 @@ describe('in-flight session ownership', () => {
     h.advance();
     await h.attention.preStep('a');
     const messages: unknown[] = [];
-    const agent = { inject: () => {}, send: (message: unknown) => messages.push(message), followup: () => {} };
+    const agent = {
+      inject: () => {},
+      send: (message: unknown) => messages.push(message),
+      followup: (message: unknown) => messages.push(message),
+    };
     const deliver = createDelivery(
       () => agent as never,
       () => true,
       async () => false,
     );
-    await deliver('a', h.delivered[0] as Parameters<typeof deliver>[1]);
+    for (const intent of h.delivered) await deliver('a', intent);
+    messages.push(...(await deliver.messages('a')));
     const text = JSON.stringify(messages);
-    expect(text).toContain('jobs: 5 events');
+    expect(text).toContain('jobs: 2 events');
+    expect(text).toContain('jobs: 3 events');
     expect(text).toContain('job: `id1` started ×2');
     expect(text).toContain('job: `id1` exited 1 ×3');
     expect(text).not.toContain('job: `id1` exited 1 ×5');
@@ -468,7 +869,13 @@ describe('in-flight session ownership', () => {
     await add('success-later', 0);
     await h.attention.preStep('a');
     const suppressed = h.delivered.find((intent) => intent.update.suppressed === 1);
-    expect(suppressed?.update.changes[0]).toMatchObject({ count: 2, level: 'context', reason: 'wake-budget' });
+    expect(suppressed?.update.changes).toContainEqual(
+      expect.objectContaining({ count: 1, level: 'context', reason: 'wake-budget' }),
+    );
+    await h.attention.preStep('a');
+    expect(h.delivered.flatMap((intent) => intent.update.changes)).toContainEqual(
+      expect.objectContaining({ count: 1, level: 'context', signal: expect.objectContaining({ id: 'success-later' }) }),
+    );
     expect(h.attention.pipeline.suppressed).toBe(1);
     await h.attention.stop();
   });
@@ -508,7 +915,7 @@ describe('in-flight session ownership', () => {
     now += 2_000;
     await attention.flush().catch(() => {});
     for (let cycle = 0; cycle < 6; cycle++) {
-      await attention.preStep('b');
+      await attention.preStep('b').catch(() => {});
       for (let i = 1; i <= 30; i++) await add(cycle * 30 + i);
       now += 3_000;
       await attention.preStep('a').catch(() => {});

@@ -52,6 +52,10 @@ export class BucketDrain {
   private readonly clock: () => number;
   private readonly wallClock: () => number;
   private readonly isCurrent: () => (sessionId: string) => boolean;
+  private readonly isTarget: (sessionId: string) => boolean;
+  private readonly isDeliveryProtected: (sessionId: string, deliveryId: string) => boolean;
+  private readonly isWakeOwner: (sessionId: string) => boolean;
+  private readonly isPendingTarget: (sessionId: string) => boolean;
   private seq = 0;
   private suppressedGroups = 0;
   constructor(hooks: DrainHooks) {
@@ -60,6 +64,10 @@ export class BucketDrain {
     this.clock = hooks.clock;
     this.wallClock = hooks.wallClock;
     this.isCurrent = hooks.isCurrent ?? (() => () => true);
+    this.isTarget = hooks.isTarget ?? (() => true);
+    this.isDeliveryProtected = hooks.isDeliveryProtected ?? (() => false);
+    this.isWakeOwner = hooks.isWakeOwner ?? (() => false);
+    this.isPendingTarget = hooks.isPendingTarget ?? (() => false);
   }
   /** Cumulative count of wake groups suppressed by the budget. */
   get suppressed(): number {
@@ -90,11 +98,17 @@ export class BucketDrain {
   nextDeadline(): number | undefined {
     let min: number | undefined;
     for (const b of this.pending.values()) {
-      if (privateBucket(b) && !this.isCurrent()(b.sessionId)) continue;
+      if (!this.eligible(b, this.isCurrent()) && (privateBucket(b) || !this.isPendingTarget(b.sessionId))) continue;
       if (b.jobs && !b.sealed && this.blockedJobs(b.sessionId, bucketLevel(b))) continue;
       if (min === undefined || b.deadline < min) min = b.deadline;
     }
     return min;
+  }
+  private eligible(bucket: Bucket, current: (id: string) => boolean): boolean {
+    return (
+      (current(bucket.sessionId) && (privateBucket(bucket) || this.isTarget(bucket.sessionId))) ||
+      (privateBucket(bucket) && bucketLevel(bucket) === 'wake' && this.isWakeOwner(bucket.sessionId))
+    );
   }
   private blockedJobs(sessionId: string, level: DeliveryLevel): boolean {
     const blocks = (bucket: Bucket) => bucket.jobs && bucketLevel(bucket) === level;
@@ -105,10 +119,15 @@ export class BucketDrain {
     );
   }
   retarget(sessionId: string): void {
-    if (!this.isCurrent()(sessionId)) return;
+    if (!this.isCurrent()(sessionId) || !this.isTarget(sessionId)) return;
     for (const b of this.pending.values()) if (b.sessionId !== sessionId && b.sealed) b.deadline = this.clock();
-    this.suppressedGroups -= retargetBuckets(this.pending, this.ready, this.batches, sessionId, (id, buckets, at) =>
-      this.buildInjectBatch(id, buckets, at),
+    this.suppressedGroups -= retargetBuckets(
+      this.pending,
+      this.ready,
+      this.batches,
+      sessionId,
+      (id, buckets, at) => this.buildInjectBatch(id, buckets, at),
+      this.isDeliveryProtected,
     );
   }
   confirm(id: string): void {
@@ -120,8 +139,7 @@ export class BucketDrain {
       privateBucket(bucket) &&
       (token === undefined ||
         [...bucket.details.values()].every((detail) => detail.latest.data.sessionToken === token));
-    const jobBucket = this.jobs.get(id);
-    if (jobBucket && matches(jobBucket)) this.jobs.delete(id);
+    for (const [key, bucket] of this.jobs) if (matches(bucket)) this.jobs.delete(key);
     for (const [key, bucket] of this.pending) {
       if (matches(bucket)) this.pending.delete(key);
     }
@@ -168,7 +186,8 @@ export class BucketDrain {
       typeof signal.data.sessionId === 'string' &&
       typeof signal.data.sessionToken === 'string'
     ) {
-      let bucket = this.jobs.get(sessionId);
+      const key = JSON.stringify([sessionId, level]);
+      let bucket = this.jobs.get(key);
       if (
         !bucket ||
         bucket.sealed ||
@@ -184,7 +203,7 @@ export class BucketDrain {
           details: new Map(),
         };
         this.pending.set(bucket.id, bucket);
-        this.jobs.set(sessionId, bucket);
+        this.jobs.set(key, bucket);
       }
       if (bucket.budgetSuppressed && bucketLevel(bucket) === 'context' && level === 'wake') {
         bucket.startedAt = now;
@@ -212,6 +231,11 @@ export class BucketDrain {
     await this.attemptDue(now, errors, this.isCurrent());
     throwCollected(errors, 'delivery failed');
   }
+  async dueOwned(now: number): Promise<void> {
+    const errors: unknown[] = [];
+    await this.attemptDue(now, errors, this.isCurrent(), true);
+    throwCollected(errors, 'delivery failed');
+  }
   /**
    * Pre-step drain (DESIGN §2.3): the session's context ships FIRST — pure
    * context groups close early and context details split out of still-open
@@ -223,6 +247,7 @@ export class BucketDrain {
     if (!current(sessionId)) return;
     for (const b of [...this.pending.values()]) {
       if (b.sessionId !== sessionId || b.sealed) continue;
+      if (!privateBucket(b) && !this.isTarget(sessionId)) continue;
       if (b.jobs && this.blockedJobs(sessionId, bucketLevel(b))) continue;
       if (bucketLevel(b) === 'context') {
         this.pending.delete(b.id);
@@ -257,9 +282,16 @@ export class BucketDrain {
     throwCollected(errors, 'pre-step delivery failed');
   }
   /** Due buckets attempted independently; failures restore the sealed bucket for a same-payload retry. */
-  private async attemptDue(now: number, errors: unknown[], current: (id: string) => boolean): Promise<void> {
+  private async attemptDue(
+    now: number,
+    errors: unknown[],
+    current: (id: string) => boolean,
+    ownedOnly = false,
+  ): Promise<void> {
     for (const b of [...this.pending.values()]) {
-      if (!current(b.sessionId)) continue;
+      if (this.pending.get(b.id) !== b) continue;
+      if (ownedOnly && (!privateBucket(b) || bucketLevel(b) !== 'wake')) continue;
+      if (!this.eligible(b, current)) continue;
       if (now < b.deadline) continue;
       if (b.jobs && !b.sealed && this.blockedJobs(b.sessionId, bucketLevel(b))) continue;
       this.pending.delete(b.id);
@@ -355,6 +387,7 @@ export class BucketDrain {
     if (batches === undefined) return;
     for (const batch of [...batches]) {
       if (!current(sessionId)) break;
+      if (!batch.buckets.some(privateBucket) && !this.isTarget(sessionId)) continue;
       if (attempted.has(batch)) continue;
       attempted.add(batch);
       try {
