@@ -1283,6 +1283,42 @@ describe('host runtime', () => {
     await h.runtime.stop();
   });
 
+  it('records an unknown outcome once without transiently marking delivery ok', async () => {
+    const h = harness();
+    let attempts = 0;
+    h.ports.dsh.deliver = async () => {
+      attempts++;
+      if (attempts === 1) throw new Error('transient failure');
+      throw new DeliveryFailure('unknown', 0, new Error('fixture'));
+    };
+    await h.runtime.start();
+    await h.agent({ type: 'created', sessionId: 's' });
+    await h.agent({ type: 'pre-step', sessionId: 's' });
+    await h.job({ type: 'exited', id: 'failed-job', exitCode: 1 });
+    await h.advance(2_000);
+    expect(h.runtime.state().observation.sources.delivery?.status).toBe('unavailable');
+    const before = h.runtime.events().filter((event) => event.source.id === 'delivery').length;
+    const statuses: (string | undefined)[] = [];
+    const off = h.runtime.subscribe((state) => {
+      statuses.push(state.observation.sources.delivery?.status);
+    });
+    await h.advance(1_000);
+    off();
+    expect(attempts).toBe(2);
+    expect(statuses).not.toContain('ok');
+    expect(statuses.at(-1)).toBe('unavailable');
+    const added = h.runtime
+      .events()
+      .filter((event) => event.source.id === 'delivery')
+      .slice(before);
+    expect(added.map((event) => event.kind)).toEqual(['delivery-unknown']);
+    expect(h.runtime.state().observation.sources.delivery).toMatchObject({
+      status: 'unavailable',
+      error: '投递结果未知，未重试',
+    });
+    await h.runtime.stop();
+  });
+
   it('records an unknown outcome without retrying it', async () => {
     const h = harness();
     let attempts = 0;

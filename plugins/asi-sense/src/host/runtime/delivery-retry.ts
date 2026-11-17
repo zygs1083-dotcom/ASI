@@ -20,15 +20,47 @@ export function deliveryRetry(
   };
   const report = async (status: 'ok' | 'unavailable', error?: string, kind = 'source.status') => {
     const attention = getAttention();
-    await attention.accept({
-      id: attention.id(),
-      kind,
-      at: clock.wall(),
-      source: { id: 'delivery', api: 'dsh', host: 'local' },
-      subject: 'delivery',
-      cause: 'agent',
-      data: { status, ...(error === undefined ? {} : { error }) },
-    });
+    if (attention.isStopped()) return;
+    const at = clock.wall();
+    const source = { id: 'delivery', api: 'dsh', host: 'local' };
+    const data = { status, ...(error === undefined ? {} : { error }) };
+    if (kind === 'source.status') {
+      await attention.accept({
+        id: attention.id(),
+        kind,
+        at,
+        source,
+        subject: 'delivery',
+        cause: 'agent',
+        data,
+      });
+      return;
+    }
+    let accepted!: Promise<void>;
+    attention.batch(
+      () => {
+        attention.store.apply({
+          id: attention.id(),
+          kind: 'source.status',
+          at,
+          source,
+          subject: 'delivery',
+          cause: 'agent',
+          data,
+        });
+        accepted = attention.accept({
+          id: attention.id(),
+          kind,
+          at,
+          source,
+          subject: 'delivery',
+          cause: 'agent',
+          data: { ...data, preserveSourceStatus: true },
+        });
+      },
+      () => attention.changed(),
+    );
+    await accepted;
   };
   return {
     ...port,
@@ -78,7 +110,6 @@ export function deliveryRetry(
           attempts.delete(key);
           degraded = true;
           await report('unavailable', '投递结果未知，未重试', 'delivery-unknown');
-          await report('unavailable', '投递结果未知，未重试');
           throw error;
         }
         if (
