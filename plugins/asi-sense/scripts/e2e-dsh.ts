@@ -14,6 +14,7 @@ import {
   envInjections,
   envMessages,
   events,
+  failureDetails,
   record,
   run,
   stop,
@@ -123,6 +124,7 @@ try {
     console.error('DSH e2e exceeded the 10-minute limit; stopping owned processes');
     void Promise.allSettled([browser?.close() ?? Promise.resolve(), server ? stop(server) : Promise.resolve()]).then(
       async () => {
+        profile.retain();
         await profile[Symbol.asyncDispose]();
         process.exit(1);
       },
@@ -220,7 +222,7 @@ try {
   }
   if (process.env.ASI_E2E_ONLY_TARGET === '1') {
     phase = 'target conversation delivery';
-    await checkTargetDelivery(chat, panel, sessionRoot);
+    await checkTargetDelivery(chat, panel, sessionRoot, workspace);
   }
   if (
     process.env.ASI_E2E_ONLY_TARGET !== '1' &&
@@ -412,9 +414,11 @@ try {
   if (shots)
     console.log(`Synthetic screenshots: ${join(shots, 'asi-sense.png')} ${join(shots, 'asi-sense-mobile.png')}`);
 } catch (error) {
+  profile.retain();
   console.error(
     `DSH e2e failed during ${phase} (${error instanceof Error ? error.name : 'unknown error'}); model request upper bound ${await count()}/${limit}`,
   );
+  console.error('DSH e2e assertion details:', JSON.stringify(failureDetails(error)));
   if (error instanceof Error && error.message.startsWith('Timed out waiting for ')) console.error(error.message);
   if (phase.startsWith('b2 ')) {
     const log = await events(sessionRoot);
@@ -430,6 +434,7 @@ try {
     server ? stop(server) : Promise.resolve(),
   ]);
   if (cleanup.some((result) => result.status === 'rejected')) {
+    profile.retain();
     console.error(`Browser cleanup: ${cleanup[0].status}; DSH cleanup: ${cleanup[1].status}`);
     for (const result of cleanup) if (result.status === 'rejected') console.error(result.reason);
     process.exitCode = 1;
@@ -437,6 +442,7 @@ try {
   const remaining = helperPids();
   console.log(`pgrep owned helper after stop: ${remaining.length ? remaining.join(' ') : '(none)'}`);
   if (remaining.length) {
+    profile.retain();
     console.error('Owned helper process remained after DSH shutdown');
     process.exitCode = 1;
   }

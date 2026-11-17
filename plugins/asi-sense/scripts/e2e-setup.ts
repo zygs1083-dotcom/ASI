@@ -38,7 +38,7 @@ export async function setup({
         {
           id: 'e2e-agent-file',
           match: { kind: 'file.changed', subject: `${workspace}/**` },
-          level: 'wake',
+          level: process.env.ASI_E2E_ONLY_TARGET === '1' ? 'context' : 'wake',
           createdBy: 'user',
           approved: true,
         },
