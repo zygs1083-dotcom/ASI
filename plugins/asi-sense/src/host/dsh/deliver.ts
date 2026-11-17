@@ -52,6 +52,13 @@ function modelUpdate(update: EnvUpdate): EnvUpdate {
         if (typeof signal.data.title === 'string') data.title = modelTitle(signal.data.title);
       } else if (signal.kind === 'file.changed') {
         data.path = modelPath(typeof signal.data.path === 'string' ? signal.data.path : signal.subject);
+        if (
+          ['add', 'create', 'created', 'modify', 'save', 'saved', 'delete', 'deleted', 'rename', 'renamed'].includes(
+            String(signal.data.change),
+          )
+        ) {
+          data.change = signal.data.change;
+        }
       } else if (signal.kind === 'job.started' || signal.kind === 'job.exited' || signal.kind === 'process.exited') {
         if (typeof signal.data.id === 'string') data.id = modelLabel(signal.data.id);
         if (typeof signal.data.exitCode === 'number') data.exitCode = signal.data.exitCode;
@@ -76,9 +83,11 @@ function modelUpdate(update: EnvUpdate): EnvUpdate {
           'slope',
           'delta',
           'etaToFloorMs',
+          'timeToFloorMs',
           'windowMs',
           'created',
           'modified',
+          'deleted',
           'agentDeleted',
         ]) {
           const value = signal.data[key];
@@ -165,7 +174,12 @@ export function createDelivery(
   const staged = new Map<string, Map<string, { intent: DeliveryIntent; step?: Step; returned: boolean }>>();
   const steps = new Map<string, Step>();
   const inflight = new Map<string, Promise<void>>();
-  const message = (id: string, intent: DeliveryIntent): UserMessage =>
+  const render = (intent: DeliveryIntent): string =>
+    formatEnvUpdate(modelUpdate(intent.update), {
+      includeWindowTitles: sendTitles(),
+      includeJobCommands: false,
+    });
+  const message = (id: string, text: string): UserMessage =>
     freezeMessage({
       id: MessageId(id),
       role: 'user',
@@ -173,13 +187,17 @@ export function createDelivery(
       content: [
         {
           type: 'text',
-          text: formatEnvUpdate(modelUpdate(intent.update), {
-            includeWindowTitles: sendTitles(),
-            includeJobCommands: false,
-          }),
+          text,
         },
       ],
     });
+  const recordFor = (sessionId: string, id: string): void => {
+    const ids = delivered.get(sessionId) ?? new Set<string>();
+    ids.add(id);
+    const oldest = ids.values().next().value;
+    if (ids.size > 1024 && oldest !== undefined) ids.delete(oldest);
+    delivered.set(sessionId, ids);
+  };
   const perform = async (
     sessionId: string,
     intent: DeliveryIntent,
@@ -199,15 +217,13 @@ export function createDelivery(
       staged.set(sessionId, pending);
       return;
     }
-    const record = () => {
-      const ids = previous ?? new Set<string>();
-      ids.add(id);
-      const oldest = ids.values().next().value;
-      if (ids.size > 1024 && oldest !== undefined) ids.delete(oldest);
-      delivered.set(sessionId, ids);
-    };
+    const text = render(intent);
+    if (!text) {
+      recordFor(sessionId, id);
+      return;
+    }
     try {
-      const input = message(id, intent);
+      const input = message(id, text);
       if (intent.kind === 'send') agent.send(input, intent.target, intent.wakeup);
       else agent.followup(input);
     } catch (error) {
@@ -221,7 +237,7 @@ export function createDelivery(
       }
       if (!wasAccepted) throw error;
     }
-    record();
+    recordFor(sessionId, id);
   };
   const deliver = async (sessionId: string, intent: DeliveryIntent, isCurrent?: () => boolean): Promise<void> => {
     if (sessionId !== intent.sessionId) throw new Error('delivery session mismatch');
@@ -246,7 +262,15 @@ export function createDelivery(
         const wasAccepted = await accepted(sessionId, id);
         if (pending.get(id) !== entry) continue;
         if (wasAccepted) pending.delete(id);
-        else if (!entry.returned) messages.push(message(id, entry.intent));
+        else if (!entry.returned) {
+          const text = render(entry.intent);
+          if (!text) {
+            pending.delete(id);
+            recordFor(sessionId, id);
+          } else {
+            messages.push(message(id, text));
+          }
+        }
       }
       if (!pending.size && staged.get(sessionId) === pending) staged.delete(sessionId);
       return messages;

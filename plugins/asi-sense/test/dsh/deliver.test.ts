@@ -339,7 +339,7 @@ describe('DSH environment delivery', () => {
     expect(agent.followup).toHaveBeenCalledTimes(1);
   });
 
-  it('omits window events and their notes when titles are disabled', async () => {
+  it('omits window events and their notes when titles are disabled without delivering an empty envelope', async () => {
     const agent = { inject: vi.fn(), followup: vi.fn(), send: vi.fn() };
     const deliver = createDelivery(
       () => agent,
@@ -364,8 +364,79 @@ describe('DSH environment delivery', () => {
         },
       ],
     };
-    await deliver('session-a', { ...intent('inject'), update: windowUpdate });
-    expect(JSON.stringify(await deliver.messages('session-a'))).not.toContain('synthetic title');
+    await deliver('session-a', { ...intent('inject', 'win-inject'), update: windowUpdate });
+    expect(await deliver.messages('session-a')).toEqual([]);
+    await deliver('session-a', { ...intent('followup', 'win-followup'), update: windowUpdate });
+    await deliver('session-a', { ...intent('send', 'win-send'), update: windowUpdate });
+    expect(agent.followup).not.toHaveBeenCalled();
+    expect(agent.send).not.toHaveBeenCalled();
+  });
+
+  it('whitelists file.changed verbs, rate timeToFloorMs, anomaly sigma and burst deleted counts without path leaks', async () => {
+    const { agent, deliver } = fixture();
+    const changes: EnvUpdate['changes'] = [
+      {
+        kind: 'file.changed',
+        subject: '/private/dir/new.ts',
+        data: { path: '/private/dir/new.ts', change: 'add' },
+      },
+      {
+        kind: 'file.changed',
+        subject: '/private/dir/old.ts',
+        data: { path: '/private/dir/old.ts', change: 'delete' },
+      },
+      {
+        kind: 'file.changed',
+        subject: '/private/dir/moved.ts',
+        data: { path: '/private/dir/moved.ts', change: 'rename' },
+      },
+      {
+        kind: 'body.rate',
+        subject: 'rate:context-eta',
+        data: { metric: 'context', ruleId: 'context-eta', severity: 'warn', slope: -25, timeToFloorMs: 120_000 },
+      },
+      {
+        kind: 'body.anomaly',
+        subject: 'baseline:cpu',
+        data: { metric: 'cpu', ruleId: 'cpu', severity: 'warn', value: 0.88, baseline: 0.2, deviation: 3.5 },
+      },
+      {
+        kind: 'file.burst',
+        subject: '/private/work/project',
+        data: {
+          directory: '/private/work/project',
+          ruleId: 'file.burst',
+          windowMs: 60_000,
+          created: 2,
+          modified: 3,
+          deleted: 55,
+          agentDeleted: 4,
+          externalDeletionExceeded: true,
+        },
+      },
+    ].map((item, index) => ({
+      count: 1,
+      level: 'context' as const,
+      signal: {
+        ...item,
+        id: `q-${index}`,
+        at: update.at + index,
+        source: { id: 'fixture', api: 'test', host: 'local' },
+      },
+    }));
+    await deliver('session-a', { ...intent('followup', 'quant'), update: { ...update, changes } });
+    const text = JSON.stringify(agent.followup.mock.calls);
+    expect(text).toContain('file: new.ts created');
+    expect(text).toContain('file: old.ts deleted');
+    expect(text).toContain('file: moved.ts renamed');
+    expect(text).toContain('slope=-25');
+    expect(text).toContain('timeToFloorMs=120000');
+    expect(text).toContain('deviation=3.5σ');
+    expect(text).toContain('file.burst: project');
+    expect(text).toContain('created=2');
+    expect(text).toContain('modified=3');
+    expect(text).toContain('deleted=55');
+    expect(text).not.toContain('/private/');
   });
 
   it.each(['inject', 'followup', 'send'] as const)('projects a consented window title before %s', async (kind) => {

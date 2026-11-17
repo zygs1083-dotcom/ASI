@@ -32,6 +32,13 @@ function str(v: unknown): string {
   return typeof v === 'string' ? v : '';
 }
 
+function fileVerb(change: unknown): 'created' | 'saved' | 'deleted' | 'renamed' {
+  if (change === 'add' || change === 'create' || change === 'created') return 'created';
+  if (change === 'delete' || change === 'deleted') return 'deleted';
+  if (change === 'rename' || change === 'renamed') return 'renamed';
+  return 'saved';
+}
+
 /** UTC HH:mm:ss — deterministic, locale- and timezone-independent. */
 function hhmmss(ms: number): string {
   return new Date(ms).toISOString().slice(11, 19);
@@ -78,7 +85,7 @@ function changeLines(ch: EnvChange, includeTitles: boolean, includeJobCommands: 
     main = `window: ${esc(str(s.data.title))}`;
   } else if (s.kind === 'file.changed') {
     const path = str(s.data.path) || s.subject;
-    main = `file: ${esc(path)} saved${ch.count > 1 ? ` ×${ch.count}` : ''}`;
+    main = `file: ${esc(path)} ${fileVerb(s.data.change)}${ch.count > 1 ? ` ×${ch.count}` : ''}`;
   } else if (s.kind === 'job.started') {
     main = `job: \`${esc(str(s.data.id) || s.subject)}\` started`;
   } else if (s.kind === 'job.exited' || s.kind === 'process.exited') {
@@ -94,16 +101,24 @@ function changeLines(ch: EnvChange, includeTitles: boolean, includeJobCommands: 
     if (typeof v === 'number' && Number.isFinite(v)) main += ` ${v}`;
     else if (typeof v === 'string') main += ` ${esc(v)}`;
   } else if (s.kind === 'body.rate' || s.kind === 'body.anomaly' || s.kind === 'file.burst') {
-    main = `${esc(s.kind)}: ${esc(s.subject)}`;
+    const head = s.kind === 'file.burst' ? str(s.data.directory) || s.subject : s.subject;
+    main = `${esc(s.kind)}: ${esc(head)}`;
+    if (s.kind !== 'file.burst' && typeof s.data.metric === 'string' && s.data.metric && s.data.metric !== s.subject) {
+      main += ` metric=${esc(s.data.metric)}`;
+    }
     if (typeof s.data.ruleId === 'string') main += ` ruleId=${esc(s.data.ruleId)}`;
     if (typeof s.data.severity === 'string') main += ` ${esc(s.data.severity)}`;
+    const etaKey =
+      typeof s.data.etaToFloorMs === 'number' && Number.isFinite(s.data.etaToFloorMs)
+        ? 'etaToFloorMs'
+        : 'timeToFloorMs';
     for (const key of [
       'value',
       'baseline',
       'deviation',
       'slope',
       'delta',
-      'etaToFloorMs',
+      etaKey,
       'windowMs',
       'created',
       'modified',
@@ -112,7 +127,9 @@ function changeLines(ch: EnvChange, includeTitles: boolean, includeJobCommands: 
       'agentDeleted',
     ]) {
       const value = s.data[key];
-      if (typeof value === 'number' && Number.isFinite(value)) main += ` ${key}=${value}`;
+      if (typeof value === 'number' && Number.isFinite(value)) {
+        main += key === 'deviation' ? ` ${key}=${value}σ` : ` ${key}=${value}`;
+      }
     }
     if (s.data.externalDeletionExceeded === true) main += ' externalDeletionExceeded=true';
   } else if (s.kind === 'fact.updated') {
@@ -148,10 +165,10 @@ function changeLines(ch: EnvChange, includeTitles: boolean, includeJobCommands: 
 export function formatEnvUpdate(update: EnvUpdate, options: FormatOptions = {}): string {
   const includeTitles = options.includeWindowTitles ?? true;
   const changes = [...update.changes].sort((a, b) => a.signal.at - b.signal.at || (a.signal.id < b.signal.id ? -1 : 1));
-  const lines = [`<env-update since="${esc(hhmmss(update.since))}" source="asi-sense">`];
-  for (const ch of changes) lines.push(...changeLines(ch, includeTitles, options.includeJobCommands ?? true));
-  if (update.suppressed > 0) lines.push(`suppressed: ${update.suppressed}`);
-  if ((update.alreadyInjected ?? 0) > 0) lines.push(`另有 ${update.alreadyInjected} 条已在上一步注入`);
-  lines.push('</env-update>');
-  return lines.join('\n');
+  const body: string[] = [];
+  for (const ch of changes) body.push(...changeLines(ch, includeTitles, options.includeJobCommands ?? true));
+  if (update.suppressed > 0) body.push(`suppressed: ${update.suppressed}`);
+  if ((update.alreadyInjected ?? 0) > 0) body.push(`另有 ${update.alreadyInjected} 条已在上一步注入`);
+  if (body.length === 0) return '';
+  return [`<env-update since="${esc(hhmmss(update.since))}" source="asi-sense">`, ...body, '</env-update>'].join('\n');
 }

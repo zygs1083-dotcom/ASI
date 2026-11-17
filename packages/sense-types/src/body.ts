@@ -31,6 +31,7 @@ export interface Body {
   harnessProcess: Fact<{ rss: number; cpu: number; uptimeSec: number }>;
   tokens: Fact<{
     contextWindow?: number;
+    contextWindowSource?: 'configured' | 'catalog' | 'fallback';
     contextUsed?: number;
     contextProjected?: number;
     sessionUsage: {
