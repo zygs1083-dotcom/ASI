@@ -52,8 +52,8 @@ const helper = join(pkg, 'lib/asi-sense-helper');
 const rand = () => randomBytes(4).toString('hex');
 const MODEL_BUDGET = 6;
 
-function helperPids(): string[] {
-  const result = spawnSync('pgrep', ['-f', helper], { encoding: 'utf8' });
+function helperPids(pattern: string = helper): string[] {
+  const result = spawnSync('pgrep', ['-f', pattern], { encoding: 'utf8' });
   if (result.status !== 0 && result.status !== 1) throw new Error('pgrep failed');
   return result.stdout.trim().split('\n').filter(Boolean);
 }
@@ -224,10 +224,10 @@ async function spawnDsh(rig: Rig): Promise<{ server: ChildProcess; url: string }
   return { server, url };
 }
 
-async function waitHelper(): Promise<string[]> {
+async function waitHelper(pattern?: string): Promise<string[]> {
   return waitFor(
     async () => {
-      const pids = helperPids();
+      const pids = helperPids(pattern);
       return pids.length ? pids : undefined;
     },
     20_000,
@@ -642,6 +642,7 @@ async function phasePack(tgz: string): Promise<void> {
     ASI_MAGPIE_PLACEHOLDER: 'magpie',
     TSX_TSCONFIG_PATH: join(dsh, 'tsconfig.json'),
   };
+  const installedHelper = join(home, 'profiles/asi-dev');
   const st: RunState = { phase: 'profile setup' };
   try {
     await run(
@@ -657,10 +658,51 @@ async function phasePack(tgz: string): Promise<void> {
     console.log(`installed package: ${manifest.name}@${manifest.version}`);
     expect(manifest.version).toBe('0.1.3');
 
+    // A configured (never-called) local model keeps the web UI off the
+    // onboarding screen so the sidebar is reachable without a session.
+    const overlay = join(root, 'overlay.yml');
+    await writeFile(
+      overlay,
+      `- id: llm-pi-ai
+  config:
+    providers:
+      magpie:
+        displayName: Local test gateway
+        apiKeyEnv: ASI_MAGPIE_PLACEHOLDER
+        api: openai-completions
+        baseURL: http://127.0.0.1:3425/v1
+        retryPolicy:
+          mode: normal
+          maxRetries: 0
+        models:
+          - id: auto/gpt-6.1-sol
+            name: Local test model
+- id: agent-default-model
+  config:
+    provider: magpie
+    model: auto/gpt-6.1-sol
+- id: session-title-llm
+  disabled: true
+`,
+      { mode: 0o600 },
+    );
     st.phase = 'sidebar opens';
     const server = spawn(
       process.execPath,
-      [...args, '--profile', 'asi-dev', '--patch', picker, '--no-open', '--host', '127.0.0.1', '--port', '0'],
+      [
+        ...args,
+        '--profile',
+        'asi-dev',
+        '--patch',
+        picker,
+        '--patch',
+        overlay,
+        '--no-open',
+        '--host',
+        '127.0.0.1',
+        '--port',
+        '0',
+      ],
       { cwd: workspace, env, detached: true, stdio: ['ignore', 'pipe', 'pipe'] },
     );
     st.server = server;
@@ -672,7 +714,7 @@ async function phasePack(tgz: string): Promise<void> {
     server.stdout?.resume();
     server.stderr?.resume();
     console.log(`Owned DSH PID: ${server.pid}`);
-    console.log(`Owned helper PIDs: ${(await waitHelper()).join(',')}`);
+    console.log(`Owned helper PIDs: ${(await waitHelper(installedHelper)).join(',')}`);
     st.browser = await chromium.launch({ headless: true });
     st.context = await st.browser.newContext({ viewport: { width: 1440, height: 900 } });
     const panelPage = await st.context.newPage();
@@ -698,7 +740,7 @@ async function phasePack(tgz: string): Promise<void> {
       st.browser?.close() ?? Promise.resolve(),
       st.server ? stop(st.server) : Promise.resolve(),
     ]);
-    const remaining = helperPids();
+    const remaining = helperPids(installedHelper);
     console.log(`pgrep owned helper after stop: ${remaining.length ? remaining.join(' ') : '(none)'}`);
     if (remaining.length) {
       profile.retain();
