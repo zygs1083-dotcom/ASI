@@ -111,4 +111,24 @@ describe('CpuSampler', () => {
     expect(ok.status).toBe('ok');
     expect(ok.value?.perCore).toHaveLength(2);
   });
+
+  it('reset() drops the previous snapshot so the next sample re-baselines as unknown', () => {
+    const seq = [
+      cpus(t(0, 0, 0, 100, 0)),
+      cpus(t(50, 0, 0, 150, 0)), // 50/100 = 0.5
+      cpus(t(500, 0, 0, 1000, 0)), // huge stopped gap — must NOT average into first post-reset sample
+      cpus(t(510, 0, 0, 1090, 0)), // 10/100 = 0.1
+    ];
+    let i = 0;
+    const s = new CpuSampler({ cpus: () => seq[Math.min(i++, seq.length - 1)]!, loadavg: () => [0, 0, 0] });
+    expect(s.sample().status).toBe('unknown');
+    expect(s.sample().value?.usage).toBeCloseTo(0.5);
+    s.reset();
+    const afterReset = s.sample();
+    expect(afterReset.status).toBe('unknown');
+    expect(afterReset.value).toBeNull();
+    const fresh = s.sample();
+    expect(fresh.status).toBe('ok');
+    expect(fresh.value?.usage).toBeCloseTo(0.1);
+  });
 });

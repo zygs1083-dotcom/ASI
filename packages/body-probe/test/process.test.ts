@@ -57,6 +57,33 @@ describe('SelfProcessSampler', () => {
     expect(f.value?.rss).not.toBe(999 * 1024);
     expect(f.value?.uptimeSec).toBe(120);
   });
+
+  it('reset() clears the previous resourceUsage baseline so post-reset sampling re-baselines', () => {
+    let t = 0;
+    const usages = [
+      res(0, 0),
+      res(1_000_000, 0), // 1.0 CPU over 1s
+      res(50_000_000, 0), // stopped gap — must NOT leak into first sample after reset
+      res(50_250_000, 0), // 0.25 CPU over 1s
+    ];
+    let i = 0;
+    const s = new SelfProcessSampler({
+      now: () => (t += 1000) - 1000,
+      memoryUsage: () => mem(1024),
+      resourceUsage: () => usages[Math.min(i++, usages.length - 1)]!,
+      uptime: () => 10,
+    });
+    expect(s.sample().status).toBe('unknown');
+    expect(s.sample().value?.cpu).toBeCloseTo(1.0);
+    s.reset();
+    t += 60_000;
+    const afterReset = s.sample();
+    expect(afterReset.status).toBe('unknown');
+    expect(afterReset.value).toBeNull();
+    const fresh = s.sample();
+    expect(fresh.status).toBe('ok');
+    expect(fresh.value?.cpu).toBeCloseTo(0.25);
+  });
 });
 
 describe('SelfProcessSampler errors', () => {

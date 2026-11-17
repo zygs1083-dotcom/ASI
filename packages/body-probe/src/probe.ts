@@ -68,12 +68,16 @@ export class BodyProbe {
     this.collectors = { ...defaults, ...collectors };
     this.customDisks = collectors.disks !== undefined;
     this.resetInner = () => {
+      cpu.reset();
       memory.reset();
       network.reset();
+      self.reset();
     };
     this.stopInner = () => {
+      cpu.reset();
       memory.reset();
       network.reset();
+      self.reset();
       disks.stop();
     };
   }

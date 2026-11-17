@@ -856,4 +856,54 @@ describe('BodyProbe', () => {
     expect(run).not.toHaveBeenCalled();
     await probe.stop();
   });
+
+  it('restarting resets cpu and self-process baselines instead of averaging across the stopped gap', async () => {
+    const cpuSeq = [
+      [{ model: 'fake', speed: 2400, times: { user: 0, nice: 0, sys: 0, idle: 100, irq: 0 } }],
+      [{ model: 'fake', speed: 2400, times: { user: 50, nice: 0, sys: 0, idle: 150, irq: 0 } }],
+      [{ model: 'fake', speed: 2400, times: { user: 5000, nice: 0, sys: 0, idle: 5100, irq: 0 } }],
+      [{ model: 'fake', speed: 2400, times: { user: 5010, nice: 0, sys: 0, idle: 5190, irq: 0 } }],
+    ] as os.CpuInfo[][];
+    const ruSeq = [
+      { userCPUTime: 0, systemCPUTime: 0 },
+      { userCPUTime: 1_000_000, systemCPUTime: 0 },
+      { userCPUTime: 90_000_000, systemCPUTime: 0 },
+      { userCPUTime: 90_250_000, systemCPUTime: 0 },
+    ] as NodeJS.ResourceUsage[];
+    let ci = 0;
+    let ri = 0;
+    vi.spyOn(os, 'cpus').mockImplementation(() => cpuSeq[Math.min(ci++, cpuSeq.length - 1)]!);
+    vi.spyOn(os, 'loadavg').mockReturnValue([0.5, 0.5, 0.5]);
+    vi.spyOn(process, 'resourceUsage').mockImplementation(() => ruSeq[Math.min(ri++, ruSeq.length - 1)]!);
+    vi.spyOn(process, 'memoryUsage').mockReturnValue({
+      rss: 1024, heapTotal: 0, heapUsed: 0, external: 0, arrayBuffers: 0,
+    });
+    vi.spyOn(process, 'uptime').mockReturnValue(10);
+
+    const collectors = baseCollectors();
+    delete (collectors as Partial<ProbeCollectors>).cpu;
+    delete (collectors as Partial<ProbeCollectors>).process;
+    const probe = new BodyProbe(collectors, { platform: 'linux' });
+    probe.start({ intervalMs: 1000 });
+    await flush();
+    expect(probe.latest()?.cpu.status).toBe('unknown');
+    expect(probe.latest()?.harnessProcess.status).toBe('unknown');
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(probe.latest()?.cpu.value?.usage).toBeCloseTo(0.5);
+    expect(probe.latest()?.harnessProcess.value?.cpu).toBeCloseTo(1.0);
+
+    await probe.stop();
+    await vi.advanceTimersByTimeAsync(60_000);
+    probe.start({ intervalMs: 1000 });
+    await flush();
+    // First tick after restart must re-baseline as unknown rather than averaging the 60s stopped gap.
+    expect(probe.latest()?.cpu.status).toBe('unknown');
+    expect(probe.latest()?.harnessProcess.status).toBe('unknown');
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(probe.latest()?.cpu.status).toBe('ok');
+    expect(probe.latest()?.cpu.value?.usage).toBeCloseTo(0.1);
+    expect(probe.latest()?.harnessProcess.status).toBe('ok');
+    expect(probe.latest()?.harnessProcess.value?.cpu).toBeCloseTo(0.25);
+    await probe.stop();
+  });
 });
