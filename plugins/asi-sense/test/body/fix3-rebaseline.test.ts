@@ -183,6 +183,7 @@ describe('user-confirmed rebaseline', () => {
     expect(f.monitor.rebaselineSuggestions).toHaveLength(1);
     expect(signals.filter((signal) => signal.data.type === 'rebaseline-suggestion')).toHaveLength(1);
     const suggestion = signals.find((signal) => signal.data.type === 'rebaseline-suggestion');
+    expect(suggestion?.data.metric).toBe('memory');
     expect(
       defaultBodyRules().some(
         (rule) => suggestion && rule.level === 'context' && matchesRule(rule, suggestion, suggestion.at),

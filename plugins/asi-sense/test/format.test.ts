@@ -211,4 +211,145 @@ describe('formatEnvUpdate', () => {
     expect(formatEnvUpdate(update([], { alreadyInjected: 0 }))).not.toContain('已在上一步注入');
     expect(formatEnvUpdate(update([]))).not.toContain('已在上一步注入');
   });
+
+  it('maps file.changed change kinds to created/saved/deleted/renamed', () => {
+    const cases = [
+      { id: '1', change: 'add', expected: 'file: a.ts created' },
+      { id: '2', change: 'modify', expected: 'file: b.ts saved ×2', count: 2 },
+      { id: '3', change: 'delete', expected: 'file: c.ts deleted' },
+      { id: '4', change: 'rename', expected: 'file: d.ts renamed' },
+    ];
+    const out = formatEnvUpdate(
+      update(
+        cases.map((item, i) =>
+          change({
+            count: item.count ?? 1,
+            signal: sig({
+              id: item.id,
+              kind: 'file.changed',
+              at: T0 + i,
+              subject: `${item.expected.split(' ')[1]}`,
+              data: { path: `${item.expected.split(' ')[1]}`, change: item.change },
+            }),
+          }),
+        ),
+      ),
+    );
+    for (const item of cases) expect(out).toContain(item.expected);
+  });
+
+  it('includes key quantitative metrics for body.rate, body.anomaly and file.burst', () => {
+    const out = formatEnvUpdate(
+      update([
+        change({
+          signal: sig({
+            id: 'r',
+            kind: 'body.rate',
+            at: T0,
+            subject: 'rate:context-eta',
+            data: { metric: 'context', windowMs: 60_000, delta: -5000, slope: -83.5, timeToFloorMs: 45_000 },
+          }),
+        }),
+        change({
+          signal: sig({
+            id: 'a',
+            kind: 'body.anomaly',
+            at: T0 + 1,
+            subject: 'baseline:cpu',
+            data: { metric: 'cpu', value: 0.92, baseline: 0.2, deviation: 4.5 },
+          }),
+        }),
+        change({
+          signal: sig({
+            id: 'b',
+            kind: 'file.burst',
+            at: T0 + 2,
+            subject: 'burst',
+            data: { directory: 'project', windowMs: 60_000, created: 3, modified: 5, deleted: 52 },
+          }),
+        }),
+      ]),
+    );
+    expect(out).toContain('slope=-83.5');
+    expect(out).toContain('timeToFloorMs=45000');
+    expect(out).toContain('value=0.92');
+    expect(out).toContain('baseline=0.2');
+    expect(out).toContain('deviation=4.5σ');
+    expect(out).toContain('file.burst: project');
+    expect(out).toContain('created=3');
+    expect(out).toContain('modified=5');
+    expect(out).toContain('deleted=52');
+  });
+
+  it('returns empty string instead of an empty env-update envelope when all window events are filtered', () => {
+    const u = update([
+      change({
+        signal: sig({ id: 'w1', kind: 'window.focused', at: T0, data: { title: 'Secret 1' } }),
+      }),
+      change({
+        signal: sig({ id: 'w2', kind: 'window.title-changed', at: T0 + 1, data: { title: 'Secret 2' } }),
+      }),
+    ]);
+    expect(formatEnvUpdate(u, { includeWindowTitles: false })).toBe('');
+  });
+
+  it('renders an explicit rebaseline suggestion line for the model', () => {
+    const u = update([
+      change({
+        signal: sig({
+          id: 'rebaseline:cpu',
+          kind: 'body.anomaly',
+          at: T0,
+          subject: 'baseline:cpu',
+          data: {
+            layer: 'baseline',
+            severity: 'warn',
+            metric: 'cpu',
+            type: 'rebaseline-suggestion',
+            feedbackAvailable: false,
+          },
+        }),
+      }),
+    ]);
+    expect(formatEnvUpdate(u)).toBe(
+      ['<env-update since="12:01:03" source="asi-sense">', '建议重新基线：cpu', '</env-update>'].join('\n'),
+    );
+  });
+
+  it('formats file.burst safely when directory is missing, blank or non-string', () => {
+    const out = formatEnvUpdate(
+      update([
+        change({
+          signal: sig({
+            id: 'missing',
+            kind: 'file.burst',
+            at: T0,
+            subject: 'subject-dir',
+            data: { deleted: 10 },
+          }),
+        }),
+        change({
+          signal: sig({
+            id: 'non-string',
+            kind: 'file.burst',
+            at: T0 + 1,
+            subject: 'array-fallback',
+            data: { directory: ['not-a-string'], deleted: 20 },
+          }),
+        }),
+        change({
+          signal: sig({
+            id: 'blank',
+            kind: 'file.burst',
+            at: T0 + 2,
+            subject: '',
+            data: { directory: '   ', deleted: 30 },
+          }),
+        }),
+      ]),
+    );
+    expect(out).toContain('file.burst: subject-dir deleted=10');
+    expect(out).toContain('file.burst: array-fallback deleted=20');
+    expect(out).toContain('file.burst: [path] deleted=30');
+  });
 });

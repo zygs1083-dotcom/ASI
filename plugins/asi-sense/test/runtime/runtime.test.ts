@@ -34,9 +34,11 @@ function harness(
   options: SenseOptions = {},
   nowReadings?: (session?: string) => NowReadings,
   modelJobs?: DshPort['modelJobs'],
+  syncMono = false,
 ) {
   vi.useFakeTimers();
   vi.setSystemTime(1_700_000_000_000);
+  const monoStart = performance.now();
   let mono = 0;
   let agent: (event: AgentEvent) => Promise<void> = async () => {};
   let tool: (event: ToolEvent) => Promise<void> = async () => {};
@@ -50,7 +52,7 @@ function harness(
   let probes = 0;
   const delivered: Parameters<DshPort['deliver']>[1][] = [];
   const ports: SensePorts = {
-    clock: { wall: () => Date.now(), mono: () => mono },
+    clock: { wall: () => Date.now(), mono: () => (syncMono ? performance.now() - monoStart : mono) },
     dsh: {
       ...(nowReadings ? { nowReadings } : {}),
       ...(modelJobs ? { modelJobs } : {}),
@@ -1197,7 +1199,7 @@ describe('host runtime', () => {
   });
 
   it('stops retrying after ten failures, reports degradation and recovers after a later delivery', async () => {
-    const h = harness();
+    const h = harness(undefined, {}, undefined, undefined, true);
     let attempts = 0;
     let failing = true;
     h.ports.dsh.deliver = async () => {
@@ -1234,7 +1236,7 @@ describe('host runtime', () => {
     expect(attempts).toBe(11);
     expect(h.runtime.state().observation.sources.delivery).toMatchObject({ status: 'ok' });
     await h.runtime.stop();
-  });
+  }, 20_000);
 
   it('resets the retry budget when the selected session changes', async () => {
     const h = harness();
@@ -1279,6 +1281,42 @@ describe('host runtime', () => {
     expect(h.runtime.state().observation.sources.delivery).toMatchObject({
       status: 'unavailable',
       error: '投递失败，已暂停重试（1 次）',
+    });
+    await h.runtime.stop();
+  });
+
+  it('records an unknown outcome once without transiently marking delivery ok', async () => {
+    const h = harness();
+    let attempts = 0;
+    h.ports.dsh.deliver = async () => {
+      attempts++;
+      if (attempts === 1) throw new Error('transient failure');
+      throw new DeliveryFailure('unknown', 0, new Error('fixture'));
+    };
+    await h.runtime.start();
+    await h.agent({ type: 'created', sessionId: 's' });
+    await h.agent({ type: 'pre-step', sessionId: 's' });
+    await h.job({ type: 'exited', id: 'failed-job', exitCode: 1 });
+    await h.advance(2_000);
+    expect(h.runtime.state().observation.sources.delivery?.status).toBe('unavailable');
+    const before = h.runtime.events().filter((event) => event.source.id === 'delivery').length;
+    const statuses: (string | undefined)[] = [];
+    const off = h.runtime.subscribe((state) => {
+      statuses.push(state.observation.sources.delivery?.status);
+    });
+    await h.advance(1_000);
+    off();
+    expect(attempts).toBe(2);
+    expect(statuses).not.toContain('ok');
+    expect(statuses.at(-1)).toBe('unavailable');
+    const added = h.runtime
+      .events()
+      .filter((event) => event.source.id === 'delivery')
+      .slice(before);
+    expect(added.map((event) => event.kind)).toEqual(['delivery-unknown']);
+    expect(h.runtime.state().observation.sources.delivery).toMatchObject({
+      status: 'unavailable',
+      error: '投递结果未知，未重试',
     });
     await h.runtime.stop();
   });

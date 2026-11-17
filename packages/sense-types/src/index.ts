@@ -221,6 +221,7 @@ export type BodyRateData = {
   delta: number;
   slope: number;
   timeToFloorMs?: number;
+  etaToFloorMs?: number;
   direction: 'up' | 'down';
 };
 
@@ -233,6 +234,8 @@ export type BodyAnomalyData = {
   value: number;
   baseline: number;
   deviation: number;
+  type?: 'rebaseline-suggestion';
+  suggestionId?: string;
 };
 
 /**
@@ -246,6 +249,8 @@ export type FileBurstData = {
   modified: number;
   deleted: number;
   agentDeleted: number;
+  externalDeleted?: number;
+  externalDeletionExceeded?: boolean;
 };
 
 /** Typed `data` contracts for signal kinds with a fixed schema. */

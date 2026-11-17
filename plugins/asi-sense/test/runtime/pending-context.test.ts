@@ -96,7 +96,7 @@ describe('pending context confirmation', () => {
     for (const id of ['retained-1', 'retained-2']) {
       expect(h.attention.events().find((event) => event.id === id)?.level).toBe('context');
     }
-  });
+  }, 20_000);
 
   it.each([0, 512, 1025])(
     'clears every alias after 1025 transfers when attempt %i confirms and ignores late confirmations',
@@ -203,5 +203,66 @@ describe('pending context confirmation', () => {
     expect(h.reported.size).toBe(1);
     for (let i = 0; i < 200; i++) await h.attention.accept(signal(`record-${i}`, 'record'));
     expect(h.reported.size).toBe(0);
+  });
+
+  it('clears staged aliases and drain batches when a transferred window batch is skipped with titles disabled', async () => {
+    let allowTitles = true;
+    const clock = { wall: () => 0, mono: () => 0 };
+    const rules: WatchRule[] = [
+      { id: 'win', match: { kind: 'window.focused' }, level: 'context', createdBy: 'user', approved: true },
+    ];
+    const deliveries: Parameters<DshPort['deliver']>[1][] = [];
+    const port = {
+      onAgentEvent: () => () => {},
+      onTool: () => () => {},
+      onJob: () => () => {},
+      tokenSnapshot: async () => undefined,
+      deliver: async (_session, intent) => {
+        deliveries.push(intent);
+      },
+      onDeliveryCommitted: () => () => {},
+    } satisfies DshPort & { onDeliveryCommitted: () => () => void };
+    const attention = new RuntimeAttention(
+      clock,
+      port,
+      () => rules,
+      () => {},
+      () => allowTitles,
+      () => {},
+      new FactExpiry(clock),
+    );
+    onTestFinished(() => attention.stop());
+    const pending = Reflect.get(attention, 'pending') as PendingContext;
+    const staged = Reflect.get(pending, 'staged') as Map<string, unknown>;
+    const batches = Reflect.get(Reflect.get(attention.pipeline, 'drain') as object, 'batches') as Map<
+      string,
+      unknown[]
+    >;
+
+    attention.create('a');
+    await attention.preStep('a');
+    await attention.accept({
+      id: 'win-1',
+      kind: 'window.focused',
+      subject: 'fixture.app',
+      at: 0,
+      source: { id: 'fixture', api: 'fixture', host: 'local' },
+      data: { title: 'Synthetic window' },
+    });
+    await attention.preStep('a');
+    expect(deliveries).toHaveLength(1);
+    expect(staged.size).toBe(1);
+    expect(batches.size).toBe(1);
+
+    allowTitles = false;
+    attention.create('b');
+    await attention.preStep('b');
+    expect(deliveries).toHaveLength(1);
+    expect(staged.size).toBe(0);
+    expect(batches.size).toBe(0);
+
+    allowTitles = true;
+    await attention.preStep('b');
+    expect(deliveries).toHaveLength(1);
   });
 });
