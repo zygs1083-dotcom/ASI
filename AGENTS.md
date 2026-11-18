@@ -17,10 +17,10 @@ ASI 是一组 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness
 |---|---|---|
 | 负责人 | 用户 | 产品决策、批准对外操作（push GitHub、发布插件） |
 | 协调端 | U2 上的 Claude（仓库 `/home/desktop/pro/ASI`） | 设计、写契约和任务说明、派发、裁决评审、合并 `main`、汇报 |
-| 开发 worker | MacPro 上的 devin，模型 `swe-2`（2026-11-17 起；terra 已从 devin 下架） | 在自己的工作树/分支实现、自测、提交、push 到 hub |
-| 测试/评审 worker | MacPro 上的 devin，模型 `swe-2`；另有 U1 上的 agy（Gemini 4 Carbon High / Hydrogen XHigh，`ASI_HOST=U1`） | 写测试、在真实 DSH 里验收、独立评审（只读代码） |
+| 开发 worker | **默认 U1 上的 agy Gemini 4 Hydrogen XHigh**（负责人 2026-11-17 定，`ASI_HOST=U1 dispatch.sh <task> hydrogen …`） | 在自己的工作树/分支实现、自测、提交、push 到 hub |
+| 测试/评审 worker | **默认 U1 上的 Hydrogen**（新会话、未参与实现）；只有必须在 macOS/真实 DSH 里做的验收，暂由 MacPro 上的 devin `swe-2` 承担（MacPro 上 agy 被 Google 地区限制） | 写测试、在真实 DSH 里验收、独立评审（只读代码） |
 
-- worker 只在 **MacPro** 上运行（插件依赖 macOS API 和本机 DSH），**同时最多 5 个**。
+- worker 在 **U1**（Linux，纯逻辑与单测）和 **MacPro**（macOS API、真实 DSH 验收）上运行，合计**同时最多 5 个**；U1 磁盘紧张，同时不超过 3 个。
 - 协调端不在 worker 工作树里改代码；worker 不替负责人做产品决策，口径不清用 `orca orchestration ask` 问。
 - 评审 worker 必须是新会话、没参与实现。
 
