@@ -15,7 +15,7 @@
 输出必须是 `0.2.2-rc.3`。然后完全退出 Desktop（包括后台进程），再执行：
 
 ```sh
-"/Applications/DeepSeek Harness.app/Contents/Resources/runtime/cli/bin/dsh" plugin --profile desktop add "$HOME/Downloads/asi-sense-0.1.3.tgz"
+"/Applications/DeepSeek Harness.app/Contents/Resources/runtime/cli/bin/dsh" plugin --profile desktop add "$HOME/Downloads/asi-sense-0.1.4.tgz"
 ```
 
 安装成功后重启 Desktop，打开侧栏的「环境感知」；

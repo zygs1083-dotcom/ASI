@@ -1,6 +1,6 @@
 {
   "name": "asi-sense",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "private": true,
   "description": "Local environment awareness and triggers for DeepSeek Harness.",
   "license": "MIT",
