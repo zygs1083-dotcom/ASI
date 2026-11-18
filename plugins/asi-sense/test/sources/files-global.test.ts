@@ -567,6 +567,27 @@ describe('FileGlobalSource integration', () => {
     await h.runtime.stop();
   });
 
+  it('masks a deep cached home root and two-segment home roots without leaking the account name', async () => {
+    const h = createHarness({ globalFileWatch: { homedir: path.posix.join('/', 'srv', 'home', 'demo') } });
+    await h.runtime.start();
+
+    // The cached home root can be deeper than two segments; it must still map to '~'.
+    h.emitFile({ path: path.posix.join('/', 'srv', 'home', 'demo'), change: 'modify' });
+    h.emitFile({ path: path.posix.join('/', 'srv', 'home', 'demo', 'proj', 'note.md'), change: 'modify' });
+    // A standard two-segment home root is recognized by shape alone, whatever os.homedir() says.
+    h.emitFile({ path: path.posix.join('/', 'Users', 'demo'), change: 'modify' });
+    await h.advance(10_000);
+
+    const acts = collectActivity(h.events());
+    const filesIn = (directory: string) =>
+      acts.filter((e) => e.detail?.directory === directory).flatMap((e) => e.detail?.files ?? []);
+    expect(filesIn('/srv/home')).toEqual(['~']);
+    expect(filesIn('/users')).toEqual(['~']);
+    expect(filesIn('/srv/home/demo/proj')).toEqual(['note.md']);
+    expect(filesIn('/srv/home')).not.toContain('demo');
+    await h.runtime.stop();
+  });
+
   it('stays within <20MB heap growth and <3% CPU under sustained 15,000/s x 60s load', async () => {
     let mono = 10_000;
     const clock = { wall: () => 1_700_000_000_000 + mono, mono: () => mono };

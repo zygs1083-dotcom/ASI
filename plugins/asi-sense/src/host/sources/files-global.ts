@@ -693,7 +693,12 @@ export class FileGlobalSource {
       const base = slash < 0 ? absPath : absPath.slice(slash + 1);
       // The home root itself must never contribute the account name to `files`; `directory` alone
       // (e.g. '/users') stays generic, so write the '~' placeholder instead of the basename.
-      if (isHomeRoot(absPath, this.platform) || (this.homeRoot !== undefined && absPath === this.homeRoot)) {
+      // Cheap shape test first: on this code path `absPath` is a normalized POSIX path, so a home
+      // root is either exactly the cached `homeRoot` or exactly two segments ('/Users/x',
+      // '/home/x'). Ordinary deep paths (the 15k/s hot path) skip isHomeRoot's
+      // os.homedir()/NFC/regex work; both branches keep the previous masking behavior.
+      const homeRootShaped = slash > 0 && absPath.indexOf('/', 1) === slash;
+      if (absPath === this.homeRoot || (homeRootShaped && isHomeRoot(absPath, this.platform))) {
         group.files.add('~');
       } else if (base.length > 0) {
         group.files.add(base);
