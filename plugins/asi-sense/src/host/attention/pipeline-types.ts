@@ -62,6 +62,8 @@ export interface AttentionPipelineOptions {
   mergeWindowMs?: number;
   /** Initial merge window for `file.changed`. @default 5000 */
   fileMergeWindowMs?: number;
+  /** Target OS platform for path comparison semantics (e.g. `'darwin'`). */
+  platform?: string;
 }
 
 export interface SessionState {

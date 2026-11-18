@@ -183,4 +183,45 @@ describe('missing file watcher roots', () => {
     ]);
     watcher.close();
   });
+
+  it('reports native close as ECLOSE watchError and lstat permission failure as watchError rather than delete', () => {
+    const handlers: Record<string, () => void> = {};
+    let emit!: (event: 'rename' | 'change', filename: string | null) => void;
+    let denied = false;
+    fsMocks.statSync.mockReturnValue({ isDirectory: () => true });
+    fsMocks.lstatSync.mockImplementation(() => {
+      if (denied) throw Object.assign(new Error('denied'), { code: 'EACCES' });
+      return { isDirectory: () => false };
+    });
+    fsMocks.watch.mockImplementation((_root, _options, cb) => {
+      emit = cb;
+      return {
+        on: (ev: string, fn: () => void) => {
+          handlers[ev] = fn;
+        },
+        close: vi.fn(),
+      };
+    });
+    const events: unknown[] = [];
+    const ports = localPorts({ logger: { warn: vi.fn() } } as unknown as Context, '/storage');
+    const watcher = ports.files.watch('/sandbox', (event) => events.push(event));
+
+    denied = true;
+    emit('rename', 'secret-file');
+    handlers.close?.();
+    // Native close stops forwarding further fs.watch callbacks.
+    emit('change', 'after-close');
+
+    expect(events).toEqual([
+      {
+        path: '/sandbox',
+        change: 'modify',
+        watchError: true,
+        errorCode: 'EACCES',
+        errorPath: '/sandbox/secret-file',
+      },
+      { path: '/sandbox', change: 'modify', watchError: true, errorCode: 'ECLOSE', errorPath: '/sandbox' },
+    ]);
+    watcher.close();
+  });
 });

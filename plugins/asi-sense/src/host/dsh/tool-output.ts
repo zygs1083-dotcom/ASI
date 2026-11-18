@@ -238,6 +238,20 @@ export function modelState(state: SenseState, now: number, section?: 'self' | 'e
       watchedPaths: fact(env.watchedPaths, (value) =>
         dictionary(value, modelPath, (item) => pick(item, ['lastChange', 'changes'])),
       ),
+      ...(env.globalFileWatch
+        ? {
+            globalFileWatch: fact(env.globalFileWatch, (value) => ({
+              enabled: value.enabled,
+              status: value.status,
+              windowMs: value.windowMs,
+              eventsPerSec: value.eventsPerSec,
+              degraded: value.degraded,
+              countOnly: value.countOnly,
+              deniedCount: value.deniedPaths.length,
+              exclusionCount: value.exclusions.length,
+            })),
+          }
+        : {}),
     },
     observation: observations(state.observation),
   };
@@ -252,8 +266,10 @@ export function modelRules(rules: WatchRule[]): JsonValue {
     'window.focused',
     'window.title-changed',
     'file.changed',
+    'file.activity',
     'job.started',
     'job.exited',
+    'process.started',
     'process.exited',
     'source.status',
     'source.error',
@@ -262,6 +278,7 @@ export function modelRules(rules: WatchRule[]): JsonValue {
     'body.anomaly',
     'file.burst',
     'fact.updated',
+    'delivery.target-unavailable',
   ]);
   return modelOutput(
     rules.map((rule) => {
@@ -288,13 +305,18 @@ export function modelRules(rules: WatchRule[]): JsonValue {
         id: identifier(rule.id),
         match: {
           kind: kinds.has(rule.match.kind) ? rule.match.kind : '[redacted]',
-          ...(rule.match.kind === 'file.changed' && rule.match.subject !== undefined
+          ...((rule.match.kind === 'file.changed' ||
+            rule.match.kind === 'file.activity' ||
+            rule.match.kind === 'file.burst') &&
+          rule.match.subject !== undefined
             ? { subject: modelPath(rule.match.subject) }
             : {}),
           ...(Object.keys(where).length ? { where } : {}),
         },
       };
     }),
+    undefined,
+    ['match.kind'],
   );
 }
 

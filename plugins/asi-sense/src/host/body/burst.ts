@@ -25,7 +25,7 @@ interface FileEvent {
   at: number;
   change: Change;
   agent: boolean;
-  count?: number;
+  count: number;
 }
 
 function activityCount(v: unknown): number | undefined {
@@ -44,11 +44,15 @@ export interface BurstTarget {
 }
 
 interface DirState {
+  key: string;
+  prev?: DirState;
+  next?: DirState;
   /** Scope id this window belongs to (retention + emitted `data.scope`). */
   scope: string;
   /** Concrete bucket directory (emitted as `subject`/`data.directory`). */
   dir: string;
   win: TimeWindow<FileEvent>;
+  counts: Counts;
   lastAt: number;
   /** External-burst wake latch. */
   wake: boolean;
@@ -68,6 +72,7 @@ interface Counts {
 
 const DEFAULTS = { windowMs: 60_000, maxChanges: 100, maxDeleted: 50 } as const;
 const REARM = 0.8;
+const EMPTY_SIGNALS: BodySignal[] = [];
 
 /**
  * Per-directory (or per watched root) file-burst detector (DESIGN §2.2c,
@@ -87,8 +92,12 @@ export class FileBurstDetector {
   private roots?: readonly string[];
   private readonly threshold: (param: string, fallback: number) => number;
   private readonly dirs = new Map<string, DirState>();
+  private head?: DirState;
+  private tail?: DirState;
   private readonly maxDirectories: number;
   private lastReceived = Number.NEGATIVE_INFINITY;
+  private readonly limBuf = { windowMs: 0, maxChanges: 0, maxDeleted: 0 };
+  private readonly singleItem: [{ change: Change; count: number }] = [{ change: 'add', count: 1 }];
 
   constructor(options: FileBurstOptions = {}) {
     if (options.threshold !== undefined && typeof options.threshold !== 'function') {
@@ -122,26 +131,61 @@ export class FileBurstDetector {
     }
   }
 
+  private linkTail(st: DirState): void {
+    st.prev = this.tail;
+    st.next = undefined;
+    if (this.tail) this.tail.next = st;
+    else this.head = st;
+    this.tail = st;
+  }
+
+  private unlink(st: DirState): void {
+    const { prev, next } = st;
+    if (prev) prev.next = next;
+    else this.head = next;
+    if (next) next.prev = prev;
+    else this.tail = prev;
+    st.prev = undefined;
+    st.next = undefined;
+  }
+
+  private moveToTail(st: DirState): void {
+    if (st === this.tail) return;
+    this.unlink(st);
+    this.linkTail(st);
+  }
+
   /**
    * Retains windows whose scope id is listed, dropping all others — a removed
    * or expired rule's history never revives if its scope returns.
    */
   setScopes(scopes: readonly string[]): void {
+    if (scopes.length === 0) {
+      this.dirs.clear();
+      this.head = undefined;
+      this.tail = undefined;
+      return;
+    }
     const retained = new Set(scopes);
-    for (const [key, entry] of this.dirs) if (!retained.has(entry.scope)) this.dirs.delete(key);
+    for (const [key, entry] of this.dirs) {
+      if (!retained.has(entry.scope)) {
+        this.unlink(entry);
+        this.dirs.delete(key);
+      }
+    }
+  }
+
+  private limitVal(param: string, fallback: number): number {
+    const v = this.threshold(param, fallback);
+    return Number.isFinite(v) && v > 0 ? v : fallback;
   }
 
   /** Live limits: the resolver is consulted per accept; bad reads fall back to config. */
   private limits(): { windowMs: number; maxChanges: number; maxDeleted: number } {
-    const r = (param: string, fallback: number) => {
-      const v = this.threshold(param, fallback);
-      return Number.isFinite(v) && v > 0 ? v : fallback;
-    };
-    return {
-      windowMs: r('file.burst.windowMs', this.windowMs),
-      maxChanges: r('file.burst.maxChanges', this.maxChanges),
-      maxDeleted: r('file.burst.maxDeleted', this.maxDeleted),
-    };
+    this.limBuf.windowMs = this.limitVal('file.burst.windowMs', this.windowMs);
+    this.limBuf.maxChanges = this.limitVal('file.burst.maxChanges', this.maxChanges);
+    this.limBuf.maxDeleted = this.limitVal('file.burst.maxDeleted', this.maxDeleted);
+    return this.limBuf;
   }
 
   /** Every watched root containing `path`, or `[dirname]` without roots. */
@@ -171,45 +215,95 @@ export class FileBurstDetector {
       !Number.isFinite(signal.at) ||
       receivedAt < this.lastReceived
     )
-      return [];
-    const items: { change: Change; count: number }[] = [];
-    let path: string;
+      return EMPTY_SIGNALS;
+    let items: { change: Change; count: number }[];
+    let path = '';
     if (signal.kind === 'file.changed') {
       const change = signal.data.change as Change | undefined;
-      if (change !== 'add' && change !== 'modify' && change !== 'delete') return [];
-      items.push({ change, count: 1 });
-      path = typeof signal.data.path === 'string' ? signal.data.path : signal.subject;
+      if (change !== 'add' && change !== 'modify' && change !== 'delete') return EMPTY_SIGNALS;
+      this.singleItem[0].change = change;
+      items = this.singleItem;
+      if (dirs === undefined) {
+        path = typeof signal.data.path === 'string' ? signal.data.path : signal.subject;
+      }
     } else {
       const created = activityCount(signal.data.created);
       const modified = activityCount(signal.data.modified);
       const deleted = activityCount(signal.data.deleted);
-      if (created === undefined || modified === undefined || deleted === undefined) return [];
+      if (created === undefined || modified === undefined || deleted === undefined) return EMPTY_SIGNALS;
+      items = [];
       if (created > 0) items.push({ change: 'add', count: created });
       if (modified > 0) items.push({ change: 'modify', count: modified });
       if (deleted > 0) items.push({ change: 'delete', count: deleted });
-      if (items.length === 0) return [];
-      path =
-        typeof signal.data.directory === 'string' && signal.data.directory.length > 0
-          ? signal.data.directory
-          : signal.subject;
+      if (items.length === 0) return EMPTY_SIGNALS;
+      if (dirs === undefined) {
+        path =
+          typeof signal.data.directory === 'string' && signal.data.directory.length > 0
+            ? signal.data.directory
+            : signal.subject;
+      }
     }
     const targets =
       dirs === undefined
         ? this.groups(path, signal.kind === 'file.activity')
-        : [...new Map(dirs.map((t) => [`${t.scope}${t.dir}`, t] as const)).values()];
-    if (targets.length === 0) return []; // outside every watched scope
+        : dirs.length <= 1
+          ? dirs
+          : [...new Map(dirs.map((t) => [`${t.scope}${t.dir}`, t] as const)).values()];
+    if (targets.length === 0) return EMPTY_SIGNALS; // outside every watched scope
     const lim = this.limits();
     this.lastReceived = receivedAt;
-    for (const [key, entry] of this.dirs) {
-      entry.win.prune(receivedAt - lim.windowMs);
-      if (entry.win.size === 0) this.dirs.delete(key);
+    const cutoff = receivedAt - lim.windowMs;
+    // `head..tail` is kept in ascending `lastAt` order, so expired
+    // directories sit at the head and we stop at the first fresh entry.
+    while (this.head && this.head.lastAt < cutoff) {
+      const old = this.head;
+      this.unlink(old);
+      this.dirs.delete(old.key);
     }
-    const out: BodySignal[] = [];
-    for (const target of targets) {
-      const emitted = this.record(target, signal, items, receivedAt, lim);
-      if (emitted) out.push(emitted);
+    let out: BodySignal[] | undefined;
+    for (let i = 0; i < targets.length; i++) {
+      const emitted = this.record(targets[i] as BurstTarget, signal, items, receivedAt, lim);
+      if (emitted) {
+        out ??= [];
+        out.push(emitted);
+      }
     }
-    return out;
+    return out ?? EMPTY_SIGNALS;
+  }
+
+  private adjustCounts(c: Counts, change: Change, agent: boolean, delta: number): void {
+    if (change === 'add') {
+      c.created += delta;
+      if (agent) c.agentCreated += delta;
+    } else if (change === 'modify') {
+      c.modified += delta;
+      if (agent) c.agentModified += delta;
+    } else {
+      c.deleted += delta;
+      if (agent) c.agentDeleted += delta;
+    }
+  }
+
+  private hasOverlappingWake(
+    target: BurstTarget,
+    receivedAt: number,
+    windowMs: number,
+    deletionOnly: boolean,
+  ): boolean {
+    const isGlobal = target.scope === 'global';
+    const cutoff = receivedAt - windowMs;
+    for (let entry = this.tail; entry !== undefined; entry = entry.prev) {
+      if (entry.lastAt < cutoff) break;
+      if (isGlobal ? entry.scope === 'global' : entry.scope !== 'global') continue;
+      if (deletionOnly ? !entry.deletion : !entry.wake && !entry.deletion) continue;
+      if (entry.dir === target.dir) return true;
+      if (isGlobal && entry.scope.startsWith('dir:')) {
+        if (entry.dir === '/' || target.dir.startsWith(`${entry.dir}/`)) return true;
+      } else if (!isGlobal && target.scope.startsWith('dir:')) {
+        if (target.dir === '/' || entry.dir.startsWith(`${target.dir}/`)) return true;
+      }
+    }
+    return false;
   }
 
   /** Counts one event (or aggregated `file.activity` batch) against a single scope window; emits on a new crossing. */
@@ -224,41 +318,70 @@ export class FileBurstDetector {
     let st = this.dirs.get(key);
     if (st && receivedAt < st.lastAt) return undefined; // backward per-directory event
     if (st) {
-      st.win.prune(receivedAt - lim.windowMs);
+      const cutoff = receivedAt - lim.windowMs;
+      for (;;) {
+        const evicted = st.win.shiftBefore(cutoff);
+        if (!evicted) break;
+        this.adjustCounts(st.counts, evicted.change, evicted.agent, -evicted.count);
+      }
       if (st.win.size === 0) {
-        this.dirs.delete(key);
-        st = undefined; // expired under its own watermark: fresh state
+        st.counts.created = 0;
+        st.counts.modified = 0;
+        st.counts.deleted = 0;
+        st.counts.agentCreated = 0;
+        st.counts.agentModified = 0;
+        st.counts.agentDeleted = 0;
+        st.wake = false;
+        st.deletion = false;
+        st.agentOnly = false;
       }
-    }
-    if (!st) {
-      if (this.dirs.size >= this.maxDirectories) {
-        let oldestKey: string | undefined;
-        let oldest = Number.POSITIVE_INFINITY;
-        for (const [k, entry] of this.dirs) {
-          if (entry.lastAt < oldest) {
-            oldestKey = k;
-            oldest = entry.lastAt;
-          }
+      this.moveToTail(st);
+    } else {
+      let reused: DirState | undefined;
+      if (this.dirs.size >= this.maxDirectories && this.head) {
+        const oldest = this.head;
+        this.unlink(oldest);
+        this.dirs.delete(oldest.key);
+        if (oldest.win.capacity <= 64) {
+          reused = oldest;
+          reused.key = key;
+          reused.scope = target.scope;
+          reused.dir = target.dir;
+          reused.win.clear();
+          reused.counts.created = 0;
+          reused.counts.modified = 0;
+          reused.counts.deleted = 0;
+          reused.counts.agentCreated = 0;
+          reused.counts.agentModified = 0;
+          reused.counts.agentDeleted = 0;
+          reused.lastAt = Number.NEGATIVE_INFINITY;
+          reused.wake = false;
+          reused.deletion = false;
+          reused.agentOnly = false;
         }
-        if (oldestKey !== undefined) this.dirs.delete(oldestKey);
       }
-      st = {
+      st = reused ?? {
+        key,
         scope: target.scope,
         dir: target.dir,
         win: new TimeWindow<FileEvent>(),
+        counts: { created: 0, modified: 0, deleted: 0, agentCreated: 0, agentModified: 0, agentDeleted: 0 },
         lastAt: Number.NEGATIVE_INFINITY,
         wake: false,
         deletion: false,
         agentOnly: false,
       };
       this.dirs.set(key, st);
+      this.linkTail(st);
     }
     st.lastAt = receivedAt;
     const agent = signal.cause === 'agent';
-    for (const item of items) {
-      st.win.push({ at: receivedAt, change: item.change, agent, ...(item.count === 1 ? {} : { count: item.count }) });
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i] as { change: Change; count: number };
+      st.win.push({ at: receivedAt, change: item.change, agent, count: item.count });
+      this.adjustCounts(st.counts, item.change, agent, item.count);
     }
-    const counts = this.count(st.win);
+    const counts = st.counts;
     const extDeleted = counts.deleted - counts.agentDeleted;
     const extTotal = counts.created + counts.modified + counts.deleted - extCounts(counts);
     const externalDeletionExceeded = extDeleted > lim.maxDeleted;
@@ -269,7 +392,12 @@ export class FileBurstDetector {
     if (externalDeletionExceeded) st.deletion = true;
     else if (extDeleted < lim.maxDeleted * REARM) st.deletion = false;
     if (extTotal > lim.maxChanges || externalDeletionExceeded) {
-      if (totalCrossed || deletionCrossed) return this.emit(signal, st, 'wake', counts, lim, externalDeletionExceeded);
+      if (totalCrossed || deletionCrossed) {
+        if (this.hasOverlappingWake(target, receivedAt, lim.windowMs, !totalCrossed && deletionCrossed)) {
+          return undefined;
+        }
+        return this.emit(signal, st, 'wake', { ...counts }, lim, externalDeletionExceeded);
+      }
       return undefined;
     }
     // Pure self-cause crossing: totals only breach through agent events.
@@ -277,30 +405,12 @@ export class FileBurstDetector {
     if (total > lim.maxChanges || counts.deleted > lim.maxDeleted) {
       if (!st.agentOnly) {
         st.agentOnly = true;
-        return this.emit(signal, st, 'record', counts, lim, externalDeletionExceeded, 'agent');
+        return this.emit(signal, st, 'record', { ...counts }, lim, externalDeletionExceeded, 'agent');
       }
     } else if (st.agentOnly && total < lim.maxChanges * REARM && counts.deleted < lim.maxDeleted * REARM) {
       st.agentOnly = false;
     }
     return undefined;
-  }
-
-  private count(win: TimeWindow<FileEvent>): Counts {
-    const c: Counts = { created: 0, modified: 0, deleted: 0, agentCreated: 0, agentModified: 0, agentDeleted: 0 };
-    for (const e of win.values()) {
-      const n = e.count ?? 1;
-      if (e.change === 'add') {
-        c.created += n;
-        if (e.agent) c.agentCreated += n;
-      } else if (e.change === 'modify') {
-        c.modified += n;
-        if (e.agent) c.agentModified += n;
-      } else {
-        c.deleted += n;
-        if (e.agent) c.agentDeleted += n;
-      }
-    }
-    return c;
   }
 
   private emit(

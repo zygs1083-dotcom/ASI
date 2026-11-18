@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import os from 'node:os';
 import type { EnvUpdate } from '@asi/sense-types';
 import type { Agent } from '@deepseek-ai/dsh-agent';
 import { freezeMessage, MessageId, type UserMessage } from '@deepseek-ai/dsh-llm';
@@ -12,6 +13,40 @@ declare module '@deepseek-ai/dsh-llm' {
   interface MessageSourceMap {
     environment: { kind: 'environment' };
   }
+}
+
+const MAX_ACTIVITY_NAME = 512;
+
+function isHomeRoot(raw: string): boolean {
+  const clean = raw.replaceAll('\\', '/').replace(/\/+$/, '') || '/';
+  const home = os.homedir().replaceAll('\\', '/').replace(/\/+$/, '');
+  const nfcClean = clean.normalize('NFC');
+  const nfcHome = home.normalize('NFC');
+  if (
+    nfcHome &&
+    (process.platform === 'darwin' ? nfcClean.toLowerCase() === nfcHome.toLowerCase() : nfcClean === nfcHome)
+  ) {
+    return true;
+  }
+  return /^\/(?:Users|home)\/[^/]+$/i.test(nfcClean);
+}
+
+function truncateName(value: string, limit = MAX_ACTIVITY_NAME): string {
+  if (value.length <= limit) return value;
+  const max = Math.max(0, limit - 3);
+  let end = 0;
+  for (const ch of value) {
+    if (end + ch.length > max) break;
+    end += ch.length;
+  }
+  return `${value.slice(0, end)}...`;
+}
+
+function modelActivityName(raw: string, maskHomeRoot = false): string {
+  if (maskHomeRoot && isHomeRoot(raw)) return '~';
+  const base = modelPath(raw);
+  const masked = modelTitle(truncateName(base));
+  return masked.trim() ? masked : '[file]';
 }
 
 function metric(value: unknown): string {
@@ -118,14 +153,15 @@ function modelUpdate(update: EnvUpdate): EnvUpdate {
           data.externalDeleted = deleted - agentDeleted;
         if (signal.data.externalDeletionExceeded === true) data.externalDeletionExceeded = true;
       } else if (signal.kind === 'file.activity') {
-        const maskedDir = modelPath(
+        const maskedDir = modelActivityName(
           typeof signal.data.directory === 'string' && signal.data.directory.trim()
             ? signal.data.directory
             : signal.subject,
+          true,
         );
         subject = maskedDir;
         data.directory = maskedDir;
-        for (const key of ['windowMs', 'created', 'modified', 'deleted']) {
+        for (const key of ['windowMs', 'created', 'modified', 'deleted', 'rolledUp']) {
           const value = signal.data[key];
           if (typeof value === 'number' && Number.isFinite(value)) data[key] = value;
         }
@@ -133,7 +169,7 @@ function modelUpdate(update: EnvUpdate): EnvUpdate {
           const files = signal.data.files
             .filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
             .slice(0, 5)
-            .map((item) => modelPath(item));
+            .map((item) => modelActivityName(item, false));
           if (files.length > 0) data.files = files;
         }
         if (signal.data.degraded === true) data.degraded = true;

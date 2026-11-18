@@ -1,6 +1,7 @@
 import type { Context } from '@deepseek-ai/cordis';
 import { principalOf, Remote, RemoteError, TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol';
 import type { SenseActions } from '../runtime/ports.ts';
+import { normalizeFileExclusion } from '../sources/file-exclusions.ts';
 import type { FramesSource } from './frames.ts';
 import { toWirePanelModel } from './wire.ts';
 import type { WirePanelModel } from './wire-types.ts';
@@ -136,12 +137,21 @@ export class AsiSenseRemote extends TypertRemoteService {
     pattern: string,
     action: ((pattern: string) => Promise<void>) | undefined,
   ): Promise<void> {
-    await this.userAction(() => {
+    await this.userAction(async () => {
       if (typeof pattern !== 'string' || !pattern.trim()) {
         throw new RemoteError('gateway/bad-request', 'Exclusion pattern is required', {});
       }
       if (!action) throw new Error('File exclusion management unavailable');
-      return action(pattern);
+      try {
+        normalizeFileExclusion(pattern);
+        await action(pattern);
+      } catch (error) {
+        if (error instanceof RemoteError) throw error;
+        if (error instanceof TypeError || error instanceof RangeError) {
+          throw new RemoteError('gateway/bad-request', error.message, {});
+        }
+        throw error;
+      }
     });
   }
 

@@ -63,9 +63,18 @@ export class BodySource {
   private burstScopes = '';
   private ruleScopes: string[] = [];
   private globalScope = false;
+  private burstWindowMs = 60_000;
+  private burstMaxChanges = 100;
+  private burstMaxDeleted = 50;
   private readonly detector = new FileBurstDetector({
-    threshold: (param, fallback) => this.tuner.number(param, fallback),
+    threshold: (param, fallback) => {
+      if (param === 'file.burst.windowMs') return this.burstWindowMs;
+      if (param === 'file.burst.maxChanges') return this.burstMaxChanges;
+      if (param === 'file.burst.maxDeleted') return this.burstMaxDeleted;
+      return this.tuner.number(param, fallback);
+    },
   });
+  private readonly pendingBursts = new Set<Promise<void>>();
   private rateTimes: RateTimes = {};
   private rateSession?: string;
 
@@ -181,6 +190,9 @@ export class BodySource {
   }
   private syncAttention(actor: 'agent' | 'user' = this.identity.getStore() ?? 'agent'): void {
     if (this.stopped) return;
+    this.burstWindowMs = this.tuner.number('file.burst.windowMs', 60_000);
+    this.burstMaxChanges = this.tuner.number('file.burst.maxChanges', 100);
+    this.burstMaxDeleted = this.tuner.number('file.burst.maxDeleted', 50);
     const pipeline = this.attention.pipeline;
     pipeline.setMergeWindows(this.tuner.number('mergeWindowMs', 2_000), this.tuner.number('fileMergeWindowMs', 5_000));
     pipeline.setDeliveryLevels(
@@ -236,13 +248,20 @@ export class BodySource {
     this.burstScopes = key;
     this.detector.setScopes(ordered);
   }
-  async burst(signal: Signal, dirs?: readonly BurstTarget[]): Promise<void> {
-    if (this.stopped) return;
-    for (const burst of this.detector.accept(signal, this.clock.mono(), dirs)) {
-      burst.data.feedbackAvailable = false;
-      await this.attention.accept(burst);
-      this.register(burst);
-    }
+  burst(signal: Signal, dirs?: readonly BurstTarget[], receivedMono = this.clock.mono()): Promise<void> | undefined {
+    if (this.stopped) return undefined;
+    const emitted = this.detector.accept(signal, receivedMono, dirs);
+    if (emitted.length === 0) return undefined;
+    const work = (async () => {
+      for (const burst of emitted) {
+        burst.data.feedbackAvailable = false;
+        await this.attention.accept(burst);
+        this.register(burst);
+      }
+    })();
+    this.pendingBursts.add(work);
+    void work.finally(() => this.pendingBursts.delete(work));
+    return work;
   }
   async stop(): Promise<void> {
     this.stopped = true;
@@ -250,7 +269,7 @@ export class BodySource {
     this.off?.();
     if (this.sampling) await this.probe.stop();
     this.sampling = false;
-    await this.tail;
+    await Promise.allSettled([this.tail, ...this.pendingBursts]);
     await this.monitor.close();
     await tokens;
   }

@@ -25,7 +25,7 @@ export interface EventEntry {
   mono?: number;
   restarts?: number;
   source: SourceRef;
-  detail?: Record<string, string | number | boolean>;
+  detail?: Record<string, string | number | boolean | string[]>;
   currentEta?: { asOf: number; ratePerMinute: number; timeToThresholdMs?: number };
   feedback?: 'useful' | 'noise';
   feedbackAvailable?: boolean;
@@ -65,6 +65,7 @@ export class RuntimeAttention {
     expiry: FactExpiry,
     private readonly ensureTarget?: () => void,
     private readonly canEnsureTarget?: () => boolean,
+    platform: string = process.platform,
   ) {
     const staged = dsh as DshPort & {
       onDeliveryCommitted?: (cb: (session: string, id: string) => void) => () => void;
@@ -81,6 +82,7 @@ export class RuntimeAttention {
     this.pipeline = new AttentionPipeline({
       store: this.store,
       rules: rules(),
+      platform,
       clock: () => clock.mono(),
       wallClock: () => clock.wall(),
       isCurrent: () => {

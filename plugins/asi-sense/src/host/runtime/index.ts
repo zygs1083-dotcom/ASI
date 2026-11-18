@@ -1,7 +1,7 @@
 import type { WatchRule } from '@asi/sense-types';
 import { BodySource } from '../sources/body.ts';
 import { DshSource } from '../sources/dsh.ts';
-import { normalizeFileExclusion } from '../sources/file-exclusions.ts';
+import { exclusionKey, MAX_FILE_EXCLUSIONS, normalizeFileExclusion } from '../sources/file-exclusions.ts';
 import { FileSource } from '../sources/files.ts';
 import { FileGlobalSource } from '../sources/files-global.ts';
 import { HelperSource } from '../sources/helper.ts';
@@ -24,7 +24,8 @@ export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}
   )
     throw new TypeError('selfCauseGraceMs must be a non-negative finite number');
   const { clock } = ports;
-  const settings = new Settings(ports.storage, options.rules);
+  const platform = options.platform ?? process.platform;
+  const settings = new Settings(ports.storage, options.rules, platform);
   let running = false;
   let started = false;
   let generation = 0;
@@ -57,13 +58,23 @@ export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}
     expiry,
     () => target.ensure(),
     () => target.canEnsure(),
+    platform,
   );
   const listeners = createStateListeners();
   const body = new BodySource(ports.probe, ports.dsh, ports.storage, clock, attention, expiry, isPaused, changed);
-  const dsh = new DshSource(deliveryPort, clock, attention, body, isPaused, options.selfCauseGraceMs, (id) => {
-    target.unload(id);
-    attention.rescheduleDelivery();
-  });
+  const dsh = new DshSource(
+    deliveryPort,
+    clock,
+    attention,
+    body,
+    isPaused,
+    options.selfCauseGraceMs,
+    (id) => {
+      target.unload(id);
+      attention.rescheduleDelivery();
+    },
+    platform,
+  );
   const target = createSessionTarget(
     ports.dsh,
     ports.storage,
@@ -98,6 +109,7 @@ export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}
     isPaused,
     (signal, dirs) => body.burst(signal, dirs),
     (scopes) => body.setScopes(scopes),
+    platform,
   );
   const filesGlobal = new FileGlobalSource(
     ports.files,
@@ -106,12 +118,12 @@ export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}
     dsh,
     settings,
     isPaused,
-    (signal, dirs) => body.burst(signal, dirs),
+    (signal, dirs, receivedMono) => body.burst(signal, dirs, receivedMono),
     (enabled) => body.setGlobalScope(enabled),
-    (dir) => files.hasDirScope(dir),
+    (absPath) => files.hasDirScope(absPath),
     () => schedule(),
     options.globalFileWatch,
-    options.platform,
+    platform,
   );
   const helper = new HelperSource(
     ports.helper,
@@ -286,24 +298,34 @@ export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}
         body.sync();
       }),
     dismissTuningBackup: () => body.asUser(() => body.monitor.dismissBackup()),
-    setGlobalFileWatch: (enabled) =>
-      updateGlobalWatch((draft) => {
+    setGlobalFileWatch: async (enabled) => {
+      filesGlobal.resetWatchAvailability();
+      await updateGlobalWatch((draft) => {
         draft.globalFileWatch = enabled;
-      }),
+      });
+    },
     addFileExclusion: (pattern) => {
       check();
       const norm = normalizeFileExclusion(pattern);
+      const key = exclusionKey(norm, platform);
       return updateGlobalWatch((draft) => {
         const list = draft.fileExclusions ?? [];
-        if (!list.includes(norm)) list.push(norm);
+        if (list.some((item) => exclusionKey(item, platform) === key)) {
+          throw new TypeError('Exclusion pattern already exists');
+        }
+        if (list.length >= MAX_FILE_EXCLUSIONS) {
+          throw new RangeError(`Maximum of ${MAX_FILE_EXCLUSIONS} exclusion patterns reached`);
+        }
+        list.push(norm);
         draft.fileExclusions = list;
       });
     },
     removeFileExclusion: (pattern) => {
       check();
       const norm = normalizeFileExclusion(pattern);
+      const key = exclusionKey(norm, platform);
       return updateGlobalWatch((draft) => {
-        draft.fileExclusions = (draft.fileExclusions ?? []).filter((item) => item !== norm);
+        draft.fileExclusions = (draft.fileExclusions ?? []).filter((item) => exclusionKey(item, platform) !== key);
       });
     },
   };

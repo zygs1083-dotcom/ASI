@@ -1,5 +1,5 @@
 import { Context } from '@deepseek-ai/cordis';
-import { remoteMethods } from '@deepseek-ai/dsh-typert-protocol';
+import { RemoteError, remoteMethods } from '@deepseek-ai/dsh-typert-protocol';
 import { describe, expect, it, onTestFinished, vi } from 'vitest';
 import type { FramesSource } from '../../src/host/dsh/frames.ts';
 import { AsiSenseRemote } from '../../src/host/dsh/remote.ts';
@@ -105,5 +105,15 @@ describe('DSH remote service', () => {
     expect(actions.addFileExclusion).toHaveBeenCalledWith('~/custom-cache');
     expect(actions.removeFileExclusion).toHaveBeenCalledWith('~/custom-cache');
     expect(invalidate).toHaveBeenCalledTimes(3);
+  });
+
+  it('rejects relative, root, home-root, and oversized exclusions with RemoteError', async () => {
+    const { remote, actions } = fixture();
+    for (const bad of ['./secret', '../secret', 'foo/bar', '/', '///', '~', '~/', '.'.repeat(1025)]) {
+      await expect(remote.addFileExclusion(bad)).rejects.toBeInstanceOf(RemoteError);
+      await expect(remote.removeFileExclusion(bad)).rejects.toBeInstanceOf(RemoteError);
+    }
+    expect(actions.addFileExclusion).not.toHaveBeenCalled();
+    expect(actions.removeFileExclusion).not.toHaveBeenCalled();
   });
 });

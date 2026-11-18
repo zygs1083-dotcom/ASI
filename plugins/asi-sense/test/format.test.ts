@@ -396,5 +396,30 @@ describe('formatEnvUpdate', () => {
     );
     expect(out).not.toContain('f.ts');
     expect(out).toContain('file.activity: logs windowMs=60000 created=0 modified=500 deleted=0 degraded=true');
+
+    const rolled = formatEnvUpdate(
+      update([
+        change({
+          signal: sig({
+            id: 'fa-roll',
+            kind: 'file.activity',
+            at: T0 + 2,
+            subject: '~',
+            data: {
+              directory: '~',
+              windowMs: 10_000,
+              created: 5,
+              modified: 0,
+              deleted: 0,
+              rolledUp: 7,
+              files: ['[file]'],
+            },
+          }),
+        }),
+      ]),
+    );
+    expect(rolled).toContain(
+      'file.activity: ~ windowMs=10000 created=5 modified=0 deleted=0 rolledUp=7 files=[[file]]',
+    );
   });
 });

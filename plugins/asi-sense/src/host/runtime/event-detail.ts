@@ -26,13 +26,13 @@ const detailFields: Record<string, readonly string[]> = {
     'agentDeleted',
     'externalDeletionExceeded',
   ],
-  'file.activity': ['directory', 'windowMs', 'created', 'modified', 'deleted', 'degraded'],
+  'file.activity': ['directory', 'windowMs', 'created', 'modified', 'deleted', 'rolledUp', 'degraded'],
 };
 
 export function eventDetail(signal: Signal): EventEntry['detail'] {
   const fields = detailFields[signal.kind];
   if (!fields) return undefined;
-  const entries: [string, string | number | boolean][] = fields.flatMap((key) => {
+  const entries: [string, string | number | boolean | string[]][] = fields.flatMap((key) => {
     const value = signal.data[key];
     return typeof value === 'string' ||
       typeof value === 'boolean' ||
@@ -44,7 +44,7 @@ export function eventDetail(signal: Signal): EventEntry['detail'] {
     const files = signal.data.files
       .filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
       .slice(0, 5);
-    if (files.length > 0) entries.push(['files', files.join(', ')]);
+    if (files.length > 0) entries.push(['files', files]);
   }
   return Object.fromEntries(entries);
 }

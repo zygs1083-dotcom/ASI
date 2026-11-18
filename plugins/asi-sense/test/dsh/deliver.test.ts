@@ -611,4 +611,74 @@ describe('DSH environment delivery', () => {
     expect(text).not.toContain('/private/');
     expect(text).not.toContain('secret-user');
   });
+
+  it('redacts file.activity emails, ips, usernames, overlong names, and empty token fallbacks without clearing files', async () => {
+    const { agent, deliver } = fixture();
+    const longName = `${'A'.repeat(600)}.log`;
+    await deliver('session-a', {
+      ...intent('followup', 'file-activity-privacy'),
+      update: {
+        ...update,
+        changes: [
+          {
+            count: 1,
+            level: 'record',
+            signal: {
+              id: 'fa-priv',
+              kind: 'file.activity',
+              at: update.at,
+              source: { id: 'files-global', api: 'watch', host: 'local' },
+              subject: '/Users/alice',
+              data: {
+                directory: '/Users/alice',
+                windowMs: 10_000,
+                created: 1,
+                modified: 2,
+                deleted: 1,
+                rolledUp: 4,
+                files: [
+                  '/Users/alice/alice@example.com-dump.log',
+                  '192.168.10.20.log',
+                  longName,
+                  'mailto:bob@example.com',
+                  '/   ',
+                ],
+              },
+            },
+          },
+          {
+            count: 1,
+            level: 'record',
+            signal: {
+              id: 'fa-home2',
+              kind: 'file.activity',
+              at: update.at + 1,
+              source: { id: 'files-global', api: 'watch', host: 'local' },
+              subject: '/home/bob-dev',
+              data: {
+                directory: '/home/bob-dev',
+                windowMs: 10_000,
+                created: 1,
+                modified: 0,
+                deleted: 0,
+                files: ['fe80::1ff:fe23:4567:890a.log'],
+              },
+            },
+          },
+        ],
+      },
+    });
+    const text = JSON.stringify(agent.followup.mock.calls);
+    expect(text).toContain('file.activity: ~ windowMs=10000');
+    expect(text).toContain('rolledUp=4');
+    expect(text).toContain('[file]');
+    expect(text).not.toContain('alice');
+    expect(text).not.toContain('bob-dev');
+    expect(text).not.toContain('alice@example.com');
+    expect(text).not.toContain('bob@example.com');
+    expect(text).not.toContain('192.168.10.20');
+    expect(text).not.toContain('fe80::1ff:fe23:4567:890a');
+    expect(text).not.toContain('files=[]');
+    expect(text).toContain('AAAAAAAAAA');
+  });
 });

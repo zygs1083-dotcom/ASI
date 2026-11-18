@@ -867,4 +867,73 @@ describe('全盘文件监视与活动视图', () => {
     expect(screen.getByText(/新增 1 · 修改 2 · 删除 0 · 文件：a\.ts、b\.ts/)).toBeTruthy();
     expect(screen.getByText(/全盘按目录与时间窗聚合的文件活动/)).toBeTruthy();
   });
+
+  it('unavailable 时禁选关闭全盘开关，显示含上卷计数，并在排除项校验失败时展示错误', async () => {
+    const base = makeScenario('healthy');
+    const unavailableState = makeState();
+    unavailableState.env.globalFileWatch = {
+      value: {
+        enabled: true,
+        status: 'disabled',
+        root: '/',
+        windowMs: 10_000,
+        eventsPerSec: 0,
+        degraded: false,
+        countOnly: false,
+        deniedPaths: [],
+        exclusions: ['node_modules'],
+      },
+      status: 'unavailable',
+      reason: '当前平台不支持全盘 FSEvents 监视',
+      observedAt: T0,
+      ttlMs: 60_000,
+      source: { id: 'files-global', api: 'watch', host: 'local' },
+    };
+    const onAddFileExclusion = vi.fn().mockRejectedValue(new Error('仅支持绝对路径、~/ 路径或单段目录名'));
+    renderPanel(
+      {
+        ...base,
+        state: unavailableState,
+        events: [
+          {
+            signal: {
+              id: 'fa-roll',
+              kind: 'file.activity',
+              at: T0 - 1_000,
+              source: { id: 'files-global', api: 'watch', host: 'local' },
+              subject: '/demo/mono',
+              data: {},
+              cause: 'unknown',
+            },
+            level: 'record',
+            reason: 'file-activity',
+            cause: 'unknown',
+            detail: {
+              kind: 'file.activity',
+              directory: '/demo/mono',
+              windowMs: 10_000,
+              created: 3,
+              modified: 1,
+              deleted: 0,
+              rolledUp: 4,
+              files: ['report, final.pdf'],
+            },
+          },
+        ],
+      },
+      { onAddFileExclusion },
+    );
+
+    const checkbox = screen.getByLabelText('全盘文件监视') as HTMLInputElement;
+    expect(checkbox.checked).toBe(false);
+    expect(checkbox.disabled).toBe(true);
+    expect(screen.getAllByText(/不可用/).length).toBeGreaterThanOrEqual(1);
+    expect(screen.getByText(/含上卷 4 条/)).toBeTruthy();
+    expect(screen.getByText(/report, final\.pdf/)).toBeTruthy();
+
+    fireEvent.click(screen.getByText('排除项 1 条'));
+    fireEvent.change(screen.getByLabelText('新增排除路径或模式'), { target: { value: './rel' } });
+    fireEvent.click(screen.getByRole('button', { name: '添加' }));
+    await waitFor(() => expect(screen.getByText('仅支持绝对路径、~/ 路径或单段目录名')).toBeTruthy());
+  });
 });

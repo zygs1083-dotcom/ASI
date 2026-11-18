@@ -118,8 +118,11 @@ function eventDetail(entry: EventEntry): SenseEvent['detail'] {
     typeof d.modified === 'number' &&
     typeof d.deleted === 'number'
   ) {
-    const files =
-      typeof d.files === 'string' && d.files.length > 0 ? d.files.split(', ').filter(Boolean).slice(0, 5) : [];
+    const files = Array.isArray(d.files)
+      ? d.files.filter((item): item is string => typeof item === 'string' && item.length > 0).slice(0, 5)
+      : typeof d.files === 'string' && d.files.length > 0
+        ? d.files.split(', ').filter(Boolean).slice(0, 5)
+        : [];
     return {
       kind: 'file.activity',
       directory: d.directory,
@@ -128,6 +131,7 @@ function eventDetail(entry: EventEntry): SenseEvent['detail'] {
       modified: d.modified,
       deleted: d.deleted,
       files,
+      ...(typeof d.rolledUp === 'number' && d.rolledUp > 0 ? { rolledUp: d.rolledUp } : {}),
       ...(d.degraded === true ? { degraded: true } : {}),
     };
   }

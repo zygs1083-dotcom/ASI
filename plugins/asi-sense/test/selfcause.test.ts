@@ -1,6 +1,6 @@
 import type { Signal } from '@asi/sense-types';
 import { describe, expect, it } from 'vitest';
-import { classifyCause as classifyReceived, type ToolWindow } from '../src/host/attention/selfcause.ts';
+import { classifyCause as classifyReceived, isUnderDir, type ToolWindow } from '../src/host/attention/selfcause.ts';
 import { sig } from './helpers.ts';
 
 const W: ToolWindow = { startedAt: 100, endedAt: 200, cwd: '/repo', pid: 42 };
@@ -213,7 +213,7 @@ describe('classifyCause', () => {
     expect(classifyReceived({ ...event, data: { pid: 42 } }, [window], 0, 111)).toBe('unknown');
   });
 
-  it('classifies file.activity signals using data.directory or subject', () => {
+  it('does not reclassify file.activity signals at flush time inside an active tool window', () => {
     const inside = sig({
       id: 'fa-1',
       kind: 'file.activity',
@@ -228,7 +228,50 @@ describe('classifyCause', () => {
       subject: '/other/dir',
       data: { directory: '/other/dir' },
     });
-    expect(classifyCause(inside, [W])).toBe('agent');
+    expect(classifyCause(inside, [W])).toBe('unknown');
     expect(classifyCause(outside, [W])).toBe('unknown');
+  });
+
+  it('normalizes NFC/NFD paths, folds case on darwin, and matches macOS /var aliases', () => {
+    const nfcDir = '/repo/Café'.normalize('NFC');
+    const nfdFile = '/repo/Café/sub/file.ts'.normalize('NFD');
+    const nfdDir = '/repo/Café'.normalize('NFD');
+    const nfcFile = '/repo/Café/sub/file.ts'.normalize('NFC');
+    expect(isUnderDir(nfcDir, nfdFile, 'darwin')).toBe(true);
+    expect(isUnderDir(nfdDir, nfcFile, 'linux')).toBe(true);
+
+    expect(isUnderDir('/repo/src', '/REPO/Src/a.ts', 'darwin')).toBe(true);
+    expect(isUnderDir('/repo/src', '/REPO/Src/a.ts', 'linux')).toBe(false);
+
+    expect(isUnderDir('/var/folders/w1', '/private/var/folders/w1/a.ts', 'darwin')).toBe(true);
+    expect(isUnderDir('/private/var/folders/w1', '/var/folders/w1/a.ts', 'darwin')).toBe(true);
+    expect(isUnderDir('/tmp/w1', '/private/tmp/w1/a.ts', 'darwin')).toBe(true);
+    expect(isUnderDir('/var/folders/w1', '/private/var/folders/w1/a.ts', 'linux')).toBe(false);
+
+    const caseMismatch = sig({
+      id: 'fc-case',
+      kind: 'file.changed',
+      at: 150,
+      subject: '/REPO/src/a.ts',
+      data: { path: '/REPO/src/a.ts' },
+    });
+    expect(
+      classifyReceived(
+        caseMismatch,
+        [{ startedAt: 100, endedAt: 200, startedMono: 100, endedMono: 200, cwd: '/repo' }],
+        1,
+        150,
+        'darwin',
+      ),
+    ).toBe('agent');
+    expect(
+      classifyReceived(
+        caseMismatch,
+        [{ startedAt: 100, endedAt: 200, startedMono: 100, endedMono: 200, cwd: '/repo' }],
+        1,
+        150,
+        'linux',
+      ),
+    ).toBe('unknown');
   });
 });

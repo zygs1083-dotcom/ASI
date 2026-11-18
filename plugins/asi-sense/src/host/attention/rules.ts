@@ -1,5 +1,6 @@
 import path from 'node:path';
 import type { DeliveryLevel, Signal, WatchRule } from '@asi/sense-types';
+import { compileGlob, matchGlob } from './glob.ts';
 
 /** Ordering of delivery levels for rule priority. */
 export const LEVEL_RANK: Record<DeliveryLevel, number> = {
@@ -10,44 +11,13 @@ export const LEVEL_RANK: Record<DeliveryLevel, number> = {
 
 const OPERATORS: ReadonlySet<string> = new Set(['==', '!=', '>', '>=', '<', '<=']);
 
-const REGEX_SPECIALS = /[.*+?^${}()|[\]\\]/g;
-
-/**
- * Converts a subject glob to a RegExp. `*` matches any run of non-`/`
- * characters, `**` matches across `/`, `?` matches a single non-`/` char.
- * Everything else is literal.
- */
-export function globToRegExp(pattern: string): RegExp {
-  let re = '';
-  for (let i = 0; i < pattern.length; i++) {
-    const ch = pattern[i] as string;
-    if (ch === '*') {
-      if (pattern[i + 1] === '*') {
-        const directory = pattern[i + 2] === '/';
-        re += directory ? '(?:.*/)?' : '.*';
-        i += directory ? 2 : 1;
-      } else {
-        re += '[^/]*';
-      }
-    } else if (ch === '?') {
-      re += '[^/]';
-    } else {
-      re += ch.replace(REGEX_SPECIALS, '\\$&');
-    }
-  }
-  return new RegExp(`^${re}$`);
+function matchSubtree(dir: string, target: string): boolean {
+  if (dir === '/') return target.startsWith('/');
+  return target === dir || target.startsWith(`${dir}/`);
 }
 
-/** `/w` itself plus everything below it. */
-function subtreeRegExp(dir: string): RegExp {
-  const escaped = (dir === '/' ? '' : dir).replace(REGEX_SPECIALS, '\\$&');
-  return new RegExp(`^${escaped}(?:/.*)?$`);
-}
-
-/** The glob pattern `P` itself and everything below it (`P` may contain wildcards). */
-function dirBoundaryRegExp(pattern: string): RegExp {
-  const inner = globToRegExp(pattern).source;
-  return new RegExp(`${inner.slice(0, -1)}(?:/.*)?$`);
+export interface SubjectMatcher {
+  test(subject: string): boolean;
 }
 
 /**
@@ -86,15 +56,18 @@ export function burstScopeId(subject: string): string | undefined {
  * matching first-level entries, and `/**`-containing globs see only their
  * glob's own matches. A rule can never observe outside this set.
  */
-export function subjectScope(subject: string): RegExp | undefined {
+export function subjectScope(subject: string): SubjectMatcher | undefined {
   const pattern = normalizeFileSubject(subject);
   if (!path.isAbsolute(pattern)) return undefined;
-  if (!/[*?]/.test(pattern)) return subtreeRegExp(pattern);
+  if (!/[*?]/.test(pattern)) return { test: (target) => matchSubtree(pattern, target) };
   if (pattern.endsWith('/**')) {
     const base = pattern.slice(0, -3);
-    if (!/[*?]/.test(base)) return subtreeRegExp(base || '/');
+    if (!/[*?]/.test(base)) {
+      const root = base || '/';
+      return { test: (target) => matchSubtree(root, target) };
+    }
   }
-  return globToRegExp(pattern);
+  return compileGlob(pattern);
 }
 
 /**
@@ -249,11 +222,11 @@ export function matchesRule(rule: WatchRule, signal: Signal, now: number): boole
     if (typeof scope === 'string') {
       matched = burstScopeId(rule.match.subject) === scope;
     } else {
-      matched = typeof subject === 'string' && globToRegExp(pattern).test(subject);
+      matched = typeof subject === 'string' && matchGlob(pattern, subject);
       if (!matched && signal.kind === 'file.burst' && typeof subject === 'string') {
         matched =
-          (!/[*?]/.test(pattern) && subtreeRegExp(pattern).test(subject)) ||
-          (pattern.endsWith('/**') && dirBoundaryRegExp(pattern.slice(0, -3) || '/').test(subject));
+          (!/[*?]/.test(pattern) && matchSubtree(pattern, subject)) ||
+          (pattern.endsWith('/**') && matchGlob(pattern.slice(0, -3) || '/', subject, true));
       }
     }
     if (!matched) return false;

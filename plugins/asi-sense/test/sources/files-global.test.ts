@@ -1,8 +1,9 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import type { GlobalFileWatchValue } from '@asi/sense-types';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { compileGlob } from '../../src/host/attention/glob.ts';
 import { DEFAULT_RULES } from '../../src/host/attention/rules.ts';
 import { defaultBodyRules } from '../../src/host/body/index.ts';
 import { createPresenter } from '../../src/host/presenter/index.ts';
@@ -12,6 +13,7 @@ import type { DshPort, FileChange, FileWatcher, SenseOptions } from '../../src/h
 import {
   DEFAULT_FILE_EXCLUSIONS,
   ExclusionMatcher,
+  MAX_FILE_EXCLUSIONS,
   normalizeFileExclusion,
 } from '../../src/host/sources/file-exclusions.ts';
 
@@ -222,8 +224,8 @@ describe('FileGlobalSource integration', () => {
       modified: 5,
       deleted: 1,
     });
-    const filesStr = String(entry?.detail?.files ?? '');
-    const files = filesStr ? filesStr.split(', ') : [];
+    const files = entry?.detail?.files;
+    expect(Array.isArray(files)).toBe(true);
     expect(files).toHaveLength(5);
     expect(entry?.level).toBe('record');
 
@@ -419,7 +421,7 @@ describe('FileGlobalSource integration', () => {
     // After recovery, filenames are collected again
     h.emitFile({ path: path.posix.join(dir, 'after.ts'), change: 'add' });
     await h.advance(10_000);
-    expect(String(collectActivity(h.events()).at(-1)?.detail?.files ?? '')).toContain('after.ts');
+    expect(collectActivity(h.events()).at(-1)?.detail?.files).toContain('after.ts');
     await h.runtime.stop();
   });
 
@@ -556,6 +558,270 @@ describe('FileGlobalSource integration', () => {
     expect(elapsedMs).toBeLessThan(10_000);
     expect(heapDeltaMb).toBeLessThan(80);
     expect(collectActivity(h.events()).length).toBeGreaterThan(0);
+    await h.runtime.stop();
+  });
+
+  it('handles darwin case folding, NFC/NFD normalization, uncreated symlinked dataDirs, aliases, and glob descendant exclusions', () => {
+    const tmpRoot = mkdtempSync(path.join(os.tmpdir(), 'asi-excl-'));
+    try {
+      const realBase = path.join(tmpRoot, 'real-base');
+      const linkBase = path.join(tmpRoot, 'link-base');
+      mkdirSync(realBase, { recursive: true });
+      symlinkSync(realBase, linkBase);
+
+      const uncreatedDataDir = path.posix.join(linkBase, 'future', 'store');
+      const matcherMac = new ExclusionMatcher(
+        ['~/Library', '~/Café'.normalize('NFC'), '项目-が'.normalize('NFC'), '/Work/tmp-*', 'tmp-*', '/var/cache'],
+        [uncreatedDataDir],
+        '/Users/Demo',
+        'darwin',
+      );
+      expect(matcherMac.isExcluded('/users/demo/library/Caches/app.db')).toBe(true);
+      expect(matcherMac.isExcluded('/Users/demo/Cafe\u0301/Sub/note.md')).toBe(true);
+      expect(matcherMac.isExcluded('/Users/demo/proj/项目-か\u3099/item.txt')).toBe(true);
+      expect(matcherMac.isExcluded(path.posix.join(realBase, 'future', 'store', 'db.sqlite'))).toBe(true);
+      expect(matcherMac.isExcluded('/private/var/cache/index.bin')).toBe(true);
+      expect(matcherMac.isExcluded('/work/tmp-abc/nested/deep.txt')).toBe(true);
+      expect(matcherMac.isExcluded('/work/repo/tmp-build/out/bundle.js')).toBe(true);
+      expect(matcherMac.isExcluded('/work/tmpfile/keep.ts')).toBe(false);
+
+      const matcherLinux = new ExclusionMatcher(['/work/Secret'], [], '/home/demo', 'linux');
+      expect(matcherLinux.isExcluded('/work/Secret/a.ts')).toBe(true);
+      expect(matcherLinux.isExcluded('/work/secret/a.ts')).toBe(false);
+    } finally {
+      rmSync(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('executes adversarial globs in linear time without ReDoS and enforces validation + dedup + 200 cap', async () => {
+    const longPattern = `${'**a'.repeat(341)}b`.slice(0, 1024);
+    const matcher = compileGlob(longPattern, { matchDescendants: true });
+    const text = `/${'a'.repeat(250)}c`;
+    const t0 = performance.now();
+    expect(matcher.test(text)).toBe(false);
+    const globMs = performance.now() - t0;
+    expect(globMs).toBeLessThan(1);
+
+    const exMatcher = new ExclusionMatcher([`${'**a'.repeat(18)}b`], [], '/Users/demo', 'darwin');
+    const t1 = performance.now();
+    expect(exMatcher.isExcluded(`/work/${'a'.repeat(180)}c/file.ts`)).toBe(false);
+    expect(performance.now() - t1).toBeLessThan(5);
+
+    for (const bad of [
+      '',
+      '   ',
+      '/',
+      '///',
+      '~',
+      '~/',
+      './rel',
+      '../rel',
+      'foo/bar',
+      '/a/../b',
+      'a/b\0c',
+      'a'.repeat(1025),
+    ]) {
+      expect(() => normalizeFileExclusion(bad)).toThrow(TypeError);
+    }
+
+    const h = createHarness({ platform: 'darwin' });
+    await h.runtime.start();
+    await h.runtime.actions.addFileExclusion?.('~/CustomCache');
+    await expect(h.runtime.actions.addFileExclusion?.('~/customcache')).rejects.toThrow();
+    await expect(h.runtime.actions.addFileExclusion?.('~/Café'.normalize('NFC'))).resolves.toBeUndefined();
+    await expect(h.runtime.actions.addFileExclusion?.('~/Cafe\u0301')).rejects.toThrow();
+
+    while ((h.globalFact()?.exclusions.length ?? 0) < MAX_FILE_EXCLUSIONS) {
+      const idx = h.globalFact()?.exclusions.length ?? 0;
+      await h.runtime.actions.addFileExclusion?.(`seg-${idx}`);
+    }
+    await expect(h.runtime.actions.addFileExclusion?.('seg-overflow')).rejects.toThrow(/最多|limit|exceed|200/);
+    await h.runtime.stop();
+  });
+
+  it('rolls up buckets beyond 2000 cap into ancestor directories and drops state in O(1) on disable', async () => {
+    const h = createHarness({ fakeClockOnly: true });
+    await h.runtime.start();
+
+    for (let i = 0; i < 2_200; i++) {
+      h.emitFile({ path: `/work/huge/dir-${i}/file.ts`, change: 'add' });
+    }
+    await h.advance(10_000);
+
+    const acts = collectActivity(h.events());
+    const rolledSum = acts.reduce((sum, e) => sum + Number(e.detail?.rolledUp ?? 0), 0);
+    expect(acts.length).toBeLessThanOrEqual(2_000);
+    expect(rolledSum).toBeGreaterThanOrEqual(200);
+
+    // 5k distinct dirs + instant O(1) toggle off (100k budget checked in dedicated perf test)
+    for (let i = 0; i < 5_000; i++) {
+      h.emitFile({ path: `/work/surge/dir-${i}/f.ts`, change: 'add' });
+    }
+    const t0 = performance.now();
+    await h.runtime.actions.setGlobalFileWatch?.(false);
+    expect(performance.now() - t0).toBeLessThan(200);
+    expect(h.openWatchers()).toBe(0);
+    const actsAfterDisable = collectActivity(h.events()).map((e) => e.id);
+    await h.advance(60_000);
+    expect(collectActivity(h.events()).map((e) => e.id)).toEqual(actsAfterDisable);
+    await h.runtime.stop();
+  }, 15_000);
+
+  it('tracks burst on raw timestamps, deduplicates glob/global wakes, ignores broken explicit watches, and never reclassifies file.activity on flush', async () => {
+    const watchers = new Map<string, (ev: FileChange) => void>();
+    const brokenRoot = '/work/broken';
+    const h = createHarness({
+      fakeClockOnly: true,
+      globalFileWatch: {
+        windowMs: 10_000,
+        degradedWindowMs: 60_000,
+        budgetPerSec: 1_000,
+        budgetSustainMs: 100_000,
+      },
+      rules: [
+        ...DEFAULT_RULES,
+        ...defaultBodyRules(),
+        {
+          id: 'glob-watch',
+          match: { kind: 'file.changed', subject: '/work/globdir/*.ts' },
+          level: 'wake',
+          createdBy: 'user',
+          approved: true,
+        },
+        {
+          id: 'broken-explicit',
+          match: { kind: 'file.changed', subject: brokenRoot },
+          level: 'wake',
+          createdBy: 'user',
+          approved: true,
+        },
+      ],
+      watchFactory: (root, cb) => {
+        watchers.set(root, cb);
+        return {
+          close: () => {
+            watchers.delete(root);
+          },
+        };
+      },
+    });
+    await h.runtime.start();
+    const globalCb = watchers.get('/')!;
+
+    // 1. Two bursts separated by 70s (> 60s file.burst window) produce ZERO false wakes even with clock gaps
+    for (let i = 0; i < 30; i++) globalCb({ path: `/work/burst70/a-${i}.ts`, change: 'delete' });
+    await h.advance(70_000);
+    for (let i = 0; i < 30; i++) globalCb({ path: `/work/burst70/b-${i}.ts`, change: 'delete' });
+    expect(h.events().filter((e) => e.kind === 'file.burst' && e.subject === '/work/burst70')).toHaveLength(0);
+
+    // 2. Non-subtree glob rule + global watch emit only ONE deduplicated wake in the same subtree
+    const globCb = watchers.get('/work/globdir')!;
+    for (let i = 0; i < 55; i++) {
+      const p = `/work/globdir/del-${i}.ts`;
+      globCb({ path: p, change: 'delete' });
+      globalCb({ path: p, change: 'delete' });
+    }
+    await h.advance(1_000);
+    const globBursts = h
+      .events()
+      .filter((e) => e.kind === 'file.burst' && e.level === 'wake' && String(e.subject).startsWith('/work/globdir'));
+    expect(globBursts).toHaveLength(1);
+
+    // 3. Broken explicit dir watch does NOT suppress global burst wake
+    watchers.get(brokenRoot)?.({ path: brokenRoot, change: 'modify', watchError: true, errorCode: 'EIO' });
+    await h.advance(10);
+    for (let i = 0; i < 55; i++) {
+      globalCb({ path: `/work/broken/sub/d-${i}.ts`, change: 'delete' });
+    }
+    await h.advance(1_000);
+    expect(
+      h.events().filter((e) => e.kind === 'file.burst' && e.level === 'wake' && e.subject === '/work/broken/sub'),
+    ).toHaveLength(1);
+
+    // 4. file.activity emitted at flush while tool window is open keeps raw cause ('unknown')
+    await h.agent({ type: 'created', sessionId: 's-flush' });
+    globalCb({ path: '/work/flush-cause/ext.ts', change: 'add' });
+    await h.advance(2_000);
+    await h.onTool({
+      type: 'pre-execute',
+      sessionId: 's-flush',
+      toolCallId: 't-flush',
+      cwd: '/work/flush-cause',
+      pid: 9001,
+      at: Date.now(),
+    });
+    await h.advance(9_000);
+    await h.onTool({
+      type: 'post-execute',
+      sessionId: 's-flush',
+      toolCallId: 't-flush',
+      cwd: '/work/flush-cause',
+      pid: 9001,
+      at: Date.now(),
+    });
+    const flushed = collectActivity(h.events()).find((e) => e.detail?.directory === '/work/flush-cause');
+    expect(flushed?.cause).toBe('unknown');
+
+    await h.runtime.stop();
+  });
+
+  it('auto-rebuilds once on non-EPERM/ECLOSE watch errors, stays unavailable on second failure, and refreshes rootDenied exclusions', async () => {
+    const cbs: ((ev: FileChange) => void)[] = [];
+    const h = createHarness({
+      watchFactory: (_root, cb) => {
+        cbs.push(cb);
+        return { close: () => {} };
+      },
+    });
+    await h.runtime.start();
+    expect(h.openWatchers()).toBe(1);
+
+    // First EIO clears pending buckets and rebuilds once
+    cbs[0]?.({ path: '/work/dropped/a.ts', change: 'add' });
+    cbs[0]?.({ path: '/', change: 'modify', watchError: true, errorCode: 'EIO' });
+    await h.advance(20);
+    expect(h.openWatchers()).toBe(1);
+    expect(h.totalWatchCalls()).toBe(2);
+    expect(h.globalFact()?.status).toBe('running');
+    await h.advance(10_000);
+    expect(collectActivity(h.events()).some((e) => e.detail?.directory === '/work/dropped')).toBe(false);
+
+    // Second EIO transitions permanently to unavailable and unrelated toggleRule does NOT revive it
+    cbs[1]?.({ path: '/', change: 'modify', watchError: true, errorCode: 'ECLOSE' });
+    await h.advance(20);
+    expect(h.openWatchers()).toBe(0);
+    expect(h.runtime.state().env.globalFileWatch?.status).toBe('unavailable');
+    await h.runtime.actions.toggleRule?.('file-activity', false);
+    expect(h.openWatchers()).toBe(0);
+
+    // Explicit toggle re-enables and clears unavailable latch
+    await h.runtime.actions.setGlobalFileWatch?.(true);
+    expect(h.openWatchers()).toBe(1);
+    expect(h.globalFact()?.status).toBe('running');
+
+    // Subtree EPERM records deniedPaths and rebuilds watcher
+    const beforeSubDenied = h.totalWatchCalls();
+    cbs.at(-1)?.({
+      path: '/protected/sub',
+      change: 'modify',
+      watchError: true,
+      errorCode: 'EPERM',
+      errorPath: '/protected/sub',
+    });
+    await h.advance(20);
+    expect(h.globalFact()?.status).toBe('partial-denied');
+    expect(h.globalFact()?.deniedPaths).toContain('/protected/sub');
+    expect(h.totalWatchCalls()).toBe(beforeSubDenied + 1);
+
+    // Under rootDenied, exclusion mutations still refresh the published fact
+    cbs.at(-1)?.({ path: '/', change: 'modify', watchError: true, errorCode: 'EPERM', errorPath: '/' });
+    await h.advance(20);
+    expect(h.globalFact()?.status).toBe('denied');
+    await h.runtime.actions.addFileExclusion?.('~/Vault');
+    expect(h.globalFact()?.exclusions).toContain('~/Vault');
+    await h.runtime.actions.removeFileExclusion?.('~/Vault');
+    expect(h.globalFact()?.exclusions).not.toContain('~/Vault');
+
     await h.runtime.stop();
   });
 });

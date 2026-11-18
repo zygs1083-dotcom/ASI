@@ -1,7 +1,12 @@
 import type { WatchRule } from '@asi/sense-types';
 import { createWatchRule, DEFAULT_RULES, validateRule } from '../attention/rules.ts';
 import { defaultBodyRules } from '../body/index.ts';
-import { DEFAULT_FILE_EXCLUSIONS, normalizeFileExclusion } from '../sources/file-exclusions.ts';
+import {
+  DEFAULT_FILE_EXCLUSIONS,
+  exclusionKey,
+  MAX_FILE_EXCLUSIONS,
+  normalizeFileExclusion,
+} from '../sources/file-exclusions.ts';
 import type { StoragePort } from './ports.ts';
 
 interface SavedSettings {
@@ -26,6 +31,7 @@ export class Settings {
   constructor(
     private readonly storage: StoragePort,
     initial?: WatchRule[],
+    private readonly platform: string = process.platform,
   ) {
     this.all = structuredClone(initial ?? [...DEFAULT_RULES, ...defaultBodyRules()]);
     this.validate(this.all);
@@ -111,9 +117,13 @@ export class Settings {
     const seen = new Set<string>();
     for (const item of items) {
       const norm = normalizeFileExclusion(item as string);
-      if (!seen.has(norm)) {
-        seen.add(norm);
+      const key = exclusionKey(norm, this.platform);
+      if (!seen.has(key)) {
+        seen.add(key);
         out.push(norm);
+        if (out.length > MAX_FILE_EXCLUSIONS) {
+          throw new RangeError(`Maximum of ${MAX_FILE_EXCLUSIONS} exclusion patterns allowed`);
+        }
       }
     }
     return out;

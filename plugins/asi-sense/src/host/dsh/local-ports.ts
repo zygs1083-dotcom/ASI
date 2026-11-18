@@ -55,6 +55,7 @@ export function localPorts(ctx: Context, storageRoot: string): Omit<SensePorts, 
                 continue;
               }
               const base = candidate;
+              let nextClosed = false;
               const next = watch(
                 base,
                 // `recursive:false` only applies at the target dir itself: an
@@ -62,7 +63,7 @@ export function localPorts(ctx: Context, storageRoot: string): Omit<SensePorts, 
                 // target's appearance; delivered events stay inside(target).
                 { recursive: base === target ? opts?.recursive !== false : base !== dirname(target) },
                 (event, filename) => {
-                  if (closed || watcher !== next) return;
+                  if (closed || nextClosed || watcher !== next) return;
                   const path = !directory || filename === null ? base : resolve(base, filename.toString());
                   if (!inside(base, path)) return;
                   try {
@@ -79,18 +80,30 @@ export function localPorts(ctx: Context, storageRoot: string): Omit<SensePorts, 
                   }
                   if (!inside(target, path) || filename === null) return;
                   let at = Date.now();
-                  const change = event === 'change' ? 'modify' : existsSync(path) ? 'add' : 'delete';
-                  if (change !== 'delete') {
-                    try {
-                      const mtime = lstatSync(path).mtimeMs;
-                      if (Number.isFinite(mtime) && mtime >= startedAt) at = mtime;
-                    } catch {}
+                  let change: 'add' | 'modify' | 'delete' = event === 'change' ? 'modify' : 'add';
+                  try {
+                    const mtime = lstatSync(path).mtimeMs;
+                    if (Number.isFinite(mtime) && mtime >= startedAt) at = mtime;
+                  } catch (error) {
+                    const code = (error as NodeJS.ErrnoException | undefined)?.code;
+                    if (code === 'EACCES' || code === 'EPERM') {
+                      callback({ path: target, change: 'modify', watchError: true, errorCode: code, errorPath: path });
+                      return;
+                    }
+                    if (event !== 'change' && (code === 'ENOENT' || code === 'ENOTDIR' || !existsSync(path))) {
+                      change = 'delete';
+                    }
                   }
                   callback({ path, change, at });
                 },
               );
+              next.on('close', () => {
+                if (closed || nextClosed || watcher !== next) return;
+                nextClosed = true;
+                fail(Object.assign(new Error('file watcher closed unexpectedly'), { code: 'ECLOSE' }));
+              });
               next.on('error', (error) => {
-                if (closed || watcher !== next) return;
+                if (closed || nextClosed || watcher !== next) return;
                 fail(error);
               });
               const previous = watcher;

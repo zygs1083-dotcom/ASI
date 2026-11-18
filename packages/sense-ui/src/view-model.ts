@@ -162,6 +162,7 @@ export type EventDetail =
       modified: number;
       deleted: number;
       files: string[];
+      rolledUp?: number;
       degraded?: boolean;
     };
 

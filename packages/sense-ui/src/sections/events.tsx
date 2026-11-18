@@ -60,6 +60,7 @@ function DetailLine({ d }: { d: EventDetail }) {
       return (
         <span className={css.detailLine}>
           {d.directory} · {formatDuration(d.windowMs / 1000)}内 新增 {d.created} · 修改 {d.modified} · 删除 {d.deleted}
+          {d.rolledUp ? ` · 含上卷 ${d.rolledUp} 条` : ''}
           {d.files.length > 0 ? ` · 文件：${d.files.join('、')}` : ''}
           {d.degraded ? ' · 已降级仅计数' : ''}
         </span>

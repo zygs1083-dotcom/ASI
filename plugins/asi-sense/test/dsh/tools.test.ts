@@ -12,7 +12,7 @@ import ToolsService from '@deepseek-ai/dsh-tools';
 import { describe, expect, it, onTestFinished, vi } from 'vitest';
 import { FileBurstDetector } from '../../src/host/body/burst.ts';
 import { createDelivery } from '../../src/host/dsh/deliver.ts';
-import { modelOutput, modelRules, modelTune } from '../../src/host/dsh/tool-output.ts';
+import { modelOutput, modelRules, modelState, modelTune } from '../../src/host/dsh/tool-output.ts';
 import { registerSenseTools } from '../../src/host/dsh/tools.ts';
 import { createSenseRuntime } from '../../src/host/runtime/index.ts';
 import type { AgentEvent, JobEvent, SensePorts, ToolEvent } from '../../src/host/runtime/ports.ts';
@@ -745,5 +745,75 @@ describe('model-facing tools', () => {
     h.off();
     expect(h.ctx.tools.get('env_state')).toBeUndefined();
     expect((await h.ctx.systemPrompt.assemble()).sections.some((section) => section.name === 'asi-sense')).toBe(false);
+  });
+
+  it('keeps file.activity rule kind unredacted in modelRules and projects globalFileWatch summary without leaking exclusions', () => {
+    const projectedRules = modelRules([
+      {
+        id: 'file-activity',
+        approved: true,
+        level: 'record',
+        createdBy: 'user',
+        match: { kind: 'file.activity', subject: '/Users/alice/secret-repo/src' },
+      },
+      {
+        id: 'burst-rule',
+        approved: true,
+        level: 'wake',
+        createdBy: 'user',
+        match: { kind: 'file.burst', subject: '/Users/alice/other-repo' },
+      },
+    ]);
+    const rulesJson = JSON.stringify(projectedRules);
+    expect(rulesJson).toContain('"kind":"file.activity"');
+    expect(rulesJson).toContain('"kind":"file.burst"');
+    expect(rulesJson).not.toContain('[redacted]');
+    expect(rulesJson).not.toContain('/Users/alice');
+
+    const store = new StateStore(
+      () => 1_000,
+      60_000,
+      () => 1_000,
+    );
+    store.apply({
+      id: 'gfw-fact',
+      kind: 'fact.updated',
+      at: 1_000,
+      source: { id: 'files-global', api: 'watch', host: 'local' },
+      subject: 'env.globalFileWatch',
+      data: {
+        path: 'env.globalFileWatch',
+        ttlMs: 60_000,
+        status: 'ok',
+        value: {
+          enabled: true,
+          status: 'partial-denied',
+          root: '/Users/alice/custom-root',
+          windowMs: 10_000,
+          eventsPerSec: 42,
+          degraded: false,
+          countOnly: false,
+          deniedPaths: ['/Users/alice/Library/Mail', '/Users/alice/Library/Messages'],
+          exclusions: ['/System', '~/SecretVault'],
+        },
+      },
+    });
+    const envProjected = modelState(store.snapshot(), 1_000, 'env') as Record<string, unknown>;
+    const gfw = envProjected.globalFileWatch as { value?: Record<string, unknown>; status?: string };
+    expect(gfw.status).toBe('ok');
+    expect(gfw.value).toEqual({
+      enabled: true,
+      status: 'partial-denied',
+      windowMs: 10_000,
+      eventsPerSec: 42,
+      degraded: false,
+      countOnly: false,
+      deniedCount: 2,
+      exclusionCount: 2,
+    });
+    const stateJson = JSON.stringify(envProjected);
+    expect(stateJson).not.toContain('SecretVault');
+    expect(stateJson).not.toContain('Mail');
+    expect(stateJson).not.toContain('custom-root');
   });
 });

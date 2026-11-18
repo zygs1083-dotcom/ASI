@@ -149,6 +149,9 @@ function changeLines(ch: EnvChange, includeTitles: boolean, includeJobCommands: 
         main += ` ${key}=${value}`;
       }
     }
+    if (typeof s.data?.rolledUp === 'number' && Number.isFinite(s.data.rolledUp) && s.data.rolledUp > 0) {
+      main += ` rolledUp=${s.data.rolledUp}`;
+    }
     if (Array.isArray(s.data?.files)) {
       const files = s.data.files
         .filter((item): item is string => typeof item === 'string' && item.trim().length > 0)

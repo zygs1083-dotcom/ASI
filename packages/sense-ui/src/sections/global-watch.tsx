@@ -51,7 +51,8 @@ export function GlobalWatchBlock({
   const [error, setError] = useState<string | null>(null);
 
   const value = fact.value;
-  const enabled = value?.enabled ?? false;
+  const unavailable = fact.status === 'unavailable';
+  const enabled = !unavailable && (value?.enabled ?? false);
   const exclusions = value?.exclusions ?? [];
   const deniedPaths = value?.deniedPaths ?? [];
   const needsPerm = fact.status === 'denied' || value?.status === 'denied' || value?.status === 'partial-denied';
@@ -108,9 +109,10 @@ export function GlobalWatchBlock({
             type="checkbox"
             aria-label="全盘文件监视"
             checked={enabled}
+            disabled={unavailable}
             onChange={(e) => onToggleGlobalFileWatch?.(e.target.checked)}
           />
-          <span>{enabled ? '开启' : '关闭'}</span>
+          <span>{unavailable ? '不可用' : enabled ? '开启' : '关闭'}</span>
         </label>
       </div>
 

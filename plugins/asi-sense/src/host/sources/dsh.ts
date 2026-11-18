@@ -41,6 +41,7 @@ export class DshSource {
     private readonly paused: () => boolean,
     private readonly selfCauseGraceMs = 2_000,
     private readonly onAgentDisposed?: (sessionId: string) => void,
+    private readonly platform: string = process.platform,
   ) {}
   start(): void {
     this.active = true;
@@ -214,7 +215,7 @@ export class DshSource {
   classify(signal: Signal): Signal {
     return {
       ...signal,
-      cause: classifyCause(signal, [...this.windows.values()], this.selfCauseGraceMs, this.clock.mono()),
+      cause: classifyCause(signal, [...this.windows.values()], this.selfCauseGraceMs, this.clock.mono(), this.platform),
     };
   }
   /** Allocation-light self-cause check for high-rate file events. */
@@ -224,7 +225,7 @@ export class DshSource {
     for (const w of this.windows.values()) {
       if (w.startedMono === undefined || mono < w.startedMono) continue;
       if (w.endedMono !== undefined && mono >= w.endedMono + this.selfCauseGraceMs) continue;
-      if (w.cwd !== undefined && isUnderDir(w.cwd, absPath)) return 'agent';
+      if (w.cwd !== undefined && isUnderDir(w.cwd, absPath, this.platform)) return 'agent';
     }
     return 'unknown';
   }

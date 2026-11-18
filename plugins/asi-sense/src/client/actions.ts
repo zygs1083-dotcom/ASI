@@ -49,6 +49,15 @@ export function createActions(api: Api) {
       if (!result.ok) throw result.error;
     } catch (error) {
       if (error instanceof Error && error.message.trim()) throw error;
+      if (
+        error &&
+        typeof error === 'object' &&
+        'message' in error &&
+        typeof error.message === 'string' &&
+        error.message.trim()
+      ) {
+        throw new Error(error.message);
+      }
       const message = typeof error === 'string' ? error.trim() : '';
       throw new Error(message || '操作失败，请重试。');
     }
