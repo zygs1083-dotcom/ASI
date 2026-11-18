@@ -2094,6 +2094,15 @@ export function modelOutput(value: unknown, now?: number, appNamePaths: readonly
   return projectModelOutput(value, now, appNamePaths);
 }
 
+/** Projects pre-sanitized tool output while keeping specified value paths and dictionary keys verbatim. */
+export function modelProjectedOutput(
+  value: unknown,
+  appNamePaths: readonly string[] = [],
+  preSanitizedDictPaths: readonly string[] = [],
+): JsonValue {
+  return projectModelOutput(value, undefined, appNamePaths, preSanitizedDictPaths);
+}
+
 type Runtime = Pick<ReturnType<typeof createSenseRuntime>, 'tools' | 'events' | 'rules'>;
 
 export function environmentDetail(
