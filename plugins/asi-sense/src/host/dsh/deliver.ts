@@ -1,10 +1,10 @@
 import { randomUUID } from 'node:crypto';
-import os from 'node:os';
 import type { EnvUpdate } from '@asi/sense-types';
 import type { Agent } from '@deepseek-ai/dsh-agent';
 import { freezeMessage, MessageId, type UserMessage } from '@deepseek-ai/dsh-llm';
 import { isSessionContext } from '../attention/buckets.ts';
 import { DeliveryFailure } from '../attention/drain.ts';
+import { isHomeRoot } from '../attention/path.ts';
 import type { DeliveryIntent } from '../attention/pipeline.ts';
 import { formatEnvUpdate } from '../delivery/format.ts';
 import { modelAppName, modelLabel, modelPath, modelTitle } from './tool-output.ts';
@@ -16,20 +16,6 @@ declare module '@deepseek-ai/dsh-llm' {
 }
 
 const MAX_ACTIVITY_NAME = 512;
-
-function isHomeRoot(raw: string): boolean {
-  const clean = raw.replaceAll('\\', '/').replace(/\/+$/, '') || '/';
-  const home = os.homedir().replaceAll('\\', '/').replace(/\/+$/, '');
-  const nfcClean = clean.normalize('NFC');
-  const nfcHome = home.normalize('NFC');
-  if (
-    nfcHome &&
-    (process.platform === 'darwin' ? nfcClean.toLowerCase() === nfcHome.toLowerCase() : nfcClean === nfcHome)
-  ) {
-    return true;
-  }
-  return /^\/(?:Users|home)\/[^/]+$/i.test(nfcClean);
-}
 
 function truncateName(value: string, limit = MAX_ACTIVITY_NAME): string {
   if (value.length <= limit) return value;

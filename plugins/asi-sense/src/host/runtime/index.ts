@@ -10,6 +10,7 @@ import { RuntimeAttention } from './attention.ts';
 import { createChanges, createStateListeners, observableActions, settleShutdown } from './changes.ts';
 import { deliveryRetry } from './delivery-retry.ts';
 import { FactExpiry } from './expiry.ts';
+import { HistoryManager } from './history/index.ts';
 import type { SenseActions, SenseOptions, SensePorts } from './ports.ts';
 import { createSessionTarget } from './session-target.ts';
 import { Settings } from './settings.ts';
@@ -48,6 +49,42 @@ export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}
   };
   const expiry = new FactExpiry(clock);
   const deliveryPort = deliveryRetry(ports.dsh, clock, () => attention);
+  let attentionRef: RuntimeAttention | undefined;
+  const history = new HistoryManager({
+    port: ports.history,
+    clock,
+    isPaused,
+    titlesAllowed: () => allowTitles,
+    restoreEntries: (entries) => attentionRef?.restoreEntries(entries),
+    clearMemoryEntries: () => attentionRef?.clearEvents(),
+    emitSourceError: (error, extra) => {
+      if (!attentionRef || stopping) return;
+      void attentionRef
+        .accept({
+          id: attentionRef.id(),
+          kind: 'source.error',
+          at: clock.wall(),
+          source: { id: 'history', api: 'storage', host: 'local' },
+          subject: 'history',
+          data: { status: 'error', error, reason: error, ...extra },
+        })
+        .catch(() => {});
+    },
+    emitSourceOk: () => {
+      if (!attentionRef || stopping) return;
+      void attentionRef
+        .accept({
+          id: attentionRef.id(),
+          kind: 'source.status',
+          at: clock.wall(),
+          source: { id: 'history', api: 'storage', host: 'local' },
+          subject: 'history',
+          data: { status: 'ok' },
+        })
+        .catch(() => {});
+    },
+    timeZone: options.timeZone,
+  });
   const attention = new RuntimeAttention(
     clock,
     deliveryPort,
@@ -58,8 +95,10 @@ export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}
     expiry,
     () => target.ensure(),
     () => target.canEnsure(),
+    history,
     platform,
   );
+  attentionRef = attention;
   const listeners = createStateListeners();
   const body = new BodySource(ports.probe, ports.dsh, ports.storage, clock, attention, expiry, isPaused, changed);
   const dsh = new DshSource(
@@ -147,6 +186,7 @@ export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}
       nextToken,
       expiry.next() ?? Infinity,
       attention.pipeline.retentionDeadline() ?? Infinity,
+      history.nextDeadline() ?? Infinity,
     );
     if (!Number.isFinite(deadline)) return;
     timer = setTimeout(
@@ -177,6 +217,7 @@ export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}
       retryAfter = clock.mono() + 250;
       await attention.flush().catch(() => {});
     }
+    await history.tick();
     schedule();
   }
   async function syncRules(): Promise<void> {
@@ -212,6 +253,27 @@ export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}
       change(rule);
     });
   }
+  const applyPause = pauseAction(
+    settings,
+    isPaused,
+    async (value) => {
+      paused = value;
+      if (value) {
+        schedule();
+        await settleShutdown([body.setPaused(true), files.refresh(), filesGlobal.refresh(), helper.stop()]);
+      } else {
+        await body.setPaused(false);
+        check();
+        await files.refresh();
+        check();
+        await filesGlobal.refresh();
+        check();
+        helper.start(settings.sendTitles);
+        schedule();
+      }
+    },
+    check,
+  );
   const unguarded: SenseActions = {
     selectTarget: (id) => target.select(id),
     dismissTargetNotice: async () => target.dismiss(),
@@ -231,27 +293,10 @@ export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}
         draft.rules = draft.rules.filter((rule) => rule.id !== id);
         draft.disabled = draft.disabled.filter((item) => item !== id);
       }),
-    pause: pauseAction(
-      settings,
-      isPaused,
-      async (value) => {
-        paused = value;
-        if (value) {
-          schedule();
-          await settleShutdown([body.setPaused(true), files.refresh(), filesGlobal.refresh(), helper.stop()]);
-        } else {
-          await body.setPaused(false);
-          check();
-          await files.refresh();
-          check();
-          await filesGlobal.refresh();
-          check();
-          helper.start(settings.sendTitles);
-          schedule();
-        }
-      },
-      check,
-    ),
+    pause: async (value) => {
+      await applyPause(value);
+      history.setPaused(value);
+    },
     setSendTitles: async (enabled) => {
       const epoch = generation;
       const intent = ++titleIntent;
@@ -338,20 +383,24 @@ export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}
   };
   const guarded = guardActions(unguarded, () => generation, check);
   const actions = guarded.actions;
-  const tools = runtimeTools(
-    attention,
-    body,
-    settings,
-    actions,
-    files,
-    helper,
-    syncRules,
-    check,
-    () => allowTitles,
-    changed,
-    deliveryPort,
-    dsh,
-  );
+  const tools = {
+    ...runtimeTools(
+      attention,
+      body,
+      settings,
+      actions,
+      files,
+      helper,
+      syncRules,
+      check,
+      () => allowTitles,
+      changed,
+      deliveryPort,
+      dsh,
+    ),
+    envHistory: (params?: Parameters<HistoryManager['query']>[0]) => history.query(params),
+    envSummary: (params?: Parameters<HistoryManager['summary']>[0]) => history.summary(params),
+  };
   function stop(): Promise<void> {
     if (stopping) return stopping;
     generation++;
@@ -374,6 +423,7 @@ export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}
       filesGlobal.stop(),
       helper.stop(),
       body.stop(),
+      history.stop(),
       settings.close(),
     ]);
     stopping = boundedShutdown(work);
@@ -389,6 +439,8 @@ export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}
         check(epoch);
         allowTitles = settings.sendTitles;
         paused = settings.paused;
+        await history.start(paused);
+        check(epoch);
         await syncRules();
         check(epoch);
         await body.start(options.intervalMs ?? 2_000);
@@ -428,6 +480,7 @@ export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}
     },
     body: { monitor: body.monitor, tuner: body.tuner },
     actions: observableActions(actions, changed),
+    clearHistory: () => history.clear(),
     tools,
   };
 }

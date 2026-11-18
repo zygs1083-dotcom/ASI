@@ -13,6 +13,13 @@ import type { FactExpiry } from './expiry.ts';
 import { PendingContext, withoutTitles } from './pending-context.ts';
 import type { Clock, DshPort } from './ports.ts';
 
+export interface AttentionHistorySink {
+  recordEvent(entry: EventEntry, meta?: { bundleId?: string; title?: string }): void;
+  patchEvent(
+    id: string,
+    patch: { at?: number; level?: DeliveryLevel; reason?: string; feedback?: 'useful' | 'noise' },
+  ): void;
+}
 export interface EventEntry {
   id: string;
   kind: string;
@@ -29,6 +36,7 @@ export interface EventEntry {
   currentEta?: { asOf: number; ratePerMinute: number; timeToThresholdMs?: number };
   feedback?: 'useful' | 'noise';
   feedbackAvailable?: boolean;
+  restored?: boolean;
 }
 export type EventLog = EventEntry[];
 
@@ -65,6 +73,7 @@ export class RuntimeAttention {
     expiry: FactExpiry,
     private readonly ensureTarget?: () => void,
     private readonly canEnsureTarget?: () => boolean,
+    private readonly history?: AttentionHistorySink,
     platform: string = process.platform,
   ) {
     const staged = dsh as DshPort & {
@@ -238,6 +247,26 @@ export class RuntimeAttention {
     }
     return events;
   }
+  restoreEntries(entries: readonly EventEntry[]): void {
+    const restored = entries.slice(-200).map((entry) => {
+      const copy = structuredClone(entry) as EventEntry & { bundleId?: unknown; title?: unknown };
+      delete copy.bundleId;
+      delete copy.title;
+      return {
+        ...copy,
+        restored: true,
+      };
+    });
+    const live = this.entries.filter((entry) => !entry.restored);
+    const combined = [...restored, ...live].slice(-200);
+    this.entries.splice(0, this.entries.length, ...combined);
+    this.changed();
+  }
+  clearEvents(): void {
+    this.entries.length = 0;
+    if (this.batchEntries) this.batchEntries.length = 0;
+    this.changed();
+  }
   current(): string | undefined {
     return this.currentSessionId();
   }
@@ -309,6 +338,7 @@ export class RuntimeAttention {
     const entry = this.entries.find((item) => item.id === id);
     if (entry) {
       entry.feedback = verdict;
+      this.history?.patchEvent(id, { at: entry.at, feedback: verdict });
       this.changed();
     }
   }
@@ -601,6 +631,66 @@ export class RuntimeAttention {
   private needsRestore(): boolean {
     return !!this.pinned && (this.selected !== this.pinned || !this.sessions.has(this.pinned));
   }
+  private normalizeEventSubject(signal: Signal): { subject: string; bundleId?: string; title?: string } {
+    if (!signal.kind.startsWith('app.') && !signal.kind.startsWith('window')) {
+      return { subject: signal.subject };
+    }
+    const front = this.store.snapshot().env.frontApp.value;
+    if (signal.kind.startsWith('app.')) {
+      const dataName = typeof signal.data.name === 'string' && signal.data.name.trim() ? signal.data.name : undefined;
+      const dataBundleId =
+        typeof signal.data.bundleId === 'string' && signal.data.bundleId.trim()
+          ? signal.data.bundleId
+          : typeof signal.data.bundle === 'string' && signal.data.bundle.trim()
+            ? signal.data.bundle
+            : undefined;
+      const matchingFrontName =
+        front?.name?.trim() &&
+        ((dataBundleId !== undefined && front.bundleId === dataBundleId) ||
+          front.bundleId === signal.subject ||
+          front.name === signal.subject)
+          ? front.name
+          : undefined;
+      const subject = dataName ?? matchingFrontName ?? signal.subject;
+      const bundleId =
+        dataBundleId ??
+        (front?.bundleId && (front.bundleId === signal.subject || front.name === subject)
+          ? front.bundleId
+          : signal.subject && signal.subject !== subject
+            ? signal.subject
+            : undefined);
+      return { subject, ...(bundleId ? { bundleId } : {}) };
+    }
+    if (signal.kind.startsWith('window')) {
+      const dataBundleId =
+        typeof signal.data.bundleId === 'string' && signal.data.bundleId.trim()
+          ? signal.data.bundleId
+          : typeof signal.data.bundle === 'string' && signal.data.bundle.trim()
+            ? signal.data.bundle
+            : undefined;
+      const matchingFront = front && (!dataBundleId || front.bundleId === dataBundleId) ? front : undefined;
+      const dataApp =
+        typeof signal.data.appName === 'string' && signal.data.appName.trim()
+          ? signal.data.appName
+          : typeof signal.data.app === 'string' && signal.data.app.trim()
+            ? signal.data.app
+            : undefined;
+      const subject = (matchingFront?.name?.trim() ? matchingFront.name : undefined) ?? dataApp ?? signal.subject;
+      const title =
+        typeof signal.data.title === 'string'
+          ? signal.data.title
+          : signal.subject && signal.subject !== subject
+            ? signal.subject
+            : undefined;
+      const bundleId = dataBundleId ?? (matchingFront?.bundleId || undefined);
+      return {
+        subject,
+        ...(bundleId ? { bundleId } : {}),
+        ...(title !== undefined ? { title } : {}),
+      };
+    }
+    return { subject: signal.subject };
+  }
   private log(change: { signal: Signal; level: DeliveryLevel; ruleId?: string; reason?: string }, mono: number): void {
     this.logEntry(change, mono);
     this.changed();
@@ -610,6 +700,7 @@ export class RuntimeAttention {
     mono: number,
   ): void {
     const { signal, level, ruleId, reason } = change;
+    const { subject, bundleId, title } = this.normalizeEventSubject(signal);
     const sourceReason =
       signal.kind === 'source.status' && typeof signal.data.reason === 'string'
         ? signal.data.reason
@@ -620,10 +711,10 @@ export class RuntimeAttention {
     const detail = eventDetail(signal);
     const slope = signal.kind === 'body.rate' && typeof detail?.slope === 'number' ? detail.slope : undefined;
     const eta = typeof detail?.timeToFloorMs === 'number' ? detail.timeToFloorMs : undefined;
-    this.entries.push({
+    const entry: EventEntry = {
       id: signal.id,
       kind: signal.kind,
-      subject: signal.subject,
+      subject,
       at: signal.at,
       mono,
       level: this.offCommit && level !== 'record' && reason !== 'no-session' ? 'record' : level,
@@ -645,14 +736,21 @@ export class RuntimeAttention {
               ...(eta === undefined ? {} : { timeToThresholdMs: eta }),
             },
           }),
-    });
+    };
+    this.entries.push(entry);
     if (this.entries.length > 200) this.pending.forget(this.entries.shift()?.id);
+    this.history?.recordEvent(entry, bundleId !== undefined || title !== undefined ? { bundleId, title } : undefined);
   }
   private mark(id: string, reason?: string, level?: DeliveryLevel): void {
     const entry = this.entries.find((item) => item.id === id);
     if (!entry) return;
     if (reason !== undefined) entry.reason = reason;
     if (level !== undefined) entry.level = level;
+    this.history?.patchEvent(id, {
+      at: entry.at,
+      ...(reason !== undefined ? { reason } : {}),
+      ...(level !== undefined ? { level } : {}),
+    });
     this.changed();
   }
 }

@@ -1,4 +1,5 @@
 import { existsSync, realpathSync } from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 
 export const MAC_ALIAS_PAIRS: readonly [string, string][] = [
@@ -210,4 +211,20 @@ export function normalizeWatchPath(
   if (outDir) outDir.dir = realDir;
   if (realDir === dir && foldedBase === base) return norm;
   return realDir === '/' ? `/${foldedBase}` : `${realDir}/${foldedBase}`;
+}
+
+/** Returns true when `raw` points to the current user's home directory or a standard POSIX home root. */
+export function isHomeRoot(raw: string, platform: string = process.platform): boolean {
+  const clean = raw.replaceAll('\\', '/').replace(/\/+$/, '') || '/';
+  const home = os.homedir().replaceAll('\\', '/').replace(/\/+$/, '');
+  const nfcClean = clean.normalize('NFC');
+  const nfcHome = home.normalize('NFC');
+  if (
+    nfcHome &&
+    nfcHome !== '/' &&
+    (platform === 'darwin' ? nfcClean.toLowerCase() === nfcHome.toLowerCase() : nfcClean === nfcHome)
+  ) {
+    return true;
+  }
+  return /^\/(?:Users|home)\/[^/]+$/i.test(nfcClean);
 }

@@ -3,7 +3,9 @@ import type { Context } from '@deepseek-ai/cordis';
 import { HarnessError } from '@deepseek-ai/dsh-llm';
 import type {} from '@deepseek-ai/dsh-system-prompt';
 import { defineTool, ToolArgsError, ToolContextUnavailableError, type ToolRunContext } from '@deepseek-ai/dsh-tools';
+import { HistoryArgsError } from '../runtime/history/index.ts';
 import type { createSenseRuntime } from '../runtime/index.ts';
+import { modelHistory, modelSummary } from './history-output.ts';
 import { environmentDetail, modelRules, modelState, modelTune } from './tool-output.ts';
 
 type Runtime = Pick<ReturnType<typeof createSenseRuntime>, 'tools' | 'events' | 'rules' | 'targetMode'>;
@@ -146,7 +148,72 @@ export function createSenseTools(runtime: Runtime, now: () => number) {
       }
     },
   });
-  return [envState, envWatch, envDetail, bodyTune];
+  const envHistory = defineTool({
+    name: 'env_history',
+    description:
+      'Query persisted local environment event history (up to 30 days). Window titles are included only when title sharing is enabled.',
+    parameters: {
+      from: {
+        oneOf: [{ type: 'number' }, { type: 'string' }],
+        description: 'Start time (epoch ms or ISO string). Defaults to 30 days before `to`.',
+      },
+      to: {
+        oneOf: [{ type: 'number' }, { type: 'string' }],
+        description: 'End time (epoch ms or ISO string). Defaults to now.',
+      },
+      kinds: {
+        type: 'array',
+        items: { type: 'string' },
+        description: 'Optional list of event kinds to include.',
+      },
+      app: {
+        type: 'string',
+        description: 'Optional app name or bundle identifier filter for app/window events.',
+      },
+      limit: {
+        type: 'integer',
+        description: 'Maximum number of events to return (default 50, clamped at 200).',
+      },
+    },
+    output,
+    async execute(args, exec) {
+      requireAgent(exec);
+      bounded(args);
+      try {
+        let result = await runtime.tools.envHistory(args);
+        if (result.available && result.titlesAllowed && !runtime.rules.settings().sendTitles) {
+          result = await runtime.tools.envHistory(args);
+        }
+        return modelHistory(result);
+      } catch (error) {
+        if (error instanceof HistoryArgsError) throw new ToolArgsError([error.message]);
+        throw error;
+      }
+    },
+  });
+  const envSummary = defineTool({
+    name: 'env_summary',
+    description:
+      'Read a monthly local environment summary computed from daily summaries (defaults to previous month). When partial=true, background daily backfill is still pending or incomplete for pendingDays and may complete on retry.',
+    parameters: {
+      month: {
+        type: 'string',
+        description: 'Target month as YYYY-MM. Defaults to previous local calendar month.',
+      },
+    },
+    output,
+    async execute(args, exec) {
+      requireAgent(exec);
+      bounded(args);
+      try {
+        return modelSummary(await runtime.tools.envSummary(args));
+      } catch (error) {
+        if (error instanceof HistoryArgsError) throw new ToolArgsError([error.message]);
+        throw error;
+      }
+    },
+  });
+  return [envState, envWatch, envDetail, bodyTune, envHistory, envSummary];
 }
 
 export function registerSenseTools(ctx: Context, runtime: Runtime, now: () => number): () => void {

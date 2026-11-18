@@ -476,7 +476,7 @@ export function environmentDetail(
           ),
         )
         .slice(-20)
-        .map(({ kind, at, level }) => ({ kind, at, level }))
+        .map(({ kind, subject, at, level }) => ({ kind, subject: modelAppName(subject), at, level }))
     : [];
   return modelOutput(
     {
