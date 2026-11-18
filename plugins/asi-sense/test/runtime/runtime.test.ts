@@ -27,7 +27,17 @@ import type { NowReadings } from '../../src/host/sources/dsh.ts';
 import { TokenFacts } from '../../src/host/sources/token-facts.ts';
 import { diskFact, f, mkBody } from '../body/helpers.ts';
 
-afterEach(() => vi.useRealTimers());
+const activeRuntimes = new Set<ReturnType<typeof createSenseRuntime>>();
+
+afterEach(async () => {
+  try {
+    await Promise.allSettled([...activeRuntimes].map((rt) => rt.stop()));
+  } finally {
+    activeRuntimes.clear();
+    if (vi.isFakeTimers()) vi.clearAllTimers();
+    vi.useRealTimers();
+  }
+});
 
 function harness(
   savedSettings?: string,
@@ -122,6 +132,7 @@ function harness(
     globalFileWatch: { disableInTests: true },
     ...options,
   });
+  activeRuntimes.add(runtime);
   return {
     ports,
     runtime,
@@ -159,6 +170,12 @@ function harness(
     advance: async (ms: number) => {
       mono += ms;
       await vi.advanceTimersByTimeAsync(ms);
+    },
+    // Jump monotonic/wall time directly when testing long deadlines without spinning 5s polling ticks.
+    jump: async (ms: number) => {
+      mono += ms;
+      vi.setSystemTime(Date.now() + ms);
+      await vi.advanceTimersByTimeAsync(0);
     },
   };
 }
@@ -2628,7 +2645,8 @@ describe('host runtime', () => {
       action: 'add',
       rule: { id: 'files-context', match: { kind: 'file.changed', subject: '/workspace/**' }, level: 'context' },
     });
-    for (let i = 0; i < 205; i++) await h.file({ path: `/workspace/file-${i}`, change: 'modify' });
+    for (let i = 0; i < 205; i++) h.fileRaw({ path: `/workspace/file-${i}`, change: 'modify' });
+    await vi.advanceTimersByTimeAsync(0);
     await h.file({ path: '/workspace/file-204', change: 'modify' });
     expect(h.runtime.events().some((event) => event.reason === 'pending-evicted:5')).toBe(true);
     await h.agent({ type: 'created', sessionId: 's' });
@@ -2638,6 +2656,7 @@ describe('host runtime', () => {
     expect(changes.find((change) => change.signal.subject === '/workspace/file-204')?.count).toBe(2);
     expect(changes.some((change) => change.signal.subject === '/workspace/file-0')).toBe(false);
     await h.runtime.stop();
+    expect(vi.getTimerCount()).toBe(0);
   });
 
   it('wakes once for a failed job and injects a successful exit at the next step', async () => {
@@ -3813,7 +3832,7 @@ describe('host runtime', () => {
     Object.assign(first.ports.storage, storage);
     await first.runtime.start();
     await first.runtime.tools.bodyTune({ param: 'deliveryLevel.file.burst', to: 'context' });
-    await first.advance(86_400_001);
+    await first.jump(86_400_001);
     await first.runtime.stop();
     if (!saved) throw new Error('missing snapshot');
     const valid = saved;
