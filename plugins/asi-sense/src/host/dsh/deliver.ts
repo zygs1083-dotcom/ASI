@@ -7,7 +7,7 @@ import { DeliveryFailure } from '../attention/drain.ts';
 import { isHomeRoot } from '../attention/path.ts';
 import type { DeliveryIntent } from '../attention/pipeline.ts';
 import { formatEnvUpdate } from '../delivery/format.ts';
-import { modelActivityName, modelAppName, modelLabel, modelPath, modelTitle } from './tool-output.ts';
+import { modelActivityName, modelAppName, modelLabel, modelTitle } from './tool-output.ts';
 
 declare module '@deepseek-ai/dsh-llm' {
   interface MessageSourceMap {
@@ -30,7 +30,7 @@ export function modelFileEntry(directory: string | undefined, item: string): str
 
 function metric(value: unknown): string {
   if (typeof value !== 'string') return 'body';
-  if (value.startsWith('disk:')) return `disk:${modelPath(value.slice(5))}`;
+  if (value.startsWith('disk:')) return `disk:${modelActivityName(value.slice(5), true)}`;
   return [
     'cpu',
     'memory',

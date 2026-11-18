@@ -213,18 +213,162 @@ export function normalizeWatchPath(
   return realDir === '/' ? `/${foldedBase}` : `${realDir}/${foldedBase}`;
 }
 
+interface HomeAliasEntry {
+  home: string;
+  extra: string;
+  set: Set<string>;
+}
+
+/**
+ * Cached home-directory aliases. The set is computed once per platform and rebuilt when
+ * `os.homedir()` changes or `setExtraHomes()` is called (e.g. a custom
+ * `globalFileWatch.homedir`). It folds together the raw, realpath, and
+ * "parent resolved / last segment preserved" forms so every projection path can compare
+ * the exact strings the hot watcher emits without touching the filesystem.
+ */
+const homeAliasCaches = new Map<string, HomeAliasEntry>();
+let extraHomes: string[] = [];
+
+function foldHomeAlias(value: string, platform: string): string {
+  if (platform !== 'darwin' && platform !== 'win32') return value;
+  return NON_ASCII_OR_CTRL.test(value) || UPPER_ASCII.test(value) ? value.toLowerCase() : value;
+}
+
+function cleanHomeAlias(value: string): string | undefined {
+  if (!value) return undefined;
+  const slashed = value.replaceAll('\\', '/');
+  const trimmed = slashed.length > 1 ? slashed.replace(/\/+$/, '') : slashed;
+  if (!trimmed) return undefined;
+  return NON_ASCII_OR_CTRL.test(trimmed) ? trimmed.normalize('NFC') : trimmed;
+}
+
+function canonicalizeAliasInput(value: string, platform: string): string | undefined {
+  const clean = cleanHomeAlias(value);
+  if (!clean) return undefined;
+  return platform === 'darwin' ? canonicalizeDarwinAlias(clean, platform) : clean;
+}
+
+function canonicalHomeAlias(value: string, platform: string): string | undefined {
+  const canonical = canonicalizeAliasInput(value, platform);
+  return canonical ? foldHomeAlias(canonical, platform) : undefined;
+}
+
+function realpathHomeAlias(value: string, platform: string): string | undefined {
+  if (value.startsWith('/')) {
+    const resolved = resolveRealPath(value);
+    return resolved ? canonicalHomeAlias(resolved, platform) : undefined;
+  }
+  try {
+    return existsSync(value) ? canonicalHomeAlias(realpathSync(value), platform) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function parentResolvedHomeAlias(value: string, platform: string): string | undefined {
+  const clean = cleanHomeAlias(value);
+  if (!clean) return undefined;
+  const lastSlash = clean.lastIndexOf('/');
+  if (lastSlash < 0) return undefined;
+  const parent = lastSlash === 0 ? '/' : clean.slice(0, lastSlash);
+  const base = clean.slice(lastSlash + 1);
+  if (!base) return undefined;
+  let realParent: string | undefined;
+  if (parent.startsWith('/')) {
+    realParent = resolveRealPath(parent);
+  } else {
+    try {
+      realParent = existsSync(parent) ? normalizeAbsPath(realpathSync(parent)) : undefined;
+    } catch {
+      realParent = undefined;
+    }
+  }
+  const joined =
+    realParent === undefined ? `${parent}/${base}` : realParent === '/' ? `/${base}` : `${realParent}/${base}`;
+  return canonicalHomeAlias(joined, platform);
+}
+
+function addHomeAliasForms(out: Set<string>, value: string | undefined, platform: string): void {
+  if (!value) return;
+  const direct = canonicalHomeAlias(value, platform);
+  if (direct) out.add(direct);
+  if (value.startsWith('/')) {
+    // Same forms the watcher emits: fully resolved (no dirCache) and parent-resolved with the
+    // last segment preserved (dirCache fast path).
+    const full = normalizeWatchPath(value, platform);
+    if (full) out.add(full);
+    const parentOnly = normalizeWatchPath(value, platform, new Map());
+    if (parentOnly) out.add(parentOnly);
+  }
+  const real = realpathHomeAlias(value, platform);
+  if (real) out.add(real);
+  const parentReal = parentResolvedHomeAlias(value, platform);
+  if (parentReal) out.add(parentReal);
+}
+
+function homeAliasEntry(platform: string, allowRebuild: boolean): HomeAliasEntry {
+  const cached = homeAliasCaches.get(platform);
+  // The hot path must never call os.homedir()/realpath per event: trust the warmed cache.
+  if (cached && !allowRebuild) return cached;
+  const home = os.homedir();
+  const extra = extraHomes.join('\u0000');
+  if (cached && cached.home === home && cached.extra === extra) return cached;
+  const set = new Set<string>();
+  addHomeAliasForms(set, home, platform);
+  for (const value of extraHomes) addHomeAliasForms(set, value, platform);
+  const entry: HomeAliasEntry = { home, extra, set };
+  homeAliasCaches.set(platform, entry);
+  return entry;
+}
+
+/**
+ * Replaces the extra home directories folded into the alias set (normally the configured
+ * `globalFileWatch.homedir`). Rebuilds the cache so a changed configuration takes effect.
+ */
+export function setExtraHomes(homes: readonly string[], platform: string = process.platform): void {
+  extraHomes = homes.filter((value): value is string => typeof value === 'string' && value.length > 0);
+  homeAliasCaches.clear();
+  homeAliasEntry(platform, true);
+}
+
+/** Returns true when `raw` is exactly one of the cached home aliases (O(1) set lookup). */
+export function isHomeAlias(raw: string, platform: string = process.platform): boolean {
+  const clean = canonicalizeAliasInput(raw, platform);
+  if (!clean) return false;
+  return homeAliasEntry(platform, true).set.has(foldHomeAlias(clean, platform));
+}
+
+/**
+ * O(1) variant for paths already produced by `normalizeWatchPath` (normalized + folded):
+ * no `os.homedir()`/`realpath` calls, so it is safe inside the 15k/s watcher hot loop.
+ */
+export function isHomeAliasNormalized(normalized: string, platform: string = process.platform): boolean {
+  const entry = homeAliasEntry(platform, false);
+  if (entry.set.size === 0) return false;
+  return entry.set.has(platform === 'win32' ? foldHomeAlias(normalized, platform) : normalized);
+}
+
+/** Maps a path at or below a home alias to `~` / `~/…`, or undefined when it is unrelated. */
+export function toHomeRelative(raw: string, platform: string = process.platform): string | undefined {
+  const clean = canonicalizeAliasInput(raw, platform);
+  if (!clean) return undefined;
+  const entry = homeAliasEntry(platform, true);
+  if (entry.set.size === 0) return undefined;
+  const folded = foldHomeAlias(clean, platform);
+  if (entry.set.has(folded)) return '~';
+  for (const alias of entry.set) {
+    if (alias.length > 1 && folded.startsWith(`${alias}/`)) return `~${clean.slice(alias.length)}`;
+  }
+  return undefined;
+}
+
+/** Standard POSIX/Windows home-root shapes (`/Users/x`, `/home/x`, `C:\Users\x`). */
+export function isHomeRootShape(raw: string): boolean {
+  const clean = (raw.replaceAll('\\', '/').replace(/\/+$/, '') || '/').normalize('NFC');
+  return /^\/(?:Users|home)\/[^/]+$/i.test(clean) || /^[A-Za-z]:\/Users\/[^/]+$/i.test(clean);
+}
+
 /** Returns true when `raw` points to the current user's home directory or a standard POSIX/Windows home root. */
 export function isHomeRoot(raw: string, platform: string = process.platform): boolean {
-  const clean = raw.replaceAll('\\', '/').replace(/\/+$/, '') || '/';
-  const home = os.homedir().replaceAll('\\', '/').replace(/\/+$/, '');
-  const nfcClean = clean.normalize('NFC');
-  const nfcHome = home.normalize('NFC');
-  if (
-    nfcHome &&
-    nfcHome !== '/' &&
-    (platform === 'darwin' ? nfcClean.toLowerCase() === nfcHome.toLowerCase() : nfcClean === nfcHome)
-  ) {
-    return true;
-  }
-  return /^\/(?:Users|home)\/[^/]+$/i.test(nfcClean) || /^[A-Za-z]:\/Users\/[^/]+$/i.test(nfcClean);
+  return isHomeAlias(raw, platform) || isHomeRootShape(raw);
 }

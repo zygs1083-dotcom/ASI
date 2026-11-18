@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import os from 'node:os';
 import type { Fact, SenseState, WatchRule } from '@asi/sense-types';
 import { isRemoteJsonValue } from '@deepseek-ai/dsh-typert-protocol';
-import { isHomeRoot } from '../attention/path.ts';
+import { isHomeRootShape, toHomeRelative } from '../attention/path.ts';
 import type { createSenseRuntime } from '../runtime/index.ts';
 import type { JsonValue } from './wire-types.ts';
 
@@ -1676,8 +1676,12 @@ function truncateName(value: string, limit = MAX_ACTIVITY_NAME): string {
 
 export function modelActivityName(raw: string, maskHomeRoot = false): string {
   // Stored summaries already contain the '~' placeholder; keep it instead of re-redacting it to [path].
-  if (maskHomeRoot && (raw === '~' || isHomeRoot(raw))) return '~';
-  const base = modelPath(raw);
+  if (raw === '~') return '~';
+  // Paths at or below a home alias collapse to `~`/`~/…` before the basename projection, so a
+  // custom `globalFileWatch.homedir` is masked exactly like `os.homedir()`.
+  const relative = maskHomeRoot ? toHomeRelative(raw) : undefined;
+  if (relative === '~' || (maskHomeRoot && isHomeRootShape(raw))) return '~';
+  const base = modelPath(relative ?? raw);
   const masked = modelTitle(truncateName(base));
   return masked.trim() ? masked : '[file]';
 }
@@ -1891,7 +1895,7 @@ export function modelState(state: SenseState, now: number, section?: 'self' | 'e
         disks: fact(body.disks, (value) =>
           value.map((disk) => ({
             ...pick(disk, ['total', 'free', 'status', 'observedAt', 'ttlMs']),
-            mount: modelPath(disk.mount),
+            mount: modelActivityName(disk.mount, true),
           })),
         ),
         battery: fact(body.battery, (value) =>
@@ -1914,7 +1918,7 @@ export function modelState(state: SenseState, now: number, section?: 'self' | 'e
         model: fact(env.where.model, (value) => ({ provider: identifier(value.provider), local: value.local })),
         harness: fact(env.where.harness, (value) => ({ os: modelLabel(value.os) })),
         observed: fact(env.where.observed, () => ({})),
-        toolExec: fact(env.where.toolExec, (value) => ({ cwd: modelPath(value.cwd) })),
+        toolExec: fact(env.where.toolExec, (value) => ({ cwd: modelActivityName(value.cwd, true) })),
       },
       frontApp: fact(env.frontApp, (value) => ({ name: modelAppName(value.name) })),
       focusedWindow: fact(env.focusedWindow, (value) => ({ title: value.title })),
@@ -1922,7 +1926,11 @@ export function modelState(state: SenseState, now: number, section?: 'self' | 'e
         value.map((job) => ({ ...pick(job, ['startedAt', 'status', 'exitCode']), id: identifier(job.id) })),
       ),
       watchedPaths: fact(env.watchedPaths, (value) =>
-        dictionary(value, modelPath, (item) => pick(item, ['lastChange', 'changes'])),
+        dictionary(
+          value,
+          (key) => modelActivityName(key, true),
+          (item) => pick(item, ['lastChange', 'changes']),
+        ),
       ),
       ...(env.globalFileWatch
         ? {

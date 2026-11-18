@@ -4,10 +4,12 @@ import { performance } from 'node:perf_hooks';
 import type { GlobalFileWatchStatus, GlobalFileWatchValue, Signal } from '@asi/sense-types';
 import {
   canonicalizeDarwinAlias,
-  isHomeRoot,
+  isHomeAliasNormalized,
+  isHomeRootShape,
   normalizeAbsPath,
   normalizeWatchPath,
   resolveRealPath,
+  setExtraHomes,
 } from '../attention/path.ts';
 import type { BurstTarget } from '../body/burst.ts';
 import type { RuntimeAttention } from '../runtime/attention.ts';
@@ -116,7 +118,6 @@ export class FileGlobalSource {
   private readonly degradedWindowMs: number;
   private readonly recoveryWindowMs: number;
   private readonly homedir: string;
-  private readonly homeRoot: string | undefined;
   private readonly dataDirs: string[];
 
   private handle?: { close(): void | Promise<void> };
@@ -186,7 +187,9 @@ export class FileGlobalSource {
     this.degradedWindowMs = options.degradedWindowMs ?? DEFAULT_DEGRADED_WINDOW_MS;
     this.recoveryWindowMs = options.recoveryWindowMs ?? DEFAULT_RECOVERY_WINDOW_MS;
     this.homedir = options.homedir ?? os.homedir();
-    this.homeRoot = normalizeWatchPath(this.homedir, this.platform);
+    // Fold the configured home (and its realpath/alias forms) into the shared projection set so
+    // every model-facing exit masks it exactly like `os.homedir()`. Rebuilt once per source.
+    setExtraHomes([this.homedir], this.platform);
     this.dataDirs = resolveDataDirs(options.dataDirs, this.platform);
     this.exclusions = new ExclusionMatcher(this.settings.fileExclusions(), this.dataDirs, this.homedir, this.platform);
   }
@@ -693,12 +696,10 @@ export class FileGlobalSource {
       const base = slash < 0 ? absPath : absPath.slice(slash + 1);
       // The home root itself must never contribute the account name to `files`; `directory` alone
       // (e.g. '/users') stays generic, so write the '~' placeholder instead of the basename.
-      // Cheap shape test first: on this code path `absPath` is a normalized POSIX path, so a home
-      // root is either exactly the cached `homeRoot` or exactly two segments ('/Users/x',
-      // '/home/x'). Ordinary deep paths (the 15k/s hot path) skip isHomeRoot's
-      // os.homedir()/NFC/regex work; both branches keep the previous masking behavior.
+      // O(1) set lookup first (no realpath/os.homedir in the 15k/s loop), then the cheap
+      // two-segment shape test for standard '/Users/x' or '/home/x' roots.
       const homeRootShaped = slash > 0 && absPath.indexOf('/', 1) === slash;
-      if (absPath === this.homeRoot || (homeRootShaped && isHomeRoot(absPath, this.platform))) {
+      if (isHomeAliasNormalized(absPath, this.platform) || (homeRootShaped && isHomeRootShape(absPath))) {
         group.files.add('~');
       } else if (base.length > 0) {
         group.files.add(base);

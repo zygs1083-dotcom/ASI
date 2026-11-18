@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import path from 'node:path';
 import type { SourceRef } from '@asi/sense-types';
+import { isHomeRoot } from '../attention/path.ts';
 import type {
   DailyDirectoryStats,
   HistoryQueryResult,
@@ -107,6 +108,7 @@ function safeReason(reason: string): string {
 }
 
 function projectPathBase(value: string): string {
+  if (isHomeRoot(value)) return '~';
   return modelTitle(modelPath(value));
 }
 
