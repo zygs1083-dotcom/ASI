@@ -17,9 +17,10 @@ function pick<T>(rng: () => number, items: readonly T[]): T {
   return items[Math.floor(rng() * items.length)] as T;
 }
 
-function collectFourCharSlices(value: string): string[] {
-  const clean = value.replace(/\p{M}/gu, '').toLowerCase();
+function collectForbiddenTokens(value: string): string[] {
+  const clean = value.normalize('NFKC').replace(/\p{M}/gu, '').toLowerCase();
   const chars = [...clean];
+  if (chars.length < 4) return clean ? [clean] : [];
   const slices: string[] = [];
   for (let i = 0; i <= chars.length - 4; i++) {
     slices.push(chars.slice(i, i + 4).join(''));
@@ -31,11 +32,11 @@ interface FuzzCase {
   hostname: string;
   secretText: string;
   forbidden: string[];
-  kind: 'hostname' | 'ipv4' | 'ipv6' | 'email' | 'path' | 'endpoint';
+  kind: 'hostname' | 'ipv4' | 'ipv6' | 'email' | 'path' | 'endpoint' | 'homoglyph' | 'punctcut' | 'unc' | 'port';
 }
 
-const PAD_DELIMS = [' ', '\t', '\n', '\u00a0', ',', ';', '(', ')', '|', '"', "'", '<', '>'] as const;
-const PAD_PUNCT = ['!', '?', '-', '_', '[', ']', '~', '+', '*'] as const;
+const PAD_DELIMS = [' ', '\t', '\n', '\u00a0', '\u3000', '\u2028', '\u200b', '\ufeff'] as const;
+const PAD_PUNCT = ['!', '?', '-', '_', "'", '’', '…', '·', '—'] as const;
 const PAD_MARKS = ['\u0301', '\u0308', '\u0323'] as const;
 const PAD_CONTROLS = ['\0', '\u0001', '\u0004', '\u0005'] as const;
 const PAD_WORDS = ['alpha', 'notes', 'window', 'visible', 'draft', 'tab', '汉', '😀', '🚀'] as const;
@@ -55,8 +56,8 @@ function makePadding(rng: () => number, mode: 'normal' | 'long' | 'huge', allowT
   for (let i = 0; i < count; i++) {
     const roll = rng();
     if (roll < 0.35) parts.push(pick(rng, PAD_WORDS));
-    else if (roll < 0.6) parts.push(pick(rng, PAD_DELIMS));
-    else if (roll < 0.78) parts.push(pick(rng, PAD_PUNCT));
+    else if (roll < 0.65) parts.push(pick(rng, PAD_DELIMS));
+    else if (roll < 0.8) parts.push(pick(rng, PAD_PUNCT));
     else if (roll < 0.9) parts.push(pick(rng, PAD_CONTROLS));
     else if (allowTrailingMark || i < count - 1) parts.push(`e${pick(rng, PAD_MARKS)}`);
     else parts.push(pick(rng, PAD_WORDS));
@@ -69,12 +70,16 @@ function makePadding(rng: () => number, mode: 'normal' | 'long' | 'huge', allowT
 }
 
 function buildSecret(rng: () => number): FuzzCase {
-  const category = Math.floor(rng() * 6);
+  const category = Math.floor(rng() * 10);
   if (category === 0) {
     const variants: [string, string, string[]][] = [
       ['zqvx-build-node', 'ZqVx-BuIlD-NoDe', ['zqvx-build-node']],
       ['zqvx-db.corp.invalid', 'zqvx-db.corp.invalid', ['zqvx-db', 'corp', 'invalid']],
-      ['Zqvx Node', 'zqvX NoDe', ['zqvx node']],
+      ['Zqvx Node', 'zqvX NoDe', ['zqvx', 'node']],
+      ['Zqvx Node', 'zqvX\u00a0NoDe', ['zqvx', 'node']],
+      ['Zqvx Node', 'zqvX\u3000NoDe', ['zqvx', 'node']],
+      ['Zqvx Node', 'zqvX\u2028NoDe', ['zqvx', 'node']],
+      ['ZqvxNode', 'zqvX\u200bNoDe', ['zqvx', 'node']],
       ['café-mkgp', 'cafe\u0301-mkgp', ['café-mkgp', 'cafe-mkgp']],
       ['cafe\u0301-mkgp', 'CAFÉ-MKGP', ['café-mkgp', 'cafe-mkgp']],
       ['vbrn-e\u0301\u0323', 'vbrn-e\u0323\u0301', ['vbrn-e']],
@@ -95,6 +100,12 @@ function buildSecret(rng: () => number): FuzzCase {
       ['198\u0301.51.100.42', ['198.51', '51.100', '100.42']],
       ['198.51', ['198.51']],
       ['(203.0.113.77)', ['203.0', '0.113', '113.77']],
+      ['zqvx-node.com', ['zqvx-node']],
+      ['zqvx-corp.nz', ['zqvx-corp']],
+      ['zqvx-db.prod', ['zqvx-db', 'prod']],
+      ['zqvx-wiki.intra', ['zqvx-wiki', 'intra']],
+      ['zqvx-portal.app', ['zqvx-portal']],
+      ['zqvx-auth.sh', ['zqvx-auth']],
     ];
     const [secretText, forbidden] = pick(rng, variants);
     return { hostname: 'fixture-host', secretText, forbidden, kind: 'ipv4' };
@@ -105,7 +116,9 @@ function buildSecret(rng: () => number): FuzzCase {
       ['::ffff:198.51.100.42', ['ffff', '198.51', '51.100', '100.42']],
       ['2001:db8::203.0.113.77', ['2001', '203.0', '0.113', '113.77']],
       ['fe80::1%eth0', ['fe80', 'eth0']],
-      ['[fe80::1%en0]:2222', ['fe80', '2222']],
+      ['zqvx%en0', ['zqvx', 'en0']],
+      ['[fe80::1%en0]:2222', ['fe80', 'en0', '2222']],
+      ['[zqvx-box]', ['zqvx-box']],
       ['[2001:db8::1\u0301]:443/mkgp/secret', ['2001', 'mkgp', 'secret']],
     ];
     const [secretText, forbidden] = pick(rng, variants);
@@ -126,7 +139,6 @@ function buildSecret(rng: () => number): FuzzCase {
   if (category === 4) {
     const variants: [string, string[]][] = [
       ['\\\\zqvx-srv\\mkgp-share\\vbrn-dir\\notes.txt', ['zqvx-srv', 'mkgp-share', 'vbrn-dir']],
-      ['\\\\zqvx-srv\\mkgp-share', ['zqvx-srv', 'mkgp-share']],
       ['C:\\mkgp-users\\vbrn-acct\\q4.xlsx', ['mkgp-users', 'vbrn-acct']],
       ['D:/mkgp-root/vbrn-sub/README.md', ['mkgp-root', 'vbrn-sub']],
       ['mkgp-rel\\vbrn-sub\\q4.xlsx', ['mkgp-rel', 'vbrn-sub']],
@@ -140,23 +152,80 @@ function buildSecret(rng: () => number): FuzzCase {
     const [secretText, forbidden] = pick(rng, variants);
     return { hostname: 'fixture-host', secretText, forbidden, kind: 'path' };
   }
-  const variants: [string, string[]][] = [
-    ['zqvx-node.corp:8443', ['zqvx-node', 'corp', '8443']],
-    ['mkgp:zqvx-internal.corp:8080', ['mkgp', 'zqvx-internal', 'corp', '8080']],
-    ['mkgp\0:zqvx\u0001.corp:8080', ['mkgp', 'zqvx', 'corp', '8080']],
-    [
-      'docker:vbrn-registry.invalid:5000/plqx-org/tykm-app',
-      ['docker', 'vbrn-registry', '5000', 'plqx-org', 'tykm-app'],
-    ],
-    ['zqvx\u0301node:80\u030180', ['zqvxnode', '8080']],
-    [
-      'https://zqvx-api.example.invalid/mkgp-v1/vbrn-secret?k=plqx',
-      ['zqvx-api', 'example', 'mkgp-v1', 'vbrn-secret', 'plqx'],
-    ],
-    ['ssh://zqvxuser@mkgp-box:2222/vbrn-path', ['zqvxuser', 'mkgp-box', '2222', 'vbrn-path']],
+  if (category === 5) {
+    const variants: [string, string[]][] = [
+      ['zqvx-node.corp:8443', ['zqvx-node', 'corp', '8443']],
+      ['mkgp:zqvx-internal.corp:8080', ['mkgp', 'zqvx-internal', 'corp', '8080']],
+      ['mkgp\0:zqvx\u0001.corp:8080', ['mkgp', 'zqvx', 'corp', '8080']],
+      [
+        'docker:vbrn-registry.invalid:5000/plqx-org/tykm-app',
+        ['docker', 'vbrn-registry', '5000', 'plqx-org', 'tykm-app'],
+      ],
+      ['zqvx\u0301node:80\u030180', ['zqvxnode', '8080']],
+      [
+        'https://zqvx-api.example.invalid/mkgp-v1/vbrn-secret?k=plqx',
+        ['zqvx-api', 'example', 'mkgp-v1', 'vbrn-secret', 'plqx'],
+      ],
+      ['ssh://zqvxuser@mkgp-box:2222/vbrn-dir', ['zqvxuser', 'mkgp-box', '2222', 'vbrn-dir']],
+      ['https://zqvx-internal', ['zqvx-internal']],
+    ];
+    const [secretText, forbidden] = pick(rng, variants);
+    return { hostname: 'fixture-host', secretText, forbidden, kind: 'endpoint' };
+  }
+  if (category === 6) {
+    const variants: [string, string[]][] = [
+      ['／Users／alice／mkgp-proj／README.md', ['users', 'alice', 'mkgp-proj']],
+      ['∕Users∕alice∕zqvx-corp∕notes', ['users', 'alice', 'zqvx-corp']],
+      ['https：//zqvx-db', ['https', 'zqvx-db']],
+      ['https：∕∕zqvx-api.example∕vbrn-dir', ['zqvx-api', 'example', 'vbrn-dir']],
+      ['192．168．1．10', ['192.168', '168.1']],
+      ['192․168․1․10', ['192.168', '168.1']],
+      ['192。168。1。10', ['192.168', '168.1']],
+      ['zqvx＠mkgp-corp．internal', ['zqvx', 'mkgp-corp', 'internal']],
+      ['zqvx-db．corp：5432', ['zqvx-db', 'corp', '5432']],
+      ['zqvx-srvr∶8080', ['zqvx-srvr', '8080']],
+      ['［fe80∶∶1％eth0］：2222', ['fe80', 'eth0', '2222']],
+      ['zqvx-corp。nz', ['zqvx-corp']],
+      ['zqvx-db‧prod', ['zqvx-db', 'prod']],
+    ];
+    const [secretText, forbidden] = pick(rng, variants);
+    return { hostname: 'fixture-host', secretText, forbidden, kind: 'homoglyph' };
+  }
+  if (category === 7) {
+    const variants: [string, string[]][] = [
+      ['/Users/alice/zqvx-org(mkgp-conf)/docs/q4.xlsx', ['zqvx-org', 'mkgp-conf']],
+      ['/Users/alice/zqvx,mkgp-dir/sub/README.md', ['zqvx', 'mkgp-dir']],
+      ['/Users/alice/zqvx-dir;mkgp/sub/file.txt', ['zqvx-dir', 'mkgp']],
+      ['/Users/alice/zqvx-dir|mkgp/sub/file.txt', ['zqvx-dir', 'mkgp']],
+      ['https://zqvx.corp/api?a=1,token=MKGP123', ['zqvx', 'token', 'mkgp123']],
+      ['https://zqvx.corp/api;jsessionid=MKGP123', ['zqvx', 'jsessionid', 'mkgp123']],
+      ['https://zqvx.corp/api|mkgp-srvr', ['zqvx', 'mkgp-srvr']],
+      ['zqvx-org(mkgp-conf)', ['zqvx-org', 'mkgp-conf']],
+    ];
+    const [secretText, forbidden] = pick(rng, variants);
+    return { hostname: 'fixture-host', secretText, forbidden, kind: 'punctcut' };
+  }
+  if (category === 8) {
+    const variants: [string, string[]][] = [
+      ['\\\\zqvx-srv\\mkgp-share', ['zqvx-srv', 'mkgp-share']],
+      ['//zqvx-fs/mkgp-share', ['zqvx-fs', 'mkgp-share']],
+      ['//zqvx-fs', ['zqvx-fs']],
+      ['\\/zqvx-fs/mkgp-share', ['zqvx-fs', 'mkgp-share']],
+      ['/\\zqvx-fs\\mkgp-share', ['zqvx-fs', 'mkgp-share']],
+      ['//zqvx-fs/mkgp-dir/q4.xlsx', ['zqvx-fs', 'mkgp-dir']],
+    ];
+    const [secretText, forbidden] = pick(rng, variants);
+    return { hostname: 'fixture-host', secretText, forbidden, kind: 'unc' };
+  }
+  const variants: [string, string, string[]][] = [
+    ['fixture-host', ':8080', ['8080']],
+    ['fixture-host', ':5432', ['5432']],
+    ['zqvx-srvr', 'zqvx-srvr: 8080', ['zqvx-srvr', '8080']],
+    ['zqvx-srvr', 'zqvx-srvr： 8443', ['zqvx-srvr', '8443']],
+    ['zqvx-srvr', 'zqvx-srvr∶ 9090', ['zqvx-srvr', '9090']],
   ];
-  const [secretText, forbidden] = pick(rng, variants);
-  return { hostname: 'fixture-host', secretText, forbidden, kind: 'endpoint' };
+  const [hostname, secretText, forbidden] = pick(rng, variants);
+  return { hostname, secretText, forbidden, kind: 'port' };
 }
 
 describe('conservative redaction fuzz suite', () => {
@@ -169,16 +238,23 @@ describe('conservative redaction fuzz suite', () => {
       const item = buildSecret(rng);
       const prefixRoll = rng();
       const suffixRoll = rng();
-      const prefixMode = prefixRoll < 0.005 ? 'huge' : prefixRoll < 0.085 ? 'long' : 'normal';
-      const suffixMode = suffixRoll < 0.005 ? 'huge' : suffixRoll < 0.085 ? 'long' : 'normal';
-      // Avoid merging a trailing combining mark onto a plain hostname without delimiter.
+      // Keep prefix short enough for modelTitle on most iterations so secrets actually reach the 512-char window.
+      const prefixMode = prefixRoll < 0.004 ? 'huge' : prefixRoll < 0.04 ? 'long' : 'normal';
+      const suffixMode = suffixRoll < 0.008 ? 'huge' : suffixRoll < 0.1 ? 'long' : 'normal';
       const before = makePadding(rng, prefixMode, item.kind !== 'hostname');
       const after = makePadding(rng, suffixMode, item.kind !== 'hostname');
       const sepBefore = item.kind === 'hostname' ? (rng() < 0.5 ? ' ' : '') : '';
-      const sepAfter = item.kind === 'hostname' ? (rng() < 0.5 ? ' ' : '') : '';
+      const sepAfter =
+        item.kind === 'hostname'
+          ? rng() < 0.5
+            ? ' '
+            : ''
+          : item.kind === 'port'
+            ? pick(rng, [' ', '\t', '\n', '\u00a0', '\u3000', '\u2028'] as const)
+            : '';
       const input = `visible ${before}${sepBefore}${item.secretText}${sepAfter}${after} tail`;
 
-      const forbiddenPieces = item.forbidden.flatMap(collectFourCharSlices);
+      const forbiddenPieces = item.forbidden.flatMap(collectForbiddenTokens);
 
       for (const [fn, limit] of [
         [modelTitle, 512],
@@ -189,13 +265,121 @@ describe('conservative redaction fuzz suite', () => {
         expect([...out].length).toBeLessThanOrEqual(limit);
         expect(out).not.toMatch(LONE_SURROGATE_RE);
 
-        const normalized = out.normalize('NFC').replace(/\p{M}/gu, '').toLowerCase();
+        const normalized = out.normalize('NFKC').replace(/\p{M}/gu, '').toLowerCase();
         for (const piece of forbiddenPieces) {
-          expect(normalized, `sample #${i} leaked "${piece}" from "${item.secretText}"`).not.toContain(piece);
+          expect(normalized, `sample #${i} (${item.kind}) leaked "${piece}" from "${item.secretText}"`).not.toContain(
+            piece,
+          );
         }
       }
     }
 
     expect(performance.now() - t0).toBeLessThan(30_000);
   }, 30_000);
+
+  describe('explicit 10-category degradation regression samples', () => {
+    const assertHidden = (samples: readonly [string, string, string][]) => {
+      for (const [input, hostname, secret] of samples) {
+        for (const fn of [modelTitle, modelText]) {
+          const out = fn(input, hostname).normalize('NFKC').replace(/\p{M}/gu, '').toLowerCase();
+          expect(out, `${fn.name}(${JSON.stringify(input)}) leaked ${secret}`).not.toContain(secret.toLowerCase());
+        }
+      }
+    };
+
+    it('M1: rejects 2-segment domains including unlisted TLDs without other structural chars', () => {
+      assertHidden([
+        ['open zqvx-node.com', 'fixture-host', 'zqvx-node'],
+        ['open zqvx-corp.nz', 'fixture-host', 'zqvx-corp'],
+        ['connect zqvx-db.prod', 'fixture-host', 'prod'],
+        ['visit zqvx-wiki.intra', 'fixture-host', 'intra'],
+        ['open zqvx-portal.app', 'fixture-host', 'zqvx-portal'],
+        ['ssh zqvx-auth.sh', 'fixture-host', 'zqvx-auth'],
+        ['open /Volumes/zqvx-corp.nz', 'fixture-host', 'zqvx-corp'],
+      ]);
+    });
+
+    it('M2: rejects Zone-ID / percent tokens without :: or brackets', () => {
+      assertHidden([
+        ['ping zqvx-fe80%eth0', 'fixture-host', 'eth0'],
+        ['ping zqvx-link%en0', 'fixture-host', 'en0'],
+        ['ping zqvx-id％eth0', 'fixture-host', 'eth0'],
+      ]);
+    });
+
+    it('M3: rejects bracketed host/address tokens without :: or /', () => {
+      assertHidden([
+        ['open [zqvx-node]', 'fixture-host', 'zqvx-node'],
+        ['open [198-51]', 'fixture-host', '198-51'],
+        ['open ［zqvx-box］', 'fixture-host', 'zqvx-box'],
+      ]);
+    });
+
+    it('M4: rejects colon host:port, standalone :port, and host: port tokens', () => {
+      assertHidden([
+        ['connect zqvx-node:8443', 'fixture-host', '8443'],
+        ['listen :8080', 'fixture-host', '8080'],
+        ['connect host: 8080', 'fixture-host', '8080'],
+        ['connect zqvx-node：8443', 'fixture-host', '8443'],
+        ['connect zqvx-node∶8080', 'fixture-host', '8080'],
+        ['connect foo:zqvx.corp:8080', 'fixture-host', 'zqvx'],
+      ]);
+    });
+
+    it('M5: rejects 1-2 segment UNC and //server paths including mixed slashes', () => {
+      assertHidden([
+        ['open \\\\zqvx-srv\\mkgp-share', 'fixture-host', 'mkgp-share'],
+        ['open //zqvx-srv/mkgp-share', 'fixture-host', 'mkgp-share'],
+        ['open //zqvx-srv', 'fixture-host', 'zqvx-srv'],
+        ['open \\/zqvx-srv/mkgp-share', 'fixture-host', 'mkgp-share'],
+        ['open /\\zqvx-srv\\mkgp-share', 'fixture-host', 'mkgp-share'],
+      ]);
+    });
+
+    it('M6: rejects :: IPv6/colon tokens without dots or brackets', () => {
+      assertHidden([
+        ['ssh 2001:db8::8a2e', 'fixture-host', '8a2e'],
+        ['connect zqvx::1', 'fixture-host', 'zqvx'],
+        ['connect zqvx∶∶1', 'fixture-host', 'zqvx'],
+      ]);
+    });
+
+    it('M7: rejects 3+ dot segments without :// or :', () => {
+      assertHidden([
+        ['visit zqvx.mkgp.internal', 'fixture-host', 'zqvx'],
+        ['ping 198.51.100.42', 'fixture-host', '198.51'],
+        ['ping 198．51．100．42', 'fixture-host', '198.51'],
+        ['ping 198․51․100․42', 'fixture-host', '198.51'],
+      ]);
+    });
+
+    it('M8: rejects :// scheme tokens without extra dots or ports', () => {
+      assertHidden([
+        ['open https://zqvx-internal', 'fixture-host', 'zqvx-internal'],
+        ['open ssh://zqvx-box', 'fixture-host', 'zqvx-box'],
+        ['open https：//zqvx-db', 'fixture-host', 'zqvx-db'],
+        ['open https：∕∕zqvx-db', 'fixture-host', 'zqvx-db'],
+      ]);
+    });
+
+    it('M9: splits on non-ASCII Unicode whitespace and strips zero-width bypasses', () => {
+      assertHidden([
+        ['open\u00a0Zqvx Node', 'Zqvx Node', 'zqvx'],
+        ['open\u3000Zqvx\u3000Node', 'Zqvx Node', 'zqvx'],
+        ['open\u2028Zqvx\u00a0Node', 'Zqvx Node', 'node'],
+        ['open zqvx\u200b-node', 'zqvx-node', 'zqvx'],
+        ['ping 198\u200b.51\u200c.100\ufeff.42', 'fixture-host', '198.51'],
+      ]);
+    });
+
+    it('M10: enforces full Unicode case folding and NFC/NFD/NFKC hostname equivalence', () => {
+      assertHidden([
+        ['on vbrnß', 'vbrnSS', 'vbrn'],
+        ['on \u03a5\u0308\u0301-mkgp', '\u03b0-mkgp', 'mkgp'],
+        ['on \u0130-zqvx', 'i\u0307-zqvx', 'zqvx'],
+        ['on CAFÉ-MKGP', 'cafe\u0301-mkgp', 'mkgp'],
+        ['on ｚｑｖｘ－ｈｏｓｔ', 'zqvx-host', 'zqvx'],
+      ]);
+    });
+  });
 });

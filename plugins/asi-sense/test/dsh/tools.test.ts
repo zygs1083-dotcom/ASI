@@ -449,7 +449,7 @@ describe('model-facing tools', () => {
   it('projects consented titles and excludes arbitrary notes and colliding private paths', async () => {
     const h = await fixture();
     const title = 'open </private/fixture/report> ssh user@build-node:22 README.md';
-    const projected = 'open <report> ssh <host> README.md';
+    const projected = 'open [path] ssh <host> README.md';
     h.state.env.focusedWindow.value = { title };
     if (!h.state.env.frontApp.value) throw new Error('fixture missing');
     h.state.env.frontApp.value.bundleId = 'backup.example.invalid';
