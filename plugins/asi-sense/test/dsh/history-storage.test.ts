@@ -1,4 +1,5 @@
-import { mkdtemp, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { execFileSync } from 'node:child_process';
+import { chmod, mkdir, mkdtemp, readdir, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { Context } from '@deepseek-ai/cordis';
@@ -117,5 +118,152 @@ describe('FileHistoryStoragePort', () => {
     // Read after removal returns empty gracefully.
     expect(await local.history?.readEvents('2026-10-18')).toBeUndefined();
     expect(await readFile(join(root, 'history', 'daily', '2026-10-18.json')).catch(() => 'gone')).toBe('gone');
+  });
+
+  it('rejects symlinks via lstat/O_NOFOLLOW, hardens permissive modes to 0700/0600, and reports dir/FIFO collisions', async () => {
+    const root = await makeTempDir();
+    const histDir = join(root, 'history');
+    const eventsDir = join(histDir, 'events');
+    const dailyDir = join(histDir, 'daily');
+    const monthlyDir = join(histDir, 'monthly');
+    await mkdir(eventsDir, { recursive: true, mode: 0o755 });
+    await mkdir(dailyDir, { recursive: true, mode: 0o755 });
+    await mkdir(monthlyDir, { recursive: true, mode: 0o755 });
+    await chmod(histDir, 0o755);
+    await chmod(eventsDir, 0o755);
+    await chmod(dailyDir, 0o755);
+    await chmod(monthlyDir, 0o755);
+
+    const existingEv = join(eventsDir, '2026-11-18.jsonl');
+    const existingDaily = join(dailyDir, '2026-11-17.json');
+    const existingMonthly = join(monthlyDir, '2026-10.json');
+    await writeFile(existingEv, '{"id":"e1"}\n', { mode: 0o644 });
+    await writeFile(existingDaily, '{}', { mode: 0o644 });
+    await writeFile(existingMonthly, '{}', { mode: 0o644 });
+    await chmod(existingEv, 0o644);
+    await chmod(existingDaily, 0o644);
+    await chmod(existingMonthly, 0o644);
+
+    const victim = join(root, 'outside-victim.txt');
+    await writeFile(victim, 'SECRET_OUTSIDE_CONTENT\n', { mode: 0o644 });
+    await chmod(victim, 0o644);
+    await symlink(victim, join(eventsDir, '2026-11-19.jsonl'));
+    await symlink(victim, join(dailyDir, '2026-11-19.json'));
+    await symlink(victim, join(monthlyDir, '2026-11.json'));
+    await mkdir(join(eventsDir, '2026-11-20.jsonl'));
+    execFileSync('mkfifo', [join(eventsDir, '2026-11-21.jsonl')]);
+
+    const port = new FileHistoryStoragePort(root);
+    const unsafe = await port.harden();
+    expect(unsafe).toEqual(
+      expect.arrayContaining([
+        { kind: 'events', name: '2026-11-19.jsonl', code: 'ELOOP' },
+        { kind: 'events', name: '2026-11-20.jsonl', code: 'EISDIR' },
+        { kind: 'events', name: '2026-11-21.jsonl', code: 'EINVAL' },
+        { kind: 'daily', name: '2026-11-19.json', code: 'ELOOP' },
+        { kind: 'monthly', name: '2026-11.json', code: 'ELOOP' },
+      ]),
+    );
+
+    expect((await stat(histDir)).mode & 0o777).toBe(0o700);
+    expect((await stat(eventsDir)).mode & 0o777).toBe(0o700);
+    expect((await stat(dailyDir)).mode & 0o777).toBe(0o700);
+    expect((await stat(monthlyDir)).mode & 0o777).toBe(0o700);
+    expect((await stat(existingEv)).mode & 0o777).toBe(0o600);
+    expect((await stat(existingDaily)).mode & 0o777).toBe(0o600);
+    expect((await stat(existingMonthly)).mode & 0o777).toBe(0o600);
+
+    await expect(port.appendEvent('2026-11-19', '{"id":"leak"}\n')).rejects.toMatchObject({ code: 'ELOOP' });
+    await expect(port.readEvents('2026-11-19')).rejects.toMatchObject({ code: 'ELOOP' });
+    await expect(port.eventFileSize('2026-11-19')).rejects.toMatchObject({ code: 'ELOOP' });
+    await expect(port.readDaily('2026-11-19')).rejects.toMatchObject({ code: 'ELOOP' });
+    await expect(port.readMonthly('2026-11')).rejects.toMatchObject({ code: 'ELOOP' });
+    await expect(port.writeDaily('2026-11-19', '{}')).rejects.toMatchObject({ code: 'ELOOP' });
+
+    await expect(port.readEvents('2026-11-20')).rejects.toMatchObject({ code: 'EISDIR' });
+    await expect(port.deleteEventDate('2026-11-20')).rejects.toMatchObject({ code: 'EISDIR' });
+    await expect(port.readEvents('2026-11-21')).rejects.toMatchObject({ code: 'EINVAL' });
+
+    // Outside victim file remains intact with original content & permissions
+    expect(await readFile(victim, 'utf8')).toBe('SECRET_OUTSIDE_CONTENT\n');
+    expect((await stat(victim)).mode & 0o777).toBe(0o644);
+
+    // Rejects invalid calendar dates/months and symlink history directory
+    expect(() => port.readEvents('2026-02-30')).toThrow(TypeError);
+    expect(() => port.readMonthly('2026-13')).toThrow(TypeError);
+
+    const symRoot = await makeTempDir();
+    const externalDir = join(symRoot, 'external');
+    await mkdir(externalDir, { recursive: true });
+    await symlink(externalDir, join(symRoot, 'history'));
+    const symPort = new FileHistoryStoragePort(symRoot);
+    await expect(symPort.appendEvent('2026-11-18', '{"id":"x"}\n')).rejects.toMatchObject({ code: 'ELOOP' });
+    expect(await symPort.harden()).toEqual([{ kind: 'dir', name: 'history', code: 'ELOOP' }]);
+  });
+
+  it('streams multi-byte UTF-8 lines across 64 KiB chunks in forward and reverse order, heals unterminated trailing line, and cleans failed atomic tmp', async () => {
+    const root = await makeTempDir();
+    const port = new FileHistoryStoragePort(root);
+    await mkdir(join(root, 'history', 'events'), { recursive: true, mode: 0o700 });
+
+    // Seed unterminated trailing line, then append via port -> must insert '\n' before appending
+    const filePath = join(root, 'history', 'events', '2026-11-18.jsonl');
+    await writeFile(filePath, '{"record":"event","id":"partial"', { mode: 0o600 });
+    await port.appendEvent('2026-11-18', '{"record":"lifecycle","state":"active","at":1000,"boot":true}\n');
+    expect(await port.readEvents('2026-11-18')).toBe(
+      '{"record":"event","id":"partial"\n{"record":"lifecycle","state":"active","at":1000,"boot":true}\n',
+    );
+
+    // > 140 KiB file with 3- and 4-byte UTF-8 chars across 64 KiB chunk boundaries + CRLF + empty lines + no final newline
+    const lines: string[] = [];
+    let totalBytes = 0;
+    for (let i = 0; totalBytes < 140 * 1024; i++) {
+      const text = JSON.stringify({
+        record: 'event',
+        id: `utf8-${i}`,
+        subject: `应用-${i}-🚀-中文测试-${'汉'.repeat(40)}`,
+      });
+      lines.push(text);
+      totalBytes += Buffer.byteLength(text, 'utf8') + 1;
+    }
+    await writeFile(join(root, 'history', 'events', '2026-11-19.jsonl'), `${lines.join('\r\n\n')}`, { mode: 0o600 });
+
+    const fwd: string[] = [];
+    for await (const line of port.readEventLines('2026-11-19')) fwd.push(line);
+    expect(fwd).toEqual(lines);
+
+    const rev: string[] = [];
+    for await (const line of port.readEventLinesDesc('2026-11-19')) rev.push(line);
+    expect(rev).toEqual([...lines].reverse());
+
+    // Atomic write failure removes .tmp-* and preserves previous file
+    await port.writeDaily('2026-11-18', '{"ok":1}');
+    const fsPromises = await import('node:fs/promises');
+    const failRenameFs: HistoryFileSystem = {
+      mkdir: (p, opts) => fsPromises.mkdir(p, opts),
+      readdir: (p) => fsPromises.readdir(p),
+      stat: (p) => fsPromises.stat(p),
+      lstat: (p) => fsPromises.lstat(p),
+      chmod: (p, m) => fsPromises.chmod(p, m),
+      readFile: (p, enc) => fsPromises.readFile(p, enc),
+      open: (p, flags, mode) => fsPromises.open(p, flags, mode),
+      rename: async () => {
+        throw Object.assign(new Error('EACCES'), { code: 'EACCES' });
+      },
+      unlink: (p) => fsPromises.unlink(p),
+      rm: (p, opts) => fsPromises.rm(p, opts),
+    };
+    const failPort = new FileHistoryStoragePort(root, failRenameFs);
+    await expect(failPort.writeDaily('2026-11-18', '{"ok":2}')).rejects.toThrow('EACCES');
+    expect(await port.readDaily('2026-11-18')).toBe('{"ok":1}');
+    expect(await readdir(join(root, 'history', 'daily'))).toEqual(['2026-11-18.json']);
+
+    // Concurrent writes serialize cleanly without interleaving
+    await Promise.all([
+      port.appendEvent('2026-11-22', '{"id":1}\n'),
+      port.appendEvent('2026-11-22', '{"id":2}\n'),
+      port.appendEvent('2026-11-22', '{"id":3}\n'),
+    ]);
+    expect(await port.readEvents('2026-11-22')).toBe('{"id":1}\n{"id":2}\n{"id":3}\n');
   });
 });

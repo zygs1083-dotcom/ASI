@@ -1,9 +1,11 @@
+import { execFileSync } from 'node:child_process';
 import { EventEmitter } from 'node:events';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { performance } from 'node:perf_hooks';
 import { PassThrough } from 'node:stream';
-import type { Signal, WatchRule } from '@asi/sense-types';
+import type { Body, Signal, WatchRule } from '@asi/sense-types';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { FileHistoryStoragePort } from '../../src/host/dsh/history-storage.ts';
 import { RuntimeAttention } from '../../src/host/runtime/attention.ts';
@@ -19,8 +21,10 @@ import {
   summarizeDay,
 } from '../../src/host/runtime/history/index.ts';
 import {
+  type AgentEvent,
   createSenseRuntime,
   type DshPort,
+  type FileChange,
   type HistoryStoragePort,
   type JobEvent,
 } from '../../src/host/runtime/index.ts';
@@ -826,7 +830,10 @@ describe('runtime history persistence, rollups, retention, and recovery', () => 
 
     await h.runtime.clearHistory();
     expect(h.runtime.events()).toEqual([]);
-    expect(await port.listEventDates()).toEqual([]);
+    expect(await port.listEventDates()).toEqual(['2026-11-12']);
+    const afterClear = parseHistoryLines((await port.readEvents('2026-11-12')) ?? '');
+    expect(afterClear.events).toEqual([]);
+    expect(afterClear.lifecycle).toEqual([{ record: 'lifecycle', state: 'active', at: now, boot: true }]);
     expect(await port.listDailyDates()).toEqual([]);
     expect(await port.listMonthlyMonths()).toEqual([]);
     expect(await h.runtime.tools.envHistory({})).toMatchObject({ available: true, total: 0, events: [] });
@@ -859,5 +866,821 @@ describe('runtime history persistence, rollups, retention, and recovery', () => 
     });
     await mgr.start(false);
     await mgr.stop();
+  });
+
+  it('hardens permissions on start and skips symlinks, colliding dirs, FIFOs, and invalid dates with one source.error (#3, #6)', async () => {
+    const dir = await makeTempDir();
+    const eventsDir = join(dir, 'history', 'events');
+    const dailyDir = join(dir, 'history', 'daily');
+    await mkdir(eventsDir, { recursive: true, mode: 0o755 });
+    await mkdir(dailyDir, { recursive: true, mode: 0o755 });
+    await chmod(join(dir, 'history'), 0o755);
+    await chmod(eventsDir, 0o755);
+    await chmod(dailyDir, 0o755);
+
+    const victim = join(dir, 'outside-secret.txt');
+    await writeFile(victim, 'OUTSIDE\n', { mode: 0o644 });
+    await symlink(victim, join(eventsDir, '2026-11-16.jsonl'));
+    await mkdir(join(eventsDir, '2026-11-15.jsonl'));
+    execFileSync('mkfifo', [join(eventsDir, '2026-11-14.jsonl')]);
+    await writeFile(join(eventsDir, '2026-02-30.jsonl'), '{"record":"event","id":"bad-date"}\n', { mode: 0o644 });
+    await writeFile(
+      join(eventsDir, '2026-11-17.jsonl'),
+      `${JSON.stringify({
+        record: 'event',
+        id: 'valid-ev',
+        kind: 'app.activated',
+        subject: 'Notes',
+        level: 'record',
+        at: Date.UTC(2026, 10, 17, 12, 0, 0),
+        source: { id: 'helper', api: 'nsworkspace', host: 'local' },
+      })}\n`,
+      { mode: 0o644 },
+    );
+
+    const port = new FileHistoryStoragePort(dir);
+    const h = createRuntimeHarness({ nowMs: Date.UTC(2026, 10, 18, 10, 0, 0), history: port, timeZone: 'UTC' });
+    await h.runtime.start();
+
+    expect((await stat(eventsDir)).mode & 0o777).toBe(0o700);
+    expect((await stat(join(eventsDir, '2026-11-17.jsonl'))).mode & 0o777).toBe(0o600);
+    expect(
+      h.runtime
+        .events()
+        .filter((e) => e.restored)
+        .map((e) => e.id),
+    ).toEqual(['valid-ev']);
+    expect(await port.readDaily('2026-11-17')).toBeDefined();
+
+    const errorsBeforeQuery = h.runtime.events().filter((e) => e.kind === 'source.error');
+    expect(errorsBeforeQuery).toHaveLength(4);
+    expect(errorsBeforeQuery.map((e) => e.reason)).toContain('invalid-history-date');
+    expect(errorsBeforeQuery.filter((e) => e.reason === 'history-unsafe-entry')).toHaveLength(3);
+
+    // Querying does not crash or emit duplicate errors for the same skipped unsafe files
+    const q = await h.runtime.tools.envHistory({});
+    expect(q).toMatchObject({ available: true });
+    expect(q.events.some((e) => e.id === 'valid-ev')).toBe(true);
+    expect(q.events.some((e) => e.id === 'bad-date')).toBe(false);
+    const qApps = await h.runtime.tools.envHistory({ kinds: ['app.activated'] });
+    expect(qApps.events.map((e) => e.id)).toEqual(['valid-ev']);
+    expect(h.runtime.events().filter((e) => e.kind === 'source.error')).toHaveLength(4);
+
+    await h.runtime.stop();
+  });
+
+  it('streams 20 MB single-day & 30x5 MB history within perf/RSS budgets and restores 200 entries from newest day first (#4)', async () => {
+    // 1) Restore 200 entries reads only newest day when newest has >= 200 events
+    const restoreDir = await makeTempDir();
+    const restorePortBase = new FileHistoryStoragePort(restoreDir);
+    const now = Date.UTC(2026, 10, 18, 12, 0, 0);
+    for (const [date, count, dayMs] of [
+      ['2026-11-17', 200, Date.UTC(2026, 10, 17, 10, 0, 0)],
+      ['2026-11-18', 210, now - 10_000],
+    ] as const) {
+      const lines = Array.from({ length: count }, (_, i) =>
+        JSON.stringify({
+          record: 'event',
+          id: `${date}-${i}`,
+          kind: 'app.activated',
+          subject: 'App',
+          level: 'record',
+          at: dayMs + i,
+          source: { id: 'helper', api: 'nsworkspace', host: 'local' },
+        }),
+      );
+      await restorePortBase.appendEvent(date, `${lines.join('\n')}\n`);
+    }
+    // Pre-write daily for 2026-11-17 so backfill doesn't read 2026-11-17
+    await restorePortBase.writeDaily(
+      '2026-11-17',
+      JSON.stringify(
+        summarizeDay('2026-11-17', { events: [], lifecycle: [] }, new LocalCalendar('UTC').dayBounds('2026-11-17')),
+      ),
+    );
+    const descSpy = vi.fn((d: string) => restorePortBase.readEventLinesDesc(d));
+    const spiedPort: HistoryStoragePort = {
+      eventFileSize: (d) => restorePortBase.eventFileSize(d),
+      appendEvent: (d, l) => restorePortBase.appendEvent(d, l),
+      readEvents: (d) => restorePortBase.readEvents(d),
+      readEventLines: (d) => restorePortBase.readEventLines(d),
+      readEventLinesDesc: descSpy,
+      listEventDates: () => restorePortBase.listEventDates(),
+      deleteEventDate: (d) => restorePortBase.deleteEventDate(d),
+      readDaily: (d) => restorePortBase.readDaily(d),
+      writeDaily: (d, j) => restorePortBase.writeDaily(d, j),
+      listDailyDates: () => restorePortBase.listDailyDates(),
+      deleteDailyDate: (d) => restorePortBase.deleteDailyDate(d),
+      readMonthly: (m) => restorePortBase.readMonthly(m),
+      writeMonthly: (m, j) => restorePortBase.writeMonthly(m, j),
+      listMonthlyMonths: () => restorePortBase.listMonthlyMonths(),
+      harden: () => restorePortBase.harden(),
+      clearAll: () => restorePortBase.clearAll(),
+    };
+    const hRestore = createRuntimeHarness({ nowMs: now, history: spiedPort, timeZone: 'UTC', withHelper: true });
+    await hRestore.runtime.start();
+    expect(descSpy).toHaveBeenCalledTimes(1);
+    expect(descSpy).toHaveBeenCalledWith('2026-11-18');
+    expect(hRestore.runtime.events()).toHaveLength(200);
+    expect(hRestore.runtime.events()[0]?.id).toBe('2026-11-18-10');
+    await hRestore.runtime.stop();
+
+    // 2) When newest day has < 200 events, falls back to previous day for remaining slots
+    const twoDayDir = await makeTempDir();
+    const twoDayPort = new FileHistoryStoragePort(twoDayDir);
+    await twoDayPort.appendEvent(
+      '2026-11-17',
+      `${Array.from({ length: 180 }, (_, i) =>
+        JSON.stringify({
+          record: 'event',
+          id: `d1-${i}`,
+          kind: 'app.activated',
+          subject: 'App',
+          level: 'record',
+          at: Date.UTC(2026, 10, 17, 10, 0, 0) + i,
+          source: { id: 'helper', api: 'nsworkspace', host: 'local' },
+        }),
+      ).join('\n')}\n`,
+    );
+    await twoDayPort.appendEvent(
+      '2026-11-18',
+      `${Array.from({ length: 50 }, (_, i) =>
+        JSON.stringify({
+          record: 'event',
+          id: `d2-${i}`,
+          kind: 'app.activated',
+          subject: 'App',
+          level: 'record',
+          at: now - 1_000 + i,
+          source: { id: 'helper', api: 'nsworkspace', host: 'local' },
+        }),
+      ).join('\n')}\n`,
+    );
+    const hTwo = createRuntimeHarness({ nowMs: now, history: twoDayPort, timeZone: 'UTC', withHelper: true });
+    await hTwo.runtime.start();
+    expect(hTwo.runtime.events()).toHaveLength(200);
+    expect(hTwo.runtime.events()[0]?.id).toBe('d1-30');
+    expect(hTwo.runtime.events()[199]?.id).toBe('d2-49');
+    await hTwo.runtime.stop();
+
+    // 3) Real 20 MB single day + 30x5 MB cold start & query budget
+    const perfDir = await makeTempDir();
+    await mkdir(join(perfDir, 'history', 'events'), { recursive: true, mode: 0o700 });
+    const row = (i: number) =>
+      `${JSON.stringify({
+        record: 'event',
+        id: `perf-${i}`,
+        kind: i % 2 === 0 ? 'app.activated' : 'window.focused',
+        subject: 'EditorApp',
+        title: `Document-${i} /Users/tester/workspace/project/src/file-${i}.ts`,
+        level: 'record',
+        at: now - 3_600_000 + i,
+        source: { id: 'helper', api: 'nsworkspace', host: 'local' },
+      })}\n`;
+    const chunks: string[] = [];
+    let bytes = 0;
+    let idx = 0;
+    while (bytes < 20 * 1024 * 1024) {
+      const l = row(idx++);
+      chunks.push(l);
+      bytes += Buffer.byteLength(l, 'utf8');
+    }
+    const day20mb = chunks.join('');
+    chunks.length = 0;
+    await writeFile(join(perfDir, 'history', 'events', '2026-11-18.jsonl'), day20mb, { mode: 0o600 });
+
+    const slice5mb = day20mb.slice(0, day20mb.indexOf('\n', 5 * 1024 * 1024) + 1);
+    chunks.length = 0;
+    const port20 = new FileHistoryStoragePort(perfDir);
+    const rss0 = process.memoryUsage().rss;
+    const h20 = createRuntimeHarness({ nowMs: now + 1_000, history: port20, timeZone: 'UTC' });
+    await h20.runtime.start();
+    const tq0 = performance.now();
+    const res20 = await h20.runtime.tools.envHistory({ limit: 50 });
+    const query20Ms = performance.now() - tq0;
+    const rssDeltaMb = (process.memoryUsage().rss - rss0) / 1_048_576;
+    expect(res20.events).toHaveLength(50);
+    expect(res20.truncated).toBe(true);
+    expect(query20Ms).toBeLessThan(150);
+    expect(rssDeltaMb).toBeLessThan(50);
+    await h20.runtime.stop();
+
+    const dir30 = await makeTempDir();
+    await mkdir(join(dir30, 'history', 'events'), { recursive: true, mode: 0o700 });
+    for (let d = 0; d < 30; d++) {
+      await writeFile(join(dir30, 'history', 'events', `${addDays('2026-11-18', -d)}.jsonl`), slice5mb, {
+        mode: 0o600,
+      });
+    }
+    const port30 = new FileHistoryStoragePort(dir30);
+    const h30 = createRuntimeHarness({ nowMs: now + 2_000, history: port30, timeZone: 'UTC' });
+    const ts0 = performance.now();
+    await h30.runtime.start();
+    const start30Ms = performance.now() - ts0;
+    const tq30 = performance.now();
+    const res30 = await h30.runtime.tools.envHistory({ limit: 50 });
+    const query30Ms = performance.now() - tq30;
+    expect(start30Ms).toBeLessThan(1_000);
+    expect(query30Ms).toBeLessThan(500);
+    expect(res30.events).toHaveLength(50);
+    await h30.runtime.stop();
+  }, 30_000);
+
+  it('re-seeds lifecycle on clearHistory(), resets 20 MB cap, and leaves no restored entries on concurrent start() (#5)', async () => {
+    // 1) Lifecycle continuity + daily cap reset after clearHistory()
+    const dir1 = await makeTempDir();
+    const port1 = new FileHistoryStoragePort(dir1);
+    let wall = Date.UTC(2026, 10, 18, 10, 0, 0);
+    let mono = 1_000;
+    const h1 = createRuntimeHarness({ nowMs: wall, history: port1, timeZone: 'UTC' });
+    await h1.runtime.start();
+    await h1.runtime.clearHistory();
+    wall += 180_000;
+    mono += 180_000;
+    h1.setTime(wall, mono);
+    await h1.runtime.stop();
+
+    const parsed = parseHistoryLines((await port1.readEvents('2026-11-18')) ?? '');
+    expect(parsed.lifecycle).toHaveLength(2);
+    const daily = summarizeDay('2026-11-18', parsed, new LocalCalendar('UTC').dayBounds('2026-11-18'));
+    expect(daily.coverage.observedMs).toBe(180_000);
+
+    // Resets 20 MB daily cap after clearHistory()
+    const mgrDir = await makeTempDir();
+    const mgrPort = new FileHistoryStoragePort(mgrDir);
+    let capWall = Date.UTC(2026, 10, 18, 10, 0, 0);
+    const capMgr = new HistoryManager({
+      port: mgrPort,
+      clock: { wall: () => capWall, mono: () => capWall },
+      isPaused: () => false,
+      titlesAllowed: () => true,
+      restoreEntries: () => {},
+      clearMemoryEntries: () => {},
+      emitSourceError: () => {},
+      emitSourceOk: () => {},
+      timeZone: 'UTC',
+      maxDailyBytes: 256,
+    });
+    await capMgr.start(false);
+    capMgr.recordEvent({
+      id: 'over-cap',
+      kind: 'app.activated',
+      subject: 'A'.repeat(240),
+      level: 'record',
+      at: capWall + 100,
+      source: { id: 'helper', api: 'nsworkspace', host: 'local' },
+    });
+    await capMgr.query({});
+    expect((await mgrPort.readEvents('2026-11-18')) ?? '').not.toContain('over-cap');
+    await capMgr.clear();
+    capWall += 1_000;
+    capMgr.recordEvent({
+      id: 'after-clear',
+      kind: 'app.activated',
+      subject: 'Ok',
+      level: 'record',
+      at: capWall,
+      source: { id: 'helper', api: 'nsworkspace', host: 'local' },
+    });
+    await capMgr.query({});
+    expect((await mgrPort.readEvents('2026-11-18')) ?? '').toContain('after-clear');
+    await capMgr.stop();
+
+    // 2) Concurrent start() + clearHistory() leaves zero restored entries
+    const dir2 = await makeTempDir();
+    const basePort = new FileHistoryStoragePort(dir2);
+    await basePort.appendEvent(
+      '2026-11-17',
+      `${JSON.stringify({
+        record: 'event',
+        id: 'stale-1',
+        kind: 'app.activated',
+        subject: 'StaleApp',
+        level: 'record',
+        at: Date.UTC(2026, 10, 17, 10, 0, 0),
+        source: { id: 'helper', api: 'nsworkspace', host: 'local' },
+      })}\n`,
+    );
+    let releaseList!: () => void;
+    const listGate = new Promise<void>((r) => {
+      releaseList = r;
+    });
+    let listStartedResolve!: () => void;
+    const listStarted = new Promise<void>((r) => {
+      listStartedResolve = r;
+    });
+    const slowPort: HistoryStoragePort = {
+      eventFileSize: (d) => basePort.eventFileSize(d),
+      appendEvent: (d, l) => basePort.appendEvent(d, l),
+      readEvents: (d) => basePort.readEvents(d),
+      readEventLines: (d) => basePort.readEventLines(d),
+      readEventLinesDesc: (d) => basePort.readEventLinesDesc(d),
+      listEventDates: async () => {
+        listStartedResolve();
+        await listGate;
+        return basePort.listEventDates();
+      },
+      deleteEventDate: (d) => basePort.deleteEventDate(d),
+      readDaily: (d) => basePort.readDaily(d),
+      writeDaily: (d, j) => basePort.writeDaily(d, j),
+      listDailyDates: () => basePort.listDailyDates(),
+      deleteDailyDate: (d) => basePort.deleteDailyDate(d),
+      readMonthly: (m) => basePort.readMonthly(m),
+      writeMonthly: (m, j) => basePort.writeMonthly(m, j),
+      listMonthlyMonths: () => basePort.listMonthlyMonths(),
+      clearAll: () => basePort.clearAll(),
+    };
+    const h2 = createRuntimeHarness({ nowMs: Date.UTC(2026, 10, 18, 10, 0, 0), history: slowPort, timeZone: 'UTC' });
+    const startP = h2.runtime.start();
+    await listStarted;
+    const clearP = h2.runtime.clearHistory();
+    releaseList();
+    await Promise.all([startP, clearP]);
+    expect(h2.runtime.events().filter((e) => e.restored)).toEqual([]);
+    expect((await h2.runtime.tools.envHistory({})).events.filter((e) => e.id === 'stale-1')).toEqual([]);
+    await h2.runtime.stop();
+  });
+
+  it('handles clock rollback across midnight, unterminated trailing line, early patch, 20MB truncatedAtLimit backfill, and rollover write failure (#7, #8)', async () => {
+    // 1) Clock rollback across midnight + same-day rollback + multi-day jump
+    const dir1 = await makeTempDir();
+    const port1 = new FileHistoryStoragePort(dir1);
+    const h1 = createRuntimeHarness({ nowMs: Date.UTC(2026, 10, 18, 0, 1, 0), history: port1, timeZone: 'UTC' });
+    await h1.runtime.start();
+
+    h1.setTime(Date.UTC(2026, 10, 17, 23, 55, 0), 10_000);
+    await h1.emitJob({
+      type: 'started',
+      id: 'j-before-midnight',
+      sessionId: 's1',
+      at: Date.UTC(2026, 10, 17, 23, 55, 0),
+    });
+
+    // Same-day rollback before moving forward across midnight
+    h1.setTime(Date.UTC(2026, 10, 17, 23, 50, 0), 15_000);
+    await h1.emitJob({
+      type: 'started',
+      id: 'j-same-day-back',
+      sessionId: 's1',
+      at: Date.UTC(2026, 10, 17, 23, 50, 0),
+    });
+
+    h1.setTime(Date.UTC(2026, 10, 18, 0, 5, 0), 615_000);
+    await h1.emitJob({ type: 'started', id: 'j-after-midnight', sessionId: 's1', at: Date.UTC(2026, 10, 18, 0, 5, 0) });
+
+    await h1.runtime.tools.envHistory({});
+    expect(await port1.readEvents('2026-11-17')).toContain('j-before-midnight');
+    expect(await port1.readDaily('2026-11-17')).toBeDefined();
+
+    // Multi-day forward jump
+    h1.setTime(Date.UTC(2026, 10, 21, 10, 0, 0), 10_000_000);
+    await h1.emitJob({ type: 'started', id: 'j-jump', sessionId: 's1', at: Date.UTC(2026, 10, 21, 10, 0, 0) });
+    await h1.runtime.tools.envHistory({});
+    expect(await port1.readDaily('2026-11-18')).toBeDefined();
+    await h1.runtime.stop();
+
+    // 2) Unterminated trailing line + corrupt JSON + patch appearing before event
+    const dir2 = await makeTempDir();
+    await mkdir(join(dir2, 'history', 'events'), { recursive: true, mode: 0o700 });
+    await writeFile(
+      join(dir2, 'history', 'events', '2026-11-18.jsonl'),
+      [
+        JSON.stringify({ record: 'patch', id: 'ev-later', level: 'wake', reason: 'early-ignored' }),
+        '{not-valid-json',
+        JSON.stringify({
+          record: 'event',
+          id: 'ev-later',
+          kind: 'app.activated',
+          subject: 'App',
+          level: 'record',
+          at: Date.UTC(2026, 10, 18, 9, 0, 0),
+          source: { id: 'helper', api: 'nsworkspace', host: 'local' },
+        }),
+        '{"record":"event","id":"partial"',
+      ].join('\n'),
+      { mode: 0o600 },
+    );
+    const port2 = new FileHistoryStoragePort(dir2);
+    const h2 = createRuntimeHarness({ nowMs: Date.UTC(2026, 10, 18, 10, 0, 0), history: port2, timeZone: 'UTC' });
+    await h2.runtime.start();
+    h2.advance(60_000);
+    await h2.runtime.stop();
+
+    const parsed2 = parseHistoryLines((await port2.readEvents('2026-11-18')) ?? '');
+    expect(parsed2.lifecycle.map((l) => ({ state: l.state, boot: l.boot }))).toEqual([
+      { state: 'active', boot: true },
+      { state: 'stopped', boot: undefined },
+    ]);
+    expect(parsed2.events.find((e) => e.id === 'ev-later')?.level).toBe('record');
+
+    // 3) Backfill preserves truncatedAtLimit when eventFileSize >= maxDailyBytes (#8)
+    const dir3 = await makeTempDir();
+    const basePort3 = new FileHistoryStoragePort(dir3);
+    const day1 = '2026-11-18';
+    await basePort3.appendEvent(
+      day1,
+      `${JSON.stringify({
+        record: 'event',
+        id: 'e1',
+        kind: 'app.activated',
+        subject: 'Editor',
+        level: 'record',
+        at: Date.UTC(2026, 10, 18, 12, 0, 0),
+        source: { id: 'helper', api: 'nsworkspace', host: 'local' },
+      })}\n`,
+    );
+    let daily1: string | undefined;
+    const capBackfillPort: HistoryStoragePort = {
+      eventFileSize: async (d) => (d === day1 ? MAX_DAILY_EVENT_BYTES : 0),
+      appendEvent: (d, l) => basePort3.appendEvent(d, l),
+      readEvents: (d) => basePort3.readEvents(d),
+      listEventDates: async () => [day1],
+      deleteEventDate: (d) => basePort3.deleteEventDate(d),
+      readDaily: async (d) => (d === day1 ? daily1 : undefined),
+      writeDaily: async (d, j) => {
+        if (d === day1) daily1 = j;
+      },
+      listDailyDates: async () => (daily1 ? [day1] : []),
+      deleteDailyDate: async () => {},
+      readMonthly: async () => undefined,
+      writeMonthly: async () => {},
+      listMonthlyMonths: async () => [],
+      clearAll: async () => {},
+    };
+    const h3 = createRuntimeHarness({
+      nowMs: Date.UTC(2026, 10, 19, 9, 0, 0),
+      history: capBackfillPort,
+      timeZone: 'UTC',
+    });
+    await h3.runtime.start();
+    expect(daily1).toBeDefined();
+    expect((JSON.parse(daily1 ?? '{}') as DailySummary).truncatedAtLimit).toBe(true);
+    await h3.runtime.stop();
+
+    // 4) Rollover writeDaily failure emits source.error (#8)
+    const failRollPort: HistoryStoragePort = {
+      eventFileSize: async () => 0,
+      appendEvent: async () => {},
+      readEvents: async (d) =>
+        d === day1
+          ? '{"record":"event","id":"x","kind":"app.activated","subject":"A","level":"record","at":1,"source":{"id":"h","api":"a","host":"l"}}\n'
+          : undefined,
+      listEventDates: async () => [day1],
+      deleteEventDate: async () => {},
+      readDaily: async () => undefined,
+      writeDaily: async () => {
+        throw new Error('EACCES');
+      },
+      listDailyDates: async () => [],
+      deleteDailyDate: async () => {},
+      readMonthly: async () => undefined,
+      writeMonthly: async () => {},
+      listMonthlyMonths: async () => [],
+      clearAll: async () => {},
+    };
+    const h4 = createRuntimeHarness({
+      nowMs: Date.UTC(2026, 10, 18, 23, 59, 0),
+      history: failRollPort,
+      timeZone: 'UTC',
+    });
+    await h4.runtime.start();
+    h4.setTime(Date.UTC(2026, 10, 19, 0, 1, 0), 121_000);
+    await h4.emitJob({ type: 'started', id: 'roll-trigger', at: Date.UTC(2026, 10, 19, 0, 1, 0) });
+    await h4.runtime.tools.envHistory({});
+    expect(
+      h4.runtime.events().filter((e) => e.kind === 'source.error' && e.reason === 'history-write-failed'),
+    ).toHaveLength(1);
+    await h4.runtime.stop();
+  });
+
+  it('guarantees full non-reentry across preStep, wake budget, FileBurstDetector, and frontApp; runs timer heartbeats & crash truncation; generates monthly once', async () => {
+    // 1) Full non-reentry: preStep, wake budget (3/10m), file.burst, frontApp
+    const dir1 = await makeTempDir();
+    const port1 = new FileHistoryStoragePort(dir1);
+    const t0 = Date.UTC(2026, 10, 17, 12, 0, 0);
+    await port1.appendEvent(
+      '2026-11-17',
+      [
+        ...Array.from({ length: 5 }, (_, i) =>
+          JSON.stringify({
+            record: 'event',
+            id: `old-wake-${i}`,
+            kind: 'job.exited',
+            subject: `old-job-${i}`,
+            level: 'wake',
+            ruleId: 'wake-job',
+            at: t0 + i * 1_000,
+            source: { id: 'dsh', api: 'events', host: 'local' },
+          }),
+        ),
+        JSON.stringify({
+          record: 'event',
+          id: 'old-ctx',
+          kind: 'file.changed',
+          subject: '/tmp/watched/a.ts',
+          level: 'context',
+          at: t0 + 6_000,
+          source: { id: 'files', api: 'watch', host: 'local' },
+        }),
+        JSON.stringify({
+          record: 'event',
+          id: 'old-app',
+          kind: 'app.activated',
+          subject: 'OldFrontApp',
+          level: 'record',
+          at: t0 + 7_000,
+          source: { id: 'helper.frontApp', api: 'nsworkspace', host: 'local' },
+        }),
+      ].join('\n') + '\n',
+    );
+
+    let wallMs = Date.UTC(2026, 10, 18, 9, 0, 0);
+    let monoMs = 1_000;
+    const delivered: Array<{ kind: string; ids: string[] }> = [];
+    let agentCb!: (ev: AgentEvent) => Promise<void>;
+    let jobCb!: (ev: JobEvent) => Promise<void>;
+    const rules: WatchRule[] = [
+      { id: 'wake-job', match: { kind: 'job.exited' }, level: 'wake', createdBy: 'user', approved: true },
+      {
+        id: 'ctx-file',
+        match: { kind: 'file.changed', subject: '/tmp/watched/**' },
+        level: 'context',
+        createdBy: 'user',
+        approved: true,
+      },
+    ];
+    const rt = createSenseRuntime(
+      {
+        clock: { wall: () => wallMs, mono: () => monoMs },
+        history: port1,
+        storage: { load: async () => undefined, save: async () => {} },
+        dsh: {
+          onAgentEvent: (cb) => {
+            agentCb = cb;
+            return () => {};
+          },
+          onTool: () => () => {},
+          onJob: (cb) => {
+            jobCb = cb;
+            return () => {};
+          },
+          deliver: async (_sid, intent) => {
+            delivered.push({ kind: intent.kind, ids: intent.update.changes.map((c) => c.signal.id) });
+          },
+          tokenSnapshot: async () => undefined,
+        },
+        helper: { spawn: () => undefined },
+        probe: { create: () => ({ onSample: () => () => {}, start: () => {}, stop: async () => {} }) },
+        files: { watch: () => ({ close: () => {} }) },
+      },
+      { platform: 'linux', timeZone: 'UTC', intervalMs: 600_000, rules },
+    );
+    await rt.start();
+    expect(rt.events().filter((e) => e.restored)).toHaveLength(7);
+    expect(rt.state().env.frontApp.value).toBeNull();
+    await agentCb({ type: 'created', sessionId: 's1' });
+    await agentCb({ type: 'pre-step', sessionId: 's1' });
+    await agentCb({ type: 'post-step', sessionId: 's1' });
+    expect(delivered).toEqual([]);
+    expect(rt.events().some((e) => e.kind === 'file.burst')).toBe(false);
+
+    for (let i = 0; i < 3; i++) {
+      monoMs += 65_000;
+      wallMs += 65_000;
+      await jobCb({ type: 'started', id: `live-job-${i}`, sessionId: 's1', at: wallMs });
+      await jobCb({ type: 'exited', id: `live-job-${i}`, sessionId: 's1', exitCode: 1, at: wallMs + 100 });
+      monoMs += 3_000;
+      wallMs += 3_000;
+      await agentCb({ type: 'pre-step', sessionId: 's1' });
+      await agentCb({ type: 'post-step', sessionId: 's1' });
+    }
+    expect(delivered).toHaveLength(3);
+    await rt.stop();
+
+    // 2) Timer-driven 5-min heartbeat (active + paused) & crash truncation + live monthly rollover generated once
+    vi.useFakeTimers();
+    const dir2 = await makeTempDir();
+    const port2 = new FileHistoryStoragePort(dir2);
+    let w2 = Date.UTC(2026, 9, 31, 23, 45, 0);
+    let m2 = 1_000;
+    let jobCb2!: (ev: JobEvent) => Promise<void>;
+    const rtCrash = createSenseRuntime(
+      {
+        clock: { wall: () => w2, mono: () => m2 },
+        history: port2,
+        storage: { load: async () => undefined, save: async () => {} },
+        dsh: {
+          onAgentEvent: () => () => {},
+          onTool: () => () => {},
+          onJob: (cb) => {
+            jobCb2 = cb;
+            return () => {};
+          },
+          deliver: async () => {},
+          tokenSnapshot: async () => undefined,
+        },
+        helper: { spawn: () => undefined },
+        probe: { create: () => ({ onSample: () => () => {}, start: () => {}, stop: async () => {} }) },
+        files: { watch: () => ({ close: () => {} }) },
+      },
+      { platform: 'linux', timeZone: 'UTC', intervalMs: 600_000 },
+    );
+    await rtCrash.start();
+    // 5-min timer heartbeat (active)
+    w2 += 300_000;
+    m2 += 300_000;
+    await vi.advanceTimersByTimeAsync(300_000);
+    // Pause and 5-min timer heartbeat (paused)
+    await rtCrash.actions.pause(true);
+    w2 += 300_000;
+    m2 += 300_000;
+    await vi.advanceTimersByTimeAsync(300_000);
+    await rtCrash.tools.envHistory({});
+    const crashLines = parseHistoryLines((await port2.readEvents('2026-10-31')) ?? '');
+    expect(crashLines.lifecycle.filter((l) => l.state === 'heartbeat')).toEqual([
+      expect.objectContaining({ state: 'heartbeat', paused: false }),
+      expect.objectContaining({ state: 'heartbeat', paused: true }),
+    ]);
+
+    // Simulate crash by clearing timers without calling rtCrash.stop(); restart next morning -> truncates at last heartbeat!
+    vi.clearAllTimers();
+    let wNext = Date.UTC(2026, 10, 1, 8, 0, 0);
+    let mNext = 1_000;
+    let jobCb3!: (ev: JobEvent) => Promise<void>;
+    const rtNext = createSenseRuntime(
+      {
+        clock: { wall: () => wNext, mono: () => mNext },
+        history: port2,
+        storage: { load: async () => undefined, save: async () => {} },
+        dsh: {
+          onAgentEvent: () => () => {},
+          onTool: () => () => {},
+          onJob: (cb) => {
+            jobCb3 = cb;
+            return () => {};
+          },
+          deliver: async () => {},
+          tokenSnapshot: async () => undefined,
+        },
+        helper: { spawn: () => undefined },
+        probe: { create: () => ({ onSample: () => () => {}, start: () => {}, stop: async () => {} }) },
+        files: { watch: () => ({ close: () => {} }) },
+      },
+      { platform: 'linux', timeZone: 'UTC', intervalMs: 600_000 },
+    );
+    await rtNext.start();
+    const octDaily = JSON.parse((await port2.readDaily('2026-10-31')) ?? '{}') as DailySummary;
+    expect(octDaily.coverage.observedMs).toBe(300_000);
+    expect(octDaily.coverage.pausedMs).toBe(300_000);
+
+    const octMonthly1 = JSON.parse((await port2.readMonthly('2026-10')) ?? '{}') as MonthlySummary;
+    expect(octMonthly1.generatedAt).toBe(Date.UTC(2026, 10, 1, 8, 0, 0));
+
+    // Roll over across next day -> monthly/2026-10.json is NOT overwritten (same generatedAt)
+    wNext = Date.UTC(2026, 10, 2, 0, 0, 5);
+    mNext += 86_400_000;
+    await jobCb3({ type: 'started', id: 'nov-2', at: wNext });
+    await rtNext.tools.envHistory({});
+    const octMonthly2 = JSON.parse((await port2.readMonthly('2026-10')) ?? '{}') as MonthlySummary;
+    expect(octMonthly2.generatedAt).toBe(octMonthly1.generatedAt);
+    await rtNext.stop();
+    expect(jobCb2).toBeDefined();
+  });
+
+  it('persists signals from real BodySource and FileSource into history and daily summaries', async () => {
+    const dir = await makeTempDir();
+    const port = new FileHistoryStoragePort(dir);
+    let wall = Date.UTC(2026, 10, 10, 10, 0, 0);
+    let mono = 1_000;
+    let probeCb!: (body: Body) => void;
+    let fileCb!: (ev: FileChange) => void;
+    const diskBody = (free: number): Body => ({
+      cpu: {
+        value: { usage: 0.1, perCore: [0.1], load1: 0.1, load5: 0.1, load15: 0.1 },
+        status: 'ok',
+        source: { id: 'body', api: 'probe', host: 'local' },
+        observedAt: wall,
+        ttlMs: 10_000,
+      },
+      memory: {
+        value: { total: 1000, used: 200, pressure: 'normal', swapUsed: 0 },
+        status: 'ok',
+        source: { id: 'body', api: 'probe', host: 'local' },
+        observedAt: wall,
+        ttlMs: 10_000,
+      },
+      disks: {
+        kind: 'disks',
+        value: [{ mount: '/Volumes/Work', total: 1000, free, status: 'ok', observedAt: wall, ttlMs: 10_000 }],
+        status: 'ok',
+        source: { id: 'body', api: 'probe', host: 'local' },
+        observedAt: wall,
+        ttlMs: 10_000,
+      },
+      battery: {
+        value: null,
+        status: 'unavailable',
+        source: { id: 'body', api: 'probe', host: 'local' },
+        observedAt: wall,
+        ttlMs: 10_000,
+      },
+      thermal: {
+        value: 'nominal',
+        status: 'ok',
+        source: { id: 'body', api: 'probe', host: 'local' },
+        observedAt: wall,
+        ttlMs: 10_000,
+      },
+      network: {
+        value: { online: true, rxBps: 0, txBps: 0 },
+        status: 'ok',
+        source: { id: 'body', api: 'probe', host: 'local' },
+        observedAt: wall,
+        ttlMs: 10_000,
+      },
+      harnessProcess: {
+        value: { rss: 100, cpu: 0.1, uptimeSec: 10 },
+        status: 'ok',
+        source: { id: 'body', api: 'probe', host: 'local' },
+        observedAt: wall,
+        ttlMs: 10_000,
+      },
+      tokens: {
+        value: null,
+        status: 'unavailable',
+        source: { id: 'tokens', api: 'dsh', host: 'local' },
+        observedAt: wall,
+        ttlMs: 10_000,
+      },
+    });
+
+    const rt = createSenseRuntime(
+      {
+        clock: { wall: () => wall, mono: () => mono },
+        history: port,
+        storage: { load: async () => undefined, save: async () => {} },
+        dsh: {
+          onAgentEvent: () => () => {},
+          onTool: () => () => {},
+          onJob: () => () => {},
+          deliver: async () => {},
+          tokenSnapshot: async () => undefined,
+        },
+        helper: { spawn: () => undefined },
+        probe: {
+          create: () => ({
+            onSample: (cb) => {
+              probeCb = cb;
+              return () => {};
+            },
+            start: () => {},
+            stop: async () => {},
+          }),
+        },
+        files: {
+          watch: (_p, cb) => {
+            fileCb = cb;
+            return { close: () => {} };
+          },
+        },
+      },
+      {
+        platform: 'linux',
+        timeZone: 'UTC',
+        intervalMs: 600_000,
+        rules: [
+          {
+            id: 'watch-src',
+            match: { kind: 'file.changed', subject: '/tmp/proj/**' },
+            level: 'context',
+            createdBy: 'user',
+            approved: true,
+          },
+        ],
+      },
+    );
+    await rt.start();
+    probeCb(diskBody(800));
+    wall += 2_000;
+    mono += 2_000;
+    probeCb(diskBody(50)); // < 10% triggers body.threshold warn on disk:/Volumes/Work
+    fileCb({ path: '/tmp/proj/index.ts', change: 'modify', at: wall });
+    await vi.waitFor(
+      () =>
+        expect(
+          rt.events().some((e) => e.kind === 'body.threshold') && rt.events().some((e) => e.kind === 'file.changed'),
+        ).toBe(true),
+      { timeout: 2_000, interval: 10 },
+    );
+    await rt.stop();
+
+    const parsed = parseHistoryLines((await port.readEvents('2026-11-10')) ?? '');
+    expect(parsed.events.some((e) => e.kind === 'body.threshold' && e.subject === 'disk:/Volumes/Work')).toBe(true);
+    expect(parsed.events.some((e) => e.kind === 'body.rate' && e.detail?.metric === 'disk:/Volumes/Work')).toBe(true);
+    expect(parsed.events.some((e) => e.kind === 'file.changed' && e.subject === '/tmp/proj/index.ts')).toBe(true);
+    const summary = summarizeDay('2026-11-10', parsed, new LocalCalendar('UTC').dayBounds('2026-11-10'));
+    expect(summary.bodyAnomalies.threshold).toBe(1);
+    expect(summary.bodyAnomalies.rate).toBe(1);
+    expect(summary.bodyAnomalies.byMetric['disk:Work']).toBe(2);
   });
 });

@@ -1,10 +1,26 @@
 import { EventEmitter } from 'node:events';
-import { hostname } from 'node:os';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { hostname, tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { PassThrough } from 'node:stream';
 import { ToolArgsError, type ToolRunContext } from '@deepseek-ai/dsh-tools';
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { modelHistory, modelSummary } from '../../src/host/dsh/history-output.ts';
+import { FileHistoryStoragePort } from '../../src/host/dsh/history-storage.ts';
 import { createSenseTools } from '../../src/host/dsh/tools.ts';
 import { createSenseRuntime, type DailySummary, type HistoryStoragePort } from '../../src/host/runtime/index.ts';
+
+const tempDirs: string[] = [];
+
+async function makeTempDir(): Promise<string> {
+  const dir = await mkdtemp(join(tmpdir(), 'asi-hist-tools-'));
+  tempDirs.push(dir);
+  return dir;
+}
+
+afterEach(async () => {
+  await Promise.all(tempDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
+});
 
 function createMemoryHistoryPort(): HistoryStoragePort {
   const events = new Map<string, string>();
@@ -388,7 +404,7 @@ describe('env_detail, env_history, and env_summary tools', () => {
       makeExec(),
     )) as { limit: number; total: number; truncated: boolean; events: Array<{ id: string }> };
     expect(isoLimited.limit).toBe(50);
-    expect(isoLimited.total).toBe(123);
+    expect(isoLimited.total).toBe(50);
     expect(isoLimited.truncated).toBe(true);
     expect(isoLimited.events).toHaveLength(50);
 
@@ -481,6 +497,511 @@ describe('env_detail, env_history, and env_summary tools', () => {
     };
     expect(missingMonth.available).toBe(false);
     expect(missingMonth.reason).toContain('No history data found');
+
+    await h.runtime.stop();
+  });
+
+  it('re-checks titlesAllowed after disk IO and aligns Linux and unready-helper with sendTitles (#1)', async () => {
+    const now = Date.UTC(2026, 10, 18, 10, 0, 0);
+    const base = createMemoryHistoryPort();
+    await base.appendEvent(
+      '2026-11-18',
+      [
+        JSON.stringify({
+          record: 'event',
+          id: 'app-1',
+          kind: 'app.activated',
+          subject: 'Notes',
+          level: 'record',
+          at: now - 2_000,
+          source: { id: 'helper.frontApp', api: 'nsworkspace', host: 'local' },
+        }),
+        JSON.stringify({
+          record: 'event',
+          id: 'w-1',
+          kind: 'window.focused',
+          subject: 'Notes',
+          title: 'Top Secret Merger Plan',
+          level: 'record',
+          at: now - 1_000,
+          source: { id: 'helper.focusedWindow', api: 'ax', host: 'local' },
+        }),
+      ].join('\n') + '\n',
+    );
+
+    let readEntered!: () => void;
+    const onReadEntered = new Promise<void>((r) => {
+      readEntered = r;
+    });
+    let releaseRead!: () => void;
+    const readGate = new Promise<void>((r) => {
+      releaseRead = r;
+    });
+    let intercept = false;
+    const gatedPort: HistoryStoragePort = {
+      ...base,
+      readEvents: async (d) => {
+        if (intercept) {
+          intercept = false;
+          readEntered();
+          await readGate;
+        }
+        return base.readEvents(d);
+      },
+    };
+
+    const hMac = createRuntimeHarness(now, gatedPort, true);
+    await hMac.runtime.start();
+    const envHistoryMac = createSenseTools(hMac.runtime, () => now).find((t) => t.name === 'env_history')!;
+
+    // Helper hasn't even completed hello/titles.ack yet, yet sendTitles=true matches env_state!
+    const preReadyOut = (await envHistoryMac.execute({ kinds: ['window.focused'] }, makeExec())) as {
+      titlesAllowed: boolean;
+      events: Array<{ title?: string }>;
+    };
+    expect(preReadyOut.titlesAllowed).toBe(true);
+    expect(preReadyOut.events[0]?.title).toBe('Top Secret Merger Plan');
+
+    // Race setSendTitles(false) while env_history is awaiting disk read (both plain and with app filter)
+    intercept = true;
+    const raceP = envHistoryMac.execute({ app: 'Notes' }, makeExec());
+    await onReadEntered;
+    const toggleP = hMac.runtime.actions.setSendTitles(false);
+    releaseRead();
+    const [raceOut] = (await Promise.all([raceP, toggleP])) as [
+      { titlesAllowed: boolean; events: Array<{ id: string; kind: string; title?: string }> },
+      void,
+    ];
+    expect(hMac.runtime.rules.settings().sendTitles).toBe(false);
+    expect(raceOut.titlesAllowed).toBe(false);
+    expect(raceOut.events.map((e) => e.id)).toEqual(['app-1']);
+
+    await hMac.runtime.stop();
+
+    // Linux (no helper) with sendTitles=true returns window titles identically to env_state
+    const hLinux = createRuntimeHarness(now, base, false);
+    await hLinux.runtime.start();
+    const linuxOut = (await createSenseTools(hLinux.runtime, () => now)
+      .find((t) => t.name === 'env_history')!
+      .execute({ kinds: ['window.focused'] }, makeExec())) as {
+      titlesAllowed: boolean;
+      events: Array<{ title?: string }>;
+    };
+    expect(hLinux.runtime.rules.settings().sendTitles).toBe(true);
+    expect(linuxOut.titlesAllowed).toBe(true);
+    expect(linuxOut.events[0]?.title).toBe('Top Secret Merger Plan');
+    await hLinux.runtime.stop();
+  });
+
+  it('redacts job.*/process.* to executable basename, disk:<mount> to mount basename, and blocks unsafe identifiers (#2)', async () => {
+    const now = Date.UTC(2026, 10, 18, 10, 0, 0);
+    const history = createMemoryHistoryPort();
+    let jobCb:
+      | ((ev: {
+          type: 'started' | 'exited';
+          id: string;
+          command?: string;
+          exitCode?: number;
+          at?: number;
+        }) => Promise<void>)
+      | undefined;
+    const rt = createSenseRuntime(
+      {
+        clock: { wall: () => now, mono: () => 1_000 },
+        history,
+        storage: { load: async () => undefined, save: async () => {} },
+        dsh: {
+          onAgentEvent: () => () => {},
+          onTool: () => () => {},
+          onJob: (cb) => {
+            jobCb = cb as typeof jobCb;
+            return () => {};
+          },
+          deliver: async () => {},
+          tokenSnapshot: async () => undefined,
+        },
+        helper: { spawn: () => undefined },
+        probe: { create: () => ({ onSample: () => () => {}, start: () => {}, stop: async () => {} }) },
+        files: { watch: () => ({ close: () => {} }) },
+      },
+      { platform: 'linux', timeZone: 'UTC', intervalMs: 600_000 },
+    );
+    await rt.start();
+    await jobCb?.({ type: 'exited', id: 'job-1', command: 'ssh prod_bastion_secret', exitCode: 1, at: now });
+    await rt.tools.envHistory({});
+    const rawDisk = await history.readEvents('2026-11-18');
+    expect(rawDisk).toContain('ssh prod_bastion_secret');
+
+    const envHistory = createSenseTools(rt, () => now).find((t) => t.name === 'env_history')!;
+    const jobOut = (await envHistory.execute({ kinds: ['job.exited'] }, makeExec())) as {
+      events: Array<{ kind: string; subject: string }>;
+    };
+    expect(jobOut.events).toEqual([expect.objectContaining({ kind: 'job.exited', subject: 'ssh' })]);
+    await rt.stop();
+
+    const projected = modelHistory({
+      available: true,
+      from: 1_000,
+      to: 2_000,
+      limit: 50,
+      total: 4,
+      truncated: false,
+      titlesAllowed: true,
+      events: [
+        {
+          id: 'proc-1',
+          kind: 'process.exited',
+          subject: 'API_KEY=secret /usr/local/bin/psql postgres://admin:s3cr3t@10.0.0.5:5432/prod_db -c "SELECT 1"',
+          level: 'wake',
+          ruleId: 'corp-db.internal:5432',
+          at: 1_800,
+          source: { id: '10.0.0.5', api: 'user@host', host: 'local' },
+        },
+        {
+          id: 'job-quoted',
+          kind: 'job.started',
+          subject: '"/Applications/Secret App.app/Contents/MacOS/MyRunner" --token=xyz',
+          level: 'context',
+          ruleId: 'host.1',
+          at: 1_700,
+          source: { id: 'a/b', api: 'a\\b', host: 'local' },
+        },
+        {
+          id: 'body:disk:/Volumes/Corp Secret/Drive:1500:warn',
+          kind: 'body.threshold',
+          subject: 'disk:/Volumes/Corp Secret/Drive',
+          level: 'context',
+          at: 1_500,
+          source: { id: 'body', api: 'probe', host: 'local' },
+          detail: {
+            severity: 'warn',
+            value: 0.05,
+            metric: 'disk:/Volumes/Corp Secret/Drive',
+            ruleId: 'corp-db.internal',
+          },
+        },
+        {
+          id: 'rate-1',
+          kind: 'body.rate',
+          subject: 'rate:disk-drop:disk:/',
+          level: 'context',
+          at: 1_300,
+          source: { id: 'body', api: 'probe', host: 'local' },
+          detail: { metric: 'disk:/', severity: 'warn' },
+        },
+      ],
+    }) as { events: Array<Record<string, unknown>> };
+    const serialized = JSON.stringify(projected);
+    expect(serialized).not.toContain('s3cr3t');
+    expect(serialized).not.toContain('prod_db');
+    expect(serialized).not.toContain('API_KEY');
+    expect(serialized).not.toContain('10.0.0.5');
+    expect(serialized).not.toContain('corp-db.internal');
+    expect(serialized).not.toContain('Corp Secret');
+    expect(serialized).not.toContain('--token=xyz');
+    expect(serialized).not.toContain('host.1');
+    expect(serialized).not.toContain('user@host');
+
+    expect(projected.events[0]).toMatchObject({
+      subject: 'psql',
+      ruleId: '[redacted]',
+      source: { id: '[redacted]', api: '[redacted]' },
+    });
+    expect(projected.events[1]).toMatchObject({
+      subject: 'MyRunner',
+      ruleId: '[redacted]',
+      source: { id: '[redacted]', api: '[redacted]' },
+    });
+    expect(projected.events[2]).toMatchObject({
+      id: 'body:disk:Drive:1500:warn',
+      subject: 'disk:Drive',
+      detail: { metric: 'disk:Drive', ruleId: '[redacted]' },
+    });
+    expect(projected.events[3]).toMatchObject({
+      subject: 'rate:disk-drop:disk:[path]',
+      detail: { metric: 'disk:[path]' },
+    });
+
+    const sumOut = modelSummary({
+      available: true,
+      summary: {
+        version: 1,
+        month: '2026-10',
+        daysInMonth: 31,
+        coveredDays: 1,
+        missingDays: [],
+        includedDays: ['2026-10-01'],
+        apps: {},
+        appSwitches: 0,
+        deliveries: {
+          wake: 1,
+          context: 0,
+          suppressed: 0,
+          byRule: {
+            '10.0.0.5:8080': { wake: 1, context: 0, suppressed: 0 },
+            'r-wake': { wake: 2, context: 0, suppressed: 0 },
+          },
+        },
+        fileBursts: {},
+        fileActivity: {},
+        bodyAnomalies: {
+          total: 3,
+          threshold: 3,
+          rate: 0,
+          anomaly: 0,
+          byMetric: { 'disk:[path]': 1, 'db.internal:5432': 1, 'disk:/Volumes/Corp Secret/Drive': 1 },
+        },
+        coverage: { totalDayMs: 86_400_000, observedMs: 1_000, pausedMs: 0, notRunningMs: 86_399_000 },
+        totalEvents: 1,
+        generatedAt: 1_000,
+      },
+    }) as {
+      summary: { deliveries: { byRule: Record<string, unknown> }; bodyAnomalies: { byMetric: Record<string, number> } };
+    };
+    expect(sumOut.summary.deliveries.byRule['[redacted]']).toBeDefined();
+    expect(sumOut.summary.deliveries.byRule['r-wake']).toBeDefined();
+    expect(sumOut.summary.bodyAnomalies.byMetric).toEqual({
+      'disk:[path]': 1,
+      '[redacted]': 1,
+      'disk:Drive': 1,
+    });
+  });
+
+  it('handles multi-day queries, date bounds, exact limit=200, early-stop across days, invalid ISO dates (#10), and corrupt JSON (#6)', async () => {
+    const now = Date.UTC(2026, 10, 15, 12, 0, 0);
+    const base = createMemoryHistoryPort();
+    for (const [date, at, id] of [
+      ['2026-10-31', Date.UTC(2026, 9, 31, 23, 0, 0), 'oct-last'],
+      ['2026-11-01', Date.UTC(2026, 10, 1, 1, 0, 0), 'nov-first'],
+      ['2026-11-12', Date.UTC(2026, 10, 12, 11, 0, 0), 'nov-12-early'],
+      ['2026-11-12', Date.UTC(2026, 10, 12, 12, 0, 0), 'nov-12'],
+    ] as const) {
+      await base.appendEvent(
+        date,
+        `${JSON.stringify({
+          record: 'event',
+          id,
+          kind: 'app.activated',
+          subject: 'App',
+          level: 'record',
+          at,
+          source: { id: 'helper', api: 'nsworkspace', host: 'local' },
+        })}\n`,
+      );
+    }
+    const readSpy = vi.fn((d: string) => base.readEvents(d));
+    const spiedPort: HistoryStoragePort = { ...base, readEvents: readSpy };
+
+    const h = createRuntimeHarness(now, spiedPort, false);
+    await h.runtime.start();
+    const tools = createSenseTools(h.runtime, () => now);
+    const envHistory = tools.find((t) => t.name === 'env_history')!;
+    const envSummary = tools.find((t) => t.name === 'env_summary')!;
+
+    // Invalid ISO calendar date rejected (#10) + negative/NaN bounds rejected
+    await expect(envHistory.execute({ from: '2026-02-30T10:00:00Z' }, makeExec())).rejects.toThrow(ToolArgsError);
+    await expect(envHistory.execute({ from: -1 }, makeExec())).rejects.toThrow(ToolArgsError);
+    await expect(envHistory.execute({ to: Number.NaN }, makeExec())).rejects.toThrow(ToolArgsError);
+
+    // Cross-month query returns newest-to-oldest
+    const cross = (await envHistory.execute({ from: '2026-10-31', to: '2026-11-02' }, makeExec())) as {
+      events: Array<{ id: string }>;
+    };
+    expect(cross.events.map((e) => e.id)).toEqual(['nov-first', 'oct-last']);
+
+    // Early-stop: limit=1 stops on newest matching day without reading older days
+    readSpy.mockClear();
+    const one = (await envHistory.execute({ from: '2026-10-31', to: '2026-11-12', limit: 1 }, makeExec())) as {
+      events: Array<{ id: string }>;
+      truncated: boolean;
+    };
+    expect(one.events.map((e) => e.id)).toEqual(['nov-12']);
+    expect(one.truncated).toBe(true);
+    expect(readSpy).toHaveBeenCalledTimes(1);
+    expect(readSpy).toHaveBeenCalledWith('2026-11-12');
+
+    // Exact 200 events with limit=200 has truncated=false; adding 1 more yields truncated=true
+    const lines200 = Array.from({ length: 200 }, (_, i) =>
+      JSON.stringify({
+        record: 'event',
+        id: `e200-${i}`,
+        kind: 'app.activated',
+        subject: 'A',
+        level: 'record',
+        at: Date.UTC(2026, 10, 14, 0, 0, 0) + i * 10,
+        source: { id: 'helper', api: 'nsworkspace', host: 'local' },
+      }),
+    );
+    await base.appendEvent('2026-11-14', `${lines200.join('\n')}\n`);
+    const exact200 = (await envHistory.execute({ from: '2026-11-14', to: '2026-11-14', limit: 200 }, makeExec())) as {
+      events: Array<{ id: string }>;
+      truncated: boolean;
+      total: number;
+    };
+    expect(exact200.events).toHaveLength(200);
+    expect(exact200.total).toBe(200);
+    expect(exact200.truncated).toBe(false);
+
+    // Pre-existing current-month monthly JSON is NOT returned prematurely (#10 nit)
+    await base.writeMonthly(
+      '2026-11',
+      JSON.stringify({
+        version: 1,
+        month: '2026-11',
+        daysInMonth: 30,
+        coveredDays: 1,
+        missingDays: [],
+        includedDays: [],
+        apps: {},
+        appSwitches: 0,
+        deliveries: { wake: 0, context: 0, suppressed: 0, byRule: {} },
+        fileBursts: {},
+        fileActivity: {},
+        bodyAnomalies: { total: 0, threshold: 0, rate: 0, anomaly: 0, byMetric: {} },
+        coverage: { totalDayMs: 86_400_000, observedMs: 0, pausedMs: 0, notRunningMs: 86_400_000 },
+        totalEvents: 0,
+        generatedAt: 1,
+      }),
+    );
+    expect(await envSummary.execute({ month: '2026-11' }, makeExec())).toMatchObject({ available: false });
+
+    // Half-corrupt daily & monthly summaries do not crash modelSummary (#6)
+    await base.writeMonthly('2026-10', JSON.stringify({ version: 1, month: '2026-10' }));
+    await base.writeMonthly('2026-08', JSON.stringify({ version: 1, month: '2026-08' }));
+    await base.writeDaily(
+      '2026-09-10',
+      JSON.stringify({
+        version: 1,
+        date: '2026-09-10',
+        coverage: {},
+        deliveries: {},
+        bodyAnomalies: {},
+        fileBursts: { d: null },
+      }),
+    );
+    const octAfterCorrupt = modelSummary(await h.runtime.tools.envSummary({ month: '2026-10' })) as {
+      available: boolean;
+    };
+    expect(octAfterCorrupt.available).toBe(true);
+    const augAfterCorrupt = modelSummary(await h.runtime.tools.envSummary({ month: '2026-08' })) as {
+      available: boolean;
+    };
+    expect(augAfterCorrupt.available).toBe(false);
+    const sepAfterCorrupt = modelSummary(await h.runtime.tools.envSummary({ month: '2026-09' })) as {
+      available: boolean;
+    };
+    expect(sepAfterCorrupt.available).toBe(false);
+    expect(
+      h.runtime.events().filter((e) => e.kind === 'source.error' && e.reason === 'corrupt-monthly-summary'),
+    ).toHaveLength(2);
+    expect(
+      h.runtime.events().filter((e) => e.kind === 'source.error' && e.reason === 'corrupt-daily-summary'),
+    ).toHaveLength(1);
+
+    await h.runtime.stop();
+
+    // Leap year Feb (29 days) & Jan default prevMonth (2027-01 -> 2026-12)
+    const janNow = Date.UTC(2027, 0, 5, 10, 0, 0);
+    const janPort = createMemoryHistoryPort();
+    await janPort.appendEvent(
+      '2026-12-15',
+      `${JSON.stringify({ record: 'event', id: 'dec', kind: 'app.activated', subject: 'App', level: 'record', at: Date.UTC(2026, 11, 15, 12, 0, 0), source: { id: 'helper', api: 'nsworkspace', host: 'local' } })}\n`,
+    );
+    await janPort.appendEvent(
+      '2024-02-29',
+      `${JSON.stringify({ record: 'event', id: 'leap', kind: 'app.activated', subject: 'App', level: 'record', at: Date.UTC(2024, 1, 29, 12, 0, 0), source: { id: 'helper', api: 'nsworkspace', host: 'local' } })}\n`,
+    );
+    const hJan = createRuntimeHarness(janNow, janPort, false);
+    await hJan.runtime.start();
+    const janTools = createSenseTools(hJan.runtime, () => janNow);
+    const janSummaryTool = janTools.find((t) => t.name === 'env_summary')!;
+    const decDefault = (await janSummaryTool.execute({}, makeExec())) as {
+      available: boolean;
+      summary: { month: string };
+    };
+    expect(decDefault).toMatchObject({ available: true, summary: { month: '2026-12' } });
+    // Leap month synthesized from direct daily summary
+    const leapDaily: DailySummary = {
+      version: 1,
+      date: '2024-02-29',
+      dayStartMs: Date.UTC(2024, 1, 29),
+      dayEndMs: Date.UTC(2024, 2, 1),
+      dayDurationMs: 86_400_000,
+      apps: {},
+      appSwitches: 0,
+      deliveries: { wake: 0, context: 0, suppressed: 0, byRule: {} },
+      fileBursts: {},
+      fileActivity: {},
+      bodyAnomalies: { total: 0, threshold: 0, rate: 0, anomaly: 0, byMetric: {} },
+      coverage: { observedMs: 0, pausedMs: 0, notRunningMs: 86_400_000 },
+      totalEvents: 0,
+    };
+    await janPort.writeDaily('2024-02-29', JSON.stringify(leapDaily));
+    const febLeap = (await janSummaryTool.execute({ month: '2024-02' }, makeExec())) as {
+      available: boolean;
+      summary: { daysInMonth: number };
+    };
+    expect(febLeap).toMatchObject({ available: true, summary: { daysInMonth: 29 } });
+    await hJan.runtime.stop();
+  });
+
+  it('marks env_summary partial:true during background cold-start backfill and clears once complete (#4)', async () => {
+    const dir = await makeTempDir();
+    const eventsDir = join(dir, 'history', 'events');
+    await mkdir(eventsDir, { recursive: true, mode: 0o700 });
+    const baseWall = Date.UTC(2026, 10, 5, 10, 0, 0);
+
+    // Build ~320 KiB per day across 3 October days (> 512 KiB total -> defers to background backfill)
+    const lines: string[] = [];
+    for (let i = 0; i < 1600; i++) {
+      lines.push(
+        JSON.stringify({
+          record: 'event',
+          id: `bg-${i}`,
+          kind: 'app.activated',
+          subject: 'EditorApp',
+          level: 'record',
+          at: Date.UTC(2026, 9, 25, 10, 0, 0) + i * 100,
+          source: { id: 'helper', api: 'nsworkspace', host: 'local' },
+        }),
+      );
+    }
+    const payload = `${lines.join('\n')}\n`;
+    for (const date of ['2026-10-25', '2026-10-26', '2026-10-27']) {
+      await writeFile(join(eventsDir, `${date}.jsonl`), payload, { mode: 0o600 });
+    }
+
+    const port = new FileHistoryStoragePort(dir);
+    const h = createRuntimeHarness(baseWall, port, false);
+    await h.runtime.start();
+
+    const envSummary = createSenseTools(h.runtime, () => baseWall).find((t) => t.name === 'env_summary')!;
+    const partialRes = (await envSummary.execute({}, makeExec())) as {
+      available: boolean;
+      partial?: boolean;
+      summary: { partial?: boolean; month: string };
+    };
+    expect(partialRes.available).toBe(true);
+    expect(partialRes.partial).toBe(true);
+    expect(partialRes.summary.partial).toBe(true);
+    expect(partialRes.summary.month).toBe('2026-10');
+    // Must not prematurely persist monthly/2026-10.json while partial
+    expect(await port.readMonthly('2026-10')).toBeUndefined();
+
+    // Wait for background backfill to finish, then confirm partial flag is gone and monthly JSON is persisted
+    await vi.waitFor(async () => expect(await port.readMonthly('2026-10')).toBeDefined(), {
+      timeout: 5_000,
+      interval: 20,
+    });
+    const fullRes = (await envSummary.execute({}, makeExec())) as {
+      available: boolean;
+      partial?: boolean;
+      summary: { partial?: boolean; coveredDays: number };
+    };
+    expect(fullRes.available).toBe(true);
+    expect(fullRes.partial).toBeUndefined();
+    expect(fullRes.summary.partial).toBeUndefined();
+    expect(fullRes.summary.coveredDays).toBe(3);
 
     await h.runtime.stop();
   });
