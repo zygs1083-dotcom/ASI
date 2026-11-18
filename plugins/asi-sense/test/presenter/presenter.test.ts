@@ -5,6 +5,7 @@ import type { SensePanelProps } from '@asi/sense-ui/model';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { attentionLine } from '../../../../packages/sense-ui/src/attention.ts';
 import { evaluateBody } from '../../../../packages/sense-ui/src/health.ts';
+import { sampleHistory } from '../../../../packages/sense-ui/src/history.ts';
 import { Sparkline } from '../../../../packages/sense-ui/src/sparkline.tsx';
 import { createPresenter } from '../../src/host/presenter/index.ts';
 import { createSenseRuntime } from '../../src/host/runtime/index.ts';
@@ -219,6 +220,59 @@ describe('presenter', () => {
       await h.runtime.stop();
     },
   );
+
+  it('keeps 5-minute body trends and ETA after a >5 minute sleep while the 24h series keeps post-wake points', async () => {
+    const h = await harness();
+    const gib = 1024 ** 3;
+    const emit = async (freeGib: number) => {
+      const at = Date.now();
+      const disks = diskFact([{ mount: '/', total: 100 * gib, free: freeGib * gib, observedAt: at }]);
+      disks.observedAt = at;
+      await h.sample(
+        mkBody({
+          disks,
+          cpu: { ...f({ usage: 0.4, perCore: [0.4], load1: 1, load5: 1, load15: 1 }), observedAt: at },
+        }),
+      );
+    };
+    await emit(80);
+    await h.advance(10_000);
+    await emit(76);
+    await h.advance(10_000);
+    await emit(75);
+    expect(h.presenter.snapshot().insights?.['disk:/']?.currentEta).toBeDefined();
+
+    // macOS sleep: Date.now() jumps an hour while performance.now() pauses.
+    vi.setSystemTime(Date.now() + 3_600_000);
+    await h.advance(1_000);
+    await emit(74.9);
+
+    const frame = h.presenter.snapshot();
+    // The frame clock is monotonic, so the wall jump must not lift it.
+    expect(frame.now).toBeLessThan(Date.now());
+    expect(sampleHistory(frame.history.cpu, frame.now, [], 300_000).length).toBeGreaterThanOrEqual(3);
+    expect(sampleHistory(frame.history.disks['/'] ?? [], frame.now, [], 300_000).length).toBeGreaterThanOrEqual(3);
+    expect(frame.insights?.['disk:/']?.currentEta).toBeDefined();
+    expect(attentionLine(frame, evaluateBody(frame.state.self.body, frame.now, frame.insights))).toMatch(/分钟后/);
+
+    // The wall-stamped 24h series publishes its own cutoff and keeps the
+    // post-wake bucket even though it sits ahead of the mono frame clock.
+    const cutoff = frame.timeline?.metrics?.cutoffAt;
+    expect(cutoff).toBeGreaterThan(frame.now);
+    const points = frame.timeline?.metrics?.cpu?.points ?? [];
+    const latest = points.at(-1);
+    expect(latest?.at).toBeGreaterThan(frame.now);
+    const plotted = sampleHistory(
+      points.map((point) => ({ at: point.at, value: point.avg })),
+      cutoff ?? 0,
+      [],
+      24 * 60 * 60 * 1000,
+    );
+    expect(plotted.at(-1)?.at).toBe(latest?.at);
+
+    h.presenter.close();
+    await h.runtime.stop();
+  });
 
   it('preserves token reasons through probe, session transitions, store and presenter', async () => {
     const h = await harness();

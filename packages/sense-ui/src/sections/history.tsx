@@ -168,7 +168,7 @@ export function HistorySection({ model, open, onListMonths, onLoadMonthly, onCle
                 label={spec.label}
                 metric={spec.metric}
                 series={timeline.metrics?.[spec.key]}
-                now={model.now}
+                now={timeline?.metrics?.cutoffAt ?? model.now}
                 paused={model.paused}
               />
             ))}

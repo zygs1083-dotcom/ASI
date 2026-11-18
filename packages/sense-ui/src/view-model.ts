@@ -330,6 +330,11 @@ export interface TimelineMetrics {
   disk?: TimelineMetricSeries;
   /** 电池电量（unit: 'percent'，0..100）。 */
   battery?: TimelineMetricSeries;
+  /**
+   * 24h 序列的墙钟截止时间。24h 桶按墙钟打戳，睡眠唤醒后可能领先于只用
+   * 单调钟的帧时钟 `model.now`；曲线应以此过滤/定位点，而不是 `model.now`。
+   */
+  cutoffAt?: number;
 }
 
 /** 最近一次离开汇总。 */

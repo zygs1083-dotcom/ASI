@@ -370,9 +370,10 @@ describe('presenter timeline projection & caching', () => {
       const frame = h.presenter.snapshot();
       const cpuPoints = frame.timeline?.metrics?.cpu?.points ?? [];
       expect(cpuPoints).toHaveLength(3);
-      // The UI sparkline drops every p.at > model.now, so a mono-derived now
-      // would hide all post-wake buckets and leave the chart empty.
-      expect(frame.now).toBeGreaterThanOrEqual(cpuPoints.at(-1)?.at ?? 0);
+      // The frame clock stays monotonic; the wall-stamped 24h series publishes
+      // its own cutoff so the UI keeps every post-wake bucket.
+      expect(frame.now).toBeLessThan(cpuPoints.at(-1)?.at ?? 0);
+      expect(frame.timeline?.metrics?.cutoffAt).toBeGreaterThanOrEqual(cpuPoints.at(-1)?.at ?? 0);
     } finally {
       h.presenter.close();
       await h.runtime.stop();

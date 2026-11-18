@@ -62,6 +62,9 @@ export interface HistoryManagerOptions {
   titlesAllowed: () => boolean;
   restoreEntries: (entries: PersistedEventEntry[]) => void;
   clearMemoryEntries: () => void;
+  /** Snapshot of the in-memory event ring, restored when a clear fails. */
+  snapshotMemoryEntries?: () => readonly PersistedEventEntry[];
+  restoreMemoryEntries?: (entries: readonly PersistedEventEntry[]) => void;
   emitSourceError: (error: string, extra?: Record<string, unknown>) => void;
   emitSourceOk: () => void;
   timeZone?: string;
@@ -200,6 +203,8 @@ export class HistoryManager {
   private readonly titlesAllowed: () => boolean;
   private readonly restoreEntries: (entries: PersistedEventEntry[]) => void;
   private readonly clearMemoryEntries: () => void;
+  private readonly snapshotMemoryEntries?: () => readonly PersistedEventEntry[];
+  private readonly restoreMemoryEntries?: (entries: readonly PersistedEventEntry[]) => void;
   private readonly emitSourceError: (error: string, extra?: Record<string, unknown>) => void;
   private readonly emitSourceOk: () => void;
   private readonly calendar: LocalCalendar;
@@ -241,7 +246,7 @@ export class HistoryManager {
   private yesterdaySummary?: DailySummary;
   private pendingTodayHydration?: { date: string; epoch: number; liveLines: string[] };
   private todayHydrationTimer?: ReturnType<typeof setTimeout>;
-  private activeTodayHydration?: Promise<void>;
+  private activeTodayHydration?: Promise<unknown>;
 
   constructor(options: HistoryManagerOptions) {
     this.port = options.port;
@@ -250,6 +255,8 @@ export class HistoryManager {
     this.titlesAllowed = options.titlesAllowed;
     this.restoreEntries = options.restoreEntries;
     this.clearMemoryEntries = options.clearMemoryEntries;
+    this.snapshotMemoryEntries = options.snapshotMemoryEntries;
+    this.restoreMemoryEntries = options.restoreMemoryEntries;
     this.emitSourceError = options.emitSourceError;
     this.emitSourceOk = options.emitSourceOk;
     this.calendar = new LocalCalendar(options.timeZone);
@@ -430,6 +437,19 @@ export class HistoryManager {
     this.clearFeedBuffer = buffered;
     this.cancelBackfill();
     this.backfillCurrentMonth = undefined;
+    // A failed clear must not lose pre-clear state: keep the in-memory values
+    // so the catch branch can restore them alongside the hydrated summary.
+    const previous = {
+      todayAcc: this.todayAcc,
+      yesterdayDate: this.yesterdayDate,
+      yesterdaySummary: this.yesterdaySummary,
+      eventDatesById: new Map(this.eventDatesById),
+      activeApp: this.activeApp,
+      activeLifecycleOpen: this.activeLifecycleOpen,
+      appendDegraded: this.appendDegraded,
+      summaryDegraded: this.summaryDegraded,
+      memoryEntries: this.snapshotMemoryEntries?.() ?? [],
+    };
     this.todayAcc = undefined;
     this.cachedToday = undefined;
     this.yesterdayDate = undefined;
@@ -459,17 +479,46 @@ export class HistoryManager {
         await port.clearAll();
       } catch (error) {
         if (this.clearFeedBuffer === buffered) {
-          this.clearFeedBuffer = undefined;
-          // A failed clear must leave the summary usable: rebuild todayAcc and
-          // replay buffered lines, then surface the error for the UI's retry.
-          if (this.started && !this.stopped) {
+          // A failed clear must leave the summary usable: rebuild todayAcc from
+          // the day's on-disk raw events, replay buffered lines, and restore the
+          // pre-clear yesterday summary / event-stream state before surfacing
+          // the error for the UI's retry.
+          if (this.started && !this.stopped && epoch === this.clearEpoch) {
             const now = this.clock.wall();
             const today = this.calendar.dateKey(now);
             this.currentDate = today;
             this.currentMonth = this.calendar.monthKey(now);
+            this.yesterdayDate = previous.yesterdayDate;
+            this.yesterdaySummary = previous.yesterdaySummary;
+            this.eventDatesById.clear();
+            for (const [id, date] of previous.eventDatesById) this.eventDatesById.set(id, date);
+            this.activeApp = previous.activeApp;
+            this.activeLifecycleOpen = previous.activeLifecycleOpen;
+            this.appendDegraded = previous.appendDegraded;
+            this.summaryDegraded = previous.summaryDegraded;
             this.resetTodayAcc(today);
-            for (const item of buffered) if (item.date === today) this.feedTodayRaw(item.date, item.raw);
+            const hydration = {
+              date: today,
+              epoch,
+              liveLines: buffered.filter((item) => item.date === today).map((item) => item.raw),
+            };
+            this.pendingTodayHydration = hydration;
+            const hydrated = await this.hydrateTodayFromDisk(today, epoch, false);
+            if (this.pendingTodayHydration === hydration) this.pendingTodayHydration = undefined;
+            if (this.clearFeedBuffer === buffered) this.clearFeedBuffer = undefined;
+            if (!hydrated) {
+              // No raw events on disk (or unreadable): fall back to the
+              // pre-clear accumulator, then replay the buffered lines.
+              if (previous.todayAcc) {
+                this.todayAcc = previous.todayAcc;
+                this.cachedToday = undefined;
+              }
+              for (const raw of hydration.liveLines) this.feedTodayRaw(today, raw);
+            }
+            this.restoreMemoryEntries?.(previous.memoryEntries);
             this.onSummaryChanged?.();
+          } else if (this.clearFeedBuffer === buffered) {
+            this.clearFeedBuffer = undefined;
           }
         }
         throw error;
@@ -849,19 +898,19 @@ export class HistoryManager {
     this.todayHydrationTimer.unref?.();
   }
 
-  private async hydrateTodayFromDisk(today: string, epoch: number, yieldSlices: boolean): Promise<void> {
-    if (!this.port || this.isEpochStale(epoch) || this.currentDate !== today) return;
+  private async hydrateTodayFromDisk(today: string, epoch: number, yieldSlices: boolean): Promise<boolean> {
+    if (!this.port || this.isEpochStale(epoch) || this.currentDate !== today) return false;
     try {
       const acc = createDailySummaryAccumulator(today, this.calendar.dayBounds(today));
       let sawLine = false;
       let sliceStart = performance.now();
       for await (const line of this.streamLinesForward(today)) {
-        if (this.isEpochStale(epoch) || this.currentDate !== today) return;
+        if (this.isEpochStale(epoch) || this.currentDate !== today) return false;
         acc.feed(line);
         sawLine = true;
         if (yieldSlices && performance.now() - sliceStart >= 10) {
           await this.waitBackfillTurn(epoch, 0);
-          if (this.isEpochStale(epoch) || this.currentDate !== today) return;
+          if (this.isEpochStale(epoch) || this.currentDate !== today) return false;
           sliceStart = performance.now();
         }
       }
@@ -878,11 +927,14 @@ export class HistoryManager {
         this.cachedToday = undefined;
         this.summaryRevision += 1;
         if (yieldSlices) this.onSummaryChanged?.();
+        return true;
       }
+      return false;
     } catch {
       if (this.pendingTodayHydration?.date === today && this.pendingTodayHydration.epoch === epoch) {
         this.pendingTodayHydration = undefined;
       }
+      return false;
     }
   }
 

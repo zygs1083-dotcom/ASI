@@ -68,6 +68,8 @@ export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}
     titlesAllowed: () => allowTitles,
     restoreEntries: (entries) => attentionRef?.restoreEntries(entries),
     clearMemoryEntries: () => attentionRef?.clearEvents(),
+    snapshotMemoryEntries: () => attentionRef?.snapshotEntries() ?? [],
+    restoreMemoryEntries: (entries) => attentionRef?.restoreEntriesPreservingLive(entries),
     emitSourceError: (error, extra) => {
       if (!attentionRef || stopping) return;
       void attentionRef

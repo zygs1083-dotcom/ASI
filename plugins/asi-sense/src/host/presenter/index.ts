@@ -11,7 +11,7 @@ import {
   type Runtime,
 } from './project.ts';
 import { createTimeline } from './time.ts';
-import { createTimelineProjector, latestMetricsAt } from './timeline.ts';
+import { createTimelineProjector } from './timeline.ts';
 
 type Waiter = (value: IteratorResult<PresenterModel>) => void;
 interface Subscriber {
@@ -65,11 +65,9 @@ export function createPresenter(
 
   function snapshot(): PresenterModel {
     if (closed && cached) return cached;
-    // The presenter advances on the monotonic clock so a wall-clock jump does
-    // not shift every frame-relative age at once. After a sleep/wake cycle,
-    // though, performance.now() pauses while Date.now() advances, so the mono
-    // timeline lags the wall clock. Only the 24h series cutoff takes the later
-    // of both, otherwise buckets recorded after wake are filtered as "future".
+    // The frame clock is monotonic only: wall-clock jumps and sleep/wake must
+    // not shift frame-relative ages, trends, or ETA. The 24h series is
+    // wall-stamped, so its cutoff is published separately in timeline metrics.
     const monoNow = timeline.at(clock.mono());
     const seriesCutoff = Math.max(monoNow, clock.wall());
     const state = projectState(timeline.state());
@@ -81,9 +79,7 @@ export function createPresenter(
     const memFact = state.self.body.memory;
     const fallbackMemoryTotal = memFact.status === 'ok' ? memFact.value?.total : undefined;
     const panelTimeline = projectPanelTimeline(runtime, entries, monoNow, fallbackMemoryTotal, seriesCutoff);
-    // 24h buckets are wall-stamped, so after wake they can be newer than the
-    // mono clock. Never publish a frame clock older than the data it carries.
-    const now = Math.max(monoNow, latestMetricsAt(panelTimeline) ?? monoNow);
+    const now = monoNow;
     const next: PresenterModel = {
       target: runtime.target(),
       state,

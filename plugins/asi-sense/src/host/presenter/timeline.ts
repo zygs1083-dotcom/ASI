@@ -188,7 +188,7 @@ export function createTimelineProjector() {
           ...(disk ? { disk } : {}),
           ...(battery ? { battery } : {}),
         };
-        cachedMetrics = Object.keys(nextMetrics).length > 0 ? nextMetrics : undefined;
+        cachedMetrics = Object.keys(nextMetrics).length > 0 ? { ...nextMetrics, cutoffAt: seriesCutoff } : undefined;
       } else {
         metricsHadMemory = false;
         cachedMetrics = undefined;
@@ -230,22 +230,4 @@ export function createTimelineProjector() {
     };
     return cachedTimeline;
   };
-}
-
-/**
- * Newest 24h bucket timestamp published in a timeline. Buckets are stamped on
- * the wall clock, so after a sleep/wake cycle they can sit ahead of the
- * mono-derived presenter clock; the frame clock must at least cover them or the
- * UI would drop every post-wake point as "future".
- */
-export function latestMetricsAt(timeline: TimelineState | undefined): number | undefined {
-  const metrics = timeline?.metrics;
-  if (!metrics) return undefined;
-  let latest: number | undefined;
-  for (const series of [metrics.cpu, metrics.memory, metrics.disk, metrics.battery]) {
-    for (const point of series?.points ?? []) {
-      if (latest === undefined || point.at > latest) latest = point.at;
-    }
-  }
-  return latest;
 }

@@ -947,11 +947,45 @@ describe('runtime history persistence, rollups, retention, and recovery', () => 
     wall += 60_000;
     mgr.recordEvent(histEvent('e2', wall));
     await mgr.query({});
-    expect(mgr.timelineSnapshots().today?.totalEvents).toBe(1);
+    // e1 is rebuilt from the day's raw events on disk, e2 is replayed from the
+    // buffer recorded while the failed clear was in flight.
+    expect(mgr.timelineSnapshots().today?.totalEvents).toBe(2);
 
     await expect(mgr.clear()).resolves.toBeUndefined();
     await mgr.query({});
     expect(mgr.timelineSnapshots().today?.totalEvents ?? 0).toBe(0);
+    await mgr.stop();
+  });
+
+  it('rebuilds the today summary from on-disk events after clearAll() fails (#2)', async () => {
+    const { port, events } = mockPort({
+      clearAll: async () => {
+        throw Object.assign(new Error('EACCES: permission denied'), { code: 'EACCES' });
+      },
+    });
+    let wall = Date.UTC(2026, 10, 18, 9, 0, 0);
+    const mgr = managerFor(port, () => wall);
+    await mgr.start(false);
+    mgr.recordEvent(histEvent('pre-1', wall + 1_000));
+    mgr.recordEvent(histEvent('pre-2', wall + 2_000));
+    await mgr.query({});
+    expect(mgr.timelineSnapshots().today?.totalEvents).toBe(2);
+    expect((events.get('2026-11-18') ?? '').match(/"id":"pre-/g)).toHaveLength(2);
+
+    const clearing = mgr.clear().then(
+      () => undefined,
+      (error: unknown) => error,
+    );
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    wall += 60_000;
+    mgr.recordEvent(histEvent('during-clear', wall));
+    const failure = await clearing;
+    expect(failure).toBeInstanceOf(Error);
+    expect((failure as Error).message).toContain('EACCES');
+    await mgr.query({});
+
+    expect(mgr.timelineSnapshots().today?.totalEvents).toBe(3);
+    expect(events.get('2026-11-18') ?? '').toContain('during-clear');
     await mgr.stop();
   });
 
