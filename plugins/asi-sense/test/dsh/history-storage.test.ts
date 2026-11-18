@@ -266,4 +266,51 @@ describe('FileHistoryStoragePort', () => {
     ]);
     expect(await port.readEvents('2026-11-22')).toBe('{"id":1}\n{"id":2}\n{"id":3}\n');
   });
+
+  it('does not cache verifiedNewlineDates when appendEvent fails before write completes (#7)', async () => {
+    const root = await makeTempDir();
+    await mkdir(join(root, 'history', 'events'), { recursive: true, mode: 0o700 });
+    await writeFile(join(root, 'history', 'events', '2026-11-18.jsonl'), '{"record":"event","id":"unterm"', {
+      mode: 0o600,
+    });
+    const fsPromises = await import('node:fs/promises');
+    let failOnce = true;
+    const flakyFs: HistoryFileSystem = {
+      mkdir: (p, opts) => fsPromises.mkdir(p, opts),
+      readdir: (p) => fsPromises.readdir(p),
+      stat: (p) => fsPromises.stat(p),
+      lstat: (p) => fsPromises.lstat(p),
+      chmod: (p, m) => fsPromises.chmod(p, m),
+      readFile: (p, enc) => fsPromises.readFile(p, enc),
+      rename: (o, n) => fsPromises.rename(o, n),
+      unlink: (p) => fsPromises.unlink(p),
+      rm: (p, opts) => fsPromises.rm(p, opts),
+      open: async (p, flags, mode) => {
+        const h = await fsPromises.open(p, flags as number, mode);
+        return {
+          read: h.read.bind(h),
+          readFile: h.readFile.bind(h),
+          stat: h.stat.bind(h),
+          chmod: h.chmod.bind(h),
+          sync: h.sync.bind(h),
+          close: h.close.bind(h),
+          writeFile: async (data: string, enc: BufferEncoding) => {
+            if (failOnce) {
+              failOnce = false;
+              throw Object.assign(new Error('ENOSPC'), { code: 'ENOSPC' });
+            }
+            return h.writeFile(data, enc);
+          },
+        };
+      },
+    };
+    const flakyPort = new FileHistoryStoragePort(root, flakyFs);
+    await expect(flakyPort.appendEvent('2026-11-18', '{"record":"event","id":"first"}\n')).rejects.toMatchObject({
+      code: 'ENOSPC',
+    });
+    await flakyPort.appendEvent('2026-11-18', '{"record":"event","id":"second"}\n');
+    expect(await readFile(join(root, 'history', 'events', '2026-11-18.jsonl'), 'utf8')).toBe(
+      '{"record":"event","id":"unterm"\n{"record":"event","id":"second"}\n',
+    );
+  });
 });

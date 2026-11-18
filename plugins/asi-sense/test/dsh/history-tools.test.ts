@@ -794,6 +794,11 @@ describe('env_detail, env_history, and env_summary tools', () => {
 
     const h = createRuntimeHarness(now, spiedPort, false);
     await h.runtime.start();
+    // Wait for background backfill of 2026-10-31 and 2026-11-12 before injecting corrupt monthly fixtures below.
+    await vi.waitFor(async () => expect(await base.readDaily('2026-11-12')).toBeDefined(), {
+      timeout: 3_000,
+      interval: 10,
+    });
     const tools = createSenseTools(h.runtime, () => now);
     const envHistory = tools.find((t) => t.name === 'env_history')!;
     const envSummary = tools.find((t) => t.name === 'env_summary')!;
@@ -979,10 +984,15 @@ describe('env_detail, env_history, and env_summary tools', () => {
     const partialRes = (await envSummary.execute({}, makeExec())) as {
       available: boolean;
       partial?: boolean;
+      pendingDays?: string[];
+      note?: string;
       summary: { partial?: boolean; month: string };
     };
     expect(partialRes.available).toBe(true);
     expect(partialRes.partial).toBe(true);
+    expect(partialRes.pendingDays).toEqual(['2026-10-25', '2026-10-26', '2026-10-27']);
+    expect(typeof partialRes.note).toBe('string');
+    expect(partialRes.note?.length).toBeGreaterThan(0);
     expect(partialRes.summary.partial).toBe(true);
     expect(partialRes.summary.month).toBe('2026-10');
     // Must not prematurely persist monthly/2026-10.json while partial
@@ -996,13 +1006,195 @@ describe('env_detail, env_history, and env_summary tools', () => {
     const fullRes = (await envSummary.execute({}, makeExec())) as {
       available: boolean;
       partial?: boolean;
+      pendingDays?: string[];
+      note?: string;
       summary: { partial?: boolean; coveredDays: number };
     };
     expect(fullRes.available).toBe(true);
     expect(fullRes.partial).toBeUndefined();
+    expect(fullRes.pendingDays).toBeUndefined();
+    expect(fullRes.note).toBeUndefined();
     expect(fullRes.summary.partial).toBeUndefined();
     expect(fullRes.summary.coveredDays).toBe(3);
 
     await h.runtime.stop();
+  });
+
+  it('whitelists command subjects across quoted/escaped env prefixes, wrappers, and domains; truncates oversized fileActivity; queries across TZ shift (#2, #5, #6)', async () => {
+    // 1) Whitelist command subject parsing (including all review #2 cases + wrapper nesting + app path nit)
+    const cmdSamples = [
+      ['API_KEY="sk_live_secret_987654" /usr/bin/curl https://api.corp.internal', 'curl'],
+      ['PROXY="https://secret-corp.internal" curl', 'curl'],
+      ["DB_PASS='hunter2_secret' psql -h 10.0.0.5", 'psql'],
+      ['MY_VAL=foo\\ secret_token /usr/bin/ssh prod', 'ssh'],
+      [
+        'sudo -E -u dbadmin env DB_PASS="secret" nohup time -p exec -a runner /usr/local/bin/python3.12 -m app',
+        'python3.12',
+      ],
+      ['timeout -s KILL 30s nice -n 10 /usr/bin/node server.js', 'node'],
+      ['env -i -u SECRET_VAR -C /Users/alice/secret build.sh', 'build.sh'],
+      ['"C:\\Program Files\\MyApp\\runner.exe" --secret=123', 'runner.exe'],
+      ['secret-corp.internal --flag', '[command]'],
+      ['api.corp.internal', '[command]'],
+      ['evil.com', '[command]'],
+      ['10.0.0.5', '[command]'],
+      ['https://secret-corp.internal/bin', '[command]'],
+      ['API_KEY="only_assignment"', '[command]'],
+      ['sudo --unknown-flag secret_arg /usr/bin/id', '[command]'],
+      ['$(SECRET_CMD) /usr/bin/id', '[command]'],
+    ] as const;
+
+    const cmdEvents = cmdSamples.map(([subject], idx) => ({
+      id: `cmd-${idx}`,
+      kind: idx % 2 === 0 ? 'job.exited' : 'process.exited',
+      subject,
+      level: 'record' as const,
+      at: 1_000 + idx,
+      source: { id: 'dsh', api: 'events', host: 'local' },
+    }));
+    const cmdProjected = modelHistory({
+      available: true,
+      from: 1_000,
+      to: 2_000,
+      limit: 50,
+      total: cmdEvents.length,
+      truncated: false,
+      titlesAllowed: true,
+      events: [
+        ...cmdEvents,
+        {
+          id: 'app-path',
+          kind: 'app.activated',
+          subject: '/Users/alice/Corp Secret/MyTool.app',
+          level: 'record',
+          at: 1_999,
+          source: { id: 'helper', api: 'nsworkspace', host: 'local' },
+        },
+      ],
+    }) as { events: Array<{ id: string; subject: string }> };
+
+    for (let idx = 0; idx < cmdSamples.length; idx++) {
+      expect(cmdProjected.events[idx]?.subject).toBe(cmdSamples[idx][1]);
+    }
+    expect(cmdProjected.events.at(-1)?.subject).toBe('MyTool.app');
+    const serializedCmd = JSON.stringify(cmdProjected);
+    for (const secret of [
+      'sk_live_secret_987654',
+      'secret-corp.internal',
+      'hunter2_secret',
+      'secret_token',
+      'dbadmin',
+      'SECRET_VAR',
+      'evil.com',
+      '10.0.0.5',
+      'Corp Secret',
+    ]) {
+      expect(serializedCmd).not.toContain(secret);
+    }
+
+    // 2) modelSummary truncates oversized fileActivity instead of whole-payload fallback (#5)
+    const fileActivity: Record<string, { events: number; created: number; modified: number; deleted: number }> = {};
+    for (let i = 0; i < 600; i++) {
+      fileActivity[`project-directory-with-moderate-name-${i}`] = {
+        events: 10 + i,
+        created: 2,
+        modified: 7,
+        deleted: 1,
+      };
+    }
+    const bigSummary = modelSummary({
+      available: true,
+      summary: {
+        version: 1,
+        month: '2026-10',
+        daysInMonth: 31,
+        coveredDays: 30,
+        missingDays: ['2026-10-31'],
+        includedDays: [],
+        apps: { '/Users/alice/Corp Secret/MyTool.app': { foregroundMs: 1_000, switches: 1 } },
+        appSwitches: 1,
+        deliveries: { wake: 0, context: 0, suppressed: 0, byRule: {} },
+        fileBursts: {},
+        fileActivity,
+        bodyAnomalies: { total: 0, threshold: 0, rate: 0, anomaly: 0, byMetric: {} },
+        coverage: {
+          totalDayMs: 30 * 86_400_000,
+          observedMs: 100_000,
+          pausedMs: 0,
+          notRunningMs: 30 * 86_400_000 - 100_000,
+        },
+        totalEvents: 6_000,
+        generatedAt: 1_000,
+      },
+    }) as {
+      available: boolean;
+      fileActivityTruncated?: boolean;
+      note?: string;
+      summary: {
+        month: string;
+        apps: Record<string, unknown>;
+        fileActivity: Record<string, unknown>;
+      };
+    };
+    expect(bigSummary.available).toBe(true);
+    expect(bigSummary.fileActivityTruncated).toBe(true);
+    expect(bigSummary.note).toContain('fileActivity');
+    expect(bigSummary.summary.month).toBe('2026-10');
+    expect(bigSummary.summary.apps['MyTool.app']).toBeDefined();
+    expect(JSON.stringify(bigSummary)).not.toContain('Corp Secret');
+    const keptFaKeys = Object.keys(bigSummary.summary.fileActivity);
+    expect(keptFaKeys.length).toBeGreaterThan(0);
+    expect(keptFaKeys.length).toBeLessThan(600);
+    expect(keptFaKeys[0]).toBe('project-directory-with-moderate-name-599');
+    expect(Buffer.byteLength(JSON.stringify(bigSummary), 'utf8')).toBeLessThanOrEqual(32_768);
+
+    // 3) Westward TZ shift across midnight still finds prior-day UTC-equivalent files (#6)
+    const origTz = process.env.TZ;
+    const tzDir = await makeTempDir();
+    try {
+      process.env.TZ = 'Asia/Tokyo';
+      const tzPort = new FileHistoryStoragePort(tzDir);
+      let tzWall = Date.UTC(2026, 10, 17, 17, 0, 0);
+      let tzMono = 1_000;
+      let tzJobCb!: (ev: { type: 'started' | 'exited'; id: string; at?: number }) => Promise<void>;
+      const rtTz = createSenseRuntime(
+        {
+          clock: { wall: () => tzWall, mono: () => tzMono },
+          history: tzPort,
+          storage: { load: async () => undefined, save: async () => {} },
+          dsh: {
+            onAgentEvent: () => () => {},
+            onTool: () => () => {},
+            onJob: (cb) => {
+              tzJobCb = cb as typeof tzJobCb;
+              return () => {};
+            },
+            deliver: async () => {},
+            tokenSnapshot: async () => undefined,
+          },
+          helper: { spawn: () => undefined },
+          probe: { create: () => ({ onSample: () => () => {}, start: () => {}, stop: async () => {} }) },
+          files: { watch: () => ({ close: () => {} }) },
+        },
+        { platform: 'linux', intervalMs: 600_000 },
+      );
+      await rtTz.start();
+      await tzJobCb({ type: 'started', id: 'tokyo-job', at: tzWall + 1_000 });
+      await rtTz.tools.envHistory({});
+      process.env.TZ = 'America/Los_Angeles';
+      tzWall += 600_000;
+      tzMono += 600_000;
+      await tzJobCb({ type: 'started', id: 'la-job', at: tzWall });
+      const defQ = await rtTz.tools.envHistory({});
+      const nov17Q = await rtTz.tools.envHistory({ from: '2026-11-17', to: '2026-11-17' });
+      expect(await tzPort.listEventDates()).toEqual(['2026-11-17', '2026-11-18']);
+      expect(defQ.events.map((e) => e.subject)).toEqual(['la-job', 'tokyo-job', 'helper']);
+      expect(nov17Q.events.map((e) => e.subject)).toEqual(['la-job', 'tokyo-job', 'helper']);
+      await rtTz.stop();
+    } finally {
+      if (origTz === undefined) delete process.env.TZ;
+      else process.env.TZ = origTz;
+      await rm(tzDir, { recursive: true, force: true });
+    }
   });
 });

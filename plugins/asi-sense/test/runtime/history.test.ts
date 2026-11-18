@@ -12,6 +12,7 @@ import { RuntimeAttention } from '../../src/host/runtime/attention.ts';
 import { FactExpiry } from '../../src/host/runtime/expiry.ts';
 import {
   addDays,
+  createDailySummaryAccumulator,
   type DailySummary,
   HistoryManager,
   LocalCalendar,
@@ -714,13 +715,16 @@ describe('runtime history persistence, rollups, retention, and recovery', () => 
     expect(oct.apps.Notes).toEqual({ foregroundMs: 300_000, switches: 30 });
     expect(oct.coverage.observedMs).toBe(300_000);
 
-    expect(await port.readDaily('2026-12-03')).toBeDefined();
+    await vi.waitFor(async () => expect(await port.readDaily('2026-12-03')).toBeDefined(), {
+      timeout: 5_000,
+      interval: 10,
+    });
     expect(await port.readDaily('2026-12-02')).toBeUndefined();
     expect(await port.readDaily(keep400Date)).toBeDefined();
     expect(await port.readDaily(delete401Date)).toBeUndefined();
 
     await h.runtime.stop();
-  });
+  }, 15_000);
 
   it('handles 23h spring-forward and 25h fall-back DST local days accurately', async () => {
     const cal = new LocalCalendar('America/New_York');
@@ -910,7 +914,10 @@ describe('runtime history persistence, rollups, retention, and recovery', () => 
         .filter((e) => e.restored)
         .map((e) => e.id),
     ).toEqual(['valid-ev']);
-    expect(await port.readDaily('2026-11-17')).toBeDefined();
+    await vi.waitFor(async () => expect(await port.readDaily('2026-11-17')).toBeDefined(), {
+      timeout: 5_000,
+      interval: 10,
+    });
 
     const errorsBeforeQuery = h.runtime.events().filter((e) => e.kind === 'source.error');
     expect(errorsBeforeQuery).toHaveLength(4);
@@ -1313,7 +1320,7 @@ describe('runtime history persistence, rollups, retention, and recovery', () => 
       timeZone: 'UTC',
     });
     await h3.runtime.start();
-    expect(daily1).toBeDefined();
+    await vi.waitFor(() => expect(daily1).toBeDefined(), { timeout: 5_000, interval: 10 });
     expect((JSON.parse(daily1 ?? '{}') as DailySummary).truncatedAtLimit).toBe(true);
     await h3.runtime.stop();
 
@@ -1529,6 +1536,9 @@ describe('runtime history persistence, rollups, retention, and recovery', () => 
       { platform: 'linux', timeZone: 'UTC', intervalMs: 600_000 },
     );
     await rtNext.start();
+    for (let i = 0; i < 40 && !(await port2.readMonthly('2026-10')); i++) {
+      await vi.advanceTimersByTimeAsync(50);
+    }
     const octDaily = JSON.parse((await port2.readDaily('2026-10-31')) ?? '{}') as DailySummary;
     expect(octDaily.coverage.observedMs).toBe(300_000);
     expect(octDaily.coverage.pausedMs).toBe(300_000);
@@ -1683,4 +1693,386 @@ describe('runtime history persistence, rollups, retention, and recovery', () => 
     expect(summary.bodyAnomalies.rate).toBe(1);
     expect(summary.bodyAnomalies.byMetric['disk:Work']).toBe(2);
   });
+
+  it('prevents stale pendingBackfill from clearHistory() race (#1), keeps pending on writeDaily failure (#4), and handles delayed midnight events (nit #4)', async () => {
+    // 1) clearHistory() during startupMaintenance readDaily() drops stale pendingBackfill and allows later monthly synthesis (#1)
+    const dir1 = await makeTempDir();
+    const base1 = new FileHistoryStoragePort(dir1);
+    await base1.appendEvent(
+      '2026-10-24',
+      `${JSON.stringify({ record: 'event', id: 'oct-24', kind: 'app.activated', subject: 'App', level: 'record', at: Date.UTC(2026, 9, 24, 10, 0, 0), source: { id: 'helper', api: 'nsworkspace', host: 'local' } })}\n`,
+    );
+    await base1.writeDaily(
+      '2026-10-24',
+      JSON.stringify(
+        summarizeDay('2026-10-24', { events: [], lifecycle: [] }, new LocalCalendar('UTC').dayBounds('2026-10-24')),
+      ),
+    );
+    await base1.appendEvent(
+      '2026-10-25',
+      `${JSON.stringify({ record: 'event', id: 'oct-25', kind: 'app.activated', subject: 'App', level: 'record', at: Date.UTC(2026, 9, 25, 10, 0, 0), source: { id: 'helper', api: 'nsworkspace', host: 'local' } })}\n`,
+    );
+    await base1.appendEvent(
+      '2026-11-17',
+      `${JSON.stringify({ record: 'event', id: 'nov-17', kind: 'app.activated', subject: 'App', level: 'record', at: Date.UTC(2026, 10, 17, 10, 0, 0), source: { id: 'helper', api: 'nsworkspace', host: 'local' } })}\n`,
+    );
+
+    let readDailyEntered!: () => void;
+    const onReadDaily = new Promise<void>((r) => {
+      readDailyEntered = r;
+    });
+    let releaseReadDaily!: () => void;
+    const readDailyGate = new Promise<void>((r) => {
+      releaseReadDaily = r;
+    });
+    const gatedPort1: HistoryStoragePort = {
+      eventFileSize: (d) => base1.eventFileSize(d),
+      appendEvent: (d, l) => base1.appendEvent(d, l),
+      readEvents: (d) => base1.readEvents(d),
+      readEventLines: (d) => base1.readEventLines(d),
+      readEventLinesDesc: (d) => base1.readEventLinesDesc(d),
+      listEventDates: () => base1.listEventDates(),
+      deleteEventDate: (d) => base1.deleteEventDate(d),
+      readDaily: async (d) => {
+        if (d === '2026-10-24') {
+          readDailyEntered();
+          await readDailyGate;
+        }
+        return base1.readDaily(d);
+      },
+      writeDaily: (d, j) => base1.writeDaily(d, j),
+      listDailyDates: () => base1.listDailyDates(),
+      deleteDailyDate: (d) => base1.deleteDailyDate(d),
+      readMonthly: (m) => base1.readMonthly(m),
+      writeMonthly: (m, j) => base1.writeMonthly(m, j),
+      listMonthlyMonths: () => base1.listMonthlyMonths(),
+      harden: () => base1.harden(),
+      clearAll: () => base1.clearAll(),
+    };
+
+    let wall1 = Date.UTC(2026, 10, 18, 10, 0, 0);
+    let mono1 = 1_000;
+    let jobCb1!: (ev: JobEvent) => Promise<void>;
+    const rt1 = createSenseRuntime(
+      {
+        clock: { wall: () => wall1, mono: () => mono1 },
+        history: gatedPort1,
+        storage: { load: async () => undefined, save: async () => {} },
+        dsh: {
+          onAgentEvent: () => () => {},
+          onTool: () => () => {},
+          onJob: (cb) => {
+            jobCb1 = cb;
+            return () => {};
+          },
+          deliver: async () => {},
+          tokenSnapshot: async () => undefined,
+        },
+        helper: { spawn: () => undefined },
+        probe: { create: () => ({ onSample: () => () => {}, start: () => {}, stop: async () => {} }) },
+        files: { watch: () => ({ close: () => {} }) },
+      },
+      { platform: 'linux', timeZone: 'UTC', intervalMs: 600_000 },
+    );
+
+    const startP = rt1.start();
+    await onReadDaily;
+    const clearP = rt1.clearHistory();
+    releaseReadDaily();
+    await Promise.all([startP, clearP]);
+
+    const octAfterClear = await rt1.tools.envSummary({ month: '2026-10' });
+    expect(octAfterClear.available).toBe(false);
+    expect(octAfterClear.partial).toBeUndefined();
+
+    await jobCb1({ type: 'started', id: 'nov-live', at: wall1 + 1_000 });
+    wall1 = Date.UTC(2026, 11, 1, 0, 1, 0);
+    mono1 += 13 * 86_400_000;
+    await jobCb1({ type: 'started', id: 'dec-live', at: wall1 });
+    await rt1.tools.envHistory({});
+    const novMonthly = await base1.readMonthly('2026-11');
+    expect(novMonthly).toBeDefined();
+    expect((JSON.parse(novMonthly ?? '{}') as MonthlySummary).month).toBe('2026-11');
+    await rt1.stop();
+
+    // 2) Transient and permanent writeDaily failures in runBackfillStep keep pendingBackfill intact (#4)
+    const dir4 = await makeTempDir();
+    await mkdir(join(dir4, 'history', 'events'), { recursive: true, mode: 0o700 });
+    const sampleLines = `${Array.from({ length: 200 }, (_, i) =>
+      JSON.stringify({
+        record: 'event',
+        id: `bf-${i}`,
+        kind: 'app.activated',
+        subject: 'Editor',
+        level: 'record',
+        at: Date.UTC(2026, 9, 25, 10, 0, 0) + i * 100,
+        source: { id: 'helper', api: 'nsworkspace', host: 'local' },
+      }),
+    ).join('\n')}\n`;
+    await writeFile(join(dir4, 'history', 'events', '2026-10-25.jsonl'), sampleLines, { mode: 0o600 });
+    await writeFile(join(dir4, 'history', 'events', '2026-10-26.jsonl'), sampleLines, { mode: 0o600 });
+
+    const base4 = new FileHistoryStoragePort(dir4);
+    let failFirst = true;
+    const transientPort: HistoryStoragePort = {
+      eventFileSize: (d) => base4.eventFileSize(d),
+      appendEvent: (d, l) => base4.appendEvent(d, l),
+      readEvents: (d) => base4.readEvents(d),
+      readEventLines: (d) => base4.readEventLines(d),
+      readEventLinesDesc: (d) => base4.readEventLinesDesc(d),
+      listEventDates: () => base4.listEventDates(),
+      deleteEventDate: (d) => base4.deleteEventDate(d),
+      readDaily: (d) => base4.readDaily(d),
+      writeDaily: async (d, j) => {
+        if (failFirst && d === '2026-10-25') {
+          failFirst = false;
+          throw Object.assign(new Error('EACCES'), { code: 'EACCES' });
+        }
+        return base4.writeDaily(d, j);
+      },
+      listDailyDates: () => base4.listDailyDates(),
+      deleteDailyDate: (d) => base4.deleteDailyDate(d),
+      readMonthly: (m) => base4.readMonthly(m),
+      writeMonthly: (m, j) => base4.writeMonthly(m, j),
+      listMonthlyMonths: () => base4.listMonthlyMonths(),
+      harden: () => base4.harden(),
+      clearAll: () => base4.clearAll(),
+    };
+    const hTransient = createRuntimeHarness({
+      nowMs: Date.UTC(2026, 10, 5, 10, 0, 0),
+      history: transientPort,
+      timeZone: 'UTC',
+    });
+    await hTransient.runtime.start();
+    const before = await hTransient.runtime.tools.envSummary({ month: '2026-10' });
+    expect(before.available).toBe(true);
+    expect(before.partial).toBe(true);
+    if (before.available) {
+      expect(before.pendingDays).toEqual(['2026-10-25', '2026-10-26']);
+      expect(typeof before.note).toBe('string');
+    }
+    await vi.waitFor(async () => expect(await base4.readMonthly('2026-10')).toBeDefined(), {
+      timeout: 3_000,
+      interval: 20,
+    });
+    const after = await hTransient.runtime.tools.envSummary({ month: '2026-10' });
+    expect(after.partial).toBeUndefined();
+    const monthly = JSON.parse((await base4.readMonthly('2026-10')) ?? '{}') as MonthlySummary;
+    expect(monthly.includedDays).toEqual(['2026-10-25', '2026-10-26']);
+    await hTransient.runtime.stop();
+
+    // Permanent failure for one day keeps partial:true + pendingDays and never persists an incomplete monthly file
+    const dirPerm = await makeTempDir();
+    await mkdir(join(dirPerm, 'history', 'events'), { recursive: true, mode: 0o700 });
+    await writeFile(join(dirPerm, 'history', 'events', '2026-10-25.jsonl'), sampleLines, { mode: 0o600 });
+    await writeFile(join(dirPerm, 'history', 'events', '2026-10-26.jsonl'), sampleLines, { mode: 0o600 });
+    const basePerm = new FileHistoryStoragePort(dirPerm);
+    let attempts25 = 0;
+    const permPort: HistoryStoragePort = {
+      ...basePerm,
+      eventFileSize: (d) => basePerm.eventFileSize(d),
+      appendEvent: (d, l) => basePerm.appendEvent(d, l),
+      readEvents: (d) => basePerm.readEvents(d),
+      readEventLines: (d) => basePerm.readEventLines(d),
+      readEventLinesDesc: (d) => basePerm.readEventLinesDesc(d),
+      listEventDates: () => basePerm.listEventDates(),
+      deleteEventDate: (d) => basePerm.deleteEventDate(d),
+      readDaily: (d) => basePerm.readDaily(d),
+      writeDaily: async (d, j) => {
+        if (d === '2026-10-25') {
+          attempts25++;
+          throw Object.assign(new Error('EACCES'), { code: 'EACCES' });
+        }
+        return basePerm.writeDaily(d, j);
+      },
+      listDailyDates: () => basePerm.listDailyDates(),
+      deleteDailyDate: (d) => basePerm.deleteDailyDate(d),
+      readMonthly: (m) => basePerm.readMonthly(m),
+      writeMonthly: (m, j) => basePerm.writeMonthly(m, j),
+      listMonthlyMonths: () => basePerm.listMonthlyMonths(),
+      harden: () => basePerm.harden(),
+      clearAll: () => basePerm.clearAll(),
+    };
+    const hPerm = createRuntimeHarness({ nowMs: Date.UTC(2026, 10, 5, 10, 0, 0), history: permPort, timeZone: 'UTC' });
+    await hPerm.runtime.start();
+    await vi.waitFor(async () => expect(await basePerm.readDaily('2026-10-26')).toBeDefined(), {
+      timeout: 3_000,
+      interval: 20,
+    });
+    await vi.waitFor(() => expect(attempts25).toBe(3), { timeout: 3_000, interval: 20 });
+    const permSummary = await hPerm.runtime.tools.envSummary({ month: '2026-10' });
+    expect(permSummary.available).toBe(true);
+    expect(permSummary.partial).toBe(true);
+    if (permSummary.available) {
+      expect(permSummary.pendingDays).toEqual(['2026-10-25']);
+      expect(permSummary.summary.coveredDays).toBe(1);
+    }
+    expect(await basePerm.readMonthly('2026-10')).toBeUndefined();
+    await hPerm.runtime.stop();
+
+    // 3) Delayed event at 23:59:59 enqueued right after midnight is included in yesterday's rollover daily summary (nit #4)
+    const dirMidnight = await makeTempDir();
+    const portMidnight = new FileHistoryStoragePort(dirMidnight);
+    const hMidnight = createRuntimeHarness({
+      nowMs: Date.UTC(2026, 10, 10, 23, 59, 0),
+      history: portMidnight,
+      timeZone: 'UTC',
+    });
+    await hMidnight.runtime.start();
+    hMidnight.setTime(Date.UTC(2026, 10, 11, 0, 0, 1), 62_000);
+    await hMidnight.emitJob({
+      type: 'started',
+      id: 'late-yesterday-job',
+      at: Date.UTC(2026, 10, 10, 23, 59, 59),
+    });
+    await hMidnight.runtime.tools.envHistory({});
+    const nov10Daily = JSON.parse((await portMidnight.readDaily('2026-11-10')) ?? '{}') as DailySummary;
+    expect(nov10Daily.totalEvents).toBeGreaterThanOrEqual(1);
+    expect(await portMidnight.readEvents('2026-11-10')).toContain('late-yesterday-job');
+    await hMidnight.runtime.stop();
+  });
+
+  it('streams daily summaries in background with accumulator parity and <100ms start() / <50MB RSS on 5MB day (#3)', async () => {
+    // 1) Exact parity between createDailySummaryAccumulator and summarizeDay(parseHistoryLines(...))
+    const dstCal = new LocalCalendar('America/New_York');
+    const dstDate = '2026-03-08';
+    const dstBounds = dstCal.dayBounds(dstDate);
+    const rawLines = [
+      JSON.stringify({ record: 'lifecycle', state: 'active', at: dstBounds.startMs + 60_000, boot: true }),
+      JSON.stringify({
+        record: 'event',
+        id: 'app-1',
+        kind: 'app.activated',
+        subject: 'Alpha',
+        level: 'record',
+        at: dstBounds.startMs + 120_000,
+        source: { id: 'helper', api: 'nsworkspace', host: 'local' },
+      }),
+      JSON.stringify({
+        record: 'event',
+        id: 'dup-1',
+        kind: 'file.activity',
+        subject: '/tmp/a',
+        level: 'context',
+        ruleId: 'r-file',
+        at: dstBounds.startMs + 180_000,
+        detail: { directory: '/tmp/a', created: 5, modified: 1, deleted: 0 },
+        source: { id: 'files', api: 'watch', host: 'local' },
+      }),
+      JSON.stringify({
+        record: 'event',
+        id: 'dup-1',
+        kind: 'file.burst',
+        subject: '/tmp/b',
+        level: 'record',
+        ruleId: 'r-burst',
+        at: dstBounds.startMs + 150_000, // out-of-order + overwrite file.activity -> file.burst
+        detail: { directory: '/tmp/b', created: 1, modified: 2, deleted: 3, externalDeletionExceeded: true },
+        source: { id: 'files', api: 'watch', host: 'local' },
+      }),
+      JSON.stringify({
+        record: 'event',
+        id: 'b-1',
+        kind: 'body.rate',
+        subject: 'rate:disk-drop:disk:/Volumes/Work',
+        level: 'record',
+        at: dstBounds.startMs + 200_000,
+        detail: { metric: 'disk:/Volumes/Work', severity: 'critical' },
+        source: { id: 'body', api: 'probe', host: 'local' },
+      }),
+      JSON.stringify({
+        record: 'patch',
+        id: 'b-1',
+        level: 'wake',
+        reason: 'wake-budget',
+      }),
+      JSON.stringify({
+        record: 'event',
+        id: 'app-ctrl',
+        kind: 'app.activated',
+        subject: '\u0001\u0002',
+        level: 'record',
+        at: dstBounds.startMs + 250_000,
+        source: { id: 'helper', api: 'nsworkspace', host: 'local' },
+      }),
+      JSON.stringify({
+        record: 'event',
+        id: 'app-empty',
+        kind: 'app.activated',
+        subject: '',
+        level: 'record',
+        at: dstBounds.startMs + 260_000,
+        source: { id: 'helper', api: 'nsworkspace', host: 'local' },
+      }),
+      JSON.stringify({ record: 'lifecycle', state: 'active', at: dstBounds.startMs + 400_000, boot: true }),
+      JSON.stringify({ record: 'lifecycle', state: 'stopped', at: dstBounds.startMs + 500_000 }),
+    ].join('\n');
+
+    const acc = createDailySummaryAccumulator(dstDate, dstBounds, { isRunningAtEnd: false, truncatedAtLimit: true });
+    for (const line of rawLines.split('\n')) acc.feed(line);
+    expect(acc.finish()).toEqual(
+      summarizeDay(dstDate, parseHistoryLines(rawLines), dstBounds, { isRunningAtEnd: false, truncatedAtLimit: true }),
+    );
+
+    // 2) U1-scale 5MB single-day missing summary: start() is non-blocking (<100ms) and streaming backfill stays <50MB RSS
+    const dir5 = await makeTempDir();
+    await mkdir(join(dir5, 'history', 'events'), { recursive: true, mode: 0o700 });
+    const baseWall = Date.UTC(2026, 10, 17, 12, 0, 0);
+    const chunks: string[] = [];
+    let bytes = 0;
+    let count = 0;
+    while (bytes < 5 * 1024 * 1024) {
+      const line = `${JSON.stringify({
+        record: 'event',
+        id: `s5-${count}`,
+        kind: count % 2 === 0 ? 'app.activated' : 'window.focused',
+        subject: 'EditorApp',
+        title: `Document-${count} /Users/tester/workspace/project/src/file-${count}.ts`,
+        level: 'record',
+        at: baseWall + count,
+        source: { id: 'helper', api: 'nsworkspace', host: 'local' },
+      })}\n`;
+      chunks.push(line);
+      bytes += Buffer.byteLength(line, 'utf8');
+      count++;
+    }
+    await writeFile(join(dir5, 'history', 'events', '2026-11-17.jsonl'), chunks.join(''), { mode: 0o600 });
+    chunks.length = 0;
+
+    const port5 = new FileHistoryStoragePort(dir5);
+    const mgr5 = new HistoryManager({
+      port: port5,
+      clock: { wall: () => Date.UTC(2026, 10, 18, 12, 0, 0), mono: () => 1_000 },
+      isPaused: () => false,
+      titlesAllowed: () => true,
+      restoreEntries: () => {},
+      clearMemoryEntries: () => {},
+      emitSourceError: () => {},
+      emitSourceOk: () => {},
+      timeZone: 'UTC',
+    });
+    const rss0 = process.memoryUsage().rss;
+    const t0 = performance.now();
+    await mgr5.start(false);
+    const startMs = performance.now() - t0;
+    try {
+      expect(startMs).toBeLessThan(100);
+      expect(await port5.readDaily('2026-11-17')).toBeUndefined();
+
+      let peakRss = process.memoryUsage().rss;
+      await vi.waitFor(
+        async () => {
+          peakRss = Math.max(peakRss, process.memoryUsage().rss);
+          expect(await port5.readDaily('2026-11-17')).toBeDefined();
+        },
+        { timeout: 15_000, interval: 20 },
+      );
+      const rssDeltaMb = (peakRss - rss0) / 1_048_576;
+      const daily5 = JSON.parse((await port5.readDaily('2026-11-17')) ?? '{}') as DailySummary;
+      expect(daily5.totalEvents).toBe(count);
+      expect(rssDeltaMb).toBeLessThan(50);
+    } finally {
+      await mgr5.stop();
+    }
+  }, 20_000);
 });
