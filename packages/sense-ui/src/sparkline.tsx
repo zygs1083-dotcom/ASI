@@ -1,8 +1,9 @@
 import { memo, useRef } from 'react';
 import { useClock, useSampling } from './clock';
 import { formatAge } from './format';
-import { buildSpark, sameThresholds } from './geometry';
+import { buildSpark, type RangeBandPoint, sameThresholds } from './geometry';
 import type { Severity } from './health';
+import { HISTORY_WINDOW_MS } from './history';
 import type { SparkThreshold } from './thresholds';
 import type { MetricInsight, MetricKey, MetricPoint } from './view-model';
 import css from './viz.module.css';
@@ -21,9 +22,13 @@ interface SparklineProps {
   severity?: Severity;
   /** 与 points 同单位的基线区间；未提供不画带、不虚构。 */
   baseline?: MetricInsight['baseline'];
+  /** min/max 区间阴影带（与 points 同时间窗口与单位）。 */
+  minMaxBand?: readonly RangeBandPoint[];
+  /** 时间窗口（ms），默认 HISTORY_WINDOW_MS（5 分钟）；24h 图传 86_400_000。 */
+  windowMs?: number;
   /** 阈值线；未提供不画线。 */
   thresholds?: SparkThreshold[];
-  /** 展开图（约 110px）：附加 y 极值、-5min/now 坐标与阈值标注。 */
+  /** 展开图（约 110px）：附加 y 极值、时间跨度与阈值标注。 */
   expanded?: boolean;
   className?: string;
 }
@@ -40,6 +45,8 @@ interface GeoKey {
   thresholds: SparkThreshold[];
   baseLow?: number;
   baseHigh?: number;
+  minMaxBand?: readonly RangeBandPoint[];
+  windowMs?: number;
   severity?: Severity;
   expanded: boolean;
 }
@@ -50,6 +57,8 @@ function sameGeoKey(a: GeoKey | undefined, b: GeoKey): boolean {
     a.points === b.points &&
     a.baseLow === b.baseLow &&
     a.baseHigh === b.baseHigh &&
+    a.minMaxBand === b.minMaxBand &&
+    a.windowMs === b.windowMs &&
     a.severity === b.severity &&
     a.expanded === b.expanded &&
     sameThresholds(a.thresholds, b.thresholds)
@@ -63,6 +72,12 @@ function sameGeoKey(a: GeoKey | undefined, b: GeoKey): boolean {
  * （图窗口随数据更新前进，刻意不做时钟跟随）。越界线段才染告警色，正常历史
  * 保持中性色；末点标记当前行级状态。数据不足给占位文案。
  */
+function windowLabelText(windowMs: number | undefined): string {
+  const w = windowMs !== undefined && Number.isFinite(windowMs) && windowMs > 0 ? windowMs : HISTORY_WINDOW_MS;
+  if (w >= 3_600_000 && w % 3_600_000 === 0) return `${w / 3_600_000} 小时`;
+  return `${Math.round(w / 60_000)} 分钟`;
+}
+
 function SparklineBase({
   points,
   now,
@@ -73,17 +88,21 @@ function SparklineBase({
   format,
   severity,
   baseline,
+  minMaxBand,
+  windowMs,
   thresholds = [],
   expanded = false,
   className,
 }: SparklineProps) {
   // 降采样 + 路径几何按几何键缓存：format/label/className 变化只重排文案。
-  // now 不进键：只有数据/语义变化才以本次渲染的 now 重锚 5 分钟窗口。
+  // now 不进键：只有数据/语义变化才以本次渲染的 now 重锚窗口。
   const key: GeoKey = {
     points,
     thresholds,
     baseLow: baseline?.low,
     baseHigh: baseline?.high,
+    minMaxBand,
+    windowMs,
     severity,
     expanded,
   };
@@ -91,17 +110,19 @@ function SparklineBase({
   const sampling = useSampling(metric, sampleIntervalMs);
   const cache = useRef<{ key: GeoKey; anchor: number; built: ReturnType<typeof buildSpark> }>();
   if (!sameGeoKey(cache.current?.key, key)) {
-    const anchor = cache.current?.key.points === points ? cache.current.anchor : now;
+    const anchor =
+      cache.current?.key.points === points && cache.current?.key.minMaxBand === minMaxBand ? cache.current.anchor : now;
     cache.current = {
       key,
       anchor,
-      built: buildSpark(points, anchor, { baseline, thresholds, severity, expanded }),
+      built: buildSpark(points, anchor, { baseline, thresholds, severity, expanded, windowMs, minMaxBand }),
     };
   }
   const built = cache.current!.built;
 
   if (!built) return <span className={css.sparkEmpty}>暂无趋势数据</span>;
   const { g } = built;
+  const spanLabel = windowLabelText(windowMs);
   const paused = pausedProp ?? sampling.paused;
   const lagging = !paused && clock - g.last.at > 3 * sampling.interval;
   const historical = paused || lagging;
@@ -109,7 +130,7 @@ function SparklineBase({
   const historyText = `${paused ? '采集暂停' : '数据滞后'} · 最后 ${age}`;
 
   const summary =
-    `${label}${historical ? `历史 5 分钟趋势，${historyText}：上次` : '最近 5 分钟趋势：当前'} ${format(g.last.value)}，最高 ${format(g.dataMax)}，` +
+    `${label}${historical ? `历史 ${spanLabel}趋势，${historyText}：上次` : `最近 ${spanLabel}趋势：当前`} ${format(g.last.value)}，最高 ${format(g.dataMax)}，` +
     `最低 ${format(g.dataMin)}` +
     (g.band ? `，基线区间 ${format(g.band.low)} 至 ${format(g.band.high)}` : '') +
     (thresholds.length
@@ -127,6 +148,7 @@ function SparklineBase({
           preserveAspectRatio="none"
           aria-hidden="true"
         >
+          {g.rangeBandPath && <path data-range-band="true" className={css.sparkRangeBand} d={g.rangeBandPath} />}
           {g.band && (
             <rect
               data-baseline="true"
@@ -197,7 +219,7 @@ function SparklineBase({
       </div>
       {expanded && (
         <div className={css.axisX}>
-          <span>-5 分钟</span>
+          <span>-{spanLabel}</span>
           <span>{historical ? historyText : '现在'}</span>
         </div>
       )}
@@ -228,5 +250,7 @@ export const Sparkline = memo(
     a.className === b.className &&
     a.baseline?.low === b.baseline?.low &&
     a.baseline?.high === b.baseline?.high &&
+    a.minMaxBand === b.minMaxBand &&
+    a.windowMs === b.windowMs &&
     sameThresholds(a.thresholds ?? [], b.thresholds ?? []),
 );

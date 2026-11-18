@@ -268,6 +268,18 @@ export class RuntimeAttention {
     if (this.batchEntries) this.batchEntries.length = 0;
     this.changed();
   }
+  snapshotEntries(): EventEntry[] {
+    return structuredClone(this.entries);
+  }
+  /** Merge pre-clear entries back in front of entries recorded during a failed clear. */
+  restoreEntriesPreservingLive(entries: readonly EventEntry[]): void {
+    const liveIds = new Set(this.entries.map((entry) => entry.id));
+    const missing = entries.filter((entry) => !liveIds.has(entry.id)).map((entry) => structuredClone(entry));
+    const combined = [...missing, ...this.entries].slice(-200);
+    this.entries.splice(0, this.entries.length, ...combined);
+    if (this.batchEntries) this.batchEntries = structuredClone(combined);
+    this.changed();
+  }
   current(): string | undefined {
     return this.currentSessionId();
   }

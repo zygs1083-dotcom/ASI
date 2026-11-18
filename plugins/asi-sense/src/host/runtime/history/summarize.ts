@@ -190,6 +190,7 @@ export function toPersistedEvent(raw: Record<string, unknown>): PersistedEventEn
 export function createHistoryLineParser() {
   const eventsById = new Map<string, PersistedEventEntry>();
   const lifecycle: HistoryLifecycleRecord[] = [];
+
   return {
     feed(rawLine: string): void {
       const line = rawLine.trim();
@@ -695,6 +696,184 @@ export function createDailySummaryAccumulator(date: string, bounds: DayBounds, o
     }
   };
 
+  function cloneDirStatsMap(source: Record<string, DailyDirectoryStats>): Record<string, DailyDirectoryStats> {
+    const out: Record<string, DailyDirectoryStats> = Object.create(null) as Record<string, DailyDirectoryStats>;
+    for (const [k, v] of Object.entries(source)) out[k] = { ...v };
+    return out;
+  }
+
+  function buildSummary(retainState: boolean): DailySummary {
+    const totalEvents = seenEvents.size;
+    const apps: Record<string, DailyAppStats> = Object.create(null) as Record<string, DailyAppStats>;
+    let appSwitches = 0;
+    let observedMs = 0;
+    let pausedMs = 0;
+    let notRunningMs = 0;
+
+    // Build ordered activation index array
+    let actValid = 0;
+    let actSorted = true;
+    let prevActAt = Number.NEGATIVE_INFINITY;
+    for (let i = 0; i < actCount; i++) {
+      if (actApp[i] !== -1) {
+        actValid++;
+        const t = actAt[i];
+        if (t < prevActAt) actSorted = false;
+        prevActAt = t;
+      }
+    }
+    const actIndices = new Int32Array(actValid);
+    for (let i = 0, p = 0; i < actCount; i++) {
+      if (actApp[i] !== -1) actIndices[p++] = i;
+    }
+    if (!actSorted && actValid > 1) {
+      actIndices.sort((a, b) => actAt[a] - actAt[b] || a - b);
+    }
+
+    if (lifecycle.length > 0) {
+      lifecycle.sort((a, b) => a.at - b.at);
+
+      let otherValid = 0;
+      let otherSorted = true;
+      let prevOtherAt = Number.NEGATIVE_INFINITY;
+      for (let i = 0; i < otherCount; i++) {
+        const t = otherAt[i];
+        if (!Number.isNaN(t)) {
+          otherValid++;
+          if (t < prevOtherAt) otherSorted = false;
+          prevOtherAt = t;
+        }
+      }
+      const otherSortedArr = new Float64Array(otherValid);
+      for (let i = 0, p = 0; i < otherCount; i++) {
+        const t = otherAt[i];
+        if (!Number.isNaN(t)) otherSortedArr[p++] = t;
+      }
+      if (!otherSorted && otherValid > 1) {
+        otherSortedArr.sort();
+      }
+
+      const machine = createLifecycleMachine(bounds, options, apps);
+      let lcPtr = 0;
+      let actPtr = 0;
+      let otherPtr = 0;
+      while (lcPtr < lifecycle.length || actPtr < actValid || otherPtr < otherValid) {
+        const lcTime = lcPtr < lifecycle.length ? clamp(lifecycle[lcPtr].at, startMs, endMs) : Infinity;
+        const actTime = actPtr < actValid ? clamp(actAt[actIndices[actPtr]], startMs, endMs) : Infinity;
+        const otherTime = otherPtr < otherValid ? clamp(otherSortedArr[otherPtr], startMs, endMs) : Infinity;
+        if (lcTime <= actTime && lcTime <= otherTime) {
+          machine.stepLifecycle(lifecycle[lcPtr++]);
+        } else if (actTime <= otherTime) {
+          const idx = actIndices[actPtr++];
+          machine.stepActivation(actAt[idx], appNames[actApp[idx]]);
+        } else {
+          machine.stepOther(otherSortedArr[otherPtr++]);
+        }
+      }
+      const cov = machine.finish();
+      observedMs = cov.observedMs;
+      pausedMs = cov.pausedMs;
+      notRunningMs = cov.notRunningMs;
+      appSwitches = cov.appSwitches;
+    } else if (totalEvents > 0) {
+      let minAt = Number.POSITIVE_INFINITY;
+      let maxAt = Number.NEGATIVE_INFINITY;
+      for (let i = 0; i < actValid; i++) {
+        const t = actAt[actIndices[i]];
+        if (t < minAt) minAt = t;
+        if (t > maxAt) maxAt = t;
+      }
+      for (let i = 0; i < otherCount; i++) {
+        const t = otherAt[i];
+        if (!Number.isNaN(t)) {
+          if (t < minAt) minAt = t;
+          if (t > maxAt) maxAt = t;
+        }
+      }
+      for (let i = 0; i < emptyActAts.length; i++) {
+        const t = emptyActAts[i];
+        if (!Number.isNaN(t)) {
+          if (t < minAt) minAt = t;
+          if (t > maxAt) maxAt = t;
+        }
+      }
+      const firstAt = clamp(minAt, startMs, endMs);
+      const lastAt = clamp(maxAt, startMs, endMs);
+      let currentApp: string | undefined;
+      let appSince: number | undefined;
+      for (let i = 0; i < actValid; i++) {
+        const idx = actIndices[i];
+        const appName = appNames[actApp[idx]];
+        if (!appName) continue;
+        const at = clamp(actAt[idx], startMs, endMs);
+        const appStats = getOrInit(apps, appName, () => ({ foregroundMs: 0, switches: 0 }));
+        appStats.switches += 1;
+        appSwitches += 1;
+        if (currentApp && appSince !== undefined) {
+          addAppDuration(apps, currentApp, at - appSince);
+        }
+        currentApp = appName;
+        appSince = at;
+      }
+      if (currentApp && appSince !== undefined) {
+        addAppDuration(apps, currentApp, Math.max(0, lastAt - appSince));
+      }
+      observedMs = Math.max(0, lastAt - firstAt);
+      notRunningMs = Math.max(0, durationMs - observedMs);
+    } else {
+      notRunningMs = durationMs;
+    }
+
+    const system = summarizeSystemEvents(
+      sysItems.filter((item): item is SystemEventItem => item !== undefined),
+      bounds,
+    );
+
+    const outDeliveries: DailySummary['deliveries'] = retainState
+      ? {
+          wake: deliveries.wake,
+          context: deliveries.context,
+          suppressed: deliveries.suppressed,
+          byRule: Object.fromEntries(Object.entries(deliveries.byRule).map(([k, v]) => [k, { ...v }])),
+        }
+      : deliveries;
+    const outFileBursts = retainState ? cloneDirStatsMap(fileBursts) : fileBursts;
+    const outFileActivity = retainState ? cloneDirStatsMap(fileActivity) : fileActivity;
+    const outBodyAnomalies: DailySummary['bodyAnomalies'] = retainState
+      ? { ...bodyAnomalies, byMetric: { ...bodyAnomalies.byMetric } }
+      : bodyAnomalies;
+
+    if (!retainState) {
+      // Release large temporary containers promptly for GC.
+      seenEvents.clear();
+      lifecycle.length = 0;
+      emptyActAts.length = 0;
+      sysOtherIdx.length = 0;
+      sysItems.length = 0;
+      actAt = new Float64Array(0);
+      actApp = new Int32Array(0);
+      otherAt = new Float64Array(0);
+    }
+
+    return {
+      version: 1,
+      date,
+      dayStartMs: startMs,
+      dayEndMs: endMs,
+      dayDurationMs: durationMs,
+      apps,
+      appSwitches,
+      deliveries: outDeliveries,
+      fileBursts: outFileBursts,
+      fileActivity: outFileActivity,
+      bodyAnomalies: outBodyAnomalies,
+      system,
+      coverage: { observedMs, pausedMs, notRunningMs },
+      totalEvents,
+      ...(options.truncatedAtLimit ? { truncatedAtLimit: true } : {}),
+    };
+  }
+
   return {
     feed(rawLine: string): void {
       const line = rawLine.trim();
@@ -858,160 +1037,12 @@ export function createDailySummaryAccumulator(date: string, bounds: DayBounds, o
       seenEvents.set(id, packEventState(levelCode, reasonCode, kindTag, ruleIdx, slotIdx));
     },
 
+    snapshot(): DailySummary {
+      return buildSummary(true);
+    },
+
     finish(): DailySummary {
-      const totalEvents = seenEvents.size;
-      const apps: Record<string, DailyAppStats> = Object.create(null) as Record<string, DailyAppStats>;
-      let appSwitches = 0;
-      let observedMs = 0;
-      let pausedMs = 0;
-      let notRunningMs = 0;
-
-      // Build ordered activation index array
-      let actValid = 0;
-      let actSorted = true;
-      let prevActAt = Number.NEGATIVE_INFINITY;
-      for (let i = 0; i < actCount; i++) {
-        if (actApp[i] !== -1) {
-          actValid++;
-          const t = actAt[i];
-          if (t < prevActAt) actSorted = false;
-          prevActAt = t;
-        }
-      }
-      const actIndices = new Int32Array(actValid);
-      for (let i = 0, p = 0; i < actCount; i++) {
-        if (actApp[i] !== -1) actIndices[p++] = i;
-      }
-      if (!actSorted && actValid > 1) {
-        actIndices.sort((a, b) => actAt[a] - actAt[b] || a - b);
-      }
-
-      if (lifecycle.length > 0) {
-        lifecycle.sort((a, b) => a.at - b.at);
-
-        let otherValid = 0;
-        let otherSorted = true;
-        let prevOtherAt = Number.NEGATIVE_INFINITY;
-        for (let i = 0; i < otherCount; i++) {
-          const t = otherAt[i];
-          if (!Number.isNaN(t)) {
-            otherValid++;
-            if (t < prevOtherAt) otherSorted = false;
-            prevOtherAt = t;
-          }
-        }
-        const otherSortedArr = new Float64Array(otherValid);
-        for (let i = 0, p = 0; i < otherCount; i++) {
-          const t = otherAt[i];
-          if (!Number.isNaN(t)) otherSortedArr[p++] = t;
-        }
-        if (!otherSorted && otherValid > 1) {
-          otherSortedArr.sort();
-        }
-
-        const machine = createLifecycleMachine(bounds, options, apps);
-        let lcPtr = 0;
-        let actPtr = 0;
-        let otherPtr = 0;
-        while (lcPtr < lifecycle.length || actPtr < actValid || otherPtr < otherValid) {
-          const lcTime = lcPtr < lifecycle.length ? clamp(lifecycle[lcPtr].at, startMs, endMs) : Infinity;
-          const actTime = actPtr < actValid ? clamp(actAt[actIndices[actPtr]], startMs, endMs) : Infinity;
-          const otherTime = otherPtr < otherValid ? clamp(otherSortedArr[otherPtr], startMs, endMs) : Infinity;
-          if (lcTime <= actTime && lcTime <= otherTime) {
-            machine.stepLifecycle(lifecycle[lcPtr++]);
-          } else if (actTime <= otherTime) {
-            const idx = actIndices[actPtr++];
-            machine.stepActivation(actAt[idx], appNames[actApp[idx]]);
-          } else {
-            machine.stepOther(otherSortedArr[otherPtr++]);
-          }
-        }
-        const cov = machine.finish();
-        observedMs = cov.observedMs;
-        pausedMs = cov.pausedMs;
-        notRunningMs = cov.notRunningMs;
-        appSwitches = cov.appSwitches;
-      } else if (totalEvents > 0) {
-        let minAt = Number.POSITIVE_INFINITY;
-        let maxAt = Number.NEGATIVE_INFINITY;
-        for (let i = 0; i < actValid; i++) {
-          const t = actAt[actIndices[i]];
-          if (t < minAt) minAt = t;
-          if (t > maxAt) maxAt = t;
-        }
-        for (let i = 0; i < otherCount; i++) {
-          const t = otherAt[i];
-          if (!Number.isNaN(t)) {
-            if (t < minAt) minAt = t;
-            if (t > maxAt) maxAt = t;
-          }
-        }
-        for (let i = 0; i < emptyActAts.length; i++) {
-          const t = emptyActAts[i];
-          if (!Number.isNaN(t)) {
-            if (t < minAt) minAt = t;
-            if (t > maxAt) maxAt = t;
-          }
-        }
-        const firstAt = clamp(minAt, startMs, endMs);
-        const lastAt = clamp(maxAt, startMs, endMs);
-        let currentApp: string | undefined;
-        let appSince: number | undefined;
-        for (let i = 0; i < actValid; i++) {
-          const idx = actIndices[i];
-          const appName = appNames[actApp[idx]];
-          if (!appName) continue;
-          const at = clamp(actAt[idx], startMs, endMs);
-          const appStats = getOrInit(apps, appName, () => ({ foregroundMs: 0, switches: 0 }));
-          appStats.switches += 1;
-          appSwitches += 1;
-          if (currentApp && appSince !== undefined) {
-            addAppDuration(apps, currentApp, at - appSince);
-          }
-          currentApp = appName;
-          appSince = at;
-        }
-        if (currentApp && appSince !== undefined) {
-          addAppDuration(apps, currentApp, Math.max(0, lastAt - appSince));
-        }
-        observedMs = Math.max(0, lastAt - firstAt);
-        notRunningMs = Math.max(0, durationMs - observedMs);
-      } else {
-        notRunningMs = durationMs;
-      }
-
-      const system = summarizeSystemEvents(
-        sysItems.filter((item): item is SystemEventItem => item !== undefined),
-        bounds,
-      );
-
-      // Release large temporary containers promptly for GC.
-      seenEvents.clear();
-      lifecycle.length = 0;
-      emptyActAts.length = 0;
-      sysOtherIdx.length = 0;
-      sysItems.length = 0;
-      actAt = new Float64Array(0);
-      actApp = new Int32Array(0);
-      otherAt = new Float64Array(0);
-
-      return {
-        version: 1,
-        date,
-        dayStartMs: startMs,
-        dayEndMs: endMs,
-        dayDurationMs: durationMs,
-        apps,
-        appSwitches,
-        deliveries,
-        fileBursts,
-        fileActivity,
-        bodyAnomalies,
-        system,
-        coverage: { observedMs, pausedMs, notRunningMs },
-        totalEvents,
-        ...(options.truncatedAtLimit ? { truncatedAtLimit: true } : {}),
-      };
+      return buildSummary(false);
     },
   };
 }

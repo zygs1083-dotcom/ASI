@@ -98,6 +98,8 @@ export class AwayReporter {
   private totalFailedCount = 0;
   private totalBurstEntries = 0;
   private totalDeletedCount = 0;
+  private version = 0;
+  private latest?: { version: number; data: AwaySummaryData };
 
   constructor(
     private readonly metrics: MetricTimeline,
@@ -314,6 +316,7 @@ export class AwayReporter {
     };
     this.lastAwayEndWall = Math.max(returnWall, returnAt);
     this.lastAwayEndMono = returnMono;
+    this.latest = { version: ++this.version, data };
     this.emit({
       id: `away.summary:${awayFrom}:${returnAt}`,
       kind: 'away.summary',
@@ -323,6 +326,19 @@ export class AwayReporter {
       cause: 'user',
       data,
     });
+  }
+
+  lastSummary(): { version: number; data: AwaySummaryData } | undefined {
+    return this.latest;
+  }
+
+  clear(): void {
+    this.reset();
+    // lastAwayEndWall/lastAwayEndMono are de-duplication watermarks for an
+    // already-pushed away episode, not history data: keep them so a late
+    // paired end hint for the same episode cannot push a second away.summary.
+    this.latest = undefined;
+    this.version += 1;
   }
 
   private reset(): void {

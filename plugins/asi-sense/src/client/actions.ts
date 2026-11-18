@@ -24,6 +24,9 @@ type Api = Pick<
   | 'retryTuningBackup'
   | 'dismissTuningBackup'
   | 'acceptRebaseline'
+  | 'listMonths'
+  | 'loadMonthly'
+  | 'clearHistory'
 >;
 type Actions = Omit<SensePanelProps, 'model'>;
 
@@ -44,10 +47,11 @@ export function createActions(api: Api) {
       () => publish(true),
     );
   };
-  const complete = async (action: () => Promise<RemoteResult<void>>) => {
+  const complete = async <T>(action: () => Promise<RemoteResult<T>>): Promise<T> => {
     try {
       const result = await action();
       if (!result.ok) throw result.error;
+      return result.value;
     } catch (error) {
       if (error instanceof Error && error.message.trim()) throw error;
       if (
@@ -84,6 +88,9 @@ export function createActions(api: Api) {
     onRetryTuningBackup: () => complete(() => api.retryTuningBackup()),
     onDismissTuningBackup: () => complete(() => api.dismissTuningBackup()),
     onAcceptRebaseline: (id) => complete(() => api.acceptRebaseline(id)),
+    onListMonths: () => complete(() => api.listMonths()),
+    onLoadMonthly: (month) => complete(() => api.loadMonthly(month)),
+    onClearHistory: () => complete(() => api.clearHistory()),
   };
   return {
     actions,

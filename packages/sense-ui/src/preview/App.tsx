@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from 'react';
 import { makeScenario, SCENARIOS, type ScenarioName } from '../mock/scenarios';
+import { MOCK_MONTHLY_2026_10 } from '../mock/scenarios-history';
 import { SensePanel } from '../SensePanel';
 import type { SensePanelModel } from '../view-model';
 import { tick } from './tick';
@@ -28,6 +29,7 @@ export function App() {
   const [theme, setTheme] = useState(readQuery().theme);
   const [realtime, setRealtime] = useState(readQuery().realtime);
   const [model, setModel] = useState<SensePanelModel>(() => makeScenario(readQuery().scenario));
+  const [historyCleared, setHistoryCleared] = useState(false);
   const [lastAction, setLastAction] = useState('');
 
   useEffect(() => applyTheme(theme), [theme]);
@@ -40,8 +42,27 @@ export function App() {
 
   const switchScenario = (name: ScenarioName) => {
     setScenario(name);
+    setHistoryCleared(false);
     setModel(makeScenario(name));
   };
+
+  const onListMonths = useCallback(async () => {
+    if (historyCleared || scenario === 'history-empty') return [];
+    return ['2026-10', '2026-09'];
+  }, [historyCleared, scenario]);
+
+  const onLoadMonthly = useCallback(
+    async (month: string) => {
+      if (scenario === 'history-monthly-error') {
+        throw new Error('月度汇总读取失败（模拟错误）');
+      }
+      if (month === '2026-10') {
+        return { available: true as const, summary: MOCK_MONTHLY_2026_10 };
+      }
+      return { available: false as const, reason: '该月份暂无已归档的月度总结' };
+    },
+    [scenario],
+  );
 
   const act = useCallback((text: string) => setLastAction(text), []);
   const onOpenPermissionSettings = useCallback(() => act('请求打开系统授权设置'), [act]);
@@ -251,6 +272,13 @@ export function App() {
               },
             }));
             act(`确认重新基线 ${id}`);
+          }}
+          onListMonths={onListMonths}
+          onLoadMonthly={onLoadMonthly}
+          onClearHistory={async () => {
+            setHistoryCleared(true);
+            setModel((m) => ({ ...m, events: [], timeline: undefined }));
+            act('清除历史数据');
           }}
         />
       </main>

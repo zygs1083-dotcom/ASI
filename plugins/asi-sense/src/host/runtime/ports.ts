@@ -1,6 +1,7 @@
 import type { ChildProcessWithoutNullStreams } from 'node:child_process';
 import type { BodyProbe } from '@asi/body-probe';
 import type { Body, JobSummary, TuningValue, WatchRule } from '@asi/sense-types';
+import type { MonthlySummaryLoadResult } from '@asi/sense-ui';
 import type { DeliveryIntent } from '../attention/pipeline.ts';
 import type {
   DailyDirectoryStats,
@@ -175,6 +176,9 @@ export interface SenseActions {
   resetTuning(): Promise<void>;
   retryTuningBackup(): Promise<void>;
   dismissTuningBackup(): Promise<void>;
+  listMonths(): Promise<string[]>;
+  loadMonthly(month: string): Promise<MonthlySummaryLoadResult>;
+  clearHistory(): Promise<void>;
 }
 export type TuneRequest =
   | { param: string; to: TuningValue; reason?: string }

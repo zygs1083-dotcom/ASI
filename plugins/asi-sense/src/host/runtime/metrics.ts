@@ -72,12 +72,32 @@ interface MetricBucket {
   samples: number;
   slots: Array<InternalMetricStats | undefined>;
   diskTotal?: number;
+  memoryTotal?: number;
   minMono: number;
   maxMono: number;
   inOrder: boolean;
   /** Flat [at, mono, v0..v7, ...] per sample to avoid per-metric array churn. */
   sampleData: number[];
   diskTotals?: number[];
+}
+
+export interface Timeline24hPoint {
+  at: number;
+  min: number;
+  avg: number;
+  max: number;
+}
+
+export interface Timeline24hMemoryPoint extends Timeline24hPoint {
+  total?: number;
+}
+
+export interface Timeline24hSnapshot {
+  version: number;
+  cpu: Timeline24hPoint[];
+  memory: Timeline24hMemoryPoint[];
+  disk: Timeline24hPoint[];
+  battery: Timeline24hPoint[];
 }
 
 type HourBucket = MetricBucket;
@@ -301,6 +321,7 @@ export class MetricTimeline {
   private lastBucket?: MetricBucket;
   private lastHour?: HourBucket;
   private lastHourEnd = Number.NEGATIVE_INFINITY;
+  private bucketVersion = 0;
 
   constructor(
     private readonly clock: Clock,
@@ -320,6 +341,7 @@ export class MetricTimeline {
       if (!bucket) {
         bucket = createBucket(start);
         this.buckets.set(start, bucket);
+        this.bucketVersion += 1;
       }
       this.lastBucket = bucket;
       this.pruneBuckets(at);
@@ -386,6 +408,63 @@ export class MetricTimeline {
       bucket.diskTotal = diskTotal;
       hour.diskTotal = diskTotal;
     }
+    const mem = okFact(body.memory, at);
+    if (mem && finite(mem.total) && mem.total > 0) {
+      bucket.memoryTotal = mem.total;
+    }
+  }
+
+  /** Monotonic counter incremented only when a new 5-minute bucket is created or cleared. */
+  snapshotVersion(): number {
+    return this.bucketVersion;
+  }
+
+  /** Synchronous 24h 5-minute bucket snapshot for sidebar presentation. */
+  series24h(to = this.clock.wall()): Timeline24hSnapshot {
+    const from = to - METRIC_RETENTION_MS;
+    const starts = [...this.buckets.keys()].sort((a, b) => a - b);
+    const cpu: Timeline24hPoint[] = [];
+    const memory: Timeline24hMemoryPoint[] = [];
+    const disk: Timeline24hPoint[] = [];
+    const battery: Timeline24hPoint[] = [];
+    for (const start of starts) {
+      if (start < from || start > to) continue;
+      const bucket = this.buckets.get(start);
+      if (!bucket) continue;
+      const c = bucket.slots[METRIC_INDEX.cpu];
+      if (c) cpu.push({ at: start, min: c.min, avg: roundAvg(c.sum / c.count), max: c.max });
+      const m = bucket.slots[METRIC_INDEX.memory];
+      if (m) {
+        memory.push({
+          at: start,
+          min: m.min,
+          avg: roundAvg(m.sum / m.count),
+          max: m.max,
+          ...(bucket.memoryTotal !== undefined ? { total: bucket.memoryTotal } : {}),
+        });
+      }
+      const d = bucket.slots[METRIC_INDEX.disk];
+      if (d) disk.push({ at: start, min: d.min, avg: roundAvg(d.sum / d.count), max: d.max });
+      const b = bucket.slots[METRIC_INDEX.battery];
+      if (b) battery.push({ at: start, min: b.min, avg: roundAvg(b.sum / b.count), max: b.max });
+    }
+    return {
+      version: this.bucketVersion,
+      cpu: cpu.slice(-MAX_METRIC_POINTS),
+      memory: memory.slice(-MAX_METRIC_POINTS),
+      disk: disk.slice(-MAX_METRIC_POINTS),
+      battery: battery.slice(-MAX_METRIC_POINTS),
+    };
+  }
+
+  /** Clears all retained 5-minute and hourly metric buckets (for user clearHistory). */
+  clear(): void {
+    this.buckets.clear();
+    this.hours.clear();
+    this.lastBucket = undefined;
+    this.lastHour = undefined;
+    this.lastHourEnd = Number.NEGATIVE_INFINITY;
+    this.bucketVersion += 1;
   }
 
   query(params: MetricQueryParams = {}): MetricQueryResult {

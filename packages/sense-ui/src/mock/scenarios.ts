@@ -15,6 +15,7 @@ import {
   T0,
 } from './fixtures';
 import { contextAlmostFull, diskPartial, tokenFallback } from './scenarios-extra';
+import { historyAwayAnomaly, historyEmpty, historyReady } from './scenarios-history';
 
 export const SCENARIOS = [
   'healthy',
@@ -29,6 +30,10 @@ export const SCENARIOS = [
   'disk-partial',
   'tuning-disabled',
   'rebaseline-suggested',
+  'history-ready',
+  'history-empty',
+  'history-away-anomaly',
+  'history-monthly-error',
 ] as const;
 
 export type ScenarioName = (typeof SCENARIOS)[number];
@@ -294,6 +299,10 @@ const BUILDERS: Record<ScenarioName, () => SensePanelModel> = {
   'disk-partial': diskPartial,
   'tuning-disabled': tuningDisabled,
   'rebaseline-suggested': rebaselineSuggested,
+  'history-ready': () => historyReady(healthy()),
+  'history-empty': () => historyEmpty(healthy()),
+  'history-away-anomaly': () => historyAwayAnomaly(healthy()),
+  'history-monthly-error': () => historyReady(healthy()),
 };
 
 export function makeScenario(name: ScenarioName): SensePanelModel {

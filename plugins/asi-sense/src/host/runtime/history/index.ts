@@ -1,3 +1,10 @@
+export {
+  digestSummaryFields,
+  type TimelineCoreFields,
+  toMonthlySummaryResult,
+  toMonthlySummaryView,
+  toTimelineDaySummary,
+} from './digest.ts';
 export { HistoryArgsError, type HistoryEventInput, HistoryManager, type HistoryManagerOptions } from './store.ts';
 export {
   createDailySummaryAccumulator,

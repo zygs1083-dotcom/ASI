@@ -165,6 +165,7 @@
 .linkButton:focus-visible,
 .panel summary:focus-visible,
 .panel button:focus-visible,
+.panel select:focus-visible,
 .panel input:focus-visible {
   outline: 2px solid var(--dsw-alias-state-business-primary, #4176e6);
   outline-offset: 1px;

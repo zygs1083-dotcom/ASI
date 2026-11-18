@@ -1,5 +1,7 @@
+import type { MonthlySummaryLoadResult } from '@asi/sense-ui';
 import type { Context } from '@deepseek-ai/cordis';
 import { principalOf, Remote, RemoteError, TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol';
+import { parseMonthKey } from '../runtime/history/index.ts';
 import type { SenseActions } from '../runtime/ports.ts';
 import { normalizeFileExclusion } from '../sources/file-exclusions.ts';
 import type { FramesSource } from './frames.ts';
@@ -40,6 +42,11 @@ export class AsiSenseRemote extends TypertRemoteService {
     } finally {
       this.framesSource.invalidate?.();
     }
+  }
+
+  private async userQuery<T>(query: () => Promise<T>): Promise<T> {
+    this.checkUser();
+    return await query();
   }
 
   @Remote({ mode: 'stream' })
@@ -187,5 +194,25 @@ export class AsiSenseRemote extends TypertRemoteService {
   @Remote
   async dismissTuningBackup(): Promise<void> {
     await this.userAction(() => this.actions.dismissTuningBackup());
+  }
+
+  @Remote
+  async listMonths(): Promise<string[]> {
+    return await this.userQuery(() => this.actions.listMonths());
+  }
+
+  @Remote
+  async loadMonthly(month: string): Promise<MonthlySummaryLoadResult> {
+    return await this.userQuery(() => {
+      if (typeof month !== 'string' || !parseMonthKey(month)) {
+        throw new RemoteError('gateway/bad-request', 'Month must be formatted as YYYY-MM', {});
+      }
+      return this.actions.loadMonthly(month);
+    });
+  }
+
+  @Remote
+  async clearHistory(): Promise<void> {
+    await this.userAction(() => this.actions.clearHistory());
   }
 }

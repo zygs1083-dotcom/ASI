@@ -44,6 +44,7 @@ interface Harness {
   settle: () => Promise<void>;
   flush: () => Promise<void>;
   advance: (ms: number) => void;
+  clearHistory: () => void;
 }
 
 async function harness(startWall = BASE): Promise<Harness> {
@@ -119,6 +120,10 @@ async function harness(startWall = BASE): Promise<Harness> {
     advance: (ms) => {
       wall += ms;
       mono += ms;
+    },
+    clearHistory: () => {
+      metrics.clear();
+      away.clear();
     },
   };
 }
@@ -198,6 +203,31 @@ describe('away detection', () => {
     await lockAway(h, BASE + 5 * HOUR, BASE + 7 * HOUR);
     await h.settle();
     expect(h.summaries).toHaveLength(2);
+  });
+
+  it('keeps the pushed-away watermark after clear() so a late paired hint never pushes twice (#1)', async () => {
+    const h = await harness();
+    h.record(cpuBody(0.1), BASE);
+    await h.send('screen.locked', BASE);
+    h.record(cpuBody(0.5), BASE + HOUR);
+    await h.send('screen.unlocked', BASE + 2 * HOUR);
+    await h.settle();
+    await h.flush();
+    expect(h.summaries).toHaveLength(1);
+    // Clearing history must not drop the watermark: the same episode's late
+    // paired end hint (session.active after screen.unlocked) stays suppressed.
+    h.advance(65_000);
+    h.clearHistory();
+    h.advance(13_000);
+    await h.send('session.active', BASE + 2 * HOUR + 78_000, { durationMs: 2 * HOUR + 78_000 });
+    await h.settle();
+    await h.flush();
+
+    expect(h.summaries).toHaveLength(1);
+    const pushes = h.delivered.flatMap((intent) =>
+      intent.update.changes.filter((change) => change.signal.kind === 'away.summary'),
+    );
+    expect(pushes).toHaveLength(1);
   });
 
   it('records a quiet away period in history without pushing it', async () => {

@@ -25,6 +25,9 @@ function fixture() {
     retryTuningBackup: method(),
     dismissTuningBackup: method(),
     acceptRebaseline: method(),
+    listMonths: method(),
+    loadMonthly: method(),
+    clearHistory: method(),
   };
   return { api, controller: createActions(api) };
 }
@@ -153,6 +156,33 @@ describe('sidebar action boundary', () => {
       error: new RemoteError('gateway/bad-request', 'watch retry failed', {}),
     });
     await expect(controller.actions.onRetryGlobalFileWatch?.()).rejects.toThrow('watch retry failed');
+    expect(controller.getSnapshot()).toBe(false);
+    controller.dispose();
+  });
+
+  it('routes listMonths, loadMonthly, and clearHistory via complete and propagates errors locally', async () => {
+    const { api, controller } = fixture();
+    api.listMonths.mockResolvedValueOnce({ ok: true, value: ['2026-10', '2026-09'] });
+    api.loadMonthly.mockResolvedValueOnce({
+      ok: true,
+      value: { available: false, reason: '暂无数据' },
+    });
+
+    await expect(controller.actions.onListMonths?.()).resolves.toEqual(['2026-10', '2026-09']);
+    await expect(controller.actions.onLoadMonthly?.('2026-10')).resolves.toEqual({
+      available: false,
+      reason: '暂无数据',
+    });
+    await expect(controller.actions.onClearHistory?.()).resolves.toBeUndefined();
+    expect(api.listMonths).toHaveBeenCalledOnce();
+    expect(api.loadMonthly).toHaveBeenCalledWith('2026-10');
+    expect(api.clearHistory).toHaveBeenCalledOnce();
+
+    api.loadMonthly.mockResolvedValueOnce({
+      ok: false,
+      error: new RemoteError('gateway/bad-request', 'invalid month', {}),
+    });
+    await expect(controller.actions.onLoadMonthly?.('bad')).rejects.toThrow('invalid month');
     expect(controller.getSnapshot()).toBe(false);
     controller.dispose();
   });

@@ -11,7 +11,7 @@ import { AwayReporter } from './away.ts';
 import { createChanges, createStateListeners, observableActions, settleShutdown } from './changes.ts';
 import { deliveryRetry } from './delivery-retry.ts';
 import { FactExpiry } from './expiry.ts';
-import { HistoryManager } from './history/index.ts';
+import { HistoryManager, toMonthlySummaryResult } from './history/index.ts';
 import { MetricTimeline } from './metrics.ts';
 import type { SenseActions, SenseOptions, SensePorts } from './ports.ts';
 import { createSessionTarget } from './session-target.ts';
@@ -68,6 +68,8 @@ export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}
     titlesAllowed: () => allowTitles,
     restoreEntries: (entries) => attentionRef?.restoreEntries(entries),
     clearMemoryEntries: () => attentionRef?.clearEvents(),
+    snapshotMemoryEntries: () => attentionRef?.snapshotEntries() ?? [],
+    restoreMemoryEntries: (entries) => attentionRef?.restoreEntriesPreservingLive(entries),
     emitSourceError: (error, extra) => {
       if (!attentionRef || stopping) return;
       void attentionRef
@@ -99,6 +101,7 @@ export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}
       const extension = metrics.dailyExtension(date);
       return extension ? { metrics: extension } : undefined;
     },
+    onSummaryChanged: changed,
   });
   const attention = new RuntimeAttention(
     clock,
@@ -300,6 +303,15 @@ export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}
     },
     check,
   );
+  const clearAllHistory = async () => {
+    // Clear persisted history first: a storage failure must leave the
+    // in-memory metrics/away state untouched and surface to the UI.
+    await history.clear();
+    metrics.clear();
+    away.clear();
+    changed();
+  };
+
   const unguarded: SenseActions = {
     selectTarget: (id) => target.select(id),
     dismissTargetNotice: async () => target.dismiss(),
@@ -406,6 +418,18 @@ export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}
         draft.fileExclusions = (draft.fileExclusions ?? []).filter((item) => exclusionKey(item, platform) !== key);
       });
     },
+    listMonths: async () => {
+      check();
+      return history.listCompletedMonths();
+    },
+    loadMonthly: async (month) => {
+      check();
+      return toMonthlySummaryResult(await history.summary({ month }));
+    },
+    clearHistory: () => {
+      check();
+      return clearAllHistory();
+    },
   };
   const guarded = guardActions(unguarded, () => generation, check);
   const actions = guarded.actions;
@@ -507,7 +531,11 @@ export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}
     },
     body: { monitor: body.monitor, tuner: body.tuner },
     actions: observableActions(actions, changed),
-    clearHistory: () => history.clear(),
+    historySnapshot: () => history.timelineSnapshots(),
+    metricsVersion: () => metrics.snapshotVersion(),
+    metrics24h: (to?: number) => metrics.series24h(to),
+    awayLast: () => away.lastSummary(),
+    clearHistory: clearAllHistory,
     tools,
   };
 }

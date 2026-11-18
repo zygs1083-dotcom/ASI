@@ -849,6 +849,163 @@ describe('runtime history persistence, rollups, retention, and recovery', () => 
     await h.runtime.stop();
   });
 
+  const histEvent = (id: string, at: number) => ({
+    id,
+    kind: 'app.activated',
+    subject: 'CodeForge',
+    level: 'wake' as const,
+    at,
+    source: { id: 'helper', api: 'ax', host: 'local' },
+  });
+  const mockPort = (opts: { clearAll?: () => Promise<void>; listMonthlyMonths?: () => Promise<string[]> } = {}) => {
+    const events = new Map<string, string>();
+    const port: HistoryStoragePort = {
+      eventFileSize: async (date) => Buffer.byteLength(events.get(date) ?? '', 'utf8'),
+      appendEvent: async (date, line) => {
+        events.set(date, (events.get(date) ?? '') + line);
+      },
+      readEvents: async (date) => events.get(date),
+      listEventDates: async () => [...events.keys()],
+      deleteEventDate: async (date) => {
+        events.delete(date);
+      },
+      readDaily: async () => undefined,
+      writeDaily: async () => {},
+      listDailyDates: async () => [],
+      deleteDailyDate: async () => {},
+      readMonthly: async () => undefined,
+      writeMonthly: async () => {},
+      listMonthlyMonths: opts.listMonthlyMonths ?? (async () => []),
+      clearAll:
+        opts.clearAll ??
+        (async () => {
+          events.clear();
+        }),
+    };
+    return { port, events };
+  };
+  const managerFor = (port: HistoryStoragePort, wall: () => number) =>
+    new HistoryManager({
+      port,
+      clock: { wall, mono: () => 1_000 },
+      isPaused: () => false,
+      titlesAllowed: () => false,
+      restoreEntries: () => {},
+      clearMemoryEntries: () => {},
+      emitSourceError: () => {},
+      emitSourceOk: () => {},
+      timeZone: 'UTC',
+    });
+
+  it('keeps events recorded while clear() awaits port.clearAll() in the today summary (#2)', async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const { port, events } = mockPort({
+      clearAll: async () => {
+        events.clear();
+        await gate;
+      },
+    });
+    let wall = Date.UTC(2026, 10, 18, 9, 0, 0);
+    const mgr = managerFor(port, () => wall);
+    await mgr.start(false);
+
+    const clearing = mgr.clear();
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    wall += 10_000;
+    mgr.recordEvent(histEvent('ev-during-clear', wall));
+    release();
+    await clearing;
+    await mgr.query({});
+
+    expect(mgr.timelineSnapshots().today?.totalEvents).toBe(1);
+    expect(events.get('2026-11-18') ?? '').toContain('ev-during-clear');
+    await mgr.stop();
+  });
+
+  it('keeps today summary usable after port.clearAll() fails and a later clear still works (#2)', async () => {
+    let failOnce = true;
+    const { port, events } = mockPort({
+      clearAll: async () => {
+        if (failOnce) {
+          failOnce = false;
+          throw Object.assign(new Error('EACCES: permission denied'), { code: 'EACCES' });
+        }
+        events.clear();
+      },
+    });
+    let wall = Date.UTC(2026, 10, 18, 9, 0, 0);
+    const mgr = managerFor(port, () => wall);
+    await mgr.start(false);
+    mgr.recordEvent(histEvent('e1', wall + 1_000));
+    await mgr.query({});
+    expect(mgr.timelineSnapshots().today?.totalEvents).toBe(1);
+
+    await expect(mgr.clear()).rejects.toThrow('EACCES');
+    wall += 60_000;
+    mgr.recordEvent(histEvent('e2', wall));
+    await mgr.query({});
+    // e1 is rebuilt from the day's raw events on disk, e2 is replayed from the
+    // buffer recorded while the failed clear was in flight.
+    expect(mgr.timelineSnapshots().today?.totalEvents).toBe(2);
+
+    await expect(mgr.clear()).resolves.toBeUndefined();
+    await mgr.query({});
+    expect(mgr.timelineSnapshots().today?.totalEvents ?? 0).toBe(0);
+    await mgr.stop();
+  });
+
+  it('rebuilds the today summary from on-disk events after clearAll() fails (#2)', async () => {
+    const { port, events } = mockPort({
+      clearAll: async () => {
+        throw Object.assign(new Error('EACCES: permission denied'), { code: 'EACCES' });
+      },
+    });
+    let wall = Date.UTC(2026, 10, 18, 9, 0, 0);
+    const mgr = managerFor(port, () => wall);
+    await mgr.start(false);
+    mgr.recordEvent(histEvent('pre-1', wall + 1_000));
+    mgr.recordEvent(histEvent('pre-2', wall + 2_000));
+    await mgr.query({});
+    expect(mgr.timelineSnapshots().today?.totalEvents).toBe(2);
+    expect((events.get('2026-11-18') ?? '').match(/"id":"pre-/g)).toHaveLength(2);
+
+    const clearing = mgr.clear().then(
+      () => undefined,
+      (error: unknown) => error,
+    );
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    wall += 60_000;
+    mgr.recordEvent(histEvent('during-clear', wall));
+    const failure = await clearing;
+    expect(failure).toBeInstanceOf(Error);
+    expect((failure as Error).message).toContain('EACCES');
+    await mgr.query({});
+
+    expect(mgr.timelineSnapshots().today?.totalEvents).toBe(3);
+    expect(events.get('2026-11-18') ?? '').toContain('during-clear');
+    await mgr.stop();
+  });
+
+  it('surfaces month-listing directory errors so the UI can retry instead of showing an empty list (#6)', async () => {
+    let fails = true;
+    const { port } = mockPort({
+      listMonthlyMonths: async () => {
+        if (fails) throw Object.assign(new Error('EACCES: permission denied'), { code: 'EACCES' });
+        return ['2026-10'];
+      },
+    });
+    const mgr = managerFor(port, () => Date.UTC(2026, 10, 18, 9, 0, 0));
+    await mgr.start(false);
+
+    await expect(mgr.listCompletedMonths()).rejects.toThrow('EACCES');
+    fails = false;
+    await expect(mgr.listCompletedMonths()).resolves.toEqual(['2026-10']);
+    await mgr.stop();
+  });
+
   it('runs safely when ports.history is omitted', async () => {
     vi.useFakeTimers();
     const now = Date.UTC(2026, 10, 12, 10, 0, 0);

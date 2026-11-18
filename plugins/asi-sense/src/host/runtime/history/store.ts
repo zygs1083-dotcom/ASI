@@ -62,6 +62,9 @@ export interface HistoryManagerOptions {
   titlesAllowed: () => boolean;
   restoreEntries: (entries: PersistedEventEntry[]) => void;
   clearMemoryEntries: () => void;
+  /** Snapshot of the in-memory event ring, restored when a clear fails. */
+  snapshotMemoryEntries?: () => readonly PersistedEventEntry[];
+  restoreMemoryEntries?: (entries: readonly PersistedEventEntry[]) => void;
   emitSourceError: (error: string, extra?: Record<string, unknown>) => void;
   emitSourceOk: () => void;
   timeZone?: string;
@@ -69,6 +72,22 @@ export interface HistoryManagerOptions {
   heartbeatIntervalMs?: number;
   /** Extra `extensions` entries (e.g. metric buckets) for a day being summarized. */
   dayExtensions?: (date: string) => Record<string, unknown> | undefined;
+  /** Called when background restore, rollover, or backfill updates today/yesterday summaries. */
+  onSummaryChanged?: () => void;
+}
+
+function isEmptyDailySummary(summary: DailySummary): boolean {
+  return (
+    summary.totalEvents === 0 &&
+    summary.coverage.observedMs === 0 &&
+    Object.keys(summary.apps).length === 0 &&
+    Object.keys(summary.fileBursts).length === 0 &&
+    summary.deliveries.wake === 0 &&
+    summary.bodyAnomalies.total === 0 &&
+    (summary.system?.sleepCount ?? 0) === 0 &&
+    (summary.system?.sleepDurationMs ?? 0) === 0 &&
+    (summary.system?.lockDurationMs ?? 0) === 0
+  );
 }
 
 const DATE_ONLY_RE = /^\d{4}-\d{2}-\d{2}$/;
@@ -184,17 +203,21 @@ export class HistoryManager {
   private readonly titlesAllowed: () => boolean;
   private readonly restoreEntries: (entries: PersistedEventEntry[]) => void;
   private readonly clearMemoryEntries: () => void;
+  private readonly snapshotMemoryEntries?: () => readonly PersistedEventEntry[];
+  private readonly restoreMemoryEntries?: (entries: readonly PersistedEventEntry[]) => void;
   private readonly emitSourceError: (error: string, extra?: Record<string, unknown>) => void;
   private readonly emitSourceOk: () => void;
   private readonly calendar: LocalCalendar;
   private readonly maxDailyBytes: number;
   private readonly heartbeatIntervalMs: number;
   private readonly dayExtensions?: (date: string) => Record<string, unknown> | undefined;
+  private readonly onSummaryChanged?: () => void;
 
   private tail: Promise<void> = Promise.resolve();
   private started = false;
   private stopped = false;
   private clearEpoch = 0;
+  private clearFeedBuffer?: Array<{ date: string; raw: string }>;
   private currentDate?: string;
   private currentMonth?: string;
   private lastAliveAt = Number.NEGATIVE_INFINITY;
@@ -216,6 +239,14 @@ export class HistoryManager {
   private backfillCurrentMonth?: string;
   private activeBackfillStep?: Promise<void>;
   private activeQueries = 0;
+  private summaryRevision = 0;
+  private todayAcc?: ReturnType<typeof createDailySummaryAccumulator>;
+  private cachedToday?: { revision: number; date: string; summary?: DailySummary };
+  private yesterdayDate?: string;
+  private yesterdaySummary?: DailySummary;
+  private pendingTodayHydration?: { date: string; epoch: number; liveLines: string[] };
+  private todayHydrationTimer?: ReturnType<typeof setTimeout>;
+  private activeTodayHydration?: Promise<unknown>;
 
   constructor(options: HistoryManagerOptions) {
     this.port = options.port;
@@ -224,12 +255,15 @@ export class HistoryManager {
     this.titlesAllowed = options.titlesAllowed;
     this.restoreEntries = options.restoreEntries;
     this.clearMemoryEntries = options.clearMemoryEntries;
+    this.snapshotMemoryEntries = options.snapshotMemoryEntries;
+    this.restoreMemoryEntries = options.restoreMemoryEntries;
     this.emitSourceError = options.emitSourceError;
     this.emitSourceOk = options.emitSourceOk;
     this.calendar = new LocalCalendar(options.timeZone);
     this.maxDailyBytes = options.maxDailyBytes ?? MAX_DAILY_EVENT_BYTES;
     this.heartbeatIntervalMs = options.heartbeatIntervalMs ?? HISTORY_HEARTBEAT_MS;
     this.dayExtensions = options.dayExtensions;
+    this.onSummaryChanged = options.onSummaryChanged;
   }
 
   async start(paused: boolean): Promise<void> {
@@ -242,6 +276,7 @@ export class HistoryManager {
     this.currentMonth = month;
     this.lastAliveAt = now;
     this.nextHeartbeatMono = this.clock.mono() + this.heartbeatIntervalMs;
+    this.resetTodayAcc(today);
 
     if (!this.port) return;
     const epoch = this.clearEpoch;
@@ -256,7 +291,10 @@ export class HistoryManager {
         boot: true,
       };
       this.activeLifecycleOpen = true;
-      await this.appendRawLine(today, `${JSON.stringify(lifecycle)}\n`, epoch);
+      const raw = JSON.stringify(lifecycle);
+      this.feedTodayRaw(today, raw);
+      await this.appendRawLine(today, `${raw}\n`, epoch);
+      this.onSummaryChanged?.();
     });
   }
 
@@ -306,8 +344,10 @@ export class HistoryManager {
       ...(meta?.bundleId !== undefined ? { bundleId: meta.bundleId } : {}),
       ...(meta?.title !== undefined ? { title: meta.title } : {}),
     };
+    const raw = JSON.stringify(line);
+    this.feedTodayRaw(date, raw);
     const epoch = this.clearEpoch;
-    this.enqueue(() => this.appendRawLine(date, `${JSON.stringify(line)}\n`, epoch));
+    this.enqueue(() => this.appendRawLine(date, `${raw}\n`, epoch));
     if (deferRollover) {
       this.syncClockDate(now);
     }
@@ -327,8 +367,10 @@ export class HistoryManager {
       ...(patch.reason !== undefined ? { reason: patch.reason } : {}),
       ...(patch.feedback !== undefined ? { feedback: patch.feedback } : {}),
     };
+    const raw = JSON.stringify(record);
+    this.feedTodayRaw(date, raw);
     const epoch = this.clearEpoch;
-    this.enqueue(() => this.appendRawLine(date, `${JSON.stringify(record)}\n`, epoch));
+    this.enqueue(() => this.appendRawLine(date, `${raw}\n`, epoch));
   }
 
   nextDeadline(): number | undefined {
@@ -357,7 +399,10 @@ export class HistoryManager {
         paused,
       };
       this.activeLifecycleOpen = true;
-      this.enqueue(() => this.appendRawLine(date, `${JSON.stringify(heartbeat)}\n`, epoch));
+      const raw = JSON.stringify(heartbeat);
+      this.feedTodayRaw(date, raw);
+      this.enqueue(() => this.appendRawLine(date, `${raw}\n`, epoch));
+      this.onSummaryChanged?.();
     }
     await this.tail;
   }
@@ -377,13 +422,39 @@ export class HistoryManager {
     if (this.activeBackfillStep) {
       await this.activeBackfillStep.catch(() => {});
     }
+    if (this.activeTodayHydration) {
+      await this.activeTodayHydration.catch(() => {});
+    }
     await this.tail;
   }
 
   async clear(): Promise<void> {
     const epoch = ++this.clearEpoch;
+    // Buffer events that arrive while clearAll() deletes files (todayAcc is
+    // empty until the clear settles) and replay them afterwards; their disk
+    // appends are queued behind this clear, so they outlive the deletion.
+    const buffered: Array<{ date: string; raw: string }> = [];
+    this.clearFeedBuffer = buffered;
     this.cancelBackfill();
     this.backfillCurrentMonth = undefined;
+    // A failed clear must not lose pre-clear state: keep the in-memory values
+    // so the catch branch can restore them alongside the hydrated summary.
+    const previous = {
+      todayAcc: this.todayAcc,
+      yesterdayDate: this.yesterdayDate,
+      yesterdaySummary: this.yesterdaySummary,
+      eventDatesById: new Map(this.eventDatesById),
+      activeApp: this.activeApp,
+      activeLifecycleOpen: this.activeLifecycleOpen,
+      appendDegraded: this.appendDegraded,
+      summaryDegraded: this.summaryDegraded,
+      memoryEntries: this.snapshotMemoryEntries?.() ?? [],
+    };
+    this.todayAcc = undefined;
+    this.cachedToday = undefined;
+    this.yesterdayDate = undefined;
+    this.yesterdaySummary = undefined;
+    this.summaryRevision += 1;
     this.clearMemoryEntries();
     this.sizes.clear();
     this.cappedDates.clear();
@@ -394,13 +465,64 @@ export class HistoryManager {
     this.activeLifecycleOpen = false;
     this.appendDegraded = false;
     this.summaryDegraded = false;
-    if (!this.port) return;
+    if (!this.port) {
+      if (this.clearFeedBuffer === buffered) this.clearFeedBuffer = undefined;
+      this.onSummaryChanged?.();
+      return;
+    }
     const port = this.port;
     const run = this.tail.then(async () => {
       if (this.activeBackfillStep) {
         await this.activeBackfillStep.catch(() => {});
       }
-      await port.clearAll();
+      try {
+        await port.clearAll();
+      } catch (error) {
+        if (this.clearFeedBuffer === buffered) {
+          // A failed clear must leave the summary usable: rebuild todayAcc from
+          // the day's on-disk raw events, replay buffered lines, and restore the
+          // pre-clear yesterday summary / event-stream state before surfacing
+          // the error for the UI's retry.
+          if (this.started && !this.stopped && epoch === this.clearEpoch) {
+            const now = this.clock.wall();
+            const today = this.calendar.dateKey(now);
+            this.currentDate = today;
+            this.currentMonth = this.calendar.monthKey(now);
+            this.yesterdayDate = previous.yesterdayDate;
+            this.yesterdaySummary = previous.yesterdaySummary;
+            this.eventDatesById.clear();
+            for (const [id, date] of previous.eventDatesById) this.eventDatesById.set(id, date);
+            this.activeApp = previous.activeApp;
+            this.activeLifecycleOpen = previous.activeLifecycleOpen;
+            this.appendDegraded = previous.appendDegraded;
+            this.summaryDegraded = previous.summaryDegraded;
+            this.resetTodayAcc(today);
+            const hydration = {
+              date: today,
+              epoch,
+              liveLines: buffered.filter((item) => item.date === today).map((item) => item.raw),
+            };
+            this.pendingTodayHydration = hydration;
+            const hydrated = await this.hydrateTodayFromDisk(today, epoch, false);
+            if (this.pendingTodayHydration === hydration) this.pendingTodayHydration = undefined;
+            if (this.clearFeedBuffer === buffered) this.clearFeedBuffer = undefined;
+            if (!hydrated) {
+              // No raw events on disk (or unreadable): fall back to the
+              // pre-clear accumulator, then replay the buffered lines.
+              if (previous.todayAcc) {
+                this.todayAcc = previous.todayAcc;
+                this.cachedToday = undefined;
+              }
+              for (const raw of hydration.liveLines) this.feedTodayRaw(today, raw);
+            }
+            this.restoreMemoryEntries?.(previous.memoryEntries);
+            this.onSummaryChanged?.();
+          } else if (this.clearFeedBuffer === buffered) {
+            this.clearFeedBuffer = undefined;
+          }
+        }
+        throw error;
+      }
       if (this.started && !this.stopped && epoch === this.clearEpoch) {
         const now = this.clock.wall();
         const today = this.calendar.dateKey(now);
@@ -410,6 +532,8 @@ export class HistoryManager {
         this.backfillCurrentMonth = month;
         this.lastAliveAt = now;
         this.nextHeartbeatMono = this.clock.mono() + this.heartbeatIntervalMs;
+        if (this.clearFeedBuffer === buffered) this.clearFeedBuffer = undefined;
+        this.resetTodayAcc(today);
         const lifecycle: HistoryLifecycleRecord = {
           record: 'lifecycle',
           state: this.isPaused() ? 'paused' : 'active',
@@ -417,8 +541,14 @@ export class HistoryManager {
           boot: true,
         };
         this.activeLifecycleOpen = true;
-        await this.appendRawLine(today, `${JSON.stringify(lifecycle)}\n`, epoch);
+        const raw = JSON.stringify(lifecycle);
+        this.feedTodayRaw(today, raw);
+        for (const item of buffered) if (item.date === today) this.feedTodayRaw(item.date, item.raw);
+        await this.appendRawLine(today, `${raw}\n`, epoch);
+      } else if (this.clearFeedBuffer === buffered) {
+        this.clearFeedBuffer = undefined;
       }
+      this.onSummaryChanged?.();
     });
     this.tail = run.catch(() => {});
     return run;
@@ -693,6 +823,121 @@ export class HistoryManager {
     return { available: true, summary: synthesized };
   }
 
+  async listCompletedMonths(): Promise<string[]> {
+    if (!this.port) return [];
+    await this.tail;
+    const nowMonth = this.calendar.monthKey(this.clock.wall());
+    const months = new Set<string>();
+    // Propagate read errors: [] would make the sidebar claim there are no
+    // summaries instead of showing its retry error state.
+    for (const month of await this.port.listMonthlyMonths()) {
+      if (parseMonthKey(month) && month < nowMonth) months.add(month);
+    }
+    for (const date of this.filterValidDates(await this.port.listDailyDates(), 'daily')) {
+      const month = date.slice(0, 7);
+      if (parseMonthKey(month) && month < nowMonth) months.add(month);
+    }
+    return [...months].sort((a, b) => b.localeCompare(a));
+  }
+
+  timelineSnapshots(): { version: number; today?: DailySummary; yesterday?: DailySummary } {
+    let today: DailySummary | undefined;
+    if (this.currentDate && this.todayAcc) {
+      if (
+        this.cachedToday &&
+        this.cachedToday.revision === this.summaryRevision &&
+        this.cachedToday.date === this.currentDate
+      ) {
+        today = this.cachedToday.summary;
+      } else {
+        const finished = this.todayAcc.snapshot();
+        this.applyDayExtensions(finished, this.currentDate);
+        today = isEmptyDailySummary(finished) ? undefined : finished;
+        this.cachedToday = { revision: this.summaryRevision, date: this.currentDate, summary: today };
+      }
+    }
+    return {
+      version: this.summaryRevision,
+      ...(today ? { today } : {}),
+      ...(this.yesterdaySummary ? { yesterday: this.yesterdaySummary } : {}),
+    };
+  }
+
+  private resetTodayAcc(date: string): void {
+    this.yesterdayDate = addDays(date, -1);
+    this.todayAcc = createDailySummaryAccumulator(date, this.calendar.dayBounds(date));
+    this.cachedToday = undefined;
+    this.summaryRevision += 1;
+  }
+
+  private feedTodayRaw(date: string, rawLine: string): void {
+    if (this.clearFeedBuffer) {
+      this.clearFeedBuffer.push({ date, raw: rawLine });
+      return;
+    }
+    if (date !== this.currentDate || !this.todayAcc) return;
+    if (this.pendingTodayHydration && this.pendingTodayHydration.date === date) {
+      this.pendingTodayHydration.liveLines.push(rawLine);
+    }
+    this.todayAcc.feed(rawLine);
+    this.cachedToday = undefined;
+    this.summaryRevision += 1;
+  }
+
+  private scheduleTodayHydration(today: string, epoch: number): void {
+    if (this.isEpochStale(epoch) || this.todayHydrationTimer) return;
+    this.pendingTodayHydration = { date: today, epoch, liveLines: [] };
+    this.todayHydrationTimer = setTimeout(() => {
+      this.todayHydrationTimer = undefined;
+      const run = this.hydrateTodayFromDisk(today, epoch, true);
+      this.activeTodayHydration = run;
+      void run.finally(() => {
+        if (this.activeTodayHydration === run) this.activeTodayHydration = undefined;
+      });
+    }, 50);
+    this.todayHydrationTimer.unref?.();
+  }
+
+  private async hydrateTodayFromDisk(today: string, epoch: number, yieldSlices: boolean): Promise<boolean> {
+    if (!this.port || this.isEpochStale(epoch) || this.currentDate !== today) return false;
+    try {
+      const acc = createDailySummaryAccumulator(today, this.calendar.dayBounds(today));
+      let sawLine = false;
+      let sliceStart = performance.now();
+      for await (const line of this.streamLinesForward(today)) {
+        if (this.isEpochStale(epoch) || this.currentDate !== today) return false;
+        acc.feed(line);
+        sawLine = true;
+        if (yieldSlices && performance.now() - sliceStart >= 10) {
+          await this.waitBackfillTurn(epoch, 0);
+          if (this.isEpochStale(epoch) || this.currentDate !== today) return false;
+          sliceStart = performance.now();
+        }
+      }
+      const live =
+        this.pendingTodayHydration?.date === today && this.pendingTodayHydration.epoch === epoch
+          ? this.pendingTodayHydration.liveLines
+          : [];
+      if (this.pendingTodayHydration?.date === today && this.pendingTodayHydration.epoch === epoch) {
+        this.pendingTodayHydration = undefined;
+      }
+      if ((sawLine || live.length > 0) && this.currentDate === today && !this.isEpochStale(epoch)) {
+        for (const raw of live) acc.feed(raw);
+        this.todayAcc = acc;
+        this.cachedToday = undefined;
+        this.summaryRevision += 1;
+        if (yieldSlices) this.onSummaryChanged?.();
+        return true;
+      }
+      return false;
+    } catch {
+      if (this.pendingTodayHydration?.date === today && this.pendingTodayHydration.epoch === epoch) {
+        this.pendingTodayHydration = undefined;
+      }
+      return false;
+    }
+  }
+
   private isEpochStale(epoch: number): boolean {
     return this.stopped || epoch !== this.clearEpoch;
   }
@@ -773,6 +1018,8 @@ export class HistoryManager {
       this.currentDate = nowDate;
       this.currentMonth = this.calendar.monthKey(wall);
       this.lastAliveAt = wall;
+      this.resetTodayAcc(nowDate);
+      this.yesterdaySummary = undefined;
       const paused = this.isPaused();
       const epoch = this.clearEpoch;
       const marker: HistoryLifecycleRecord = {
@@ -781,7 +1028,10 @@ export class HistoryManager {
         at: wall,
       };
       this.activeLifecycleOpen = true;
-      this.enqueue(() => this.appendRawLine(nowDate, `${JSON.stringify(marker)}\n`, epoch));
+      const raw = JSON.stringify(marker);
+      this.feedTodayRaw(nowDate, raw);
+      this.enqueue(() => this.appendRawLine(nowDate, `${raw}\n`, epoch));
+      this.onSummaryChanged?.();
     }
     return nowDate;
   }
@@ -792,7 +1042,9 @@ export class HistoryManager {
     const epoch = this.clearEpoch;
     const record: HistoryLifecycleRecord = { record: 'lifecycle', state, at };
     this.activeLifecycleOpen = true;
-    this.enqueue(() => this.appendRawLine(date, `${JSON.stringify(record)}\n`, epoch));
+    const raw = JSON.stringify(record);
+    this.feedTodayRaw(date, raw);
+    this.enqueue(() => this.appendRawLine(date, `${raw}\n`, epoch));
   }
 
   private enqueueRollover(wall: number): void {
@@ -802,6 +1054,9 @@ export class HistoryManager {
     const nextMonthKey = this.calendar.monthKey(wall);
     if (!prevDate || nextDate <= prevDate) return;
 
+    const prevProvisional = this.todayAcc && diffDays(nextDate, prevDate) === 1 ? this.todayAcc.snapshot() : undefined;
+    if (prevProvisional) this.applyDayExtensions(prevProvisional, prevDate);
+
     const prevAliveAt = this.lastAliveAt;
     const carryApp = this.activeApp;
     const paused = this.isPaused();
@@ -809,6 +1064,8 @@ export class HistoryManager {
     this.currentMonth = nextMonthKey;
     this.backfillCurrentMonth = nextMonthKey;
     this.lastAliveAt = wall;
+    this.resetTodayAcc(nextDate);
+    this.yesterdaySummary = prevProvisional && !isEmptyDailySummary(prevProvisional) ? prevProvisional : undefined;
     const epoch = this.clearEpoch;
 
     this.enqueue(async () => {
@@ -835,6 +1092,10 @@ export class HistoryManager {
           this.applyDayExtensions(daily, prevDate);
           await this.port.writeDaily(prevDate, JSON.stringify(daily));
           if (this.isEpochStale(epoch)) return;
+          if (prevDate === this.yesterdayDate) {
+            this.yesterdaySummary = isEmptyDailySummary(daily) ? undefined : daily;
+            this.summaryRevision += 1;
+          }
           if (this.pendingBackfillEpoch === epoch) {
             this.pendingBackfill.delete(prevDate);
             this.backfillFailures.delete(prevDate);
@@ -869,7 +1130,10 @@ export class HistoryManager {
         ...(continuous && carryApp ? { app: carryApp } : {}),
       };
       this.activeLifecycleOpen = true;
-      await this.appendRawLine(nextDate, `${JSON.stringify(boundary)}\n`, epoch);
+      const rawBoundary = JSON.stringify(boundary);
+      this.feedTodayRaw(nextDate, rawBoundary);
+      await this.appendRawLine(nextDate, `${rawBoundary}\n`, epoch);
+      this.onSummaryChanged?.();
     });
   }
 
@@ -1053,6 +1317,23 @@ export class HistoryManager {
         this.restoreEntries(collected);
       }
 
+      if (keptDates.includes(today) && !knownUnsafeEvents.has(today)) {
+        const todayBytes = await this.safeEventFileSize(today);
+        if (this.isEpochStale(epoch)) {
+          this.clearPendingForEpoch(epoch);
+          return;
+        }
+        if (todayBytes <= 512 * 1024) {
+          await this.hydrateTodayFromDisk(today, epoch, false);
+          if (this.isEpochStale(epoch)) {
+            this.clearPendingForEpoch(epoch);
+            return;
+          }
+        } else {
+          this.scheduleTodayHydration(today, epoch);
+        }
+      }
+
       // Prune daily summaries older than 400 days.
       const existingDailyDates = new Set<string>();
       try {
@@ -1129,7 +1410,14 @@ export class HistoryManager {
             return;
           }
           if (existing !== undefined) {
-            if (parseDailySummary(existing)) continue;
+            const parsed = parseDailySummary(existing);
+            if (parsed) {
+              if (date === this.yesterdayDate) {
+                this.yesterdaySummary = isEmptyDailySummary(parsed) ? undefined : parsed;
+                this.summaryRevision += 1;
+              }
+              continue;
+            }
             this.reportFileErrorOnce(`corrupt:daily:${date}`, 'corrupt-daily-summary', { date });
           }
           missingDailyDates.push(date);
@@ -1157,6 +1445,24 @@ export class HistoryManager {
 
       // Synthesize completed months that have no pending backfill; months with
       // pending days are synthesized once background backfill completes.
+      if (this.yesterdayDate && !this.yesterdaySummary && existingDailyDates.has(this.yesterdayDate)) {
+        try {
+          const rawYesterday = await this.port.readDaily(this.yesterdayDate);
+          if (this.isEpochStale(epoch)) {
+            this.clearPendingForEpoch(epoch);
+            return;
+          }
+          if (rawYesterday !== undefined) {
+            const parsedYesterday = parseDailySummary(rawYesterday);
+            if (parsedYesterday && !isEmptyDailySummary(parsedYesterday)) {
+              this.yesterdaySummary = parsedYesterday;
+              this.summaryRevision += 1;
+            }
+          }
+        } catch {
+          // Handled via missingDailyDates or left empty.
+        }
+      }
       if (existingDailyDates.size > 0) {
         await this.synthesizeAllCompletedMonths(currentMonth, epoch, [...existingDailyDates]);
       }
@@ -1202,6 +1508,11 @@ export class HistoryManager {
       clearTimeout(this.backfillTimer);
       this.backfillTimer = undefined;
     }
+    if (this.todayHydrationTimer) {
+      clearTimeout(this.todayHydrationTimer);
+      this.todayHydrationTimer = undefined;
+    }
+    this.pendingTodayHydration = undefined;
     this.backfillYieldWake?.();
     this.backfillYieldWake = undefined;
     this.pendingBackfill.clear();
@@ -1288,6 +1599,11 @@ export class HistoryManager {
             if (this.isEpochStale(epoch)) {
               this.clearPendingForEpoch(epoch);
               return;
+            }
+            if (nextDate === this.yesterdayDate) {
+              this.yesterdaySummary = isEmptyDailySummary(daily) ? undefined : daily;
+              this.summaryRevision += 1;
+              this.onSummaryChanged?.();
             }
             this.pendingBackfill.delete(nextDate);
             this.backfillFailures.delete(nextDate);
