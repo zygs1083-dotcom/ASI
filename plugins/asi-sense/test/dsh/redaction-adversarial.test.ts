@@ -48,6 +48,41 @@ describe('T1 damaged hash-named backup (hidden regression)', () => {
     const { port } = await setup();
     await expect(port.backup('settings', 'different')).rejects.toThrow(/changed/);
   });
+
+  it('F8 recovers to an alternate backup when the hash backup is replaced by a directory, dangling symlink, or chmod 000 file', async () => {
+    const { root, port } = await setup();
+    const hashed = await port.backup('settings', 'old');
+    const hashedPath = join(root, hashed);
+
+    await fs.rm(hashedPath);
+    await fs.mkdir(hashedPath);
+    const afterDir = await port.backup('settings', 'old');
+    expect(afterDir).not.toBe(hashed);
+    expect(afterDir).toMatch(/^settings\.json\.bak-\d{1,20}-[a-f0-9-]{36}$/i);
+    expect(await fs.readFile(join(root, afterDir), 'utf8')).toBe('old');
+    expect((await fs.stat(join(root, afterDir))).mode & 0o777).toBe(0o600);
+    expect(await port.backup('settings', 'old')).toBe(afterDir);
+
+    await fs.rm(join(root, afterDir));
+    await fs.rm(hashedPath, { recursive: true, force: true });
+    await fs.symlink(join(root, 'nonexistent-target'), hashedPath);
+    const afterSymlink = await port.backup('settings', 'old');
+    expect(afterSymlink).not.toBe(hashed);
+    expect(await fs.readFile(join(root, afterSymlink), 'utf8')).toBe('old');
+
+    if (process.getuid?.() !== 0) {
+      await fs.rm(join(root, afterSymlink));
+      await fs.rm(hashedPath);
+      await fs.writeFile(hashedPath, 'unreadable', { mode: 0o000 });
+      try {
+        const afterUnreadable = await port.backup('settings', 'old');
+        expect(afterUnreadable).not.toBe(hashed);
+        expect(await fs.readFile(join(root, afterUnreadable), 'utf8')).toBe('old');
+      } finally {
+        await fs.chmod(hashedPath, 0o600).catch(() => {});
+      }
+    }
+  });
 });
 
 describe('T2 bounded redaction (hidden regression)', () => {
@@ -60,8 +95,10 @@ describe('T2 bounded redaction (hidden regression)', () => {
     expect([...out].length).toBeLessThanOrEqual(512);
   });
 
-  it('H5 a long separator-free text is not emptied', () => {
-    expect(modelText('z'.repeat(40_000), H).length).toBeGreaterThan(0);
+  it('H5 a long separator-free text is not emptied and is bounded', () => {
+    const out = modelText('z'.repeat(40_000), H);
+    expect(out.length).toBeGreaterThan(0);
+    expect([...out].length).toBeLessThanOrEqual(32_768);
   });
 
   it('H6 never splits a surrogate pair', () => {
@@ -107,8 +144,10 @@ describe('T2 bounded redaction (hidden regression)', () => {
     const big = 'w '.repeat(500_000);
     const t0 = performance.now();
     modelTitle(big, H);
+    expect(performance.now() - t0).toBeLessThan(200);
+    const t1 = performance.now();
     modelText(big, H);
-    expect(performance.now() - t0).toBeLessThan(1500);
+    expect(performance.now() - t1).toBeLessThan(200);
   });
 });
 
@@ -191,8 +230,8 @@ describe('blind bakeoff adversarial regressions', () => {
       expect(textOut.length).toBeGreaterThan(0);
       expect([...titleOut].length).toBeLessThanOrEqual(512);
       expect([...textOut].length).toBeLessThanOrEqual(32_768);
-      expect(titleMs).toBeLessThan(1500);
-      expect(textMs).toBeLessThan(1500);
+      expect(titleMs).toBeLessThan(200);
+      expect(textMs).toBeLessThan(200);
     }
 
     expect(modelTitle(`ab${'\u0301'.repeat(100)} café`, 'café')).toBe(`ab${'\u0301'.repeat(100)} <host>`);
@@ -207,19 +246,35 @@ describe('blind bakeoff adversarial regressions', () => {
     const spaceHostInput = '/a '.repeat(350_000);
     const t0 = performance.now();
     expect(modelTitle(spaceHostInput, 'My Host').length).toBeGreaterThan(0);
+    expect(performance.now() - t0).toBeLessThan(200);
+    const t1 = performance.now();
     expect(modelText(spaceHostInput, 'My Host').length).toBeGreaterThan(0);
-    expect(performance.now() - t0).toBeLessThan(1500);
+    expect(performance.now() - t1).toBeLessThan(200);
 
     const spacedSecret = `${`https://a.example/${'x'.repeat(300)} `.repeat(15)}My Host end`;
     expect(modelTitle(spacedSecret, 'My Host')).not.toContain('My Host');
+
+    for (const boundary of [4096, 131_072]) {
+      const padUrl = `https://a.example/${'x'.repeat(1000)} `;
+      const repeats = Math.floor((boundary - 3) / padUrl.length);
+      const prefix = padUrl.repeat(repeats);
+      const spacer = 'a'.repeat(Math.max(0, boundary - 3 - prefix.length));
+      const straddling = `${prefix}${spacer} My Host end`;
+      const titleOut = modelTitle(straddling, 'My Host');
+      expect(titleOut).not.toContain('My Host');
+      expect(titleOut).not.toContain('a.example');
+      const textOut = modelText(straddling, 'My Host');
+      expect(textOut).not.toContain('My Host');
+      expect(textOut).not.toContain('a.example');
+    }
   });
 
-  it('C-3..C-5 hides combining-mark tokens completely, matches Turkish İ/i̇, and preserves literal [redacted] bounds', () => {
+  it('C-3..C-5 hides structural tokens conservatively, matches Turkish İ/i̇, and preserves literal [redacted] bounds', () => {
     expect(modelTitle('open sche\u0301me://secret.example/a/b', 'fixture-host')).toBe('open <host>');
     expect(modelTitle('ssh user@[2001:db8::1\u0301]:22/secret-dir/secret-file', 'fixture-host')).toBe('ssh <host>');
-    expect(modelTitle('connect node\u0301::1', 'fixture-host')).toBe('connect node\u0301::1');
-    expect(modelTitle('ping v1\u0301192.168.1.1', 'fixture-host')).toBe('ping v1\u0301192.168.1.1');
-    expect(modelTitle('Task:1\u20e3 Notes', 'fixture-host')).toBe('Task:1\u20e3 Notes');
+    expect(modelTitle('connect node\u0301::1', 'fixture-host')).toBe('connect <host>');
+    expect(modelTitle('ping v1\u0301192.168.1.1', 'fixture-host')).toBe('ping <host>');
+    expect(modelTitle('Task:1\u20e3 Notes', 'fixture-host')).toBe('<host> Notes');
     expect(modelTitle('ssh user@host:22\u0301', 'fixture-host')).toBe('ssh <host>');
     expect(modelTitle('ssh server:22\u0301', 'fixture-host')).toBe('ssh <host>');
 
@@ -231,7 +286,7 @@ describe('blind bakeoff adversarial regressions', () => {
     expect(modelTitle(`${'x'.repeat(508)}[redacted]`, 'fixture-host').slice(505)).toBe('xxx');
   });
 
-  it('keeps 1 MB delimiter-free pathological punctuation inputs bounded and fast', () => {
+  it('keeps 1 MB delimiter-free pathological punctuation inputs bounded, redacted, and < 200 ms', () => {
     for (const input of [
       `${':'.repeat(1_000_000)}g`,
       `${'a:'.repeat(500_000)}g`,
@@ -241,12 +296,116 @@ describe('blind bakeoff adversarial regressions', () => {
     ]) {
       const t0 = performance.now();
       const titleOut = modelTitle(input, 'fixture-host');
+      expect(performance.now() - t0).toBeLessThan(200);
+      const t1 = performance.now();
       const textOut = modelText(input, 'fixture-host');
-      expect(performance.now() - t0).toBeLessThan(1500);
+      expect(performance.now() - t1).toBeLessThan(200);
       expect(titleOut.length).toBeGreaterThan(0);
       expect(textOut.length).toBeGreaterThan(0);
       expect([...titleOut].length).toBeLessThanOrEqual(512);
       expect([...textOut].length).toBeLessThanOrEqual(32_768);
+      expect(titleOut).not.toMatch(/a:a|a@b|::/);
+      expect(textOut).not.toMatch(/a:a|a@b|::/);
     }
+  });
+});
+
+describe('review F1..F6 regressions', () => {
+  it('F1 hides IPv4-mapped/embedded IPv6, Zone-ID IPv6, and RFC 5321 literal emails', () => {
+    for (const input of [
+      'ssh ::ffff:192.168.1.10',
+      'connect 2001:db8::192.0.2.1',
+      'ssh [fe80::1%eth0]:22',
+      'ssh fe80::1%eth0',
+      'mail alice@[fe80::1%eth0]',
+      'mail alice@[IPv6:2001:db8::1]',
+    ]) {
+      const titleOut = modelTitle(input, 'build-host');
+      const textOut = modelText(input, 'build-host');
+      expect(titleOut).not.toMatch(/192|168|eth0|alice|2001|db8|fe80|22/i);
+      expect(textOut).not.toMatch(/192|168|eth0|alice|2001|db8|fe80|22/i);
+    }
+    expect(modelTitle('ssh ::ffff:192.168.1.10', 'build-host')).toBe('ssh <host>');
+    expect(modelTitle('connect 2001:db8::192.0.2.1', 'build-host')).toBe('connect <host>');
+    expect(modelTitle('ssh [fe80::1%eth0]:22', 'build-host')).toBe('ssh <host>');
+    expect(modelTitle('ssh fe80::1%eth0', 'build-host')).toBe('ssh <host>');
+    expect(modelTitle('mail alice@[fe80::1%eth0]', 'build-host')).toBe('mail <host>');
+    expect(modelTitle('mail alice@[IPv6:2001:db8::1]', 'build-host')).toBe('mail <host>');
+    expect(modelText('mail alice@[IPv6:2001:db8::1]', 'build-host')).toBe('mail [host]');
+  });
+
+  it('F2 hides UNC paths, drive/relative backslash paths, and punctuated first-level directories', () => {
+    expect(modelTitle('open \\\\corp-fs\\finance\\q4.xlsx', 'build-host')).toBe('open q4.xlsx');
+    expect(modelText('read \\\\corp-fs\\finance\\q4.xlsx', 'build-host')).toBe('read q4.xlsx');
+    expect(modelTitle('open \\\\corp-fs\\secret-share', 'build-host')).toBe('open [path]');
+    expect(modelText('open \\\\corp-fs\\secret-share', 'build-host')).toBe('open [path]');
+    expect(modelTitle('open C:\\Users\\secret-user\\q4.xlsx', 'build-host')).toBe('open q4.xlsx');
+    expect(modelTitle('open corp-secret\\finance\\q4.xlsx', 'build-host')).toBe('open q4.xlsx');
+    expect(modelTitle('open [secret-org]/repo/README.md', 'build-host')).toBe('open <host>');
+    expect(modelText('open [secret-org]/repo/README.md', 'build-host')).toBe('open [host]');
+    expect(modelTitle('open secret:team/sub/README.md', 'build-host')).toBe('open <host>');
+    expect(modelText('open secret:team/sub/README.md', 'build-host')).toBe('open [host]');
+  });
+
+  it('F3 hides prefix:host:port and prefix:host:port/path tokens completely', () => {
+    expect(modelTitle('connect foo:secret-host.internal:8080', 'build-host')).toBe('connect <host>');
+    expect(modelText('connect foo:secret-host.internal:8080', 'build-host')).toBe('connect [host]');
+    expect(modelTitle('docker:registry.corp.invalid:5000/org/app', 'build-host')).toBe('<host>');
+    expect(modelText('docker:registry.corp.invalid:5000/org/app', 'build-host')).toBe('[host]');
+  });
+
+  it('F4 processes all six <= 1 MB pathological inputs in < 200 ms each', () => {
+    const distinctParts: string[] = [];
+    outer: for (let m = 0x0300; m <= 0x036f; m++) {
+      for (let b = 0x4e00; b <= 0x5600; b++) {
+        distinctParts.push(String.fromCharCode(b, m));
+        if (distinctParts.length >= 200_000) break outer;
+      }
+    }
+    const s1 = `/${'a:1,'.repeat(250_000)}`;
+    const s2 = `/${'a@b,::1,a:1,'.repeat(87_381)}`;
+    const s3 = '\0\u0001\u0004\u0005'.repeat(250_000);
+    const s4 = `${distinctParts.join('')} tail`;
+    const cases: [string, string, (input: string) => string, number][] = [
+      ['slash+hostport (title)', s1, (v) => modelTitle(v, 'fixture-host'), 512],
+      ['slash+mixed (title)', s2, (v) => modelTitle(v, 'fixture-host'), 512],
+      ['sentinels (title)', s3, (v) => modelTitle(v, 'fixture-host'), 512],
+      ['sentinels (text)', s3, (v) => modelText(v, 'fixture-host'), 32_768],
+      ['space-host NFD (title)', s4, (v) => modelTitle(v, 'café host'), 512],
+      ['space-host NFD (text)', s4, (v) => modelText(v, 'café host'), 32_768],
+    ];
+    for (const [name, input, fn, limit] of cases) {
+      const t0 = performance.now();
+      const out = fn(input);
+      const elapsed = performance.now() - t0;
+      expect(elapsed, name).toBeLessThan(200);
+      expect(out.length, name).toBeGreaterThan(0);
+      expect([...out].length, name).toBeLessThanOrEqual(limit);
+      expect(out, name).not.toMatch(/a:1|a@b|::1/);
+    }
+  });
+
+  it('F5 hides tokens containing combining marks and sentinel control characters', () => {
+    expect(modelTitle('ping 192.168.1.1\u0301', 'build-host')).toBe('ping <host>');
+    expect(modelTitle('ssh 2001:db8::1\u0301', 'build-host')).toBe('ssh <host>');
+    expect(modelTitle('connect secret.corp:80\u030180', 'build-host')).toBe('connect <host>');
+    expect(modelTitle('connect secret.corp:8080\u0903', 'build-host')).toBe('connect <host>');
+    expect(modelTitle('mail alice\0@secret-corp.internal', 'build-host')).toBe('mail <host>');
+    expect(modelText('mail alice\0@secret-corp.internal', 'build-host')).toBe('mail [host]');
+  });
+
+  it('F6 matches >32 combining-mark hosts, full Unicode case folding, and never splits clusters at truncation', () => {
+    const longMarkHost = `a${'\u0301'.repeat(33)}`;
+    expect(modelTitle(`on ${longMarkHost}`, longMarkHost)).toBe('on <host>');
+    expect(modelText(`on ${longMarkHost}`, longMarkHost)).toBe('on [host]');
+
+    expect(modelTitle('on \u03a5\u0308\u0301-host', '\u03b0-host')).toBe('on <host>');
+    expect(modelTitle('on \u03b0-host', '\u03a5\u0308\u0301-host')).toBe('on <host>');
+    expect(modelTitle('on hostß', 'hostSS')).toBe('on <host>');
+    expect(modelTitle('on hostSS', 'hostß')).toBe('on <host>');
+
+    const truncated = modelTitle(`${'a'.repeat(508)}host\u0301`, 'host');
+    expect(truncated.slice(505)).toBe('aaahos');
+    expect(truncated).not.toContain('host');
   });
 });

@@ -8,33 +8,76 @@ import type { JsonValue } from './wire-types.ts';
 
 const MAX_BYTES = 32_768;
 const MAX_TITLE_LENGTH = 512;
-const MAX_CLUSTER_MARKS = 32;
 const PLACEHOLDERS = ['<host>', '[host]', '[endpoint]', '[path]', '[redacted]'] as const;
-const DELIMITER_RE = /(?:[\s"'<>](?![\p{M}\u1160-\u11ff\ud7b0-\ud7ff]))+/gu;
-const HAS_DELIMITER_RE = /[\s"'<>]/u;
+const PLACEHOLDERS_SET = new Set<string>(PLACEHOLDERS);
+const DELIMITER_RE = /(?:[\s"'<>,;()|](?![\p{M}\u1160-\u11ff\ud7b0-\ud7ff]))+/gu;
+const DELIM_CHAR_RE = /[\s"'<>,;()|](?![\p{M}\u1160-\u11ff\ud7b0-\ud7ff])/gu;
 const COMBINING_MARK_AT_RE = /\p{M}/uy;
-const NEEDS_CLUSTER_NFC_RE = /[\p{M}\u1100-\u11ff\ud7b0-\ud7ff\u0130]/u;
+const ALNUM_AT_RE = /[\p{L}\p{N}]/uy;
+const NON_DOT_RUN_RE = /[^.]+/g;
+const SURROGATE_RE = /[\ud800-\udfff]/;
+const NON_ASCII_RE = /[\u0080-\uffff]/;
+const FAST_TRUNCATE_UNSAFE_RE = /[\p{M}\u1160-\u11ff\ud7b0-\ud7ff<[]/u;
+const HAS_STRUCTURAL_CHAR_RE = /[:/\\@%.[]/;
+const STRUCTURAL_CHAR_AT_RE = /[:/\\@%.[]/g;
+const NEEDS_CLUSTER_NFC_RE =
+  /[\p{M}\u1100-\u11ff\ud7b0-\ud7ff\u00b5\u00df\u0130\u0149\u017f\u01f0\u037e\u03c2\u03d0-\u03f5\u0587\u1c80-\u1c88\u1e96-\u1e9e\u1f80-\u1ffc\u1fef\ufb00-\ufb17]/u;
 const CLUSTER_BOUND_LOOKAHEAD = '(?![\\p{M}\\u1160-\\u11ff\\ud7b0-\\ud7ff])';
 
-const SENTINEL_HOST = '\0';
-const SENTINEL_ENDPOINT = '\u0004';
-const SENTINEL_PATH = '\u0005';
-const ESCAPE_CHAR = '\u0001';
-
-const TEXT_ENDPOINT_RE = /https?:\/\/[^\s"'<>]+/gi;
-const TEXT_PATH_RE = /(?<![\w])(?:[A-Za-z]:\\+|\/+)(?:[^\s"'<>/\\]+[/\\])*[^\s"'<>/\\]*/g;
-
-const TITLE_SCHEME_RE = /(?<![\p{L}\p{N}\p{M}+.-])[\p{L}\p{N}\p{M}+.-]+:\/\/[^\s"'<>]+/giu;
-const TITLE_EMAIL_RE =
-  /(?<![\p{L}\p{N}\p{M}_.+%-])[\p{L}\p{N}\p{M}_.+%-]+@(?:\[[\da-f:.\p{M}]+\]|[\p{L}\p{N}\p{M}_.-]+)(?::\d+(?:\p{Mn}+)?)?(?![\p{L}\p{N}\p{M}_])(?:[/\\][^\s"'<>]*)?/giu;
-const TITLE_IPV6_RE =
-  /\[[\da-f:.\p{M}]+\](?::\d+(?:\p{Mn}+)?)?(?:[/\\][^\s"'<>]*)?|(?<![\p{L}\p{N}\p{M}_:])(?:[\da-f]{0,4}:){2,8}[\da-f]{0,4}(?![\p{L}\p{N}\p{M}_:])(?:[/\\][^\s"'<>]*)?/giu;
-const TITLE_IPV4_RE =
-  /(?<![\p{L}\p{N}\p{M}_])(?:\d{1,3}\.){3}\d{1,3}(?::\d+(?:\p{Mn}+)?)?(?![\p{L}\p{N}\p{M}_])(?:[/\\][^\s"'<>]*)?/giu;
-const TITLE_HOST_PORT_RE =
-  /(?<![\p{L}\p{N}\p{M}_.:-])[\p{L}\p{N}\p{M}_.-]+:\d+(?:\p{Mn}+)?(?![\p{L}\p{N}\p{M}_])(?:[/\\][^\s"'<>]*)?/giu;
-const TITLE_PATH_RE =
-  /(?<![\p{L}\p{N}\p{M}._-])(?:[A-Za-z]:\\+|\/+|[\p{L}\p{N}\p{M}._-]+\/+)(?:[^\s"'<>/\\]+[/\\])*[^\s"'<>/\\]*/gu;
+const KNOWN_TLDS = new Set([
+  'com',
+  'net',
+  'org',
+  'edu',
+  'gov',
+  'mil',
+  'int',
+  'biz',
+  'info',
+  'name',
+  'pro',
+  'xyz',
+  'top',
+  'site',
+  'tech',
+  'cloud',
+  'dev',
+  'io',
+  'co',
+  'me',
+  'tv',
+  'gg',
+  'ai',
+  'uk',
+  'de',
+  'cn',
+  'jp',
+  'fr',
+  'eu',
+  'au',
+  'ca',
+  'nl',
+  'ru',
+  'kr',
+  'in',
+  'sg',
+  'hk',
+  'tw',
+  'it',
+  'es',
+  'se',
+  'ch',
+  'br',
+  'pl',
+  'us',
+  'local',
+  'lan',
+  'home',
+  'corp',
+  'arpa',
+  'test',
+  'onion',
+]);
 
 const FIXED_IDENTIFIERS = new Set([
   'accessibility',
@@ -59,6 +102,7 @@ const FIXED_IDENTIFIERS = new Set([
 ]);
 
 function countCodePoints(text: string): number {
+  if (!SURROGATE_RE.test(text)) return text.length;
   let count = 0;
   for (let i = 0; i < text.length; ) {
     const cp = text.codePointAt(i) ?? 0;
@@ -71,6 +115,8 @@ function countCodePoints(text: string): number {
 function sliceByCodePoints(text: string, maxCodePoints: number): string {
   if (maxCodePoints <= 0) return '';
   if (text.length <= maxCodePoints) return text;
+  const candidate = text.slice(0, maxCodePoints);
+  if (!SURROGATE_RE.test(candidate)) return candidate;
   let cps = 0;
   let i = 0;
   while (i < text.length) {
@@ -84,6 +130,10 @@ function sliceByCodePoints(text: string, maxCodePoints: number): string {
 
 function truncateRedacted(text: string, limit: number): string {
   if (text.length <= limit) return text;
+  const head = text.slice(0, limit + 1);
+  if (!SURROGATE_RE.test(head) && !FAST_TRUNCATE_UNSAFE_RE.test(head)) {
+    return text.slice(0, limit);
+  }
   let cps = 0;
   let i = 0;
   while (i < text.length) {
@@ -103,68 +153,66 @@ function truncateRedacted(text: string, limit: number): string {
         continue;
       }
     }
-    const cp = text.codePointAt(i) ?? 0;
-    if (cps + 1 > limit) break;
-    cps += 1;
-    i += cp > 0xffff ? 2 : 1;
+    const firstCp = text.codePointAt(i) ?? 0;
+    let end = i + (firstCp > 0xffff ? 2 : 1);
+    let clusterCps = 1;
+    while (end < text.length) {
+      const nextCp = text.codePointAt(end) ?? 0;
+      if (!isClusterContinuation(text, end, nextCp)) break;
+      clusterCps += 1;
+      end += nextCp > 0xffff ? 2 : 1;
+      if (cps > 0 && cps + clusterCps > limit) break;
+      if (cps === 0 && clusterCps >= limit) break;
+    }
+    if (cps + clusterCps > limit) {
+      if (cps === 0) return sliceByCodePoints(text, limit);
+      break;
+    }
+    cps += clusterCps;
+    i = end;
   }
   return i === text.length ? text : text.slice(0, i);
 }
 
-function lastPathSegment(value: string, fallback: string): string {
-  let end = value.length;
-  while (end > 0 && (value[end - 1] === '/' || value[end - 1] === '\\')) end--;
-  if (end === 0) return fallback;
-  let start = end;
-  while (start > 0 && value[start - 1] !== '/' && value[start - 1] !== '\\') start--;
-  return value.slice(start, end);
-}
-
-function needsSentinelEscape(text: string): boolean {
-  return (
-    text.includes(SENTINEL_HOST) ||
-    text.includes(ESCAPE_CHAR) ||
-    text.includes(SENTINEL_ENDPOINT) ||
-    text.includes(SENTINEL_PATH)
-  );
-}
-
-function escapeSentinels(text: string): string {
-  return text
-    .replaceAll(ESCAPE_CHAR, `${ESCAPE_CHAR}\u0002`)
-    .replaceAll(SENTINEL_HOST, `${ESCAPE_CHAR}\u0003`)
-    .replaceAll(SENTINEL_ENDPOINT, `${ESCAPE_CHAR}\u0006`)
-    .replaceAll(SENTINEL_PATH, `${ESCAPE_CHAR}\u0007`);
-}
-
-function unescapeSentinels(text: string): string {
-  return text
-    .replaceAll(`${ESCAPE_CHAR}\u0007`, SENTINEL_PATH)
-    .replaceAll(`${ESCAPE_CHAR}\u0006`, SENTINEL_ENDPOINT)
-    .replaceAll(`${ESCAPE_CHAR}\u0003`, SENTINEL_HOST)
-    .replaceAll(`${ESCAPE_CHAR}\u0002`, ESCAPE_CHAR);
-}
-
 function isAscii(text: string): boolean {
-  for (let i = 0; i < text.length; i++) {
-    if (text.charCodeAt(i) > 0x7f) return false;
-  }
-  return true;
+  return !NON_ASCII_RE.test(text);
+}
+
+function isAsciiLetter(code: number): boolean {
+  return (code >= 65 && code <= 90) || (code >= 97 && code <= 122);
+}
+
+function isAsciiAlnum(code: number): boolean {
+  return isAsciiLetter(code) || (code >= 48 && code <= 57);
+}
+
+function isAlnumAt(text: string, index: number): boolean {
+  const code = text.charCodeAt(index);
+  if (code < 0x80) return isAsciiAlnum(code);
+  ALNUM_AT_RE.lastIndex = index;
+  return ALNUM_AT_RE.test(text);
 }
 
 function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
-function foldNfc(value: string): string {
+function foldCaseNfc(value: string): string {
   const nfc = value.normalize('NFC');
-  if (!nfc.includes('\u0130')) return nfc;
-  return nfc.replaceAll('\u0130', 'i\u0307').normalize('NFC');
+  const lowered = nfc.includes('\u0130') ? nfc.replaceAll('\u0130', 'i\u0307').normalize('NFC') : nfc;
+  if (lowered.includes('\u0131')) {
+    return lowered
+      .split('\u0131')
+      .map((part) => (part ? part.toLowerCase().toUpperCase().toLowerCase().normalize('NFC') : ''))
+      .join('\u0131');
+  }
+  return lowered.toLowerCase().toUpperCase().toLowerCase().normalize('NFC');
 }
 
 function isClusterContinuation(text: string, index: number, cp: number): boolean {
   if (index === 0) return false;
   if (cp < 0x0300 || (cp >= 0x4e00 && cp <= 0x9fff) || (cp >= 0xac00 && cp <= 0xd7a3)) return false;
+  if (cp <= 0x036f) return true;
   if (cp >= 0x1160 && cp <= 0x11ff) return true;
   if (cp >= 0xd7b0 && cp <= 0xd7ff) return true;
   COMBINING_MARK_AT_RE.lastIndex = index;
@@ -174,15 +222,17 @@ function isClusterContinuation(text: string, index: number, cp: number): boolean
 interface HostSpec {
   folded: string;
   escapedPattern: string;
+  asciiRe: RegExp;
+  nfcRe: RegExp;
   ascii: boolean;
   clusters: number;
   maxNfdClusterCps: number;
-  hasSemi: boolean;
-  hasBacktick: boolean;
   hasDelimiters: boolean;
   allDelimiters: boolean;
   unmatchable: string;
 }
+
+const HOST_SPEC_CACHE = new Map<string, HostSpec>();
 
 function pickUnmatchable(avoid: string): string {
   for (let cp = 0xfdd0; cp <= 0xfdef; cp++) {
@@ -196,71 +246,92 @@ function pickUnmatchable(avoid: string): string {
   return '\uFFFF';
 }
 
-function analyzeHost(hostname: string): HostSpec | undefined {
-  if (!hostname) return undefined;
-  const asciiInput = isAscii(hostname);
-  const folded = asciiInput ? hostname : foldNfc(hostname);
-  const ascii = asciiInput || isAscii(folded);
+function measureNfdClusters(value: string): { clusters: number; maxNfdClusterCps: number } {
+  const nfd = value.normalize('NFD');
   let clusters = 0;
   let maxNfdClusterCps = 1;
-  if (ascii) {
+  let clusterCps = 0;
+  for (let i = 0; i < nfd.length; ) {
+    const cp = nfd.codePointAt(i) ?? 0;
+    const len = cp > 0xffff ? 2 : 1;
+    if (!isClusterContinuation(nfd, i, cp)) {
+      if (clusterCps > maxNfdClusterCps) maxNfdClusterCps = clusterCps;
+      clusters++;
+      clusterCps = 1;
+    } else {
+      clusterCps++;
+    }
+    i += len;
+  }
+  if (clusterCps > maxNfdClusterCps) maxNfdClusterCps = clusterCps;
+  return { clusters, maxNfdClusterCps };
+}
+
+function analyzeHost(hostname: string): HostSpec | undefined {
+  if (!hostname) return undefined;
+  const cached = HOST_SPEC_CACHE.get(hostname);
+  if (cached) return cached;
+  const asciiInput = isAscii(hostname);
+  const folded = asciiInput ? hostname.toLowerCase() : foldCaseNfc(hostname);
+  const ascii = asciiInput || isAscii(folded);
+  let clusters: number;
+  let maxNfdClusterCps = 1;
+  if (asciiInput) {
     clusters = folded.length;
   } else {
-    const nfd = folded.normalize('NFD');
-    let clusterCps = 0;
-    for (let i = 0; i < nfd.length; ) {
-      const cp = nfd.codePointAt(i) ?? 0;
-      const len = cp > 0xffff ? 2 : 1;
-      if (!isClusterContinuation(nfd, i, cp)) {
-        if (clusterCps > maxNfdClusterCps) maxNfdClusterCps = clusterCps;
-        clusters++;
-        clusterCps = 1;
-      } else {
-        clusterCps++;
-      }
-      i += len;
-    }
-    if (clusterCps > maxNfdClusterCps) maxNfdClusterCps = clusterCps;
+    const rawStats = measureNfdClusters(hostname);
+    const foldedStats = measureNfdClusters(folded);
+    clusters = Math.max(rawStats.clusters, foldedStats.clusters);
+    maxNfdClusterCps = Math.max(rawStats.maxNfdClusterCps, foldedStats.maxNfdClusterCps);
   }
-  const hasDelimiters = HAS_DELIMITER_RE.test(folded);
+  DELIM_CHAR_RE.lastIndex = 0;
+  const hasDelimiters = DELIM_CHAR_RE.test(folded);
   const allDelimiters = hasDelimiters && folded.replace(DELIMITER_RE, '').length === 0;
-  return {
+  const escapedPattern = escapeRegExp(folded);
+  const spec: HostSpec = {
     folded,
-    escapedPattern: escapeRegExp(folded),
+    escapedPattern,
+    asciiRe: new RegExp(`${escapedPattern}${CLUSTER_BOUND_LOOKAHEAD}`, 'giu'),
+    nfcRe: new RegExp(escapedPattern, 'gu'),
     ascii,
     clusters,
     maxNfdClusterCps,
-    hasSemi: folded.includes(';'),
-    hasBacktick: folded.includes('`'),
     hasDelimiters,
     allDelimiters,
     unmatchable: pickUnmatchable(folded),
   };
+  if (HOST_SPEC_CACHE.size >= 32) {
+    const oldest = HOST_SPEC_CACHE.keys().next().value;
+    if (oldest !== undefined) HOST_SPEC_CACHE.delete(oldest);
+  }
+  HOST_SPEC_CACHE.set(hostname, spec);
+  return spec;
 }
 
 function sliceAsciiBound(text: string, maxCodePoints: number): string {
+  if (maxCodePoints <= 0) return '';
   if (text.length <= maxCodePoints) return text;
-  let cps = 0;
   let i = 0;
-  while (i < text.length && cps < maxCodePoints) {
-    const cp = text.codePointAt(i) ?? 0;
-    cps += 1;
-    i += cp > 0xffff ? 2 : 1;
+  const candidate = text.slice(0, maxCodePoints);
+  if (!SURROGATE_RE.test(candidate)) {
+    i = maxCodePoints;
+  } else {
+    let cps = 0;
+    while (i < text.length && cps < maxCodePoints) {
+      const cp = text.codePointAt(i) ?? 0;
+      cps += 1;
+      i += cp > 0xffff ? 2 : 1;
+    }
   }
-  if (i >= text.length) return text;
-  // Preserve one continuation code point if present so negative lookahead stays accurate at the boundary.
-  const nextCp = text.codePointAt(i) ?? 0;
-  const nextLen = nextCp > 0xffff ? 2 : 1;
-  if (isClusterContinuation(text, i, nextCp)) return text.slice(0, i + nextLen);
-  return text.slice(0, i);
+  while (i < text.length) {
+    const nextCp = text.codePointAt(i) ?? 0;
+    if (!isClusterContinuation(text, i, nextCp)) break;
+    i += nextCp > 0xffff ? 2 : 1;
+  }
+  return i >= text.length ? text : text.slice(0, i);
 }
 
-function sliceToClusterBound(
-  text: string,
-  maxClusters: number,
-  limit?: number,
-  maxMatchClusterCps = MAX_CLUSTER_MARKS + 1,
-): string {
+function sliceToClusterBound(text: string, maxClusters: number, limit?: number, maxMatchClusterCps = 33): string {
   if (text.length <= maxClusters && (limit === undefined || text.length <= limit)) return text;
   const candidate = text.slice(0, maxClusters);
   if (text.length > maxClusters && !NEEDS_CLUSTER_NFC_RE.test(candidate) && !/[\ud800-\udfff]/.test(candidate)) {
@@ -279,7 +350,21 @@ function sliceToClusterBound(
       i += 1;
       continue;
     }
-    const cp = text.codePointAt(i) ?? 0;
+    if (
+      i > 0 &&
+      ((code >= 0x0300 && code <= 0x036f) || (code >= 0x1160 && code <= 0x11ff) || (code >= 0xd7b0 && code <= 0xd7ff))
+    ) {
+      clusterCps++;
+      if (clusterCps === maxMatchClusterCps + 1) {
+        permanentCps += clusterCps;
+      } else if (clusterCps > maxMatchClusterCps + 1) {
+        permanentCps++;
+      }
+      if (limit !== undefined && permanentCps >= limit) return text.slice(0, i + 1);
+      i += 1;
+      continue;
+    }
+    const cp = code >= 0xd800 && code <= 0xdbff ? (text.codePointAt(i) ?? code) : code;
     const len = cp > 0xffff ? 2 : 1;
     if (isClusterContinuation(text, i, cp)) {
       clusterCps++;
@@ -307,37 +392,82 @@ function segmentNfcClusters(
   const normCache = new Map<string, string>();
   const rawStarts: number[] = [];
   const nfcStarts: number[] = [];
-  const nfcParts: string[] = [];
+  let nfcParts: string[] | undefined;
+  let plainStart = 0;
   let nfcLen = 0;
   let segStart = 0;
   let segCps = 0;
+  const pushChanged = (norm: string, end: number) => {
+    if (!nfcParts) nfcParts = [];
+    if (segStart > plainStart) nfcParts.push(text.slice(plainStart, segStart));
+    nfcParts.push(norm);
+    plainStart = end;
+  };
   const pushCluster = (end: number) => {
     rawStarts.push(segStart);
     nfcStarts.push(nfcLen);
-    let norm: string;
+    const segLen = end - segStart;
     if (segCps > maxClusterCps) {
-      norm = unmatchable;
+      pushChanged(unmatchable, end);
+      nfcLen += unmatchable.length;
+    } else if (segLen === 1) {
+      const c0 = text.charCodeAt(segStart);
+      if (c0 < 0x0080) {
+        if (c0 >= 65 && c0 <= 90) {
+          pushChanged(String.fromCharCode(c0 + 32), end);
+        }
+        nfcLen += 1;
+      } else if (c0 >= 0x4e00 && c0 <= 0x9fff) {
+        nfcLen += 1;
+      } else {
+        const seg = text.slice(segStart, end);
+        let norm = normCache.get(seg);
+        if (norm === undefined) {
+          norm = foldCaseNfc(seg);
+          if (normCache.size < 4096) normCache.set(seg, norm);
+        }
+        if (norm !== seg) pushChanged(norm, end);
+        nfcLen += norm.length;
+      }
+    } else if (
+      segLen === 2 &&
+      text.charCodeAt(segStart) >= 0x4e00 &&
+      text.charCodeAt(segStart) <= 0x9fff &&
+      text.charCodeAt(segStart + 1) >= 0x0300 &&
+      text.charCodeAt(segStart + 1) <= 0x036f &&
+      (text.charCodeAt(segStart + 1) < 0x0340 || text.charCodeAt(segStart + 1) > 0x0344)
+    ) {
+      nfcLen += 2;
     } else {
       const seg = text.slice(segStart, end);
-      if (seg.length === 1 && seg.charCodeAt(0) < 0x0080) {
-        norm = seg;
-      } else {
-        const cached = normCache.get(seg);
-        if (cached !== undefined) {
-          norm = cached;
-        } else {
-          norm = foldNfc(seg);
-          if (normCache.size < 2048) normCache.set(seg, norm);
-        }
+      let norm = normCache.get(seg);
+      if (norm === undefined) {
+        norm = foldCaseNfc(seg);
+        if (normCache.size < 4096) normCache.set(seg, norm);
       }
+      if (norm !== seg) pushChanged(norm, end);
+      nfcLen += norm.length;
     }
-    nfcParts.push(norm);
-    nfcLen += norm.length;
     segStart = end;
     segCps = 0;
   };
   for (let i = 0; i < text.length; ) {
-    const cp = text.codePointAt(i) ?? 0;
+    const code = text.charCodeAt(i);
+    if (code < 0x0300 || (code >= 0x4e00 && code <= 0x9fff) || (code >= 0xac00 && code <= 0xd7a3)) {
+      if (i > segStart) pushCluster(i);
+      segCps++;
+      i += 1;
+      continue;
+    }
+    if (
+      i > segStart &&
+      ((code >= 0x0300 && code <= 0x036f) || (code >= 0x1160 && code <= 0x11ff) || (code >= 0xd7b0 && code <= 0xd7ff))
+    ) {
+      segCps++;
+      i += 1;
+      continue;
+    }
+    const cp = code >= 0xd800 && code <= 0xdbff ? (text.codePointAt(i) ?? code) : code;
     const len = cp > 0xffff ? 2 : 1;
     if (!isClusterContinuation(text, i, cp) && i > segStart) pushCluster(i);
     segCps++;
@@ -346,8 +476,17 @@ function segmentNfcClusters(
   if (text.length > segStart) pushCluster(text.length);
   rawStarts.push(text.length);
   nfcStarts.push(nfcLen);
-  return { rawStarts, nfcStarts, nfc: nfcParts.join('') };
+  let nfc: string;
+  if (!nfcParts) {
+    nfc = text;
+  } else {
+    if (plainStart < text.length) nfcParts.push(text.slice(plainStart));
+    nfc = nfcParts.join('');
+  }
+  return { rawStarts, nfcStarts, nfc };
 }
+
+const ASCII_HOST_NEEDS_CLUSTER_RE = /[\u00df\u1e9e\u0130\u0149\u037e\u1fef\u1e9a\ufb00-\ufb06]/u;
 
 /**
  * Replaces case-insensitive NFC-equivalent matches of `host` in `text`
@@ -361,48 +500,56 @@ function replaceHostWithTail(
   limit?: number,
 ): { text: string; tailStart: number } {
   if (!text) return { text, tailStart: 0 };
-  const needsSingletonNfc =
-    host.ascii && ((host.hasSemi && text.includes('\u037e')) || (host.hasBacktick && text.includes('\u1fef')));
-  if (host.ascii && !needsSingletonNfc) {
+  if (host.ascii) {
+    if (text.length < host.folded.length && (isAscii(text) || !ASCII_HOST_NEEDS_CLUSTER_RE.test(text))) {
+      return { text, tailStart: 0 };
+    }
     const boundCps =
       limit === undefined
         ? undefined
         : Math.ceil(limit * Math.max(1, host.folded.length / replacement.length)) + host.folded.length + 1;
     const bounded = boundCps === undefined ? text : sliceAsciiBound(text, boundCps);
-    const hostRe = new RegExp(`${host.escapedPattern}${CLUSTER_BOUND_LOOKAHEAD}`, 'giu');
-    if (limit === undefined || bounded.length <= limit * 2) {
+    if (isAscii(bounded) || !ASCII_HOST_NEEDS_CLUSTER_RE.test(bounded)) {
+      const hostRe = host.asciiRe;
+      hostRe.lastIndex = 0;
+      if (limit === undefined || bounded.length <= limit * 2) {
+        let out = '';
+        let last = 0;
+        let tailStart = 0;
+        for (let match = hostRe.exec(bounded); match !== null; match = hostRe.exec(bounded)) {
+          out += bounded.slice(last, match.index) + replacement;
+          tailStart = out.length;
+          last = match.index + match[0].length;
+          if (match[0].length === 0) hostRe.lastIndex++;
+        }
+        return last === 0 ? { text: bounded, tailStart: 0 } : { text: out + bounded.slice(last), tailStart };
+      }
       let out = '';
       let last = 0;
-      let tailStart = 0;
+      let outCps = 0;
       for (let match = hostRe.exec(bounded); match !== null; match = hostRe.exec(bounded)) {
-        out += bounded.slice(last, match.index) + replacement;
-        tailStart = out.length;
+        const gap = bounded.slice(last, match.index);
+        out += gap + replacement;
+        outCps += countCodePoints(gap) + replacement.length;
         last = match.index + match[0].length;
         if (match[0].length === 0) hostRe.lastIndex++;
+        if (outCps >= limit) return { text: out, tailStart: out.length };
       }
-      return last === 0 ? { text: bounded, tailStart: 0 } : { text: out + bounded.slice(last), tailStart };
+      return last === 0 ? { text: bounded, tailStart: 0 } : { text: out + bounded.slice(last), tailStart: out.length };
     }
-    let out = '';
-    let last = 0;
-    let outCps = 0;
-    for (let match = hostRe.exec(bounded); match !== null; match = hostRe.exec(bounded)) {
-      const gap = bounded.slice(last, match.index);
-      out += gap + replacement;
-      outCps += countCodePoints(gap) + replacement.length;
-      last = match.index + match[0].length;
-      if (match[0].length === 0) hostRe.lastIndex++;
-      if (outCps >= limit) return { text: out, tailStart: out.length };
-    }
-    return last === 0 ? { text: bounded, tailStart: 0 } : { text: out + bounded.slice(last), tailStart: out.length };
   }
   const maxClusters =
     limit === undefined
       ? Number.POSITIVE_INFINITY
       : Math.ceil(limit * Math.max(1, host.clusters / replacement.length)) + host.clusters;
-  const clusterCap = Math.min(MAX_CLUSTER_MARKS + 1, host.maxNfdClusterCps);
-  const bounded = limit === undefined ? text : sliceToClusterBound(text, maxClusters, limit, host.maxNfdClusterCps);
-  if (isAscii(bounded) || (!NEEDS_CLUSTER_NFC_RE.test(bounded) && bounded.normalize('NFC') === bounded)) {
-    const hostRe = new RegExp(`${host.escapedPattern}${CLUSTER_BOUND_LOOKAHEAD}`, 'giu');
+  const clusterCap = host.maxNfdClusterCps;
+  const bounded = limit === undefined ? text : sliceToClusterBound(text, maxClusters, limit, clusterCap);
+  if (!host.ascii && isAscii(bounded)) {
+    return { text: bounded, tailStart: 0 };
+  }
+  if (!NEEDS_CLUSTER_NFC_RE.test(bounded) && bounded.normalize('NFC') === bounded) {
+    const hostRe = host.asciiRe;
+    hostRe.lastIndex = 0;
     let out = '';
     let last = 0;
     let outCps = 0;
@@ -419,7 +566,8 @@ function replaceHostWithTail(
     return last === 0 ? { text: bounded, tailStart: 0 } : { text: out + bounded.slice(last), tailStart };
   }
   const { rawStarts, nfcStarts, nfc } = segmentNfcClusters(bounded, clusterCap, host.unmatchable);
-  const hostRe = new RegExp(host.escapedPattern, 'giu');
+  const hostRe = host.nfcRe;
+  hostRe.lastIndex = 0;
   let out = '';
   let lastRaw = 0;
   let segCursor = 0;
@@ -452,159 +600,166 @@ function replaceHostWithTail(
   return lastRaw === 0 ? { text: bounded, tailStart: 0 } : { text: out + bounded.slice(lastRaw), tailStart };
 }
 
-/**
- * Replaces regex matches up to an early-stop bound once irreversible sentinel placeholders
- * already exceed `limit` code points, avoiding full-string work on 1 MB inputs.
- */
-function replaceBounded(
-  str: string,
-  re: RegExp,
-  replacer: (match: string) => string,
-  limit: number,
-  allowEarlyStop: boolean,
-  countMatch: (replaced: string) => boolean = () => true,
-): string {
-  if (str.length <= 65_536) {
-    return str.replace(re, replacer);
-  }
-  const maxPlaceholders = Math.ceil(limit / 6) + 2;
-  re.lastIndex = 0;
-  let out = '';
-  let last = 0;
-  let count = 0;
-  let seenPathSep = false;
-  for (let match = re.exec(str); match !== null; match = re.exec(str)) {
-    const gap = str.slice(last, match.index);
-    if (!allowEarlyStop) {
-      const lastSlash = Math.max(gap.lastIndexOf('/'), gap.lastIndexOf('\\'));
-      if (lastSlash !== -1) {
-        seenPathSep = !HAS_DELIMITER_RE.test(gap.slice(lastSlash + 1));
-        count = 0;
-      } else if (seenPathSep && HAS_DELIMITER_RE.test(gap)) {
-        seenPathSep = false;
-        count = 0;
-      }
-    }
-    const replaced = replacer(match[0]);
-    out += gap + replaced;
-    last = match.index + match[0].length;
-    if (match[0].length === 0) re.lastIndex++;
-    if (!seenPathSep && countMatch(replaced) && ++count >= maxPlaceholders) return out;
-  }
-  return last === 0 ? str : out + str.slice(last);
-}
-
-function nextSentinel(text: string, from: number): { index: number; code: number } {
-  let best = -1;
-  let code = -1;
-  for (const [sentinel, value] of [
-    [SENTINEL_HOST, 0],
-    [SENTINEL_ENDPOINT, 4],
-    [SENTINEL_PATH, 5],
-  ] as const) {
-    const idx = text.indexOf(sentinel, from);
-    if (idx !== -1 && (best === -1 || idx < best)) {
-      best = idx;
-      code = value;
-    }
-  }
-  return { index: best, code };
-}
-
-function sentinelPlaceholder(code: number, hostPlaceholder: string): string {
-  return code === 0 ? hostPlaceholder : code === 4 ? '[endpoint]' : '[path]';
-}
-
-function redactPlainSegment(
-  plain: string,
-  host: HostSpec | undefined,
-  hostPlaceholder: string,
-  remaining: number,
-  escaped: boolean,
-): string {
-  const raw = escaped ? unescapeSentinels(plain) : plain;
-  const withHost = host ? replaceHostWithTail(raw, host, hostPlaceholder, remaining + 12).text : raw;
-  return sliceByCodePoints(withHost, remaining + 12);
-}
-
-function expandAndRedactHost(
-  text: string,
-  host: HostSpec | undefined,
-  hostPlaceholder: string,
-  limit: number,
-  escaped: boolean,
-): string {
-  const first = nextSentinel(text, 0);
-  if (first.index === -1) {
-    return redactPlainSegment(text, host, hostPlaceholder, limit, escaped);
-  }
-  const out: string[] = [];
-  let cps = 0;
-  let start = 0;
-  let current = first;
+function hasBracketAddress(token: string): boolean {
+  let pos = 0;
   while (true) {
-    const end = current.index === -1 ? text.length : current.index;
-    if (end > start) {
-      const boundedPart = redactPlainSegment(
-        text.slice(start, end),
-        host,
-        hostPlaceholder,
-        Math.max(1, limit - cps),
-        escaped,
-      );
-      out.push(boundedPart);
-      if (current.index === -1) break;
-      cps += countCodePoints(boundedPart);
-      if (cps >= limit) break;
+    const open = token.indexOf('[', pos);
+    if (open === -1) return false;
+    const close = token.indexOf(']', open + 1);
+    if (close === -1) return false;
+    if (close > open + 1) {
+      const slice = token.slice(open, close + 1);
+      if (!PLACEHOLDERS_SET.has(slice)) return true;
     }
-    if (current.index === -1) break;
-    const placeholder = sentinelPlaceholder(current.code, hostPlaceholder);
-    out.push(placeholder);
-    cps += placeholder.length;
-    if (cps >= limit) break;
-    start = current.index + 1;
-    current = nextSentinel(text, start);
+    pos = close + 1;
   }
-  return out.join('');
 }
 
-function redactTextTokens(chunk: string, limit: number): { text: string; escaped: boolean } {
-  const escaped = needsSentinelEscape(chunk);
-  let r = escaped ? escapeSentinels(chunk) : chunk;
-  if (r.includes('://')) r = r.replace(TEXT_ENDPOINT_RE, SENTINEL_ENDPOINT);
-  if (r.includes('/') || r.includes('\\')) {
-    r = replaceBounded(
-      r,
-      TEXT_PATH_RE,
-      (match) => lastPathSegment(match, SENTINEL_PATH),
-      limit,
-      true,
-      (seg) => seg === SENTINEL_PATH,
-    );
+function hasColonWithAlnumSides(token: string): boolean {
+  const firstColon = token.indexOf(':');
+  if (firstColon === -1) return false;
+  let firstAlnum = -1;
+  for (let i = 0; i < token.length; ) {
+    const cp = token.codePointAt(i) ?? 0;
+    if (isAlnumAt(token, i)) {
+      firstAlnum = i;
+      break;
+    }
+    i += cp > 0xffff ? 2 : 1;
   }
-  return { text: r, escaped };
+  if (firstAlnum === -1 || firstAlnum >= token.length - 1) return false;
+  const colonAfter = token.indexOf(':', firstAlnum + 1);
+  if (colonAfter === -1) return false;
+  let lastAlnum = -1;
+  for (let i = token.length; i > colonAfter + 1; ) {
+    const prevUnit = token.charCodeAt(i - 1);
+    let cpStart = i - 1;
+    if (prevUnit >= 0xdc00 && prevUnit <= 0xdfff && i >= 2) {
+      const high = token.charCodeAt(i - 2);
+      if (high >= 0xd800 && high <= 0xdbff) cpStart = i - 2;
+    }
+    if (isAlnumAt(token, cpStart)) {
+      lastAlnum = cpStart;
+      break;
+    }
+    i = cpStart;
+  }
+  return lastAlnum > colonAfter;
 }
 
-function redactTitleTokens(chunk: string, limit: number): { text: string; escaped: boolean } {
-  const escaped = needsSentinelEscape(chunk);
-  let r = escaped ? escapeSentinels(chunk) : chunk;
-  const toHost = () => SENTINEL_HOST;
-  if (r.includes('://')) r = replaceBounded(r, TITLE_SCHEME_RE, toHost, limit, false);
-  if (r.includes('@')) r = replaceBounded(r, TITLE_EMAIL_RE, toHost, limit, false);
-  if (r.includes(':')) r = replaceBounded(r, TITLE_IPV6_RE, toHost, limit, false);
-  if (r.includes('.')) r = replaceBounded(r, TITLE_IPV4_RE, toHost, limit, false);
-  if (r.includes(':')) r = replaceBounded(r, TITLE_HOST_PORT_RE, toHost, limit, false);
-  if (r.includes('/') || r.includes('\\')) {
-    r = replaceBounded(
-      r,
-      TITLE_PATH_RE,
-      (match) => lastPathSegment(match, SENTINEL_PATH),
-      limit,
-      true,
-      (seg) => seg === SENTINEL_PATH,
-    );
+function isSafeSingleDotFilename(seg1: string, seg2: string): boolean {
+  let hasAlnum1 = false;
+  for (let i = 0; i < seg1.length; ) {
+    const cp = seg1.codePointAt(i) ?? 0;
+    if (isAlnumAt(seg1, i)) {
+      hasAlnum1 = true;
+      break;
+    }
+    i += cp > 0xffff ? 2 : 1;
   }
-  return { text: r, escaped };
+  if (!hasAlnum1) return false;
+  const ext = seg2.replace(/[!?\u3002\uff01\uff1f]+$/u, '');
+  if (!ext) return true;
+  if (!/^[A-Za-z]{1,5}$/.test(ext)) return false;
+  return !KNOWN_TLDS.has(ext.toLowerCase());
+}
+
+function hasHostOrIpDotFeature(token: string): boolean {
+  if (!token.includes('.')) return false;
+  NON_DOT_RUN_RE.lastIndex = 0;
+  const first = NON_DOT_RUN_RE.exec(token);
+  if (first === null) return false;
+  const second = NON_DOT_RUN_RE.exec(token);
+  if (second === null) return false;
+  const third = NON_DOT_RUN_RE.exec(token);
+  if (third !== null) return true;
+  if (second.index !== first.index + first[0].length + 1) return true;
+  return !isSafeSingleDotFilename(first[0], second[0]);
+}
+
+function lastPathSegment(value: string): string {
+  let end = value.length;
+  while (end > 0 && (value[end - 1] === '/' || value[end - 1] === '\\')) end--;
+  if (end === 0) return '';
+  let start = end;
+  while (start > 0 && value[start - 1] !== '/' && value[start - 1] !== '\\') start--;
+  return value.slice(start, end);
+}
+
+function isTwoPartUnc(token: string): boolean {
+  const uncStart = token.indexOf('\\\\');
+  if (uncStart === -1) return false;
+  let i = uncStart + 2;
+  while (i < token.length && (token[i] === '\\' || token[i] === '/')) i++;
+  let segments = 0;
+  while (i < token.length) {
+    const start = i;
+    while (i < token.length && token[i] !== '\\' && token[i] !== '/') i++;
+    if (i > start) {
+      segments++;
+      if (segments >= 3) return false;
+    }
+    while (i < token.length && (token[i] === '\\' || token[i] === '/')) i++;
+  }
+  return segments <= 2;
+}
+
+type TokenClassification =
+  | { kind: 'plain'; text: string }
+  | { kind: 'basename'; text: string }
+  | { kind: 'replaced'; text: string };
+
+function classifyToken(token: string, isTitle: boolean): TokenClassification {
+  if (!HAS_STRUCTURAL_CHAR_RE.test(token)) {
+    return { kind: 'plain', text: token };
+  }
+  const hostPlaceholder = isTitle ? '<host>' : '[host]';
+  if (PLACEHOLDERS_SET.has(token)) {
+    return { kind: 'replaced', text: token };
+  }
+  if (token.includes('://')) {
+    return { kind: 'replaced', text: isTitle ? '<host>' : '[endpoint]' };
+  }
+  const hasSlash = token.includes('/') || token.includes('\\');
+  if (hasSlash) {
+    const hasDrivePrefix =
+      token.length >= 3 &&
+      isAsciiLetter(token.charCodeAt(0)) &&
+      token.charCodeAt(1) === 58 &&
+      (token.charCodeAt(2) === 47 || token.charCodeAt(2) === 92);
+    const colonStart = hasDrivePrefix ? 2 : 0;
+    if (
+      token.includes('@') ||
+      token.includes('%') ||
+      token.includes('::') ||
+      token.indexOf(':', colonStart) !== -1 ||
+      hasBracketAddress(token)
+    ) {
+      return { kind: 'replaced', text: hostPlaceholder };
+    }
+    if (isTwoPartUnc(token)) {
+      return { kind: 'replaced', text: '[path]' };
+    }
+    const base = lastPathSegment(token);
+    if (!base || base === '.' || base === '..') {
+      return { kind: 'replaced', text: '[path]' };
+    }
+    if (hasHostOrIpDotFeature(base)) {
+      return { kind: 'replaced', text: hostPlaceholder };
+    }
+    return { kind: 'basename', text: base };
+  }
+  if (
+    token.includes('@') ||
+    token.includes('%') ||
+    token.includes('::') ||
+    hasColonWithAlnumSides(token) ||
+    hasBracketAddress(token) ||
+    hasHostOrIpDotFeature(token)
+  ) {
+    return { kind: 'replaced', text: hostPlaceholder };
+  }
+  return { kind: 'plain', text: token };
 }
 
 function splitTailClusters(text: string, tailClusters: number): [string, string] {
@@ -628,36 +783,129 @@ function splitTailClusters(text: string, tailClusters: number): [string, string]
   return ['', text];
 }
 
-function projectModelString(
-  value: string,
-  hostname: string,
-  limit: number,
-  redactTokens: (chunk: string, limit: number) => { text: string; escaped: boolean },
-  hostPlaceholder: string,
-): string {
-  if (!value) return value;
-  const host = analyzeHost(hostname);
-  const batchSize = Math.max(limit * 4, 4096);
-  if (value.length <= batchSize) {
-    const tokens = redactTokens(value, limit);
-    return truncateRedacted(expandAndRedactHost(tokens.text, host, hostPlaceholder, limit, tokens.escaped), limit);
+function isAsciiDelimiterCode(code: number): boolean {
+  return (
+    code === 32 ||
+    (code >= 9 && code <= 13) ||
+    code === 34 ||
+    code === 39 ||
+    code === 40 ||
+    code === 41 ||
+    code === 44 ||
+    code === 59 ||
+    code === 60 ||
+    code === 62 ||
+    code === 124
+  );
+}
+
+function isDelimiterAt(text: string, index: number): boolean {
+  const code = text.charCodeAt(index);
+  if (code < 0x80) {
+    if (!isAsciiDelimiterCode(code)) return false;
+    if (index + 1 < text.length) {
+      const nextCp = text.codePointAt(index + 1) ?? 0;
+      if (isClusterContinuation(text, index + 1, nextCp)) return false;
+    }
+    return true;
   }
+  if (code >= 0xd800 && code <= 0xdfff) return false;
+  DELIM_CHAR_RE.lastIndex = index;
+  const m = DELIM_CHAR_RE.exec(text);
+  return m !== null && m.index === index;
+}
+
+function findPrevDelimiter(value: string, minIndex: number, beforeIndex: number): number {
+  for (let k = beforeIndex - 1; k >= minIndex; k--) {
+    const code = value.charCodeAt(k);
+    if (code < 0x80) {
+      if (!isAsciiDelimiterCode(code)) continue;
+      if (k + 1 < value.length) {
+        const nextCp = value.codePointAt(k + 1) ?? 0;
+        if (isClusterContinuation(value, k + 1, nextCp)) continue;
+      }
+      return k;
+    }
+    if (code >= 0x4e00 && code <= 0x9fff) continue;
+    if (isDelimiterAt(value, k)) return k;
+  }
+  return -1;
+}
+
+function projectModelString(value: string, hostname: string, limit: number, isTitle: boolean): string {
+  if (!value) return value;
+  const hostPlaceholder = isTitle ? '<host>' : '[host]';
+  const host = analyzeHost(hostname);
   const chunks: string[] = [];
   let outCps = 0;
   let pos = 0;
-  let carry = '';
-  const carryClusters = host?.hasDelimiters ? Math.max(0, host.clusters - 1) : 0;
 
-  const pushPlainCarry = (plain: string, isEndOfSegment: boolean) => {
+  if (!host?.hasDelimiters) {
+    const emitPlainSpan = (span: string) => {
+      const remaining = limit - outCps;
+      const redacted = host ? replaceHostWithTail(span, host, hostPlaceholder, remaining).text : span;
+      const bounded = sliceByCodePoints(redacted, remaining + 12);
+      chunks.push(bounded);
+      outCps += countCodePoints(bounded);
+    };
+
+    while (pos < value.length && outCps < limit) {
+      STRUCTURAL_CHAR_AT_RE.lastIndex = pos;
+      const structMatch = STRUCTURAL_CHAR_AT_RE.exec(value);
+      if (structMatch === null) {
+        emitPlainSpan(value.slice(pos));
+        break;
+      }
+      if (structMatch.index - pos > 256) {
+        const delimEnd = findPrevDelimiter(value, pos, structMatch.index);
+        if (delimEnd >= pos) {
+          emitPlainSpan(value.slice(pos, delimEnd + 1));
+          pos = delimEnd + 1;
+          continue;
+        }
+      }
+      if (isDelimiterAt(value, pos)) {
+        const start = pos;
+        const maxDelim = limit - outCps + 12;
+        pos++;
+        while (pos < value.length && pos - start < maxDelim && isDelimiterAt(value, pos)) pos++;
+        const delim = sliceByCodePoints(value.slice(start, pos), maxDelim);
+        chunks.push(delim);
+        outCps += countCodePoints(delim);
+        continue;
+      }
+      DELIM_CHAR_RE.lastIndex = pos;
+      const match = DELIM_CHAR_RE.exec(value);
+      const tokEnd = match === null ? value.length : match.index;
+      const token = value.slice(pos, tokEnd);
+      pos = tokEnd;
+      const classified = classifyToken(token, isTitle);
+      if (classified.kind === 'replaced') {
+        if (outCps + classified.text.length > limit) break;
+        chunks.push(classified.text);
+        outCps += classified.text.length;
+      } else {
+        emitPlainSpan(classified.text);
+      }
+    }
+    return truncateRedacted(chunks.join(''), limit);
+  }
+
+  const carryClusters = Math.max(0, host.clusters - 1);
+  const flushThreshold = Math.max(limit * 2, 65_536);
+  let carry = '';
+  let plainParts: string[] = [];
+  let plainLen = 0;
+
+  const flushPlain = (isEndOfSegment: boolean) => {
+    const plain = plainParts.join('');
+    plainParts = [];
+    plainLen = 0;
     const combined = carry ? carry + plain : plain;
     carry = '';
     if (!combined) return;
-    if (!host) {
-      chunks.push(combined);
-      outCps += countCodePoints(combined);
-      return;
-    }
-    const { text: replaced, tailStart } = replaceHostWithTail(combined, host, hostPlaceholder);
+    const remaining = Math.max(1, limit - outCps);
+    const { text: replaced, tailStart } = replaceHostWithTail(combined, host, hostPlaceholder, remaining);
     if (isEndOfSegment || carryClusters === 0) {
       chunks.push(replaced);
       outCps += countCodePoints(replaced);
@@ -674,94 +922,84 @@ function projectModelString(
       chunks.push(prefix);
       outCps += countCodePoints(prefix);
     }
-    carry = nextCarry;
-  };
-
-  const emitChunk = (chunk: string, delim: string, isFinal: boolean) => {
-    const { text, escaped } = redactTokens(chunk, limit - outCps);
-    let start = 0;
-    let current = nextSentinel(text, 0);
-    while (current.index !== -1) {
-      const rawSeg = start < current.index ? text.slice(start, current.index) : '';
-      const seg = escaped && rawSeg ? unescapeSentinels(rawSeg) : rawSeg;
-      if (seg || carry) {
-        pushPlainCarry(seg, true);
-        if (outCps >= limit) return;
-      }
-      const placeholder = sentinelPlaceholder(current.code, hostPlaceholder);
-      chunks.push(placeholder);
-      outCps += placeholder.length;
-      if (outCps >= limit) return;
-      start = current.index + 1;
-      current = nextSentinel(text, start);
-    }
-    const rawTail = start < text.length ? text.slice(start) : '';
-    const tail = (escaped && rawTail ? unescapeSentinels(rawTail) : rawTail) + delim;
-    if (tail || carry) pushPlainCarry(tail, isFinal);
+    if (outCps < limit) carry = nextCarry;
   };
 
   while (pos < value.length && outCps < limit) {
-    const targetEnd = pos + batchSize;
-    if (targetEnd >= value.length) {
-      if (carry) {
-        emitChunk(value.slice(pos), '', true);
-      } else {
-        const tokens = redactTokens(value.slice(pos), limit - outCps);
-        chunks.push(expandAndRedactHost(tokens.text, host, hostPlaceholder, limit - outCps, tokens.escaped));
-      }
+    STRUCTURAL_CHAR_AT_RE.lastIndex = pos;
+    const structMatch = STRUCTURAL_CHAR_AT_RE.exec(value);
+    if (structMatch === null) {
+      const rest = value.slice(pos);
+      plainParts.push(rest);
+      plainLen += rest.length;
+      pos = value.length;
       break;
     }
-    DELIMITER_RE.lastIndex = targetEnd;
-    const match = DELIMITER_RE.exec(value);
-    if (match === null) {
-      if (carry) {
-        emitChunk(value.slice(pos), '', true);
-      } else {
-        const tokens = redactTokens(value.slice(pos), limit - outCps);
-        chunks.push(expandAndRedactHost(tokens.text, host, hostPlaceholder, limit - outCps, tokens.escaped));
+    if (structMatch.index - pos > 256) {
+      const delimEnd = findPrevDelimiter(value, pos, structMatch.index);
+      if (delimEnd >= pos) {
+        const span = value.slice(pos, delimEnd + 1);
+        plainParts.push(span);
+        plainLen += span.length;
+        pos = delimEnd + 1;
+        if (plainLen >= flushThreshold) flushPlain(false);
+        continue;
       }
-      break;
     }
-    if (carryClusters > 0 && host) {
-      const delimLimit = host.allDelimiters
+    if (isDelimiterAt(value, pos)) {
+      const start = pos;
+      pos++;
+      const maxDelim = host.allDelimiters
         ? (limit - outCps + 12) * Math.max(1, host.clusters) + host.clusters
         : limit - outCps + 12 + host.folded.length;
-      const delim = sliceByCodePoints(match[0], delimLimit);
-      emitChunk(value.slice(pos, match.index), delim, false);
-    } else {
-      if (match.index > pos) {
-        const tokens = redactTokens(value.slice(pos, match.index), limit - outCps);
-        const redacted = expandAndRedactHost(tokens.text, host, hostPlaceholder, limit - outCps, tokens.escaped);
-        chunks.push(redacted);
-        outCps += countCodePoints(redacted);
+      while (pos < value.length && pos - start < maxDelim && isDelimiterAt(value, pos)) pos++;
+      const delim = value.slice(start, pos);
+      plainParts.push(delim);
+      plainLen += delim.length;
+      if (pos - start >= maxDelim) {
+        flushPlain(false);
+        if (outCps >= limit) break;
+        while (pos < value.length && isDelimiterAt(value, pos)) pos++;
+      } else if (plainLen >= flushThreshold) {
+        flushPlain(false);
       }
-      if (outCps < limit) {
-        const delim = sliceByCodePoints(match[0], limit - outCps + 12);
-        chunks.push(delim);
-        outCps += countCodePoints(delim);
-      }
+      continue;
     }
-    pos = match.index + match[0].length;
+    DELIM_CHAR_RE.lastIndex = pos;
+    const match = DELIM_CHAR_RE.exec(value);
+    const tokEnd = match === null ? value.length : match.index;
+    const token = value.slice(pos, tokEnd);
+    pos = tokEnd;
+    const classified = classifyToken(token, isTitle);
+    if (classified.kind === 'replaced') {
+      flushPlain(true);
+      if (outCps >= limit || outCps + classified.text.length > limit) break;
+      chunks.push(classified.text);
+      outCps += classified.text.length;
+    } else {
+      plainParts.push(classified.text);
+      plainLen += classified.text.length;
+      if (plainLen >= flushThreshold) flushPlain(false);
+    }
   }
-  if (carry && outCps < limit) chunks.push(carry);
+  if ((plainLen > 0 || carry) && outCps < limit) flushPlain(true);
   return truncateRedacted(chunks.join(''), limit);
 }
 
 export function modelText(value: string, hostname = os.hostname()): string {
-  return projectModelString(value, hostname, MAX_BYTES, redactTextTokens, '[host]');
+  return projectModelString(value, hostname, MAX_BYTES, false);
 }
 
 export function modelTitle(value: string, hostname = os.hostname()): string {
-  return projectModelString(value, hostname, MAX_TITLE_LENGTH, redactTitleTokens, '<host>');
+  return projectModelString(value, hostname, MAX_TITLE_LENGTH, true);
 }
 
 function minimize(value: JsonValue, hostname: string, path = '', appNamePaths: readonly string[] = []): JsonValue {
   if (typeof value === 'string') {
     const source = path.endsWith('.source.id') || path.endsWith('.source.api');
-    if (appNamePaths.includes(path) || (source && isSourceIdentifier(value))) return value;
-    return path === 'title' || path.endsWith('.title')
-      ? modelTitle(value, hostname)
-      : modelText(value, source && isHashedFileSource(value) ? '' : hostname);
+    if (appNamePaths.includes(path) || (source && (isSourceIdentifier(value) || isHashedFileSource(value))))
+      return value;
+    return path === 'title' || path.endsWith('.title') ? modelTitle(value, hostname) : modelText(value, hostname);
   }
   if (Array.isArray(value)) return value.map((item) => minimize(item, hostname, path, appNamePaths));
   if (value === null || typeof value !== 'object') return value;
@@ -769,8 +1007,10 @@ function minimize(value: JsonValue, hostname: string, path = '', appNamePaths: r
   for (const [key, child] of Object.entries(value)) {
     if (key === 'host' || key === 'endpoint' || key === 'command' || key === 'userSession') continue;
     const sourceKey = path === 'sources' || path === 'observation.sources';
-    const fixedKey = (sourceKey || path.endsWith('permissions.value')) && isSourceIdentifier(key);
-    const base = fixedKey ? key : modelText(key, sourceKey && isHashedFileSource(key) ? '' : hostname);
+    const fixedKey =
+      ((sourceKey || path.endsWith('permissions.value')) && isSourceIdentifier(key)) ||
+      (sourceKey && isHashedFileSource(key));
+    const base = fixedKey ? key : modelText(key, hostname);
     let name = base;
     for (let n = 2; Object.hasOwn(entries, name); n++) name = `${base} (${n})`;
     entries[name] = minimize(child, hostname, path ? `${path}.${key}` : key, appNamePaths);
@@ -780,7 +1020,9 @@ function minimize(value: JsonValue, hostname: string, path = '', appNamePaths: r
 
 export function modelPath(value: string): string {
   const normalized = value.replaceAll('\\', '/').replace(/\/+$/, '');
-  return modelText(path.posix.basename(normalized) || '[path]');
+  const base = path.posix.basename(normalized);
+  if (!base || base === '.' || base === '..' || /^[A-Za-z]:$/.test(base)) return '[path]';
+  return modelText(base);
 }
 
 export function modelLabel(value: string): string {
@@ -974,6 +1216,8 @@ export function modelRules(rules: WatchRule[]): JsonValue {
         },
       };
     }),
+    undefined,
+    ['match.kind'],
   );
 }
 
@@ -1046,7 +1290,7 @@ export function modelTune(value: unknown): JsonValue {
     }
     result.change = fields;
   }
-  return modelOutput(result);
+  return modelOutput(result, undefined, ['change.param']);
 }
 
 function json(value: unknown): JsonValue {
@@ -1153,6 +1397,6 @@ export function environmentDetail(
       guidance: '如需查看窗口内容，请使用当前会话可用的 computer-use 工具（需经其授权流程）',
     },
     undefined,
-    ['app.value.name'],
+    ['app.value.name', 'recentEvents.kind'],
   );
 }

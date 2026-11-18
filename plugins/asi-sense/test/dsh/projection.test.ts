@@ -71,19 +71,14 @@ describe('bounded model projections', () => {
             expect(result).toBe(length >= 6 ? `${prefix}[host]` : prefix);
           } else if (token === 'https://secret-host.invalid/file') {
             expect(result).toBe(length >= 10 ? `${prefix}[endpoint]` : prefix);
-          } else if (token === '/private/secret-file') {
+          } else if (token === '/private/secret-file' || token === 'src/private/secret-file') {
             expect(result).not.toContain('/private/');
+            expect(result).not.toContain('src/');
             expect(result).toBe(`${prefix}${'secret-file'.slice(0, length)}`);
-          } else if (token === 'user@secret-host.invalid') {
-            expect(result).toBe(
-              length >= 16
-                ? `${prefix}user@[host]`
-                : length >= 8
-                  ? `${prefix}user@`
-                  : `${prefix}${'user@'.slice(0, length)}`,
-            );
           } else {
-            expect(result).toBe(`${prefix}${token.slice(0, length)}`);
+            expect(result).not.toContain('user@');
+            expect(result).not.toContain('2001:db8::1');
+            expect(result).toBe(length >= 6 ? `${prefix}[host]` : prefix);
           }
         }
       }
@@ -100,13 +95,20 @@ describe('bounded model projections', () => {
     expect(modelTitle('汉'.repeat(20_000), 'fixture-host')).toBe('汉'.repeat(512));
     expect(modelText('汉'.repeat(40_000), 'fixture-host')).toBe('汉'.repeat(32_768));
 
-    expect(modelTitle(`${'a'.repeat(505)}secret-host.invalid`, 'secret-host.invalid')).toBe(`${'a'.repeat(505)}<host>`);
-    expect(modelTitle(`${'a'.repeat(509)}secret-host.invalid`, 'secret-host.invalid')).toBe('a'.repeat(509));
-    expect(modelText(`${'a'.repeat(32_760)}https://secret-host.invalid/p`, 'secret-host.invalid')).toBe(
-      `${'a'.repeat(32_760)}`,
+    expect(modelTitle(`${'a'.repeat(505)}secret-host.invalid`, 'secret-host.invalid')).toBe('<host>');
+    expect(modelTitle(`${'a'.repeat(509)}secret-host.invalid`, 'secret-host.invalid')).toBe('<host>');
+    expect(modelText(`${'a'.repeat(32_760)}https://secret-host.invalid/p`, 'secret-host.invalid')).toBe('[endpoint]');
+    expect(modelText(`${'a'.repeat(32_758)}https://secret-host.invalid/p`, 'secret-host.invalid')).toBe('[endpoint]');
+
+    expect(modelTitle(`${'a'.repeat(504)} secret-host.invalid`, 'secret-host.invalid')).toBe(
+      `${'a'.repeat(504)} <host>`,
     );
-    expect(modelText(`${'a'.repeat(32_758)}https://secret-host.invalid/p`, 'secret-host.invalid')).toBe(
-      `${'a'.repeat(32_758)}[endpoint]`,
+    expect(modelTitle(`${'a'.repeat(508)} secret-host.invalid`, 'secret-host.invalid')).toBe(`${'a'.repeat(508)} `);
+    expect(modelText(`${'a'.repeat(32_759)} https://secret-host.invalid/p`, 'secret-host.invalid')).toBe(
+      `${'a'.repeat(32_759)} `,
+    );
+    expect(modelText(`${'a'.repeat(32_757)} https://secret-host.invalid/p`, 'secret-host.invalid')).toBe(
+      `${'a'.repeat(32_757)} [endpoint]`,
     );
 
     expect(modelTitle(`https://a.invalid/${'x'.repeat(20_000)} secret-host.invalid`, 'secret-host.invalid')).toBe(

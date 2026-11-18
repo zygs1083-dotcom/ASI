@@ -80,7 +80,13 @@ export class FileStoragePort implements StoragePort {
           const suffix = name.slice(prefix.length);
           if (suffix !== hash && !/^\d{1,20}-[a-f0-9-]{36}$/i.test(suffix)) continue;
           const candidate = join(this.root, name);
-          const content = await this.fs.readFile(candidate);
+          let content: Uint8Array;
+          try {
+            content = await this.fs.readFile(candidate);
+          } catch {
+            if (suffix === hash) hashDamaged = true;
+            continue;
+          }
           if (createHash('sha256').update(content).digest('hex') === hash && Buffer.from(content).equals(bytes)) {
             path = candidate;
             existing = true;

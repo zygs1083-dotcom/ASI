@@ -123,7 +123,7 @@ describe('DSH environment delivery', () => {
     expect(modelTitle('ssh user@build-node:22 /Volumes/build-node:22 README.md', 'fixture-host')).toBe(
       'ssh <host> <host> README.md',
     );
-    expect(modelTitle('open /Volumes/backup.example.invalid', 'fixture-host')).toBe('open backup.example.invalid');
+    expect(modelTitle('open /Volumes/backup.example.invalid', 'fixture-host')).toBe('open <host>');
     expect(modelTitle('src/README.md /Volumes/fixture-host ssh user@build-node', 'fixture-host')).toBe(
       'README.md <host> ssh <host>',
     );
