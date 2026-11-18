@@ -72,18 +72,32 @@ export class FileStoragePort implements StoragePort {
       let complete = false;
       try {
         let existing = false;
-        for (const name of await this.fs.readdir(this.root)) {
+        let hashDamaged = false;
+        const names = await this.fs.readdir(this.root);
+        const nameSet = new Set(names);
+        for (const name of names) {
           if (!name.startsWith(prefix)) continue;
           const suffix = name.slice(prefix.length);
           if (suffix !== hash && !/^\d{1,20}-[a-f0-9-]{36}$/i.test(suffix)) continue;
           const candidate = join(this.root, name);
-          const content = await this.fs.readFile(candidate);
+          let content: Uint8Array;
+          try {
+            content = await this.fs.readFile(candidate);
+          } catch {
+            if (suffix === hash) hashDamaged = true;
+            continue;
+          }
           if (createHash('sha256').update(content).digest('hex') === hash && Buffer.from(content).equals(bytes)) {
             path = candidate;
             existing = true;
             break;
           }
-          if (suffix === hash) throw Object.assign(new Error('backup content mismatch'), { code: 'EEXIST' });
+          if (suffix === hash) hashDamaged = true;
+        }
+        if (!existing && hashDamaged) {
+          do {
+            path = `${target}.bak-${Date.now()}-${randomUUID()}`;
+          } while (nameSet.has(basename(path)));
         }
         if (existing) {
           handle = await this.fs.open(path, 'r');

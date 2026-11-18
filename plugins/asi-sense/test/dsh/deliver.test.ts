@@ -112,7 +112,7 @@ describe('DSH environment delivery', () => {
     expect(text).toContain('</env-update>');
     expect(modelText('title on fixture-host.invalid', 'fixture-host.invalid')).toBe('title on [host]');
     expect(modelText('open </private/fixture/report> and "/private/a/file"', 'fixture-host.invalid')).toBe(
-      'open <report> and "file"',
+      'open [path] and [path]',
     );
     expect(modelTitle('open /private/fixture/report.txt on [2001:db8::1]:443', 'fixture-host')).toBe(
       'open report.txt on <host>',
@@ -123,7 +123,7 @@ describe('DSH environment delivery', () => {
     expect(modelTitle('ssh user@build-node:22 /Volumes/build-node:22 README.md', 'fixture-host')).toBe(
       'ssh <host> <host> README.md',
     );
-    expect(modelTitle('open /Volumes/backup.example.invalid', 'fixture-host')).toBe('open backup.example.invalid');
+    expect(modelTitle('open /Volumes/backup.example.invalid', 'fixture-host')).toBe('open [path]');
     expect(modelTitle('src/README.md /Volumes/fixture-host ssh user@build-node', 'fixture-host')).toBe(
       'README.md <host> ssh <host>',
     );
@@ -513,7 +513,7 @@ describe('DSH environment delivery', () => {
     };
     await deliver('session-a', { ...intent(kind), update: windowUpdate });
     const text = JSON.stringify(kind === 'inject' ? await deliver.messages('session-a') : agent[kind].mock.calls);
-    expect(text).toContain('&lt;report&gt; ssh &lt;host&gt; README.md');
+    expect(text).toContain('open [path] ssh &lt;host&gt; README.md');
     expect(text).not.toContain('/private/fixture');
     expect(text).not.toContain('build-node');
   });

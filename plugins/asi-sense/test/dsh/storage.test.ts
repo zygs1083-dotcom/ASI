@@ -112,14 +112,54 @@ describe('atomic file storage', () => {
     expect((await fs.readdir(root)).filter((name) => name.startsWith('settings.json.bak-'))).toEqual([legacy]);
   });
 
-  it('does not reuse or overwrite a damaged hash-named backup', async () => {
+  it('writes a private fallback backup when the hash-named backup is damaged and reuses it idempotently', async () => {
     const { root, port } = await fixture();
-    const name = await port.backup('settings', 'old');
-    await fs.writeFile(join(root, name), 'damaged');
-    await expect(port.backup('settings', 'old')).rejects.toMatchObject({ code: 'EEXIST' });
-    expect(await fs.readFile(join(root, name), 'utf8')).toBe('damaged');
+    const damaged = await port.backup('settings', 'old');
+    await fs.writeFile(join(root, damaged), 'damaged');
+
+    const fallback = await port.backup('settings', 'old');
+    expect(fallback).not.toBe(damaged);
+    expect(fallback).toMatch(/^settings\.json\.bak-\d{1,20}-[a-f0-9-]{36}$/i);
+    expect(await fs.readFile(join(root, fallback), 'utf8')).toBe('old');
+    expect((await fs.stat(join(root, fallback))).mode & 0o777).toBe(0o600);
+    expect(await fs.readFile(join(root, damaged), 'utf8')).toBe('damaged');
     expect(await port.load('settings')).toBe('old');
+
+    expect(await port.backup('settings', 'old')).toBe(fallback);
+    const backups = (await fs.readdir(root)).filter((name) => name.startsWith('settings.json.bak-'));
+    expect(backups.sort()).toEqual([damaged, fallback].sort());
+
+    const orderedPort = new FileStoragePort(
+      root,
+      {
+        ...fs,
+        readdir: async () => [damaged, fallback],
+      },
+      () => {},
+    );
+    expect(await orderedPort.backup('settings', 'old')).toBe(fallback);
+    expect((await fs.readdir(root)).filter((name) => name.startsWith('settings.json.bak-')).sort()).toEqual(
+      [damaged, fallback].sort(),
+    );
+
+    await expect(port.backup('settings', 'changed')).rejects.toMatchObject({ code: 'SNAPSHOT_CHANGED' });
+    expect(await fs.readFile(join(root, damaged), 'utf8')).toBe('damaged');
+    expect(await fs.readFile(join(root, fallback), 'utf8')).toBe('old');
   });
+
+  it.each(['file-open', 'write', 'file-sync', 'file-close', 'rename', 'dir-open', 'dir-sync', 'dir-close'])(
+    'does not install a fallback backup or touch a damaged hash backup after a %s failure',
+    async (fault) => {
+      const { root, port } = await fixture(fault);
+      const seed = new FileStoragePort(root, fs, () => {});
+      const damaged = await seed.backup('settings', 'old');
+      await fs.writeFile(join(root, damaged), 'damaged');
+      await expect(port.backup('settings', 'old')).rejects.toThrow();
+      expect(await fs.readFile(join(root, damaged), 'utf8')).toBe('damaged');
+      expect(await fs.readFile(join(root, 'settings.json'), 'utf8')).toBe('old');
+      expect((await fs.readdir(root)).sort()).toEqual([damaged, 'settings.json'].sort());
+    },
+  );
 
   it.each(['file-open', 'write', 'file-sync', 'file-close', 'rename', 'dir-open', 'dir-sync', 'dir-close'])(
     'does not install a backup after a %s failure',
@@ -130,4 +170,17 @@ describe('atomic file storage', () => {
       expect(await fs.readdir(root)).toEqual(['settings.json']);
     },
   );
+
+  it('avoids colliding with existing fallback backup names returned by readdir', async () => {
+    const { root, port } = await fixture();
+    const damaged = await port.backup('settings', 'old');
+    await fs.writeFile(join(root, damaged), 'damaged');
+    const first = await port.backup('settings', 'old');
+    await fs.writeFile(join(root, first), 'also-damaged');
+    const second = await port.backup('settings', 'old');
+    expect(second).not.toBe(damaged);
+    expect(second).not.toBe(first);
+    expect(await fs.readFile(join(root, first), 'utf8')).toBe('also-damaged');
+    expect(await fs.readFile(join(root, second), 'utf8')).toBe('old');
+  });
 });
