@@ -582,19 +582,23 @@ describe('away detection', () => {
     let wall = T;
     let mono = 10_000;
     const clock = { wall: () => wall, mono: () => mono };
+    const metrics = new MetricTimeline(clock, 'UTC');
+    metrics.record(sample(cpuBody(0.1), wall), wall);
     const emitted: Signal[] = [];
-    const away = new AwayReporter(new MetricTimeline(clock, 'UTC'), clock, (s) => emitted.push(s));
+    const away = new AwayReporter(metrics, clock, (s) => emitted.push(s));
 
     away.observe(sig({ id: 'l1', kind: 'screen.locked', at: wall, subject: 'screen', data: { at: wall } }));
     // Wall clock jumps back 1 hour, while monotonic clock advances 30 minutes.
     wall = T - HOUR + 30 * MINUTE;
     mono += 30 * MINUTE;
+    metrics.record(sample(cpuBody(0.8), wall), wall);
     away.observe(
       sig({ id: 'j1', kind: 'job.failed', at: wall, subject: 'build-task', data: { id: 'build-task', exitCode: 1 } }),
     );
     // Another 35 minutes pass on mono (total 65 minutes away); wall is still <= T + 5m.
     wall += 35 * MINUTE;
     mono += 35 * MINUTE;
+    metrics.record(sample(cpuBody(0.9), wall), wall);
     away.observe(sig({ id: 'u1', kind: 'screen.unlocked', at: wall, subject: 'screen', data: { at: wall } }));
 
     expect(emitted).toHaveLength(1);
@@ -604,13 +608,16 @@ describe('away detection', () => {
       durationMs: 65 * MINUTE,
       lockMs: 65 * MINUTE,
       hasAnomaly: true,
-      anomalies: ['failed-jobs'],
+      anomalies: ['failed-jobs', 'metric-growth'],
       failedCount: 1,
     });
+    const data = emitted[0]?.data as Record<string, unknown>;
+    const cpuTrend = (data.metrics as Array<Record<string, unknown>>).find((m) => m.metric === 'cpu');
+    expect(cpuTrend).toMatchObject({ metric: 'cpu', start: 0.1, end: 0.9, min: 0.1, max: 0.9 });
   });
 
-  it('does not report away when wall jumps forward >=1h while monotonic clock elapsed <1h', () => {
-    const T = Date.UTC(2026, 10, 18, 12, 0, 0);
+  it('reports an 8-hour sleep away episode when wall advances 8h while monotonic clock pauses', () => {
+    const T = Date.UTC(2026, 10, 18, 23, 0, 0);
     let wall = T;
     let mono = 10_000;
     const clock = { wall: () => wall, mono: () => mono };
@@ -618,10 +625,242 @@ describe('away detection', () => {
     const away = new AwayReporter(new MetricTimeline(clock, 'UTC'), clock, (s) => emitted.push(s));
 
     away.observe(sig({ id: 'l1', kind: 'screen.locked', at: wall, subject: 'screen', data: { at: wall } }));
-    wall += 2 * HOUR;
-    mono += 30 * MINUTE;
+    wall += 1_000;
+    mono += 1_000;
+    away.observe(sig({ id: 's1', kind: 'system.sleep', at: wall, subject: 'system', data: { at: wall } }));
+    away.observe(
+      sig({
+        id: 'c1',
+        kind: 'body.threshold',
+        at: wall,
+        source: { id: 'body', api: 'probe', host: 'local' },
+        subject: 'thermal',
+        data: { severity: 'critical', value: 'critical' },
+      }),
+    );
+    wall += 8 * HOUR;
+    mono += 2_000;
+    away.observe(
+      sig({ id: 'w1', kind: 'system.wake', at: wall, subject: 'system', data: { at: wall, durationMs: 8 * HOUR } }),
+    );
+    wall += 2_000;
+    mono += 2_000;
+    away.observe(
+      sig({
+        id: 'u1',
+        kind: 'screen.unlocked',
+        at: wall,
+        subject: 'screen',
+        data: { at: wall, durationMs: 8 * HOUR + 3_000 },
+      }),
+    );
+
+    expect(emitted).toHaveLength(1);
+    expect(emitted[0]?.data).toMatchObject({
+      awayFrom: T,
+      returnAt: T + 8 * HOUR + 3_000,
+      durationMs: 8 * HOUR + 3_000,
+      sleepMs: 8 * HOUR,
+      lockMs: 8 * HOUR + 3_000,
+      hasAnomaly: true,
+      anomalies: ['alerts'],
+      alerts: [{ metric: 'thermal', severity: 'critical', count: 1 }],
+    });
+  });
+
+  it('clamps returnAt >= awayFrom and preserves metric trends when wall rolls back 2 hours during a 1.5h away', () => {
+    const T = Date.UTC(2026, 10, 18, 12, 0, 0);
+    let wall = T;
+    let mono = 10_000;
+    const clock = { wall: () => wall, mono: () => mono };
+    const metrics = new MetricTimeline(clock, 'UTC');
+    metrics.record(sample(cpuBody(0.1), wall), wall);
+    const emitted: Signal[] = [];
+    const away = new AwayReporter(metrics, clock, (s) => emitted.push(s));
+
+    away.observe(sig({ id: 'l1', kind: 'screen.locked', at: wall, subject: 'screen', data: { at: wall } }));
+    wall = T - 2 * HOUR + 90 * MINUTE;
+    mono += 90 * MINUTE;
+    metrics.record(sample(cpuBody(0.9), wall), wall);
     away.observe(sig({ id: 'u1', kind: 'screen.unlocked', at: wall, subject: 'screen', data: { at: wall } }));
 
-    expect(emitted).toHaveLength(0);
+    expect(emitted).toHaveLength(1);
+    const data = emitted[0]?.data as Record<string, unknown>;
+    expect(data.awayFrom).toBe(T);
+    expect(data.durationMs).toBe(90 * MINUTE);
+    expect(data.returnAt).toBe(T + 90 * MINUTE);
+    expect(data.returnAt as number).toBeGreaterThanOrEqual(data.awayFrom as number);
+    expect(data.hasAnomaly).toBe(true);
+    expect(data.anomalies).toEqual(['metric-growth']);
+    const cpuTrend = (data.metrics as Array<Record<string, unknown>>).find((m) => m.metric === 'cpu');
+    expect(cpuTrend).toMatchObject({ metric: 'cpu', start: 0.1, end: 0.9, min: 0.1, max: 0.9 });
+  });
+
+  it('ignores same-bucket pre-away fluctuations and starts trend from post-away samples', () => {
+    const T = Date.UTC(2026, 10, 18, 9, 0, 0);
+    let wall = T;
+    let mono = 10_000;
+    const clock = { wall: () => wall, mono: () => mono };
+    const metrics = new MetricTimeline(clock, 'UTC');
+    metrics.record(sample(cpuBody(0.1), T + MINUTE), T + MINUTE);
+    metrics.record(sample(cpuBody(0.5), T + 2 * MINUTE), T + 2 * MINUTE);
+    const emitted: Signal[] = [];
+    const away = new AwayReporter(metrics, clock, (s) => emitted.push(s));
+
+    wall = T + 3 * MINUTE;
+    away.observe(sig({ id: 'l1', kind: 'screen.locked', at: wall, subject: 'screen', data: { at: wall } }));
+    wall = T + 70 * MINUTE;
+    mono += 67 * MINUTE;
+    metrics.record(sample(cpuBody(0.5), wall), wall);
+    away.observe(sig({ id: 'u1', kind: 'screen.unlocked', at: wall, subject: 'screen', data: { at: wall } }));
+
+    expect(emitted).toHaveLength(1);
+    const data = emitted[0]?.data as Record<string, unknown>;
+    expect(data.hasAnomaly).toBe(false);
+    expect(data.anomalies).toEqual([]);
+    const cpuTrend = (data.metrics as Array<Record<string, unknown>>).find((m) => m.metric === 'cpu');
+    expect(cpuTrend).toMatchObject({ metric: 'cpu', start: 0.5, end: 0.5, min: 0.5, max: 0.5 });
+
+    // Also when a post-away sample exists later in the same starting 5m bucket, start from that sample.
+    const metrics2 = new MetricTimeline({ wall: () => wall, mono: () => mono }, 'UTC');
+    const emitted2: Signal[] = [];
+    const away2 = new AwayReporter(metrics2, { wall: () => wall, mono: () => mono }, (s) => emitted2.push(s));
+    wall = T;
+    mono = 10_000;
+    metrics2.record(sample(cpuBody(0.1), T + MINUTE), T + MINUTE);
+    wall = T + 3 * MINUTE;
+    away2.observe(sig({ id: 'l2', kind: 'screen.locked', at: wall, subject: 'screen', data: { at: wall } }));
+    wall = T + 4 * MINUTE;
+    mono += MINUTE;
+    metrics2.record(sample(cpuBody(0.5), wall), wall);
+    wall = T + 70 * MINUTE;
+    mono += 66 * MINUTE;
+    metrics2.record(sample(cpuBody(0.55), wall), wall);
+    away2.observe(sig({ id: 'u2', kind: 'screen.unlocked', at: wall, subject: 'screen', data: { at: wall } }));
+
+    expect(emitted2).toHaveLength(1);
+    const data2 = emitted2[0]?.data as Record<string, unknown>;
+    expect(data2.hasAnomaly).toBe(false);
+    const cpuTrend2 = (data2.metrics as Array<Record<string, unknown>>).find((m) => m.metric === 'cpu');
+    expect(cpuTrend2).toMatchObject({ metric: 'cpu', start: 0.5, end: 0.55, min: 0.5, max: 0.55 });
+  });
+
+  it('preserves budget-downgraded away.summary when batched with older context events over 2KB', async () => {
+    const T = Date.UTC(2026, 10, 18, 9, 0, 0);
+    let wall = T;
+    let mono = 10_000;
+    const clock = { wall: () => wall, mono: () => mono };
+    const delivered: Parameters<DshPort['deliver']>[1][] = [];
+    const dsh: DshPort = {
+      onAgentEvent: () => () => {},
+      onTool: () => () => {},
+      onJob: () => () => {},
+      deliver: async (_session, intent) => {
+        delivered.push(intent);
+      },
+      tokenSnapshot: async () => undefined,
+    };
+    let attention: RuntimeAttention;
+    const away = new AwayReporter(new MetricTimeline(clock, 'UTC'), clock, (s) => {
+      queueMicrotask(() => {
+        void attention.accept(s);
+      });
+    });
+    attention = new RuntimeAttention(
+      clock,
+      dsh,
+      () => [...DEFAULT_RULES],
+      () => {},
+      () => true,
+      () => {},
+      new FactExpiry(clock),
+      undefined,
+      undefined,
+      undefined,
+      'darwin',
+      (s) => away.observe(s),
+    );
+    attention.create('s1');
+    await attention.preStep('s1', false, false);
+    attention.postStep('s1');
+
+    await attention.accept(
+      sig({
+        id: 'l1',
+        kind: 'screen.locked',
+        at: wall,
+        source: { id: 'helper', api: 'ndjson', host: 'local' },
+        subject: 'screen',
+        data: { at: wall },
+      }),
+    );
+    wall += 69 * MINUTE;
+    mono += 69 * MINUTE;
+    await attention.accept(
+      sig({
+        id: 'w-prev',
+        kind: 'job.failed',
+        at: wall,
+        source: { id: 'user', api: 'shell', host: 'local' },
+        subject: 'build',
+        data: { id: 'build', exitCode: 1 },
+      }),
+    );
+    mono += 2_001;
+    wall += 2_001;
+    await attention.pipeline.flush();
+
+    for (let i = 0; i < 12; i++) {
+      wall += 100;
+      mono += 100;
+      const p = `src/mod-${i}/${'deep-subdir-'.repeat(12)}file-${i}.ts`;
+      await attention.accept(
+        sig({
+          id: `fc-${i}`,
+          kind: 'file.changed',
+          at: wall,
+          source: { id: 'files', api: 'watch', host: 'local' },
+          subject: p,
+          data: { path: p, change: 'modify' },
+        }),
+      );
+    }
+    wall += 1_000;
+    mono += 1_000;
+    await attention.accept(
+      sig({
+        id: 'crit-1',
+        kind: 'body.threshold',
+        at: wall,
+        source: { id: 'body', api: 'probe', host: 'local' },
+        subject: 'thermal',
+        data: { severity: 'critical', value: 'critical' },
+      }),
+    );
+    wall += 1_000;
+    mono += 1_000;
+    await attention.accept(
+      sig({
+        id: 'u1',
+        kind: 'screen.unlocked',
+        at: wall,
+        source: { id: 'helper', api: 'ndjson', host: 'local' },
+        subject: 'screen',
+        data: { at: wall },
+      }),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    mono += 3_000;
+    wall += 3_000;
+    await attention.pipeline.flush();
+    await attention.preStep('s1', false, true);
+
+    const inject = delivered.find((item) => item.kind === 'inject');
+    expect(inject).toBeDefined();
+    expect(inject?.update.changes).toHaveLength(13);
+    const formatted = formatEnvUpdate(modelUpdate(inject!.update));
+    expect(Buffer.byteLength(formatted, 'utf8')).toBeLessThanOrEqual(2048);
+    expect(formatted).toContain('away.summary:');
+    expect(formatted).toContain('alerts=1');
   });
 });

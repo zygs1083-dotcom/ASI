@@ -378,4 +378,60 @@ describe('daily summary metric extension', () => {
       expect(dstTimeline.dailyExtension(date)?.hours).toHaveLength(expectedHours);
     }
   });
+
+  it('starts trend from the first sample at or after from within the bucket, falls through to the next bucket, and excludes samples after to', () => {
+    const T = Date.UTC(2026, 10, 18, 9, 0, 0);
+    const { clock: c } = clock(T + 5_000_000);
+    const timeline = new MetricTimeline(c, 'UTC');
+    timeline.record(fresh({ cpu: cpuBody(0.1).cpu }, T + 60_000), T + 60_000);
+    timeline.record(fresh({ cpu: cpuBody(0.4).cpu }, T + 120_000), T + 120_000);
+    timeline.record(fresh({ cpu: cpuBody(0.5).cpu }, T + 240_000), T + 240_000);
+    timeline.record(fresh({ cpu: cpuBody(0.55).cpu }, T + 4_200_000), T + 4_200_000);
+    timeline.record(fresh({ cpu: cpuBody(0.95).cpu }, T + 4_260_000), T + 4_260_000);
+
+    // Within first bucket: start at 0.5 (T+240s), ignore 0.1/0.4 before T+180s, and ignore 0.95 after T+4200s.
+    expect(timeline.trend('cpu', T + 180_000, T + 4_200_000)).toMatchObject({
+      start: 0.5,
+      end: 0.55,
+      min: 0.5,
+      max: 0.55,
+      samples: 2,
+    });
+
+    // No sample >= T+250s in the first bucket -> falls through to the next bucket at T+4200s.
+    expect(timeline.trend('cpu', T + 250_000, T + 4_200_000)).toMatchObject({
+      start: 0.55,
+      end: 0.55,
+      min: 0.55,
+      max: 0.55,
+      samples: 1,
+    });
+  });
+
+  it('preserves monotonic order and excludes pre-away samples in overlapped wall buckets during a 2h wall rollback', () => {
+    const T = Date.UTC(2026, 10, 18, 12, 0, 0);
+    let wall = T - 30 * 60_000;
+    let mono = 1_000;
+    const timeline = new MetricTimeline({ wall: () => wall, mono: () => mono }, 'UTC');
+    // Pre-away reading in the 11:30 bucket before rollback.
+    timeline.record(fresh({ cpu: cpuBody(0.05).cpu }, wall), wall);
+
+    wall = T;
+    mono = 10_000;
+    timeline.record(fresh({ cpu: cpuBody(0.2).cpu }, wall), wall);
+
+    // Wall jumps back 2h while mono advances 90m -> lands back in 11:30 bucket.
+    wall = T - 2 * 3_600_000 + 90 * 60_000;
+    mono += 90 * 60_000;
+    timeline.record(fresh({ cpu: cpuBody(0.8).cpu }, wall), wall);
+
+    const trend = timeline.trend('cpu', T, T + 90 * 60_000, { from: 10_000, to: mono });
+    expect(trend).toMatchObject({
+      start: 0.2,
+      end: 0.8,
+      min: 0.2,
+      max: 0.8,
+      samples: 2,
+    });
+  });
 });
