@@ -50,6 +50,8 @@ interface MetricBucket {
   start: number;
   samples: number;
   metrics: Partial<Record<MetricKey, MetricStats>>;
+  /** First/last raw sample per metric, used for away start/end values (not persisted). */
+  edges?: Partial<Record<MetricKey, { first: number; last: number }>>;
   diskTotal?: number;
 }
 
@@ -131,9 +133,14 @@ function addValue(stats: MetricStats | undefined, value: number, count = 1): Met
   return {
     min: Math.min(stats.min, value),
     max: Math.max(stats.max, value),
-    avg: (stats.avg * stats.count + value * count) / next,
+    avg: roundAvg((stats.avg * stats.count + value * count) / next),
     count: next,
   };
+}
+
+/** Trims binary floating-point noise so repeated averages stay exact decimals. */
+function roundAvg(value: number): number {
+  return Math.round(value * 1e9) / 1e9;
 }
 
 function mergeStats(target: MetricStats | undefined, source: MetricStats): MetricStats {
@@ -142,7 +149,7 @@ function mergeStats(target: MetricStats | undefined, source: MetricStats): Metri
   return {
     min: Math.min(target.min, source.min),
     max: Math.max(target.max, source.max),
-    avg: (target.avg * target.count + source.avg * source.count) / count,
+    avg: roundAvg((target.avg * target.count + source.avg * source.count) / count),
     count,
   };
 }
@@ -212,7 +219,11 @@ export class MetricTimeline {
     bucket.samples += 1;
     for (const key of METRIC_KEYS) {
       const value = values[key];
-      if (value !== undefined) bucket.metrics[key] = addValue(bucket.metrics[key], value);
+      if (value === undefined) continue;
+      bucket.metrics[key] = addValue(bucket.metrics[key], value);
+      const edge = bucket.edges?.[key];
+      if (edge) edge.last = value;
+      else bucket.edges = { ...bucket.edges, [key]: { first: value, last: value } };
     }
     if (diskTotal !== undefined) bucket.diskTotal = diskTotal;
     this.buckets.set(start, bucket);
@@ -275,7 +286,7 @@ export class MetricTimeline {
         at,
         min: group.min,
         max: group.max,
-        avg: group.count > 0 ? group.sum / group.count : group.min,
+        avg: group.count > 0 ? roundAvg(group.sum / group.count) : group.min,
         count: group.count,
       }));
     const truncated = points.length > MAX_METRIC_POINTS;
@@ -305,8 +316,8 @@ export class MetricTimeline {
   trend(metric: MetricKey, from: number, to: number): MetricTrend | undefined {
     if (!finite(from) || !finite(to) || to < from) return undefined;
     const starts = [...this.buckets.keys()].sort((a, b) => a - b);
-    let first: { bucket: MetricBucket; stats: MetricStats } | undefined;
-    let last: { bucket: MetricBucket; stats: MetricStats } | undefined;
+    let first: { bucket: MetricBucket; stats: MetricStats; value: number } | undefined;
+    let last: { bucket: MetricBucket; stats: MetricStats; value: number } | undefined;
     let min = Number.POSITIVE_INFINITY;
     let max = Number.NEGATIVE_INFINITY;
     let samples = 0;
@@ -317,8 +328,9 @@ export class MetricTimeline {
       const bucket = this.buckets.get(start);
       const stats = bucket?.metrics[metric];
       if (!bucket || !stats) continue;
-      if (!first) first = { bucket, stats };
-      last = { bucket, stats };
+      const edge = bucket.edges?.[metric];
+      if (!first) first = { bucket, stats, value: edge?.first ?? stats.avg };
+      last = { bucket, stats, value: edge?.last ?? stats.avg };
       min = Math.min(min, stats.min);
       max = Math.max(max, stats.max);
       samples += stats.count;
@@ -332,23 +344,23 @@ export class MetricTimeline {
     const result: MetricTrend = {
       metric,
       unit: METRIC_UNITS[metric],
-      start: first.stats.avg,
-      end: last.stats.avg,
+      start: first.value,
+      end: last.value,
       min,
       max,
       samples,
     };
     if (metric === 'disk') {
       if (first.bucket.diskTotal !== undefined && first.bucket.diskTotal > 0) {
-        result.ratioStart = first.stats.avg / first.bucket.diskTotal;
+        result.ratioStart = first.value / first.bucket.diskTotal;
       }
       if (last.bucket.diskTotal !== undefined && last.bucket.diskTotal > 0) {
-        result.ratioEnd = last.stats.avg / last.bucket.diskTotal;
+        result.ratioEnd = last.value / last.bucket.diskTotal;
       }
       if (ratioMin !== Number.POSITIVE_INFINITY) result.ratioMin = ratioMin;
     } else if (metric === 'battery') {
-      result.ratioStart = first.stats.avg / 100;
-      result.ratioEnd = last.stats.avg / 100;
+      result.ratioStart = first.value / 100;
+      result.ratioEnd = last.value / 100;
       if (ratioMin !== Number.POSITIVE_INFINITY) result.ratioMin = ratioMin;
     }
     return result;

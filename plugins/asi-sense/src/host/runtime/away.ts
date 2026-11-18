@@ -187,7 +187,7 @@ export class AwayReporter {
             trend.ratioStart === undefined || trend.ratioStart >= threshold.warn || trend.ratioMin < trend.ratioStart;
           if (trend.ratioMin < threshold.warn && worsened) anomalies.add('metric-warning');
         }
-      } else if (trend.start > 0 && (trend.end - trend.start) / trend.start >= AWAY_GROWTH_RATIO) {
+      } else if (trend.start > 0 && (trend.end - trend.start) / trend.start >= AWAY_GROWTH_RATIO - 1e-9) {
         anomalies.add('metric-growth');
       }
     }

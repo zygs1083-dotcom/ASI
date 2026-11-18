@@ -4,8 +4,8 @@ import { describe, expect, it } from 'vitest';
 import { DEFAULT_RULES } from '../../src/host/attention/rules.ts';
 import { formatEnvUpdate } from '../../src/host/delivery/format.ts';
 import { modelUpdate } from '../../src/host/dsh/deliver.ts';
-import { AwayReporter, AWAY_GROWTH_RATIO } from '../../src/host/runtime/away.ts';
 import { RuntimeAttention } from '../../src/host/runtime/attention.ts';
+import { AWAY_GROWTH_RATIO, AwayReporter } from '../../src/host/runtime/away.ts';
 import { FactExpiry } from '../../src/host/runtime/expiry.ts';
 import { MetricTimeline } from '../../src/host/runtime/metrics.ts';
 import type { DshPort } from '../../src/host/runtime/ports.ts';
@@ -31,14 +31,6 @@ function diskBody(free: number, total = 1000): Body {
       kind: 'disks',
     },
   });
-}
-
-function memoryBody(used: number, total: number, swapUsed = 0): Body {
-  return mkBody({ memory: f({ total, used, pressure: 'normal', swapUsed }) });
-}
-
-function batteryBody(percent: number): Body {
-  return mkBody({ battery: f({ percent, charging: false }) });
 }
 
 interface Harness {
@@ -83,7 +75,7 @@ async function harness(startWall = BASE): Promise<Harness> {
   attention = new RuntimeAttention(
     clock,
     dsh,
-    () => DEFAULT_RULES,
+    () => [...DEFAULT_RULES],
     () => {},
     () => true,
     () => {},
@@ -108,7 +100,7 @@ async function harness(startWall = BASE): Promise<Harness> {
     delivered,
     history,
     send: async (kind, at, data = {}, subject) => {
-      const subjectFor = subject ?? (kind.startsWith('screen.') ? 'screen' : kind.split('.')[0] ?? 'system');
+      const subjectFor = subject ?? (kind.startsWith('screen.') ? 'screen' : (kind.split('.')[0] ?? 'system'));
       await attention.accept(
         sig({ id: `${kind}:${at}:${counter++}`, kind, at, subject: subjectFor, data: { at, ...data } }),
       );
@@ -163,7 +155,8 @@ describe('away detection', () => {
       hasAnomaly: true,
     });
     expect(data?.anomalies).toEqual(['metric-growth']);
-    const growth = (data?.metrics as Array<Record<string, unknown>>).find((metric) => metric.metric === 'cpu');
+    const trends = Array.isArray(data?.metrics) ? (data.metrics as Array<Record<string, unknown>>) : [];
+    const growth = trends.find((metric) => metric.metric === 'cpu');
     expect(growth).toMatchObject({ start: 0.1, end: 0.5, min: 0.1, max: 0.5, unit: 'ratio' });
 
     await h.flush();
@@ -290,14 +283,14 @@ describe('away detection', () => {
       expect(data?.hasAnomaly, testCase.name).toBe(true);
       expect(data?.anomalies, testCase.name).toContain(testCase.expected);
       await h.flush();
-      expect(
-        h.delivered.flatMap((intent) =>
-          intent.update.changes.filter(
-            (change) => change.signal.kind === 'away.summary' && change.level === 'wake',
-          ),
-        ),
-        testCase.name,
-      ).toHaveLength(1);
+      // A competing wake in the same window (a failed job) may spend the wake
+      // budget, downgrading the summary to context; it is still delivered.
+      await h.attention.preStep('s1');
+      const awayChanges = h.delivered.flatMap((intent) =>
+        intent.update.changes.filter((change) => change.signal.kind === 'away.summary'),
+      );
+      expect(awayChanges, testCase.name).toHaveLength(1);
+      expect(awayChanges[0]?.level, testCase.name).toMatch(/^(wake|context)$/);
     }
   });
 

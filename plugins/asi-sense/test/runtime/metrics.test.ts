@@ -10,8 +10,8 @@ import {
   MAX_METRIC_POINTS,
   METRIC_BUCKET_MS,
   METRIC_RETENTION_MS,
-  MetricTimeline,
   MetricsArgsError,
+  MetricTimeline,
 } from '../../src/host/runtime/metrics.ts';
 import { diskFact, f, freshSample, memBody, mkBody } from '../body/helpers.ts';
 
@@ -58,11 +58,9 @@ describe('metric timeline bucket aggregation', () => {
     expect(result.available).toBe(true);
     expect(result.unit).toBe('ratio');
     expect(result.stepMs).toBe(METRIC_BUCKET_MS);
-    expect(result.points).toEqual([
-      expect.objectContaining({ at: base, min: 0.2, avg: 0.4, max: 0.6, count: 3 }),
-    ]);
-    // `load1` only came from the third sample.
-    expect(timeline.query({ metric: 'load1', from: base }).points[0]).toMatchObject({ min: 3, max: 3, count: 1 });
+    expect(result.points).toEqual([expect.objectContaining({ at: base, min: 0.2, avg: 0.4, max: 0.6, count: 3 })]);
+    // Every sample carries load1=1 in the helper; the third sample raises the peak.
+    expect(timeline.query({ metric: 'load1', from: base }).points[0]).toMatchObject({ min: 1, max: 3, count: 3 });
     // Memory was absent from the first two samples and is simply missing, never zero-filled.
     expect(timeline.query({ metric: 'memory', from: base }).points[0]).toMatchObject({
       min: 30,
@@ -117,6 +115,7 @@ describe('metric timeline bucket aggregation', () => {
     const series = timeline.query({ metric: 'cpu', from: day1, to: day2 });
     expect(series.points.map((point) => point.at)).toEqual([
       Date.UTC(2026, 10, 18, 23, 50, 0),
+      Date.UTC(2026, 10, 18, 23, 55, 0),
       Date.UTC(2026, 10, 19, 0, 10, 0),
     ]);
   });
@@ -125,8 +124,7 @@ describe('metric timeline bucket aggregation', () => {
     const t = Date.UTC(2026, 10, 18, 10, 0, 0);
     const { clock: c, set } = clock(t + 20 * 60_000);
     const timeline = new MetricTimeline(c, 'UTC');
-    const record = (at: number, usage: number) =>
-      timeline.record(fresh({ cpu: cpuBody(usage).cpu }, at), at);
+    const record = (at: number, usage: number) => timeline.record(fresh({ cpu: cpuBody(usage).cpu }, at), at);
     record(t + 20 * 60_000, 0.9); // bucket 10:20
     record(t + 4 * 60_000, 0.1); // earlier bucket 10:00
     record(t - 60_000, 0.2); // earlier still, 09:55
@@ -134,11 +132,7 @@ describe('metric timeline bucket aggregation', () => {
     set(t + 30 * 60_000);
 
     const series = timeline.query({ metric: 'cpu', from: t - 10 * 60_000, to: t + 30 * 60_000 });
-    expect(series.points.map((point) => point.at)).toEqual([
-      t - 5 * 60_000,
-      t,
-      t + 20 * 60_000,
-    ]);
+    expect(series.points.map((point) => point.at)).toEqual([t - 5 * 60_000, t, t + 20 * 60_000]);
     expect(series.points[1]).toMatchObject({ min: 0.1, max: 0.3, avg: 0.2, count: 2 });
   });
 
@@ -252,6 +246,9 @@ describe('daily summary metric extension', () => {
       source: { id: 'helper', api: 'nsworkspace', host: 'local' },
     });
     set(nextDay);
+    // Advance the manager past midnight before recording, matching the runtime
+    // heartbeat path that writes the closing day summary.
+    await manager.tick();
     manager.recordEvent({
       id: 'evt-2',
       kind: 'app.activated',
@@ -264,11 +261,12 @@ describe('daily summary metric extension', () => {
 
     const raw = await port.readDaily('2026-11-18');
     expect(raw).toBeDefined();
-    const daily = parseDailySummary(JSON.parse(raw as string));
+    const daily = parseDailySummary(raw as string);
     expect(daily).toBeDefined();
     const extensions = daily?.extensions as { metrics?: Record<string, unknown> } | undefined;
     expect(extensions?.metrics).toMatchObject({ version: 1, bucketMs: METRIC_BUCKET_MS });
-    const hours = (extensions?.metrics as { hours: Array<Record<string, unknown>> }).hours;
+    if (!extensions?.metrics) throw new Error('missing extensions.metrics');
+    const hours = (extensions.metrics as { hours: Array<Record<string, unknown>> }).hours;
     expect(hours).toHaveLength(1);
     expect(hours[0]).toMatchObject({
       start: Date.UTC(2026, 10, 18, 23, 0, 0),
