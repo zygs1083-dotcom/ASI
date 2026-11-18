@@ -11,6 +11,7 @@ import {
   type Runtime,
 } from './project.ts';
 import { createTimeline } from './time.ts';
+import { createTimelineProjector } from './timeline.ts';
 
 type Waiter = (value: IteratorResult<PresenterModel>) => void;
 interface Subscriber {
@@ -53,6 +54,7 @@ export function createPresenter(
   ) as Partial<Record<MetricKey, number>>;
   const history = createHistory(intervals);
   const timeline = createTimeline(runtime, clock);
+  const projectPanelTimeline = createTimelineProjector();
   const subscribers = new Set<Subscriber>();
   let cached: PresenterModel | undefined;
   let published: PresenterModel | undefined;
@@ -70,6 +72,9 @@ export function createPresenter(
     const entries = runtime.events();
     const settings = runtime.rules.settings();
     const { insights, learning } = projectInsights(runtime, samples, clock, intervals, state.self.body, timeline.at);
+    const memFact = state.self.body.memory;
+    const fallbackMemoryTotal = memFact.status === 'ok' ? memFact.value?.total : undefined;
+    const panelTimeline = projectPanelTimeline(runtime, entries, now, fallbackMemoryTotal);
     const next: PresenterModel = {
       target: runtime.target(),
       state,
@@ -82,6 +87,7 @@ export function createPresenter(
       ...settings,
       now,
       sampleIntervalsMs: intervals,
+      ...(panelTimeline ? { timeline: panelTimeline } : {}),
     };
     cached = cached
       ? {

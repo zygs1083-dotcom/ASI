@@ -27,6 +27,24 @@ function fixture() {
     resetTuning: vi.fn(async () => {}),
     retryTuningBackup: vi.fn(async () => {}),
     dismissTuningBackup: vi.fn(async () => {}),
+    listMonths: vi.fn(async () => ['2026-10']),
+    loadMonthly: vi.fn(async (month: string) => ({
+      available: true as const,
+      summary: {
+        month,
+        coveredDays: 30,
+        daysInMonth: 31,
+        topApps: [],
+        wakeCount: 1,
+        alertCount: 0,
+        fileBurstCount: 0,
+        sleepCount: 0,
+        sleepDurationMs: 0,
+        lockDurationMs: 0,
+        observedMs: 1_000,
+      },
+    })),
+    clearHistory: vi.fn(async () => {}),
   };
   const invalidate = vi.fn();
   const frames: FramesSource = Object.assign(async function* () {}, { invalidate });
@@ -118,5 +136,66 @@ describe('DSH remote service', () => {
     }
     expect(actions.addFileExclusion).not.toHaveBeenCalled();
     expect(actions.removeFileExclusion).not.toHaveBeenCalled();
+  });
+
+  it('exposes unary listMonths, loadMonthly, and clearHistory endpoints with validation and owner check', async () => {
+    const { remote, actions, invalidate } = fixture();
+    const methods = remoteMethods(remote);
+    expect(methods).toContainEqual(expect.objectContaining({ method: 'listMonths' }));
+    expect(methods).toContainEqual(expect.objectContaining({ method: 'loadMonthly' }));
+    expect(methods).toContainEqual(expect.objectContaining({ method: 'clearHistory' }));
+
+    await expect(remote.listMonths()).resolves.toEqual(['2026-10']);
+    const loaded = await remote.loadMonthly('2026-10');
+    expect(loaded).toMatchObject({ available: true, summary: { month: '2026-10' } });
+    expect(actions.listMonths).toHaveBeenCalledOnce();
+    expect(actions.loadMonthly).toHaveBeenCalledWith('2026-10');
+    expect(invalidate).not.toHaveBeenCalled();
+
+    for (const bad of ['', '2026', '2026-13', '2026-00', 'bad-month']) {
+      await expect(remote.loadMonthly(bad)).rejects.toBeInstanceOf(RemoteError);
+    }
+    expect(actions.loadMonthly).toHaveBeenCalledTimes(1);
+
+    await remote.clearHistory();
+    expect(actions.clearHistory).toHaveBeenCalledOnce();
+    expect(invalidate).toHaveBeenCalledOnce();
+  });
+
+  it('rejects non-owner principals on listMonths, loadMonthly, and clearHistory', async () => {
+    const ctx = new Context();
+    onTestFinished(() => ctx.fiber.dispose());
+    const inv = ctx.extend({
+      invocation: {
+        peer: { principal: { kind: 'web-session' } },
+      } as never,
+    });
+    const actions: SenseActions = {
+      toggleRule: vi.fn(async () => {}),
+      confirmRule: vi.fn(async () => {}),
+      deleteRule: vi.fn(async () => {}),
+      pause: vi.fn(async () => {}),
+      setSendTitles: vi.fn(async () => {}),
+      openPermissionSettings: vi.fn(async () => {}),
+      revertTuning: vi.fn(async () => ({ applied: true })),
+      lockParam: vi.fn(async () => ({ applied: true })),
+      feedback: vi.fn(async () => ({ applied: true })),
+      acceptRebaseline: vi.fn(async () => ({ applied: true })),
+      resumeTuning: vi.fn(async () => {}),
+      resetTuning: vi.fn(async () => {}),
+      retryTuningBackup: vi.fn(async () => {}),
+      dismissTuningBackup: vi.fn(async () => {}),
+      listMonths: vi.fn(async () => []),
+      loadMonthly: vi.fn(async () => ({ available: false as const, reason: 'none' })),
+      clearHistory: vi.fn(async () => {}),
+    };
+    const frames: FramesSource = Object.assign(async function* () {}, { invalidate: vi.fn() });
+    const remote = new AsiSenseRemote(inv, actions, frames);
+    await expect(remote.listMonths()).rejects.toBeInstanceOf(RemoteError);
+    await expect(remote.loadMonthly('2026-10')).rejects.toBeInstanceOf(RemoteError);
+    await expect(remote.clearHistory()).rejects.toBeInstanceOf(RemoteError);
+    expect(actions.listMonths).not.toHaveBeenCalled();
+    expect(actions.loadMonthly).not.toHaveBeenCalled();
+    expect(actions.clearHistory).not.toHaveBeenCalled();
   });
 });

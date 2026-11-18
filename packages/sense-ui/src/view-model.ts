@@ -269,6 +269,111 @@ export interface LearningState {
   confidence?: number;
 }
 
+/** 单日/单月应用前台使用统计。 */
+export interface TimelineAppSummary {
+  app: string;
+  foregroundMs: number;
+  switches: number;
+}
+
+/** 单日汇总摘要（由 runtime DailySummary / 实时累加器投影）。 */
+export interface TimelineDaySummary {
+  /** 本地日历日期（YYYY-MM-DD）。 */
+  date: string;
+  /** 前台时长 Top 5 应用（按 foregroundMs 降序）。 */
+  topApps: TimelineAppSummary[];
+  /** 唤醒投递次数（deliveries.wake）。 */
+  wakeCount: number;
+  /** 告警次数（bodyAnomalies.total）。 */
+  alertCount: number;
+  /** 文件 burst 次数（fileBursts.events 累计）。 */
+  fileBurstCount: number;
+  /** 系统睡眠次数。 */
+  sleepCount: number;
+  /** 系统睡眠累计时长（ms）。 */
+  sleepDurationMs: number;
+  /** 锁屏累计时长（ms）。 */
+  lockDurationMs: number;
+  /** 观测覆盖时长（ms）。 */
+  observedMs: number;
+}
+
+/**
+ * 24h 指标序列单位：
+ * - `'ratio'`: `0..1` 比例（CPU 利用率、内存已用占比 `used / total`）。
+ * - `'percent'`: `0..100` 百分比（电池电量）。
+ * - `'bytes'`: 字节（磁盘可用空间 `diskFree`、缺内存总量时的已用字节回退）。
+ */
+export type TimelineMetricUnit = 'ratio' | 'percent' | 'bytes';
+export type TimelineMetricKey = 'cpu' | 'memory' | 'disk' | 'battery';
+
+/** 5 分钟桶聚合统计点（`at` 为桶起始 UTC 毫秒；数值单位见所属 TimelineMetricSeries.unit）。 */
+export interface TimelineMetricBucket {
+  at: number;
+  min: number;
+  avg: number;
+  max: number;
+}
+
+export interface TimelineMetricSeries {
+  unit: TimelineMetricUnit;
+  /** 按时间升序排列的 5 分钟桶（24h 最多 288 点）。 */
+  points: TimelineMetricBucket[];
+}
+
+export interface TimelineMetrics {
+  /** CPU 利用率（unit: 'ratio'，0..1）。 */
+  cpu?: TimelineMetricSeries;
+  /** 内存占用占比（unit: 'ratio'，0..1；缺总量时回退为 unit: 'bytes'）。 */
+  memory?: TimelineMetricSeries;
+  /** 磁盘可用空间（unit: 'bytes'）。 */
+  disk?: TimelineMetricSeries;
+  /** 电池电量（unit: 'percent'，0..100）。 */
+  battery?: TimelineMetricSeries;
+}
+
+/** 最近一次离开汇总。 */
+export interface TimelineAwaySummary {
+  awayFrom: number;
+  returnAt: number;
+  durationMs: number;
+  hasAnomaly: boolean;
+  /** 异常条目列表（无异常时为空数组）。 */
+  anomalies: string[];
+  /** 是否已推送给 agent（wake/context 投递）。 */
+  pushed: boolean;
+}
+
+/** 侧栏「历史」区块时间线视图模型。 */
+export interface TimelineState {
+  today?: TimelineDaySummary;
+  yesterday?: TimelineDaySummary;
+  metrics?: TimelineMetrics;
+  lastAway?: TimelineAwaySummary;
+}
+
+/** 月度总结摘要（按需通过 loadMonthly 拉取，不进入每帧）。 */
+export interface MonthlySummaryView {
+  month: string;
+  coveredDays: number;
+  daysInMonth: number;
+  partial?: boolean;
+  pendingDays?: string[];
+  note?: string;
+  topApps: TimelineAppSummary[];
+  wakeCount: number;
+  alertCount: number;
+  fileBurstCount: number;
+  sleepCount: number;
+  sleepDurationMs: number;
+  lockDurationMs: number;
+  observedMs: number;
+}
+
+export type MonthlySummaryLoadResult =
+  | { available: true; summary: MonthlySummaryView }
+  | { available: false; reason: string };
+
 export interface SensePanelModel {
   target?: {
     mode: 'auto' | 'pinned';
@@ -288,6 +393,7 @@ export interface SensePanelModel {
   insights?: Partial<Record<MetricKey, MetricInsight>>;
   learning?: LearningState;
   tuning?: TuningState;
+  timeline?: TimelineState;
 }
 
 export interface SensePanelProps {
@@ -325,6 +431,9 @@ export interface SensePanelProps {
   onAcceptRebaseline: (id: string) => Promise<void>;
   onRetryTuningBackup?: () => Promise<void>;
   onDismissTuningBackup?: () => Promise<void>;
+  onListMonths?: () => Promise<string[]>;
+  onLoadMonthly?: (month: string) => Promise<MonthlySummaryLoadResult>;
+  onClearHistory?: () => Promise<void>;
   tuningCopy?: {
     backupFailed: string;
     saveFailed: string;

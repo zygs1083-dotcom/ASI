@@ -42,6 +42,57 @@ function spreadLabels(marks: { t: SparkThreshold; y: number }[]): { t: SparkThre
   return marks;
 }
 
+export interface RangeBandPoint {
+  at: number;
+  min: number;
+  max: number;
+}
+
+function buildRangeBandPath(
+  points: readonly RangeBandPoint[],
+  xOf: (at: number) => number,
+  yOf: (v: number) => number,
+): string | undefined {
+  if (points.length === 0) return undefined;
+  let minStep = Number.POSITIVE_INFINITY;
+  for (let i = 1; i < points.length; i++) {
+    const dt = points[i]!.at - points[i - 1]!.at;
+    if (dt > 0 && dt < minStep) minStep = dt;
+  }
+  const gapBreakMs = Number.isFinite(minStep) ? Math.max(15 * 60_000, minStep * 2.5) : 15 * 60_000;
+  const parts: string[] = [];
+  let start = 0;
+  while (start < points.length) {
+    let end = start + 1;
+    while (end < points.length && points[end]!.at - points[end - 1]!.at <= gapBreakMs) {
+      end += 1;
+    }
+    const run = points.slice(start, end);
+    if (run.length === 1) {
+      const p = run[0]!;
+      const x = xOf(p.at);
+      const yTop = yOf(Math.max(p.min, p.max));
+      const yBot = yOf(Math.min(p.min, p.max));
+      parts.push(
+        `M${Math.max(0, x - 0.5).toFixed(2)},${yTop.toFixed(2)} L${Math.min(100, x + 0.5).toFixed(2)},${yTop.toFixed(2)} L${Math.min(100, x + 0.5).toFixed(2)},${yBot.toFixed(2)} L${Math.max(0, x - 0.5).toFixed(2)},${yBot.toFixed(2)} Z`,
+      );
+    } else {
+      const top = run.map((p, idx) => {
+        const prefix = idx === 0 ? 'M' : 'L';
+        return `${prefix}${xOf(p.at).toFixed(2)},${yOf(Math.max(p.min, p.max)).toFixed(2)}`;
+      });
+      const bottom: string[] = [];
+      for (let i = run.length - 1; i >= 0; i--) {
+        const p = run[i]!;
+        bottom.push(`L${xOf(p.at).toFixed(2)},${yOf(Math.min(p.min, p.max)).toFixed(2)}`);
+      }
+      parts.push(`${top.join(' ')} ${bottom.join(' ')} Z`);
+    }
+    start = end;
+  }
+  return parts.length > 0 ? parts.join(' ') : undefined;
+}
+
 export interface SparkGeometry {
   since: number;
   dataMin: number;
@@ -51,6 +102,7 @@ export interface SparkGeometry {
   xOf: (at: number) => number;
   yOf: (v: number) => number;
   band: { low: number; high: number } | null;
+  rangeBandPath?: string;
   normalSegs: string[];
   warnSegs: string[];
   critSegs: string[];
@@ -59,8 +111,8 @@ export interface SparkGeometry {
 }
 
 /**
- * 窗口内采样 + 路径几何。x 域固定为 [anchor-300s, anchor]（稀疏点也按真实
- * 时间摆位）；y 域取数据/基线/阈值的并集。越界线段才染告警色；末点保留。
+ * 窗口内采样 + 路径几何。x 域固定为 [anchor-windowMs, anchor]（稀疏点也按真实
+ * 时间摆位）；y 域取数据/min-max 带/基线/阈值的并集。越界线段才染告警色；末点保留。
  * recent < 2 点返回 null（调用方画占位文案）。
  */
 export function buildSpark(
@@ -71,20 +123,42 @@ export function buildSpark(
     thresholds?: SparkThreshold[];
     severity?: Severity;
     expanded?: boolean;
+    windowMs?: number;
+    minMaxBand?: readonly RangeBandPoint[];
   } = {},
 ): { recent: MetricPoint[]; g: SparkGeometry } | null {
   const thresholds = opts.thresholds ?? [];
+  const window =
+    opts.windowMs !== undefined && Number.isFinite(opts.windowMs) && opts.windowMs > 0
+      ? opts.windowMs
+      : HISTORY_WINDOW_MS;
   // 阈值传入采样器：越界/相等迁移的边界点强制保留（含未激活参考线的几何）
-  const recent = sampleHistory(points, anchor, thresholds);
+  const recent = sampleHistory(points, anchor, thresholds, window);
   if (recent.length < 2) return null;
 
-  const since = anchor - HISTORY_WINDOW_MS;
-  // 数据极值只来自观察点（无障碍文案）；绘图域再纳入基线带与阈值线保证可见。
+  const since = anchor - window;
+  const rawBand = opts.minMaxBand
+    ? opts.minMaxBand.filter(
+        (p) =>
+          Number.isFinite(p.at) && Number.isFinite(p.min) && Number.isFinite(p.max) && p.at >= since && p.at <= anchor,
+      )
+    : [];
+  const bandPoints = rawBand.some((p, i) => i > 0 && p.at < rawBand[i - 1]!.at)
+    ? [...rawBand].sort((a, b) => a.at - b.at)
+    : rawBand;
+
+  // 数据极值只来自观察点与 min/max 统计带（无障碍文案）；绘图域再纳入基线带与阈值线保证可见。
   let dataMin = Infinity;
   let dataMax = -Infinity;
   for (const p of recent) {
     if (p.value < dataMin) dataMin = p.value;
     if (p.value > dataMax) dataMax = p.value;
+  }
+  for (const p of bandPoints) {
+    const lo = Math.min(p.min, p.max);
+    const hi = Math.max(p.min, p.max);
+    if (lo < dataMin) dataMin = lo;
+    if (hi > dataMax) dataMax = hi;
   }
   const band =
     opts.baseline && Number.isFinite(opts.baseline.low) && Number.isFinite(opts.baseline.high) ? opts.baseline : null;
@@ -105,8 +179,9 @@ export function buildSpark(
   max += pad;
   const span = max - min;
 
-  const xOf = (at: number) => ((at - since) / HISTORY_WINDOW_MS) * 100;
+  const xOf = (at: number) => ((at - since) / window) * 100;
   const yOf = (v: number) => (1 - (v - min) / span) * 100;
+  const rangeBandPath = buildRangeBandPath(bandPoints, xOf, yOf);
 
   // 逐段拆分：跨越激活阈值线的段在交点切开，越界部分单独着色。
   // 染色上限受行级 severity 约束（good/unknown 全中性，warn 不升 critical），
@@ -159,6 +234,7 @@ export function buildSpark(
       xOf,
       yOf,
       band,
+      ...(rangeBandPath ? { rangeBandPath } : {}),
       normalSegs,
       warnSegs,
       critSegs,

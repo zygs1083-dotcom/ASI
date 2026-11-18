@@ -14,8 +14,14 @@ const BUCKETS = MAX_PLOT_POINTS / 2 - 1; // 119
  * 为软上限（≤240 普通采样 + 不设上限的越界边界点），不静默丢弃 excursion。
  * 同时间戳按输入顺序稳定（仅非非降序时才排序），末点为最晚时间戳的最后点。
  */
-export function sampleHistory(points: MetricPoint[], now: number, thresholds: SparkThreshold[] = []): MetricPoint[] {
-  const since = now - HISTORY_WINDOW_MS;
+export function sampleHistory(
+  points: MetricPoint[],
+  now: number,
+  thresholds: SparkThreshold[] = [],
+  windowMs = HISTORY_WINDOW_MS,
+): MetricPoint[] {
+  const window = Number.isFinite(windowMs) && windowMs > 0 ? windowMs : HISTORY_WINDOW_MS;
+  const since = now - window;
   const valid: MetricPoint[] = [];
   for (const p of points) {
     if (!Number.isFinite(p.at) || !Number.isFinite(p.value) || p.at < since || p.at > now) continue;
@@ -33,7 +39,7 @@ export function sampleHistory(points: MetricPoint[], now: number, thresholds: Sp
 
   const buckets: ({ min: MetricPoint; max: MetricPoint } | undefined)[] = new Array(BUCKETS);
   for (const p of sorted) {
-    const i = Math.min(BUCKETS - 1, Math.floor(((p.at - since) / HISTORY_WINDOW_MS) * BUCKETS));
+    const i = Math.min(BUCKETS - 1, Math.floor(((p.at - since) / window) * BUCKETS));
     const b = buckets[i];
     if (!b) buckets[i] = { min: p, max: p };
     else {

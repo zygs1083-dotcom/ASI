@@ -4,6 +4,7 @@ import { PauseIcon, ShieldIcon } from './icons';
 import css from './panel.module.css';
 import { BodySection } from './sections/body';
 import { EventsSection } from './sections/events';
+import { HistorySection } from './sections/history';
 import { NowSection } from './sections/now';
 import { RulesSection } from './sections/rules';
 import rulesCss from './sections/rules.module.css';
@@ -19,6 +20,7 @@ import type { SensePanelProps } from './view-model';
  */
 export function SensePanel(props: SensePanelProps) {
   const model = useFreshModel(props.model);
+  const [historyOpen, setHistoryOpen] = useState(false);
   const [rulesOpen, setRulesOpen] = useState(false);
   const rulesSummary = useRef<HTMLElement>(null);
   const operations = useTuningOperations(model);
@@ -114,6 +116,19 @@ export function SensePanel(props: SensePanelProps) {
         <summary>事件流</summary>
         <div className={css.sectionBody}>
           <EventsSection model={model} onFeedback={props.onFeedback} />
+        </div>
+      </details>
+
+      <details open={historyOpen} className={css.section} onToggle={(e) => setHistoryOpen(e.currentTarget.open)}>
+        <summary>历史</summary>
+        <div className={css.sectionBody}>
+          <HistorySection
+            model={model}
+            open={historyOpen}
+            onListMonths={props.onListMonths}
+            onLoadMonthly={props.onLoadMonthly}
+            onClearHistory={props.onClearHistory}
+          />
         </div>
       </details>
 

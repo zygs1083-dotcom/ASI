@@ -99,7 +99,7 @@ export function TuningBackupStatus({
   );
 }
 
-function ConfirmAction({
+export function ConfirmAction({
   label,
   confirmLabel,
   message,
@@ -108,6 +108,7 @@ function ConfirmAction({
   operation,
   onOpen,
   onClose,
+  disabled = false,
   cancelLabel = '取消',
   processing = '处理中',
 }: {
@@ -119,6 +120,7 @@ function ConfirmAction({
   operation?: { phase: 'pending' | 'waiting' | 'error' | 'unconfirmed' };
   onOpen?: () => void;
   onClose?: () => void;
+  disabled?: boolean;
   cancelLabel?: string;
   processing?: string;
 }) {
@@ -142,7 +144,7 @@ function ConfirmAction({
         type="button"
         aria-expanded={open}
         aria-describedby={describedBy}
-        disabled={busy}
+        disabled={disabled || busy}
         onClick={() => {
           if (open) cancel.current?.focus();
           else {
@@ -154,7 +156,18 @@ function ConfirmAction({
         {busy ? `${label} · ${processing}` : label}
       </button>
       {open && (
-        <div className={css.confirmation} role="alertdialog" aria-label={label} aria-describedby={messageId}>
+        <div
+          className={css.confirmation}
+          role="alertdialog"
+          aria-label={label}
+          aria-describedby={messageId}
+          onKeyDown={(e) => {
+            if (e.key === 'Escape') {
+              e.stopPropagation();
+              close();
+            }
+          }}
+        >
           <span id={messageId}>{message}</span>
           <div className={css.confirmButtons}>
             <button

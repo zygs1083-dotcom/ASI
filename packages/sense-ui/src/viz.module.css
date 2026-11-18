@@ -73,6 +73,10 @@
   fill: color-mix(in srgb, var(--dsw-alias-state-business-primary, #4176e6) 16%, transparent);
 }
 
+.sparkRangeBand {
+  fill: color-mix(in srgb, var(--dsw-alias-label-secondary, #61666b) 22%, transparent);
+}
+
 .sparkEmpty {
   display: block;
   font-size: var(--sense-fs-s);

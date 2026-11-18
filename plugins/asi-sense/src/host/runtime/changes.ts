@@ -102,5 +102,8 @@ export function observableActions(actions: SenseActions, changed: () => void): S
     resetTuning: () => publish(actions.resetTuning()),
     retryTuningBackup: () => publish(actions.retryTuningBackup()),
     dismissTuningBackup: () => publish(actions.dismissTuningBackup()),
+    listMonths: () => actions.listMonths(),
+    loadMonthly: (month) => actions.loadMonthly(month),
+    clearHistory: () => publish(actions.clearHistory()),
   };
 }

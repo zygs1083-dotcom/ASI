@@ -58,6 +58,8 @@ export class AwayReporter {
   private readonly bursts = new Map<string, AwayDeletion>();
   private startAt?: number;
   private lastAwayEnd?: number;
+  private version = 0;
+  private latest?: { version: number; data: AwaySummaryData };
 
   constructor(
     private readonly metrics: MetricTimeline,
@@ -210,6 +212,7 @@ export class AwayReporter {
       deletedCount: bursts.reduce((sum, burst) => sum + burst.deleted, 0),
     };
     this.lastAwayEnd = returnAt;
+    this.latest = { version: ++this.version, data };
     this.emit({
       id: `away.summary:${awayFrom}:${returnAt}`,
       kind: 'away.summary',
@@ -219,6 +222,17 @@ export class AwayReporter {
       cause: 'user',
       data,
     });
+  }
+
+  lastSummary(): { version: number; data: AwaySummaryData } | undefined {
+    return this.latest;
+  }
+
+  clear(): void {
+    this.reset();
+    this.lastAwayEnd = undefined;
+    this.latest = undefined;
+    this.version += 1;
   }
 
   private reset(): void {
