@@ -1,5 +1,5 @@
 import type { DeliveryLevel, SignalCause, SourceRef } from '@asi/sense-types';
-import { type DayBounds, datesInMonth, daysInMonth } from './time.ts';
+import { type DayBounds, datesInMonth, daysInMonth, parseDateKey, parseMonthKey } from './time.ts';
 import {
   type DailyAppStats,
   type DailyDeliveryCounts,
@@ -68,7 +68,7 @@ function validEta(value: unknown): PersistedEventEntry['currentEta'] | undefined
   };
 }
 
-function toPersistedEvent(raw: Record<string, unknown>): PersistedEventEntry | undefined {
+export function toPersistedEvent(raw: Record<string, unknown>): PersistedEventEntry | undefined {
   if (
     typeof raw.id !== 'string' ||
     !raw.id ||
@@ -103,51 +103,78 @@ function toPersistedEvent(raw: Record<string, unknown>): PersistedEventEntry | u
   return entry;
 }
 
-export function parseHistoryLines(jsonl: string): ParsedHistoryDay {
+export function createHistoryLineParser() {
   const eventsById = new Map<string, PersistedEventEntry>();
   const lifecycle: HistoryLifecycleRecord[] = [];
-  for (const rawLine of jsonl.split('\n')) {
-    const line = rawLine.trim();
-    if (!line) continue;
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(line);
-    } catch {
-      continue;
-    }
-    if (!isRecordObject(parsed)) continue;
-    if (parsed.record === 'lifecycle') {
-      if (
-        VALID_LIFECYCLE.has(parsed.state as HistoryLifecycleState) &&
-        typeof parsed.at === 'number' &&
-        Number.isFinite(parsed.at)
-      ) {
-        lifecycle.push({
-          record: 'lifecycle',
-          state: parsed.state as HistoryLifecycleState,
-          at: parsed.at,
-          ...(typeof parsed.paused === 'boolean' ? { paused: parsed.paused } : {}),
-          ...(typeof parsed.app === 'string' ? { app: parsed.app } : {}),
-          ...(typeof parsed.boot === 'boolean' ? { boot: parsed.boot } : {}),
-        });
+  return {
+    feed(rawLine: string): void {
+      const line = rawLine.trim();
+      if (!line) return;
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(line);
+      } catch {
+        return;
       }
-      continue;
+      if (!isRecordObject(parsed)) return;
+      if (parsed.record === 'lifecycle') {
+        if (
+          VALID_LIFECYCLE.has(parsed.state as HistoryLifecycleState) &&
+          typeof parsed.at === 'number' &&
+          Number.isFinite(parsed.at)
+        ) {
+          lifecycle.push({
+            record: 'lifecycle',
+            state: parsed.state as HistoryLifecycleState,
+            at: parsed.at,
+            ...(typeof parsed.paused === 'boolean' ? { paused: parsed.paused } : {}),
+            ...(typeof parsed.app === 'string' ? { app: parsed.app } : {}),
+            ...(typeof parsed.boot === 'boolean' ? { boot: parsed.boot } : {}),
+          });
+        }
+        return;
+      }
+      if (parsed.record === 'patch') {
+        if (typeof parsed.id !== 'string') return;
+        const existing = eventsById.get(parsed.id);
+        if (!existing) return;
+        if (VALID_LEVELS.has(parsed.level as DeliveryLevel)) existing.level = parsed.level as DeliveryLevel;
+        if (typeof parsed.reason === 'string') existing.reason = parsed.reason;
+        if (parsed.feedback === 'useful' || parsed.feedback === 'noise') existing.feedback = parsed.feedback;
+        return;
+      }
+      if (parsed.record === 'event' || parsed.record === undefined) {
+        const event = toPersistedEvent(parsed);
+        if (event) eventsById.set(event.id, event);
+      }
+    },
+    finish(): ParsedHistoryDay {
+      return { events: [...eventsById.values()], lifecycle };
+    },
+  };
+}
+
+export function parseHistoryLines(jsonl: string): ParsedHistoryDay {
+  const parser = createHistoryLineParser();
+  let start = 0;
+  while (start < jsonl.length) {
+    const nl = jsonl.indexOf('\n', start);
+    if (nl < 0) {
+      parser.feed(jsonl.slice(start));
+      break;
     }
-    if (parsed.record === 'patch') {
-      if (typeof parsed.id !== 'string') continue;
-      const existing = eventsById.get(parsed.id);
-      if (!existing) continue;
-      if (VALID_LEVELS.has(parsed.level as DeliveryLevel)) existing.level = parsed.level as DeliveryLevel;
-      if (typeof parsed.reason === 'string') existing.reason = parsed.reason;
-      if (parsed.feedback === 'useful' || parsed.feedback === 'noise') existing.feedback = parsed.feedback;
-      continue;
-    }
-    if (parsed.record === 'event' || parsed.record === undefined) {
-      const event = toPersistedEvent(parsed);
-      if (event) eventsById.set(event.id, event);
-    }
+    parser.feed(jsonl.slice(start, nl));
+    start = nl + 1;
   }
-  return { events: [...eventsById.values()], lifecycle };
+  return parser.finish();
+}
+
+export async function parseHistoryStream(lines: AsyncIterable<string>): Promise<ParsedHistoryDay> {
+  const parser = createHistoryLineParser();
+  for await (const line of lines) {
+    parser.feed(line);
+  }
+  return parser.finish();
 }
 
 function clamp(value: number, min: number, max: number): number {
@@ -443,7 +470,15 @@ export function summarizeDay(
           : typeof ev.detail?.metric === 'string'
             ? ev.detail.metric
             : ev.subject;
-      const metric = rawMetric.startsWith('disk:') ? `disk:${sanitizeDirPath(rawMetric.slice(5))}` : rawMetric;
+      let metric = rawMetric;
+      if (rawMetric.startsWith('disk:')) {
+        metric = `disk:${sanitizeDirPath(rawMetric.slice(5))}`;
+      } else {
+        const diskIdx = rawMetric.indexOf(':disk:');
+        if (diskIdx >= 0) {
+          metric = `disk:${sanitizeDirPath(rawMetric.slice(diskIdx + 6))}`;
+        }
+      }
       if (metric) bodyAnomalies.byMetric[metric] = (bodyAnomalies.byMetric[metric] ?? 0) + 1;
     }
   }
@@ -466,6 +501,48 @@ export function summarizeDay(
   };
 }
 
+function isFiniteNonNeg(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0;
+}
+
+function isValidAppStats(value: unknown): value is DailyAppStats {
+  return isRecordObject(value) && isFiniteNonNeg(value.foregroundMs) && isFiniteNonNeg(value.switches);
+}
+
+function isValidDeliveryCounts(value: unknown): value is DailyDeliveryCounts {
+  return (
+    isRecordObject(value) &&
+    isFiniteNonNeg(value.wake) &&
+    isFiniteNonNeg(value.context) &&
+    isFiniteNonNeg(value.suppressed)
+  );
+}
+
+function isValidDeliveries(value: unknown): value is DailySummary['deliveries'] {
+  return (
+    isValidDeliveryCounts(value) && allRecordEntriesValid((value as { byRule?: unknown }).byRule, isValidDeliveryCounts)
+  );
+}
+
+function isValidDirStats(value: unknown): value is DailyDirectoryStats {
+  return (
+    isRecordObject(value) &&
+    isFiniteNonNeg(value.events) &&
+    isFiniteNonNeg(value.created) &&
+    isFiniteNonNeg(value.modified) &&
+    isFiniteNonNeg(value.deleted) &&
+    (value.externalDeletionExceeded === undefined || isFiniteNonNeg(value.externalDeletionExceeded))
+  );
+}
+
+function allRecordEntriesValid<T>(value: unknown, check: (entry: unknown) => entry is T): value is Record<string, T> {
+  if (!isRecordObject(value)) return false;
+  for (const item of Object.values(value)) {
+    if (!check(item)) return false;
+  }
+  return true;
+}
+
 export function parseDailySummary(raw: string): DailySummary | undefined {
   let parsed: unknown;
   try {
@@ -473,8 +550,42 @@ export function parseDailySummary(raw: string): DailySummary | undefined {
   } catch {
     return undefined;
   }
-  if (!isRecordObject(parsed) || parsed.version !== 1 || typeof parsed.date !== 'string') return undefined;
-  if (!isRecordObject(parsed.coverage) || !isRecordObject(parsed.deliveries) || !isRecordObject(parsed.bodyAnomalies)) {
+  if (
+    !isRecordObject(parsed) ||
+    parsed.version !== 1 ||
+    typeof parsed.date !== 'string' ||
+    !parseDateKey(parsed.date) ||
+    !isFiniteNonNeg(parsed.dayStartMs) ||
+    !isFiniteNonNeg(parsed.dayEndMs) ||
+    !isFiniteNonNeg(parsed.dayDurationMs) ||
+    !isFiniteNonNeg(parsed.appSwitches) ||
+    !isFiniteNonNeg(parsed.totalEvents)
+  ) {
+    return undefined;
+  }
+  if (parsed.truncatedAtLimit !== undefined && typeof parsed.truncatedAtLimit !== 'boolean') return undefined;
+  if (
+    !isRecordObject(parsed.coverage) ||
+    !isFiniteNonNeg(parsed.coverage.observedMs) ||
+    !isFiniteNonNeg(parsed.coverage.pausedMs) ||
+    !isFiniteNonNeg(parsed.coverage.notRunningMs)
+  ) {
+    return undefined;
+  }
+  if (!allRecordEntriesValid(parsed.apps, isValidAppStats)) return undefined;
+  if (!isValidDeliveries(parsed.deliveries)) {
+    return undefined;
+  }
+  if (!allRecordEntriesValid(parsed.fileBursts, isValidDirStats)) return undefined;
+  if (!allRecordEntriesValid(parsed.fileActivity, isValidDirStats)) return undefined;
+  if (
+    !isRecordObject(parsed.bodyAnomalies) ||
+    !isFiniteNonNeg(parsed.bodyAnomalies.total) ||
+    !isFiniteNonNeg(parsed.bodyAnomalies.threshold) ||
+    !isFiniteNonNeg(parsed.bodyAnomalies.rate) ||
+    !isFiniteNonNeg(parsed.bodyAnomalies.anomaly) ||
+    !allRecordEntriesValid(parsed.bodyAnomalies.byMetric, isFiniteNonNeg)
+  ) {
     return undefined;
   }
   return parsed as unknown as DailySummary;
@@ -487,12 +598,58 @@ export function parseMonthlySummary(raw: string): MonthlySummary | undefined {
   } catch {
     return undefined;
   }
-  if (!isRecordObject(parsed) || parsed.version !== 1 || typeof parsed.month !== 'string') return undefined;
+  if (
+    !isRecordObject(parsed) ||
+    parsed.version !== 1 ||
+    typeof parsed.month !== 'string' ||
+    !parseMonthKey(parsed.month) ||
+    !isFiniteNonNeg(parsed.daysInMonth) ||
+    !isFiniteNonNeg(parsed.coveredDays) ||
+    !isFiniteNonNeg(parsed.appSwitches) ||
+    !isFiniteNonNeg(parsed.totalEvents) ||
+    !isFiniteNonNeg(parsed.generatedAt)
+  ) {
+    return undefined;
+  }
+  if (
+    !Array.isArray(parsed.missingDays) ||
+    !parsed.missingDays.every((d) => typeof d === 'string') ||
+    !Array.isArray(parsed.includedDays) ||
+    !parsed.includedDays.every((d) => typeof d === 'string')
+  ) {
+    return undefined;
+  }
+  if (
+    !isRecordObject(parsed.coverage) ||
+    !isFiniteNonNeg(parsed.coverage.totalDayMs) ||
+    !isFiniteNonNeg(parsed.coverage.observedMs) ||
+    !isFiniteNonNeg(parsed.coverage.pausedMs) ||
+    !isFiniteNonNeg(parsed.coverage.notRunningMs)
+  ) {
+    return undefined;
+  }
+  if (!allRecordEntriesValid(parsed.apps, isValidAppStats)) return undefined;
+  if (!isValidDeliveries(parsed.deliveries)) {
+    return undefined;
+  }
+  if (!allRecordEntriesValid(parsed.fileBursts, isValidDirStats)) return undefined;
+  if (!allRecordEntriesValid(parsed.fileActivity, isValidDirStats)) return undefined;
+  if (
+    !isRecordObject(parsed.bodyAnomalies) ||
+    !isFiniteNonNeg(parsed.bodyAnomalies.total) ||
+    !isFiniteNonNeg(parsed.bodyAnomalies.threshold) ||
+    !isFiniteNonNeg(parsed.bodyAnomalies.rate) ||
+    !isFiniteNonNeg(parsed.bodyAnomalies.anomaly) ||
+    !allRecordEntriesValid(parsed.bodyAnomalies.byMetric, isFiniteNonNeg)
+  ) {
+    return undefined;
+  }
   return parsed as unknown as MonthlySummary;
 }
 
 function mergeDirStats(target: Record<string, DailyDirectoryStats>, source: Record<string, DailyDirectoryStats>): void {
   for (const [dir, stats] of Object.entries(source)) {
+    if (!isRecordObject(stats)) continue;
     const dest = getOrInit<DailyDirectoryStats>(target, dir, () => ({
       events: 0,
       created: 0,
@@ -503,7 +660,11 @@ function mergeDirStats(target: Record<string, DailyDirectoryStats>, source: Reco
     dest.created += finiteCount(stats.created);
     dest.modified += finiteCount(stats.modified);
     dest.deleted += finiteCount(stats.deleted);
-    if (stats.externalDeletionExceeded !== undefined && stats.externalDeletionExceeded > 0) {
+    if (
+      typeof stats.externalDeletionExceeded === 'number' &&
+      Number.isFinite(stats.externalDeletionExceeded) &&
+      stats.externalDeletionExceeded > 0
+    ) {
       dest.externalDeletionExceeded = (dest.externalDeletionExceeded ?? 0) + stats.externalDeletionExceeded;
     }
   }
@@ -553,6 +714,7 @@ export function synthesizeMonth(month: string, dailies: readonly DailySummary[],
     coverage.notRunningMs += finiteCount(d.coverage?.notRunningMs);
 
     for (const [app, stats] of Object.entries(d.apps ?? {})) {
+      if (!isRecordObject(stats)) continue;
       const dest = getOrInit(apps, app, () => ({ foregroundMs: 0, switches: 0 }));
       dest.foregroundMs += finiteCount(stats.foregroundMs);
       dest.switches += finiteCount(stats.switches);
@@ -562,14 +724,15 @@ export function synthesizeMonth(month: string, dailies: readonly DailySummary[],
     deliveries.context += finiteCount(d.deliveries?.context);
     deliveries.suppressed += finiteCount(d.deliveries?.suppressed);
     for (const [ruleId, counts] of Object.entries(d.deliveries?.byRule ?? {})) {
+      if (!isRecordObject(counts)) continue;
       const dest = getOrInit(deliveries.byRule, ruleId, () => ({ wake: 0, context: 0, suppressed: 0 }));
       dest.wake += finiteCount(counts.wake);
       dest.context += finiteCount(counts.context);
       dest.suppressed += finiteCount(counts.suppressed);
     }
 
-    if (d.fileBursts) mergeDirStats(fileBursts, d.fileBursts);
-    if (d.fileActivity) mergeDirStats(fileActivity, d.fileActivity);
+    if (isRecordObject(d.fileBursts)) mergeDirStats(fileBursts, d.fileBursts);
+    if (isRecordObject(d.fileActivity)) mergeDirStats(fileActivity, d.fileActivity);
 
     bodyAnomalies.total += finiteCount(d.bodyAnomalies?.total);
     bodyAnomalies.threshold += finiteCount(d.bodyAnomalies?.threshold);

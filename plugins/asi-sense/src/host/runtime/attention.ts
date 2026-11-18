@@ -255,7 +255,9 @@ export class RuntimeAttention {
         restored: true,
       };
     });
-    this.entries.splice(0, this.entries.length, ...restored);
+    const live = this.entries.filter((entry) => !entry.restored);
+    const combined = [...restored, ...live].slice(-200);
+    this.entries.splice(0, this.entries.length, ...combined);
     this.changed();
   }
   clearEvents(): void {

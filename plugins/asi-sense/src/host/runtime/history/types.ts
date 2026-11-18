@@ -125,12 +125,21 @@ export interface MonthlySummary {
   };
   totalEvents: number;
   generatedAt: number;
+  partial?: boolean;
+}
+
+export interface HistoryUnsafeEntry {
+  kind: 'dir' | 'events' | 'daily' | 'monthly';
+  name: string;
+  code: string;
 }
 
 export interface HistoryStoragePort {
   eventFileSize(date: string): Promise<number>;
   appendEvent(date: string, line: string): Promise<void>;
   readEvents(date: string): Promise<string | undefined>;
+  readEventLines?(date: string): AsyncIterable<string>;
+  readEventLinesDesc?(date: string): AsyncIterable<string>;
   listEventDates(): Promise<string[]>;
   deleteEventDate(date: string): Promise<void>;
 
@@ -143,6 +152,7 @@ export interface HistoryStoragePort {
   writeMonthly(month: string, json: string): Promise<void>;
   listMonthlyMonths(): Promise<string[]>;
 
+  harden?(): Promise<HistoryUnsafeEntry[]>;
   clearAll(): Promise<void>;
 }
 
@@ -173,8 +183,8 @@ export interface SummaryQuery {
 }
 
 export type SummaryQueryResult =
-  | { available: true; summary: MonthlySummary }
-  | { available: false; month: string; reason: string };
+  | { available: true; partial?: boolean; summary: MonthlySummary }
+  | { available: false; partial?: boolean; month: string; reason: string };
 
 export function sanitizeAppName(value: string): string {
   return Array.from(value.replace(/\p{Cc}/gu, ''))

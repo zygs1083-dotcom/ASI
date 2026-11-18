@@ -47,12 +47,11 @@ export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}
   const expiry = new FactExpiry(clock);
   const deliveryPort = deliveryRetry(ports.dsh, clock, () => attention);
   let attentionRef: RuntimeAttention | undefined;
-  let helperRef: HelperSource | undefined;
   const history = new HistoryManager({
     port: ports.history,
     clock,
     isPaused,
-    titlesAllowed: () => allowTitles && (helperRef?.titlesEnabled() ?? true),
+    titlesAllowed: () => allowTitles,
     restoreEntries: (entries) => attentionRef?.restoreEntries(entries),
     clearMemoryEntries: () => attentionRef?.clearEvents(),
     emitSourceError: (error, extra) => {
@@ -147,7 +146,6 @@ export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}
     schedule,
     isPaused,
   );
-  helperRef = helper;
   function schedule(): void {
     if (timer) clearTimeout(timer);
     timer = undefined;

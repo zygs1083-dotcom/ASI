@@ -180,7 +180,11 @@ export function createSenseTools(runtime: Runtime, now: () => number) {
       requireAgent(exec);
       bounded(args);
       try {
-        return modelHistory(await runtime.tools.envHistory(args));
+        let result = await runtime.tools.envHistory(args);
+        if (result.available && result.titlesAllowed && !runtime.rules.settings().sendTitles) {
+          result = await runtime.tools.envHistory(args);
+        }
+        return modelHistory(result);
       } catch (error) {
         if (error instanceof HistoryArgsError) throw new ToolArgsError([error.message]);
         throw error;

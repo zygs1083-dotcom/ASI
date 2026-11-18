@@ -1,12 +1,15 @@
 export { HistoryArgsError, type HistoryEventInput, HistoryManager, type HistoryManagerOptions } from './store.ts';
 export {
+  createHistoryLineParser,
   type ParsedHistoryDay,
   parseDailySummary,
   parseHistoryLines,
+  parseHistoryStream,
   parseMonthlySummary,
   type SummarizeDayOptions,
   summarizeDay,
   synthesizeMonth,
+  toPersistedEvent,
 } from './summarize.ts';
 export {
   addDays,
@@ -36,6 +39,7 @@ export {
   type HistoryQuery,
   type HistoryQueryResult,
   type HistoryStoragePort,
+  type HistoryUnsafeEntry,
   isNonEmptyString,
   MAX_DAILY_EVENT_BYTES,
   MAX_HISTORY_LIMIT,
