@@ -2,9 +2,10 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { performance } from 'node:perf_hooks';
-import type { Body } from '@asi/sense-types';
+import type { Body, Signal } from '@asi/sense-types';
 import { afterEach, describe, expect, it } from 'vitest';
 import { FileHistoryStoragePort } from '../../src/host/dsh/history-storage.ts';
+import { AwayReporter } from '../../src/host/runtime/away.ts';
 import { HistoryManager, LocalCalendar, parseDailySummary } from '../../src/host/runtime/history/index.ts';
 import {
   MAX_METRIC_POINTS,
@@ -14,6 +15,7 @@ import {
   MetricTimeline,
 } from '../../src/host/runtime/metrics.ts';
 import { diskFact, f, freshSample, memBody, mkBody } from '../body/helpers.ts';
+import { sig } from '../helpers.ts';
 
 const tempDirs: string[] = [];
 
@@ -433,5 +435,32 @@ describe('daily summary metric extension', () => {
       max: 0.8,
       samples: 2,
     });
+  });
+
+  it('excludes samples from before a wall-clock rollback so a flat away is not flagged as metric-growth', () => {
+    const MINUTE = 60_000;
+    const T = Date.UTC(2026, 10, 18, 9, 0, 0);
+    let wall = T + 30 * MINUTE;
+    let mono = 5_000;
+    const clock = { wall: () => wall, mono: () => mono };
+    const timeline = new MetricTimeline(clock, 'UTC');
+    // Recorded while the wall clock ran 30m fast, before NTP rolled it back.
+    timeline.record(fresh({ cpu: cpuBody(0.1).cpu }, wall), wall);
+    wall = T;
+    mono = 10_000;
+    const emitted: Signal[] = [];
+    const away = new AwayReporter(timeline, clock, (signal) => emitted.push(signal));
+    away.observe(sig({ id: 'l1', kind: 'screen.locked', at: wall, subject: 'screen', data: { at: wall } }));
+    for (const at of [T + 40 * MINUTE, T + 70 * MINUTE]) {
+      wall = at;
+      mono = 10_000 + (at - T);
+      timeline.record(fresh({ cpu: cpuBody(0.5).cpu }, wall), wall);
+    }
+    away.observe(sig({ id: 'u1', kind: 'screen.unlocked', at: wall, subject: 'screen', data: { at: wall } }));
+
+    const data = emitted[0]?.data as Record<string, unknown>;
+    const cpu = (data.metrics as Array<Record<string, unknown>>).find((m) => m.metric === 'cpu');
+    expect(data.anomalies).toEqual([]);
+    expect(cpu).toMatchObject({ start: 0.5, end: 0.5, min: 0.5, max: 0.5 });
   });
 });

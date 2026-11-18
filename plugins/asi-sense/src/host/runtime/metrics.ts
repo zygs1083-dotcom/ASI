@@ -282,7 +282,10 @@ function visitMatchingSamples(
     if (value === undefined || Number.isNaN(value)) continue;
     const sampleAt = data[base] as number;
     const sampleMono = data[base + 1] as number;
-    const inWall = sampleAt >= from && sampleAt <= to && (!monoBounds || sampleMono <= monoBounds.to);
+    const inWall =
+      sampleAt >= from &&
+      sampleAt <= to &&
+      (!monoBounds || (sampleMono >= monoBounds.from && sampleMono <= monoBounds.to));
     const inMono = monoBounds !== undefined && sampleMono > monoBounds.from && sampleMono <= monoBounds.to;
     if (!inWall && !inMono) continue;
     const diskTotal = bucket.diskTotals ? (bucket.diskTotals[order] ?? bucket.diskTotal) : bucket.diskTotal;
@@ -521,7 +524,8 @@ export class MetricTimeline {
         const stats = bucket.slots[slotIdx];
         if (!stats) continue;
         const wallFullyInside = bucket.start >= from && bucket.start + METRIC_BUCKET_MS - 1 <= to;
-        const monoOk = monoBounds === undefined || bucket.maxMono <= monoBounds.to;
+        const monoOk =
+          monoBounds === undefined || (bucket.minMono >= monoBounds.from && bucket.maxMono <= monoBounds.to);
         if (wallFullyInside && monoOk && !bucket.diskTotals) {
           if (firstValue === undefined) {
             firstValue = stats.first;

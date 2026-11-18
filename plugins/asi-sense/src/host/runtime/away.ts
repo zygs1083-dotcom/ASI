@@ -312,7 +312,7 @@ export class AwayReporter {
       anomalyCount,
       ...(omitted > 0 ? { omitted } : {}),
     };
-    this.lastAwayEndWall = returnWall;
+    this.lastAwayEndWall = Math.max(returnWall, returnAt);
     this.lastAwayEndMono = returnMono;
     this.emit({
       id: `away.summary:${awayFrom}:${returnAt}`,

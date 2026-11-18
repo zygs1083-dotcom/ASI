@@ -487,11 +487,13 @@ describe('away detection', () => {
     'does not pull in the previous bucket or report growth when away starts at %s and metrics stay flat',
     async (_label, offset) => {
       const h = await harness();
+      // The lock must precede in-away samples so their monotonic timestamps are not before the away start.
+      await h.send('screen.locked', BASE + offset);
       h.record(cpuBody(0.1), BASE - 2 * MINUTE);
       h.record(cpuBody(0.5), BASE + offset);
       h.record(cpuBody(0.5), BASE + offset + 30 * MINUTE);
       h.record(cpuBody(0.5), BASE + offset + 65 * MINUTE);
-      await lockAway(h, BASE + offset, BASE + offset + 70 * MINUTE);
+      await h.send('screen.unlocked', BASE + offset + 70 * MINUTE);
       await h.settle();
       await h.flush();
       const data = awaySummary(h);
@@ -862,5 +864,23 @@ describe('away detection', () => {
     expect(Buffer.byteLength(formatted, 'utf8')).toBeLessThanOrEqual(2048);
     expect(formatted).toContain('away.summary:');
     expect(formatted).toContain('alerts=1');
+  });
+
+  it('pushes once when the wall clock rolls back past the away start and later recovers', async () => {
+    const h = await harness();
+    h.record(cpuBody(0.1), BASE);
+    await h.send('screen.locked', BASE);
+    h.advance(90 * MINUTE);
+    const rolledBack = BASE - 2 * HOUR + 90 * MINUTE;
+    h.record(cpuBody(0.9), rolledBack);
+    await h.send('screen.unlocked', rolledBack);
+    await h.settle();
+    // NTP restores the wall clock; the same away's paired end hint arrives with durationMs.
+    await h.send('session.active', BASE + 91 * MINUTE, { durationMs: 91 * MINUTE });
+    await h.settle();
+    await h.flush();
+    const pushed = h.delivered.flatMap((i) => i.update.changes.filter((c) => c.signal.kind === 'away.summary'));
+    expect(h.summaries).toHaveLength(1);
+    expect(pushed).toHaveLength(1);
   });
 });
