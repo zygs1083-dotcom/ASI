@@ -7,6 +7,7 @@ import { isSessionContext } from '../attention/buckets.ts';
 import { DeliveryFailure } from '../attention/drain.ts';
 import { homeAliasRevision, isHomeRoot } from '../attention/path.ts';
 import type { DeliveryIntent } from '../attention/pipeline.ts';
+import { BODY_THRESHOLDS } from '../attention/thresholds.ts';
 import { formatEnvUpdate } from '../delivery/format.ts';
 import { isAnomalousAwayMetric } from '../runtime/away.ts';
 import { modelActivityName, modelAppName, modelLabel, modelText, modelTitle, sourceIdentifier } from './tool-output.ts';
@@ -509,6 +510,13 @@ type AwayMetricItem = {
   ratioMin?: number;
 };
 
+function isCriticalAwayMetric(trend: AwayMetricItem): boolean {
+  if (trend.metric !== 'disk' && trend.metric !== 'battery') return false;
+  if (!isAnomalousAwayMetric(trend)) return false;
+  const threshold = BODY_THRESHOLDS[trend.metric];
+  return trend.ratioMin !== undefined && trend.ratioMin < threshold.critical;
+}
+
 function projectAwaySummaryData(
   rawData: Record<string, unknown>,
   fitsBudget: (candidate: Record<string, unknown>) => boolean,
@@ -563,6 +571,8 @@ function projectAwaySummaryData(
         })
         .sort((a, b) => (a.severity === b.severity ? 0 : a.severity === 'critical' ? -1 : 1))
     : [];
+  const criticalAlerts = alerts.filter((item) => item.severity === 'critical');
+  const warnAlerts = alerts.filter((item) => item.severity === 'warn');
 
   const rawMetrics: AwayMetricItem[] = Array.isArray(rawData.metrics)
     ? rawData.metrics.flatMap((item: unknown): AwayMetricItem[] => {
@@ -580,13 +590,15 @@ function projectAwaySummaryData(
         return [{ metric: name, unit, start: numbers.start, end: numbers.end, ...numbers }];
       })
     : [];
-  const anomalousMetrics: AwayMetricItem[] = [];
+  const criticalMetrics: AwayMetricItem[] = [];
+  const warnMetrics: AwayMetricItem[] = [];
   const normalMetrics: AwayMetricItem[] = [];
   for (const item of rawMetrics) {
-    if (isAnomalousAwayMetric(item)) anomalousMetrics.push(item);
+    if (isCriticalAwayMetric(item)) criticalMetrics.push(item);
+    else if (isAnomalousAwayMetric(item)) warnMetrics.push(item);
     else normalMetrics.push(item);
   }
-  const metrics = [...anomalousMetrics, ...normalMetrics];
+  const metrics = [...criticalMetrics, ...warnMetrics, ...normalMetrics];
 
   const failed: AwayFailedItem[] = Array.isArray(rawData.failed)
     ? rawData.failed.flatMap((item: unknown): AwayFailedItem[] => {
@@ -636,7 +648,8 @@ function projectAwaySummaryData(
       : failedTotal > failed.length
         ? failedTotal - failed.length
         : 0;
-  const computedAnomalyCount = alerts.length + failedTotal + bursts.length + anomalousMetrics.length;
+  const computedAnomalyCount =
+    alerts.length + failedTotal + bursts.length + criticalMetrics.length + warnMetrics.length;
   data.anomalyCount =
     typeof data.anomalyCount === 'number'
       ? Math.max(Math.round(data.anomalyCount), computedAnomalyCount)
@@ -672,9 +685,8 @@ function projectAwaySummaryData(
   const sAlerts = shrinkAlerts(alerts, 160, 96);
   const sFailed = shrinkFailed(failed, 160, 96);
   const sBursts = shrinkBursts(bursts, 160, 96);
-  let base: Record<string, unknown> = shrinkReasons(data, 160);
   const shrunkFull: Record<string, unknown> = {
-    ...base,
+    ...shrinkReasons(data, 160),
     ...(sAlerts.length > 0 ? { alerts: sAlerts } : {}),
     ...(metrics.length > 0 ? { metrics } : {}),
     ...(sFailed.length > 0 ? { failed: sFailed } : {}),
@@ -682,61 +694,64 @@ function projectAwaySummaryData(
   };
   if (fitsBudget(shrunkFull)) return shrunkFull;
 
-  const totalRawItems = sAlerts.length + sFailed.length + sBursts.length + metrics.length;
-  if (
-    !fitsBudget({
-      ...base,
-      ...(upstreamOmitted + totalRawItems > 0 ? { omitted: upstreamOmitted + totalRawItems } : {}),
-    })
-  ) {
-    base = shrinkReasons(base, 0);
-  }
-
-  const keptAlerts: AwayAlertItem[] = [];
-  const keptFailed: AwayFailedItem[] = [];
-  const keptBursts: AwayBurstItem[] = [];
-  const keptMetrics: AwayMetricItem[] = [];
+  // Strip all reasons/errors from base and entries before dropping any entry.
+  const base = shrinkReasons(data, 0);
+  let keptCriticalAlerts = shrinkAlerts(criticalAlerts, 160, 0);
+  let keptWarnAlerts = shrinkAlerts(warnAlerts, 160, 0);
+  const keptCriticalMetrics = [...criticalMetrics];
+  const keptWarnMetrics = [...warnMetrics];
+  const keptNormalMetrics = [...normalMetrics];
+  const keptFailed = shrinkFailed(failed, 160, 0);
+  let keptBursts = shrinkBursts(bursts, 160, 0);
+  const totalRawItems = alerts.length + failed.length + bursts.length + metrics.length;
 
   const buildCandidate = (): Record<string, unknown> => {
+    const nextAlerts = [...keptCriticalAlerts, ...keptWarnAlerts];
+    const nextMetrics = [...keptCriticalMetrics, ...keptWarnMetrics, ...keptNormalMetrics];
     const candidate: Record<string, unknown> = { ...base };
-    if (keptAlerts.length > 0) candidate.alerts = keptAlerts;
-    if (keptMetrics.length > 0) candidate.metrics = keptMetrics;
+    if (nextAlerts.length > 0) candidate.alerts = nextAlerts;
+    if (nextMetrics.length > 0) candidate.metrics = nextMetrics;
     if (keptFailed.length > 0) candidate.failed = keptFailed;
     if (keptBursts.length > 0) candidate.bursts = keptBursts;
-    const dropped = totalRawItems - (keptAlerts.length + keptFailed.length + keptBursts.length + keptMetrics.length);
-    const totalOmitted = upstreamOmitted + dropped;
+    const keptTotal = nextAlerts.length + nextMetrics.length + keptFailed.length + keptBursts.length;
+    const totalOmitted = upstreamOmitted + (totalRawItems - keptTotal);
     if (totalOmitted > 0) candidate.omitted = totalOmitted;
     else delete candidate.omitted;
     return candidate;
   };
 
-  const tryPush = <T>(items: readonly T[], target: T[], compact?: (item: T) => T): boolean => {
-    for (const item of items) {
-      target.push(item);
-      if (fitsBudget(buildCandidate())) continue;
-      const keptCount = keptAlerts.length + keptFailed.length + keptBursts.length + keptMetrics.length;
-      if (keptCount === 1 && compact) {
-        base = shrinkReasons(base, 0);
-        target[target.length - 1] = compact(item);
-        if (fitsBudget(buildCandidate())) continue;
-      }
-      target.pop();
-      return false;
+  const noReasonCandidate = buildCandidate();
+  if (fitsBudget(noReasonCandidate)) return noReasonCandidate;
+
+  const dropTailUntilFits = (list: unknown[]): boolean => {
+    while (list.length > 0) {
+      list.pop();
+      if (fitsBudget(buildCandidate())) return true;
     }
-    return true;
+    return false;
   };
 
-  if (
-    tryPush(sAlerts, keptAlerts, (a) => shrinkAlerts([a], 64, 0)[0] as AwayAlertItem) &&
-    tryPush(sFailed, keptFailed, (f) => shrinkFailed([f], 64, 0)[0] as AwayFailedItem) &&
-    tryPush(sBursts, keptBursts, (b) => shrinkBursts([b], 64, 0)[0] as AwayBurstItem)
-  ) {
-    tryPush(metrics, keptMetrics);
+  // Priority (dropped last -> first):
+  // critical alerts > critical metrics > external deletion bursts > warn alerts > warn metrics > failed jobs > normal metrics
+  const dropOrder: Array<() => boolean> = [
+    () => dropTailUntilFits(keptNormalMetrics),
+    () => dropTailUntilFits(keptFailed),
+    () => dropTailUntilFits(keptWarnMetrics),
+    () => {
+      keptCriticalAlerts = shrinkAlerts(keptCriticalAlerts, 64, 0);
+      keptWarnAlerts = shrinkAlerts(keptWarnAlerts, 64, 0);
+      keptBursts = shrinkBursts(keptBursts, 64, 0);
+      return fitsBudget(buildCandidate());
+    },
+    () => dropTailUntilFits(keptWarnAlerts),
+    () => dropTailUntilFits(keptBursts),
+    () => dropTailUntilFits(keptCriticalMetrics),
+    () => dropTailUntilFits(keptCriticalAlerts),
+  ];
+  for (const step of dropOrder) {
+    if (step()) return buildCandidate();
   }
 
-  const result = buildCandidate();
-  if (fitsBudget(result)) return result;
-  base = shrinkReasons(base, 0);
   const minimal = buildCandidate();
   if (fitsBudget(minimal)) return minimal;
   delete minimal.anomalies;

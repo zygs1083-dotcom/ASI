@@ -401,6 +401,101 @@ function changeLines(ch: EnvChange, includeTitles: boolean, includeJobCommands: 
   return lines;
 }
 
+interface RenderedChange {
+  protected: boolean;
+  isAway: boolean;
+  lines: string[];
+}
+
+function renderEnvEnvelope(
+  header: string,
+  entries: readonly RenderedChange[],
+  trailers: readonly string[],
+  footer: string,
+): string {
+  const body: string[] = [];
+  for (const entry of entries) body.push(...entry.lines);
+  for (const line of trailers) body.push(line);
+  return [header, ...body, footer].join('\n');
+}
+
+function trimProtectedLinesToBudget(
+  header: string,
+  entries: RenderedChange[],
+  trailers: string[],
+  footer: string,
+): string {
+  let rendered = renderEnvEnvelope(header, entries, trailers, footer);
+  if (Buffer.byteLength(rendered, 'utf8') <= MAX_AWAY_FORMAT_BYTES) return rendered;
+
+  // Drop secondary lines (e.g. notes) from non-away wake entries first, then away.summary.
+  for (const dropAway of [false, true]) {
+    for (const entry of entries) {
+      if (entry.isAway !== dropAway || entry.lines.length <= 1) continue;
+      entry.lines = [entry.lines[0] as string];
+      rendered = renderEnvEnvelope(header, entries, trailers, footer);
+      if (Buffer.byteLength(rendered, 'utf8') <= MAX_AWAY_FORMAT_BYTES) return rendered;
+    }
+  }
+
+  // Drop trailer counters before touching primary wake / away.summary lines.
+  while (trailers.length > 0) {
+    trailers.pop();
+    rendered = renderEnvEnvelope(header, entries, trailers, footer);
+    if (Buffer.byteLength(rendered, 'utf8') <= MAX_AWAY_FORMAT_BYTES) return rendered;
+  }
+
+  // Last resort: truncate the longest primary line (non-away wake before away.summary).
+  for (const allowAway of [false, true]) {
+    for (;;) {
+      const excess = Buffer.byteLength(rendered, 'utf8') - MAX_AWAY_FORMAT_BYTES;
+      if (excess <= 0) return rendered;
+      let target: { entry: RenderedChange; lineIdx: number; bytes: number } | undefined;
+      for (const entry of entries) {
+        if (!allowAway && entry.isAway) continue;
+        for (let i = 0; i < entry.lines.length; i++) {
+          const bytes = Buffer.byteLength(entry.lines[i] as string, 'utf8');
+          if (!target || bytes > target.bytes) target = { entry, lineIdx: i, bytes };
+        }
+      }
+      const floor = allowAway ? 4 : 32;
+      if (!target || target.bytes <= floor) break;
+      const nextMax = Math.max(floor, target.bytes - excess);
+      const nextLine = truncateUtf8Line(target.entry.lines[target.lineIdx] as string, nextMax);
+      if (Buffer.byteLength(nextLine, 'utf8') >= target.bytes) break;
+      target.entry.lines[target.lineIdx] = nextLine;
+      rendered = renderEnvEnvelope(header, entries, trailers, footer);
+    }
+  }
+
+  return rendered;
+}
+
+function fitAwayBatchWithinBudget(
+  header: string,
+  entries: readonly RenderedChange[],
+  trailers: readonly string[],
+  footer: string,
+): string {
+  // Drop low-priority (non-wake, non-away.summary) changes from oldest to newest first.
+  const active = [...entries];
+  for (let i = 0; i < active.length; ) {
+    if (active[i]?.protected) {
+      i++;
+      continue;
+    }
+    active.splice(i, 1);
+    const rendered = renderEnvEnvelope(header, active, trailers, footer);
+    if (Buffer.byteLength(rendered, 'utf8') <= MAX_AWAY_FORMAT_BYTES) return rendered;
+  }
+  return trimProtectedLinesToBudget(
+    header,
+    active.map((entry) => ({ ...entry, lines: [...entry.lines] })),
+    [...trailers],
+    footer,
+  );
+}
+
 /**
  * Renders an EnvUpdate as the compact `<env-update>` increment (DESIGN §2.4).
  * Output is byte-deterministic for identical input: changes are sorted by
@@ -410,36 +505,28 @@ function changeLines(ch: EnvChange, includeTitles: boolean, includeJobCommands: 
  */
 export function formatEnvUpdate(update: EnvUpdate, options: FormatOptions = {}): string {
   const includeTitles = options.includeWindowTitles ?? true;
+  const includeJobCommands = options.includeJobCommands ?? true;
   const changes = [...update.changes].sort((a, b) => a.signal.at - b.signal.at || (a.signal.id < b.signal.id ? -1 : 1));
-  const body: string[] = [];
-  for (const ch of changes) body.push(...changeLines(ch, includeTitles, options.includeJobCommands ?? true));
-  if (update.suppressed > 0) body.push(`suppressed: ${update.suppressed}`);
-  if ((update.alreadyInjected ?? 0) > 0) body.push(`另有 ${update.alreadyInjected} 条已在上一步注入`);
-  if (body.length === 0) return '';
+  const entries: RenderedChange[] = [];
+  for (const ch of changes) {
+    const lines = changeLines(ch, includeTitles, includeJobCommands);
+    if (lines.length === 0) continue;
+    const isAway = ch.signal.kind === 'away.summary';
+    entries.push({
+      protected: isAway || ch.level === 'wake',
+      isAway,
+      lines,
+    });
+  }
+  const trailers: string[] = [];
+  if (update.suppressed > 0) trailers.push(`suppressed: ${update.suppressed}`);
+  if ((update.alreadyInjected ?? 0) > 0) trailers.push(`另有 ${update.alreadyInjected} 条已在上一步注入`);
+  if (entries.length === 0 && trailers.length === 0) return '';
   const header = `<env-update since="${esc(hhmmss(update.since))}" source="asi-sense">`;
   const footer = '</env-update>';
-  let rendered = [header, ...body, footer].join('\n');
-  if (
-    changes.some((ch) => ch.signal.kind === 'away.summary') &&
-    Buffer.byteLength(rendered, 'utf8') > MAX_AWAY_FORMAT_BYTES
-  ) {
-    const overhead = Buffer.byteLength(`${header}\n${footer}`, 'utf8');
-    let budget = Math.max(0, MAX_AWAY_FORMAT_BYTES - overhead);
-    const trimmedBody: string[] = [];
-    for (const line of body) {
-      const lineBytes = Buffer.byteLength(line, 'utf8');
-      const sep = trimmedBody.length > 0 ? 1 : 0;
-      if (lineBytes + sep <= budget) {
-        trimmedBody.push(line);
-        budget -= lineBytes + sep;
-      } else if (budget > sep + 16) {
-        trimmedBody.push(truncateUtf8Line(line, budget - sep));
-        break;
-      } else {
-        break;
-      }
-    }
-    rendered = [header, ...trimmedBody, footer].join('\n');
+  const rendered = renderEnvEnvelope(header, entries, trailers, footer);
+  if (entries.some((entry) => entry.isAway) && Buffer.byteLength(rendered, 'utf8') > MAX_AWAY_FORMAT_BYTES) {
+    return fitAwayBatchWithinBudget(header, entries, trailers, footer);
   }
   return rendered;
 }

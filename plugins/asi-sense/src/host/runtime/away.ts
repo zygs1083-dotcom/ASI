@@ -121,7 +121,7 @@ export class AwayReporter {
     if (endCause) {
       const open = this.active.get(endCause);
       if (open !== undefined) {
-        this.causeMs[endCause] += Math.max(0, monoAt - open.mono);
+        this.causeMs[endCause] += Math.max(0, wallAt - open.wall, monoAt - open.mono);
         this.active.delete(endCause);
       } else {
         this.consumeHint(endCause, signal, wallAt, monoAt);
@@ -158,12 +158,18 @@ export class AwayReporter {
     const inferredWall = wallAt - duration;
     if (inferredWall < 0) return;
     const inferredMono = monoAt - duration;
-    if (this.lastAwayEndMono !== undefined && inferredMono < this.lastAwayEndMono) return;
-    if (this.lastAwayEndMono === undefined && this.lastAwayEndWall !== undefined && inferredWall < this.lastAwayEndWall)
+    const beforeLastMono = this.lastAwayEndMono !== undefined && inferredMono < this.lastAwayEndMono;
+    const beforeLastWall = this.lastAwayEndWall !== undefined && inferredWall < this.lastAwayEndWall;
+    if (
+      this.lastAwayEndMono !== undefined && this.lastAwayEndWall !== undefined
+        ? beforeLastMono && beforeLastWall
+        : beforeLastMono || beforeLastWall
+    ) {
       return;
+    }
     if (this.startMono === undefined || inferredMono < this.startMono) {
       this.startMono = inferredMono;
-      this.startWall = inferredWall;
+      this.startWall = this.startWall === undefined ? inferredWall : Math.min(this.startWall, inferredWall);
     } else if (this.startWall === undefined) {
       this.startWall = inferredWall;
     }
@@ -245,9 +251,11 @@ export class AwayReporter {
   private finish(returnWall: number, returnMono: number): void {
     const awayFrom = this.startWall ?? returnWall;
     const startMono = this.startMono ?? returnMono;
-    const durationMs = Math.max(0, returnMono - startMono);
+    const durationMs = Math.max(0, returnWall - awayFrom, returnMono - startMono);
     const causes = { ...this.causeMs };
-    for (const [cause, open] of this.active) causes[cause] += Math.max(0, returnMono - open.mono);
+    for (const [cause, open] of this.active) {
+      causes[cause] += Math.max(0, returnWall - open.wall, returnMono - open.mono);
+    }
     const alerts = [...this.alerts.values()]
       .map((alert) => ({ ...alert }))
       .sort((a, b) => (BODY_ALERT_RANK[b.severity] ?? 0) - (BODY_ALERT_RANK[a.severity] ?? 0));
@@ -261,9 +269,10 @@ export class AwayReporter {
     this.reset();
     if (durationMs < AWAY_MIN_MS) return;
 
+    const returnAt = returnWall >= awayFrom ? returnWall : awayFrom + durationMs;
     const rawTrends: AwayMetricTrend[] = [];
     for (const metric of METRIC_KEYS) {
-      const trend = this.metrics.trend(metric, awayFrom, returnWall);
+      const trend = this.metrics.trend(metric, awayFrom, returnAt, { from: startMono, to: returnMono });
       if (trend) rawTrends.push(toMetricTrend(trend));
     }
     const anomalies = new Set<AwayAnomaly>();
@@ -286,7 +295,7 @@ export class AwayReporter {
     const omitted = alertEntries - alerts.length + (failedCount - failed.length) + (burstEntries - bursts.length);
     const data: AwaySummaryData = {
       awayFrom,
-      returnAt: returnWall,
+      returnAt,
       durationMs,
       sleepMs: Math.round(causes.sleep),
       lockMs: Math.round(causes.lock),
@@ -306,9 +315,9 @@ export class AwayReporter {
     this.lastAwayEndWall = returnWall;
     this.lastAwayEndMono = returnMono;
     this.emit({
-      id: `away.summary:${awayFrom}:${returnWall}`,
+      id: `away.summary:${awayFrom}:${returnAt}`,
       kind: 'away.summary',
-      at: returnWall,
+      at: returnAt,
       source: { id: 'away', api: 'detector', host: 'local' },
       subject: 'away',
       cause: 'user',
