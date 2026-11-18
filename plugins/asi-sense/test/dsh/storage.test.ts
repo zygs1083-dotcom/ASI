@@ -170,4 +170,17 @@ describe('atomic file storage', () => {
       expect(await fs.readdir(root)).toEqual(['settings.json']);
     },
   );
+
+  it('avoids colliding with existing fallback backup names returned by readdir', async () => {
+    const { root, port } = await fixture();
+    const damaged = await port.backup('settings', 'old');
+    await fs.writeFile(join(root, damaged), 'damaged');
+    const first = await port.backup('settings', 'old');
+    await fs.writeFile(join(root, first), 'also-damaged');
+    const second = await port.backup('settings', 'old');
+    expect(second).not.toBe(damaged);
+    expect(second).not.toBe(first);
+    expect(await fs.readFile(join(root, first), 'utf8')).toBe('also-damaged');
+    expect(await fs.readFile(join(root, second), 'utf8')).toBe('old');
+  });
 });

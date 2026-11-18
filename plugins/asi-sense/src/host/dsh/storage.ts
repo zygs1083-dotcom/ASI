@@ -73,7 +73,9 @@ export class FileStoragePort implements StoragePort {
       try {
         let existing = false;
         let hashDamaged = false;
-        for (const name of await this.fs.readdir(this.root)) {
+        const names = await this.fs.readdir(this.root);
+        const nameSet = new Set(names);
+        for (const name of names) {
           if (!name.startsWith(prefix)) continue;
           const suffix = name.slice(prefix.length);
           if (suffix !== hash && !/^\d{1,20}-[a-f0-9-]{36}$/i.test(suffix)) continue;
@@ -87,7 +89,9 @@ export class FileStoragePort implements StoragePort {
           if (suffix === hash) hashDamaged = true;
         }
         if (!existing && hashDamaged) {
-          path = `${target}.bak-${Date.now()}-${randomUUID()}`;
+          do {
+            path = `${target}.bak-${Date.now()}-${randomUUID()}`;
+          } while (nameSet.has(basename(path)));
         }
         if (existing) {
           handle = await this.fs.open(path, 'r');
