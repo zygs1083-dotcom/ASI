@@ -8,6 +8,7 @@ import { DeliveryFailure } from '../attention/drain.ts';
 import { homeAliasRevision, isHomeRoot } from '../attention/path.ts';
 import type { DeliveryIntent } from '../attention/pipeline.ts';
 import { formatEnvUpdate } from '../delivery/format.ts';
+import { isAnomalousAwayMetric } from '../runtime/away.ts';
 import { modelActivityName, modelAppName, modelLabel, modelText, modelTitle, sourceIdentifier } from './tool-output.ts';
 
 declare module '@deepseek-ai/dsh-llm' {
@@ -455,6 +456,293 @@ function pickSanitizedReasons(
   return out;
 }
 
+const MAX_AWAY_PROJECTION_BYTES = 2048;
+const PLACEHOLDER_TOKENS = ['<host>', '[host]', '[endpoint]', '[path]', '[redacted]', '[long]'];
+
+function truncateUtf8Safe(value: string, maxBytes: number): string {
+  if (Buffer.byteLength(value, 'utf8') <= maxBytes) return value;
+  if (maxBytes <= 0) return '';
+  if (maxBytes <= 3) return '.'.repeat(maxBytes);
+  const limit = maxBytes - 3;
+  let bytes = 0;
+  let i = 0;
+  while (i < value.length) {
+    const cp = value.codePointAt(i) ?? 0;
+    const charLen = cp > 0xffff ? 2 : 1;
+    const utf8Len = cp < 0x80 ? 1 : cp < 0x800 ? 2 : cp < 0x10000 ? 3 : 4;
+    if (bytes + utf8Len > limit) break;
+    bytes += utf8Len;
+    i += charLen;
+  }
+  let head = value.slice(0, i);
+  const openBracket = head.lastIndexOf('[');
+  if (openBracket >= 0 && head.indexOf(']', openBracket) === -1) {
+    if (PLACEHOLDER_TOKENS.some((tok) => tok.startsWith(head.slice(openBracket)))) {
+      head = head.slice(0, openBracket).trimEnd();
+    }
+  }
+  return `${head}...`;
+}
+
+function shrinkReasons(item: Record<string, unknown>, maxReasonBytes: number): Record<string, unknown> {
+  if (maxReasonBytes <= 0) {
+    const { reason: _r, error: _e, ...rest } = item;
+    return rest;
+  }
+  const out = { ...item };
+  if (typeof out.reason === 'string') out.reason = truncateUtf8Safe(out.reason, maxReasonBytes);
+  if (typeof out.error === 'string') out.error = truncateUtf8Safe(out.error, maxReasonBytes);
+  return out;
+}
+
+type AwayAlertItem = { metric: string; severity: 'warn' | 'critical'; count: number; reason?: string; error?: string };
+type AwayFailedItem = { id: string; kind: string; exitCode?: number; reason?: string; error?: string };
+type AwayBurstItem = { directory: string; deleted: number; reason?: string; error?: string };
+type AwayMetricItem = {
+  metric: string;
+  unit: string;
+  start: number;
+  end: number;
+  min?: number;
+  max?: number;
+  ratioStart?: number;
+  ratioMin?: number;
+};
+
+function projectAwaySummaryData(
+  rawData: Record<string, unknown>,
+  fitsBudget: (candidate: Record<string, unknown>) => boolean,
+  hostname: string,
+  homeKey: string,
+): Record<string, unknown> {
+  const data: Record<string, unknown> = {};
+  for (const key of [
+    'awayFrom',
+    'returnAt',
+    'durationMs',
+    'sleepMs',
+    'lockMs',
+    'inactiveMs',
+    'alertCount',
+    'failedCount',
+    'deletedCount',
+    'anomalyCount',
+    'omitted',
+  ]) {
+    const value = rawData[key];
+    if (typeof value === 'number' && Number.isFinite(value) && value >= 0) data[key] = value;
+  }
+  Object.assign(data, pickSanitizedReasons(rawData, hostname, homeKey));
+  data.hasAnomaly = rawData.hasAnomaly === true;
+  if (Array.isArray(rawData.anomalies)) {
+    const anomalies = rawData.anomalies
+      .filter((item): item is string => typeof item === 'string' && AWAY_ANOMALIES.has(item))
+      .slice(0, 8);
+    if (anomalies.length > 0) data.anomalies = anomalies;
+  }
+
+  const alerts: AwayAlertItem[] = Array.isArray(rawData.alerts)
+    ? rawData.alerts
+        .flatMap((item: unknown): AwayAlertItem[] => {
+          if (!item || typeof item !== 'object') return [];
+          const source = item as Record<string, unknown>;
+          const { metric: rawMetric, severity, count } = source;
+          if (typeof rawMetric !== 'string' || typeof severity !== 'string') return [];
+          if (severity !== 'warn' && severity !== 'critical') return [];
+          const safeMetric = metric(rawMetric);
+          const safeCount =
+            typeof count === 'number' && Number.isFinite(count) && count >= 0 ? Math.max(1, Math.round(count)) : 1;
+          return [
+            {
+              metric: safeMetric,
+              severity,
+              count: safeCount,
+              ...pickSanitizedReasons(source, hostname, homeKey),
+            },
+          ];
+        })
+        .sort((a, b) => (a.severity === b.severity ? 0 : a.severity === 'critical' ? -1 : 1))
+    : [];
+
+  const rawMetrics: AwayMetricItem[] = Array.isArray(rawData.metrics)
+    ? rawData.metrics.flatMap((item: unknown): AwayMetricItem[] => {
+        if (!item || typeof item !== 'object') return [];
+        const source = item as Record<string, unknown>;
+        const name = source.metric;
+        if (typeof name !== 'string' || !AWAY_METRIC_NAMES.has(name)) return [];
+        const unit = typeof source.unit === 'string' && AWAY_UNITS.has(source.unit) ? source.unit : undefined;
+        const numbers: Record<string, number> = {};
+        for (const key of ['start', 'end', 'min', 'max', 'ratioStart', 'ratioMin']) {
+          const value = source[key];
+          if (typeof value === 'number' && Number.isFinite(value) && value >= 0) numbers[key] = value;
+        }
+        if (!unit || numbers.start === undefined || numbers.end === undefined) return [];
+        return [{ metric: name, unit, start: numbers.start, end: numbers.end, ...numbers }];
+      })
+    : [];
+  const anomalousMetrics: AwayMetricItem[] = [];
+  const normalMetrics: AwayMetricItem[] = [];
+  for (const item of rawMetrics) {
+    if (isAnomalousAwayMetric(item)) anomalousMetrics.push(item);
+    else normalMetrics.push(item);
+  }
+  const metrics = [...anomalousMetrics, ...normalMetrics];
+
+  const failed: AwayFailedItem[] = Array.isArray(rawData.failed)
+    ? rawData.failed.flatMap((item: unknown): AwayFailedItem[] => {
+        if (!item || typeof item !== 'object') return [];
+        const source = item as Record<string, unknown>;
+        const kind = source.kind;
+        if (typeof kind !== 'string' || !AWAY_FAILED_KINDS.has(kind)) return [];
+        const rawId = typeof source.id === 'string' && source.id.trim() ? source.id : 'job';
+        const id = sanitizeReason(rawId, hostname, homeKey) || 'job';
+        return [
+          {
+            id,
+            kind,
+            ...(typeof source.exitCode === 'number' && Number.isFinite(source.exitCode)
+              ? { exitCode: source.exitCode }
+              : {}),
+            ...pickSanitizedReasons(source, hostname, homeKey),
+          },
+        ];
+      })
+    : [];
+
+  const bursts: AwayBurstItem[] = Array.isArray(rawData.bursts)
+    ? rawData.bursts.flatMap((item: unknown): AwayBurstItem[] => {
+        if (!item || typeof item !== 'object') return [];
+        const source = item as Record<string, unknown>;
+        const rawDir = typeof source.directory === 'string' ? source.directory : '';
+        const deleted =
+          typeof source.deleted === 'number' && Number.isFinite(source.deleted) && source.deleted >= 0
+            ? source.deleted
+            : 0;
+        return [
+          {
+            directory: modelActivityName(rawDir, true),
+            deleted: Math.max(0, Math.round(deleted)),
+            ...pickSanitizedReasons(source, hostname, homeKey),
+          },
+        ];
+      })
+    : [];
+
+  const failedTotal =
+    typeof data.failedCount === 'number' ? Math.max(failed.length, Math.round(data.failedCount)) : failed.length;
+  const upstreamOmitted =
+    typeof data.omitted === 'number'
+      ? Math.round(data.omitted)
+      : failedTotal > failed.length
+        ? failedTotal - failed.length
+        : 0;
+  const computedAnomalyCount = alerts.length + failedTotal + bursts.length + anomalousMetrics.length;
+  data.anomalyCount =
+    typeof data.anomalyCount === 'number'
+      ? Math.max(Math.round(data.anomalyCount), computedAnomalyCount)
+      : computedAnomalyCount;
+  if (upstreamOmitted > 0) data.omitted = upstreamOmitted;
+  else delete data.omitted;
+
+  const fullCandidate: Record<string, unknown> = {
+    ...data,
+    ...(alerts.length > 0 ? { alerts } : {}),
+    ...(metrics.length > 0 ? { metrics } : {}),
+    ...(failed.length > 0 ? { failed } : {}),
+    ...(bursts.length > 0 ? { bursts } : {}),
+  };
+  if (fitsBudget(fullCandidate)) return fullCandidate;
+
+  const shrinkAlerts = (list: AwayAlertItem[], fieldBytes: number, reasonBytes: number): AwayAlertItem[] =>
+    list.map((a) => ({
+      ...(shrinkReasons(a, reasonBytes) as AwayAlertItem),
+      metric: truncateUtf8Safe(a.metric, fieldBytes),
+    }));
+  const shrinkFailed = (list: AwayFailedItem[], fieldBytes: number, reasonBytes: number): AwayFailedItem[] =>
+    list.map((f) => ({
+      ...(shrinkReasons(f, reasonBytes) as AwayFailedItem),
+      id: truncateUtf8Safe(f.id, fieldBytes) || 'job',
+    }));
+  const shrinkBursts = (list: AwayBurstItem[], fieldBytes: number, reasonBytes: number): AwayBurstItem[] =>
+    list.map((b) => ({
+      ...(shrinkReasons(b, reasonBytes) as AwayBurstItem),
+      directory: truncateUtf8Safe(b.directory, fieldBytes),
+    }));
+
+  const sAlerts = shrinkAlerts(alerts, 160, 96);
+  const sFailed = shrinkFailed(failed, 160, 96);
+  const sBursts = shrinkBursts(bursts, 160, 96);
+  let base: Record<string, unknown> = shrinkReasons(data, 160);
+  const shrunkFull: Record<string, unknown> = {
+    ...base,
+    ...(sAlerts.length > 0 ? { alerts: sAlerts } : {}),
+    ...(metrics.length > 0 ? { metrics } : {}),
+    ...(sFailed.length > 0 ? { failed: sFailed } : {}),
+    ...(sBursts.length > 0 ? { bursts: sBursts } : {}),
+  };
+  if (fitsBudget(shrunkFull)) return shrunkFull;
+
+  const totalRawItems = sAlerts.length + sFailed.length + sBursts.length + metrics.length;
+  if (
+    !fitsBudget({
+      ...base,
+      ...(upstreamOmitted + totalRawItems > 0 ? { omitted: upstreamOmitted + totalRawItems } : {}),
+    })
+  ) {
+    base = shrinkReasons(base, 0);
+  }
+
+  const keptAlerts: AwayAlertItem[] = [];
+  const keptFailed: AwayFailedItem[] = [];
+  const keptBursts: AwayBurstItem[] = [];
+  const keptMetrics: AwayMetricItem[] = [];
+
+  const buildCandidate = (): Record<string, unknown> => {
+    const candidate: Record<string, unknown> = { ...base };
+    if (keptAlerts.length > 0) candidate.alerts = keptAlerts;
+    if (keptMetrics.length > 0) candidate.metrics = keptMetrics;
+    if (keptFailed.length > 0) candidate.failed = keptFailed;
+    if (keptBursts.length > 0) candidate.bursts = keptBursts;
+    const dropped = totalRawItems - (keptAlerts.length + keptFailed.length + keptBursts.length + keptMetrics.length);
+    const totalOmitted = upstreamOmitted + dropped;
+    if (totalOmitted > 0) candidate.omitted = totalOmitted;
+    else delete candidate.omitted;
+    return candidate;
+  };
+
+  const tryPush = <T>(items: readonly T[], target: T[], compact?: (item: T) => T): boolean => {
+    for (const item of items) {
+      target.push(item);
+      if (fitsBudget(buildCandidate())) continue;
+      const keptCount = keptAlerts.length + keptFailed.length + keptBursts.length + keptMetrics.length;
+      if (keptCount === 1 && compact) {
+        base = shrinkReasons(base, 0);
+        target[target.length - 1] = compact(item);
+        if (fitsBudget(buildCandidate())) continue;
+      }
+      target.pop();
+      return false;
+    }
+    return true;
+  };
+
+  if (
+    tryPush(sAlerts, keptAlerts, (a) => shrinkAlerts([a], 64, 0)[0] as AwayAlertItem) &&
+    tryPush(sFailed, keptFailed, (f) => shrinkFailed([f], 64, 0)[0] as AwayFailedItem) &&
+    tryPush(sBursts, keptBursts, (b) => shrinkBursts([b], 64, 0)[0] as AwayBurstItem)
+  ) {
+    tryPush(metrics, keptMetrics);
+  }
+
+  const result = buildCandidate();
+  if (fitsBudget(result)) return result;
+  base = shrinkReasons(base, 0);
+  const minimal = buildCandidate();
+  if (fitsBudget(minimal)) return minimal;
+  delete minimal.anomalies;
+  return minimal;
+}
+
 const SYSTEM_SIGNAL_KINDS: ReadonlySet<string> = new Set([
   'system.sleep',
   'system.wake',
@@ -573,102 +861,37 @@ export function modelUpdate(update: EnvUpdate): EnvUpdate {
       }
     } else if (signal.kind === 'away.summary') {
       subject = 'away';
-      for (const key of [
-        'awayFrom',
-        'returnAt',
-        'durationMs',
-        'sleepMs',
-        'lockMs',
-        'inactiveMs',
-        'alertCount',
-        'failedCount',
-        'deletedCount',
-      ]) {
-        const value = signal.data[key];
-        if (typeof value === 'number' && Number.isFinite(value)) data[key] = value;
-      }
-      Object.assign(data, pickSanitizedReasons(signal.data, getHostname(), getHomeKey()));
-      data.hasAnomaly = signal.data.hasAnomaly === true;
-      if (Array.isArray(signal.data.anomalies)) {
-        const anomalies = signal.data.anomalies
-          .filter((item): item is string => typeof item === 'string' && AWAY_ANOMALIES.has(item))
-          .slice(0, 8);
-        if (anomalies.length > 0) data.anomalies = anomalies;
-      }
-      if (Array.isArray(signal.data.alerts)) {
-        const alerts = signal.data.alerts.flatMap((item: unknown) => {
-          if (!item || typeof item !== 'object') return [];
-          const source = item as Record<string, unknown>;
-          const { metric: rawMetric, severity, count } = source;
-          if (typeof rawMetric !== 'string' || typeof severity !== 'string') return [];
-          if (severity !== 'warn' && severity !== 'critical') return [];
-          const safeMetric = metric(rawMetric);
-          const safeCount = typeof count === 'number' && Number.isFinite(count) ? Math.max(1, Math.round(count)) : 1;
-          return [
-            {
-              metric: safeMetric,
-              severity,
-              count: safeCount,
-              ...pickSanitizedReasons(source, getHostname(), getHomeKey()),
-            },
-          ];
-        });
-        if (alerts.length > 0) data.alerts = alerts.slice(0, 5);
-      }
-      if (Array.isArray(signal.data.metrics)) {
-        const metrics = signal.data.metrics.flatMap((item: unknown) => {
-          if (!item || typeof item !== 'object') return [];
-          const source = item as Record<string, unknown>;
-          const name = source.metric;
-          if (typeof name !== 'string' || !AWAY_METRIC_NAMES.has(name)) return [];
-          const unit = typeof source.unit === 'string' && AWAY_UNITS.has(source.unit) ? source.unit : undefined;
-          const numbers: Record<string, number> = {};
-          for (const key of ['start', 'end', 'min', 'max', 'ratioMin']) {
-            const value = source[key];
-            if (typeof value === 'number' && Number.isFinite(value)) numbers[key] = value;
-          }
-          if (!unit || numbers.start === undefined || numbers.end === undefined) return [];
-          return [{ metric: name, unit, ...numbers }];
-        });
-        if (metrics.length > 0) data.metrics = metrics.slice(0, 8);
-      }
-      if (Array.isArray(signal.data.failed)) {
-        const failed = signal.data.failed.flatMap((item: unknown) => {
-          if (!item || typeof item !== 'object') return [];
-          const source = item as Record<string, unknown>;
-          const kind = source.kind;
-          if (typeof kind !== 'string' || !AWAY_FAILED_KINDS.has(kind)) return [];
-          const rawId = typeof source.id === 'string' && source.id.trim() ? source.id : 'job';
-          const id = sanitizeReason(rawId, getHostname(), getHomeKey()) || 'job';
-          return [
-            {
-              id,
-              kind,
-              ...(typeof source.exitCode === 'number' && Number.isFinite(source.exitCode)
-                ? { exitCode: source.exitCode }
-                : {}),
-              ...pickSanitizedReasons(source, getHostname(), getHomeKey()),
-            },
-          ];
-        });
-        if (failed.length > 0) data.failed = failed.slice(0, 5);
-      }
-      if (Array.isArray(signal.data.bursts)) {
-        const bursts = signal.data.bursts.flatMap((item: unknown) => {
-          if (!item || typeof item !== 'object') return [];
-          const source = item as Record<string, unknown>;
-          const rawDir = typeof source.directory === 'string' ? source.directory : '';
-          const deleted = typeof source.deleted === 'number' && Number.isFinite(source.deleted) ? source.deleted : 0;
-          return [
-            {
-              directory: modelActivityName(rawDir, true),
-              deleted: Math.max(0, Math.round(deleted)),
-              ...pickSanitizedReasons(source, getHostname(), getHomeKey()),
-            },
-          ];
-        });
-        if (bursts.length > 0) data.bursts = bursts.slice(0, 5);
-      }
+      const prefix = { ...data };
+      const projectedAway = projectAwaySummaryData(
+        signal.data,
+        (candidate) =>
+          Buffer.byteLength(
+            JSON.stringify({
+              since: update.since,
+              at: update.at,
+              suppressed,
+              ...(update.alreadyInjected !== undefined ? { alreadyInjected: update.alreadyInjected } : {}),
+              changes: [
+                {
+                  count,
+                  level,
+                  signal: {
+                    id: signal.id,
+                    kind: signal.kind,
+                    at: signal.at,
+                    source: { id: 'asi-sense', api: 'delivery', host: 'local' },
+                    subject,
+                    data: { ...prefix, ...candidate },
+                  },
+                },
+              ],
+            }),
+            'utf8',
+          ) <= MAX_AWAY_PROJECTION_BYTES,
+        getHostname(),
+        getHomeKey(),
+      );
+      Object.assign(data, projectedAway);
     } else if (signal.kind === 'delivery.target-unavailable') {
       subject = 'delivery-target';
       data.status = 'unavailable';

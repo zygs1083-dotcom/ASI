@@ -241,6 +241,16 @@ export function measureBody(body: Body, at: number): MeasuredValues {
   return diskTotal === undefined ? { values } : { values, diskTotal };
 }
 
+type LocalParts = ReturnType<LocalCalendar['parts']>;
+
+function sameLocalHour(a: LocalParts, b: LocalParts): boolean {
+  return a.year === b.year && a.month === b.month && a.day === b.day && a.hour === b.hour;
+}
+
+function localOffsetMs(p: LocalParts, secMs: number): number {
+  return Date.UTC(p.year, p.month - 1, p.day, p.hour, p.minute, p.second, 0) - secMs;
+}
+
 export class MetricTimeline {
   private readonly buckets = new Map<number, MetricBucket>();
   private readonly hours = new Map<number, HourBucket>();
@@ -248,6 +258,7 @@ export class MetricTimeline {
   private readonly sampleScratch = new Float64Array(METRIC_KEYS.length);
   private lastBucket?: MetricBucket;
   private lastHour?: HourBucket;
+  private lastHourEnd = Number.NEGATIVE_INFINITY;
 
   constructor(
     private readonly clock: Clock,
@@ -261,8 +272,7 @@ export class MetricTimeline {
     if (!finite(at) || at < 0) return;
 
     let bucket = this.lastBucket;
-    let hour = this.lastHour;
-    if (!bucket || !hour || at < bucket.start || at >= bucket.start + METRIC_BUCKET_MS) {
+    if (!bucket || at < bucket.start || at >= bucket.start + METRIC_BUCKET_MS) {
       const start = Math.floor(at / METRIC_BUCKET_MS) * METRIC_BUCKET_MS;
       bucket = this.buckets.get(start);
       if (!bucket) {
@@ -271,17 +281,19 @@ export class MetricTimeline {
       }
       this.lastBucket = bucket;
       this.pruneBuckets(at);
+    }
 
-      const hourStart = Math.floor(start / METRIC_HOUR_MS) * METRIC_HOUR_MS;
-      if (!hour || hour.start !== hourStart) {
-        hour = this.hours.get(hourStart);
-        if (!hour) {
-          hour = createBucket(hourStart);
-          this.hours.set(hourStart, hour);
-        }
-        this.lastHour = hour;
-        this.pruneHours(at);
+    let hour = this.lastHour;
+    if (!hour || at < hour.start || at >= this.lastHourEnd) {
+      const bounds = this.localHourBounds(at);
+      hour = this.hours.get(bounds.start);
+      if (!hour) {
+        hour = createBucket(bounds.start);
+        this.hours.set(bounds.start, hour);
       }
+      this.lastHour = hour;
+      this.lastHourEnd = bounds.end;
+      this.pruneHours(at);
     }
 
     bucket.samples += 1;
@@ -323,24 +335,27 @@ export class MetricTimeline {
     if ((fromRaw !== undefined && clampedFrom !== from) || (toRaw !== undefined && clampedTo !== to)) {
       rangeClamped = true;
     }
-    if (clampedFrom > clampedTo) clampedFrom = clampedTo;
+    const emptyRange = clampedFrom > clampedTo;
+    if (emptyRange) clampedFrom = clampedTo;
 
     const slotIdx = METRIC_INDEX[key];
     const groups = new Map<number, { min: number; max: number; sum: number; count: number; samples: number }>();
-    const starts = [...this.buckets.keys()].sort((a, b) => a - b);
-    for (const start of starts) {
-      if (start < clampedFrom || start > clampedTo) continue;
-      const bucket = this.buckets.get(start);
-      const stats = bucket?.slots[slotIdx];
-      if (!bucket || !stats) continue;
-      const at = Math.floor(start / stepMs) * stepMs;
-      const group = groups.get(at) ?? { min: stats.min, max: stats.max, sum: 0, count: 0, samples: 0 };
-      group.min = Math.min(group.min, stats.min);
-      group.max = Math.max(group.max, stats.max);
-      group.sum += stats.sum;
-      group.count += stats.count;
-      group.samples += bucket.samples;
-      groups.set(at, group);
+    if (!emptyRange) {
+      const starts = [...this.buckets.keys()].sort((a, b) => a - b);
+      for (const start of starts) {
+        if (start + METRIC_BUCKET_MS <= clampedFrom || start > clampedTo) continue;
+        const bucket = this.buckets.get(start);
+        const stats = bucket?.slots[slotIdx];
+        if (!bucket || !stats) continue;
+        const at = Math.floor(start / stepMs) * stepMs;
+        const group = groups.get(at) ?? { min: stats.min, max: stats.max, sum: 0, count: 0, samples: 0 };
+        group.min = Math.min(group.min, stats.min);
+        group.max = Math.max(group.max, stats.max);
+        group.sum += stats.sum;
+        group.count += stats.count;
+        group.samples += bucket.samples;
+        groups.set(at, group);
+      }
     }
     let points: MetricSeriesPoint[] = [...groups.entries()]
       .sort(([a], [b]) => a - b)
@@ -386,7 +401,7 @@ export class MetricTimeline {
     let samples = 0;
     let ratioMin = Number.POSITIVE_INFINITY;
     for (const start of starts) {
-      if (start < from - METRIC_BUCKET_MS) continue;
+      if (start + METRIC_BUCKET_MS <= from) continue;
       if (start > to) break;
       const bucket = this.buckets.get(start);
       const stats = bucket?.slots[slotIdx];
@@ -470,6 +485,66 @@ export class MetricTimeline {
     };
   }
 
+  private localHourBounds(at: number): { start: number; end: number } {
+    const secMs = Math.floor(at / 1000) * 1000;
+    const p = this.calendar.parts(secMs);
+    const guess = secMs - (p.minute * 60_000 + p.second * 1000);
+    let start: number;
+    let sp: LocalParts;
+    if (guess >= 0) {
+      const gp = this.calendar.parts(guess);
+      if (sameLocalHour(gp, p) && gp.minute === 0 && gp.second === 0) {
+        start = guess;
+        sp = gp;
+      } else {
+        start = this.findLocalHourStart(secMs, p);
+        sp = this.calendar.parts(start);
+      }
+    } else {
+      start = this.findLocalHourStart(secMs, p);
+      sp = this.calendar.parts(start);
+    }
+    const nextProbe = start + METRIC_HOUR_MS;
+    const ep = this.calendar.parts(nextProbe);
+    const startOffset = localOffsetMs(sp, Math.floor(start / 1000) * 1000);
+    const end =
+      ep.minute === 0 && ep.second === 0 && (!sameLocalHour(ep, sp) || localOffsetMs(ep, nextProbe) !== startOffset)
+        ? nextProbe
+        : this.findLocalHourEnd(start, sp, startOffset);
+    return { start, end };
+  }
+
+  private findLocalHourStart(secMs: number, p: LocalParts): number {
+    const targetOffset = localOffsetMs(p, secMs);
+    let lo = Math.max(0, secMs - METRIC_HOUR_MS);
+    let hi = secMs;
+    while (lo < hi) {
+      const mid = Math.floor((lo + hi) / 2);
+      const mp = this.calendar.parts(mid);
+      if (sameLocalHour(mp, p) && localOffsetMs(mp, Math.floor(mid / 1000) * 1000) === targetOffset) {
+        hi = mid;
+      } else {
+        lo = mid + 1;
+      }
+    }
+    return lo;
+  }
+
+  private findLocalHourEnd(start: number, sp: LocalParts, startOffset: number): number {
+    let lo = start + 1;
+    let hi = start + METRIC_HOUR_MS;
+    while (lo < hi) {
+      const mid = Math.floor((lo + hi) / 2);
+      const mp = this.calendar.parts(mid);
+      if (sameLocalHour(mp, sp) && localOffsetMs(mp, Math.floor(mid / 1000) * 1000) === startOffset) {
+        lo = mid + 1;
+      } else {
+        hi = mid;
+      }
+    }
+    return lo;
+  }
+
   private pruneBuckets(at: number): void {
     const bucketCutoff = Math.floor((at - METRIC_RETENTION_MS) / METRIC_BUCKET_MS) * METRIC_BUCKET_MS;
     for (const start of this.buckets.keys()) {
@@ -478,7 +553,9 @@ export class MetricTimeline {
   }
 
   private pruneHours(at: number): void {
-    const hourCutoff = Math.floor((at - METRIC_HOUR_RETENTION_MS) / METRIC_HOUR_MS) * METRIC_HOUR_MS;
+    const cutoffPoint = at - METRIC_HOUR_RETENTION_MS;
+    if (cutoffPoint <= 0) return;
+    const hourCutoff = this.localHourBounds(cutoffPoint).start;
     for (const start of this.hours.keys()) {
       if (start < hourCutoff) this.hours.delete(start);
     }

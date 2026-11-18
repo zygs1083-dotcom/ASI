@@ -50,14 +50,54 @@ function finite(value: unknown): value is number {
   return typeof value === 'number' && Number.isFinite(value);
 }
 
+const BODY_ALERT_RANK: Readonly<Record<string, number>> = {
+  warn: 1,
+  critical: 2,
+};
+
+function bodyAlertSeverity(value: unknown): 'warn' | 'critical' | undefined {
+  if (typeof value !== 'string') return undefined;
+  return (BODY_ALERT_RANK[value] ?? 0) >= BODY_ALERT_RANK.warn ? (value as 'warn' | 'critical') : undefined;
+}
+
+/** Returns true when an away metric trend crossed a warn threshold or grew by at least 20%. */
+export function isAnomalousAwayMetric(trend: {
+  metric: string;
+  start: number;
+  end: number;
+  ratioStart?: number;
+  ratioMin?: number;
+}): boolean {
+  if (trend.metric === 'disk' || trend.metric === 'battery') {
+    const threshold = BODY_THRESHOLDS[trend.metric];
+    if (trend.ratioMin === undefined) return false;
+    const worsened =
+      trend.ratioStart === undefined || trend.ratioStart >= threshold.warn || trend.ratioMin < trend.ratioStart;
+    return trend.ratioMin < threshold.warn && worsened;
+  }
+  return trend.start > 0 && (trend.end - trend.start) / trend.start >= AWAY_GROWTH_RATIO - 1e-9;
+}
+
+interface ActiveCause {
+  wall: number;
+  mono: number;
+}
+
 export class AwayReporter {
-  private readonly active = new Map<Cause, number>();
+  private readonly active = new Map<Cause, ActiveCause>();
   private readonly causeMs: Record<Cause, number> = { ...EMPTY_CAUSE_MS };
   private readonly alerts = new Map<string, AwayAlert>();
   private readonly failed: AwayFailedJob[] = [];
   private readonly bursts = new Map<string, AwayDeletion>();
-  private startAt?: number;
-  private lastAwayEnd?: number;
+  private startWall?: number;
+  private startMono?: number;
+  private lastAwayEndWall?: number;
+  private lastAwayEndMono?: number;
+  private totalAlertCount = 0;
+  private totalAlertEntries = 0;
+  private totalFailedCount = 0;
+  private totalBurstEntries = 0;
+  private totalDeletedCount = 0;
 
   constructor(
     private readonly metrics: MetricTimeline,
@@ -69,32 +109,41 @@ export class AwayReporter {
   observe(signal: Signal): void {
     const kind = signal.kind;
     if (kind === 'away.summary') return;
-    const at = finite(signal.at) ? signal.at : this.clock.wall();
+    const wallAt = finite(signal.at) ? signal.at : this.clock.wall();
+    const rawMono = this.clock.mono();
+    const monoAt = finite(rawMono) ? rawMono : 0;
     const startCause = START_CAUSES[kind];
     if (startCause) {
-      this.beginCause(startCause, at);
+      this.beginCause(startCause, wallAt, monoAt);
       return;
     }
     const endCause = END_CAUSES[kind];
     if (endCause) {
       const open = this.active.get(endCause);
       if (open !== undefined) {
-        this.causeMs[endCause] += Math.max(0, at - open);
+        this.causeMs[endCause] += Math.max(0, monoAt - open.mono);
         this.active.delete(endCause);
       } else {
-        this.consumeHint(endCause, signal, at);
+        this.consumeHint(endCause, signal, wallAt, monoAt);
       }
-      if (this.active.size === 0 && this.startAt !== undefined) this.finish(at);
+      if (this.active.size === 0 && this.startMono !== undefined) this.finish(wallAt, monoAt);
       return;
     }
-    if (this.startAt === undefined || at < this.startAt) return;
+    if (this.startMono === undefined || monoAt < this.startMono) return;
     this.collect(signal);
   }
 
-  private beginCause(cause: Cause, at: number): void {
+  private beginCause(cause: Cause, wallAt: number, monoAt: number): void {
     const open = this.active.get(cause);
-    if (open === undefined || at < open) this.active.set(cause, at);
-    this.startAt = this.startAt === undefined ? at : Math.min(this.startAt, at);
+    if (open === undefined || monoAt < open.mono) {
+      this.active.set(cause, { wall: wallAt, mono: monoAt });
+    }
+    if (this.startMono === undefined || monoAt < this.startMono) {
+      this.startMono = monoAt;
+      this.startWall = wallAt;
+    } else if (this.startWall === undefined) {
+      this.startWall = wallAt;
+    }
   }
 
   /**
@@ -103,25 +152,52 @@ export class AwayReporter {
    * inside the previous episode is ignored so paired unlock/wake events can
    * never report the same away twice.
    */
-  private consumeHint(cause: Cause, signal: Signal, at: number): void {
+  private consumeHint(cause: Cause, signal: Signal, wallAt: number, monoAt: number): void {
     const duration = signal.data.durationMs;
     if (!finite(duration) || duration <= 0) return;
-    const inferred = at - duration;
-    if (inferred < 0) return;
-    if (this.lastAwayEnd !== undefined && inferred < this.lastAwayEnd) return;
-    this.startAt = this.startAt === undefined ? inferred : Math.min(this.startAt, inferred);
+    const inferredWall = wallAt - duration;
+    if (inferredWall < 0) return;
+    const inferredMono = monoAt - duration;
+    if (this.lastAwayEndMono !== undefined && inferredMono < this.lastAwayEndMono) return;
+    if (this.lastAwayEndMono === undefined && this.lastAwayEndWall !== undefined && inferredWall < this.lastAwayEndWall)
+      return;
+    if (this.startMono === undefined || inferredMono < this.startMono) {
+      this.startMono = inferredMono;
+      this.startWall = inferredWall;
+    } else if (this.startWall === undefined) {
+      this.startWall = inferredWall;
+    }
     this.causeMs[cause] += duration;
   }
 
   private collect(signal: Signal): void {
-    if (signal.kind === 'body.threshold') {
-      const severity = signal.data.severity;
-      if (severity !== 'warn' && severity !== 'critical') return;
-      const metric = signal.subject.trim() || 'body';
+    if (signal.kind.startsWith('body.')) {
+      if (signal.kind === 'body.anomaly' && signal.data.type === 'rebaseline-suggestion') return;
+      const severity = bodyAlertSeverity(signal.data.severity);
+      if (!severity) return;
+      const metric =
+        typeof signal.data.metric === 'string' && signal.data.metric.trim()
+          ? signal.data.metric.trim()
+          : signal.subject.trim() || 'body';
       const key = `${metric}\u0000${severity}`;
+      this.totalAlertCount += 1;
       const existing = this.alerts.get(key);
-      if (existing) existing.count += 1;
-      else if (this.alerts.size < ALERT_CAP) this.alerts.set(key, { metric, severity, count: 1 });
+      if (existing) {
+        existing.count += 1;
+        return;
+      }
+      this.totalAlertEntries += 1;
+      if (this.alerts.size >= ALERT_CAP) {
+        if (severity === 'critical') {
+          const warnKey = [...this.alerts.entries()].find(([, alert]) => alert.severity === 'warn')?.[0];
+          if (warnKey !== undefined) {
+            this.alerts.delete(warnKey);
+            this.alerts.set(key, { metric, severity, count: 1 });
+          }
+        }
+        return;
+      }
+      this.alerts.set(key, { metric, severity, count: 1 });
       return;
     }
     if (
@@ -130,6 +206,7 @@ export class AwayReporter {
         finite(signal.data.exitCode) &&
         signal.data.exitCode !== 0)
     ) {
+      this.totalFailedCount += 1;
       if (this.failed.length < FAILED_CAP) {
         const id =
           typeof signal.data.id === 'string' && signal.data.id.trim() ? signal.data.id : signal.subject || signal.kind;
@@ -148,53 +225,68 @@ export class AwayReporter {
           ? signal.data.directory
           : signal.subject || '';
       const deleted = finite(signal.data.externalDeleted)
-        ? signal.data.externalDeleted
+        ? Math.max(0, signal.data.externalDeleted)
         : finite(signal.data.deleted)
-          ? signal.data.deleted
+          ? Math.max(0, signal.data.deleted)
           : 0;
-      if (this.bursts.size >= BURST_CAP && !this.bursts.has(directory)) return;
+      this.totalDeletedCount += deleted;
       const existing = this.bursts.get(directory);
-      if (existing) existing.deleted += deleted;
-      else this.bursts.set(directory, { directory, deleted });
+      if (existing) {
+        existing.deleted += deleted;
+        return;
+      }
+      this.totalBurstEntries += 1;
+      if (this.bursts.size < BURST_CAP) {
+        this.bursts.set(directory, { directory, deleted });
+      }
     }
   }
 
-  private finish(returnAt: number): void {
-    const awayFrom = this.startAt ?? returnAt;
-    const durationMs = Math.max(0, returnAt - awayFrom);
+  private finish(returnWall: number, returnMono: number): void {
+    const awayFrom = this.startWall ?? returnWall;
+    const startMono = this.startMono ?? returnMono;
+    const durationMs = Math.max(0, returnMono - startMono);
     const causes = { ...this.causeMs };
-    for (const [cause, start] of this.active) causes[cause] += Math.max(0, returnAt - start);
-    const alerts = [...this.alerts.values()].map((alert) => ({ ...alert }));
+    for (const [cause, open] of this.active) causes[cause] += Math.max(0, returnMono - open.mono);
+    const alerts = [...this.alerts.values()]
+      .map((alert) => ({ ...alert }))
+      .sort((a, b) => (BODY_ALERT_RANK[b.severity] ?? 0) - (BODY_ALERT_RANK[a.severity] ?? 0));
     const failed = this.failed.map((item) => ({ ...item }));
     const bursts = [...this.bursts.values()].map((item) => ({ ...item }));
+    const alertCount = this.totalAlertCount;
+    const alertEntries = this.totalAlertEntries;
+    const failedCount = this.totalFailedCount;
+    const burstEntries = this.totalBurstEntries;
+    const deletedCount = this.totalDeletedCount;
     this.reset();
     if (durationMs < AWAY_MIN_MS) return;
 
-    const trends: AwayMetricTrend[] = [];
+    const rawTrends: AwayMetricTrend[] = [];
     for (const metric of METRIC_KEYS) {
-      const trend = this.metrics.trend(metric, awayFrom, returnAt);
-      if (trend) trends.push(toMetricTrend(trend));
+      const trend = this.metrics.trend(metric, awayFrom, returnWall);
+      if (trend) rawTrends.push(toMetricTrend(trend));
     }
     const anomalies = new Set<AwayAnomaly>();
-    if (alerts.length > 0) anomalies.add('alerts');
-    if (failed.length > 0) anomalies.add('failed-jobs');
-    if (bursts.length > 0) anomalies.add('external-deletion');
-    for (const trend of trends) {
-      if (trend.metric === 'disk' || trend.metric === 'battery') {
-        const threshold = BODY_THRESHOLDS[trend.metric];
-        if (trend.ratioMin !== undefined) {
-          const worsened =
-            trend.ratioStart === undefined || trend.ratioStart >= threshold.warn || trend.ratioMin < trend.ratioStart;
-          if (trend.ratioMin < threshold.warn && worsened) anomalies.add('metric-warning');
-        }
-      } else if (trend.start > 0 && (trend.end - trend.start) / trend.start >= AWAY_GROWTH_RATIO - 1e-9) {
-        anomalies.add('metric-growth');
+    if (alertEntries > 0 || alerts.length > 0) anomalies.add('alerts');
+    if (failedCount > 0 || failed.length > 0) anomalies.add('failed-jobs');
+    if (burstEntries > 0 || bursts.length > 0) anomalies.add('external-deletion');
+    const anomalousTrends: AwayMetricTrend[] = [];
+    const normalTrends: AwayMetricTrend[] = [];
+    for (const trend of rawTrends) {
+      if (isAnomalousAwayMetric(trend)) {
+        anomalies.add(trend.metric === 'disk' || trend.metric === 'battery' ? 'metric-warning' : 'metric-growth');
+        anomalousTrends.push(trend);
+      } else {
+        normalTrends.push(trend);
       }
     }
+    const trends = [...anomalousTrends, ...normalTrends];
     const hasAnomaly = anomalies.size > 0;
+    const anomalyCount = alertEntries + failedCount + burstEntries + anomalousTrends.length;
+    const omitted = alertEntries - alerts.length + (failedCount - failed.length) + (burstEntries - bursts.length);
     const data: AwaySummaryData = {
       awayFrom,
-      returnAt,
+      returnAt: returnWall,
       durationMs,
       sleepMs: Math.round(causes.sleep),
       lockMs: Math.round(causes.lock),
@@ -205,15 +297,18 @@ export class AwayReporter {
       metrics: trends,
       failed,
       bursts,
-      alertCount: alerts.reduce((sum, alert) => sum + alert.count, 0),
-      failedCount: failed.length,
-      deletedCount: bursts.reduce((sum, burst) => sum + burst.deleted, 0),
+      alertCount,
+      failedCount,
+      deletedCount,
+      anomalyCount,
+      ...(omitted > 0 ? { omitted } : {}),
     };
-    this.lastAwayEnd = returnAt;
+    this.lastAwayEndWall = returnWall;
+    this.lastAwayEndMono = returnMono;
     this.emit({
-      id: `away.summary:${awayFrom}:${returnAt}`,
+      id: `away.summary:${awayFrom}:${returnWall}`,
       kind: 'away.summary',
-      at: returnAt,
+      at: returnWall,
       source: { id: 'away', api: 'detector', host: 'local' },
       subject: 'away',
       cause: 'user',
@@ -229,7 +324,13 @@ export class AwayReporter {
     this.alerts.clear();
     this.failed.length = 0;
     this.bursts.clear();
-    this.startAt = undefined;
+    this.startWall = undefined;
+    this.startMono = undefined;
+    this.totalAlertCount = 0;
+    this.totalAlertEntries = 0;
+    this.totalFailedCount = 0;
+    this.totalBurstEntries = 0;
+    this.totalDeletedCount = 0;
   }
 }
 
@@ -242,6 +343,7 @@ function toMetricTrend(trend: MetricTrend): AwayMetricTrend {
     end: trend.end,
     min: trend.min,
     max: trend.max,
+    ...(trend.ratioStart === undefined ? {} : { ratioStart: trend.ratioStart }),
     ...(trend.ratioMin === undefined ? {} : { ratioMin: trend.ratioMin }),
   };
 }

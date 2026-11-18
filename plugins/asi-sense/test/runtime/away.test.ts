@@ -100,6 +100,8 @@ async function harness(startWall = BASE): Promise<Harness> {
     delivered,
     history,
     send: async (kind, at, data = {}, subject) => {
+      mono = Math.max(mono, 1_000 + (at - startWall));
+      wall = at;
       const subjectFor = subject ?? (kind.startsWith('screen.') ? 'screen' : (kind.split('.')[0] ?? 'system'));
       await attention.accept(
         sig({ id: `${kind}:${at}:${counter++}`, kind, at, subject: subjectFor, data: { at, ...data } }),
@@ -366,5 +368,260 @@ describe('away detection', () => {
     const projected = update.changes[0]?.signal.data as Record<string, unknown>;
     expect(projected.hasAnomaly).toBe(true);
     expect((projected.bursts as Array<Record<string, unknown>>)[0]?.directory).toBe('secret-0');
+  });
+
+  it('triggers hasAnomaly and pushes when only a body.threshold warn occurs', async () => {
+    const h = await harness();
+    await h.send('screen.locked', BASE);
+    await h.send('body.threshold', BASE + 10 * MINUTE, { severity: 'warn', value: 0.9 }, 'memory');
+    await h.send('screen.unlocked', BASE + 70 * MINUTE);
+    await h.settle();
+    expect(awaySummary(h)).toMatchObject({
+      hasAnomaly: true,
+      anomalies: ['alerts'],
+      alerts: [{ metric: 'memory', severity: 'warn', count: 1 }],
+      alertCount: 1,
+    });
+    await h.flush();
+    const pushed = h.delivered.flatMap((i) => i.update.changes.filter((c) => c.signal.kind === 'away.summary'));
+    expect(pushed).toHaveLength(1);
+  });
+
+  it('triggers hasAnomaly and pushes when only a body.rate warn occurs', async () => {
+    const h = await harness();
+    await h.send('screen.locked', BASE);
+    await h.send(
+      'body.rate',
+      BASE + 10 * MINUTE,
+      { metric: 'rss', ruleId: 'rss-surge', severity: 'warn', slope: 1000 },
+      'rate:rss-surge',
+    );
+    await h.send('screen.unlocked', BASE + 70 * MINUTE);
+    await h.settle();
+    expect(awaySummary(h)).toMatchObject({
+      hasAnomaly: true,
+      anomalies: ['alerts'],
+      alerts: [{ metric: 'rss', severity: 'warn', count: 1 }],
+      alertCount: 1,
+    });
+    await h.flush();
+    await h.attention.preStep('s1');
+    const pushed = h.delivered.flatMap((i) => i.update.changes.filter((c) => c.signal.kind === 'away.summary'));
+    expect(pushed).toHaveLength(1);
+  });
+
+  it('triggers hasAnomaly and pushes when only a body.anomaly warn occurs', async () => {
+    const h = await harness();
+    await h.send('screen.locked', BASE);
+    await h.send(
+      'body.anomaly',
+      BASE + 10 * MINUTE,
+      { metric: 'network.rx', ruleId: 'network-rx', severity: 'warn', deviation: 4.2 },
+      'baseline:network-rx',
+    );
+    await h.send('screen.unlocked', BASE + 70 * MINUTE);
+    await h.settle();
+    expect(awaySummary(h)).toMatchObject({
+      hasAnomaly: true,
+      anomalies: ['alerts'],
+      alerts: [{ metric: 'network.rx', severity: 'warn', count: 1 }],
+      alertCount: 1,
+    });
+    await h.flush();
+    await h.attention.preStep('s1');
+    const pushed = h.delivered.flatMap((i) => i.update.changes.filter((c) => c.signal.kind === 'away.summary'));
+    expect(pushed).toHaveLength(1);
+  });
+
+  it('triggers hasAnomaly and pushes when only a future body.* warn occurs', async () => {
+    const h = await harness();
+    await h.send('screen.locked', BASE);
+    await h.send(
+      'body.thermal-future',
+      BASE + 10 * MINUTE,
+      { metric: 'thermal', severity: 'warn', value: 'serious' },
+      'thermal',
+    );
+    await h.send('screen.unlocked', BASE + 70 * MINUTE);
+    await h.settle();
+    expect(awaySummary(h)).toMatchObject({
+      hasAnomaly: true,
+      anomalies: ['alerts'],
+      alerts: [{ metric: 'thermal', severity: 'warn', count: 1 }],
+      alertCount: 1,
+    });
+    await h.flush();
+    const pushed = h.delivered.flatMap((i) => i.update.changes.filter((c) => c.signal.kind === 'away.summary'));
+    expect(pushed).toHaveLength(1);
+  });
+
+  it('ignores rebaseline-suggestion and normal severity body.* signals in away.summary', async () => {
+    const h = await harness();
+    await h.send('screen.locked', BASE);
+    await h.send(
+      'body.anomaly',
+      BASE + 10 * MINUTE,
+      { metric: 'cpu', severity: 'warn', type: 'rebaseline-suggestion', suggestionId: 's1' },
+      'rebaseline:cpu',
+    );
+    await h.send(
+      'body.rate',
+      BASE + 20 * MINUTE,
+      { metric: 'rss', ruleId: 'rss-surge', severity: 'normal', slope: 0 },
+      'rate:rss-surge',
+    );
+    await h.send('screen.unlocked', BASE + 70 * MINUTE);
+    await h.settle();
+    await h.flush();
+    expect(awaySummary(h)).toMatchObject({ hasAnomaly: false, anomalies: [], alerts: [], alertCount: 0 });
+    expect(h.delivered.flatMap((i) => i.update.changes.filter((c) => c.signal.kind === 'away.summary'))).toHaveLength(
+      0,
+    );
+  });
+
+  it.each([
+    ['exact 5m boundary', 0],
+    ['middle of bucket', 2 * MINUTE + 30_000],
+    ['end of bucket', 4 * MINUTE + 59_999],
+  ])(
+    'does not pull in the previous bucket or report growth when away starts at %s and metrics stay flat',
+    async (_label, offset) => {
+      const h = await harness();
+      h.record(cpuBody(0.1), BASE - 2 * MINUTE);
+      h.record(cpuBody(0.5), BASE + offset);
+      h.record(cpuBody(0.5), BASE + offset + 30 * MINUTE);
+      h.record(cpuBody(0.5), BASE + offset + 65 * MINUTE);
+      await lockAway(h, BASE + offset, BASE + offset + 70 * MINUTE);
+      await h.settle();
+      await h.flush();
+      const data = awaySummary(h);
+      expect(data).toMatchObject({ hasAnomaly: false, anomalies: [] });
+      const cpuTrend = (data?.metrics as Array<Record<string, unknown>> | undefined)?.find((m) => m.metric === 'cpu');
+      expect(cpuTrend).toMatchObject({ start: 0.5, end: 0.5, min: 0.5, max: 0.5 });
+      expect(h.delivered.flatMap((i) => i.update.changes.filter((c) => c.signal.kind === 'away.summary'))).toHaveLength(
+        0,
+      );
+    },
+  );
+
+  it('retains uncapped totals, anomalyCount and omitted while prioritizing critical > warn > failed > burst > metrics within 2KB', async () => {
+    const h = await harness();
+    h.record(
+      sample(
+        mkBody({
+          cpu: f({ usage: 0.2, perCore: [0.2], load1: 1, load5: 1, load15: 1 }),
+          disks: { ...f([{ mount: '/', total: 1000, free: 500 }]), kind: 'disks' },
+        }),
+        BASE,
+      ),
+      BASE,
+    );
+    await h.send('screen.locked', BASE);
+    h.record(
+      sample(
+        mkBody({
+          cpu: f({ usage: 0.2, perCore: [0.2], load1: 1, load5: 1, load15: 1 }),
+          disks: { ...f([{ mount: '/', total: 1000, free: 40 }]), kind: 'disks' },
+        }),
+        BASE + 60 * MINUTE,
+      ),
+      BASE + 60 * MINUTE,
+    );
+    await h.send('body.threshold', BASE + 5 * MINUTE, { severity: 'warn', value: 0.85 }, 'memory');
+    await h.send('body.threshold', BASE + 6 * MINUTE, { severity: 'critical', value: 'critical' }, 'thermal');
+    for (let i = 0; i < 300; i++) {
+      const name = `job-${i}-${'alpha beta gamma delta '.repeat(12)}`;
+      await h.send('job.exited', BASE + 10 * MINUTE + i, { id: name, exitCode: 1 }, name);
+    }
+    for (let i = 0; i < 10; i++) {
+      const dir = `/Users/alice/${'dir word '.repeat(35)}bucket-${i}`;
+      await h.send(
+        'file.burst',
+        BASE + 20 * MINUTE + i,
+        { directory: dir, deleted: 100, externalDeleted: 100, externalDeletionExceeded: true },
+        dir,
+      );
+    }
+    await h.send('screen.unlocked', BASE + 70 * MINUTE);
+    await h.settle();
+
+    const summary = h.summaries[0] as Signal;
+    expect(summary.data).toMatchObject({
+      alertCount: 2,
+      failedCount: 300,
+      deletedCount: 1000,
+      anomalyCount: 313,
+      omitted: 280,
+    });
+    const update = modelUpdate({
+      since: summary.at - 1,
+      at: summary.at,
+      changes: [{ signal: summary, count: 1, level: 'wake' }],
+      suppressed: 0,
+    });
+    expect(Buffer.byteLength(JSON.stringify(update), 'utf8')).toBeLessThanOrEqual(2048);
+    const projected = update.changes[0]?.signal.data as Record<string, unknown>;
+    expect(projected.alertCount).toBe(2);
+    expect(projected.failedCount).toBe(300);
+    expect(projected.deletedCount).toBe(1000);
+    expect(projected.anomalyCount).toBe(313);
+    expect(projected.omitted).toBeGreaterThan(280);
+    const projectedAlerts = projected.alerts as Array<{ metric: string; severity: string }>;
+    expect(projectedAlerts.map((a) => `${a.severity}:${a.metric}`)).toEqual(['critical:thermal', 'warn:memory']);
+
+    const text = formatEnvUpdate(update);
+    expect(Buffer.byteLength(text, 'utf8')).toBeLessThanOrEqual(2048);
+    expect(text).toContain('alerts=2');
+    expect(text).toContain('failed=300');
+    expect(text).toContain('deletes=1000');
+    expect(text).toContain(`另有 ${String(projected.omitted)} 项`);
+  });
+
+  it('uses monotonic clock for away duration and signal collection when wall clock rolls back 1 hour', () => {
+    const T = Date.UTC(2026, 10, 18, 12, 0, 0);
+    let wall = T;
+    let mono = 10_000;
+    const clock = { wall: () => wall, mono: () => mono };
+    const emitted: Signal[] = [];
+    const away = new AwayReporter(new MetricTimeline(clock, 'UTC'), clock, (s) => emitted.push(s));
+
+    away.observe(sig({ id: 'l1', kind: 'screen.locked', at: wall, subject: 'screen', data: { at: wall } }));
+    // Wall clock jumps back 1 hour, while monotonic clock advances 30 minutes.
+    wall = T - HOUR + 30 * MINUTE;
+    mono += 30 * MINUTE;
+    away.observe(
+      sig({ id: 'j1', kind: 'job.failed', at: wall, subject: 'build-task', data: { id: 'build-task', exitCode: 1 } }),
+    );
+    // Another 35 minutes pass on mono (total 65 minutes away); wall is still <= T + 5m.
+    wall += 35 * MINUTE;
+    mono += 35 * MINUTE;
+    away.observe(sig({ id: 'u1', kind: 'screen.unlocked', at: wall, subject: 'screen', data: { at: wall } }));
+
+    expect(emitted).toHaveLength(1);
+    expect(emitted[0]?.data).toMatchObject({
+      awayFrom: T,
+      returnAt: wall,
+      durationMs: 65 * MINUTE,
+      lockMs: 65 * MINUTE,
+      hasAnomaly: true,
+      anomalies: ['failed-jobs'],
+      failedCount: 1,
+    });
+  });
+
+  it('does not report away when wall jumps forward >=1h while monotonic clock elapsed <1h', () => {
+    const T = Date.UTC(2026, 10, 18, 12, 0, 0);
+    let wall = T;
+    let mono = 10_000;
+    const clock = { wall: () => wall, mono: () => mono };
+    const emitted: Signal[] = [];
+    const away = new AwayReporter(new MetricTimeline(clock, 'UTC'), clock, (s) => emitted.push(s));
+
+    away.observe(sig({ id: 'l1', kind: 'screen.locked', at: wall, subject: 'screen', data: { at: wall } }));
+    wall += 2 * HOUR;
+    mono += 30 * MINUTE;
+    away.observe(sig({ id: 'u1', kind: 'screen.unlocked', at: wall, subject: 'screen', data: { at: wall } }));
+
+    expect(emitted).toHaveLength(0);
   });
 });

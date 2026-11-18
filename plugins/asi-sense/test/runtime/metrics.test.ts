@@ -284,4 +284,98 @@ describe('daily summary metric extension', () => {
       metrics: { cpu: { min: 0.2, max: 0.4, avg: 0.3, count: 2 } },
     });
   });
+
+  it('includes the containing bucket when query from falls mid-bucket', () => {
+    const T = Date.UTC(2026, 10, 18, 10, 0, 0);
+    const { clock: c } = clock(T + 600_000);
+    const timeline = new MetricTimeline(c, 'UTC');
+    timeline.record(fresh({ cpu: cpuBody(0.4).cpu }, T + 120_000), T + 120_000);
+    timeline.record(fresh({ cpu: cpuBody(0.6).cpu }, T + 180_000), T + 180_000);
+
+    const res = timeline.query({ metric: 'cpu', from: T + 60_000, to: T + 240_000 });
+    expect(res.available).toBe(true);
+    expect(res.points).toEqual([expect.objectContaining({ at: T, min: 0.4, avg: 0.5, max: 0.6, count: 2 })]);
+
+    const beforeWindow = timeline.query({ metric: 'cpu', from: T - 600_000, to: T - 60_000 });
+    expect(beforeWindow.available).toBe(false);
+    expect(beforeWindow.points).toEqual([]);
+  });
+
+  it('starts trend from the bucket containing from across 5m boundary, mid-bucket, and bucket-end', () => {
+    const T = Date.UTC(2026, 10, 18, 9, 0, 0);
+    const { clock: c } = clock(T + 4_000_000);
+    const timeline = new MetricTimeline(c, 'UTC');
+    timeline.record(fresh({ cpu: cpuBody(0.1).cpu }, T - 120_000), T - 120_000);
+    timeline.record(fresh({ cpu: cpuBody(0.5).cpu }, T + 60_000), T + 60_000);
+    timeline.record(fresh({ cpu: cpuBody(0.5).cpu }, T + 3_900_000), T + 3_900_000);
+
+    for (const from of [T, T + 150_000, T + METRIC_BUCKET_MS - 1]) {
+      expect(timeline.trend('cpu', from, T + 4_000_000)).toMatchObject({
+        start: 0.5,
+        end: 0.5,
+        min: 0.5,
+        max: 0.5,
+      });
+    }
+  });
+
+  it('aligns hourly buckets and daily summaries to local hour/day boundaries in Asia/Kolkata (+05:30)', () => {
+    const { clock: c } = clock(Date.UTC(2026, 10, 18, 12, 0, 0));
+    const timeline = new MetricTimeline(c, 'Asia/Kolkata');
+    const ist2345 = Date.UTC(2026, 10, 17, 18, 15, 0); // 2026-11-17 23:45 IST -> hour 17:30Z
+    const ist0015 = Date.UTC(2026, 10, 17, 18, 45, 0); // 2026-11-18 00:15 IST -> hour 18:30Z
+    const ist0045 = Date.UTC(2026, 10, 17, 19, 15, 0); // 2026-11-18 00:45 IST -> hour 18:30Z
+
+    timeline.record(fresh({ cpu: cpuBody(0.2).cpu }, ist2345), ist2345);
+    timeline.record(fresh({ cpu: cpuBody(0.4).cpu }, ist0015), ist0015);
+    timeline.record(fresh({ cpu: cpuBody(0.6).cpu }, ist0045), ist0045);
+
+    const nov17 = timeline.dailyExtension('2026-11-17');
+    const nov18 = timeline.dailyExtension('2026-11-18');
+    expect(nov17?.hours).toHaveLength(1);
+    expect(nov17?.hours[0]).toMatchObject({
+      start: Date.UTC(2026, 10, 17, 17, 30, 0),
+      samples: 1,
+      metrics: { cpu: { min: 0.2, max: 0.2, avg: 0.2, count: 1 } },
+    });
+    expect(nov18?.hours).toHaveLength(1);
+    expect(nov18?.hours[0]).toMatchObject({
+      start: Date.UTC(2026, 10, 17, 18, 30, 0),
+      samples: 2,
+      metrics: { cpu: { min: 0.4, max: 0.6, avg: 0.5, count: 2 } },
+    });
+  });
+
+  it('aligns hourly buckets and daily summaries across midnight and DST in Australia/Adelaide', () => {
+    const { clock: c } = clock(Date.UTC(2026, 10, 18, 12, 0, 0));
+    const timeline = new MetricTimeline(c, 'Australia/Adelaide');
+    // Nov 2026 Adelaide is UTC+10:30 (ACDT) -> midnight 2026-11-18 is 2026-11-17T13:30:00Z
+    const acdt2345 = Date.UTC(2026, 10, 17, 13, 15, 0); // 2026-11-17 23:45 ACDT -> hour 12:30Z
+    const acdt0015 = Date.UTC(2026, 10, 17, 13, 45, 0); // 2026-11-18 00:15 ACDT -> hour 13:30Z
+
+    timeline.record(fresh({ cpu: cpuBody(0.25).cpu }, acdt2345), acdt2345);
+    timeline.record(fresh({ cpu: cpuBody(0.75).cpu }, acdt0015), acdt0015);
+
+    const nov17 = timeline.dailyExtension('2026-11-17');
+    const nov18 = timeline.dailyExtension('2026-11-18');
+    expect(nov17?.hours.map((h) => h.start)).toEqual([Date.UTC(2026, 10, 17, 12, 30, 0)]);
+    expect(nov18?.hours.map((h) => h.start)).toEqual([Date.UTC(2026, 10, 17, 13, 30, 0)]);
+
+    const cal = new LocalCalendar('Australia/Adelaide');
+    const fall = cal.dayBounds('2026-04-05'); // 25h
+    const spring = cal.dayBounds('2026-10-04'); // 23h
+    expect(fall.durationMs).toBe(25 * 60 * 60_000);
+    expect(spring.durationMs).toBe(23 * 60 * 60_000);
+    for (const [date, bounds, expectedHours] of [
+      ['2026-04-05', fall, 25],
+      ['2026-10-04', spring, 23],
+    ] as const) {
+      const { clock: dc } = clock(bounds.endMs - 1);
+      const dstTimeline = new MetricTimeline(dc, 'Australia/Adelaide');
+      for (let at = bounds.startMs; at < bounds.endMs; at += 30 * 60_000) {
+        dstTimeline.record(fresh({ cpu: cpuBody(0.5).cpu }, at), at);
+      }
+      expect(dstTimeline.dailyExtension(date)?.hours).toHaveLength(expectedHours);
+    }
+  });
 });

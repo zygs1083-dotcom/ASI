@@ -1,4 +1,5 @@
 import type { EnvChange, EnvUpdate, Signal } from '@asi/sense-types';
+import { isAnomalousAwayMetric } from '../runtime/away.ts';
 
 /** Options for {@link formatEnvUpdate}. */
 export interface FormatOptions {
@@ -56,6 +57,48 @@ function percentDelta(current: number, start: number): string | undefined {
   if (!Number.isFinite(current) || !Number.isFinite(start) || start <= 0) return undefined;
   const ratio = (current - start) / start;
   return `${ratio >= 0 ? '+' : ''}${Math.round(ratio * 100)}%`;
+}
+
+const MAX_AWAY_FORMAT_BYTES = 2048;
+
+function truncateEscapedRaw(raw: string, maxEscapedBytes: number): string {
+  const escaped = esc(raw);
+  if (Buffer.byteLength(escaped, 'utf8') <= maxEscapedBytes) return escaped;
+  if (maxEscapedBytes <= 3) return '';
+  const limit = maxEscapedBytes - 3;
+  let out = '';
+  let bytes = 0;
+  for (const ch of raw) {
+    const piece = esc(ch);
+    const pieceBytes = Buffer.byteLength(piece, 'utf8');
+    if (bytes + pieceBytes > limit) break;
+    out += piece;
+    bytes += pieceBytes;
+  }
+  return `${out}...`;
+}
+
+function truncateUtf8Line(line: string, maxBytes: number): string {
+  if (Buffer.byteLength(line, 'utf8') <= maxBytes) return line;
+  if (maxBytes <= 3) return '.'.repeat(Math.max(0, maxBytes));
+  const limit = maxBytes - 3;
+  let bytes = 0;
+  let i = 0;
+  while (i < line.length) {
+    const cp = line.codePointAt(i) ?? 0;
+    const charLen = cp > 0xffff ? 2 : 1;
+    const utf8Len = cp < 0x80 ? 1 : cp < 0x800 ? 2 : cp < 0x10000 ? 3 : 4;
+    if (bytes + utf8Len > limit) break;
+    bytes += utf8Len;
+    i += charLen;
+  }
+  let head = line.slice(0, i);
+  // Avoid cutting inside an XML entity such as `&amp;` or `&#39;`.
+  const amp = head.lastIndexOf('&');
+  if (amp >= 0 && head.indexOf(';', amp) === -1) {
+    head = head.slice(0, amp);
+  }
+  return `${head}...`;
 }
 
 function awayMetricLabel(entry: Record<string, unknown>): string | undefined {
@@ -234,7 +277,10 @@ function changeLines(ch: EnvChange, includeTitles: boolean, includeJobCommands: 
     const dur = durationMs(s);
     if (dur !== undefined) main += ` after ${Math.round(dur / 1000)}s`;
   } else if (s.kind === 'away.summary') {
-    const total = typeof s.data.durationMs === 'number' ? s.data.durationMs : undefined;
+    const total =
+      typeof s.data.durationMs === 'number' && Number.isFinite(s.data.durationMs) && s.data.durationMs >= 0
+        ? s.data.durationMs
+        : undefined;
     main = 'away.summary:';
     if (total !== undefined) main += ` away=${compactDuration(total)}`;
     for (const [key, label] of [
@@ -248,34 +294,76 @@ function changeLines(ch: EnvChange, includeTitles: boolean, includeJobCommands: 
       }
     }
     if (Array.isArray(s.data.metrics)) {
-      const metrics = s.data.metrics
-        .flatMap((item: unknown) =>
-          item && typeof item === 'object' ? [awayMetricLabel(item as Record<string, unknown>)] : [],
-        )
-        .filter((item): item is string => item !== undefined)
-        .slice(0, 3);
+      const anomalous: Record<string, unknown>[] = [];
+      const normal: Record<string, unknown>[] = [];
+      for (const item of s.data.metrics) {
+        if (!item || typeof item !== 'object') continue;
+        const entry = item as Record<string, unknown>;
+        const metricName = str(entry.metric);
+        const start = typeof entry.start === 'number' && Number.isFinite(entry.start) ? entry.start : undefined;
+        const end = typeof entry.end === 'number' && Number.isFinite(entry.end) ? entry.end : undefined;
+        const ratioStart =
+          typeof entry.ratioStart === 'number' && Number.isFinite(entry.ratioStart) ? entry.ratioStart : undefined;
+        const ratioMin =
+          typeof entry.ratioMin === 'number' && Number.isFinite(entry.ratioMin) ? entry.ratioMin : undefined;
+        if (
+          metricName &&
+          start !== undefined &&
+          end !== undefined &&
+          isAnomalousAwayMetric({ metric: metricName, start, end, ratioStart, ratioMin })
+        ) {
+          anomalous.push(entry);
+        } else {
+          normal.push(entry);
+        }
+      }
+      const metrics = [...anomalous, ...normal].slice(0, Math.max(3, anomalous.length)).flatMap((entry) => {
+        const label = awayMetricLabel(entry);
+        return label !== undefined ? [label] : [];
+      });
       if (metrics.length > 0) main += ` metrics=${metrics.map((item) => esc(item)).join(',')}`;
     }
-    if (Array.isArray(s.data.alerts) && s.data.alerts.length > 0) {
-      let alerts = 0;
+    let alerts =
+      typeof s.data.alertCount === 'number' && Number.isFinite(s.data.alertCount) && s.data.alertCount >= 0
+        ? Math.round(s.data.alertCount)
+        : undefined;
+    if (alerts === undefined && Array.isArray(s.data.alerts) && s.data.alerts.length > 0) {
+      alerts = 0;
       for (const item of s.data.alerts) {
         if (!item || typeof item !== 'object') continue;
         const count = (item as Record<string, unknown>).count;
         alerts += typeof count === 'number' && Number.isFinite(count) ? count : 1;
       }
-      main += ` alerts=${alerts}`;
     }
-    if (Array.isArray(s.data.failed) && s.data.failed.length > 0) main += ` failed=${s.data.failed.length}`;
-    if (Array.isArray(s.data.bursts) && s.data.bursts.length > 0) {
-      let deleted = 0;
-      let directory = '';
+    if (alerts !== undefined && alerts > 0) main += ` alerts=${alerts}`;
+    const failed =
+      typeof s.data.failedCount === 'number' && Number.isFinite(s.data.failedCount) && s.data.failedCount >= 0
+        ? Math.round(s.data.failedCount)
+        : Array.isArray(s.data.failed)
+          ? s.data.failed.length
+          : 0;
+    if (failed > 0) main += ` failed=${failed}`;
+    let deletedFromBursts = 0;
+    let directory = '';
+    const burstCount = Array.isArray(s.data.bursts) ? s.data.bursts.length : 0;
+    if (Array.isArray(s.data.bursts)) {
       for (const item of s.data.bursts) {
         if (!item || typeof item !== 'object') continue;
         const source = item as Record<string, unknown>;
-        if (typeof source.deleted === 'number' && Number.isFinite(source.deleted)) deleted += source.deleted;
+        if (typeof source.deleted === 'number' && Number.isFinite(source.deleted)) deletedFromBursts += source.deleted;
         if (!directory && typeof source.directory === 'string') directory = source.directory;
       }
-      main += ` deletes=${deleted}${directory ? `@${esc(directory)}` : ''}`;
+    }
+    const deleted =
+      typeof s.data.deletedCount === 'number' && Number.isFinite(s.data.deletedCount) && s.data.deletedCount >= 0
+        ? Math.round(s.data.deletedCount)
+        : deletedFromBursts;
+    if (deleted > 0 || burstCount > 0) {
+      const safeDir = directory ? `@${truncateEscapedRaw(directory, 256)}` : '';
+      main += ` deletes=${deleted}${safeDir}`;
+    }
+    if (typeof s.data.omitted === 'number' && Number.isFinite(s.data.omitted) && s.data.omitted > 0) {
+      main += ` 另有 ${Math.round(s.data.omitted)} 项`;
     }
     if (s.data.hasAnomaly !== true) main += ' anomalies=none';
   } else if (s.kind === 'delivery.target-unavailable') {
@@ -298,6 +386,16 @@ function changeLines(ch: EnvChange, includeTitles: boolean, includeJobCommands: 
       ? ` alertId="${bytes.toString('base64url')}" feedbackAvailable="true"`
       : ' feedbackAvailable="false"';
   }
+  if (s.kind === 'away.summary') {
+    const maxLineBytes = ch.note ? 1600 : 1900;
+    const boundedMain = truncateUtf8Line(main, maxLineBytes);
+    const lines = [boundedMain];
+    if (ch.note) {
+      const remainingNoteBytes = Math.max(32, 1900 - Buffer.byteLength(boundedMain, 'utf8'));
+      lines.push(`note: ${truncateEscapedRaw(ch.note, remainingNoteBytes)}`);
+    }
+    return lines;
+  }
   const lines = [main];
   if (ch.note) lines.push(`note: ${esc(ch.note)}`);
   return lines;
@@ -318,5 +416,30 @@ export function formatEnvUpdate(update: EnvUpdate, options: FormatOptions = {}):
   if (update.suppressed > 0) body.push(`suppressed: ${update.suppressed}`);
   if ((update.alreadyInjected ?? 0) > 0) body.push(`另有 ${update.alreadyInjected} 条已在上一步注入`);
   if (body.length === 0) return '';
-  return [`<env-update since="${esc(hhmmss(update.since))}" source="asi-sense">`, ...body, '</env-update>'].join('\n');
+  const header = `<env-update since="${esc(hhmmss(update.since))}" source="asi-sense">`;
+  const footer = '</env-update>';
+  let rendered = [header, ...body, footer].join('\n');
+  if (
+    changes.some((ch) => ch.signal.kind === 'away.summary') &&
+    Buffer.byteLength(rendered, 'utf8') > MAX_AWAY_FORMAT_BYTES
+  ) {
+    const overhead = Buffer.byteLength(`${header}\n${footer}`, 'utf8');
+    let budget = Math.max(0, MAX_AWAY_FORMAT_BYTES - overhead);
+    const trimmedBody: string[] = [];
+    for (const line of body) {
+      const lineBytes = Buffer.byteLength(line, 'utf8');
+      const sep = trimmedBody.length > 0 ? 1 : 0;
+      if (lineBytes + sep <= budget) {
+        trimmedBody.push(line);
+        budget -= lineBytes + sep;
+      } else if (budget > sep + 16) {
+        trimmedBody.push(truncateUtf8Line(line, budget - sep));
+        break;
+      } else {
+        break;
+      }
+    }
+    rendered = [header, ...trimmedBody, footer].join('\n');
+  }
+  return rendered;
 }

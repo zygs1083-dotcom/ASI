@@ -189,6 +189,8 @@ export interface AwaySummaryData {
   alertCount: number;
   failedCount: number;
   deletedCount: number;
+  anomalyCount?: number;
+  omitted?: number;
 }
 
 /** Observed environment state. */
