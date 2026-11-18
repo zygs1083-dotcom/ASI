@@ -11,7 +11,7 @@ import {
   type Runtime,
 } from './project.ts';
 import { createTimeline } from './time.ts';
-import { createTimelineProjector } from './timeline.ts';
+import { createTimelineProjector, latestMetricsAt } from './timeline.ts';
 
 type Waiter = (value: IteratorResult<PresenterModel>) => void;
 interface Subscriber {
@@ -65,20 +65,25 @@ export function createPresenter(
 
   function snapshot(): PresenterModel {
     if (closed && cached) return cached;
-    // After a macOS sleep/wake cycle performance.now() pauses but Date.now()
-    // advances, so the mono-derived timeline lags the wall clock. Take the
-    // later of both (same max(wall, mono) rule as the metrics/away sources)
-    // so 24h buckets recorded after wake are not filtered out as "future".
-    const now = Math.max(timeline.at(clock.mono()), clock.wall());
+    // The presenter advances on the monotonic clock so a wall-clock jump does
+    // not shift every frame-relative age at once. After a sleep/wake cycle,
+    // though, performance.now() pauses while Date.now() advances, so the mono
+    // timeline lags the wall clock. Only the 24h series cutoff takes the later
+    // of both, otherwise buckets recorded after wake are filtered as "future".
+    const monoNow = timeline.at(clock.mono());
+    const seriesCutoff = Math.max(monoNow, clock.wall());
     const state = projectState(timeline.state());
-    history.record(state.self.body, now, clock.mono());
+    history.record(state.self.body, monoNow, clock.mono());
     const samples = history.snapshot(clock.mono());
     const entries = runtime.events();
     const settings = runtime.rules.settings();
     const { insights, learning } = projectInsights(runtime, samples, clock, intervals, state.self.body, timeline.at);
     const memFact = state.self.body.memory;
     const fallbackMemoryTotal = memFact.status === 'ok' ? memFact.value?.total : undefined;
-    const panelTimeline = projectPanelTimeline(runtime, entries, now, fallbackMemoryTotal);
+    const panelTimeline = projectPanelTimeline(runtime, entries, monoNow, fallbackMemoryTotal, seriesCutoff);
+    // 24h buckets are wall-stamped, so after wake they can be newer than the
+    // mono clock. Never publish a frame clock older than the data it carries.
+    const now = Math.max(monoNow, latestMetricsAt(panelTimeline) ?? monoNow);
     const next: PresenterModel = {
       target: runtime.target(),
       state,
