@@ -4,11 +4,18 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { EnvUpdate } from '@asi/sense-types';
 import { describe, expect, it, vi } from 'vitest';
+import { setExtraHomes } from '../../src/host/attention/path.ts';
 import type { DeliveryIntent } from '../../src/host/attention/pipeline.ts';
 import { DEFAULT_RULES } from '../../src/host/attention/rules.ts';
 import { defaultBodyRules } from '../../src/host/body/rules.ts';
 import { formatEnvUpdate } from '../../src/host/delivery/format.ts';
-import { createDelivery, DELIVERABLE_KINDS, modelUpdate } from '../../src/host/dsh/deliver.ts';
+import {
+  createDelivery,
+  DELIVERABLE_KINDS,
+  modelUpdate,
+  replacePathTokens,
+  sanitizeReason,
+} from '../../src/host/dsh/deliver.ts';
 import { KNOWN_EVENT_KINDS } from '../../src/host/dsh/history-output.ts';
 import { MODEL_RULE_KINDS, modelText, modelTitle } from '../../src/host/dsh/tool-output.ts';
 
@@ -1060,5 +1067,405 @@ describe('DSH environment delivery', () => {
       expect(formatted.length).toBeGreaterThan(0);
       expect(formatted).not.toContain('observation');
     }
+  });
+
+  it('replaces embedded POSIX, tilde, Windows, and delimited paths in reason/lastFailure/error without leaking usernames', () => {
+    const home = os.homedir();
+    const homeBase = path.basename(home);
+    expect(replacePathTokens('EACCES: permission denied, scandir /Users/alice')).toBe(
+      'EACCES: permission denied, scandir ~',
+    );
+    expect(replacePathTokens(`EACCES: scandir ${home}`)).toBe('EACCES: scandir ~');
+    expect(replacePathTokens('open /home/bob')).toBe('open ~');
+    expect(replacePathTokens('EACCES: scandir /Users/alice, permission denied')).toBe(
+      'EACCES: scandir ~, permission denied',
+    );
+    expect(replacePathTokens("open '/Users/alice/.ssh/config'")).toBe("open 'config'");
+    expect(replacePathTokens('(/home/bob/x)')).toBe('(x)');
+    expect(replacePathTokens('C:\\Users\\carol\\a.txt,')).toBe('a.txt,');
+    expect(replacePathTokens('Error opening C:\\Users\\alice')).toBe('Error opening ~');
+    expect(replacePathTokens('open ~/secret/file.txt')).toBe('open file.txt');
+    expect(replacePathTokens('open ~/')).toBe('open [path]');
+    expect(replacePathTokens('path:/Users/alice: denied')).toBe('path:~: denied');
+    expect(replacePathTokens('/Users/alice:/home/bob')).toBe('~:~');
+    expect(replacePathTokens('C:\\Users\\alice;C:\\Users\\bob')).toBe('~;~');
+    expect(replacePathTokens('https://secret-token@host.example.invalid:8443/Users/alice')).toBe(
+      'https://secret-token@host.example.invalid:8443/Users/alice',
+    );
+
+    const projected = modelUpdate({
+      since: update.since,
+      at: update.at,
+      suppressed: 0,
+      changes: [
+        {
+          count: 1,
+          level: 'context',
+          signal: {
+            id: 'r1',
+            kind: 'source.status',
+            at: update.at,
+            source: { id: 'files-global', api: 'watch', host: 'local' },
+            subject: 'files-global',
+            data: { status: 'denied', reason: 'EACCES: permission denied, scandir /Users/alice' },
+          },
+        },
+        {
+          count: 1,
+          level: 'context',
+          signal: {
+            id: 'r2',
+            kind: 'source.status',
+            at: update.at + 1,
+            source: { id: 'files-global', api: 'watch', host: 'local' },
+            subject: 'files-global',
+            data: { status: 'denied', reason: `EACCES: scandir ${home}` },
+          },
+        },
+        {
+          count: 1,
+          level: 'context',
+          signal: {
+            id: 'r3',
+            kind: 'source.error',
+            at: update.at + 2,
+            source: { id: 'files-global', api: 'watch', host: 'local' },
+            subject: 'files-global',
+            data: { error: 'open /home/bob', reason: 'EACCES: scandir /Users/alice, permission denied' },
+          },
+        },
+        {
+          count: 1,
+          level: 'context',
+          signal: {
+            id: 'r4',
+            kind: 'source.status',
+            at: update.at + 3,
+            source: { id: 'files-global', api: 'watch', host: 'local' },
+            subject: 'files-global',
+            data: { status: 'error', lastFailure: "open '/Users/alice/.ssh/config'" },
+          },
+        },
+        {
+          count: 1,
+          level: 'context',
+          signal: {
+            id: 'r5',
+            kind: 'source.status',
+            at: update.at + 4,
+            source: { id: 'files-global', api: 'watch', host: 'local' },
+            subject: 'files-global',
+            data: { status: 'error', reason: '(/home/bob/x)' },
+          },
+        },
+        {
+          count: 1,
+          level: 'context',
+          signal: {
+            id: 'r6',
+            kind: 'source.error',
+            at: update.at + 5,
+            source: { id: 'files-global', api: 'watch', host: 'local' },
+            subject: 'files-global',
+            data: { error: 'C:\\Users\\carol\\a.txt,', reason: 'Error opening C:\\Users\\alice' },
+          },
+        },
+        {
+          count: 1,
+          level: 'context',
+          signal: {
+            id: 'r7',
+            kind: 'source.status',
+            at: update.at + 6,
+            source: { id: 'files-global', api: 'watch', host: 'local' },
+            subject: 'files-global',
+            data: {
+              status: 'error',
+              reason: 'open ~/secret/file.txt and https://secret-token@host.example.invalid/Users/alice',
+            },
+          },
+        },
+      ],
+    });
+
+    const serialized = JSON.stringify(projected);
+    expect(serialized).not.toContain('alice');
+    expect(serialized).not.toContain('bob');
+    expect(serialized).not.toContain('carol');
+    expect(serialized).not.toContain('secret-token');
+    expect(serialized).not.toContain('host.example.invalid');
+    if (homeBase && homeBase !== '/' && homeBase.length > 2) {
+      expect(serialized).not.toContain(homeBase);
+    }
+    const formatted = formatEnvUpdate(projected);
+    expect(formatted).not.toContain('alice');
+    expect(formatted).not.toContain('bob');
+    expect(formatted).not.toContain('carol');
+  });
+
+  it('strips path prefixes before modelAppName on app.* and window.* fallback subjects and handles Windows paths', () => {
+    const projected = modelUpdate({
+      since: update.since,
+      at: update.at,
+      suppressed: 0,
+      changes: [
+        {
+          count: 1,
+          level: 'context',
+          signal: {
+            id: 'a1',
+            kind: 'app.launched',
+            at: update.at,
+            source: { id: 'helper', api: 'ndjson', host: 'local' },
+            subject: '/Users/alice/Tools/SecretTool.app',
+            data: { bundleId: '/Users/alice/Tools/SecretTool.app' },
+          },
+        },
+        {
+          count: 1,
+          level: 'context',
+          signal: {
+            id: 'a2',
+            kind: 'app.terminated',
+            at: update.at + 1,
+            source: { id: 'helper', api: 'ndjson', host: 'local' },
+            subject: 'C:\\Users\\carol\\Tools\\WinTool.exe',
+            data: {},
+          },
+        },
+        {
+          count: 1,
+          level: 'context',
+          signal: {
+            id: 'a3',
+            kind: 'app.activated',
+            at: update.at + 2,
+            source: { id: 'helper', api: 'ndjson', host: 'local' },
+            subject: `/Users/alice/${'sub/'.repeat(100)}LongTool.app`,
+            data: { name: '/Users/alice/Tools/NamedTool.app' },
+          },
+        },
+        {
+          count: 1,
+          level: 'context',
+          signal: {
+            id: 'a4',
+            kind: 'app.launched',
+            at: update.at + 3,
+            source: { id: 'helper', api: 'ndjson', host: 'local' },
+            subject: '/Users/alice',
+            data: {},
+          },
+        },
+        {
+          count: 1,
+          level: 'context',
+          signal: {
+            id: 'w1',
+            kind: 'window.focused',
+            at: update.at + 4,
+            source: { id: 'helper.ax', api: 'accessibility', host: 'local' },
+            subject: 'alice@10.0.0.1 - /Users/alice/notes.md',
+            data: { title: 'notes' },
+          },
+        },
+        {
+          count: 1,
+          level: 'context',
+          signal: {
+            id: 'w2',
+            kind: 'window.title-changed',
+            at: update.at + 5,
+            source: { id: 'helper.ax', api: 'accessibility', host: 'local' },
+            subject: 'C:\\Users\\bob\\Editor.exe',
+            data: { title: 'notes' },
+          },
+        },
+      ],
+    });
+
+    const byId = new Map(projected.changes.map((c) => [c.signal.id, c.signal]));
+    expect(byId.get('a1')).toMatchObject({ subject: 'SecretTool.app', data: { name: 'SecretTool.app' } });
+    expect(byId.get('a2')).toMatchObject({ subject: 'WinTool.exe', data: { name: 'WinTool.exe' } });
+    expect(byId.get('a3')).toMatchObject({ subject: 'NamedTool.app', data: { name: 'NamedTool.app' } });
+    expect(byId.get('a4')).toMatchObject({ subject: '~', data: { name: '~' } });
+    expect(byId.get('w1')).toMatchObject({ subject: 'notes.md', data: { title: 'notes' } });
+    expect(byId.get('w2')).toMatchObject({ subject: 'Editor.exe', data: { title: 'notes' } });
+    const serialized = JSON.stringify(projected);
+    expect(serialized).not.toContain('alice');
+    expect(serialized).not.toContain('bob');
+    expect(serialized).not.toContain('carol');
+    expect(serialized).not.toContain('10.0.0.1');
+    const formatted = formatEnvUpdate(projected);
+    expect(formatted).toContain('app: SecretTool.app launched');
+    expect(formatted).toContain('app: WinTool.exe terminated');
+    expect(formatted).not.toContain('/Users/');
+  });
+
+  it('fast-paths known source statuses, caches sanitizeReason with <=256 LRU entries, and queries os.hostname() once per batch', () => {
+    const hostnameSpy = vi.spyOn(os, 'hostname').mockReturnValue('local-host-fixture');
+    try {
+      const batch = Array.from({ length: 50 }, (_, i) => ({
+        count: 1,
+        level: 'context' as const,
+        signal: {
+          id: `st-${i}`,
+          kind: 'source.status',
+          at: update.at + i,
+          source: { id: 'files-global', api: 'watch', host: 'local' },
+          subject: 'files-global',
+          data: { status: 'denied', reason: 'permission-denied-fixture' },
+        },
+      }));
+      const out = modelUpdate({ since: update.since, at: update.at + 50, suppressed: 0, changes: batch });
+      expect(out.changes).toHaveLength(50);
+      expect(out.changes[0]?.signal.data).toMatchObject({ status: 'denied', reason: 'permission-denied-fixture' });
+      expect(hostnameSpy).toHaveBeenCalledTimes(1);
+
+      // Non-enum status still uses modelLabel and hostname redaction.
+      const hostStatusOut = modelUpdate({
+        since: update.since,
+        at: update.at,
+        suppressed: 0,
+        changes: [
+          {
+            count: 1,
+            level: 'context',
+            signal: {
+              id: 'bad-status',
+              kind: 'source.status',
+              at: update.at,
+              source: { id: 'helper', api: 'ndjson', host: 'local' },
+              subject: 'helper',
+              data: { status: 'local-host-fixture', reason: 'on local-host-fixture' },
+            },
+          },
+        ],
+      });
+      expect(hostStatusOut.changes[0]?.signal.data).toMatchObject({
+        status: '[host]',
+        reason: 'on [host]',
+      });
+
+      // Hostname and extraHomes changes invalidate the sanitizeReason cache safely.
+      expect(sanitizeReason('custom /srv/home/demo_user')).toBe('custom demo_user');
+      setExtraHomes(['/srv/home/demo_user']);
+      expect(sanitizeReason('custom /srv/home/demo_user')).toBe('custom [host]');
+      setExtraHomes([]);
+      expect(sanitizeReason('custom /srv/home/demo_user')).toBe('custom demo_user');
+
+      // Eviction above 256 entries keeps working without throwing or retaining stale results.
+      for (let i = 0; i < 270; i++) {
+        expect(sanitizeReason(`err-${i}`)).toBe(`err-${i}`);
+      }
+      expect(sanitizeReason('err-0')).toBe('err-0');
+    } finally {
+      setExtraHomes([]);
+      hostnameSpy.mockRestore();
+    }
+  });
+
+  it('projects 10,000 source.status signals within 300ms without leaking paths', () => {
+    const T = Date.UTC(2026, 10, 18, 12, 0, 0);
+    const changes = Array.from({ length: 10_000 }, (_, i) => ({
+      count: 1,
+      level: 'context' as const,
+      signal: {
+        id: `ss-${i}`,
+        kind: 'source.status',
+        at: T + i,
+        source: { id: 'files-global', api: 'watch', host: 'local' },
+        subject: 'files-global',
+        data: { status: 'error', reason: "EACCES: permission denied, open '/Users/alice/.ssh/config'" },
+      },
+    }));
+    modelUpdate({ since: T, at: T + 10_000, suppressed: 0, changes: changes.slice(0, 500) });
+    const t0 = performance.now();
+    const out = modelUpdate({ since: T, at: T + 10_000, suppressed: 0, changes });
+    const elapsed = performance.now() - t0;
+    expect(out.changes).toHaveLength(10_000);
+    expect(out.changes[0]?.signal.data.status).toBe('error');
+    expect(String(out.changes[0]?.signal.data.reason)).not.toContain('alice');
+    expect(elapsed).toBeLessThanOrEqual(300);
+  });
+
+  it('sanitizes embedded paths and hostnames in away.summary text fields', () => {
+    const projected = modelUpdate({
+      since: update.since,
+      at: update.at,
+      suppressed: 0,
+      changes: [
+        {
+          count: 1,
+          level: 'wake',
+          signal: {
+            id: 'away:1',
+            kind: 'away.summary',
+            at: update.at,
+            source: { id: 'away', api: 'detector', host: 'local' },
+            subject: 'away',
+            data: {
+              awayFrom: update.since - 3_600_000,
+              returnAt: update.at,
+              durationMs: 3_600_000,
+              sleepMs: 3_600_000,
+              lockMs: 0,
+              hasAnomaly: true,
+              anomalies: ['alerts', 'failed-jobs', 'external-deletion'],
+              reason: 'EACCES: open /Users/alice/x',
+              error: 'EACCES: open /Users/alice/x',
+              alerts: [
+                {
+                  metric: 'disk:/Users/alice/x',
+                  severity: 'warn',
+                  count: 2,
+                  reason: 'EACCES: open /Users/alice/x',
+                },
+              ],
+              failed: [
+                {
+                  id: 'EACCES: open /Users/alice/x',
+                  kind: 'job.failed',
+                  exitCode: 1,
+                  reason: 'EACCES: open /Users/alice/x',
+                },
+              ],
+              bursts: [
+                {
+                  directory: '/Users/alice/x',
+                  deleted: 60,
+                  reason: 'EACCES: open /Users/alice/x',
+                },
+              ],
+            },
+          },
+        },
+      ],
+    });
+
+    const serialized = JSON.stringify(projected);
+    expect(serialized).not.toContain('alice');
+    expect(serialized).not.toContain('/Users/alice');
+    expect(formatEnvUpdate(projected)).not.toContain('alice');
+    const data = projected.changes[0]?.signal.data as Record<string, unknown>;
+    expect(data.reason).toBe('EACCES: open x');
+    expect(data.error).toBe('EACCES: open x');
+    expect((data.alerts as Array<Record<string, unknown>>)[0]).toMatchObject({
+      metric: 'disk:x',
+      severity: 'warn',
+      count: 2,
+      reason: 'EACCES: open x',
+    });
+    expect((data.failed as Array<Record<string, unknown>>)[0]).toMatchObject({
+      id: 'EACCES: open x',
+      kind: 'job.failed',
+      exitCode: 1,
+      reason: 'EACCES: open x',
+    });
+    expect((data.bursts as Array<Record<string, unknown>>)[0]).toMatchObject({
+      directory: 'x',
+      deleted: 60,
+      reason: 'EACCES: open x',
+    });
   });
 });

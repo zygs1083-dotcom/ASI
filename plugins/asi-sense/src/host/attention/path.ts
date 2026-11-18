@@ -228,6 +228,7 @@ interface HomeAliasEntry {
  */
 const homeAliasCaches = new Map<string, HomeAliasEntry>();
 let extraHomes: string[] = [];
+let extraHomesRevision = 0;
 
 function foldHomeAlias(value: string, platform: string): string {
   if (platform !== 'darwin' && platform !== 'win32') return value;
@@ -327,8 +328,14 @@ function homeAliasEntry(platform: string, allowRebuild: boolean): HomeAliasEntry
  */
 export function setExtraHomes(homes: readonly string[], platform: string = process.platform): void {
   extraHomes = homes.filter((value): value is string => typeof value === 'string' && value.length > 0);
+  extraHomesRevision++;
   homeAliasCaches.clear();
   homeAliasEntry(platform, true);
+}
+
+/** Monotonic revision incremented whenever `setExtraHomes` updates extra home aliases. */
+export function homeAliasRevision(): number {
+  return extraHomesRevision;
 }
 
 /** Returns true when `raw` is exactly one of the cached home aliases (O(1) set lookup). */

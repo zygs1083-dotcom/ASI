@@ -1,10 +1,11 @@
 import { randomUUID } from 'node:crypto';
+import os from 'node:os';
 import type { EnvUpdate } from '@asi/sense-types';
 import type { Agent } from '@deepseek-ai/dsh-agent';
 import { freezeMessage, MessageId, type UserMessage } from '@deepseek-ai/dsh-llm';
 import { isSessionContext } from '../attention/buckets.ts';
 import { DeliveryFailure } from '../attention/drain.ts';
-import { isHomeRoot } from '../attention/path.ts';
+import { homeAliasRevision, isHomeRoot } from '../attention/path.ts';
 import type { DeliveryIntent } from '../attention/pipeline.ts';
 import { formatEnvUpdate } from '../delivery/format.ts';
 import { modelActivityName, modelAppName, modelLabel, modelText, modelTitle, sourceIdentifier } from './tool-output.ts';
@@ -97,13 +98,361 @@ const AWAY_ANOMALIES: ReadonlySet<string> = new Set([
 ]);
 const AWAY_FAILED_KINDS: ReadonlySet<string> = new Set(['job.failed', 'job.exited', 'process.exited']);
 
-function sanitizeReason(value: string): string {
+const HOMOGLYPH_SLASH_TEST_RE = /[\u2215\u2044\u29f8\u2571\u29f5\u29f9\u2216\u2572\ufe68\uff0f\uff3c]/;
+
+function isSpaceCode(code: number): boolean {
+  return (
+    code === 32 ||
+    (code >= 9 && code <= 13) ||
+    code === 0x00a0 ||
+    code === 0x1680 ||
+    (code >= 0x2000 && code <= 0x200a) ||
+    code === 0x2028 ||
+    code === 0x2029 ||
+    code === 0x202f ||
+    code === 0x205f ||
+    code === 0x3000
+  );
+}
+
+function isAsciiLetter(code: number): boolean {
+  return (code >= 65 && code <= 90) || (code >= 97 && code <= 122);
+}
+
+function isForwardSlashOrHomoglyph(code: number): boolean {
+  return code === 47 || code === 0x2215 || code === 0x2044 || code === 0x29f8 || code === 0x2571 || code === 0xff0f;
+}
+
+function isBackslashOrHomoglyph(code: number): boolean {
+  return (
+    code === 92 ||
+    code === 0x29f5 ||
+    code === 0x29f9 ||
+    code === 0x2216 ||
+    code === 0x2572 ||
+    code === 0xfe68 ||
+    code === 0xff3c
+  );
+}
+
+function isSlashOrBackslash(code: number): boolean {
+  return isForwardSlashOrHomoglyph(code) || isBackslashOrHomoglyph(code);
+}
+
+function isPathPrefixBoundary(code: number): boolean {
+  if (isSpaceCode(code)) return true;
+  switch (code) {
+    case 39:
+    case 34:
+    case 96:
+    case 40:
+    case 91:
+    case 123:
+    case 60:
+    case 44:
+    case 59:
+    case 58:
+    case 61:
+    case 0x2018:
+    case 0x201c:
+    case 0xff08:
+    case 0x300c:
+    case 0x300e:
+    case 0x3010:
+    case 0x3008:
+    case 0x300a:
+    case 0xff1a:
+    case 0xff0c:
+    case 0x3001:
+    case 0xff1b:
+    case 0xff1d:
+      return true;
+    default:
+      return false;
+  }
+}
+
+function isPathHardStop(code: number, stopOnColon: boolean): boolean {
+  if (isSpaceCode(code)) return true;
+  if (stopOnColon && (code === 58 || code === 0xff1a)) return true;
+  switch (code) {
+    case 39:
+    case 34:
+    case 96:
+    case 44:
+    case 59:
+    case 60:
+    case 62:
+    case 0x2018:
+    case 0x2019:
+    case 0x201c:
+    case 0x201d:
+    case 0x3001:
+    case 0x3002:
+    case 0xff0c:
+    case 0xff1b:
+    case 0xff09:
+    case 0x300d:
+    case 0x300f:
+    case 0x3011:
+    case 0x3009:
+    case 0x300b:
+      return true;
+    default:
+      return false;
+  }
+}
+
+function scanTokenEnd(value: string, start: number, stopOnColon: boolean): { end: number; sawSlash: boolean } {
+  const len = value.length;
+  let j = start;
+  let openParen = 0;
+  let openBracket = 0;
+  let openBrace = 0;
+  let sawSlash = false;
+  while (j < len) {
+    const code = value.charCodeAt(j);
+    if (code === 40) {
+      openParen++;
+      j++;
+      continue;
+    }
+    if (code === 41) {
+      if (openParen === 0) break;
+      openParen--;
+      j++;
+      continue;
+    }
+    if (code === 91) {
+      openBracket++;
+      j++;
+      continue;
+    }
+    if (code === 93) {
+      if (openBracket === 0) break;
+      openBracket--;
+      j++;
+      continue;
+    }
+    if (code === 123) {
+      openBrace++;
+      j++;
+      continue;
+    }
+    if (code === 125) {
+      if (openBrace === 0) break;
+      openBrace--;
+      j++;
+      continue;
+    }
+    if (isPathHardStop(code, stopOnColon)) break;
+    if (isSlashOrBackslash(code)) sawSlash = true;
+    j++;
+  }
+  return { end: j, sawSlash };
+}
+
+function scanPathTokens(value: string): { text: string; singlePath: boolean } {
+  const len = value.length;
+  if (!len || (!value.includes('/') && !value.includes('\\') && !HOMOGLYPH_SLASH_TEST_RE.test(value))) {
+    return { text: value, singlePath: false };
+  }
+  const parts: string[] = [];
+  let cursor = 0;
+  let i = 0;
+  let tokenCount = 0;
+  let firstStart = -1;
+  let firstEnd = -1;
+  while (i < len) {
+    if (i > 0 && !isPathPrefixBoundary(value.charCodeAt(i - 1))) {
+      i++;
+      continue;
+    }
+    const code = value.charCodeAt(i);
+    if (
+      i > 0 &&
+      (value.charCodeAt(i - 1) === 58 || value.charCodeAt(i - 1) === 0xff1a) &&
+      isForwardSlashOrHomoglyph(code) &&
+      i + 1 < len &&
+      isForwardSlashOrHomoglyph(value.charCodeAt(i + 1))
+    ) {
+      i = scanTokenEnd(value, i + 2, false).end;
+      continue;
+    }
+    let prefixLen = 0;
+    let singleBackslash = false;
+    if (isForwardSlashOrHomoglyph(code)) {
+      prefixLen = 1;
+    } else if (isBackslashOrHomoglyph(code)) {
+      if (i + 1 < len && isBackslashOrHomoglyph(value.charCodeAt(i + 1))) {
+        prefixLen = 2;
+      } else {
+        prefixLen = 1;
+        singleBackslash = true;
+      }
+    } else if ((code === 126 || code === 0xff5e) && i + 1 < len && isSlashOrBackslash(value.charCodeAt(i + 1))) {
+      prefixLen = 2;
+    } else if (
+      isAsciiLetter(code) &&
+      i + 2 < len &&
+      (value.charCodeAt(i + 1) === 58 || value.charCodeAt(i + 1) === 0xff1a) &&
+      isSlashOrBackslash(value.charCodeAt(i + 2))
+    ) {
+      prefixLen = 3;
+    }
+    if (prefixLen === 0) {
+      i++;
+      continue;
+    }
+    const { end: scanEnd, sawSlash } = scanTokenEnd(value, i + prefixLen, true);
+    if (singleBackslash && !sawSlash) {
+      i++;
+      continue;
+    }
+    let end = scanEnd;
+    while (end > i + prefixLen) {
+      const c = value.charCodeAt(end - 1);
+      if (c === 33 || c === 63) {
+        end--;
+        continue;
+      }
+      if (c === 46) {
+        const prev = value.charCodeAt(end - 2);
+        if (isSlashOrBackslash(prev)) break;
+        if (prev === 46 && end - 3 >= i && isSlashOrBackslash(value.charCodeAt(end - 3))) break;
+        end--;
+        continue;
+      }
+      break;
+    }
+    if (i > cursor) parts.push(value.slice(cursor, i));
+    parts.push(modelActivityName(value.slice(i, end), true));
+    if (tokenCount === 0) {
+      firstStart = i;
+      firstEnd = end;
+    }
+    tokenCount++;
+    cursor = end;
+    i = end;
+  }
+  if (cursor === 0) return { text: value, singlePath: false };
+  if (cursor < len) parts.push(value.slice(cursor));
+  return {
+    text: parts.join(''),
+    singlePath: tokenCount === 1 && firstStart === 0 && firstEnd === len,
+  };
+}
+
+/**
+ * Linear-time scanner that replaces embedded POSIX (`/…`), tilde (`~/…`),
+ * Windows (`X:\…` / `X:/…`), and UNC (`\\…`) absolute path tokens via
+ * `modelActivityName(token, true)` while preserving surrounding delimiters.
+ */
+export function replacePathTokens(value: string): string {
+  return scanPathTokens(value).text;
+}
+
+const MAX_REASON_CACHE = 256;
+const MAX_CACHED_REASON_LENGTH = 2048;
+const reasonCache = new Map<string, string>();
+let reasonCacheHostname: string | undefined;
+let reasonCacheHomeKey: string | undefined;
+let lastReasonKey: string | undefined;
+let lastReasonVal = '';
+
+export function sanitizeReason(
+  value: string,
+  hostname = os.hostname(),
+  homeKey = `${homeAliasRevision()}\u0000${os.homedir()}`,
+): string {
   const trimmed = value.trim();
   if (!trimmed) return '';
-  if (isHomeRoot(trimmed) || /^(?:~?[/\\]|[A-Za-z]:[/\\])/.test(trimmed)) {
-    return modelActivityName(trimmed, true);
+  if (hostname !== reasonCacheHostname || homeKey !== reasonCacheHomeKey) {
+    reasonCache.clear();
+    reasonCacheHostname = hostname;
+    reasonCacheHomeKey = homeKey;
+    lastReasonKey = undefined;
+  } else if (trimmed === lastReasonKey) {
+    return lastReasonVal;
   }
-  return modelText(trimmed) || '[redacted]';
+  const cached = reasonCache.get(trimmed);
+  if (cached !== undefined) {
+    reasonCache.delete(trimmed);
+    reasonCache.set(trimmed, cached);
+    lastReasonKey = trimmed;
+    lastReasonVal = cached;
+    return cached;
+  }
+  const replaced = scanPathTokens(trimmed);
+  const sanitized = replaced.singlePath ? replaced.text : modelText(replaced.text, hostname) || '[redacted]';
+  if (trimmed.length <= MAX_CACHED_REASON_LENGTH) {
+    if (reasonCache.size >= MAX_REASON_CACHE) {
+      const oldest = reasonCache.keys().next().value;
+      if (oldest !== undefined) reasonCache.delete(oldest);
+    }
+    reasonCache.set(trimmed, sanitized);
+    lastReasonKey = trimmed;
+    lastReasonVal = sanitized;
+  }
+  return sanitized;
+}
+
+const KNOWN_SOURCE_STATUSES: ReadonlySet<string> = new Set([
+  'ok',
+  'stale',
+  'denied',
+  'unsupported',
+  'unavailable',
+  'unknown',
+  'error',
+  'degraded',
+  'partial-denied',
+  'disabled',
+  'running',
+]);
+
+function sanitizeSourceStatus(value: unknown, getHostLower: () => string): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const trimmed = value.trim();
+  if (!trimmed) return undefined;
+  if (KNOWN_SOURCE_STATUSES.has(trimmed)) {
+    const hostLower = getHostLower();
+    if (!hostLower || !trimmed.includes(hostLower)) return trimmed;
+  }
+  return modelLabel(trimmed);
+}
+
+const APP_PATH_LIKE_RE = /^(?:~?[/\\]|[A-Za-z]:[/\\])|[/\\].*[/\\]|[/\\][^/\\]+\.app$/i;
+const CTRL_CHARS_RE = /\p{Cc}/gu;
+
+function fallbackAppSubject(raw: string): string {
+  if (!raw.includes('/') && !raw.includes('\\')) return modelAppName(raw);
+  const trimmed = raw.replace(CTRL_CHARS_RE, '').replace(/[/\\]+$/, '');
+  if (!trimmed) return '';
+  if (isHomeRoot(trimmed)) return '~';
+  const lastSlash = Math.max(trimmed.lastIndexOf('/'), trimmed.lastIndexOf('\\'));
+  const base = lastSlash >= 0 ? trimmed.slice(lastSlash + 1) : trimmed;
+  if (!base || /^[A-Za-z]:$/.test(base) || !base.trim()) return '';
+  return modelAppName(base);
+}
+
+function projectAppNameField(raw: string): string {
+  return APP_PATH_LIKE_RE.test(raw) ? fallbackAppSubject(raw) : modelAppName(raw);
+}
+
+function pickSanitizedReasons(
+  source: Record<string, unknown>,
+  hostname: string,
+  homeKey: string,
+): { reason?: string; error?: string } {
+  const out: { reason?: string; error?: string } = {};
+  if (typeof source.reason === 'string' && source.reason.trim()) {
+    out.reason = sanitizeReason(source.reason, hostname, homeKey);
+  }
+  if (typeof source.error === 'string' && source.error.trim()) {
+    out.error = sanitizeReason(source.error, hostname, homeKey);
+  }
+  return out;
 }
 
 const SYSTEM_SIGNAL_KINDS: ReadonlySet<string> = new Set([
@@ -118,6 +467,12 @@ const SYSTEM_SIGNAL_KINDS: ReadonlySet<string> = new Set([
 export function modelUpdate(update: EnvUpdate): EnvUpdate {
   let suppressed = update.suppressed;
   const changes: EnvUpdate['changes'] = [];
+  let cachedHostname: string | undefined;
+  let cachedHostLower: string | undefined;
+  let cachedHomeKey: string | undefined;
+  const getHostname = (): string => (cachedHostname ??= os.hostname());
+  const getHostLower = (): string => (cachedHostLower ??= getHostname().toLowerCase());
+  const getHomeKey = (): string => (cachedHomeKey ??= `${homeAliasRevision()}\u0000${os.homedir()}`);
   for (const { signal, count, level, ruleId } of update.changes) {
     if (!DELIVERABLE_KINDS.has(signal.kind)) {
       suppressed += count > 0 ? count : 1;
@@ -130,37 +485,36 @@ export function modelUpdate(update: EnvUpdate): EnvUpdate {
     }
     if (signal.kind === 'app.activated' || signal.kind === 'app.launched' || signal.kind === 'app.terminated') {
       const fallbackName =
-        modelAppName(
-          typeof signal.data.name === 'string' && signal.data.name.trim()
-            ? signal.data.name
-            : typeof signal.data.bundleId === 'string' && signal.data.bundleId.trim()
-              ? signal.data.bundleId
-              : signal.subject,
-        ) || 'app';
+        (typeof signal.data.name === 'string' && signal.data.name.trim()
+          ? projectAppNameField(signal.data.name)
+          : fallbackAppSubject(
+              typeof signal.data.bundleId === 'string' && signal.data.bundleId.trim()
+                ? signal.data.bundleId
+                : signal.subject,
+            )) || 'app';
       subject = fallbackName;
       if (typeof signal.data.name === 'string') {
-        const maskedName = modelAppName(signal.data.name);
+        const maskedName = projectAppNameField(signal.data.name);
         data.name = signal.kind === 'app.activated' ? maskedName : maskedName || fallbackName;
       } else {
         data.name = fallbackName;
       }
-      if (typeof signal.data.previousName === 'string') data.previousName = modelAppName(signal.data.previousName);
+      if (typeof signal.data.previousName === 'string') {
+        data.previousName = projectAppNameField(signal.data.previousName);
+      }
     } else if (signal.kind === 'window.focused' || signal.kind === 'window.title-changed') {
       subject =
-        modelAppName(
+        fallbackAppSubject(
           typeof signal.data.bundleId === 'string' && signal.data.bundleId.trim()
             ? signal.data.bundleId
             : signal.subject,
         ) || 'window';
-      data.title = typeof signal.data.title === 'string' ? modelTitle(signal.data.title) : '';
+      data.title = typeof signal.data.title === 'string' ? modelTitle(signal.data.title, getHostname()) : '';
     } else if (signal.kind === 'source.status') {
       const srcId = sourceIdentifier(signal.source.id || signal.subject || 'source');
       subject = srcId;
       data.source = srcId;
-      data.status =
-        typeof signal.data.status === 'string' && signal.data.status.trim()
-          ? modelLabel(signal.data.status.trim())
-          : 'unknown';
+      data.status = sanitizeSourceStatus(signal.data.status, getHostLower) ?? 'unknown';
       const rawPath =
         typeof signal.data.path === 'string' && signal.data.path.trim()
           ? signal.data.path.trim()
@@ -174,9 +528,9 @@ export function modelUpdate(update: EnvUpdate): EnvUpdate {
           : typeof signal.data.lastFailure === 'string' && signal.data.lastFailure.trim()
             ? signal.data.lastFailure
             : '';
-      if (rawReason) data.reason = sanitizeReason(rawReason);
+      if (rawReason) data.reason = sanitizeReason(rawReason, getHostname(), getHomeKey());
       if (typeof signal.data.error === 'string' && signal.data.error.trim()) {
-        data.error = sanitizeReason(signal.data.error);
+        data.error = sanitizeReason(signal.data.error, getHostname(), getHomeKey());
       }
       if (typeof signal.data.restarts === 'number' && Number.isFinite(signal.data.restarts)) {
         data.restarts = signal.data.restarts;
@@ -193,12 +547,11 @@ export function modelUpdate(update: EnvUpdate): EnvUpdate {
             : typeof signal.data.reason === 'string' && signal.data.reason.trim()
               ? signal.data.reason
               : 'error';
-      data.error = sanitizeReason(rawError);
-      if (typeof signal.data.status === 'string' && signal.data.status.trim()) {
-        data.status = modelLabel(signal.data.status.trim());
-      }
+      data.error = sanitizeReason(rawError, getHostname(), getHomeKey());
+      const status = sanitizeSourceStatus(signal.data.status, getHostLower);
+      if (status) data.status = status;
       if (typeof signal.data.reason === 'string' && signal.data.reason.trim()) {
-        data.reason = sanitizeReason(signal.data.reason);
+        data.reason = sanitizeReason(signal.data.reason, getHostname(), getHomeKey());
       }
       if (typeof signal.data.dropped === 'number' && Number.isFinite(signal.data.dropped)) {
         data.dropped = signal.data.dropped;
@@ -234,6 +587,7 @@ export function modelUpdate(update: EnvUpdate): EnvUpdate {
         const value = signal.data[key];
         if (typeof value === 'number' && Number.isFinite(value)) data[key] = value;
       }
+      Object.assign(data, pickSanitizedReasons(signal.data, getHostname(), getHomeKey()));
       data.hasAnomaly = signal.data.hasAnomaly === true;
       if (Array.isArray(signal.data.anomalies)) {
         const anomalies = signal.data.anomalies
@@ -244,12 +598,20 @@ export function modelUpdate(update: EnvUpdate): EnvUpdate {
       if (Array.isArray(signal.data.alerts)) {
         const alerts = signal.data.alerts.flatMap((item: unknown) => {
           if (!item || typeof item !== 'object') return [];
-          const { metric: rawMetric, severity, count } = item as Record<string, unknown>;
+          const source = item as Record<string, unknown>;
+          const { metric: rawMetric, severity, count } = source;
           if (typeof rawMetric !== 'string' || typeof severity !== 'string') return [];
           if (severity !== 'warn' && severity !== 'critical') return [];
           const safeMetric = metric(rawMetric);
           const safeCount = typeof count === 'number' && Number.isFinite(count) ? Math.max(1, Math.round(count)) : 1;
-          return [{ metric: safeMetric, severity, count: safeCount }];
+          return [
+            {
+              metric: safeMetric,
+              severity,
+              count: safeCount,
+              ...pickSanitizedReasons(source, getHostname(), getHomeKey()),
+            },
+          ];
         });
         if (alerts.length > 0) data.alerts = alerts.slice(0, 5);
       }
@@ -277,7 +639,7 @@ export function modelUpdate(update: EnvUpdate): EnvUpdate {
           const kind = source.kind;
           if (typeof kind !== 'string' || !AWAY_FAILED_KINDS.has(kind)) return [];
           const rawId = typeof source.id === 'string' && source.id.trim() ? source.id : 'job';
-          const id = modelLabel(rawId) || 'job';
+          const id = sanitizeReason(rawId, getHostname(), getHomeKey()) || 'job';
           return [
             {
               id,
@@ -285,6 +647,7 @@ export function modelUpdate(update: EnvUpdate): EnvUpdate {
               ...(typeof source.exitCode === 'number' && Number.isFinite(source.exitCode)
                 ? { exitCode: source.exitCode }
                 : {}),
+              ...pickSanitizedReasons(source, getHostname(), getHomeKey()),
             },
           ];
         });
@@ -296,7 +659,13 @@ export function modelUpdate(update: EnvUpdate): EnvUpdate {
           const source = item as Record<string, unknown>;
           const rawDir = typeof source.directory === 'string' ? source.directory : '';
           const deleted = typeof source.deleted === 'number' && Number.isFinite(source.deleted) ? source.deleted : 0;
-          return [{ directory: modelActivityName(rawDir, true), deleted: Math.max(0, Math.round(deleted)) }];
+          return [
+            {
+              directory: modelActivityName(rawDir, true),
+              deleted: Math.max(0, Math.round(deleted)),
+              ...pickSanitizedReasons(source, getHostname(), getHomeKey()),
+            },
+          ];
         });
         if (bursts.length > 0) data.bursts = bursts.slice(0, 5);
       }
