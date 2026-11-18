@@ -213,7 +213,7 @@ export function normalizeWatchPath(
   return realDir === '/' ? `/${foldedBase}` : `${realDir}/${foldedBase}`;
 }
 
-/** Returns true when `raw` points to the current user's home directory or a standard POSIX home root. */
+/** Returns true when `raw` points to the current user's home directory or a standard POSIX/Windows home root. */
 export function isHomeRoot(raw: string, platform: string = process.platform): boolean {
   const clean = raw.replaceAll('\\', '/').replace(/\/+$/, '') || '/';
   const home = os.homedir().replaceAll('\\', '/').replace(/\/+$/, '');
@@ -226,5 +226,5 @@ export function isHomeRoot(raw: string, platform: string = process.platform): bo
   ) {
     return true;
   }
-  return /^\/(?:Users|home)\/[^/]+$/i.test(nfcClean);
+  return /^\/(?:Users|home)\/[^/]+$/i.test(nfcClean) || /^[A-Za-z]:\/Users\/[^/]+$/i.test(nfcClean);
 }
