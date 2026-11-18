@@ -6,12 +6,18 @@ import { performance } from 'node:perf_hooks';
 import { BodyProbe } from '@asi/body-probe';
 import type { Context } from '@deepseek-ai/cordis';
 import type { SensePorts } from '../runtime/ports.ts';
+import { FileHistoryStoragePort } from './history-storage.ts';
 import { FileStoragePort } from './storage.ts';
 
 export function localPorts(ctx: Context, storageRoot: string): Omit<SensePorts, 'dsh'> {
   if (!isAbsolute(storageRoot)) throw new TypeError('asi-sense storageRoot must be absolute');
   return {
     clock: { wall: Date.now, mono: () => performance.now() },
+    history: new FileHistoryStoragePort(storageRoot, undefined, (error) =>
+      ctx.logger.warn(
+        `asi-sense history directory sync failed: ${error instanceof Error ? error.message : String(error)}`,
+      ),
+    ),
     storage: new FileStoragePort(
       storageRoot,
       fs,

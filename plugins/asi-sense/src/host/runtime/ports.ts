@@ -2,6 +2,29 @@ import type { ChildProcessWithoutNullStreams } from 'node:child_process';
 import type { BodyProbe } from '@asi/body-probe';
 import type { Body, JobSummary, TuningValue, WatchRule } from '@asi/sense-types';
 import type { DeliveryIntent } from '../attention/pipeline.ts';
+import type {
+  DailyDirectoryStats,
+  DailySummary,
+  HistoryQuery,
+  HistoryQueryResult,
+  HistoryStoragePort,
+  MonthlySummary,
+  PersistedEventEntry,
+  SummaryQuery,
+  SummaryQueryResult,
+} from './history/index.ts';
+
+export type {
+  DailyDirectoryStats,
+  DailySummary,
+  HistoryQuery,
+  HistoryQueryResult,
+  HistoryStoragePort,
+  MonthlySummary,
+  PersistedEventEntry,
+  SummaryQuery,
+  SummaryQueryResult,
+};
 
 export type Unsubscribe = () => void;
 export interface Clock {
@@ -98,6 +121,7 @@ export interface SensePorts {
   probe: ProbeFactory;
   files: FileWatcher;
   clock: Clock;
+  history?: HistoryStoragePort;
 }
 export interface SenseOptions {
   platform?: string;
@@ -106,6 +130,7 @@ export interface SenseOptions {
   rules?: WatchRule[];
   selfCauseGraceMs?: number;
   targetStorageKey?: string;
+  timeZone?: string;
 }
 export interface SenseActions {
   selectTarget?(id: string | undefined): Promise<void>;
