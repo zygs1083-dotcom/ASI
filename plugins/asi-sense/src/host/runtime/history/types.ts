@@ -183,7 +183,7 @@ export interface SummaryQuery {
 }
 
 export type SummaryQueryResult =
-  | { available: true; partial?: boolean; summary: MonthlySummary }
+  | { available: true; partial?: boolean; pendingDays?: string[]; note?: string; summary: MonthlySummary }
   | { available: false; partial?: boolean; month: string; reason: string };
 
 export function sanitizeAppName(value: string): string {

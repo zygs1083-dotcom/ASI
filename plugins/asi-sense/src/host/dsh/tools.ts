@@ -193,7 +193,8 @@ export function createSenseTools(runtime: Runtime, now: () => number) {
   });
   const envSummary = defineTool({
     name: 'env_summary',
-    description: 'Read a monthly local environment summary computed from daily summaries (defaults to previous month).',
+    description:
+      'Read a monthly local environment summary computed from daily summaries (defaults to previous month). When partial=true, background daily backfill is still pending or incomplete for pendingDays and may complete on retry.',
     parameters: {
       month: {
         type: 'string',

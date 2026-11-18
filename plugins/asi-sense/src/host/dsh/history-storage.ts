@@ -124,43 +124,47 @@ export class FileHistoryStoragePort implements HistoryStoragePort {
         { kind: 'daily', dir: this.dailyDir },
         { kind: 'monthly', dir: this.monthlyDir },
       ];
-      for (const { kind, dir } of subdirs) {
-        try {
-          const ok = await this.ensureSafeDir(dir, false);
-          if (!ok) continue;
-        } catch (error) {
-          const code = (error as NodeJS.ErrnoException | undefined)?.code ?? 'EINVAL';
-          unsafe.push({ kind: 'dir', name: kind, code });
-          continue;
-        }
-
-        const names = await this.fs.readdir(dir);
-        for (const name of names) {
-          const entryPath = join(dir, name);
-          let info: HistoryFileStat;
+      await Promise.all(
+        subdirs.map(async ({ kind, dir }) => {
           try {
-            info = await this.lstatPath(entryPath);
+            const ok = await this.checkExistingSafeDir(dir);
+            if (!ok) return;
           } catch (error) {
-            if (isMissing(error)) continue;
-            throw error;
+            const code = (error as NodeJS.ErrnoException | undefined)?.code ?? 'EINVAL';
+            unsafe.push({ kind: 'dir', name: kind, code });
+            return;
           }
-          if (info.isSymbolicLink?.()) {
-            unsafe.push({ kind, name, code: 'ELOOP' });
-            continue;
-          }
-          if (info.isDirectory?.()) {
-            unsafe.push({ kind, name, code: 'EISDIR' });
-            continue;
-          }
-          if (info.isFile && !info.isFile()) {
-            unsafe.push({ kind, name, code: 'EINVAL' });
-            continue;
-          }
-          if (info.mode !== undefined && (info.mode & 0o777) !== 0o600) {
-            await this.fs.chmod?.(entryPath, 0o600);
-          }
-        }
-      }
+
+          const names = await this.fs.readdir(dir);
+          await Promise.all(
+            names.map(async (name) => {
+              const entryPath = join(dir, name);
+              let info: HistoryFileStat;
+              try {
+                info = await this.lstatPath(entryPath);
+              } catch (error) {
+                if (isMissing(error)) return;
+                throw error;
+              }
+              if (info.isSymbolicLink?.()) {
+                unsafe.push({ kind, name, code: 'ELOOP' });
+                return;
+              }
+              if (info.isDirectory?.()) {
+                unsafe.push({ kind, name, code: 'EISDIR' });
+                return;
+              }
+              if (info.isFile && !info.isFile()) {
+                unsafe.push({ kind, name, code: 'EINVAL' });
+                return;
+              }
+              if (info.mode !== undefined && (info.mode & 0o777) !== 0o600) {
+                await this.hardenFileMode(entryPath, kind, name, unsafe);
+              }
+            }),
+          );
+        }),
+      );
       return unsafe;
     });
   }
@@ -214,11 +218,12 @@ export class FileHistoryStoragePort implements HistoryStoragePort {
               payload = `\n${payload}`;
             }
           }
-          this.verifiedNewlineDates.add(date);
         }
 
         await handle.writeFile(payload, 'utf8');
-        await handle.sync();
+        if (payload.endsWith('\n')) {
+          this.verifiedNewlineDates.add(date);
+        }
       } finally {
         await handle.close().catch(() => {});
       }
@@ -254,29 +259,37 @@ export class FileHistoryStoragePort implements HistoryStoragePort {
         return;
       }
 
-      const buf = Buffer.allocUnsafe(STREAM_CHUNK_BYTES);
+      let buf = Buffer.allocUnsafe(STREAM_CHUNK_BYTES * 2);
+      let carryLen = 0;
       let pos = 0;
-      let carry: Buffer = Buffer.alloc(0);
       for (;;) {
-        const { bytesRead } = await handle.read(buf, 0, STREAM_CHUNK_BYTES, pos);
+        if (buf.length - carryLen < STREAM_CHUNK_BYTES) {
+          const next = Buffer.allocUnsafe(buf.length * 2);
+          if (carryLen > 0) buf.copy(next, 0, 0, carryLen);
+          buf = next;
+        }
+        const { bytesRead } = await handle.read(buf, carryLen, STREAM_CHUNK_BYTES, pos);
         if (bytesRead <= 0) break;
         pos += bytesRead;
-        const chunk = buf.subarray(0, bytesRead);
-        const combined = carry.length > 0 ? Buffer.concat([carry, chunk]) : chunk;
+        const total = carryLen + bytesRead;
+        const view = buf.subarray(0, total);
         let lineStart = 0;
         for (;;) {
-          const nl = combined.indexOf(0x0a, lineStart);
+          const nl = view.indexOf(0x0a, lineStart);
           if (nl < 0) break;
           if (nl > lineStart) {
-            const text = trimLineBuffer(combined.subarray(lineStart, nl));
+            const text = trimLineBuffer(view.subarray(lineStart, nl));
             if (text) yield text;
           }
           lineStart = nl + 1;
         }
-        carry = lineStart < combined.length ? Buffer.from(combined.subarray(lineStart)) : Buffer.alloc(0);
+        carryLen = total - lineStart;
+        if (carryLen > 0 && lineStart > 0) {
+          buf.copy(buf, 0, lineStart, total);
+        }
       }
-      if (carry.length > 0) {
-        const text = trimLineBuffer(carry);
+      if (carryLen > 0) {
+        const text = trimLineBuffer(buf.subarray(0, carryLen));
         if (text) yield text;
       }
     } finally {
@@ -417,11 +430,88 @@ export class FileHistoryStoragePort implements HistoryStoragePort {
     return run;
   }
 
+  private async hardenFileMode(
+    entryPath: string,
+    kind: 'events' | 'daily' | 'monthly',
+    name: string,
+    unsafe: HistoryUnsafeEntry[],
+  ): Promise<void> {
+    const flags = (fsConstants.O_RDONLY ?? 0) | (fsConstants.O_NOFOLLOW ?? 0) | (fsConstants.O_NONBLOCK ?? 0);
+    let handle: HistoryFileHandle | undefined;
+    try {
+      handle = await this.fs.open(entryPath, flags);
+    } catch (error) {
+      if (isMissing(error)) return;
+      const code = (error as NodeJS.ErrnoException | undefined)?.code;
+      if (code === 'ELOOP' || code === 'EISDIR' || code === 'EINVAL' || code === 'ENOTDIR') {
+        unsafe.push({ kind, name, code });
+        return;
+      }
+      if (code === 'EACCES') {
+        await this.fs.chmod?.(entryPath, 0o600);
+        return;
+      }
+      throw error;
+    }
+    try {
+      const st = await handle.stat?.();
+      if (st?.isSymbolicLink?.()) {
+        unsafe.push({ kind, name, code: 'ELOOP' });
+        return;
+      }
+      if (st?.isDirectory?.()) {
+        unsafe.push({ kind, name, code: 'EISDIR' });
+        return;
+      }
+      if (st?.isFile && !st.isFile()) {
+        unsafe.push({ kind, name, code: 'EINVAL' });
+        return;
+      }
+      if (typeof handle.chmod === 'function') {
+        await handle.chmod(0o600);
+      } else {
+        await this.fs.chmod?.(entryPath, 0o600);
+      }
+    } finally {
+      await handle.close().catch(() => {});
+    }
+  }
+
   private lstatPath(targetPath: string): Promise<HistoryFileStat> {
     return this.fs.lstat ? this.fs.lstat(targetPath) : this.fs.stat(targetPath);
   }
 
+  private async checkExistingSafeDir(dir: string): Promise<boolean> {
+    let info: HistoryFileStat;
+    try {
+      info = await this.lstatPath(dir);
+    } catch (error) {
+      if (isMissing(error)) return false;
+      throw error;
+    }
+    if (info.isSymbolicLink?.()) {
+      throw errnoError('ELOOP', `refusing symlink history directory: ${dir}`);
+    }
+    if (info.isDirectory && !info.isDirectory()) {
+      throw errnoError('ENOTDIR', `history path is not a directory: ${dir}`);
+    }
+    if (info.mode !== undefined && (info.mode & 0o777) !== 0o700) {
+      await this.fs.chmod?.(dir, 0o700);
+    }
+    return true;
+  }
+
   private async ensureSafeDir(leafDir: string, createIfMissing: boolean): Promise<boolean> {
+    if (!createIfMissing) {
+      if (leafDir === this.historyDir) {
+        return this.checkExistingSafeDir(this.historyDir);
+      }
+      const [rootOk, leafOk] = await Promise.all([
+        this.checkExistingSafeDir(this.historyDir),
+        this.checkExistingSafeDir(leafDir),
+      ]);
+      return rootOk && leafOk;
+    }
     const dirs = leafDir === this.historyDir ? [this.historyDir] : [this.historyDir, leafDir];
     for (const dir of dirs) {
       let info: HistoryFileStat;
@@ -429,7 +519,6 @@ export class FileHistoryStoragePort implements HistoryStoragePort {
         info = await this.lstatPath(dir);
       } catch (error) {
         if (!isMissing(error)) throw error;
-        if (!createIfMissing) return false;
         await this.fs.mkdir(dir, { recursive: true, mode: 0o700 });
         info = await this.lstatPath(dir);
       }

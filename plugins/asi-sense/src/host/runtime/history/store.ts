@@ -1,15 +1,13 @@
 import { performance } from 'node:perf_hooks';
 import type { DeliveryLevel, SignalCause, SourceRef } from '@asi/sense-types';
 import {
-  createHistoryLineParser,
+  createDailySummaryAccumulator,
   parseDailySummary,
-  type parseHistoryStream,
   parseMonthlySummary,
-  summarizeDay,
   synthesizeMonth,
   toPersistedEvent,
 } from './summarize.ts';
-import { diffDays, LocalCalendar, parseDateKey, parseMonthKey, prevMonth } from './time.ts';
+import { addDays, diffDays, formatDate, LocalCalendar, parseDateKey, parseMonthKey, prevMonth } from './time.ts';
 import {
   DAILY_SUMMARY_RETENTION_DAYS,
   type DailySummary,
@@ -73,10 +71,16 @@ export interface HistoryManagerOptions {
 
 const DATE_ONLY_RE = /^\d{4}-\d{2}-\d{2}$/;
 const ISO_DATE_PREFIX_RE = /^(\d{4}-\d{2}-\d{2})(?:[T ]|$)/;
-const INLINE_BACKFILL_MAX_BYTES = 512 * 1024;
-const INLINE_BACKFILL_MAX_MS = 40;
+const MAX_BACKFILL_RETRIES = 3;
+const PARTIAL_SUMMARY_NOTE =
+  'Monthly summary is partial because daily backfill for some days is still pending or failed; retry later for complete data.';
 const UNSAFE_FS_CODES = new Set(['ELOOP', 'EISDIR', 'ENOTDIR', 'EINVAL', 'ENOTSUP', 'EOPNOTSUPP']);
 const VALID_LEVELS = new Set<DeliveryLevel>(['record', 'context', 'wake']);
+
+function utcDateKey(ms: number): string {
+  const d = new Date(ms);
+  return formatDate(d.getUTCFullYear(), d.getUTCMonth() + 1, d.getUTCDate());
+}
 
 function isRecordObject(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -202,6 +206,8 @@ export class HistoryManager {
   private readonly eventDatesById = new Map<string, string>();
   private activeLifecycleOpen = false;
   private readonly pendingBackfill = new Set<string>();
+  private pendingBackfillEpoch = 0;
+  private readonly backfillFailures = new Map<string, number>();
   private backfillTimer?: ReturnType<typeof setTimeout>;
   private backfillYieldWake?: () => void;
   private backfillCurrentMonth?: string;
@@ -259,8 +265,12 @@ export class HistoryManager {
   recordEvent(entry: HistoryEventInput, meta?: { bundleId?: string; title?: string }): void {
     if (!this.port || !this.started || this.stopped || entry.restored) return;
     const now = this.clock.wall();
-    this.syncClockDate(now);
     const date = this.calendar.dateKey(entry.at);
+    const deferRollover =
+      this.currentDate !== undefined && date === this.currentDate && this.calendar.dateKey(now) > this.currentDate;
+    if (!deferRollover) {
+      this.syncClockDate(now);
+    }
     this.rememberEventDate(entry.id, date);
     if (entry.kind === 'app.activated' && isNonEmptyString(entry.subject)) {
       this.activeApp = entry.subject;
@@ -288,6 +298,9 @@ export class HistoryManager {
     };
     const epoch = this.clearEpoch;
     this.enqueue(() => this.appendRawLine(date, `${JSON.stringify(line)}\n`, epoch));
+    if (deferRollover) {
+      this.syncClockDate(now);
+    }
   }
 
   patchEvent(
@@ -360,6 +373,7 @@ export class HistoryManager {
   async clear(): Promise<void> {
     const epoch = ++this.clearEpoch;
     this.cancelBackfill();
+    this.backfillCurrentMonth = undefined;
     this.clearMemoryEntries();
     this.sizes.clear();
     this.cappedDates.clear();
@@ -380,8 +394,10 @@ export class HistoryManager {
       if (this.started && !this.stopped && epoch === this.clearEpoch) {
         const now = this.clock.wall();
         const today = this.calendar.dateKey(now);
+        const month = this.calendar.monthKey(now);
         this.currentDate = today;
-        this.currentMonth = this.calendar.monthKey(now);
+        this.currentMonth = month;
+        this.backfillCurrentMonth = month;
         this.lastAliveAt = now;
         this.nextHeartbeatMono = this.clock.mono() + this.heartbeatIntervalMs;
         const lifecycle: HistoryLifecycleRecord = {
@@ -478,8 +494,8 @@ export class HistoryManager {
       };
     }
 
-    const startDate = this.calendar.dateKey(fromMs);
-    const endDate = this.calendar.dateKey(toMs);
+    const startDate = addDays(utcDateKey(fromMs), -1);
+    const endDate = addDays(utcDateKey(toMs), 1);
     let rawDates: string[];
     try {
       rawDates = await this.port.listEventDates();
@@ -611,6 +627,7 @@ export class HistoryManager {
 
     await this.tail;
 
+    const epoch = this.clearEpoch;
     if (month > nowMonth) {
       return { available: false, month, reason: `Month ${month} is in the future.` };
     }
@@ -623,11 +640,15 @@ export class HistoryManager {
       };
     }
 
-    const hasPendingForMonth = this.hasPendingBackfillForMonth(month);
+    const pendingDays = this.pendingBackfillDatesForMonth(month);
+    const hasPendingForMonth = pendingDays.length > 0;
 
     if (!hasPendingForMonth) {
       try {
         const existingRaw = await this.port.readMonthly(month);
+        if (epoch !== this.clearEpoch) {
+          return { available: false, month, reason: `No history data found for month ${month}.` };
+        }
         if (existingRaw !== undefined) {
           const parsed = parseMonthlySummary(existingRaw);
           if (parsed) return { available: true, summary: parsed };
@@ -647,22 +668,75 @@ export class HistoryManager {
       }
     }
 
-    const synthesized = await this.synthesizeMonthFromDaily(month, undefined, !hasPendingForMonth, hasPendingForMonth);
-    if (!synthesized) {
+    const synthesized = await this.synthesizeMonthFromDaily(month, undefined, false, hasPendingForMonth, epoch);
+    if (epoch !== this.clearEpoch || !synthesized) {
       return { available: false, month, reason: `No history data found for month ${month}.` };
     }
     if (hasPendingForMonth) {
       synthesized.partial = true;
-      return { available: true, partial: true, summary: synthesized };
+      return { available: true, partial: true, pendingDays, note: PARTIAL_SUMMARY_NOTE, summary: synthesized };
     }
+    await this.enqueue(async () => {
+      if (!this.port || this.isEpochStale(epoch) || this.hasPendingBackfillForMonth(month)) return;
+      await this.persistMonthlySummary(month, synthesized, epoch);
+    });
     return { available: true, summary: synthesized };
   }
 
+  private isEpochStale(epoch: number): boolean {
+    return this.stopped || epoch !== this.clearEpoch;
+  }
+
+  private clearPendingForEpoch(epoch: number): void {
+    if (this.pendingBackfillEpoch === epoch) {
+      this.pendingBackfill.clear();
+      this.backfillFailures.clear();
+    }
+  }
+
+  private registerPendingBackfill(dates: readonly string[], epoch: number): boolean {
+    if (this.isEpochStale(epoch)) {
+      this.clearPendingForEpoch(epoch);
+      return false;
+    }
+    this.pendingBackfill.clear();
+    this.backfillFailures.clear();
+    this.pendingBackfillEpoch = epoch;
+    for (const date of dates) this.pendingBackfill.add(date);
+    return true;
+  }
+
+  private pendingBackfillDatesForMonth(month: string): string[] {
+    if (this.pendingBackfillEpoch !== this.clearEpoch) {
+      this.pendingBackfill.clear();
+      this.backfillFailures.clear();
+      return [];
+    }
+    const dates: string[] = [];
+    for (const date of this.pendingBackfill) {
+      if (date.startsWith(`${month}-`)) dates.push(date);
+    }
+    dates.sort();
+    return dates;
+  }
+
   private hasPendingBackfillForMonth(month: string): boolean {
+    if (this.pendingBackfillEpoch !== this.clearEpoch) {
+      this.pendingBackfill.clear();
+      this.backfillFailures.clear();
+      return false;
+    }
     for (const date of this.pendingBackfill) {
       if (date.startsWith(`${month}-`)) return true;
     }
     return false;
+  }
+
+  private pickNextBackfillDate(): string | undefined {
+    for (const date of this.pendingBackfill) {
+      if ((this.backfillFailures.get(date) ?? 0) < MAX_BACKFILL_RETRIES) return date;
+    }
+    return undefined;
   }
 
   private rememberEventDate(id: string, date: string): void {
@@ -728,55 +802,42 @@ export class HistoryManager {
     const epoch = this.clearEpoch;
 
     this.enqueue(async () => {
-      if (!this.port || epoch !== this.clearEpoch) return;
+      if (!this.port || this.isEpochStale(epoch)) return;
       const prevBounds = this.calendar.dayBounds(prevDate);
       const continuous = diffDays(nextDate, prevDate) === 1 && prevBounds.endMs - prevAliveAt <= 10 * 60_000;
       try {
-        let parsedPrev: Awaited<ReturnType<typeof parseHistoryStream>> | undefined;
-        let sawPrevFile = true;
-        if (this.port.readEventLines) {
-          const size = await this.safeEventFileSize(prevDate);
-          const parser = createHistoryLineParser();
-          let count = 0;
-          for await (const line of this.streamLinesForward(prevDate)) {
-            parser.feed(line);
-            count++;
-          }
-          if (count === 0 && size === 0) sawPrevFile = false;
-          else parsedPrev = parser.finish();
-        } else {
-          const rawPrev = await this.port.readEvents(prevDate);
-          if (rawPrev === undefined) sawPrevFile = false;
-          else {
-            const parser = createHistoryLineParser();
-            let start = 0;
-            while (start < rawPrev.length) {
-              const nl = rawPrev.indexOf('\n', start);
-              parser.feed(nl < 0 ? rawPrev.slice(start) : rawPrev.slice(start, nl));
-              if (nl < 0) break;
-              start = nl + 1;
-            }
-            parsedPrev = parser.finish();
-          }
+        const size = await this.safeEventFileSize(prevDate);
+        if (this.isEpochStale(epoch)) return;
+        const acc = createDailySummaryAccumulator(prevDate, prevBounds, {
+          isRunningAtEnd: continuous,
+          liveEndMs: continuous ? prevBounds.endMs : undefined,
+          truncatedAtLimit: this.cappedDates.has(prevDate) || size >= this.maxDailyBytes,
+        });
+        let sawLine = false;
+        for await (const line of this.streamLinesForward(prevDate)) {
+          if (this.isEpochStale(epoch)) return;
+          acc.feed(line);
+          sawLine = true;
         }
-        if (epoch !== this.clearEpoch) return;
-        if (sawPrevFile && parsedPrev) {
-          const size = await this.safeEventFileSize(prevDate);
-          const daily = summarizeDay(prevDate, parsedPrev, prevBounds, {
-            isRunningAtEnd: continuous,
-            liveEndMs: continuous ? prevBounds.endMs : undefined,
-            truncatedAtLimit: this.cappedDates.has(prevDate) || size >= this.maxDailyBytes,
-          });
+        if (this.isEpochStale(epoch)) return;
+        if (sawLine || size > 0) {
+          const daily = acc.finish();
           await this.port.writeDaily(prevDate, JSON.stringify(daily));
-          this.pendingBackfill.delete(prevDate);
+          if (this.isEpochStale(epoch)) return;
+          if (this.pendingBackfillEpoch === epoch) {
+            this.pendingBackfill.delete(prevDate);
+            this.backfillFailures.delete(prevDate);
+          }
           this.clearSummaryDegraded();
         }
-        if (epoch !== this.clearEpoch) return;
+        if (this.isEpochStale(epoch)) return;
         if (nextMonthKey !== prevMonthKey) {
           await this.synthesizeAllCompletedMonths(nextMonthKey, epoch);
         }
+        if (this.isEpochStale(epoch)) return;
         await this.pruneExpired(nextDate, epoch);
       } catch (error) {
+        if (this.isEpochStale(epoch)) return;
         const code = unsafeFsCode(error);
         if (code) {
           this.reportFileErrorOnce(`unsafe:events:${prevDate}:${code}`, 'history-unsafe-entry', {
@@ -788,7 +849,7 @@ export class HistoryManager {
           this.reportSummaryWriteFailure(prevDate, 'history-write-failed');
         }
       }
-      if (epoch !== this.clearEpoch || this.stopped) return;
+      if (this.isEpochStale(epoch)) return;
       const startAt = continuous ? prevBounds.endMs : wall;
       const boundary: HistoryLifecycleRecord = {
         record: 'lifecycle',
@@ -832,13 +893,20 @@ export class HistoryManager {
   }
 
   private async startupMaintenance(today: string, currentMonth: string, epoch: number): Promise<void> {
-    if (!this.port) return;
+    if (!this.port || this.isEpochStale(epoch)) {
+      this.clearPendingForEpoch(epoch);
+      return;
+    }
     this.backfillCurrentMonth = currentMonth;
     try {
       const knownUnsafeEvents = new Set<string>();
       if (this.port.harden) {
         try {
           const unsafe = await this.port.harden();
+          if (this.isEpochStale(epoch)) {
+            this.clearPendingForEpoch(epoch);
+            return;
+          }
           for (const item of unsafe) {
             const keyName =
               item.kind === 'events'
@@ -854,6 +922,10 @@ export class HistoryManager {
             });
           }
         } catch (error) {
+          if (this.isEpochStale(epoch)) {
+            this.clearPendingForEpoch(epoch);
+            return;
+          }
           const code = unsafeFsCode(error);
           if (code) {
             this.reportFileErrorOnce(`unsafe:harden:${code}`, 'history-unsafe-entry', { code });
@@ -862,12 +934,19 @@ export class HistoryManager {
           throw error;
         }
       }
-      if (this.stopped || epoch !== this.clearEpoch) return;
+      if (this.isEpochStale(epoch)) {
+        this.clearPendingForEpoch(epoch);
+        return;
+      }
 
       let rawEventDates: string[] = [];
       try {
         rawEventDates = await this.port.listEventDates();
       } catch (error) {
+        if (this.isEpochStale(epoch)) {
+          this.clearPendingForEpoch(epoch);
+          return;
+        }
         const code = unsafeFsCode(error);
         if (code) {
           this.reportFileErrorOnce(`unsafe:events-dir:${code}`, 'history-unsafe-entry', { dir: 'events', code });
@@ -875,16 +954,31 @@ export class HistoryManager {
           throw error;
         }
       }
-      if (this.stopped || epoch !== this.clearEpoch) return;
+      if (this.isEpochStale(epoch)) {
+        this.clearPendingForEpoch(epoch);
+        return;
+      }
 
       const eventDates = this.filterValidDates(rawEventDates, 'events').sort();
       const keptDates: string[] = [];
       for (const date of eventDates) {
+        if (this.isEpochStale(epoch)) {
+          this.clearPendingForEpoch(epoch);
+          return;
+        }
         if (knownUnsafeEvents.has(date)) continue;
         if (diffDays(today, date) > HISTORY_RETENTION_DAYS) {
           try {
             await this.port.deleteEventDate(date);
+            if (this.isEpochStale(epoch)) {
+              this.clearPendingForEpoch(epoch);
+              return;
+            }
           } catch (error) {
+            if (this.isEpochStale(epoch)) {
+              this.clearPendingForEpoch(epoch);
+              return;
+            }
             const code = unsafeFsCode(error);
             if (code) {
               this.reportFileErrorOnce(`unsafe:events:${date}:${code}`, 'history-unsafe-entry', {
@@ -900,7 +994,10 @@ export class HistoryManager {
           keptDates.push(date);
         }
       }
-      if (this.stopped || epoch !== this.clearEpoch) return;
+      if (this.isEpochStale(epoch)) {
+        this.clearPendingForEpoch(epoch);
+        return;
+      }
 
       // Restore up to 200 most recent events starting from the latest day only.
       const collected: PersistedEventEntry[] = [];
@@ -909,12 +1006,20 @@ export class HistoryManager {
         try {
           const scanner = createReverseEventScanner();
           for await (const line of this.streamLinesDesc(date)) {
+            if (this.isEpochStale(epoch)) {
+              this.clearPendingForEpoch(epoch);
+              return;
+            }
             const ev = scanner.accept(line);
             if (!ev) continue;
             collected.push(ev);
             if (collected.length >= MAX_HISTORY_LIMIT) break;
           }
         } catch (error) {
+          if (this.isEpochStale(epoch)) {
+            this.clearPendingForEpoch(epoch);
+            return;
+          }
           const code = unsafeFsCode(error);
           if (code) {
             knownUnsafeEvents.add(date);
@@ -928,7 +1033,10 @@ export class HistoryManager {
           throw error;
         }
       }
-      if (this.stopped || epoch !== this.clearEpoch) return;
+      if (this.isEpochStale(epoch)) {
+        this.clearPendingForEpoch(epoch);
+        return;
+      }
       if (collected.length > 0) {
         collected.reverse();
         this.restoreEntries(collected);
@@ -938,11 +1046,27 @@ export class HistoryManager {
       const existingDailyDates = new Set<string>();
       try {
         const rawDailyDates = await this.port.listDailyDates();
+        if (this.isEpochStale(epoch)) {
+          this.clearPendingForEpoch(epoch);
+          return;
+        }
         for (const date of this.filterValidDates(rawDailyDates, 'daily')) {
+          if (this.isEpochStale(epoch)) {
+            this.clearPendingForEpoch(epoch);
+            return;
+          }
           if (diffDays(today, date) > DAILY_SUMMARY_RETENTION_DAYS) {
             try {
               await this.port.deleteDailyDate(date);
+              if (this.isEpochStale(epoch)) {
+                this.clearPendingForEpoch(epoch);
+                return;
+              }
             } catch (error) {
+              if (this.isEpochStale(epoch)) {
+                this.clearPendingForEpoch(epoch);
+                return;
+              }
               const code = unsafeFsCode(error);
               if (code) {
                 this.reportFileErrorOnce(`unsafe:daily:${date}:${code}`, 'history-unsafe-entry', {
@@ -959,6 +1083,10 @@ export class HistoryManager {
           }
         }
       } catch (error) {
+        if (this.isEpochStale(epoch)) {
+          this.clearPendingForEpoch(epoch);
+          return;
+        }
         const code = unsafeFsCode(error);
         if (code) {
           this.reportFileErrorOnce(`unsafe:daily-dir:${code}`, 'history-unsafe-entry', { dir: 'daily', code });
@@ -966,11 +1094,18 @@ export class HistoryManager {
           throw error;
         }
       }
-      if (this.stopped || epoch !== this.clearEpoch) return;
+      if (this.isEpochStale(epoch)) {
+        this.clearPendingForEpoch(epoch);
+        return;
+      }
 
       // Determine missing daily summaries for past days with raw logs.
       const missingDailyDates: string[] = [];
       for (const date of keptDates) {
+        if (this.isEpochStale(epoch)) {
+          this.clearPendingForEpoch(epoch);
+          return;
+        }
         if (date >= today || knownUnsafeEvents.has(date)) continue;
         if (!existingDailyDates.has(date)) {
           missingDailyDates.push(date);
@@ -978,12 +1113,20 @@ export class HistoryManager {
         }
         try {
           const existing = await this.port.readDaily(date);
+          if (this.isEpochStale(epoch)) {
+            this.clearPendingForEpoch(epoch);
+            return;
+          }
           if (existing !== undefined) {
             if (parseDailySummary(existing)) continue;
             this.reportFileErrorOnce(`corrupt:daily:${date}`, 'corrupt-daily-summary', { date });
           }
           missingDailyDates.push(date);
         } catch (error) {
+          if (this.isEpochStale(epoch)) {
+            this.clearPendingForEpoch(epoch);
+            return;
+          }
           const code = unsafeFsCode(error);
           if (code) {
             this.reportFileErrorOnce(`unsafe:daily:${date}:${code}`, 'history-unsafe-entry', {
@@ -997,89 +1140,41 @@ export class HistoryManager {
         }
       }
 
-      for (const date of missingDailyDates) this.pendingBackfill.add(date);
-
-      if (missingDailyDates.length > 0) {
-        let deferAll = false;
-        if (missingDailyDates.length > 1) {
-          const firstSize = await this.safeEventFileSize(missingDailyDates[0]);
-          if (firstSize > INLINE_BACKFILL_MAX_BYTES) deferAll = true;
-        }
-        if (!deferAll) {
-          const t0 = performance.now();
-          let inlineBytes = 0;
-          for (let i = 0; i < missingDailyDates.length; i++) {
-            if (this.stopped || epoch !== this.clearEpoch) return;
-            const date = missingDailyDates[i];
-            const estSize = await this.safeEventFileSize(date);
-            if (
-              i > 0 &&
-              (inlineBytes + estSize > INLINE_BACKFILL_MAX_BYTES || performance.now() - t0 >= INLINE_BACKFILL_MAX_MS)
-            ) {
-              break;
-            }
-            const written = await this.backfillSingleDay(date, epoch);
-            inlineBytes += written ?? estSize;
-            this.pendingBackfill.delete(date);
-          }
-        }
+      if (!this.registerPendingBackfill(missingDailyDates, epoch)) {
+        return;
       }
-      if (this.stopped || epoch !== this.clearEpoch) return;
 
-      // Synthesize completed months whose pending backfill is already done.
-      await this.synthesizeAllCompletedMonths(currentMonth, epoch);
+      // Synthesize completed months that have no pending backfill; months with
+      // pending days are synthesized once background backfill completes.
+      if (existingDailyDates.size > 0) {
+        await this.synthesizeAllCompletedMonths(currentMonth, epoch, [...existingDailyDates]);
+      }
+      if (this.isEpochStale(epoch)) {
+        this.clearPendingForEpoch(epoch);
+        return;
+      }
 
-      if (this.pendingBackfill.size > 0 && !this.stopped && epoch === this.clearEpoch) {
+      if (this.pendingBackfill.size > 0) {
         this.scheduleBackfill(epoch);
       }
     } catch {
-      if (epoch === this.clearEpoch) {
-        this.reportSummaryWriteFailure(today, 'history-startup-failed');
+      if (this.isEpochStale(epoch)) {
+        this.clearPendingForEpoch(epoch);
+        return;
       }
-    }
-  }
-
-  private async backfillSingleDay(date: string, epoch: number): Promise<number | undefined> {
-    if (!this.port || this.stopped || epoch !== this.clearEpoch) return undefined;
-    try {
-      const size = await this.safeEventFileSize(date);
-      let readBytes = 0;
-      const parser = createHistoryLineParser();
-      let sawLine = false;
-      for await (const line of this.streamLinesForward(date)) {
-        if (this.stopped || epoch !== this.clearEpoch) return undefined;
-        readBytes += Buffer.byteLength(line, 'utf8') + 1;
-        parser.feed(line);
-        sawLine = true;
-      }
-      if (!sawLine && size === 0) return 0;
-      if (this.stopped || epoch !== this.clearEpoch) return undefined;
-      const parsed = parser.finish();
-      const bounds = this.calendar.dayBounds(date);
-      const daily = summarizeDay(date, parsed, bounds, {
-        isRunningAtEnd: false,
-        truncatedAtLimit: this.cappedDates.has(date) || size >= this.maxDailyBytes,
-      });
-      await this.port.writeDaily(date, JSON.stringify(daily));
-      this.clearSummaryDegraded();
-      return readBytes || size;
-    } catch (error) {
-      const code = unsafeFsCode(error);
-      if (code) {
-        this.reportFileErrorOnce(`unsafe:events:${date}:${code}`, 'history-unsafe-entry', {
-          kind: 'events',
-          date,
-          code,
-        });
-        return 0;
-      }
-      this.reportSummaryWriteFailure(date, 'history-write-failed');
-      return 0;
+      this.reportSummaryWriteFailure(today, 'history-startup-failed');
     }
   }
 
   private scheduleBackfill(epoch: number, delayMs = 50): void {
-    if (this.backfillTimer || this.stopped || epoch !== this.clearEpoch || this.pendingBackfill.size === 0) return;
+    if (
+      this.backfillTimer ||
+      this.isEpochStale(epoch) ||
+      this.pendingBackfillEpoch !== epoch ||
+      this.pendingBackfill.size === 0
+    ) {
+      return;
+    }
     this.backfillTimer = setTimeout(() => {
       this.backfillTimer = undefined;
       const step = this.runBackfillStep(epoch);
@@ -1099,10 +1194,11 @@ export class HistoryManager {
     this.backfillYieldWake?.();
     this.backfillYieldWake = undefined;
     this.pendingBackfill.clear();
+    this.backfillFailures.clear();
   }
 
   private waitBackfillTurn(epoch: number, delayMs = 0): Promise<void> {
-    if (this.stopped || epoch !== this.clearEpoch) return Promise.resolve();
+    if (this.isEpochStale(epoch)) return Promise.resolve();
     return new Promise<void>((resolve) => {
       const done = () => {
         clearTimeout(timer);
@@ -1116,50 +1212,104 @@ export class HistoryManager {
   }
 
   private async runBackfillStep(epoch: number): Promise<void> {
-    if (!this.port || this.stopped || epoch !== this.clearEpoch) return;
+    if (!this.port || this.isEpochStale(epoch) || this.pendingBackfillEpoch !== epoch) {
+      this.clearPendingForEpoch(epoch);
+      return;
+    }
     if (this.activeQueries > 0) {
       this.scheduleBackfill(epoch, 20);
       return;
     }
-    const nextDate = this.pendingBackfill.values().next().value;
-    if (!nextDate) return;
+    const nextDate = this.pickNextBackfillDate();
+    if (!nextDate) {
+      const month = this.backfillCurrentMonth ?? this.calendar.monthKey(this.clock.wall());
+      await this.enqueue(() => this.synthesizeAllCompletedMonths(month, epoch));
+      return;
+    }
     try {
       const size = await this.safeEventFileSize(nextDate);
-      const parser = createHistoryLineParser();
+      if (this.isEpochStale(epoch)) {
+        this.clearPendingForEpoch(epoch);
+        return;
+      }
+      const bounds = this.calendar.dayBounds(nextDate);
+      const acc = createDailySummaryAccumulator(nextDate, bounds, {
+        isRunningAtEnd: false,
+        truncatedAtLimit: this.cappedDates.has(nextDate) || size >= this.maxDailyBytes,
+      });
       let sawLine = false;
       let sliceStart = performance.now();
       for await (const line of this.streamLinesForward(nextDate)) {
-        if (this.stopped || epoch !== this.clearEpoch) return;
-        parser.feed(line);
+        if (this.isEpochStale(epoch)) {
+          this.clearPendingForEpoch(epoch);
+          return;
+        }
+        acc.feed(line);
         sawLine = true;
-        if (this.activeQueries > 0 || performance.now() - sliceStart >= 8) {
+        if (this.activeQueries > 0 || performance.now() - sliceStart >= 16) {
           await this.waitBackfillTurn(epoch, this.activeQueries > 0 ? 15 : 0);
-          if (this.stopped || epoch !== this.clearEpoch) return;
+          if (this.isEpochStale(epoch)) {
+            this.clearPendingForEpoch(epoch);
+            return;
+          }
           sliceStart = performance.now();
         }
       }
-      if (this.stopped || epoch !== this.clearEpoch) return;
+      if (this.isEpochStale(epoch)) {
+        this.clearPendingForEpoch(epoch);
+        return;
+      }
       if (sawLine || size > 0) {
-        const parsed = parser.finish();
-        const bounds = this.calendar.dayBounds(nextDate);
-        const daily = summarizeDay(nextDate, parsed, bounds, {
-          isRunningAtEnd: false,
-          truncatedAtLimit: this.cappedDates.has(nextDate) || size >= this.maxDailyBytes,
-        });
+        const dailyJson = JSON.stringify(acc.finish());
+        if (this.isEpochStale(epoch)) {
+          this.clearPendingForEpoch(epoch);
+          return;
+        }
         await this.enqueue(async () => {
-          if (!this.port || this.stopped || epoch !== this.clearEpoch) return;
-          try {
-            await this.port.writeDaily(nextDate, JSON.stringify(daily));
-            this.clearSummaryDegraded();
-          } catch {
-            this.reportSummaryWriteFailure(nextDate, 'history-write-failed');
+          if (!this.port || this.isEpochStale(epoch)) {
+            this.clearPendingForEpoch(epoch);
+            return;
           }
-          this.pendingBackfill.delete(nextDate);
+          try {
+            await this.port.writeDaily(nextDate, dailyJson);
+            if (this.isEpochStale(epoch)) {
+              this.clearPendingForEpoch(epoch);
+              return;
+            }
+            this.pendingBackfill.delete(nextDate);
+            this.backfillFailures.delete(nextDate);
+            this.clearSummaryDegraded();
+          } catch (writeError) {
+            if (this.isEpochStale(epoch)) {
+              this.clearPendingForEpoch(epoch);
+              return;
+            }
+            const code = unsafeFsCode(writeError);
+            if (code) {
+              this.reportFileErrorOnce(`unsafe:daily:${nextDate}:${code}`, 'history-unsafe-entry', {
+                kind: 'daily',
+                date: nextDate,
+                code,
+              });
+            } else {
+              this.reportSummaryWriteFailure(nextDate, 'history-write-failed');
+            }
+            const failures = (this.backfillFailures.get(nextDate) ?? 0) + 1;
+            this.backfillFailures.set(nextDate, failures);
+            if (this.pendingBackfill.delete(nextDate)) {
+              this.pendingBackfill.add(nextDate);
+            }
+          }
         });
       } else {
         this.pendingBackfill.delete(nextDate);
+        this.backfillFailures.delete(nextDate);
       }
     } catch (error) {
+      if (this.isEpochStale(epoch)) {
+        this.clearPendingForEpoch(epoch);
+        return;
+      }
       const code = unsafeFsCode(error);
       if (code) {
         this.reportFileErrorOnce(`unsafe:events:${nextDate}:${code}`, 'history-unsafe-entry', {
@@ -1167,33 +1317,64 @@ export class HistoryManager {
           date: nextDate,
           code,
         });
+        this.pendingBackfill.delete(nextDate);
+        this.backfillFailures.delete(nextDate);
       } else {
         this.reportSummaryWriteFailure(nextDate, 'history-write-failed');
+        const failures = (this.backfillFailures.get(nextDate) ?? 0) + 1;
+        this.backfillFailures.set(nextDate, failures);
+        if (this.pendingBackfill.delete(nextDate)) {
+          this.pendingBackfill.add(nextDate);
+        }
       }
-      this.pendingBackfill.delete(nextDate);
     }
 
-    if (this.stopped || epoch !== this.clearEpoch) return;
-    if (this.pendingBackfill.size === 0) {
+    if (this.isEpochStale(epoch)) {
+      this.clearPendingForEpoch(epoch);
+      return;
+    }
+    const upcoming = this.pickNextBackfillDate();
+    if (!upcoming) {
       const month = this.backfillCurrentMonth ?? this.calendar.monthKey(this.clock.wall());
       await this.enqueue(() => this.synthesizeAllCompletedMonths(month, epoch));
       return;
     }
-    this.scheduleBackfill(epoch, 5);
+    const failCount = this.backfillFailures.get(upcoming) ?? 0;
+    const delayMs = failCount > 0 ? Math.min(200, failCount * 40) : 5;
+    this.scheduleBackfill(epoch, delayMs);
   }
 
-  private async synthesizeAllCompletedMonths(currentMonth: string, epoch: number): Promise<void> {
-    if (!this.port || this.stopped || epoch !== this.clearEpoch) return;
+  private async synthesizeAllCompletedMonths(
+    currentMonth: string,
+    epoch: number,
+    cachedDailyDates?: string[],
+  ): Promise<void> {
+    if (!this.port || this.isEpochStale(epoch)) {
+      this.clearPendingForEpoch(epoch);
+      return;
+    }
     let rawDailyDates: string[];
-    try {
-      rawDailyDates = await this.port.listDailyDates();
-    } catch (error) {
-      const code = unsafeFsCode(error);
-      if (code) {
-        this.reportFileErrorOnce(`unsafe:daily-dir:${code}`, 'history-unsafe-entry', { dir: 'daily', code });
+    if (cachedDailyDates) {
+      rawDailyDates = cachedDailyDates;
+    } else {
+      try {
+        rawDailyDates = await this.port.listDailyDates();
+      } catch (error) {
+        if (this.isEpochStale(epoch)) {
+          this.clearPendingForEpoch(epoch);
+          return;
+        }
+        const code = unsafeFsCode(error);
+        if (code) {
+          this.reportFileErrorOnce(`unsafe:daily-dir:${code}`, 'history-unsafe-entry', { dir: 'daily', code });
+          return;
+        }
+        throw error;
+      }
+      if (this.isEpochStale(epoch)) {
+        this.clearPendingForEpoch(epoch);
         return;
       }
-      throw error;
     }
     const dailyDates = this.filterValidDates(rawDailyDates, 'daily').sort();
     const completedMonths = new Set<string>();
@@ -1204,14 +1385,26 @@ export class HistoryManager {
       }
     }
     for (const month of [...completedMonths].sort()) {
-      if (this.stopped || epoch !== this.clearEpoch) return;
+      if (this.isEpochStale(epoch)) {
+        this.clearPendingForEpoch(epoch);
+        return;
+      }
+      if (this.hasPendingBackfillForMonth(month)) continue;
       try {
         const existing = await this.port.readMonthly(month);
+        if (this.isEpochStale(epoch)) {
+          this.clearPendingForEpoch(epoch);
+          return;
+        }
         if (existing !== undefined) {
           if (parseMonthlySummary(existing)) continue;
           this.reportFileErrorOnce(`corrupt:monthly:${month}`, 'corrupt-monthly-summary', { month });
         }
       } catch (error) {
+        if (this.isEpochStale(epoch)) {
+          this.clearPendingForEpoch(epoch);
+          return;
+        }
         const code = unsafeFsCode(error);
         if (code) {
           this.reportFileErrorOnce(`unsafe:monthly:${month}:${code}`, 'history-unsafe-entry', {
@@ -1223,7 +1416,27 @@ export class HistoryManager {
         }
         throw error;
       }
-      await this.synthesizeMonthFromDaily(month, dailyDates, true, false);
+      await this.synthesizeMonthFromDaily(month, dailyDates, true, false, epoch);
+    }
+  }
+
+  private async persistMonthlySummary(month: string, monthly: MonthlySummary, epoch?: number): Promise<void> {
+    if (!this.port || (epoch !== undefined && this.isEpochStale(epoch))) return;
+    try {
+      await this.port.writeMonthly(month, JSON.stringify(monthly));
+      this.clearSummaryDegraded();
+    } catch (error) {
+      if (epoch !== undefined && this.isEpochStale(epoch)) return;
+      const code = unsafeFsCode(error);
+      if (code) {
+        this.reportFileErrorOnce(`unsafe:monthly:${month}:${code}`, 'history-unsafe-entry', {
+          kind: 'monthly',
+          month,
+          code,
+        });
+      } else {
+        this.reportSummaryWriteFailure(month, 'history-write-failed');
+      }
     }
   }
 
@@ -1232,8 +1445,9 @@ export class HistoryManager {
     cachedDates?: string[],
     persist = true,
     allowEmpty = false,
+    epoch?: number,
   ): Promise<MonthlySummary | undefined> {
-    if (!this.port) return undefined;
+    if (!this.port || (epoch !== undefined && this.isEpochStale(epoch))) return undefined;
     let sourceDates: string[];
     if (cachedDates) {
       sourceDates = cachedDates;
@@ -1249,12 +1463,15 @@ export class HistoryManager {
         throw error;
       }
     }
+    if (epoch !== undefined && this.isEpochStale(epoch)) return undefined;
     const dailyDates = sourceDates.filter((d) => d.startsWith(`${month}-`)).sort();
     if (dailyDates.length === 0 && !allowEmpty) return undefined;
     const dailies: DailySummary[] = [];
     for (const date of dailyDates) {
+      if (epoch !== undefined && this.isEpochStale(epoch)) return undefined;
       try {
         const raw = await this.port.readDaily(date);
+        if (epoch !== undefined && this.isEpochStale(epoch)) return undefined;
         if (raw === undefined) continue;
         const parsed = parseDailySummary(raw);
         if (parsed) {
@@ -1276,32 +1493,21 @@ export class HistoryManager {
       }
     }
     if (dailies.length === 0 && !allowEmpty) return undefined;
+    if (epoch !== undefined && this.isEpochStale(epoch)) return undefined;
     const monthly = synthesizeMonth(month, dailies, this.clock.wall());
     if (persist) {
-      try {
-        await this.port.writeMonthly(month, JSON.stringify(monthly));
-        this.clearSummaryDegraded();
-      } catch (error) {
-        const code = unsafeFsCode(error);
-        if (code) {
-          this.reportFileErrorOnce(`unsafe:monthly:${month}:${code}`, 'history-unsafe-entry', {
-            kind: 'monthly',
-            month,
-            code,
-          });
-        } else {
-          this.reportSummaryWriteFailure(month, 'history-write-failed');
-        }
-      }
+      await this.persistMonthlySummary(month, monthly, epoch);
     }
     return monthly;
   }
 
   private async pruneExpired(today: string, epoch: number): Promise<void> {
-    if (!this.port || epoch !== this.clearEpoch) return;
+    if (!this.port || this.isEpochStale(epoch)) return;
     try {
       const eventDates = this.filterValidDates(await this.port.listEventDates(), 'events');
+      if (this.isEpochStale(epoch)) return;
       for (const date of eventDates) {
+        if (this.isEpochStale(epoch)) return;
         if (diffDays(today, date) > HISTORY_RETENTION_DAYS) {
           try {
             await this.port.deleteEventDate(date);
@@ -1330,9 +1536,12 @@ export class HistoryManager {
         throw error;
       }
     }
+    if (this.isEpochStale(epoch)) return;
     try {
       const dailyDates = this.filterValidDates(await this.port.listDailyDates(), 'daily');
+      if (this.isEpochStale(epoch)) return;
       for (const date of dailyDates) {
+        if (this.isEpochStale(epoch)) return;
         if (diffDays(today, date) > DAILY_SUMMARY_RETENTION_DAYS) {
           try {
             await this.port.deleteDailyDate(date);
@@ -1450,6 +1659,16 @@ export class HistoryManager {
     if (!this.summaryDegraded) return;
     this.summaryDegraded = false;
     if (!this.appendDegraded) this.safeEmitSourceOk();
+    if (
+      this.pendingBackfill.size > 0 &&
+      this.pendingBackfillEpoch === this.clearEpoch &&
+      !this.stopped &&
+      !this.backfillTimer &&
+      !this.activeBackfillStep
+    ) {
+      this.backfillFailures.clear();
+      this.scheduleBackfill(this.clearEpoch, 50);
+    }
   }
 
   private reportFileErrorOnce(dedupKey: string, errorCode: string, extra?: Record<string, unknown>): void {

@@ -199,12 +199,57 @@ function addAppDuration(apps: Record<string, DailyAppStats>, app: string | undef
   entry.foregroundMs += ms;
 }
 
-function addDirStats(
+function adjustDeliveryCounts(
+  target: DailyDeliveryCounts,
+  wake: boolean,
+  context: boolean,
+  suppressed: boolean,
+  delta: 1 | -1,
+): void {
+  if (wake) target.wake += delta;
+  if (context) target.context += delta;
+  if (suppressed) target.suppressed += delta;
+}
+
+function levelToCode(level: DeliveryLevel): number {
+  return level === 'wake' ? 2 : level === 'context' ? 1 : 0;
+}
+
+function reasonToCode(reason: unknown): number {
+  if (reason === 'no-session') return 1;
+  if (reason === 'wake-budget' || reason === 'self-caused') return 2;
+  return 0;
+}
+
+function extractDirRaw(subject: string, detail: Record<string, unknown> | undefined): string {
+  if (typeof detail?.directory === 'string') return detail.directory;
+  if (typeof detail?.dir === 'string') return detail.dir;
+  return subject;
+}
+
+function adjustDirStats(
   target: Record<string, DailyDirectoryStats>,
   dir: string,
-  detail: Record<string, string | number | boolean> | undefined,
-  withExcessiveDeletion: boolean,
+  created: number,
+  modified: number,
+  deleted: number,
+  excessive: boolean,
+  delta: 1 | -1,
 ): void {
+  if (delta === -1) {
+    const existing = target[dir];
+    if (!existing) return;
+    existing.events -= 1;
+    existing.created -= created;
+    existing.modified -= modified;
+    existing.deleted -= deleted;
+    if (excessive && existing.externalDeletionExceeded !== undefined) {
+      existing.externalDeletionExceeded -= 1;
+      if (existing.externalDeletionExceeded <= 0) delete existing.externalDeletionExceeded;
+    }
+    if (existing.events <= 0) delete target[dir];
+    return;
+  }
   const entry = getOrInit<DailyDirectoryStats>(target, dir, () => ({
     events: 0,
     created: 0,
@@ -212,115 +257,101 @@ function addDirStats(
     deleted: 0,
   }));
   entry.events += 1;
-  entry.created += finiteCount(detail?.created);
-  entry.modified += finiteCount(detail?.modified);
-  entry.deleted += finiteCount(detail?.deleted);
-  if (withExcessiveDeletion && detail?.externalDeletionExceeded === true) {
+  entry.created += created;
+  entry.modified += modified;
+  entry.deleted += deleted;
+  if (excessive) {
     entry.externalDeletionExceeded = (entry.externalDeletionExceeded ?? 0) + 1;
   }
 }
 
-function bumpDelivery(target: DailyDeliveryCounts, wake: boolean, context: boolean, suppressed: boolean): void {
-  if (wake) target.wake += 1;
-  if (context) target.context += 1;
-  if (suppressed) target.suppressed += 1;
+function extractBodyMetric(
+  id: string,
+  kind: string,
+  subject: string,
+  detail: Record<string, unknown> | undefined,
+): { bodyType: 0 | 1 | 2; metric: string } | undefined {
+  const isRebaseline =
+    kind === 'body.anomaly' &&
+    (detail?.type === 'rebaseline-suggestion' || id.startsWith('rebaseline:') || subject.startsWith('rebaseline:'));
+  if (isRebaseline) return undefined;
+  const severity = detail?.severity;
+  if (severity !== 'warn' && severity !== 'critical') return undefined;
+  const bodyType: 0 | 1 | 2 = kind === 'body.threshold' ? 0 : kind === 'body.rate' ? 1 : 2;
+  const rawMetric = kind === 'body.threshold' ? subject : typeof detail?.metric === 'string' ? detail.metric : subject;
+  let metric = rawMetric;
+  if (rawMetric.startsWith('disk:')) {
+    metric = `disk:${sanitizeDirPath(rawMetric.slice(5))}`;
+  } else {
+    const diskIdx = rawMetric.indexOf(':disk:');
+    if (diskIdx >= 0) {
+      metric = `disk:${sanitizeDirPath(rawMetric.slice(diskIdx + 6))}`;
+    }
+  }
+  return { bodyType, metric };
 }
 
-export interface SummarizeDayOptions {
-  liveEndMs?: number;
-  isRunningAtEnd?: boolean;
-  truncatedAtLimit?: boolean;
-}
-
-export function summarizeDay(
-  date: string,
-  parsed: ParsedHistoryDay,
-  bounds: DayBounds,
-  options: SummarizeDayOptions = {},
-): DailySummary {
-  const { startMs, endMs, durationMs } = bounds;
-  const events = [...parsed.events].sort((a, b) => a.at - b.at);
-  const lifecycle = [...parsed.lifecycle].sort((a, b) => a.at - b.at);
-
-  const apps: Record<string, DailyAppStats> = Object.create(null) as Record<string, DailyAppStats>;
-  let appSwitches = 0;
-
+function createLifecycleMachine(bounds: DayBounds, options: SummarizeDayOptions, apps: Record<string, DailyAppStats>) {
+  const { startMs, endMs } = bounds;
+  let state: 'not-running' | 'active' | 'paused' = 'not-running';
+  let cursor = startMs;
+  let lastAlive = startMs;
+  let currentApp: string | undefined;
+  let appSince: number | undefined;
   let observedMs = 0;
   let pausedMs = 0;
   let notRunningMs = 0;
+  let appSwitches = 0;
 
-  const activations = events.filter((ev) => ev.kind === 'app.activated' && isNonEmptyString(ev.subject));
+  const advanceCoverage = (to: number) => {
+    const dt = Math.max(0, to - cursor);
+    if (state === 'active') observedMs += dt;
+    else if (state === 'paused') pausedMs += dt;
+    else notRunningMs += dt;
+    cursor = to;
+  };
 
-  if (lifecycle.length > 0) {
-    type TimelineItem =
-      | { order: 0; at: number; item: HistoryLifecycleRecord }
-      | { order: 1; at: number; item: PersistedEventEntry }
-      | { order: 2; at: number };
+  const closeCrashGap = (at: number) => {
+    if (state === 'not-running') return;
+    const aliveEnd = clamp(lastAlive, cursor, at);
+    advanceCoverage(aliveEnd);
+    if (state === 'active' && currentApp && appSince !== undefined) {
+      addAppDuration(apps, currentApp, aliveEnd - appSince);
+    }
+    state = 'not-running';
+    currentApp = undefined;
+    appSince = undefined;
+    advanceCoverage(at);
+  };
 
-    const timeline: TimelineItem[] = [
-      ...lifecycle.map((item): TimelineItem => ({ order: 0, at: clamp(item.at, startMs, endMs), item })),
-      ...activations.map((item): TimelineItem => ({ order: 1, at: clamp(item.at, startMs, endMs), item })),
-      ...events
-        .filter((ev) => ev.kind !== 'app.activated')
-        .map((ev): TimelineItem => ({ order: 2, at: clamp(ev.at, startMs, endMs) })),
-    ].sort((a, b) => a.at - b.at || a.order - b.order);
-
-    let state: 'not-running' | 'active' | 'paused' = 'not-running';
-    let cursor = startMs;
-    let lastAlive = startMs;
-    let currentApp: string | undefined;
-    let appSince: number | undefined;
-
-    const advanceCoverage = (to: number) => {
-      const dt = Math.max(0, to - cursor);
-      if (state === 'active') observedMs += dt;
-      else if (state === 'paused') pausedMs += dt;
-      else notRunningMs += dt;
-      cursor = to;
-    };
-
-    const closeCrashGap = (at: number) => {
-      if (state === 'not-running') return;
-      const aliveEnd = clamp(lastAlive, cursor, at);
-      advanceCoverage(aliveEnd);
-      if (state === 'active' && currentApp && appSince !== undefined) {
-        addAppDuration(apps, currentApp, aliveEnd - appSince);
-      }
-      state = 'not-running';
-      currentApp = undefined;
-      appSince = undefined;
+  return {
+    stepOther(rawAt: number): void {
+      const at = clamp(rawAt, startMs, endMs);
+      if (state !== 'not-running' && at > lastAlive) lastAlive = at;
+    },
+    stepActivation(rawAt: number, appName: string): void {
+      const at = clamp(rawAt, startMs, endMs);
       advanceCoverage(at);
-    };
-
-    for (const entry of timeline) {
-      const at = entry.at;
-      if (entry.order === 2) {
-        if (state !== 'not-running' && at > lastAlive) lastAlive = at;
-        continue;
+      if (at > lastAlive) lastAlive = at;
+      if (!appName) return;
+      const appStats = getOrInit(apps, appName, () => ({ foregroundMs: 0, switches: 0 }));
+      appStats.switches += 1;
+      appSwitches += 1;
+      if (state === 'active') {
+        if (currentApp && appSince !== undefined) {
+          addAppDuration(apps, currentApp, at - appSince);
+        }
+        appSince = at;
       }
-      if (entry.order === 0 && entry.item.boot && state !== 'not-running') {
+      currentApp = appName;
+    },
+    stepLifecycle(lc: HistoryLifecycleRecord): void {
+      const at = clamp(lc.at, startMs, endMs);
+      if (lc.boot && state !== 'not-running') {
         closeCrashGap(at);
       } else {
         advanceCoverage(at);
       }
-      if (entry.order === 1) {
-        if (at > lastAlive) lastAlive = at;
-        const appName = sanitizeAppName(entry.item.subject);
-        if (!appName) continue;
-        const appStats = getOrInit(apps, appName, () => ({ foregroundMs: 0, switches: 0 }));
-        appStats.switches += 1;
-        appSwitches += 1;
-        if (state === 'active') {
-          if (currentApp && appSince !== undefined) {
-            addAppDuration(apps, currentApp, at - appSince);
-          }
-          appSince = at;
-        }
-        currentApp = appName;
-        continue;
-      }
-
-      const lc = entry.item;
       if (lc.state === 'active') {
         if (state === 'active' && currentApp && appSince !== undefined) {
           addAppDuration(apps, currentApp, at - appSince);
@@ -366,20 +397,567 @@ export function summarizeDay(
           appSince = currentApp ? at : undefined;
         }
       }
-    }
-
-    if (state === 'not-running') {
-      notRunningMs += Math.max(0, endMs - cursor);
-    } else {
-      const activeEnd = options.isRunningAtEnd
-        ? clamp(options.liveEndMs ?? endMs, cursor, endMs)
-        : clamp(lastAlive, cursor, endMs);
-      advanceCoverage(activeEnd);
-      if (state === 'active' && currentApp && appSince !== undefined) {
-        addAppDuration(apps, currentApp, activeEnd - appSince);
+    },
+    finish(): { observedMs: number; pausedMs: number; notRunningMs: number; appSwitches: number } {
+      if (state === 'not-running') {
+        notRunningMs += Math.max(0, endMs - cursor);
+      } else {
+        const activeEnd = options.isRunningAtEnd
+          ? clamp(options.liveEndMs ?? endMs, cursor, endMs)
+          : clamp(lastAlive, cursor, endMs);
+        advanceCoverage(activeEnd);
+        if (state === 'active' && currentApp && appSince !== undefined) {
+          addAppDuration(apps, currentApp, activeEnd - appSince);
+        }
+        notRunningMs += Math.max(0, endMs - activeEnd);
       }
-      notRunningMs += Math.max(0, endMs - activeEnd);
+      return { observedMs, pausedMs, notRunningMs, appSwitches };
+    },
+  };
+}
+
+const LOW_PACK_RADIX = 16_777_216; // 2^24 fallback for ruleIdx >= 8 or slotIdx >= 1_048_576
+
+function packEventState(
+  levelCode: number,
+  reasonCode: number,
+  kindTag: number,
+  ruleIdx: number,
+  slotIdx: number,
+): number {
+  if (ruleIdx < 8 && slotIdx < 1_048_576) {
+    return (slotIdx << 10) | (ruleIdx << 7) | (kindTag << 4) | (reasonCode << 2) | levelCode;
+  }
+  const low = (ruleIdx << 7) | (kindTag << 4) | (reasonCode << 2) | levelCode;
+  return -(slotIdx * LOW_PACK_RADIX + low) - 1;
+}
+
+function unpackEventState(packed: number): {
+  levelCode: number;
+  reasonCode: number;
+  kindTag: number;
+  ruleIdx: number;
+  slotIdx: number;
+} {
+  if (packed >= 0) {
+    return {
+      levelCode: packed & 3,
+      reasonCode: (packed >>> 2) & 3,
+      kindTag: (packed >>> 4) & 7,
+      ruleIdx: (packed >>> 7) & 7,
+      slotIdx: packed >>> 10,
+    };
+  }
+  const raw = -packed - 1;
+  const low = raw % LOW_PACK_RADIX;
+  return {
+    levelCode: low & 3,
+    reasonCode: (low >>> 2) & 3,
+    kindTag: (low >>> 4) & 7,
+    ruleIdx: low >>> 7,
+    slotIdx: (raw - low) / LOW_PACK_RADIX,
+  };
+}
+
+export function createDailySummaryAccumulator(date: string, bounds: DayBounds, options: SummarizeDayOptions = {}) {
+  const { startMs, endMs, durationMs } = bounds;
+  const seenEvents = new Map<string, number>();
+  const lifecycle: HistoryLifecycleRecord[] = [];
+
+  const appNames: string[] = [''];
+  const appNameToIdx = new Map<string, number>([['', 0]]);
+  let actCap = 256;
+  let actCount = 0;
+  let actAt = new Float64Array(actCap);
+  let actApp = new Int32Array(actCap);
+
+  let otherCap = 256;
+  let otherCount = 0;
+  let otherAt = new Float64Array(otherCap);
+  const emptyActAts: number[] = [];
+
+  const ruleKeys: string[] = ['_none'];
+  const ruleKeyToIdx = new Map<string, number>([['_none', 0]]);
+
+  const deliveries: DailySummary['deliveries'] = {
+    wake: 0,
+    context: 0,
+    suppressed: 0,
+    byRule: Object.create(null) as Record<string, DailyDeliveryCounts>,
+  };
+  const fileBursts: Record<string, DailyDirectoryStats> = Object.create(null) as Record<string, DailyDirectoryStats>;
+  const fileActivity: Record<string, DailyDirectoryStats> = Object.create(null) as Record<string, DailyDirectoryStats>;
+  const bodyAnomalies: DailySummary['bodyAnomalies'] = {
+    total: 0,
+    threshold: 0,
+    rate: 0,
+    anomaly: 0,
+    byMetric: Object.create(null) as Record<string, number>,
+  };
+
+  const fileDirs: string[] = [];
+  const fileDirToIdx = new Map<string, number>();
+  const fileOtherIdx: number[] = [];
+  const fileDirIdx: number[] = [];
+  const fileCreated: number[] = [];
+  const fileModified: number[] = [];
+  const fileDeleted: number[] = [];
+  const fileFlags: number[] = [];
+
+  const bodyMetrics: string[] = [];
+  const bodyMetricToIdx = new Map<string, number>();
+  const bodyOtherIdx: number[] = [];
+  const bodyTypes: number[] = [];
+  const bodyMetricIds: number[] = [];
+
+  const applyDelivery = (levelCode: number, reasonCode: number, ruleIdx: number, delta: 1 | -1) => {
+    const suppressed = reasonCode !== 0;
+    const isWake = levelCode === 2 && reasonCode !== 1;
+    const isContext = levelCode === 1;
+    if (!isWake && !isContext && !suppressed) return;
+    adjustDeliveryCounts(deliveries, isWake, isContext, suppressed, delta);
+    const ruleKey = ruleKeys[ruleIdx] ?? '_none';
+    if (delta === -1) {
+      const ruleCounts = deliveries.byRule[ruleKey];
+      if (!ruleCounts) return;
+      adjustDeliveryCounts(ruleCounts, isWake, isContext, suppressed, -1);
+      if (ruleCounts.wake <= 0 && ruleCounts.context <= 0 && ruleCounts.suppressed <= 0) {
+        delete deliveries.byRule[ruleKey];
+      }
+      return;
     }
+    const ruleCounts = getOrInit(deliveries.byRule, ruleKey, () => ({ wake: 0, context: 0, suppressed: 0 }));
+    adjustDeliveryCounts(ruleCounts, isWake, isContext, suppressed, 1);
+  };
+
+  const pushActivation = (at: number, appName: string): number => {
+    let appIdx = appNameToIdx.get(appName);
+    if (appIdx === undefined) {
+      appIdx = appNames.length;
+      appNames.push(appName);
+      appNameToIdx.set(appName, appIdx);
+    }
+    if (actCount === actCap) {
+      actCap *= 2;
+      const nextAt = new Float64Array(actCap);
+      nextAt.set(actAt);
+      actAt = nextAt;
+      const nextApp = new Int32Array(actCap);
+      nextApp.set(actApp);
+      actApp = nextApp;
+    }
+    const idx = actCount++;
+    actAt[idx] = at;
+    actApp[idx] = appIdx;
+    return idx;
+  };
+
+  const pushOtherAt = (at: number): number => {
+    if (otherCount === otherCap) {
+      otherCap *= 2;
+      const nextAt = new Float64Array(otherCap);
+      nextAt.set(otherAt);
+      otherAt = nextAt;
+    }
+    const idx = otherCount++;
+    otherAt[idx] = at;
+    return idx;
+  };
+
+  const undoPrevious = (packed: number) => {
+    const { levelCode, reasonCode, kindTag, ruleIdx, slotIdx } = unpackEventState(packed);
+
+    applyDelivery(levelCode, reasonCode, ruleIdx, -1);
+    if (kindTag === 0) {
+      otherAt[slotIdx] = Number.NaN;
+    } else if (kindTag === 1) {
+      actApp[slotIdx] = -1;
+    } else if (kindTag === 2) {
+      emptyActAts[slotIdx] = Number.NaN;
+    } else if (kindTag === 3) {
+      otherAt[fileOtherIdx[slotIdx]] = Number.NaN;
+      const flags = fileFlags[slotIdx];
+      const target = (flags & 1) !== 0 ? fileBursts : fileActivity;
+      const dir = fileDirs[fileDirIdx[slotIdx]];
+      adjustDirStats(
+        target,
+        dir,
+        fileCreated[slotIdx],
+        fileModified[slotIdx],
+        fileDeleted[slotIdx],
+        (flags & 2) !== 0,
+        -1,
+      );
+    } else if (kindTag === 4) {
+      otherAt[bodyOtherIdx[slotIdx]] = Number.NaN;
+      const bType = bodyTypes[slotIdx];
+      bodyAnomalies.total -= 1;
+      if (bType === 0) bodyAnomalies.threshold -= 1;
+      else if (bType === 1) bodyAnomalies.rate -= 1;
+      else bodyAnomalies.anomaly -= 1;
+      const metricIdx = bodyMetricIds[slotIdx];
+      if (metricIdx >= 0) {
+        const metric = bodyMetrics[metricIdx];
+        const nextCount = (bodyAnomalies.byMetric[metric] ?? 0) - 1;
+        if (nextCount <= 0) delete bodyAnomalies.byMetric[metric];
+        else bodyAnomalies.byMetric[metric] = nextCount;
+      }
+    }
+  };
+
+  return {
+    feed(rawLine: string): void {
+      const line = rawLine.trim();
+      if (!line) return;
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(line);
+      } catch {
+        return;
+      }
+      if (!isRecordObject(parsed)) return;
+
+      if (parsed.record === 'lifecycle') {
+        if (
+          VALID_LIFECYCLE.has(parsed.state as HistoryLifecycleState) &&
+          typeof parsed.at === 'number' &&
+          Number.isFinite(parsed.at)
+        ) {
+          lifecycle.push({
+            record: 'lifecycle',
+            state: parsed.state as HistoryLifecycleState,
+            at: parsed.at,
+            ...(typeof parsed.paused === 'boolean' ? { paused: parsed.paused } : {}),
+            ...(typeof parsed.app === 'string' ? { app: parsed.app } : {}),
+            ...(typeof parsed.boot === 'boolean' ? { boot: parsed.boot } : {}),
+          });
+        }
+        return;
+      }
+
+      if (parsed.record === 'patch') {
+        if (typeof parsed.id !== 'string') return;
+        const packed = seenEvents.get(parsed.id);
+        if (packed === undefined) return;
+        const { levelCode: oldLevel, reasonCode: oldReason, kindTag, ruleIdx, slotIdx } = unpackEventState(packed);
+        const newLevel = VALID_LEVELS.has(parsed.level as DeliveryLevel)
+          ? levelToCode(parsed.level as DeliveryLevel)
+          : oldLevel;
+        const newReason = typeof parsed.reason === 'string' ? reasonToCode(parsed.reason) : oldReason;
+        if (newLevel === oldLevel && newReason === oldReason) return;
+        applyDelivery(oldLevel, oldReason, ruleIdx, -1);
+        applyDelivery(newLevel, newReason, ruleIdx, 1);
+        seenEvents.set(parsed.id, packEventState(newLevel, newReason, kindTag, ruleIdx, slotIdx));
+        return;
+      }
+
+      if (parsed.record !== 'event' && parsed.record !== undefined) return;
+      if (
+        typeof parsed.id !== 'string' ||
+        !parsed.id ||
+        typeof parsed.kind !== 'string' ||
+        !parsed.kind ||
+        typeof parsed.at !== 'number' ||
+        !Number.isFinite(parsed.at)
+      ) {
+        return;
+      }
+
+      const prevPacked = seenEvents.get(parsed.id);
+      if (prevPacked !== undefined) {
+        undoPrevious(prevPacked);
+      }
+
+      const id = parsed.id;
+      const kind = parsed.kind;
+      const at = parsed.at;
+      const subject = typeof parsed.subject === 'string' ? parsed.subject : '';
+      const level: DeliveryLevel = VALID_LEVELS.has(parsed.level as DeliveryLevel)
+        ? (parsed.level as DeliveryLevel)
+        : 'record';
+      const levelCode = levelToCode(level);
+      const reasonCode = typeof parsed.reason === 'string' ? reasonToCode(parsed.reason) : 0;
+      const ruleKey = isNonEmptyString(parsed.ruleId) ? parsed.ruleId : '_none';
+      let ruleIdx = ruleKeyToIdx.get(ruleKey);
+      if (ruleIdx === undefined) {
+        ruleIdx = ruleKeys.length;
+        ruleKeys.push(ruleKey);
+        ruleKeyToIdx.set(ruleKey, ruleIdx);
+      }
+
+      applyDelivery(levelCode, reasonCode, ruleIdx, 1);
+
+      let kindTag = 0;
+      let slotIdx = 0;
+
+      if (kind === 'app.activated') {
+        if (isNonEmptyString(subject)) {
+          kindTag = 1;
+          slotIdx = pushActivation(at, sanitizeAppName(subject));
+        } else {
+          kindTag = 2;
+          slotIdx = emptyActAts.length;
+          emptyActAts.push(at);
+        }
+      } else if (kind === 'file.burst' || kind === 'file.activity') {
+        const detail = isRecordObject(parsed.detail) ? parsed.detail : undefined;
+        const isBurst = kind === 'file.burst';
+        const dir = sanitizeDirPath(extractDirRaw(subject, detail));
+        const created = finiteCount(detail?.created);
+        const modified = finiteCount(detail?.modified);
+        const deleted = finiteCount(detail?.deleted);
+        const excessive = isBurst && detail?.externalDeletionExceeded === true;
+        adjustDirStats(isBurst ? fileBursts : fileActivity, dir, created, modified, deleted, excessive, 1);
+
+        let dIdx = fileDirToIdx.get(dir);
+        if (dIdx === undefined) {
+          dIdx = fileDirs.length;
+          fileDirs.push(dir);
+          fileDirToIdx.set(dir, dIdx);
+        }
+        kindTag = 3;
+        slotIdx = fileOtherIdx.length;
+        fileOtherIdx.push(pushOtherAt(at));
+        fileDirIdx.push(dIdx);
+        fileCreated.push(created);
+        fileModified.push(modified);
+        fileDeleted.push(deleted);
+        fileFlags.push((isBurst ? 1 : 0) | (excessive ? 2 : 0));
+      } else if (kind === 'body.threshold' || kind === 'body.rate' || kind === 'body.anomaly') {
+        const detail = isRecordObject(parsed.detail) ? parsed.detail : undefined;
+        const bodyInfo = extractBodyMetric(id, kind, subject, detail);
+        if (bodyInfo) {
+          bodyAnomalies.total += 1;
+          if (bodyInfo.bodyType === 0) bodyAnomalies.threshold += 1;
+          else if (bodyInfo.bodyType === 1) bodyAnomalies.rate += 1;
+          else bodyAnomalies.anomaly += 1;
+          let mIdx = -1;
+          if (bodyInfo.metric) {
+            bodyAnomalies.byMetric[bodyInfo.metric] = (bodyAnomalies.byMetric[bodyInfo.metric] ?? 0) + 1;
+            mIdx = bodyMetricToIdx.get(bodyInfo.metric) ?? -1;
+            if (mIdx < 0) {
+              mIdx = bodyMetrics.length;
+              bodyMetrics.push(bodyInfo.metric);
+              bodyMetricToIdx.set(bodyInfo.metric, mIdx);
+            }
+          }
+          kindTag = 4;
+          slotIdx = bodyOtherIdx.length;
+          bodyOtherIdx.push(pushOtherAt(at));
+          bodyTypes.push(bodyInfo.bodyType);
+          bodyMetricIds.push(mIdx);
+        } else {
+          kindTag = 0;
+          slotIdx = pushOtherAt(at);
+        }
+      } else {
+        kindTag = 0;
+        slotIdx = pushOtherAt(at);
+      }
+
+      seenEvents.set(id, packEventState(levelCode, reasonCode, kindTag, ruleIdx, slotIdx));
+    },
+
+    finish(): DailySummary {
+      const totalEvents = seenEvents.size;
+      const apps: Record<string, DailyAppStats> = Object.create(null) as Record<string, DailyAppStats>;
+      let appSwitches = 0;
+      let observedMs = 0;
+      let pausedMs = 0;
+      let notRunningMs = 0;
+
+      // Build ordered activation index array
+      let actValid = 0;
+      let actSorted = true;
+      let prevActAt = Number.NEGATIVE_INFINITY;
+      for (let i = 0; i < actCount; i++) {
+        if (actApp[i] !== -1) {
+          actValid++;
+          const t = actAt[i];
+          if (t < prevActAt) actSorted = false;
+          prevActAt = t;
+        }
+      }
+      const actIndices = new Int32Array(actValid);
+      for (let i = 0, p = 0; i < actCount; i++) {
+        if (actApp[i] !== -1) actIndices[p++] = i;
+      }
+      if (!actSorted && actValid > 1) {
+        actIndices.sort((a, b) => actAt[a] - actAt[b] || a - b);
+      }
+
+      if (lifecycle.length > 0) {
+        lifecycle.sort((a, b) => a.at - b.at);
+
+        let otherValid = 0;
+        let otherSorted = true;
+        let prevOtherAt = Number.NEGATIVE_INFINITY;
+        for (let i = 0; i < otherCount; i++) {
+          const t = otherAt[i];
+          if (!Number.isNaN(t)) {
+            otherValid++;
+            if (t < prevOtherAt) otherSorted = false;
+            prevOtherAt = t;
+          }
+        }
+        const otherSortedArr = new Float64Array(otherValid);
+        for (let i = 0, p = 0; i < otherCount; i++) {
+          const t = otherAt[i];
+          if (!Number.isNaN(t)) otherSortedArr[p++] = t;
+        }
+        if (!otherSorted && otherValid > 1) {
+          otherSortedArr.sort();
+        }
+
+        const machine = createLifecycleMachine(bounds, options, apps);
+        let lcPtr = 0;
+        let actPtr = 0;
+        let otherPtr = 0;
+        while (lcPtr < lifecycle.length || actPtr < actValid || otherPtr < otherValid) {
+          const lcTime = lcPtr < lifecycle.length ? clamp(lifecycle[lcPtr].at, startMs, endMs) : Infinity;
+          const actTime = actPtr < actValid ? clamp(actAt[actIndices[actPtr]], startMs, endMs) : Infinity;
+          const otherTime = otherPtr < otherValid ? clamp(otherSortedArr[otherPtr], startMs, endMs) : Infinity;
+          if (lcTime <= actTime && lcTime <= otherTime) {
+            machine.stepLifecycle(lifecycle[lcPtr++]);
+          } else if (actTime <= otherTime) {
+            const idx = actIndices[actPtr++];
+            machine.stepActivation(actAt[idx], appNames[actApp[idx]]);
+          } else {
+            machine.stepOther(otherSortedArr[otherPtr++]);
+          }
+        }
+        const cov = machine.finish();
+        observedMs = cov.observedMs;
+        pausedMs = cov.pausedMs;
+        notRunningMs = cov.notRunningMs;
+        appSwitches = cov.appSwitches;
+      } else if (totalEvents > 0) {
+        let minAt = Number.POSITIVE_INFINITY;
+        let maxAt = Number.NEGATIVE_INFINITY;
+        for (let i = 0; i < actValid; i++) {
+          const t = actAt[actIndices[i]];
+          if (t < minAt) minAt = t;
+          if (t > maxAt) maxAt = t;
+        }
+        for (let i = 0; i < otherCount; i++) {
+          const t = otherAt[i];
+          if (!Number.isNaN(t)) {
+            if (t < minAt) minAt = t;
+            if (t > maxAt) maxAt = t;
+          }
+        }
+        for (let i = 0; i < emptyActAts.length; i++) {
+          const t = emptyActAts[i];
+          if (!Number.isNaN(t)) {
+            if (t < minAt) minAt = t;
+            if (t > maxAt) maxAt = t;
+          }
+        }
+        const firstAt = clamp(minAt, startMs, endMs);
+        const lastAt = clamp(maxAt, startMs, endMs);
+        let currentApp: string | undefined;
+        let appSince: number | undefined;
+        for (let i = 0; i < actValid; i++) {
+          const idx = actIndices[i];
+          const appName = appNames[actApp[idx]];
+          if (!appName) continue;
+          const at = clamp(actAt[idx], startMs, endMs);
+          const appStats = getOrInit(apps, appName, () => ({ foregroundMs: 0, switches: 0 }));
+          appStats.switches += 1;
+          appSwitches += 1;
+          if (currentApp && appSince !== undefined) {
+            addAppDuration(apps, currentApp, at - appSince);
+          }
+          currentApp = appName;
+          appSince = at;
+        }
+        if (currentApp && appSince !== undefined) {
+          addAppDuration(apps, currentApp, Math.max(0, lastAt - appSince));
+        }
+        observedMs = Math.max(0, lastAt - firstAt);
+        notRunningMs = Math.max(0, durationMs - observedMs);
+      } else {
+        notRunningMs = durationMs;
+      }
+
+      // Release large temporary containers promptly for GC.
+      seenEvents.clear();
+      lifecycle.length = 0;
+      emptyActAts.length = 0;
+      actAt = new Float64Array(0);
+      actApp = new Int32Array(0);
+      otherAt = new Float64Array(0);
+
+      return {
+        version: 1,
+        date,
+        dayStartMs: startMs,
+        dayEndMs: endMs,
+        dayDurationMs: durationMs,
+        apps,
+        appSwitches,
+        deliveries,
+        fileBursts,
+        fileActivity,
+        bodyAnomalies,
+        coverage: { observedMs, pausedMs, notRunningMs },
+        totalEvents,
+        ...(options.truncatedAtLimit ? { truncatedAtLimit: true } : {}),
+      };
+    },
+  };
+}
+
+export interface SummarizeDayOptions {
+  liveEndMs?: number;
+  isRunningAtEnd?: boolean;
+  truncatedAtLimit?: boolean;
+}
+
+export function summarizeDay(
+  date: string,
+  parsed: ParsedHistoryDay,
+  bounds: DayBounds,
+  options: SummarizeDayOptions = {},
+): DailySummary {
+  const { startMs, endMs, durationMs } = bounds;
+  const events = [...parsed.events].sort((a, b) => a.at - b.at);
+  const lifecycle = [...parsed.lifecycle].sort((a, b) => a.at - b.at);
+
+  const apps: Record<string, DailyAppStats> = Object.create(null) as Record<string, DailyAppStats>;
+  let appSwitches = 0;
+
+  let observedMs = 0;
+  let pausedMs = 0;
+  let notRunningMs = 0;
+
+  const activations = events.filter((ev) => ev.kind === 'app.activated' && isNonEmptyString(ev.subject));
+
+  if (lifecycle.length > 0) {
+    type TimelineItem =
+      | { order: 0; at: number; item: HistoryLifecycleRecord }
+      | { order: 1; at: number; item: PersistedEventEntry }
+      | { order: 2; at: number };
+
+    const timeline: TimelineItem[] = [
+      ...lifecycle.map((item): TimelineItem => ({ order: 0, at: clamp(item.at, startMs, endMs), item })),
+      ...activations.map((item): TimelineItem => ({ order: 1, at: clamp(item.at, startMs, endMs), item })),
+      ...events
+        .filter((ev) => ev.kind !== 'app.activated')
+        .map((ev): TimelineItem => ({ order: 2, at: clamp(ev.at, startMs, endMs) })),
+    ].sort((a, b) => a.at - b.at || a.order - b.order);
+
+    const machine = createLifecycleMachine(bounds, options, apps);
+    for (const entry of timeline) {
+      if (entry.order === 0) machine.stepLifecycle(entry.item);
+      else if (entry.order === 1) machine.stepActivation(entry.item.at, sanitizeAppName(entry.item.subject));
+      else machine.stepOther(entry.at);
+    }
+    const cov = machine.finish();
+    observedMs = cov.observedMs;
+    pausedMs = cov.pausedMs;
+    notRunningMs = cov.notRunningMs;
+    appSwitches = cov.appSwitches;
   } else if (events.length > 0) {
     const firstAt = clamp(events[0].at, startMs, endMs);
     const lastAt = clamp(events[events.length - 1].at, startMs, endMs);
@@ -428,58 +1006,34 @@ export function summarizeDay(
     const isWake = ev.level === 'wake' && ev.reason !== 'no-session';
     const isContext = ev.level === 'context';
     if (isWake || isContext || suppressed) {
-      bumpDelivery(deliveries, isWake, isContext, suppressed);
+      adjustDeliveryCounts(deliveries, isWake, isContext, suppressed, 1);
       const ruleKey = isNonEmptyString(ev.ruleId) ? ev.ruleId : '_none';
       const ruleCounts = getOrInit(deliveries.byRule, ruleKey, () => ({ wake: 0, context: 0, suppressed: 0 }));
-      bumpDelivery(ruleCounts, isWake, isContext, suppressed);
+      adjustDeliveryCounts(ruleCounts, isWake, isContext, suppressed, 1);
     }
 
-    if (ev.kind === 'file.burst') {
-      const rawDir =
-        typeof ev.detail?.directory === 'string'
-          ? ev.detail.directory
-          : typeof ev.detail?.dir === 'string'
-            ? ev.detail.dir
-            : ev.subject;
-      addDirStats(fileBursts, sanitizeDirPath(rawDir), ev.detail, true);
-    } else if (ev.kind === 'file.activity') {
-      const rawDir =
-        typeof ev.detail?.directory === 'string'
-          ? ev.detail.directory
-          : typeof ev.detail?.dir === 'string'
-            ? ev.detail.dir
-            : ev.subject;
-      addDirStats(fileActivity, sanitizeDirPath(rawDir), ev.detail, false);
+    if (ev.kind === 'file.burst' || ev.kind === 'file.activity') {
+      const isBurst = ev.kind === 'file.burst';
+      const rawDir = extractDirRaw(ev.subject, ev.detail);
+      adjustDirStats(
+        isBurst ? fileBursts : fileActivity,
+        sanitizeDirPath(rawDir),
+        finiteCount(ev.detail?.created),
+        finiteCount(ev.detail?.modified),
+        finiteCount(ev.detail?.deleted),
+        isBurst && ev.detail?.externalDeletionExceeded === true,
+        1,
+      );
     } else if (ev.kind === 'body.threshold' || ev.kind === 'body.rate' || ev.kind === 'body.anomaly') {
-      const isRebaseline =
-        ev.kind === 'body.anomaly' &&
-        (ev.detail?.type === 'rebaseline-suggestion' ||
-          ev.id.startsWith('rebaseline:') ||
-          ev.subject.startsWith('rebaseline:'));
-      if (isRebaseline) continue;
-      const severity = ev.detail?.severity;
-      if (severity !== 'warn' && severity !== 'critical') continue;
+      const bodyInfo = extractBodyMetric(ev.id, ev.kind, ev.subject, ev.detail);
+      if (!bodyInfo) continue;
       bodyAnomalies.total += 1;
-      if (ev.kind === 'body.threshold') bodyAnomalies.threshold += 1;
-      else if (ev.kind === 'body.rate') bodyAnomalies.rate += 1;
+      if (bodyInfo.bodyType === 0) bodyAnomalies.threshold += 1;
+      else if (bodyInfo.bodyType === 1) bodyAnomalies.rate += 1;
       else bodyAnomalies.anomaly += 1;
-
-      const rawMetric =
-        ev.kind === 'body.threshold'
-          ? ev.subject
-          : typeof ev.detail?.metric === 'string'
-            ? ev.detail.metric
-            : ev.subject;
-      let metric = rawMetric;
-      if (rawMetric.startsWith('disk:')) {
-        metric = `disk:${sanitizeDirPath(rawMetric.slice(5))}`;
-      } else {
-        const diskIdx = rawMetric.indexOf(':disk:');
-        if (diskIdx >= 0) {
-          metric = `disk:${sanitizeDirPath(rawMetric.slice(diskIdx + 6))}`;
-        }
+      if (bodyInfo.metric) {
+        bodyAnomalies.byMetric[bodyInfo.metric] = (bodyAnomalies.byMetric[bodyInfo.metric] ?? 0) + 1;
       }
-      if (metric) bodyAnomalies.byMetric[metric] = (bodyAnomalies.byMetric[metric] ?? 0) + 1;
     }
   }
 

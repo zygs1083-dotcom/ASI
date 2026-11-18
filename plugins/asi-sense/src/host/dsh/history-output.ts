@@ -92,49 +92,325 @@ function projectMetric(value: string): string {
   return safeIdentifier(value);
 }
 
-function extractExecutableToken(raw: string): string | undefined {
+const COMMAND_BASENAME_RE = /^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$/;
+const VERSIONED_COMMAND_RE = /^[A-Za-z][A-Za-z0-9_+-]*\d+(?:\.\d+){1,2}$/;
+const EXECUTABLE_EXTENSIONS = new Set([
+  'sh',
+  'bash',
+  'zsh',
+  'fish',
+  'ksh',
+  'csh',
+  'dash',
+  'py',
+  'pyw',
+  'rb',
+  'pl',
+  'pm',
+  'php',
+  'lua',
+  'tcl',
+  'js',
+  'mjs',
+  'cjs',
+  'ts',
+  'mts',
+  'cts',
+  'jsx',
+  'tsx',
+  'exe',
+  'bat',
+  'cmd',
+  'ps1',
+  'psm1',
+  'vbs',
+  'wsf',
+  'bin',
+  'out',
+  'run',
+  'jar',
+  'awk',
+  'expect',
+  'scpt',
+  'applescript',
+]);
+const PARTIAL_SUMMARY_NOTE =
+  'Monthly summary is partial because daily backfill for some days is still pending or failed; retry later for complete data.';
+
+interface WrapperSpec {
+  noArgFlags: Set<string>;
+  argFlags: Set<string>;
+  consumesDurationPositional?: boolean;
+  allowsNumericDash?: boolean;
+}
+
+const WRAPPER_SPECS: Record<string, WrapperSpec> = {
+  env: {
+    noArgFlags: new Set(['i', '0', 'v', '--ignore-environment', '--null', '--debug', '--help', '--version']),
+    argFlags: new Set([
+      'u',
+      'C',
+      'S',
+      'P',
+      '--unset',
+      '--chdir',
+      '--split-string',
+      '--default-signal',
+      '--ignore-signal',
+      '--block-signal',
+    ]),
+  },
+  sudo: {
+    noArgFlags: new Set([
+      'A',
+      'b',
+      'E',
+      'H',
+      'i',
+      'K',
+      'k',
+      'l',
+      'n',
+      'P',
+      'S',
+      's',
+      'v',
+      'V',
+      '--askpass',
+      '--background',
+      '--bell',
+      '--edit',
+      '--help',
+      '--interactive',
+      '--kill',
+      '--list',
+      '--login',
+      '--non-interactive',
+      '--preserve-env',
+      '--remove-timestamp',
+      '--reset-timestamp',
+      '--shell',
+      '--stdin',
+      '--validate',
+      '--version',
+    ]),
+    argFlags: new Set([
+      'a',
+      'C',
+      'c',
+      'D',
+      'g',
+      'h',
+      'p',
+      'R',
+      'r',
+      't',
+      'T',
+      'U',
+      'u',
+      '--auth-type',
+      '--chdir',
+      '--chroot',
+      '--close-from',
+      '--command-timeout',
+      '--group',
+      '--host',
+      '--other-user',
+      '--preserve-env',
+      '--prompt',
+      '--role',
+      '--type',
+      '--user',
+    ]),
+  },
+  nohup: {
+    noArgFlags: new Set(['--help', '--version']),
+    argFlags: new Set(),
+  },
+  exec: {
+    noArgFlags: new Set(['c', 'l']),
+    argFlags: new Set(['a']),
+  },
+  time: {
+    noArgFlags: new Set(['p', 'l', 'h', 'v', 'q', 'a', 'P', '--verbose', '--quiet', '--append', '--portability']),
+    argFlags: new Set(['f', 'o', '--format', '--output']),
+  },
+  command: {
+    noArgFlags: new Set(['p', 'v', 'V']),
+    argFlags: new Set(),
+  },
+  nice: {
+    noArgFlags: new Set(['--help', '--version']),
+    argFlags: new Set(['n', '--adjustment']),
+    allowsNumericDash: true,
+  },
+  timeout: {
+    noArgFlags: new Set(['v', '--preserve-status', '--foreground', '--verbose', '--help', '--version']),
+    argFlags: new Set(['k', 's', '--kill-after', '--signal']),
+    consumesDurationPositional: true,
+  },
+  stdbuf: {
+    noArgFlags: new Set(['--help', '--version']),
+    argFlags: new Set(['i', 'o', 'e', '--input', '--output', '--error']),
+  },
+};
+
+interface CommandToken {
+  value: string;
+  isEnvAssign: boolean;
+}
+
+function tokenizeCommandPrefix(raw: string): CommandToken[] {
+  const tokens: CommandToken[] = [];
   let i = 0;
   const len = raw.length;
-  while (i < len) {
+  while (i < len && tokens.length < 128) {
     while (i < len && /\s/.test(raw[i])) i++;
-    if (i >= len) return undefined;
-    let token = '';
-    let wasQuoted = false;
+    if (i >= len) break;
+    let value = '';
+    let sawQuoteOrEscapeBeforeEq = false;
+    let eqAt = -1;
+    const windowsDrive = /^[A-Za-z]:\\/.test(raw.slice(i));
     while (i < len && !/\s/.test(raw[i])) {
       const ch = raw[i];
       if (ch === '"' || ch === "'") {
-        wasQuoted = true;
+        if (eqAt < 0) sawQuoteOrEscapeBeforeEq = true;
         const quote = ch;
         i++;
         while (i < len && raw[i] !== quote) {
           if (raw[i] === '\\' && quote === '"' && i + 1 < len && (raw[i + 1] === '"' || raw[i + 1] === '\\')) {
             i++;
           }
-          token += raw[i++];
+          value += raw[i++];
         }
         if (i < len && raw[i] === quote) i++;
+      } else if (ch === '\\' && !windowsDrive) {
+        if (eqAt < 0) sawQuoteOrEscapeBeforeEq = true;
+        i++;
+        if (i < len) value += raw[i++];
       } else {
-        token += ch;
+        if (ch === '=' && eqAt < 0) eqAt = value.length;
+        value += ch;
         i++;
       }
     }
-    if (!wasQuoted && /^[A-Za-z_][A-Za-z0-9_]*=/.test(token)) {
+    const isEnvAssign = eqAt > 0 && !sawQuoteOrEscapeBeforeEq && /^[A-Za-z_][A-Za-z0-9_]*$/.test(value.slice(0, eqAt));
+    tokens.push({ value, isEnvAssign });
+  }
+  return tokens;
+}
+
+function wrapperNameForToken(token: string): string | undefined {
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(token)) return undefined;
+  const normalized = token.replaceAll('\\', '/').replace(/\/+$/, '');
+  const base = path.posix.basename(normalized);
+  return Object.hasOwn(WRAPPER_SPECS, base) ? base : undefined;
+}
+
+function consumeWrapperOptions(
+  tokens: readonly CommandToken[],
+  startIndex: number,
+  spec: WrapperSpec,
+): number | undefined {
+  let idx = startIndex;
+  while (idx < tokens.length) {
+    const tok = tokens[idx];
+    if (tok.isEnvAssign) return idx;
+    const v = tok.value;
+    if (v === '--') {
+      idx++;
+      break;
+    }
+    if (!v.startsWith('-') || v === '-') {
+      break;
+    }
+    if (spec.allowsNumericDash && /^-\d+$/.test(v)) {
+      idx++;
       continue;
     }
-    return token;
+    if (v.startsWith('--')) {
+      const eq = v.indexOf('=');
+      if (eq >= 0) {
+        const flag = v.slice(0, eq);
+        if (!spec.argFlags.has(flag) && !spec.noArgFlags.has(flag)) return undefined;
+        idx++;
+        continue;
+      }
+      if (spec.argFlags.has(v)) {
+        idx += 2;
+        if (idx > tokens.length) return undefined;
+        continue;
+      }
+      if (spec.noArgFlags.has(v)) {
+        idx++;
+        continue;
+      }
+      return undefined;
+    }
+    // Short options cluster (e.g. -iu VAR, -uVAR)
+    let nextIdx = idx + 1;
+    for (let k = 1; k < v.length; k++) {
+      const flag = v[k];
+      if (spec.argFlags.has(flag)) {
+        if (k + 1 >= v.length) {
+          if (idx + 1 >= tokens.length) return undefined;
+          nextIdx = idx + 2;
+        }
+        break;
+      }
+      if (!spec.noArgFlags.has(flag)) return undefined;
+    }
+    idx = nextIdx;
+  }
+  if (spec.consumesDurationPositional) {
+    if (idx >= tokens.length || tokens[idx].isEnvAssign) return undefined;
+    idx++;
+  }
+  return idx < tokens.length ? idx : undefined;
+}
+
+function extractExecutableToken(raw: string): string | undefined {
+  const tokens = tokenizeCommandPrefix(raw);
+  let idx = 0;
+  while (idx < tokens.length) {
+    const tok = tokens[idx];
+    if (tok.isEnvAssign) {
+      idx++;
+      continue;
+    }
+    const wrapperName = wrapperNameForToken(tok.value);
+    if (wrapperName) {
+      if (idx + 1 >= tokens.length) return tok.value;
+      const nextIdx = consumeWrapperOptions(tokens, idx + 1, WRAPPER_SPECS[wrapperName]);
+      if (nextIdx === undefined) return undefined;
+      idx = nextIdx;
+      continue;
+    }
+    return tok.value;
   }
   return undefined;
+}
+
+function isSafeCommandBasename(base: string): boolean {
+  if (!COMMAND_BASENAME_RE.test(base)) return false;
+  if (!/[A-Za-z]/.test(base)) return false;
+  if (!base.includes('.')) return true;
+  if (VERSIONED_COMMAND_RE.test(base)) return true;
+  const parts = base.split('.');
+  if (parts.length !== 2 || !parts[0]) return false;
+  return EXECUTABLE_EXTENSIONS.has(parts[1].toLowerCase());
 }
 
 function projectCommandSubject(subject: string): string {
   const trimmed = subject.trim();
   if (!trimmed) return '';
   const token = extractExecutableToken(trimmed);
-  if (!token) return '[redacted]';
-  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(token)) return '[redacted]';
+  if (!token) return '[command]';
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(token)) return '[command]';
+  if (token.includes(':') && !/^[A-Za-z]:[/\\]/.test(token)) return '[command]';
   const normalized = token.replaceAll('\\', '/').replace(/\/+$/, '');
   const base = path.posix.basename(normalized);
-  if (!base) return '[path]';
+  if (!base || !isSafeCommandBasename(base)) return '[command]';
   return modelTitle(base);
 }
 
@@ -191,9 +467,23 @@ function projectDetail(
   return out;
 }
 
+function projectAppSubject(value: string): string {
+  const cleaned = modelAppName(value);
+  if (
+    /^(?:~?[/\\]|[A-Za-z]:[/\\])/.test(cleaned) ||
+    /[/\\].*[/\\]/.test(cleaned) ||
+    /[/\\][^/\\]+\.app$/i.test(cleaned)
+  ) {
+    const normalized = cleaned.replaceAll('\\', '/').replace(/\/+$/, '');
+    const base = path.posix.basename(normalized);
+    if (base) return modelAppName(base);
+  }
+  return cleaned;
+}
+
 function projectSubject(entry: PersistedEventEntry): string {
   if (entry.kind.startsWith('app.') || entry.kind.startsWith('window')) {
-    return modelAppName(entry.subject);
+    return projectAppSubject(entry.subject);
   }
   if (entry.kind.startsWith('file.')) {
     return projectPathBase(entry.subject);
@@ -314,34 +604,198 @@ export function modelHistory(result: HistoryQueryResult): JsonValue {
   }
 }
 
+function isAvailableResult(value: JsonValue): boolean {
+  return value !== null && typeof value === 'object' && !Array.isArray(value) && Object.hasOwn(value, 'available');
+}
+
+function sliceRecord<V>(entries: ReadonlyArray<[string, V]>, count: number): Record<string, V> {
+  const out: Record<string, V> = Object.create(null);
+  for (let i = 0; i < count && i < entries.length; i++) {
+    const [k, v] = entries[i];
+    out[k] = v;
+  }
+  return out;
+}
+
+function fitTopEntries<V>(
+  sortedEntries: ReadonlyArray<[string, V]>,
+  render: (subset: Record<string, V>, truncated: boolean) => JsonValue,
+): { out: JsonValue; truncated: boolean } | undefined {
+  const full = render(sliceRecord(sortedEntries, sortedEntries.length), false);
+  if (isAvailableResult(full)) {
+    return { out: full, truncated: false };
+  }
+  let lo = 0;
+  let hi = sortedEntries.length - 1;
+  let bestOut: JsonValue | undefined;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    const candidate = render(sliceRecord(sortedEntries, mid), true);
+    if (isAvailableResult(candidate)) {
+      bestOut = candidate;
+      lo = mid + 1;
+    } else {
+      hi = mid - 1;
+    }
+  }
+  if (bestOut === undefined) return undefined;
+  return { out: bestOut, truncated: true };
+}
+
+function sortDirEntries(record: Record<string, DailyDirectoryStats>): Array<[string, DailyDirectoryStats]> {
+  return Object.entries(record).sort(
+    ([ak, a], [bk, b]) =>
+      b.events - a.events ||
+      b.created + b.modified + b.deleted - (a.created + a.modified + a.deleted) ||
+      ak.localeCompare(bk),
+  );
+}
+
 export function modelSummary(result: SummaryQueryResult): JsonValue {
   if (!result.available) return modelOutput(result);
   const s = result.summary;
-  const partial = result.partial || s.partial;
-  return modelOutput({
-    available: true,
-    ...(partial ? { partial: true } : {}),
-    summary: {
-      ...s,
-      ...(partial ? { partial: true } : {}),
-      apps: projectRecord(s.apps, modelAppName, (a, b) => ({
-        foregroundMs: a.foregroundMs + b.foregroundMs,
-        switches: a.switches + b.switches,
-      })),
-      deliveries: {
-        ...s.deliveries,
-        byRule: projectRecord(s.deliveries.byRule, safeIdentifier, (a, b) => ({
-          wake: a.wake + b.wake,
-          context: a.context + b.context,
-          suppressed: a.suppressed + b.suppressed,
-        })),
-      },
-      fileBursts: projectRecord(s.fileBursts, projectPathBase, mergeDirStats),
-      fileActivity: projectRecord(s.fileActivity, projectPathBase, mergeDirStats),
-      bodyAnomalies: {
-        ...s.bodyAnomalies,
-        byMetric: projectRecord(s.bodyAnomalies.byMetric, projectMetric, (a, b) => a + b),
-      },
+  const partial = Boolean(result.partial || s.partial);
+  const pendingDays = partial ? (result.pendingDays ?? []).filter((d) => /^\d{4}-\d{2}-\d{2}$/.test(d)) : undefined;
+  const partialNote = partial ? (result.note ?? PARTIAL_SUMMARY_NOTE) : undefined;
+
+  const apps = projectRecord(s.apps, projectAppSubject, (a, b) => ({
+    foregroundMs: a.foregroundMs + b.foregroundMs,
+    switches: a.switches + b.switches,
+  }));
+  const byRule = projectRecord(s.deliveries.byRule, safeIdentifier, (a, b) => ({
+    wake: a.wake + b.wake,
+    context: a.context + b.context,
+    suppressed: a.suppressed + b.suppressed,
+  }));
+  const fileBursts = projectRecord(s.fileBursts, projectPathBase, mergeDirStats);
+  const fileActivity = projectRecord(s.fileActivity, projectPathBase, mergeDirStats);
+  const byMetric = projectRecord(s.bodyAnomalies.byMetric, projectMetric, (a, b) => a + b);
+
+  const buildPayload = (
+    fa: Record<string, DailyDirectoryStats>,
+    faTruncated: boolean,
+    overrides?: {
+      apps?: Record<string, (typeof s.apps)[string]>;
+      byRule?: Record<string, (typeof s.deliveries.byRule)[string]>;
+      fileBursts?: Record<string, DailyDirectoryStats>;
+      byMetric?: Record<string, number>;
+      extraTruncated?: boolean;
     },
-  });
+  ) => {
+    const notes: string[] = [];
+    if (partialNote) notes.push(partialNote);
+    if (faTruncated) {
+      notes.push('fileActivity was truncated to fit the output size limit; top active directories are shown.');
+    }
+    if (overrides?.extraTruncated) {
+      notes.push('Additional summary breakdown maps were truncated to fit the output size limit.');
+    }
+    const note = notes.length > 0 ? notes.join(' ') : undefined;
+    return {
+      available: true,
+      ...(partial ? { partial: true } : {}),
+      ...(pendingDays && pendingDays.length > 0 ? { pendingDays } : {}),
+      ...(faTruncated ? { fileActivityTruncated: true } : {}),
+      ...(note ? { note } : {}),
+      summary: {
+        ...s,
+        ...(partial ? { partial: true } : {}),
+        apps: overrides?.apps ?? apps,
+        deliveries: {
+          ...s.deliveries,
+          byRule: overrides?.byRule ?? byRule,
+        },
+        fileBursts: overrides?.fileBursts ?? fileBursts,
+        fileActivity: fa,
+        bodyAnomalies: {
+          ...s.bodyAnomalies,
+          byMetric: overrides?.byMetric ?? byMetric,
+        },
+      },
+    };
+  };
+
+  const sortedFa = sortDirEntries(fileActivity);
+  const faFit = fitTopEntries(sortedFa, (faSubset, faTruncated) => modelOutput(buildPayload(faSubset, faTruncated)));
+  if (faFit) return faFit.out;
+
+  const emptyFa: Record<string, DailyDirectoryStats> = Object.create(null);
+  const faTruncated = sortedFa.length > 0;
+  const curApps = apps;
+  const curByRule = byRule;
+  const curBursts = fileBursts;
+  const curByMetric = byMetric;
+
+  const burstFit = fitTopEntries(sortDirEntries(curBursts), (sub) =>
+    modelOutput(
+      buildPayload(emptyFa, faTruncated, {
+        apps: curApps,
+        byRule: curByRule,
+        fileBursts: sub,
+        byMetric: curByMetric,
+        extraTruncated: true,
+      }),
+    ),
+  );
+  if (burstFit) return burstFit.out;
+  const noBursts: Record<string, DailyDirectoryStats> = Object.create(null);
+
+  const sortedApps = Object.entries(curApps).sort(
+    ([ak, a], [bk, b]) => b.foregroundMs - a.foregroundMs || b.switches - a.switches || ak.localeCompare(bk),
+  );
+  const appsFit = fitTopEntries(sortedApps, (sub) =>
+    modelOutput(
+      buildPayload(emptyFa, faTruncated, {
+        apps: sub,
+        byRule: curByRule,
+        fileBursts: noBursts,
+        byMetric: curByMetric,
+        extraTruncated: true,
+      }),
+    ),
+  );
+  if (appsFit) return appsFit.out;
+  const noApps: Record<string, (typeof s.apps)[string]> = Object.create(null);
+
+  const sortedRules = Object.entries(curByRule).sort(
+    ([ak, a], [bk, b]) =>
+      b.wake + b.context + b.suppressed - (a.wake + a.context + a.suppressed) || ak.localeCompare(bk),
+  );
+  const ruleFit = fitTopEntries(sortedRules, (sub) =>
+    modelOutput(
+      buildPayload(emptyFa, faTruncated, {
+        apps: noApps,
+        byRule: sub,
+        fileBursts: noBursts,
+        byMetric: curByMetric,
+        extraTruncated: true,
+      }),
+    ),
+  );
+  if (ruleFit) return ruleFit.out;
+  const noRules: Record<string, (typeof s.deliveries.byRule)[string]> = Object.create(null);
+
+  const sortedMetrics = Object.entries(curByMetric).sort(([ak, a], [bk, b]) => b - a || ak.localeCompare(bk));
+  const metricFit = fitTopEntries(sortedMetrics, (sub) =>
+    modelOutput(
+      buildPayload(emptyFa, faTruncated, {
+        apps: noApps,
+        byRule: noRules,
+        fileBursts: noBursts,
+        byMetric: sub,
+        extraTruncated: true,
+      }),
+    ),
+  );
+  if (metricFit) return metricFit.out;
+
+  return modelOutput(
+    buildPayload(emptyFa, faTruncated, {
+      apps: Object.create(null),
+      byRule: Object.create(null),
+      fileBursts: Object.create(null),
+      byMetric: Object.create(null),
+      extraTruncated: true,
+    }),
+  );
 }

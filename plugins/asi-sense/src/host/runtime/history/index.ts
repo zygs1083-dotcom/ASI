@@ -1,5 +1,6 @@
 export { HistoryArgsError, type HistoryEventInput, HistoryManager, type HistoryManagerOptions } from './store.ts';
 export {
+  createDailySummaryAccumulator,
   createHistoryLineParser,
   type ParsedHistoryDay,
   parseDailySummary,
