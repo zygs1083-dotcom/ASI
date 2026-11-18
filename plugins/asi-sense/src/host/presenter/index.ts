@@ -65,7 +65,11 @@ export function createPresenter(
 
   function snapshot(): PresenterModel {
     if (closed && cached) return cached;
-    const now = timeline.at(clock.mono());
+    // After a macOS sleep/wake cycle performance.now() pauses but Date.now()
+    // advances, so the mono-derived timeline lags the wall clock. Take the
+    // later of both (same max(wall, mono) rule as the metrics/away sources)
+    // so 24h buckets recorded after wake are not filtered out as "future".
+    const now = Math.max(timeline.at(clock.mono()), clock.wall());
     const state = projectState(timeline.state());
     history.record(state.self.body, now, clock.mono());
     const samples = history.snapshot(clock.mono());

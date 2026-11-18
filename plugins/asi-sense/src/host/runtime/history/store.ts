@@ -212,6 +212,7 @@ export class HistoryManager {
   private started = false;
   private stopped = false;
   private clearEpoch = 0;
+  private clearFeedBuffer?: Array<{ date: string; raw: string }>;
   private currentDate?: string;
   private currentMonth?: string;
   private lastAliveAt = Number.NEGATIVE_INFINITY;
@@ -422,6 +423,11 @@ export class HistoryManager {
 
   async clear(): Promise<void> {
     const epoch = ++this.clearEpoch;
+    // Buffer events that arrive while clearAll() deletes files (todayAcc is
+    // empty until the clear settles) and replay them afterwards; their disk
+    // appends are queued behind this clear, so they outlive the deletion.
+    const buffered: Array<{ date: string; raw: string }> = [];
+    this.clearFeedBuffer = buffered;
     this.cancelBackfill();
     this.backfillCurrentMonth = undefined;
     this.todayAcc = undefined;
@@ -440,6 +446,7 @@ export class HistoryManager {
     this.appendDegraded = false;
     this.summaryDegraded = false;
     if (!this.port) {
+      if (this.clearFeedBuffer === buffered) this.clearFeedBuffer = undefined;
       this.onSummaryChanged?.();
       return;
     }
@@ -448,7 +455,25 @@ export class HistoryManager {
       if (this.activeBackfillStep) {
         await this.activeBackfillStep.catch(() => {});
       }
-      await port.clearAll();
+      try {
+        await port.clearAll();
+      } catch (error) {
+        if (this.clearFeedBuffer === buffered) {
+          this.clearFeedBuffer = undefined;
+          // A failed clear must leave the summary usable: rebuild todayAcc and
+          // replay buffered lines, then surface the error for the UI's retry.
+          if (this.started && !this.stopped) {
+            const now = this.clock.wall();
+            const today = this.calendar.dateKey(now);
+            this.currentDate = today;
+            this.currentMonth = this.calendar.monthKey(now);
+            this.resetTodayAcc(today);
+            for (const item of buffered) if (item.date === today) this.feedTodayRaw(item.date, item.raw);
+            this.onSummaryChanged?.();
+          }
+        }
+        throw error;
+      }
       if (this.started && !this.stopped && epoch === this.clearEpoch) {
         const now = this.clock.wall();
         const today = this.calendar.dateKey(now);
@@ -458,6 +483,7 @@ export class HistoryManager {
         this.backfillCurrentMonth = month;
         this.lastAliveAt = now;
         this.nextHeartbeatMono = this.clock.mono() + this.heartbeatIntervalMs;
+        if (this.clearFeedBuffer === buffered) this.clearFeedBuffer = undefined;
         this.resetTodayAcc(today);
         const lifecycle: HistoryLifecycleRecord = {
           record: 'lifecycle',
@@ -468,7 +494,10 @@ export class HistoryManager {
         this.activeLifecycleOpen = true;
         const raw = JSON.stringify(lifecycle);
         this.feedTodayRaw(today, raw);
+        for (const item of buffered) if (item.date === today) this.feedTodayRaw(item.date, item.raw);
         await this.appendRawLine(today, `${raw}\n`, epoch);
+      } else if (this.clearFeedBuffer === buffered) {
+        this.clearFeedBuffer = undefined;
       }
       this.onSummaryChanged?.();
     });
@@ -750,20 +779,14 @@ export class HistoryManager {
     await this.tail;
     const nowMonth = this.calendar.monthKey(this.clock.wall());
     const months = new Set<string>();
-    try {
-      for (const month of await this.port.listMonthlyMonths()) {
-        if (parseMonthKey(month) && month < nowMonth) months.add(month);
-      }
-    } catch {
-      // Keep daily-discovered months if monthly dir fails validation.
+    // Propagate read errors: [] would make the sidebar claim there are no
+    // summaries instead of showing its retry error state.
+    for (const month of await this.port.listMonthlyMonths()) {
+      if (parseMonthKey(month) && month < nowMonth) months.add(month);
     }
-    try {
-      for (const date of this.filterValidDates(await this.port.listDailyDates(), 'daily')) {
-        const month = date.slice(0, 7);
-        if (parseMonthKey(month) && month < nowMonth) months.add(month);
-      }
-    } catch {
-      // Keep already collected months.
+    for (const date of this.filterValidDates(await this.port.listDailyDates(), 'daily')) {
+      const month = date.slice(0, 7);
+      if (parseMonthKey(month) && month < nowMonth) months.add(month);
     }
     return [...months].sort((a, b) => b.localeCompare(a));
   }
@@ -799,6 +822,10 @@ export class HistoryManager {
   }
 
   private feedTodayRaw(date: string, rawLine: string): void {
+    if (this.clearFeedBuffer) {
+      this.clearFeedBuffer.push({ date, raw: rawLine });
+      return;
+    }
     if (date !== this.currentDate || !this.todayAcc) return;
     if (this.pendingTodayHydration && this.pendingTodayHydration.date === date) {
       this.pendingTodayHydration.liveLines.push(rawLine);

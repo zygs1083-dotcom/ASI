@@ -302,9 +302,11 @@ export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}
     check,
   );
   const clearAllHistory = async () => {
+    // Clear persisted history first: a storage failure must leave the
+    // in-memory metrics/away state untouched and surface to the UI.
+    await history.clear();
     metrics.clear();
     away.clear();
-    await history.clear();
     changed();
   };
 

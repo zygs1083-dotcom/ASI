@@ -334,8 +334,9 @@ export class AwayReporter {
 
   clear(): void {
     this.reset();
-    this.lastAwayEndWall = undefined;
-    this.lastAwayEndMono = undefined;
+    // lastAwayEndWall/lastAwayEndMono are de-duplication watermarks for an
+    // already-pushed away episode, not history data: keep them so a late
+    // paired end hint for the same episode cannot push a second away.summary.
     this.latest = undefined;
     this.version += 1;
   }

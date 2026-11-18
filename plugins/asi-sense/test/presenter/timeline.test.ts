@@ -183,6 +183,10 @@ async function createTimelineHarness(
       wall += ms;
       mono += ms;
     },
+    sleep: (ms: number) => {
+      // macOS sleep: the wall clock advances while the monotonic clock pauses.
+      wall += ms;
+    },
     emitHelper: async (event: Record<string, unknown>) => {
       helperChild?.send({ at: wall, ...event });
       await new Promise((resolve) => setTimeout(resolve, 15));
@@ -346,6 +350,29 @@ describe('presenter timeline projection & caching', () => {
       const afterBoundary = h.presenter.snapshot();
       expect(afterBoundary.timeline).not.toBe(baseline.timeline);
       expect(afterBoundary.timeline?.metrics?.cpu?.points).toHaveLength(2);
+    } finally {
+      h.presenter.close();
+      await h.runtime.stop();
+    }
+  });
+
+  it('keeps 24h buckets recorded after sleep/wake when only the wall clock advanced (#3)', async () => {
+    const start = Date.UTC(2026, 10, 18, 9, 0, 0);
+    const h = await createTimelineHarness(start);
+    try {
+      await h.emitBody({ cpu: 0.2, memUsed: 4_000, memTotal: 10_000, diskFree: 40_000, battery: 80 });
+      // Lid closed for an hour: Date.now() moves, performance.now() does not.
+      h.sleep(3_600_000);
+      await h.emitBody({ cpu: 0.6, memUsed: 5_000, memTotal: 10_000, diskFree: 39_000, battery: 79 });
+      h.advance(5 * 60_000);
+      await h.emitBody({ cpu: 0.7, memUsed: 6_000, memTotal: 10_000, diskFree: 38_000, battery: 78 });
+
+      const frame = h.presenter.snapshot();
+      const cpuPoints = frame.timeline?.metrics?.cpu?.points ?? [];
+      expect(cpuPoints).toHaveLength(3);
+      // The UI sparkline drops every p.at > model.now, so a mono-derived now
+      // would hide all post-wake buckets and leave the chart empty.
+      expect(frame.now).toBeGreaterThanOrEqual(cpuPoints.at(-1)?.at ?? 0);
     } finally {
       h.presenter.close();
       await h.runtime.stop();
