@@ -304,6 +304,13 @@ export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}
         draft.globalFileWatch = enabled;
       });
     },
+    retryGlobalFileWatch: async () => {
+      const epoch = generation;
+      check(epoch);
+      if (running) await filesGlobal.retry();
+      check(epoch);
+      changed();
+    },
     addFileExclusion: (pattern) => {
       check();
       const norm = normalizeFileExclusion(pattern);

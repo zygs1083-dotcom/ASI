@@ -103,6 +103,7 @@ export function SensePanel(props: SensePanelProps) {
             model={model}
             onOpenPermissionSettings={props.onOpenPermissionSettings}
             onToggleGlobalFileWatch={props.onToggleGlobalFileWatch}
+            onRetryGlobalFileWatch={props.onRetryGlobalFileWatch}
             onAddFileExclusion={props.onAddFileExclusion}
             onRemoveFileExclusion={props.onRemoveFileExclusion}
           />

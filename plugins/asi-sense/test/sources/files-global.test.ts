@@ -1,13 +1,16 @@
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import type { GlobalFileWatchValue } from '@asi/sense-types';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { compileGlob } from '../../src/host/attention/glob.ts';
 import { DEFAULT_RULES } from '../../src/host/attention/rules.ts';
+import { FileBurstDetector } from '../../src/host/body/burst.ts';
 import { defaultBodyRules } from '../../src/host/body/index.ts';
 import { createPresenter } from '../../src/host/presenter/index.ts';
-import type { EventEntry } from '../../src/host/runtime/attention.ts';
+import { type EventEntry, RuntimeAttention } from '../../src/host/runtime/attention.ts';
+import { FactExpiry } from '../../src/host/runtime/expiry.ts';
 import { createSenseRuntime } from '../../src/host/runtime/index.ts';
 import type { DshPort, FileChange, FileWatcher, SenseOptions } from '../../src/host/runtime/ports.ts';
 import {
@@ -16,6 +19,7 @@ import {
   MAX_FILE_EXCLUSIONS,
   normalizeFileExclusion,
 } from '../../src/host/sources/file-exclusions.ts';
+import { FileGlobalSource } from '../../src/host/sources/files-global.ts';
 
 afterEach(() => vi.useRealTimers());
 
@@ -561,6 +565,80 @@ describe('FileGlobalSource integration', () => {
     await h.runtime.stop();
   });
 
+  it('stays within <20MB heap growth and <3% CPU under sustained 15,000/s x 60s load', async () => {
+    let mono = 10_000;
+    const clock = { wall: () => 1_700_000_000_000 + mono, mono: () => mono };
+    const expiry = new FactExpiry(clock);
+    const rules = [...DEFAULT_RULES, ...defaultBodyRules()];
+    const att = new RuntimeAttention(
+      clock,
+      { deliver: async () => {} } as unknown as DshPort,
+      () => rules,
+      () => {},
+      () => true,
+      () => {},
+      expiry,
+    );
+    const detector = new FileBurstDetector({ windowMs: 60_000, maxChanges: 100, maxDeleted: 50 });
+    detector.setScopes(['global']);
+    let cb!: (event: FileChange) => void;
+    const fg = new FileGlobalSource(
+      {
+        watch: (_r, fn) => {
+          cb = fn;
+          return { close: () => {} };
+        },
+      },
+      clock,
+      att,
+      { classifyFilePath: () => 'unknown' },
+      { globalFileWatch: true, fileExclusions: () => [] },
+      () => false,
+      async (sig, dirs, rm) => {
+        detector.accept(sig, rm ?? clock.mono(), dirs);
+      },
+      () => {},
+      () => false,
+      () => {},
+      { homedir: '/Users/demo' },
+      'darwin',
+    );
+    await fg.refresh();
+    // Warm up JIT cleanly on a brief 1s burst before timing the 60s window
+    for (let j = 0; j < 2_000; j++) {
+      cb({ path: `/work/hot-${j % 5}/f-${j % 10}.log`, change: 'modify' });
+    }
+    mono += 1_000;
+    await fg.tick();
+    const gcFn = (globalThis as { gc?: () => void }).gc;
+    gcFn?.();
+    const h0 = process.memoryUsage().heapUsed;
+    const cpu0 = process.cpuUsage();
+
+    for (let s = 0; s < 60; s++) {
+      for (let j = 0; j < 15_000; j++) {
+        cb({ path: `/work/hot-${j % 5}/f-${j % 10}.log`, change: 'modify' });
+      }
+      mono += 1_000;
+      await fg.tick();
+    }
+
+    const cpu = process.cpuUsage(cpu0);
+    gcFn?.();
+    const h1 = process.memoryUsage().heapUsed;
+    const cpuPct = ((cpu.user + cpu.system) / 1000 / 60_000) * 100;
+    const heapDeltaMb = (h1 - h0) / (1024 * 1024);
+    console.info(
+      `[files-global 15k/s x 60s] cpuMs=${((cpu.user + cpu.system) / 1000).toFixed(1)}, cpuPct=${cpuPct.toFixed(2)}%, heapDelta=${heapDeltaMb.toFixed(2)} MB, degraded=${fg.isDegraded()}`,
+    );
+
+    expect(fg.isDegraded()).toBe(true);
+    expect(cpuPct).toBeLessThan(3);
+    expect(heapDeltaMb).toBeLessThan(20);
+    await fg.stop();
+    await att.stop();
+  });
+
   it('handles darwin case folding, NFC/NFD normalization, uncreated symlinked dataDirs, aliases, and glob descendant exclusions', () => {
     const tmpRoot = mkdtempSync(path.join(os.tmpdir(), 'asi-excl-'));
     try {
@@ -597,6 +675,7 @@ describe('FileGlobalSource integration', () => {
     const longPattern = `${'**a'.repeat(341)}b`.slice(0, 1024);
     const matcher = compileGlob(longPattern, { matchDescendants: true });
     const text = `/${'a'.repeat(250)}c`;
+    for (let i = 0; i < 5; i++) matcher.test(text);
     const t0 = performance.now();
     expect(matcher.test(text)).toBe(false);
     const globMs = performance.now() - t0;
@@ -647,6 +726,10 @@ describe('FileGlobalSource integration', () => {
       h.emitFile({ path: `/work/huge/dir-${i}/file.ts`, change: 'add' });
     }
     await h.advance(10_000);
+    for (let i = 0; i < 100; i++) {
+      if (collectActivity(h.events()).some((e) => e.detail?.directory === '/work/huge')) break;
+      await new Promise((r) => setImmediate(r));
+    }
 
     const acts = collectActivity(h.events());
     const rolledSum = acts.reduce((sum, e) => sum + Number(e.detail?.rolledUp ?? 0), 0);
@@ -786,11 +869,13 @@ describe('FileGlobalSource integration', () => {
     await h.advance(10_000);
     expect(collectActivity(h.events()).some((e) => e.detail?.directory === '/work/dropped')).toBe(false);
 
-    // Second EIO transitions permanently to unavailable and unrelated toggleRule does NOT revive it
+    // Second EIO transitions to unavailable with reason & retryAt and unrelated toggleRule does NOT revive it
     cbs[1]?.({ path: '/', change: 'modify', watchError: true, errorCode: 'ECLOSE' });
     await h.advance(20);
     expect(h.openWatchers()).toBe(0);
     expect(h.runtime.state().env.globalFileWatch?.status).toBe('unavailable');
+    expect(h.globalFact()?.reason).toContain('ECLOSE');
+    expect(h.globalFact()?.retryAt).toBeDefined();
     await h.runtime.actions.toggleRule?.('file-activity', false);
     expect(h.openWatchers()).toBe(0);
 
@@ -813,6 +898,21 @@ describe('FileGlobalSource integration', () => {
     expect(h.globalFact()?.deniedPaths).toContain('/protected/sub');
     expect(h.totalWatchCalls()).toBe(beforeSubDenied + 1);
 
+    // Excluded path EPERM is ignored without closing or rebuilding the watcher
+    const callsBeforeExcluded = h.totalWatchCalls();
+    const excludedSub = path.posix.join('/Users/demo', 'Library', 'Safari', 'Bookmarks.plist');
+    cbs.at(-1)?.({
+      path: excludedSub,
+      change: 'modify',
+      watchError: true,
+      errorCode: 'EPERM',
+      errorPath: excludedSub,
+    });
+    await h.advance(20);
+    expect(h.totalWatchCalls()).toBe(callsBeforeExcluded);
+    expect(h.globalFact()?.deniedPaths).not.toContain(excludedSub);
+    expect(h.globalFact()?.status).toBe('partial-denied');
+
     // Under rootDenied, exclusion mutations still refresh the published fact
     cbs.at(-1)?.({ path: '/', change: 'modify', watchError: true, errorCode: 'EPERM', errorPath: '/' });
     await h.advance(20);
@@ -822,6 +922,179 @@ describe('FileGlobalSource integration', () => {
     await h.runtime.actions.removeFileExclusion?.('~/Vault');
     expect(h.globalFact()?.exclusions).not.toContain('~/Vault');
 
+    await h.runtime.stop();
+  });
+
+  it('reports unsupported on non-darwin default root without retry', async () => {
+    const h = createHarness({ platform: 'linux' });
+    await h.runtime.start();
+    expect(h.openWatchers()).toBe(0);
+    expect(h.totalWatchCalls()).toBe(0);
+    expect(h.runtime.state().env.globalFileWatch?.status).toBe('unsupported');
+    expect(h.globalFact()?.status).toBe('unsupported');
+    expect(h.globalFact()?.reason).toContain('不支持');
+    expect(h.globalFact()?.retryAt).toBeUndefined();
+    expect(h.runtime.state().observation.sources['files-global']?.status).toBe('unsupported');
+    await h.runtime.stop();
+  });
+
+  it('recovers from startup EIO via exponential backoff, pause/unpause, and explicit retryGlobalFileWatch', async () => {
+    let failOpen = true;
+    const h = createHarness({
+      watchFactory: () => {
+        if (failOpen) throw Object.assign(new Error('io error'), { code: 'EIO' });
+        return { close: () => {} };
+      },
+    });
+    await h.runtime.start();
+    expect(h.openWatchers()).toBe(0);
+    expect(h.totalWatchCalls()).toBe(1);
+    expect(h.runtime.state().env.globalFileWatch?.status).toBe('unavailable');
+    const firstRetryAt = h.globalFact()?.retryAt ?? 0;
+    const obs1 = h.runtime.state().env.globalFileWatch?.observedAt ?? 0;
+    expect(firstRetryAt - obs1).toBe(30_000);
+
+    // 1st backoff (30s) still fails -> next backoff doubles to 60s
+    await h.advance(30_000);
+    expect(h.totalWatchCalls()).toBe(2);
+    expect(h.runtime.state().env.globalFileWatch?.status).toBe('unavailable');
+    const secondRetryAt = h.globalFact()?.retryAt ?? 0;
+    const obs2 = h.runtime.state().env.globalFileWatch?.observedAt ?? 0;
+    expect(secondRetryAt - obs2).toBe(60_000);
+
+    // Pause -> unpause clears transient unavailable and retries immediately
+    failOpen = false;
+    await h.runtime.actions.pause(true);
+    await h.runtime.actions.pause(false);
+    expect(h.openWatchers()).toBe(1);
+    expect(h.globalFact()?.status).toBe('running');
+
+    // Simulate another unavailable cycle and verify explicit retryGlobalFileWatch action
+    await h.runtime.stop();
+
+    let attempts = 0;
+    const h2 = createHarness({
+      watchFactory: () => {
+        attempts++;
+        if (attempts === 1) throw Object.assign(new Error('io error'), { code: 'EIO' });
+        return { close: () => {} };
+      },
+    });
+    await h2.runtime.start();
+    expect(h2.runtime.state().env.globalFileWatch?.status).toBe('unavailable');
+    await h2.runtime.actions.retryGlobalFileWatch?.();
+    expect(attempts).toBe(2);
+    expect(h2.openWatchers()).toBe(1);
+    expect(h2.globalFact()?.status).toBe('running');
+    await h2.runtime.stop();
+  });
+
+  it('normalizes darwin case/NFC identically across FileSource and FileGlobalSource and wakes explicit rule file.burst', async () => {
+    const ruleDir = '/Users/Demo/Project';
+    const callbacks = new Map<string, (event: FileChange) => void>();
+    const h = createHarness({
+      platform: 'darwin',
+      watchFactory: (root, cb) => {
+        callbacks.set(root, cb);
+        return { close: () => {} };
+      },
+      rules: [
+        ...DEFAULT_RULES,
+        {
+          id: 'explicit-project',
+          match: { kind: 'file.changed', subject: `${ruleDir}/**` },
+          level: 'context',
+          createdBy: 'user',
+          approved: true,
+        },
+        {
+          id: 'explicit-project-burst',
+          match: { kind: 'file.burst', subject: `${ruleDir}/**` },
+          level: 'wake',
+          createdBy: 'user',
+          approved: true,
+        },
+      ],
+    });
+    await h.runtime.start();
+    expect(h.totalWatchCalls()).toBe(2);
+    const globalCb = callbacks.get('/');
+    const ruleCb = callbacks.get(ruleDir);
+    expect(globalCb).toBeDefined();
+    expect(ruleCb).toBeDefined();
+
+    for (let i = 0; i < 60; i++) {
+      const ev: FileChange = { path: `/users/demo/project/del-${i}.ts`, change: 'delete' };
+      ruleCb?.(ev);
+      globalCb?.(ev);
+    }
+    await h.advance(50);
+
+    const bursts = h.events().filter((e) => e.kind === 'file.burst');
+    expect(bursts.length).toBeGreaterThanOrEqual(1);
+    expect(bursts.some((e) => e.level === 'wake')).toBe(true);
+    expect(bursts.at(-1)?.detail?.deleted).toBe(51);
+    await h.runtime.stop();
+  });
+
+  it('architecture: FileSource and FileGlobalSource both normalize paths via normalizeWatchPath', () => {
+    const here = path.dirname(fileURLToPath(import.meta.url));
+    const filesSrc = readFileSync(path.resolve(here, '../../src/host/sources/files.ts'), 'utf8');
+    const globalSrc = readFileSync(path.resolve(here, '../../src/host/sources/files-global.ts'), 'utf8');
+    expect(filesSrc).toContain('normalizeWatchPath(');
+    expect(globalSrc).toContain('normalizeWatchPath(');
+  });
+
+  it('slices flushing of 2,200 directory buckets without blocking a single synchronous turn >= 50ms', async () => {
+    const h = createHarness({ fakeClockOnly: true });
+    await h.runtime.start();
+
+    for (let i = 0; i < 2200; i++) {
+      h.emitFile({ path: `/work/s-${Math.floor(i / 20)}/d-${i}/a.ts`, change: 'modify' });
+    }
+
+    let sliceNotifications = 0;
+    const unsub = h.runtime.subscribe(() => {
+      sliceNotifications++;
+    });
+
+    await h.advance(9_999);
+    await new Promise((r) => setImmediate(r));
+    let maxTickBlockMs = 0;
+    let lastBeat = performance.now();
+    let probing = true;
+    const beat = () => {
+      const now = performance.now();
+      maxTickBlockMs = Math.max(maxTickBlockMs, now - lastBeat);
+      lastBeat = now;
+      if (probing) setImmediate(beat);
+    };
+    setImmediate(beat);
+
+    const t0 = performance.now();
+    await h.advance(501);
+    let stable = 0;
+    let prev = sliceNotifications;
+    for (let i = 0; i < 200; i++) {
+      await new Promise((r) => setImmediate(r));
+      if (sliceNotifications === prev && sliceNotifications >= 10) {
+        stable++;
+        if (stable >= 3) break;
+      } else {
+        stable = 0;
+        prev = sliceNotifications;
+      }
+    }
+    probing = false;
+    unsub();
+    const totalMs = performance.now() - t0;
+
+    console.info(
+      `[files-global flush] 2200 events across ${sliceNotifications} slices, total=${totalMs.toFixed(1)} ms, maxSetImmediateGap=${maxTickBlockMs.toFixed(1)} ms`,
+    );
+    expect(maxTickBlockMs).toBeLessThan(50);
+    expect(sliceNotifications).toBeGreaterThanOrEqual(10);
+    expect(collectActivity(h.events()).some((e) => Number(e.detail?.rolledUp ?? 0) > 0)).toBe(true);
     await h.runtime.stop();
   });
 });

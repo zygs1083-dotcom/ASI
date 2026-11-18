@@ -177,7 +177,7 @@ describe('missing file watcher roots', () => {
     const ports = localPorts({ logger: { warn: vi.fn() } } as unknown as Context, '/storage');
     const watcher = ports.files.watch('/sandbox/root', (event) => events.push(event));
     failed = true;
-    emit('rename', null);
+    emit('rename', 'after-fail.txt');
     expect(events).toEqual([
       { path: '/sandbox/root', change: 'modify', watchError: true, errorCode: 'EACCES', errorPath: '/sandbox/root' },
     ]);

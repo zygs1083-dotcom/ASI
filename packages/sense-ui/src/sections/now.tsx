@@ -9,7 +9,12 @@ import css from './now.module.css';
 
 type Panel = Pick<
   SensePanelProps,
-  'model' | 'onOpenPermissionSettings' | 'onToggleGlobalFileWatch' | 'onAddFileExclusion' | 'onRemoveFileExclusion'
+  | 'model'
+  | 'onOpenPermissionSettings'
+  | 'onToggleGlobalFileWatch'
+  | 'onRetryGlobalFileWatch'
+  | 'onAddFileExclusion'
+  | 'onRemoveFileExclusion'
 >;
 type Where = SensePanelProps['model']['state']['env']['where'];
 
@@ -211,6 +216,7 @@ export function NowSection({
   model,
   onOpenPermissionSettings,
   onToggleGlobalFileWatch,
+  onRetryGlobalFileWatch,
   onAddFileExclusion,
   onRemoveFileExclusion,
 }: Panel) {
@@ -283,8 +289,10 @@ export function NowSection({
       {env.globalFileWatch && (
         <GlobalWatchBlock
           fact={env.globalFileWatch}
+          now={now}
           onOpenPermissionSettings={ops}
           onToggleGlobalFileWatch={onToggleGlobalFileWatch}
+          onRetryGlobalFileWatch={onRetryGlobalFileWatch}
           onAddFileExclusion={onAddFileExclusion}
           onRemoveFileExclusion={onRemoveFileExclusion}
         />

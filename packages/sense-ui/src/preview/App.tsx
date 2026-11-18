@@ -107,6 +107,34 @@ export function App() {
             });
             act(on ? '开启全盘文件监视' : '关闭全盘文件监视');
           }}
+          onRetryGlobalFileWatch={async () => {
+            setModel((m) => {
+              const cur = m.state.env.globalFileWatch;
+              if (!cur?.value) return m;
+              return {
+                ...m,
+                state: {
+                  ...m.state,
+                  env: {
+                    ...m.state.env,
+                    globalFileWatch: {
+                      ...cur,
+                      status: 'ok',
+                      reason: undefined,
+                      value: {
+                        ...cur.value,
+                        enabled: true,
+                        status: cur.value.degraded ? 'degraded' : 'running',
+                        reason: undefined,
+                        retryAt: undefined,
+                      },
+                    },
+                  },
+                },
+              };
+            });
+            act('重试全盘文件监视');
+          }}
           onAddFileExclusion={async (pattern) => {
             setModel((m) => {
               const cur = m.state.env.globalFileWatch;

@@ -1,6 +1,9 @@
 import path from 'node:path';
 import type { DeliveryLevel, Signal, WatchRule } from '@asi/sense-types';
 import { compileGlob, matchGlob } from './glob.ts';
+import { normalizeWatchPath } from './path.ts';
+
+export const MAX_RULE_SUBJECT_LENGTH = 1024;
 
 /** Ordering of delivery levels for rule priority. */
 export const LEVEL_RANK: Record<DeliveryLevel, number> = {
@@ -37,8 +40,11 @@ export function normalizeFileSubject(subject: string): string {
  * every scope keeps its own sliding window and latches, so a burst under one
  * scope can never wake or mask a sibling scope on the same watch root.
  */
-export function burstScopeId(subject: string): string | undefined {
-  const pattern = normalizeFileSubject(subject);
+export function burstScopeId(subject: string, platform?: string): string | undefined {
+  const pattern =
+    platform !== undefined
+      ? (normalizeWatchPath(subject, platform) ?? normalizeFileSubject(subject))
+      : normalizeFileSubject(subject);
   if (!path.isAbsolute(pattern)) return undefined;
   if (!/[*?]/.test(pattern)) return `dir:${pattern}`;
   if (pattern.endsWith('/**')) {
@@ -175,7 +181,12 @@ export function validateRule(input: unknown): string[] {
   } else {
     const m = r.match;
     if (typeof m.kind !== 'string' || m.kind.length === 0) errors.push('match.kind must be a non-empty string');
-    if (m.subject !== undefined && typeof m.subject !== 'string') errors.push('match.subject must be a string');
+    if (m.subject !== undefined) {
+      if (typeof m.subject !== 'string') errors.push('match.subject must be a string');
+      else if (m.subject.length > MAX_RULE_SUBJECT_LENGTH) {
+        errors.push(`match.subject must not exceed ${MAX_RULE_SUBJECT_LENGTH} characters`);
+      }
+    }
     if (Object.hasOwn(m, 'where')) {
       if (!isPlainObject(m.where)) errors.push('match.where must be a plain object when present');
       else validateWhere(m.where, 'match.where', errors);
@@ -199,18 +210,28 @@ export function validateRule(input: unknown): string[] {
  * `where` that is not a plain object — simply never matches, and no
  * malformed input can make it throw.
  */
-export function matchesRule(rule: WatchRule, signal: Signal, now: number): boolean {
+export function matchesRule(
+  rule: WatchRule,
+  signal: Signal,
+  now: number,
+  platform: string = process.platform,
+): boolean {
   if (validateRule(rule).length > 0 || !isPlainObject(signal)) return false;
   if (rule.expiresAt !== undefined && now >= rule.expiresAt) return false;
   if (rule.match.kind !== signal.kind) return false;
   if (rule.match.subject !== undefined) {
+    const isFileSignal =
+      signal.kind === 'file.changed' || signal.kind === 'file.burst' || signal.kind === 'file.activity';
     // Only file signals carry paths — normalize their subject spelling; every
     // other kind (job.*, window.*, …) keeps raw glob semantics.
-    const pattern =
-      signal.kind === 'file.changed' || signal.kind === 'file.burst' || signal.kind === 'file.activity'
-        ? normalizeFileSubject(rule.match.subject)
-        : rule.match.subject;
-    const subject = signal.subject;
+    const pattern = isFileSignal
+      ? (normalizeWatchPath(rule.match.subject, platform) ?? normalizeFileSubject(rule.match.subject))
+      : rule.match.subject;
+    const rawSubject = signal.subject;
+    const subject =
+      isFileSignal && typeof rawSubject === 'string'
+        ? (normalizeWatchPath(rawSubject, platform) ?? rawSubject)
+        : rawSubject;
     // A file.burst signal carrying `data.scope` attributes the burst to one
     // canonical scope id — it matches only the identical scope, never a
     // sibling glob on the same watch root (even when the emitted dir happens
@@ -220,7 +241,7 @@ export function matchesRule(rule: WatchRule, signal: Signal, now: number): boole
     const scope = signal.kind === 'file.burst' && isPlainObject(signal.data) ? signal.data.scope : undefined;
     let matched: boolean;
     if (typeof scope === 'string') {
-      matched = burstScopeId(rule.match.subject) === scope;
+      matched = burstScopeId(rule.match.subject, platform) === scope;
     } else {
       matched = typeof subject === 'string' && matchGlob(pattern, subject);
       if (!matched && signal.kind === 'file.burst' && typeof subject === 'string') {
@@ -266,10 +287,15 @@ function effectiveLevel(rule: WatchRule): DeliveryLevel {
  * `context` > `record`, unapproved wakes ranked as context so they cannot
  * mask an approved wake). On ties the earliest rule in the list wins.
  */
-export function selectRule(rules: readonly WatchRule[], signal: Signal, now: number): WatchRule | undefined {
+export function selectRule(
+  rules: readonly WatchRule[],
+  signal: Signal,
+  now: number,
+  platform: string = process.platform,
+): WatchRule | undefined {
   let best: WatchRule | undefined;
   for (const rule of rules) {
-    if (!matchesRule(rule, signal, now)) continue;
+    if (!matchesRule(rule, signal, now, platform)) continue;
     if (!best || LEVEL_RANK[effectiveLevel(rule)] > LEVEL_RANK[effectiveLevel(best)]) {
       best = rule;
     }

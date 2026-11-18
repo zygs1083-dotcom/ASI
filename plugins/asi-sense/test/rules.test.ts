@@ -4,8 +4,10 @@ import {
   createWatchRule,
   DEFAULT_RULES,
   isRuleApproved,
+  MAX_RULE_SUBJECT_LENGTH,
   matchesRule,
   selectRule,
+  validateRule,
 } from '../src/host/attention/rules.ts';
 import { sig } from './helpers.ts';
 
@@ -248,6 +250,25 @@ describe('matchesRule', () => {
     const r = rule({ id: 'r', expiresAt: 100 });
     expect(matchesRule(r, sig({ id: '1', kind: 'k' }), 99)).toBe(true);
     expect(matchesRule(r, sig({ id: '1', kind: 'k' }), 100)).toBe(false);
+  });
+
+  it('normalizes darwin case and NFC on file.* subjects and rejects oversized subjects', () => {
+    const darwinRule = rule({ id: 'mac', match: { kind: 'file.burst', subject: '/Users/Demo/Cafe\u0301/**' } });
+    const burst = sig({ id: 'b1', kind: 'file.burst', subject: '/users/demo/caf\u00e9/src' });
+    expect(matchesRule(darwinRule, burst, 0, 'darwin')).toBe(true);
+    expect(matchesRule(darwinRule, burst, 0, 'linux')).toBe(false);
+
+    const tooLong = `/${'a'.repeat(MAX_RULE_SUBJECT_LENGTH)}`;
+    expect(tooLong.length).toBe(MAX_RULE_SUBJECT_LENGTH + 1);
+    const oversized = rule({ id: 'long', match: { kind: 'file.changed', subject: tooLong } });
+    expect(validateRule(oversized).length).toBeGreaterThan(0);
+    expect(matchesRule(oversized, sig({ id: 'b2', kind: 'file.changed', subject: tooLong }), 0)).toBe(false);
+
+    const boundary = rule({
+      id: 'max',
+      match: { kind: 'file.changed', subject: `/${'a'.repeat(MAX_RULE_SUBJECT_LENGTH - 1)}` },
+    });
+    expect(validateRule(boundary)).toEqual([]);
   });
 });
 

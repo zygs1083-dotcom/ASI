@@ -15,6 +15,7 @@ function fixture() {
     pause: vi.fn(async () => {}),
     setSendTitles: vi.fn(async () => {}),
     setGlobalFileWatch: vi.fn(async () => {}),
+    retryGlobalFileWatch: vi.fn(async () => {}),
     addFileExclusion: vi.fn(async () => {}),
     removeFileExclusion: vi.fn(async () => {}),
     openPermissionSettings: vi.fn(async () => {}),
@@ -99,12 +100,14 @@ describe('DSH remote service', () => {
 
     invalidate.mockClear();
     await remote.setGlobalFileWatch(false);
+    await remote.retryGlobalFileWatch();
     await remote.addFileExclusion('~/custom-cache');
     await remote.removeFileExclusion('~/custom-cache');
     expect(actions.setGlobalFileWatch).toHaveBeenCalledWith(false);
+    expect(actions.retryGlobalFileWatch).toHaveBeenCalledOnce();
     expect(actions.addFileExclusion).toHaveBeenCalledWith('~/custom-cache');
     expect(actions.removeFileExclusion).toHaveBeenCalledWith('~/custom-cache');
-    expect(invalidate).toHaveBeenCalledTimes(3);
+    expect(invalidate).toHaveBeenCalledTimes(4);
   });
 
   it('rejects relative, root, home-root, and oversized exclusions with RemoteError', async () => {

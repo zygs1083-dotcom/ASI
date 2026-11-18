@@ -13,6 +13,7 @@ function fixture() {
     pause: method(),
     setSendTitles: method(),
     setGlobalFileWatch: method(),
+    retryGlobalFileWatch: method(),
     addFileExclusion: method(),
     removeFileExclusion: method(),
     openPermissionSettings: method(),
@@ -138,6 +139,20 @@ describe('sidebar action boundary', () => {
       error: new RemoteError('gateway/bad-request', 'invalid exclusion', {}),
     });
     await expect(controller.actions.onAddFileExclusion?.('bad/pat')).rejects.toThrow('invalid exclusion');
+    expect(controller.getSnapshot()).toBe(false);
+    controller.dispose();
+  });
+
+  it('routes retryGlobalFileWatch via complete and surfaces failures without global banner', async () => {
+    const { api, controller } = fixture();
+    await expect(controller.actions.onRetryGlobalFileWatch?.()).resolves.toBeUndefined();
+    expect(api.retryGlobalFileWatch).toHaveBeenCalledOnce();
+
+    api.retryGlobalFileWatch.mockResolvedValueOnce({
+      ok: false,
+      error: new RemoteError('gateway/bad-request', 'watch retry failed', {}),
+    });
+    await expect(controller.actions.onRetryGlobalFileWatch?.()).rejects.toThrow('watch retry failed');
     expect(controller.getSnapshot()).toBe(false);
     controller.dispose();
   });

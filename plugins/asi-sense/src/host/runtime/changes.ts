@@ -87,6 +87,8 @@ export function observableActions(actions: SenseActions, changed: () => void): S
     setSendTitles: (value) => publish(actions.setSendTitles(value)),
     setGlobalFileWatch: (value) =>
       publish(actions.setGlobalFileWatch?.(value) ?? Promise.reject(new Error('globalFileWatch unavailable'))),
+    retryGlobalFileWatch: () =>
+      publish(actions.retryGlobalFileWatch?.() ?? Promise.reject(new Error('globalFileWatch unavailable'))),
     addFileExclusion: (pattern) =>
       publish(actions.addFileExclusion?.(pattern) ?? Promise.reject(new Error('addFileExclusion unavailable'))),
     removeFileExclusion: (pattern) =>

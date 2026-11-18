@@ -108,6 +108,7 @@ function eventDetail(entry: EventEntry): SenseEvent['detail'] {
       modified: d.modified,
       deleted: d.deleted,
       excessiveDeletion: d.externalDeletionExceeded === true,
+      ...(d.rolledUp === true ? { rolledUp: true } : {}),
     };
   }
   if (

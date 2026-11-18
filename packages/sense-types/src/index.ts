@@ -94,7 +94,14 @@ export interface EnvWhere {
 }
 
 /** Status of the whole-disk file watcher. */
-export type GlobalFileWatchStatus = 'running' | 'degraded' | 'partial-denied' | 'denied' | 'disabled';
+export type GlobalFileWatchStatus =
+  | 'running'
+  | 'degraded'
+  | 'partial-denied'
+  | 'denied'
+  | 'disabled'
+  | 'unavailable'
+  | 'unsupported';
 
 /** Summary value for `env.globalFileWatch`. */
 export interface GlobalFileWatchValue {
@@ -107,6 +114,8 @@ export interface GlobalFileWatchValue {
   countOnly: boolean;
   deniedPaths: string[];
   exclusions: string[];
+  reason?: string;
+  retryAt?: number;
 }
 
 /** Observed environment state. */
@@ -268,6 +277,7 @@ export type FileBurstData = {
   agentDeleted: number;
   externalDeleted?: number;
   externalDeletionExceeded?: boolean;
+  rolledUp?: boolean;
 };
 
 /** Aggregated per-directory file activity signal payload (`file.activity`). */

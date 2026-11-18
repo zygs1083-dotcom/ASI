@@ -167,6 +167,14 @@ export class AsiSenseRemote extends TypertRemoteService {
   }
 
   @Remote
+  async retryGlobalFileWatch(): Promise<void> {
+    await this.userAction(() => {
+      if (!this.actions.retryGlobalFileWatch) throw new Error('Global file watch unavailable');
+      return this.actions.retryGlobalFileWatch();
+    });
+  }
+
+  @Remote
   async addFileExclusion(pattern: string): Promise<void> {
     await this.updateExclusion(pattern, this.actions.addFileExclusion);
   }

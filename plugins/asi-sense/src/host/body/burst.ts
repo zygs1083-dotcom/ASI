@@ -2,7 +2,6 @@ import { createHash } from 'node:crypto';
 import { posix } from 'node:path';
 import type { Signal } from '@asi/sense-types';
 import type { BodySignal } from './metrics.ts';
-import { TimeWindow } from './window.ts';
 
 export interface FileBurstOptions {
   windowMs?: number;
@@ -21,13 +20,6 @@ export interface FileBurstOptions {
 
 type Change = 'add' | 'modify' | 'delete';
 
-interface FileEvent {
-  at: number;
-  change: Change;
-  agent: boolean;
-  count: number;
-}
-
 function activityCount(v: unknown): number | undefined {
   return typeof v === 'number' && Number.isSafeInteger(v) && v >= 0 ? v : undefined;
 }
@@ -43,6 +35,55 @@ export interface BurstTarget {
   dir: string;
 }
 
+const RING_SLOTS = 64;
+const RING_DIVISOR = 60;
+const COUNT_FIELDS = 6;
+const F_CREATED = 0;
+const F_MODIFIED = 1;
+const F_DELETED = 2;
+const F_AGENT_CREATED = 3;
+const F_AGENT_MODIFIED = 4;
+const F_AGENT_DELETED = 5;
+
+function ringPos(slotIdx: number): number {
+  const r = slotIdx % RING_SLOTS;
+  return r < 0 ? r + RING_SLOTS : r;
+}
+
+function slotWidthMs(windowMs: number): number {
+  return Math.max(1, Math.ceil(windowMs / RING_DIVISOR));
+}
+
+function scopeRoot(scope: string): string {
+  if (scope === 'global') return '/';
+  if (scope.startsWith('dir:')) return scope.slice(4) || '/';
+  if (scope.startsWith('glob:')) {
+    const pat = scope.slice(5);
+    const w = pat.search(/[*?]/);
+    if (w < 0) return pat || '/';
+    const slash = pat.lastIndexOf('/', w);
+    return slash <= 0 ? '/' : pat.slice(0, slash);
+  }
+  return '/';
+}
+
+function pathDepth(dir: string): number {
+  let d = 0;
+  for (let i = 0; i < dir.length; i++) {
+    if (dir.charCodeAt(i) === 47) d++;
+  }
+  return d;
+}
+
+function parentDirWithin(dir: string, root: string): string | undefined {
+  if (dir === root || dir === '/') return undefined;
+  if (root !== '/' && !dir.startsWith(`${root}/`)) return undefined;
+  const slash = dir.lastIndexOf('/');
+  const parent = slash <= 0 ? '/' : dir.slice(0, slash);
+  if (root !== '/' && parent.length < root.length) return root;
+  return parent;
+}
+
 interface DirState {
   key: string;
   prev?: DirState;
@@ -51,7 +92,11 @@ interface DirState {
   scope: string;
   /** Concrete bucket directory (emitted as `subject`/`data.directory`). */
   dir: string;
-  win: TimeWindow<FileEvent>;
+  slotMs: number;
+  slotIds: Float64Array;
+  slotCounts: Uint32Array;
+  oldestSlot: number;
+  lastSlot: number;
   counts: Counts;
   lastAt: number;
   /** External-burst wake latch. */
@@ -59,6 +104,8 @@ interface DirState {
   deletion: boolean;
   /** Self-cause crossing audit latch (never suppresses `wake`). */
   agentOnly: boolean;
+  /** Whether overflow directories were merged into this bucket. */
+  rolledUp: boolean;
 }
 
 interface Counts {
@@ -77,13 +124,10 @@ const EMPTY_SIGNALS: BodySignal[] = [];
 /**
  * Per-directory (or per watched root) file-burst detector (DESIGN §2.2c,
  * layer `rate`, kind `file.burst`). Counts `file.changed` events inside a
- * sliding window on each directory's OWN watermark — an event never prunes
- * another directory's history. External and agent-caused events are
- * counted separately for every change type; only EXTERNAL counts arm the
- * `wake` latch (`externalDeletionExceeded` names the deletion trigger).
- * A burst that crosses a limit purely through agent-caused events emits a
- * `record`-level `cause:'agent'` audit instead — never a wake. Pure
- * bookkeeping — never touches the filesystem.
+ * fixed-size slotted ring window per directory — never retaining individual
+ * event objects — and rolls overflow directories above `maxDirectories`
+ * into ancestor buckets marked `rolledUp`. Pure bookkeeping — never touches
+ * the filesystem.
  */
 export class FileBurstDetector {
   private readonly windowMs: number;
@@ -92,12 +136,22 @@ export class FileBurstDetector {
   private roots?: readonly string[];
   private readonly threshold: (param: string, fallback: number) => number;
   private readonly dirs = new Map<string, DirState>();
+  private readonly pool: DirState[] = [];
   private head?: DirState;
   private tail?: DirState;
   private readonly maxDirectories: number;
   private lastReceived = Number.NEGATIVE_INFINITY;
   private readonly limBuf = { windowMs: 0, maxChanges: 0, maxDeleted: 0 };
   private readonly singleItem: [{ change: Change; count: number }] = [{ change: 'add', count: 1 }];
+  private readonly rebucketBuf: {
+    at: number;
+    c0: number;
+    c1: number;
+    c2: number;
+    c3: number;
+    c4: number;
+    c5: number;
+  }[] = [];
 
   constructor(options: FileBurstOptions = {}) {
     if (options.threshold !== undefined && typeof options.threshold !== 'function') {
@@ -131,12 +185,88 @@ export class FileBurstDetector {
     }
   }
 
+  private allocState(key: string, scope: string, dir: string, slotMs: number): DirState {
+    const recycled = this.pool.pop();
+    if (recycled) {
+      recycled.key = key;
+      recycled.scope = scope;
+      recycled.dir = dir;
+      recycled.slotMs = slotMs;
+      recycled.prev = undefined;
+      recycled.next = undefined;
+      recycled.lastAt = Number.NEGATIVE_INFINITY;
+      this.clearStateWindow(recycled);
+      return recycled;
+    }
+    const slotIds = new Float64Array(RING_SLOTS);
+    slotIds.fill(Number.NEGATIVE_INFINITY);
+    return {
+      key,
+      scope,
+      dir,
+      slotMs,
+      slotIds,
+      slotCounts: new Uint32Array(RING_SLOTS * COUNT_FIELDS),
+      oldestSlot: Number.POSITIVE_INFINITY,
+      lastSlot: Number.NEGATIVE_INFINITY,
+      counts: { created: 0, modified: 0, deleted: 0, agentCreated: 0, agentModified: 0, agentDeleted: 0 },
+      lastAt: Number.NEGATIVE_INFINITY,
+      wake: false,
+      deletion: false,
+      agentOnly: false,
+      rolledUp: false,
+    };
+  }
+
+  private recycleState(st: DirState): void {
+    st.prev = undefined;
+    st.next = undefined;
+    if (this.pool.length < Math.min(this.maxDirectories, 256)) {
+      this.pool.push(st);
+    }
+  }
+
+  private clearStateWindow(st: DirState): void {
+    st.slotIds.fill(Number.NEGATIVE_INFINITY);
+    st.oldestSlot = Number.POSITIVE_INFINITY;
+    st.lastSlot = Number.NEGATIVE_INFINITY;
+    st.counts.created = 0;
+    st.counts.modified = 0;
+    st.counts.deleted = 0;
+    st.counts.agentCreated = 0;
+    st.counts.agentModified = 0;
+    st.counts.agentDeleted = 0;
+    st.wake = false;
+    st.deletion = false;
+    st.agentOnly = false;
+    st.rolledUp = false;
+  }
+
   private linkTail(st: DirState): void {
     st.prev = this.tail;
     st.next = undefined;
     if (this.tail) this.tail.next = st;
     else this.head = st;
     this.tail = st;
+  }
+
+  private insertBefore(st: DirState, anchor: DirState | undefined): void {
+    if (!anchor) {
+      this.linkTail(st);
+      return;
+    }
+    const prev = anchor.prev;
+    st.prev = prev;
+    st.next = anchor;
+    anchor.prev = st;
+    if (prev) prev.next = st;
+    else this.head = st;
+  }
+
+  private insertByLastAt(st: DirState): void {
+    let cur = this.head;
+    while (cur && cur.lastAt <= st.lastAt) cur = cur.next;
+    this.insertBefore(st, cur);
   }
 
   private unlink(st: DirState): void {
@@ -161,6 +291,7 @@ export class FileBurstDetector {
    */
   setScopes(scopes: readonly string[]): void {
     if (scopes.length === 0) {
+      for (const entry of this.dirs.values()) this.recycleState(entry);
       this.dirs.clear();
       this.head = undefined;
       this.tail = undefined;
@@ -171,6 +302,7 @@ export class FileBurstDetector {
       if (!retained.has(entry.scope)) {
         this.unlink(entry);
         this.dirs.delete(key);
+        this.recycleState(entry);
       }
     }
   }
@@ -248,7 +380,7 @@ export class FileBurstDetector {
         ? this.groups(path, signal.kind === 'file.activity')
         : dirs.length <= 1
           ? dirs
-          : [...new Map(dirs.map((t) => [`${t.scope}${t.dir}`, t] as const)).values()];
+          : [...new Map(dirs.map((t) => [`${t.scope}\0${t.dir}`, t] as const)).values()];
     if (targets.length === 0) return EMPTY_SIGNALS; // outside every watched scope
     const lim = this.limits();
     this.lastReceived = receivedAt;
@@ -259,29 +391,249 @@ export class FileBurstDetector {
       const old = this.head;
       this.unlink(old);
       this.dirs.delete(old.key);
+      this.recycleState(old);
     }
     let out: BodySignal[] | undefined;
     for (let i = 0; i < targets.length; i++) {
-      const emitted = this.record(targets[i] as BurstTarget, signal, items, receivedAt, lim);
-      if (emitted) {
-        out ??= [];
-        out.push(emitted);
-      }
+      out = this.record(targets[i] as BurstTarget, signal, items, receivedAt, lim, out);
     }
     return out ?? EMPTY_SIGNALS;
   }
 
-  private adjustCounts(c: Counts, change: Change, agent: boolean, delta: number): void {
-    if (change === 'add') {
-      c.created += delta;
-      if (agent) c.agentCreated += delta;
-    } else if (change === 'modify') {
-      c.modified += delta;
-      if (agent) c.agentModified += delta;
+  private addSlotCounts(
+    st: DirState,
+    slotIdx: number,
+    c0: number,
+    c1: number,
+    c2: number,
+    c3: number,
+    c4: number,
+    c5: number,
+  ): void {
+    const pos = ringPos(slotIdx);
+    const base = pos * COUNT_FIELDS;
+    if (st.slotIds[pos] !== slotIdx) {
+      st.slotIds[pos] = slotIdx;
+      st.slotCounts[base] = c0;
+      st.slotCounts[base + 1] = c1;
+      st.slotCounts[base + 2] = c2;
+      st.slotCounts[base + 3] = c3;
+      st.slotCounts[base + 4] = c4;
+      st.slotCounts[base + 5] = c5;
     } else {
-      c.deleted += delta;
-      if (agent) c.agentDeleted += delta;
+      st.slotCounts[base] = (st.slotCounts[base] as number) + c0;
+      st.slotCounts[base + 1] = (st.slotCounts[base + 1] as number) + c1;
+      st.slotCounts[base + 2] = (st.slotCounts[base + 2] as number) + c2;
+      st.slotCounts[base + 3] = (st.slotCounts[base + 3] as number) + c3;
+      st.slotCounts[base + 4] = (st.slotCounts[base + 4] as number) + c4;
+      st.slotCounts[base + 5] = (st.slotCounts[base + 5] as number) + c5;
     }
+    st.counts.created += c0;
+    st.counts.modified += c1;
+    st.counts.deleted += c2;
+    st.counts.agentCreated += c3;
+    st.counts.agentModified += c4;
+    st.counts.agentDeleted += c5;
+    if (slotIdx < st.oldestSlot) st.oldestSlot = slotIdx;
+    if (slotIdx > st.lastSlot) st.lastSlot = slotIdx;
+  }
+
+  private pruneState(st: DirState, receivedAt: number, windowMs: number): void {
+    const nextSlotMs = slotWidthMs(windowMs);
+    const cutoff = receivedAt - windowMs;
+    const cutoffSlot = Math.floor(cutoff / nextSlotMs);
+    if (st.lastSlot === Number.NEGATIVE_INFINITY) {
+      st.slotMs = nextSlotMs;
+      return;
+    }
+    if (st.slotMs !== nextSlotMs) {
+      const oldSlotMs = st.slotMs;
+      const saved = this.rebucketBuf;
+      saved.length = 0;
+      for (let s = st.oldestSlot; s <= st.lastSlot; s++) {
+        const pos = ringPos(s);
+        if (st.slotIds[pos] !== s) continue;
+        const at = s * oldSlotMs;
+        if (at < cutoff) continue;
+        const base = pos * COUNT_FIELDS;
+        saved.push({
+          at,
+          c0: st.slotCounts[base] as number,
+          c1: st.slotCounts[base + 1] as number,
+          c2: st.slotCounts[base + 2] as number,
+          c3: st.slotCounts[base + 3] as number,
+          c4: st.slotCounts[base + 4] as number,
+          c5: st.slotCounts[base + 5] as number,
+        });
+      }
+      const { wake, deletion, agentOnly, rolledUp } = st;
+      this.clearStateWindow(st);
+      st.slotMs = nextSlotMs;
+      if (saved.length > 0) {
+        st.wake = wake;
+        st.deletion = deletion;
+        st.agentOnly = agentOnly;
+        st.rolledUp = rolledUp;
+        for (let i = 0; i < saved.length; i++) {
+          const item = saved[i]!;
+          this.addSlotCounts(
+            st,
+            Math.floor(item.at / nextSlotMs),
+            item.c0,
+            item.c1,
+            item.c2,
+            item.c3,
+            item.c4,
+            item.c5,
+          );
+        }
+      }
+      saved.length = 0;
+      return;
+    }
+
+    if (cutoffSlot > st.lastSlot) {
+      this.clearStateWindow(st);
+      return;
+    }
+    if (st.oldestSlot < cutoffSlot) {
+      for (let s = st.oldestSlot; s < cutoffSlot; s++) {
+        const pos = ringPos(s);
+        if (st.slotIds[pos] !== s) continue;
+        const base = pos * COUNT_FIELDS;
+        st.counts.created -= st.slotCounts[base] as number;
+        st.counts.modified -= st.slotCounts[base + 1] as number;
+        st.counts.deleted -= st.slotCounts[base + 2] as number;
+        st.counts.agentCreated -= st.slotCounts[base + 3] as number;
+        st.counts.agentModified -= st.slotCounts[base + 4] as number;
+        st.counts.agentDeleted -= st.slotCounts[base + 5] as number;
+        st.slotIds[pos] = Number.NEGATIVE_INFINITY;
+      }
+      st.oldestSlot = cutoffSlot;
+      if (st.counts.created + st.counts.modified + st.counts.deleted === 0) {
+        st.slotIds.fill(Number.NEGATIVE_INFINITY);
+        st.oldestSlot = Number.POSITIVE_INFINITY;
+        st.lastSlot = Number.NEGATIVE_INFINITY;
+        st.wake = false;
+        st.deletion = false;
+        st.agentOnly = false;
+        st.rolledUp = false;
+      }
+    }
+  }
+
+  private mergeStateInto(target: DirState, child: DirState, receivedAt: number, windowMs: number): void {
+    this.pruneState(target, receivedAt, windowMs);
+    this.pruneState(child, receivedAt, windowMs);
+    if (child.lastSlot === Number.NEGATIVE_INFINITY) return;
+    for (let s = child.oldestSlot; s <= child.lastSlot; s++) {
+      const pos = ringPos(s);
+      if (child.slotIds[pos] !== s) continue;
+      const base = pos * COUNT_FIELDS;
+      this.addSlotCounts(
+        target,
+        s,
+        child.slotCounts[base] as number,
+        child.slotCounts[base + 1] as number,
+        child.slotCounts[base + 2] as number,
+        child.slotCounts[base + 3] as number,
+        child.slotCounts[base + 4] as number,
+        child.slotCounts[base + 5] as number,
+      );
+    }
+    target.rolledUp = true;
+    target.wake ||= child.wake;
+    target.deletion ||= child.deletion;
+    target.agentOnly ||= child.agentOnly;
+  }
+
+  private findAncestorInDirs(scope: string, dir: string): DirState | undefined {
+    const root = scopeRoot(scope);
+    let cur = parentDirWithin(dir, root);
+    while (cur !== undefined) {
+      const found = this.dirs.get(`${scope}\0${cur}`);
+      if (found) return found;
+      cur = parentDirWithin(cur, root);
+    }
+    return undefined;
+  }
+
+  private rollUpOldestUntilUnderCap(
+    signal: Signal,
+    receivedAt: number,
+    lim: { windowMs: number; maxChanges: number; maxDeleted: number },
+    out: BodySignal[] | undefined,
+  ): BodySignal[] | undefined {
+    while (this.dirs.size >= this.maxDirectories) {
+      let picked: DirState | undefined;
+      let existingParent: DirState | undefined;
+      for (let cur = this.head; cur !== undefined; cur = cur.next) {
+        const anc = this.findAncestorInDirs(cur.scope, cur.dir);
+        if (anc) {
+          picked = cur;
+          existingParent = anc;
+          break;
+        }
+      }
+      if (picked && existingParent) {
+        this.unlink(picked);
+        this.dirs.delete(picked.key);
+        this.mergeStateInto(existingParent, picked, receivedAt, lim.windowMs);
+        if (picked.lastAt > existingParent.lastAt) {
+          existingParent.lastAt = picked.lastAt;
+          this.unlink(existingParent);
+          this.insertByLastAt(existingParent);
+        }
+        this.recycleState(picked);
+        const emitted = this.evaluateLatches(
+          { scope: existingParent.scope, dir: existingParent.dir },
+          existingParent,
+          signal,
+          receivedAt,
+          lim,
+        );
+        if (emitted) {
+          out ??= [];
+          out.push(emitted);
+        }
+        continue;
+      }
+      let bestDepth = -1;
+      let pDir: string | undefined;
+      for (let cur = this.head; cur !== undefined; cur = cur.next) {
+        const candidate = parentDirWithin(cur.dir, scopeRoot(cur.scope));
+        if (candidate === undefined) continue;
+        const depth = pathDepth(cur.dir);
+        if (depth > bestDepth) {
+          bestDepth = depth;
+          picked = cur;
+          pDir = candidate;
+        }
+      }
+      if (!picked || pDir === undefined) {
+        if (!this.head) break;
+        const oldest = this.head;
+        this.unlink(oldest);
+        this.dirs.delete(oldest.key);
+        this.recycleState(oldest);
+        break;
+      }
+      const nextAfter = picked.next;
+      this.unlink(picked);
+      this.dirs.delete(picked.key);
+      this.pruneState(picked, receivedAt, lim.windowMs);
+      if (picked.lastSlot === Number.NEGATIVE_INFINITY) {
+        this.recycleState(picked);
+        continue;
+      }
+      const pKey = `${picked.scope}\0${pDir}`;
+      picked.key = pKey;
+      picked.dir = pDir;
+      picked.rolledUp = true;
+      this.dirs.set(pKey, picked);
+      this.insertBefore(picked, nextAfter);
+    }
+    return out;
   }
 
   private hasOverlappingWake(
@@ -313,77 +665,68 @@ export class FileBurstDetector {
     items: readonly { change: Change; count: number }[],
     receivedAt: number,
     lim: { windowMs: number; maxChanges: number; maxDeleted: number },
-  ): BodySignal | undefined {
-    const key = `${target.scope}${target.dir}`;
+    out: BodySignal[] | undefined,
+  ): BodySignal[] | undefined {
+    const key = `${target.scope}\0${target.dir}`;
     let st = this.dirs.get(key);
-    if (st && receivedAt < st.lastAt) return undefined; // backward per-directory event
+    if (st && receivedAt < st.lastAt) return out; // backward per-directory event
     if (st) {
-      const cutoff = receivedAt - lim.windowMs;
-      for (;;) {
-        const evicted = st.win.shiftBefore(cutoff);
-        if (!evicted) break;
-        this.adjustCounts(st.counts, evicted.change, evicted.agent, -evicted.count);
-      }
-      if (st.win.size === 0) {
-        st.counts.created = 0;
-        st.counts.modified = 0;
-        st.counts.deleted = 0;
-        st.counts.agentCreated = 0;
-        st.counts.agentModified = 0;
-        st.counts.agentDeleted = 0;
-        st.wake = false;
-        st.deletion = false;
-        st.agentOnly = false;
-      }
+      this.pruneState(st, receivedAt, lim.windowMs);
       this.moveToTail(st);
-    } else {
-      let reused: DirState | undefined;
-      if (this.dirs.size >= this.maxDirectories && this.head) {
-        const oldest = this.head;
-        this.unlink(oldest);
-        this.dirs.delete(oldest.key);
-        if (oldest.win.capacity <= 64) {
-          reused = oldest;
-          reused.key = key;
-          reused.scope = target.scope;
-          reused.dir = target.dir;
-          reused.win.clear();
-          reused.counts.created = 0;
-          reused.counts.modified = 0;
-          reused.counts.deleted = 0;
-          reused.counts.agentCreated = 0;
-          reused.counts.agentModified = 0;
-          reused.counts.agentDeleted = 0;
-          reused.lastAt = Number.NEGATIVE_INFINITY;
-          reused.wake = false;
-          reused.deletion = false;
-          reused.agentOnly = false;
+    } else if (this.dirs.size >= this.maxDirectories) {
+      const ancestor = this.findAncestorInDirs(target.scope, target.dir);
+      if (ancestor) {
+        st = ancestor;
+        this.pruneState(st, receivedAt, lim.windowMs);
+        st.rolledUp = true;
+        this.moveToTail(st);
+      } else {
+        out = this.rollUpOldestUntilUnderCap(signal, receivedAt, lim, out);
+        const afterAncestor = this.findAncestorInDirs(target.scope, target.dir);
+        if (afterAncestor) {
+          st = afterAncestor;
+          this.pruneState(st, receivedAt, lim.windowMs);
+          st.rolledUp = true;
+          this.moveToTail(st);
+        } else {
+          st = this.allocState(key, target.scope, target.dir, slotWidthMs(lim.windowMs));
+          this.dirs.set(key, st);
+          this.linkTail(st);
         }
       }
-      st = reused ?? {
-        key,
-        scope: target.scope,
-        dir: target.dir,
-        win: new TimeWindow<FileEvent>(),
-        counts: { created: 0, modified: 0, deleted: 0, agentCreated: 0, agentModified: 0, agentDeleted: 0 },
-        lastAt: Number.NEGATIVE_INFINITY,
-        wake: false,
-        deletion: false,
-        agentOnly: false,
-      };
+    } else {
+      st = this.allocState(key, target.scope, target.dir, slotWidthMs(lim.windowMs));
       this.dirs.set(key, st);
       this.linkTail(st);
     }
     st.lastAt = receivedAt;
+    const slotIdx = Math.floor(receivedAt / st.slotMs);
     const agent = signal.cause === 'agent';
     for (let i = 0; i < items.length; i++) {
       const item = items[i] as { change: Change; count: number };
-      st.win.push({ at: receivedAt, change: item.change, agent, count: item.count });
-      this.adjustCounts(st.counts, item.change, agent, item.count);
+      const c = item.count;
+      if (item.change === 'add') this.addSlotCounts(st, slotIdx, c, 0, 0, agent ? c : 0, 0, 0);
+      else if (item.change === 'modify') this.addSlotCounts(st, slotIdx, 0, c, 0, 0, agent ? c : 0, 0);
+      else this.addSlotCounts(st, slotIdx, 0, 0, c, 0, 0, agent ? c : 0);
     }
+    const emitted = this.evaluateLatches({ scope: st.scope, dir: st.dir }, st, signal, receivedAt, lim);
+    if (emitted) {
+      out ??= [];
+      out.push(emitted);
+    }
+    return out;
+  }
+
+  private evaluateLatches(
+    target: BurstTarget,
+    st: DirState,
+    signal: Signal,
+    receivedAt: number,
+    lim: { windowMs: number; maxChanges: number; maxDeleted: number },
+  ): BodySignal | undefined {
     const counts = st.counts;
     const extDeleted = counts.deleted - counts.agentDeleted;
-    const extTotal = counts.created + counts.modified + counts.deleted - extCounts(counts);
+    const extTotal = counts.created + counts.modified + counts.deleted - agentCounts(counts);
     const externalDeletionExceeded = extDeleted > lim.maxDeleted;
     const totalCrossed = extTotal > lim.maxChanges && !st.wake;
     const deletionCrossed = externalDeletionExceeded && !st.deletion;
@@ -441,10 +784,11 @@ export class FileBurstDetector {
         scope: st.scope,
         windowMs: lim.windowMs,
         externalDeletionExceeded,
+        ...(st.rolledUp ? { rolledUp: true } : {}),
         ...c,
       },
     };
   }
 }
 
-const extCounts = (c: Counts): number => c.agentCreated + c.agentModified + c.agentDeleted;
+const agentCounts = (c: Counts): number => c.agentCreated + c.agentModified + c.agentDeleted;

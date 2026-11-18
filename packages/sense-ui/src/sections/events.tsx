@@ -53,6 +53,7 @@ function DetailLine({ d }: { d: EventDetail }) {
       return (
         <span className={css.detailLine}>
           {d.directory} · {formatDuration(d.windowMs / 1000)}内 新增 {d.created} · 修改 {d.modified} · 删除 {d.deleted}
+          {d.rolledUp ? ' · 已上卷' : ''}
           {d.excessiveDeletion ? ' · 过量删除' : ''}
         </span>
       );

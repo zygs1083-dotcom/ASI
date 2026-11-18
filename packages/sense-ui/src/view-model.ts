@@ -153,6 +153,7 @@ export type EventDetail =
       modified: number;
       deleted: number;
       excessiveDeletion: boolean;
+      rolledUp?: boolean;
     }
   | {
       kind: 'file.activity';
@@ -304,6 +305,7 @@ export interface SensePanelProps {
   onPause: (paused: boolean) => void;
   onToggleTitles: (enabled: boolean) => void;
   onToggleGlobalFileWatch?: (enabled: boolean) => void;
+  onRetryGlobalFileWatch?: () => void | Promise<void>;
   onAddFileExclusion?: (pattern: string) => Promise<void>;
   onRemoveFileExclusion?: (pattern: string) => Promise<void>;
   onOpenPermissionSettings: () => void;

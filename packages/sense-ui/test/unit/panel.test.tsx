@@ -868,13 +868,14 @@ describe('全盘文件监视与活动视图', () => {
     expect(screen.getByText(/全盘按目录与时间窗聚合的文件活动/)).toBeTruthy();
   });
 
-  it('unavailable 时禁选关闭全盘开关，显示含上卷计数，并在排除项校验失败时展示错误', async () => {
+  it('unsupported 时禁选关闭全盘开关，显示含上卷计数与已上卷爆发，并在排除项校验失败时展示错误', async () => {
     const base = makeScenario('healthy');
-    const unavailableState = makeState();
-    unavailableState.env.globalFileWatch = {
+    const unsupportedState = makeState();
+    unsupportedState.env.globalFileWatch = {
       value: {
         enabled: true,
-        status: 'disabled',
+        status: 'unsupported',
+        reason: '当前平台不支持全盘 FSEvents 监视',
         root: '/',
         windowMs: 10_000,
         eventsPerSec: 0,
@@ -883,7 +884,7 @@ describe('全盘文件监视与活动视图', () => {
         deniedPaths: [],
         exclusions: ['node_modules'],
       },
-      status: 'unavailable',
+      status: 'unsupported',
       reason: '当前平台不支持全盘 FSEvents 监视',
       observedAt: T0,
       ttlMs: 60_000,
@@ -893,7 +894,7 @@ describe('全盘文件监视与活动视图', () => {
     renderPanel(
       {
         ...base,
-        state: unavailableState,
+        state: unsupportedState,
         events: [
           {
             signal: {
@@ -919,6 +920,30 @@ describe('全盘文件监视与活动视图', () => {
               files: ['report, final.pdf'],
             },
           },
+          {
+            signal: {
+              id: 'fb-roll',
+              kind: 'file.burst',
+              at: T0 - 500,
+              source: { id: 'files-global', api: 'watch', host: 'local' },
+              subject: '/demo/mono',
+              data: {},
+              cause: 'unknown',
+            },
+            level: 'wake',
+            reason: 'file-burst',
+            cause: 'unknown',
+            detail: {
+              kind: 'file.burst',
+              directory: '/demo/mono',
+              windowMs: 10_000,
+              created: 20,
+              modified: 5,
+              deleted: 0,
+              excessiveDeletion: false,
+              rolledUp: true,
+            },
+          },
         ],
       },
       { onAddFileExclusion },
@@ -927,13 +952,68 @@ describe('全盘文件监视与活动视图', () => {
     const checkbox = screen.getByLabelText('全盘文件监视') as HTMLInputElement;
     expect(checkbox.checked).toBe(false);
     expect(checkbox.disabled).toBe(true);
-    expect(screen.getAllByText(/不可用/).length).toBeGreaterThanOrEqual(1);
+    expect(screen.getAllByText(/不支持/).length).toBeGreaterThanOrEqual(1);
+    expect(screen.queryByRole('button', { name: '重试' })).toBeNull();
     expect(screen.getByText(/含上卷 4 条/)).toBeTruthy();
     expect(screen.getByText(/report, final\.pdf/)).toBeTruthy();
+    expect(screen.getByText(/已上卷/)).toBeTruthy();
 
     fireEvent.click(screen.getByText('排除项 1 条'));
     fireEvent.change(screen.getByLabelText('新增排除路径或模式'), { target: { value: './rel' } });
     fireEvent.click(screen.getByRole('button', { name: '添加' }));
     await waitFor(() => expect(screen.getByText('仅支持绝对路径、~/ 路径或单段目录名')).toBeTruthy());
+  });
+
+  it('unavailable 时展示原因与自动重试倒计时，允许开关与立即重试并呈现失败提示', async () => {
+    const base = makeScenario('healthy');
+    const unavailableState = makeState();
+    unavailableState.env.globalFileWatch = {
+      value: {
+        enabled: true,
+        status: 'unavailable',
+        reason: 'FSEvents 启动失败',
+        retryAt: T0 + 30_000,
+        root: '/',
+        windowMs: 10_000,
+        eventsPerSec: 0,
+        degraded: false,
+        countOnly: false,
+        deniedPaths: [],
+        exclusions: [],
+      },
+      status: 'unavailable',
+      reason: 'FSEvents 启动失败',
+      observedAt: T0,
+      ttlMs: 60_000,
+      source: { id: 'files-global', api: 'watch', host: 'local' },
+    };
+
+    const onToggleGlobalFileWatch = vi.fn();
+    let rejectRetry: (err: Error) => void = () => {};
+    const onRetryGlobalFileWatch = vi.fn(
+      () =>
+        new Promise<void>((_resolve, reject) => {
+          rejectRetry = reject;
+        }),
+    );
+
+    renderPanel({ ...base, now: T0, state: unavailableState }, { onToggleGlobalFileWatch, onRetryGlobalFileWatch });
+
+    const checkbox = screen.getByLabelText('全盘文件监视') as HTMLInputElement;
+    expect(checkbox.checked).toBe(true);
+    expect(checkbox.disabled).toBe(false);
+    expect(screen.getByText(/不可用（FSEvents 启动失败） · 30 秒后自动重试/)).toBeTruthy();
+
+    fireEvent.click(checkbox);
+    expect(onToggleGlobalFileWatch).toHaveBeenCalledWith(false);
+
+    const retryBtn = screen.getByRole('button', { name: '重试' }) as HTMLButtonElement;
+    fireEvent.click(retryBtn);
+    expect(onRetryGlobalFileWatch).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole('button', { name: '重试中' }).hasAttribute('disabled')).toBe(true);
+
+    rejectRetry(new Error('重试仍失败'));
+    await waitFor(() => expect(screen.getByRole('alert').textContent).toBe('重试仍失败'));
+    expect(screen.getByRole('button', { name: '重试' })).toBeTruthy();
   });
 });

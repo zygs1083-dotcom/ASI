@@ -12,6 +12,7 @@ type Api = Pick<
   | 'pause'
   | 'setSendTitles'
   | 'setGlobalFileWatch'
+  | 'retryGlobalFileWatch'
   | 'addFileExclusion'
   | 'removeFileExclusion'
   | 'openPermissionSettings'
@@ -71,6 +72,7 @@ export function createActions(api: Api) {
     onPause: (paused) => fire(api.pause(paused)),
     onToggleTitles: (enabled) => fire(api.setSendTitles(enabled)),
     onToggleGlobalFileWatch: (enabled) => fire(api.setGlobalFileWatch(enabled)),
+    onRetryGlobalFileWatch: () => complete(() => api.retryGlobalFileWatch()),
     onAddFileExclusion: (pattern) => complete(() => api.addFileExclusion(pattern)),
     onRemoveFileExclusion: (pattern) => complete(() => api.removeFileExclusion(pattern)),
     onOpenPermissionSettings: () => fire(api.openPermissionSettings()),

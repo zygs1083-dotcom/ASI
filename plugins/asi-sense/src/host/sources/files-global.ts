@@ -1,11 +1,13 @@
 import os from 'node:os';
 import path from 'node:path';
+import { performance } from 'node:perf_hooks';
 import type { GlobalFileWatchStatus, GlobalFileWatchValue, Signal } from '@asi/sense-types';
+import { canonicalizeDarwinAlias, normalizeAbsPath, normalizeWatchPath, resolveRealPath } from '../attention/path.ts';
 import type { BurstTarget } from '../body/burst.ts';
 import type { RuntimeAttention } from '../runtime/attention.ts';
 import type { Clock, FileChange, FileWatcher, GlobalFileWatchOptions } from '../runtime/ports.ts';
 import type { DshSource } from './dsh.ts';
-import { ExclusionMatcher, normalizeAbsPath, resolvePathVariants } from './file-exclusions.ts';
+import { ExclusionMatcher, resolvePathVariants } from './file-exclusions.ts';
 
 const source = { id: 'files-global', api: 'watch', host: 'local' };
 const deniedSubSource = { id: 'files-global-denied', api: 'watch', host: 'local' };
@@ -17,6 +19,12 @@ const DEFAULT_DEGRADED_WINDOW_MS = 60_000;
 const DEFAULT_RECOVERY_WINDOW_MS = 30_000;
 const MAX_BUCKETS = 2_000;
 const MAX_FILES_PER_BUCKET = 5;
+const MAX_FLUSH_SLICE_BUCKETS = 200;
+const MAX_FLUSH_SLICE_MS = 8;
+const MAX_DENIED_PATHS = 100;
+const BASE_RETRY_BACKOFF_MS = 30_000;
+const MAX_RETRY_BACKOFF_MS = 1_800_000;
+const HEALTHY_RESET_MS = 60_000;
 
 interface ActivityGroup {
   created: number;
@@ -31,7 +39,17 @@ interface ActivityBucket {
   latestAt: number;
   ext?: ActivityGroup;
   agent?: ActivityGroup;
+  bDirty?: boolean;
+  bMonoAt: number;
+  bExtCreated: number;
+  bExtModified: number;
+  bExtDeleted: number;
+  bAgentCreated: number;
+  bAgentModified: number;
+  bAgentDeleted: number;
 }
+
+const IMMEDIATE_BURST_CAP_PER_SEC = 256;
 
 function resolveDataDirs(dirs: readonly string[] | undefined, platform: string): string[] {
   if (!dirs?.length) return [];
@@ -53,6 +71,27 @@ function newGroup(): ActivityGroup {
   return { created: 0, modified: 0, deleted: 0, rolledUp: 0, files: new Set() };
 }
 
+function newBucket(dir: string, latestAt: number): ActivityBucket {
+  return {
+    dir,
+    latestAt,
+    bMonoAt: 0,
+    bExtCreated: 0,
+    bExtModified: 0,
+    bExtDeleted: 0,
+    bAgentCreated: 0,
+    bAgentModified: 0,
+    bAgentDeleted: 0,
+  };
+}
+
+function normalizeDeniedDisplayPath(rawPath: string, platform: string): string | undefined {
+  const norm = normalizeAbsPath(rawPath);
+  if (!norm) return undefined;
+  const resolved = resolveRealPath(norm) ?? norm;
+  return canonicalizeDarwinAlias(resolved, platform);
+}
+
 function parentDir(dir: string, root: string): string | undefined {
   if (dir === root || dir === '/') return undefined;
   if (root !== '/' && !dir.startsWith(`${root}/`)) return undefined;
@@ -63,6 +102,7 @@ function parentDir(dir: string, root: string): string | undefined {
 }
 
 export class FileGlobalSource {
+  private readonly watchRoot: string;
   private readonly root: string;
   private readonly baseWindowMs: number;
   private readonly budgetPerSec: number;
@@ -74,19 +114,29 @@ export class FileGlobalSource {
 
   private handle?: { close(): void | Promise<void> };
   private exclusions: ExclusionMatcher;
+  private readonly dirCache = new Map<string, string>();
+  private readonly splitDir = { dir: '' };
   private stopped = false;
   private tail = Promise.resolve();
   private flushEpoch = 0;
 
   private buckets = new Map<string, ActivityBucket>();
+  private readonly dirtyBurst = new Set<ActivityBucket>();
   private windowStartMono?: number;
   private windowDeadlineMono?: number;
 
+  private readonly deniedKeys = new Set<string>();
   private readonly deniedPaths = new Set<string>();
   private rootDenied = false;
   private watchUnavailable = false;
-  private rebuildAttempts = 0;
+  private unavailableReason?: string;
+  private retryDeadlineMono?: number;
+  private retryAt?: number;
+  private retryFailures = 0;
+  private immediateRebuildUsed = false;
+  private openedMono = 0;
   private unsupportedReported = false;
+  private rawSeq = 0;
 
   private degraded = false;
   private countOnly = false;
@@ -121,7 +171,8 @@ export class FileGlobalSource {
     private readonly options: GlobalFileWatchOptions = {},
     private readonly platform: string = process.platform,
   ) {
-    this.root = normalizeAbsPath(options.root ?? '/') ?? '/';
+    this.watchRoot = normalizeAbsPath(options.root ?? '/') ?? '/';
+    this.root = normalizeWatchPath(this.watchRoot, this.platform) ?? '/';
     this.baseWindowMs = options.windowMs ?? DEFAULT_WINDOW_MS;
     this.budgetPerSec = options.budgetPerSec ?? DEFAULT_BUDGET_PER_SEC;
     this.budgetSustainMs = options.budgetSustainMs ?? DEFAULT_BUDGET_SUSTAIN_MS;
@@ -137,6 +188,7 @@ export class FileGlobalSource {
       !this.stopped &&
       !this.paused() &&
       this.settings.globalFileWatch &&
+      this.supportedPlatform() &&
       this.handle !== undefined &&
       !this.rootDenied &&
       !this.watchUnavailable
@@ -151,10 +203,37 @@ export class FileGlobalSource {
     return this.degraded ? this.degradedWindowMs : this.baseWindowMs;
   }
 
-  /** Clears latched watch failure state when the user explicitly toggles global watch. */
+  /** Clears latched watch failure state when the user explicitly toggles or retries global watch. */
   resetWatchAvailability(): void {
+    this.clearUnavailable();
+  }
+
+  /** Immediately retries opening the global watch (user action). */
+  retry(): Promise<void> {
+    this.resetWatchAvailability();
+    return this.refresh();
+  }
+
+  private clearUnavailable(): void {
     this.watchUnavailable = false;
-    this.rebuildAttempts = 0;
+    this.unavailableReason = undefined;
+    this.retryDeadlineMono = undefined;
+    this.retryAt = undefined;
+    this.retryFailures = 0;
+    this.immediateRebuildUsed = false;
+  }
+
+  private formatUnavailableReason(code?: string): string {
+    return code ? `全盘文件监视出错（${code}）` : '全盘文件监视出错';
+  }
+
+  private enterUnavailable(code?: string): void {
+    this.watchUnavailable = true;
+    this.unavailableReason = this.formatUnavailableReason(code);
+    const delay = Math.min(MAX_RETRY_BACKOFF_MS, BASE_RETRY_BACKOFF_MS * 2 ** Math.min(this.retryFailures, 10));
+    this.retryFailures++;
+    this.retryDeadlineMono = this.clock.mono() + delay;
+    this.retryAt = this.clock.wall() + delay;
   }
 
   private wantsWatch(): boolean {
@@ -163,11 +242,23 @@ export class FileGlobalSource {
 
   private currentStatus(): GlobalFileWatchStatus {
     if (!this.settings.globalFileWatch || this.stopped || this.options.disableInTests) return 'disabled';
+    if (!this.supportedPlatform()) return 'unsupported';
     if (this.rootDenied) return 'denied';
-    if (this.watchUnavailable || this.paused()) return 'disabled';
+    if (this.paused()) return 'disabled';
+    if (this.watchUnavailable) return 'unavailable';
     if (this.degraded) return 'degraded';
     if (this.deniedPaths.size > 0) return 'partial-denied';
     return 'running';
+  }
+
+  private publishCurrentFact(): void {
+    if (this.rootDenied) {
+      this.publishFact('denied', '全盘文件监视无权限');
+    } else if (this.watchUnavailable) {
+      this.publishFact('unavailable', this.unavailableReason);
+    } else {
+      this.publishFact('ok');
+    }
   }
 
   private supportedPlatform(): boolean {
@@ -176,6 +267,7 @@ export class FileGlobalSource {
 
   private resetRuntimeState(): void {
     this.buckets.clear();
+    this.dirtyBurst.clear();
     this.windowStartMono = undefined;
     this.windowDeadlineMono = undefined;
     this.secStartMono = undefined;
@@ -198,20 +290,30 @@ export class FileGlobalSource {
     try {
       let current: { close(): void | Promise<void> } | undefined;
       current = this.watcher.watch(
-        this.root,
+        this.watchRoot,
         (event) => {
           if (current) this.onWatcherEvent(current, event);
         },
         { recursive: true },
       );
       this.handle = current;
+      this.watchUnavailable = false;
+      this.unavailableReason = undefined;
+      this.retryDeadlineMono = undefined;
+      this.retryAt = undefined;
+      this.openedMono = this.clock.mono();
+      if (probeProtected) {
+        this.retryFailures = 0;
+        this.immediateRebuildUsed = false;
+      }
       if (!this.degraded) await this.emitSourceStatus('ok');
       if (probeProtected) {
         for (const dir of this.options.protectedDirs ?? []) {
-          const norm = normalizeAbsPath(dir);
-          if (!norm || this.exclusions.isExcluded(norm)) continue;
-          if (this.options.probeAccess?.(norm) === false) {
-            await this.handleDenied(norm, norm === this.root);
+          const norm = normalizeWatchPath(dir, this.platform, this.dirCache);
+          if (!norm || this.exclusions.isExcludedNormalized(norm)) continue;
+          if (this.options.probeAccess?.(dir) === false) {
+            const display = normalizeDeniedDisplayPath(dir, this.platform) ?? dir;
+            await this.handleDenied(norm, display, norm === this.root || norm === this.watchRoot);
           }
         }
       }
@@ -219,11 +321,14 @@ export class FileGlobalSource {
     } catch (error) {
       const code = (error as NodeJS.ErrnoException)?.code;
       if (code === 'EPERM' || code === 'EACCES') {
-        await this.handleDenied(this.root, true);
+        await this.handleDenied(this.root, this.watchRoot, true);
       } else {
-        this.watchUnavailable = true;
+        this.enterUnavailable(code);
         this.setGlobalScope(false);
-        await this.emitSourceStatus('error', { error: code ?? 'watch-failed' });
+        await this.emitSourceStatus('unavailable', {
+          error: code ?? 'watch-failed',
+          reason: this.unavailableReason,
+        });
       }
       return false;
     }
@@ -234,6 +339,7 @@ export class FileGlobalSource {
       this.flushEpoch++;
     }
     const run = this.tail.then(async () => {
+      this.dirCache.clear();
       const enabled = this.settings.globalFileWatch;
       const wantsWatch = this.wantsWatch();
       const supported = this.supportedPlatform();
@@ -243,19 +349,21 @@ export class FileGlobalSource {
         this.resetRuntimeState();
         if (!enabled || this.stopped || this.options.disableInTests) {
           this.rootDenied = false;
-          this.watchUnavailable = false;
-          this.rebuildAttempts = 0;
+          this.clearUnavailable();
+          this.deniedKeys.clear();
           this.deniedPaths.clear();
+        } else if (this.paused()) {
+          this.clearUnavailable();
         }
         this.setGlobalScope(false);
         if (!this.stopped && !this.attention.isStopped()) {
           if (wantsWatch && !supported) {
-            this.watchUnavailable = true;
+            this.clearUnavailable();
             if (!this.unsupportedReported) {
               this.unsupportedReported = true;
-              await this.emitSourceStatus('unavailable', { reason: 'unsupported-platform' });
+              await this.emitSourceStatus('unsupported', { reason: 'unsupported-platform' });
             }
-            this.publishFact('unavailable', '当前平台不支持全盘 FSEvents 监视');
+            this.publishFact('unsupported', '当前平台不支持全盘 FSEvents 监视');
           } else {
             if (!enabled) await this.emitSourceStatus('unavailable', { reason: 'disabled' });
             this.publishFact('ok');
@@ -277,11 +385,7 @@ export class FileGlobalSource {
       }
 
       this.setGlobalScope(this.isWatching());
-      if (this.rootDenied) {
-        this.publishFact('denied', '全盘文件监视无权限');
-      } else {
-        this.publishFact(this.watchUnavailable ? 'unavailable' : 'ok');
-      }
+      this.publishCurrentFact();
       this.maybeReschedule();
       if (this.nextDeadline() === undefined) this.reschedule();
     });
@@ -292,10 +396,14 @@ export class FileGlobalSource {
   async stop(): Promise<void> {
     this.stopped = true;
     this.flushEpoch++;
+    this.dirCache.clear();
     await this.refresh();
   }
 
   nextDeadline(): number | undefined {
+    if (this.watchUnavailable && this.wantsWatch() && this.supportedPlatform() && !this.rootDenied) {
+      return this.retryDeadlineMono;
+    }
     if (!this.isWatching()) return undefined;
     let earliest = this.windowDeadlineMono ?? Number.POSITIVE_INFINITY;
     if (
@@ -309,12 +417,87 @@ export class FileGlobalSource {
     return Number.isFinite(earliest) ? earliest : undefined;
   }
 
+  private flushPendingBurst(): void {
+    if (this.dirtyBurst.size === 0 || this.stopped || this.attention.isStopped()) return;
+    const windowMs = this.currentWindowMs();
+    for (const bucket of this.dirtyBurst) {
+      const target = [{ scope: 'global', dir: bucket.dir }];
+      if (bucket.bExtCreated > 0 || bucket.bExtModified > 0 || bucket.bExtDeleted > 0) {
+        const sig: Signal = {
+          id: `fg:${++this.rawSeq}`,
+          kind: 'file.activity',
+          at: bucket.latestAt,
+          source,
+          subject: bucket.dir,
+          cause: 'unknown',
+          data: {
+            directory: bucket.dir,
+            windowMs,
+            created: bucket.bExtCreated,
+            modified: bucket.bExtModified,
+            deleted: bucket.bExtDeleted,
+          },
+        };
+        bucket.bExtCreated = 0;
+        bucket.bExtModified = 0;
+        bucket.bExtDeleted = 0;
+        const pending = this.burst(sig, target, bucket.bMonoAt);
+        if (pending) void pending.catch(() => {});
+      }
+      if (bucket.bAgentCreated > 0 || bucket.bAgentModified > 0 || bucket.bAgentDeleted > 0) {
+        const sig: Signal = {
+          id: `fg:${++this.rawSeq}`,
+          kind: 'file.activity',
+          at: bucket.latestAt,
+          source,
+          subject: bucket.dir,
+          cause: 'agent',
+          data: {
+            directory: bucket.dir,
+            windowMs,
+            created: bucket.bAgentCreated,
+            modified: bucket.bAgentModified,
+            deleted: bucket.bAgentDeleted,
+          },
+        };
+        bucket.bAgentCreated = 0;
+        bucket.bAgentModified = 0;
+        bucket.bAgentDeleted = 0;
+        const pending = this.burst(sig, target, bucket.bMonoAt);
+        if (pending) void pending.catch(() => {});
+      }
+      bucket.bDirty = false;
+    }
+    this.dirtyBurst.clear();
+  }
+
   tick(): Promise<void> {
+    if (this.watchUnavailable && this.wantsWatch() && this.supportedPlatform() && !this.rootDenied) {
+      if (this.retryDeadlineMono !== undefined && this.clock.mono() >= this.retryDeadlineMono) {
+        const run = this.tail.then(async () => {
+          if (!this.watchUnavailable || !this.wantsWatch() || !this.supportedPlatform() || this.rootDenied) return;
+          if (this.retryDeadlineMono === undefined || this.clock.mono() < this.retryDeadlineMono) return;
+          this.watchUnavailable = false;
+          this.retryDeadlineMono = undefined;
+          this.retryAt = undefined;
+          this.scheduledDeadline = undefined;
+          await this.openWatcher(true);
+          this.setGlobalScope(this.isWatching());
+          this.publishCurrentFact();
+          this.maybeReschedule();
+          if (this.nextDeadline() === undefined) this.reschedule();
+        });
+        this.tail = run.catch(() => {});
+        return run;
+      }
+      return Promise.resolve();
+    }
     if (!this.isWatching()) return Promise.resolve();
     const epoch = this.flushEpoch;
     const run = this.tail.then(async () => {
       if (epoch !== this.flushEpoch || !this.isWatching()) return;
       const mono = this.clock.mono();
+      this.flushPendingBurst();
       const transition = this.advanceBudget(mono);
       if (transition === 'degraded') await this.applyDegraded();
       else if (transition === 'recovered') await this.applyRecovered();
@@ -324,9 +507,46 @@ export class FileGlobalSource {
         this.buckets = new Map();
         this.windowStartMono = undefined;
         this.windowDeadlineMono = undefined;
-        for (const bucket of flushed.values()) {
+        this.scheduledDeadline = undefined;
+        let sliceCap = 24;
+        const iter = flushed.values();
+        for (;;) {
           if (epoch !== this.flushEpoch || !this.isWatching()) break;
-          await this.emitBucket(bucket);
+          const sliceStart = performance.now();
+          const signals: Signal[] = [];
+          let sliceBuckets = 0;
+          let done = false;
+          while (sliceBuckets < sliceCap) {
+            if (sliceBuckets > 0 && performance.now() - sliceStart >= MAX_FLUSH_SLICE_MS) break;
+            const next = iter.next();
+            if (next.done) {
+              done = true;
+              break;
+            }
+            sliceBuckets++;
+            this.collectBucketSignals(next.value, signals);
+          }
+          if (signals.length > 0) {
+            const att = this.attention as RuntimeAttention & {
+              acceptBatch?: (batch: readonly Signal[]) => Promise<void>;
+            };
+            if (typeof att.acceptBatch === 'function') {
+              await att.acceptBatch(signals);
+            } else {
+              for (const signal of signals) {
+                if (epoch !== this.flushEpoch || !this.isWatching()) break;
+                await this.attention.accept(signal);
+              }
+            }
+          }
+          const sliceElapsed = performance.now() - sliceStart;
+          if (sliceElapsed > 6) {
+            sliceCap = Math.max(8, Math.floor(sliceCap / 2));
+          } else if (sliceElapsed < 2.5 && sliceBuckets >= sliceCap) {
+            sliceCap = Math.min(MAX_FLUSH_SLICE_BUCKETS, sliceCap + Math.max(8, Math.floor(sliceCap / 2)));
+          }
+          if (done || epoch !== this.flushEpoch || !this.isWatching()) break;
+          await new Promise<void>((resolve) => setImmediate(resolve));
         }
       }
 
@@ -335,6 +555,7 @@ export class FileGlobalSource {
         this.publishFact('ok');
       }
       this.scheduledDeadline = undefined;
+      this.maybeReschedule();
     });
     this.tail = run.catch(() => {});
     return run;
@@ -354,15 +575,18 @@ export class FileGlobalSource {
     if (event.watchError === true) {
       const code = event.errorCode;
       if (code === 'EPERM' || code === 'EACCES') {
-        const target = normalizeAbsPath(event.errorPath ?? event.path) ?? this.root;
-        const isRoot = target === this.root;
+        const rawTarget = event.errorPath ?? event.path;
+        const target = normalizeWatchPath(rawTarget, this.platform, this.dirCache) ?? this.root;
+        const isRoot = target === this.root || target === this.watchRoot;
+        if (!isRoot && this.exclusions.isExcludedNormalized(target)) return;
+        const display = normalizeDeniedDisplayPath(rawTarget, this.platform) ?? target;
         const run = this.tail.then(async () => {
           if (this.handle !== handle) return;
           if (isRoot) {
-            await this.handleDenied(target, true);
+            await this.handleDenied(target, display, true);
             return;
           }
-          await this.handleDenied(target, false);
+          await this.handleDenied(target, display, false);
           // Subtree EPERM via FSWatcher error may leave the native handle broken;
           // close and rebuild once so healthy subtrees continue receiving events.
           await this.closeWatcher();
@@ -370,8 +594,7 @@ export class FileGlobalSource {
             await this.openWatcher(false);
           }
           this.setGlobalScope(this.isWatching());
-          if (this.rootDenied) this.publishFact('denied', '全盘文件监视无权限');
-          else this.publishFact(this.watchUnavailable ? 'unavailable' : 'ok');
+          this.publishCurrentFact();
           this.maybeReschedule();
           if (this.nextDeadline() === undefined) this.reschedule();
         });
@@ -379,28 +602,34 @@ export class FileGlobalSource {
         return;
       }
 
+      if (this.clock.mono() - this.openedMono >= HEALTHY_RESET_MS) {
+        this.immediateRebuildUsed = false;
+        this.retryFailures = 0;
+      }
       this.flushEpoch++;
       const run = this.tail.then(async () => {
         if (this.handle !== handle) return;
         await this.closeWatcher();
         this.resetRuntimeState();
         this.reschedule();
-        if (this.wantsWatch() && this.supportedPlatform() && this.rebuildAttempts < 1) {
-          this.rebuildAttempts++;
+        if (this.wantsWatch() && this.supportedPlatform() && !this.immediateRebuildUsed) {
+          this.immediateRebuildUsed = true;
           const ok = await this.openWatcher(false);
           this.setGlobalScope(this.isWatching());
           if (ok) {
-            this.publishFact('ok');
+            this.publishCurrentFact();
             this.maybeReschedule();
             return;
           }
         } else {
-          this.watchUnavailable = true;
+          this.enterUnavailable(code);
           this.setGlobalScope(false);
-          await this.emitSourceStatus('error', { error: code ?? 'watch-failed' });
+          await this.emitSourceStatus('unavailable', {
+            error: code ?? 'watch-failed',
+            reason: this.unavailableReason,
+          });
         }
-        if (this.rootDenied) this.publishFact('denied', '全盘文件监视无权限');
-        else this.publishFact('unavailable', '全盘文件监视出错');
+        this.publishCurrentFact();
         this.reschedule();
       });
       this.tail = run.catch(() => {});
@@ -408,18 +637,18 @@ export class FileGlobalSource {
     }
 
     if (typeof event.path !== 'string' || event.path.charCodeAt(0) !== 47) return;
-    if (event.change !== 'add' && event.change !== 'modify' && event.change !== 'delete') return;
-    const absPath = normalizeAbsPath(event.path);
+    const change = event.change;
+    if (change !== 'add' && change !== 'modify' && change !== 'delete') return;
+    const absPath = normalizeWatchPath(event.path, this.platform, this.dirCache, this.splitDir);
     if (!absPath || this.exclusions.isExcludedNormalized(absPath)) return;
 
     const mono = this.clock.mono();
-    const transition = this.advanceBudget(mono);
+    const transition =
+      this.secStartMono !== undefined && mono - this.secStartMono < 1_000 ? undefined : this.advanceBudget(mono);
     if (this.secStartMono === undefined) this.secStartMono = mono;
     this.countInSec++;
 
-    const slash = absPath.lastIndexOf('/');
-    const dir = slash <= 0 ? '/' : absPath.slice(0, slash);
-    const base = slash < 0 ? absPath : absPath.slice(slash + 1);
+    const dir = this.splitDir.dir;
     const agent = this.dsh.classifyFilePath(absPath) === 'agent';
     const wallAt = event.at ?? this.clock.wall();
 
@@ -428,8 +657,14 @@ export class FileGlobalSource {
       this.windowDeadlineMono = mono + this.currentWindowMs();
     }
 
-    const bucket = this.resolveTargetBucket(dir, wallAt);
-    const rolledUp = this.lastRolledUp;
+    let bucket = this.buckets.get(dir);
+    let rolledUp = false;
+    if (bucket) {
+      if (wallAt > bucket.latestAt) bucket.latestAt = wallAt;
+    } else {
+      bucket = this.resolveTargetBucket(dir, wallAt);
+      rolledUp = this.lastRolledUp;
+    }
     let group: ActivityGroup;
     if (agent) {
       if (!bucket.agent) bucket.agent = newGroup();
@@ -438,26 +673,47 @@ export class FileGlobalSource {
       if (!bucket.ext) bucket.ext = newGroup();
       group = bucket.ext;
     }
-    if (event.change === 'add') group.created++;
-    else if (event.change === 'modify') group.modified++;
+    if (change === 'add') group.created++;
+    else if (change === 'modify') group.modified++;
     else group.deleted++;
     if (rolledUp) group.rolledUp++;
-    if (!this.countOnly && base.length > 0 && group.files.size < MAX_FILES_PER_BUCKET) {
-      group.files.add(base);
+    if (!this.countOnly && group.files.size < MAX_FILES_PER_BUCKET) {
+      const slash = absPath.lastIndexOf('/');
+      const base = slash < 0 ? absPath : absPath.slice(slash + 1);
+      if (base.length > 0) group.files.add(base);
     }
 
-    if (!this.coveredByDirRule(absPath)) {
-      const rawSignal: Signal = {
-        id: this.attention.id(),
-        kind: 'file.changed',
-        at: wallAt,
-        source,
-        subject: absPath,
-        cause: agent ? 'agent' : 'unknown',
-        data: { path: absPath, change: event.change },
-      };
-      const pending = this.burst(rawSignal, [{ scope: 'global', dir }], mono);
-      if (pending) void pending.catch(() => {});
+    const immediateCap =
+      this.budgetPerSec < IMMEDIATE_BURST_CAP_PER_SEC ? this.budgetPerSec : IMMEDIATE_BURST_CAP_PER_SEC;
+    if (!this.degraded && this.countInSec <= immediateCap) {
+      if (!this.coveredByDirRule(absPath)) {
+        const rawSignal: Signal = {
+          id: `fg:${++this.rawSeq}`,
+          kind: 'file.changed',
+          at: wallAt,
+          source,
+          subject: absPath,
+          cause: agent ? 'agent' : 'unknown',
+          data: { path: absPath, change },
+        };
+        const pending = this.burst(rawSignal, [{ scope: 'global', dir }], mono);
+        if (pending) void pending.catch(() => {});
+      }
+    } else if (!this.coveredByDirRule(absPath)) {
+      if (!bucket.bDirty) {
+        bucket.bDirty = true;
+        this.dirtyBurst.add(bucket);
+      }
+      if (mono > bucket.bMonoAt) bucket.bMonoAt = mono;
+      if (agent) {
+        if (change === 'add') bucket.bAgentCreated++;
+        else if (change === 'modify') bucket.bAgentModified++;
+        else bucket.bAgentDeleted++;
+      } else {
+        if (change === 'add') bucket.bExtCreated++;
+        else if (change === 'modify') bucket.bExtModified++;
+        else bucket.bExtDeleted++;
+      }
     }
 
     if (transition === 'degraded') {
@@ -467,7 +723,13 @@ export class FileGlobalSource {
       const work = this.tail.then(() => this.applyRecovered());
       this.tail = work.catch(() => {});
     }
-    this.maybeReschedule();
+    if (
+      this.scheduledDeadline === undefined ||
+      transition !== undefined ||
+      (this.windowDeadlineMono !== undefined && this.windowDeadlineMono < this.scheduledDeadline)
+    ) {
+      this.maybeReschedule();
+    }
   }
 
   private findAncestorBucket(dir: string): ActivityBucket | undefined {
@@ -495,6 +757,27 @@ export class FileGlobalSource {
 
   private mergeBucketInto(target: ActivityBucket, child: ActivityBucket): void {
     if (child.latestAt > target.latestAt) target.latestAt = child.latestAt;
+    if (child.bMonoAt > target.bMonoAt) target.bMonoAt = child.bMonoAt;
+    if (child.bDirty) {
+      this.dirtyBurst.delete(child);
+      child.bDirty = false;
+      target.bExtCreated += child.bExtCreated;
+      target.bExtModified += child.bExtModified;
+      target.bExtDeleted += child.bExtDeleted;
+      target.bAgentCreated += child.bAgentCreated;
+      target.bAgentModified += child.bAgentModified;
+      target.bAgentDeleted += child.bAgentDeleted;
+      child.bExtCreated = 0;
+      child.bExtModified = 0;
+      child.bExtDeleted = 0;
+      child.bAgentCreated = 0;
+      child.bAgentModified = 0;
+      child.bAgentDeleted = 0;
+      if (!target.bDirty) {
+        target.bDirty = true;
+        this.dirtyBurst.add(target);
+      }
+    }
     if (child.ext) {
       if (!target.ext) target.ext = newGroup();
       this.mergeGroupInto(target.ext, child.ext);
@@ -522,7 +805,7 @@ export class FileGlobalSource {
       this.buckets.delete(pickedDir);
       let pBucket = this.buckets.get(pDir);
       if (!pBucket) {
-        pBucket = { dir: pDir, latestAt: pickedBucket.latestAt };
+        pBucket = newBucket(pDir, pickedBucket.latestAt);
         this.buckets.set(pDir, pBucket);
       }
       this.mergeBucketInto(pBucket, pickedBucket);
@@ -537,7 +820,7 @@ export class FileGlobalSource {
       return existing;
     }
     if (this.buckets.size < MAX_BUCKETS) {
-      const bucket: ActivityBucket = { dir, latestAt: wallAt };
+      const bucket = newBucket(dir, wallAt);
       this.buckets.set(dir, bucket);
       this.lastRolledUp = false;
       return bucket;
@@ -562,7 +845,7 @@ export class FileGlobalSource {
     const targetDir = parent ?? dir;
     let target = this.buckets.get(targetDir);
     if (!target) {
-      target = { dir: targetDir, latestAt: wallAt };
+      target = newBucket(targetDir, wallAt);
       this.buckets.set(targetDir, target);
     } else if (wallAt > target.latestAt) {
       target.latestAt = wallAt;
@@ -659,9 +942,12 @@ export class FileGlobalSource {
     this.publishFact('ok');
   }
 
-  private async handleDenied(deniedPath: string, isRoot: boolean): Promise<void> {
-    const firstForPath = !this.deniedPaths.has(deniedPath);
-    this.deniedPaths.add(deniedPath);
+  private async handleDenied(deniedKey: string, deniedPath: string, isRoot: boolean): Promise<void> {
+    const firstForPath = !this.deniedKeys.has(deniedKey);
+    if (firstForPath && this.deniedKeys.size < MAX_DENIED_PATHS) {
+      this.deniedKeys.add(deniedKey);
+      this.deniedPaths.add(deniedPath);
+    }
     if (isRoot) {
       this.rootDenied = true;
       this.flushEpoch++;
@@ -696,11 +982,11 @@ export class FileGlobalSource {
   }
 
   private async emitSourceStatus(
-    status: 'ok' | 'denied' | 'error' | 'unavailable',
+    status: 'ok' | 'denied' | 'error' | 'unavailable' | 'unsupported',
     extra: Record<string, unknown> = {},
   ): Promise<void> {
     if (this.attention.isStopped()) return;
-    const key = JSON.stringify([status, extra.error ?? '', extra.degraded ?? null]);
+    const key = JSON.stringify([status, extra.error ?? '', extra.reason ?? '', extra.degraded ?? null]);
     if (this.lastSourceStatus === key) return;
     this.lastSourceStatus = key;
     await this.attention.accept({
@@ -713,17 +999,13 @@ export class FileGlobalSource {
     });
   }
 
-  private async emitBucket(bucket: ActivityBucket): Promise<void> {
+  private collectBucketSignals(bucket: ActivityBucket, out: Signal[]): void {
     if (this.stopped || this.attention.isStopped()) return;
-    const groups: { group: ActivityGroup; agent: boolean }[] = [];
-    if (bucket.ext) groups.push({ group: bucket.ext, agent: false });
-    if (bucket.agent) groups.push({ group: bucket.agent, agent: true });
-    if (groups.length === 0) return;
-
+    if (!bucket.ext && !bucket.agent) return;
     const preserveSourceStatus = this.degraded || this.deniedPaths.size > 0;
     const windowMs = this.currentWindowMs();
-    for (const { group, agent } of groups) {
-      const signal: Signal = {
+    const pushGroup = (group: ActivityGroup, agent: boolean) => {
+      out.push({
         id: this.attention.id(),
         kind: 'file.activity',
         at: bucket.latestAt,
@@ -741,13 +1023,15 @@ export class FileGlobalSource {
           ...(this.degraded ? { degraded: true } : {}),
           ...(preserveSourceStatus ? { preserveSourceStatus: true } : {}),
         },
-      };
-      await this.attention.accept(signal);
-    }
+      });
+    };
+    if (bucket.ext) pushGroup(bucket.ext, false);
+    if (bucket.agent) pushGroup(bucket.agent, true);
   }
 
-  private publishFact(factStatus: 'ok' | 'denied' | 'unavailable', reason?: string): void {
+  private publishFact(factStatus: 'ok' | 'denied' | 'unavailable' | 'unsupported', reason?: string): void {
     if (this.stopped || this.attention.isStopped()) return;
+    const effectiveReason = factStatus === 'unavailable' ? (reason ?? this.unavailableReason) : reason;
     const value: GlobalFileWatchValue = {
       enabled: this.settings.globalFileWatch,
       status: this.currentStatus(),
@@ -758,8 +1042,14 @@ export class FileGlobalSource {
       countOnly: this.countOnly,
       deniedPaths: [...this.deniedPaths],
       exclusions: this.settings.fileExclusions(),
+      ...(this.watchUnavailable && effectiveReason
+        ? { reason: effectiveReason }
+        : factStatus === 'unsupported' && effectiveReason
+          ? { reason: effectiveReason }
+          : {}),
+      ...(this.watchUnavailable && this.retryAt !== undefined ? { retryAt: this.retryAt } : {}),
     };
-    const key = JSON.stringify([factStatus, reason ?? '', value]);
+    const key = JSON.stringify([factStatus, effectiveReason ?? '', value]);
     if (key === this.lastFactKey) return;
     this.lastFactKey = key;
     this.attention.store.apply({
@@ -774,7 +1064,7 @@ export class FileGlobalSource {
         status: factStatus,
         ttlMs: 86_400_000,
         preserveSourceStatus: true,
-        ...(reason ? { reason } : {}),
+        ...(effectiveReason ? { reason: effectiveReason } : {}),
       },
     });
     this.attention.changed();

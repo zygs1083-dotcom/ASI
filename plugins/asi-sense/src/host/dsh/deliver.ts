@@ -42,7 +42,7 @@ function truncateName(value: string, limit = MAX_ACTIVITY_NAME): string {
   return `${value.slice(0, end)}...`;
 }
 
-function modelActivityName(raw: string, maskHomeRoot = false): string {
+export function modelActivityName(raw: string, maskHomeRoot = false): string {
   if (maskHomeRoot && isHomeRoot(raw)) return '~';
   const base = modelPath(raw);
   const masked = modelTitle(truncateName(base));
@@ -86,7 +86,12 @@ function modelUpdate(update: EnvUpdate): EnvUpdate {
       } else if (signal.kind === 'window.focused' || signal.kind === 'window.title-changed') {
         if (typeof signal.data.title === 'string') data.title = modelTitle(signal.data.title);
       } else if (signal.kind === 'file.changed') {
-        data.path = modelPath(typeof signal.data.path === 'string' ? signal.data.path : signal.subject);
+        const maskedPath = modelActivityName(
+          typeof signal.data.path === 'string' && signal.data.path.trim() ? signal.data.path : signal.subject,
+          true,
+        );
+        subject = maskedPath;
+        data.path = maskedPath;
         if (
           typeof signal.data.change === 'string' &&
           ['add', 'create', 'created', 'modify', 'save', 'saved', 'delete', 'deleted', 'rename', 'renamed'].includes(
@@ -110,14 +115,18 @@ function modelUpdate(update: EnvUpdate): EnvUpdate {
           (signal.kind === 'body.anomaly' && signal.data.type === 'rebaseline-suggestion'
             ? signal.subject.replace(/^(?:rebaseline|baseline):/, '')
             : undefined);
-        subject =
-          signal.kind === 'file.burst'
-            ? modelPath(
-                typeof signal.data.directory === 'string' && signal.data.directory.trim()
-                  ? signal.data.directory
-                  : signal.subject,
-              )
-            : metric(rawMetric);
+        if (signal.kind === 'file.burst') {
+          const maskedDir = modelActivityName(
+            typeof signal.data.directory === 'string' && signal.data.directory.trim()
+              ? signal.data.directory
+              : signal.subject,
+            true,
+          );
+          subject = maskedDir;
+          data.directory = maskedDir;
+        } else {
+          subject = metric(rawMetric);
+        }
         if (signal.kind === 'body.anomaly' && signal.data.type === 'rebaseline-suggestion') {
           data.type = 'rebaseline-suggestion';
         }
@@ -152,6 +161,7 @@ function modelUpdate(update: EnvUpdate): EnvUpdate {
         )
           data.externalDeleted = deleted - agentDeleted;
         if (signal.data.externalDeletionExceeded === true) data.externalDeletionExceeded = true;
+        if (signal.kind === 'file.burst' && signal.data.rolledUp === true) data.rolledUp = true;
       } else if (signal.kind === 'file.activity') {
         const maskedDir = modelActivityName(
           typeof signal.data.directory === 'string' && signal.data.directory.trim()

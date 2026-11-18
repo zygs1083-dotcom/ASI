@@ -25,6 +25,7 @@ const detailFields: Record<string, readonly string[]> = {
     'agentModified',
     'agentDeleted',
     'externalDeletionExceeded',
+    'rolledUp',
   ],
   'file.activity': ['directory', 'windowMs', 'created', 'modified', 'deleted', 'rolledUp', 'degraded'],
 };

@@ -134,6 +134,7 @@ export interface SenseActions {
   pause(paused: boolean): Promise<void>;
   setSendTitles(enabled: boolean): Promise<void>;
   setGlobalFileWatch?(enabled: boolean): Promise<void>;
+  retryGlobalFileWatch?(): Promise<void>;
   addFileExclusion?(pattern: string): Promise<void>;
   removeFileExclusion?(pattern: string): Promise<void>;
   openPermissionSettings(): Promise<void>;

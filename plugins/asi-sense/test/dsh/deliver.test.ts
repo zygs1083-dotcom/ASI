@@ -1,3 +1,6 @@
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import type { EnvUpdate } from '@asi/sense-types';
 import { describe, expect, it, vi } from 'vitest';
 import type { DeliveryIntent } from '../../src/host/attention/pipeline.ts';
@@ -680,5 +683,107 @@ describe('DSH environment delivery', () => {
     expect(text).not.toContain('fe80::1ff:fe23:4567:890a');
     expect(text).not.toContain('files=[]');
     expect(text).toContain('AAAAAAAAAA');
+  });
+
+  it('redacts usernames, emails, and IP:port from file.burst and file.changed before delivery', async () => {
+    const { deliver, agent } = fixture();
+    await deliver('session-a', {
+      kind: 'followup',
+      sessionId: 'session-a',
+      deliveryId: 'file-burst-redact',
+      update: {
+        since: update.since,
+        at: update.at,
+        suppressed: 0,
+        changes: [
+          {
+            count: 1,
+            level: 'wake',
+            signal: {
+              id: 'fb-p1',
+              kind: 'file.burst',
+              at: update.at,
+              source: { id: 'files-global', api: 'watch', host: 'local' },
+              subject: 'alice@corp.com-192.168.1.50:5432',
+              data: {
+                directory: '/Users/alice/alice@corp.com-192.168.1.50:5432',
+                windowMs: 60_000,
+                created: 1,
+                modified: 2,
+                deleted: 120,
+                rolledUp: true,
+              },
+            },
+          },
+          {
+            count: 1,
+            level: 'context',
+            signal: {
+              id: 'fc-p1',
+              kind: 'file.changed',
+              at: update.at + 1,
+              source: { id: 'files', api: 'watch', host: 'local' },
+              subject: '/home/bob-dev/alice@corp.com-192.168.1.50:5432/secret.log',
+              data: {
+                path: '/home/bob-dev/alice@corp.com-192.168.1.50:5432/secret.log',
+                change: 'delete',
+              },
+            },
+          },
+          {
+            count: 1,
+            level: 'wake',
+            signal: {
+              id: 'fb-home',
+              kind: 'file.burst',
+              at: update.at + 2,
+              source: { id: 'files-global', api: 'watch', host: 'local' },
+              subject: '/Users/alice',
+              data: { directory: '/Users/alice', windowMs: 10_000, deleted: 5 },
+            },
+          },
+        ],
+      },
+    });
+    const text = JSON.stringify(agent.followup.mock.calls);
+    expect(text).toContain('rolledUp=true');
+    expect(text).not.toContain('alice');
+    expect(text).not.toContain('bob-dev');
+    expect(text).not.toContain('alice@corp.com');
+    expect(text).not.toContain('192.168.1.50');
+    expect(text).not.toContain('5432');
+  });
+
+  it('architecture: routes every file.* subject in deliver.ts through modelActivityName', () => {
+    const here = path.dirname(fileURLToPath(import.meta.url));
+    const src = readFileSync(path.resolve(here, '../../src/host/dsh/deliver.ts'), 'utf8');
+    const fnStart = src.indexOf('function modelUpdate(');
+    const fnEnd = src.indexOf('export function createDelivery(');
+    expect(fnStart).toBeGreaterThan(-1);
+    expect(fnEnd).toBeGreaterThan(fnStart);
+    const body = src.slice(fnStart, fnEnd);
+
+    for (const kind of ['file.changed', 'file.burst', 'file.activity'] as const) {
+      expect(body).toContain(kind);
+    }
+
+    const changedIdx = body.indexOf("signal.kind === 'file.changed'");
+    const burstIdx = body.indexOf("signal.kind === 'file.burst'");
+    const activityIdx = body.indexOf("signal.kind === 'file.activity'");
+    expect(changedIdx).toBeGreaterThan(-1);
+    expect(burstIdx).toBeGreaterThan(-1);
+    expect(activityIdx).toBeGreaterThan(-1);
+
+    const changedBlock = body.slice(changedIdx, body.indexOf('} else if', changedIdx));
+    expect(changedBlock).toContain('subject = maskedPath');
+    expect(changedBlock).toContain('modelActivityName(');
+
+    const burstBlock = body.slice(burstIdx, body.indexOf('} else {', burstIdx));
+    expect(burstBlock).toContain('subject = maskedDir');
+    expect(burstBlock).toContain('modelActivityName(');
+
+    const activityBlock = body.slice(activityIdx, body.indexOf('const summary =', activityIdx));
+    expect(activityBlock).toContain('subject = maskedDir');
+    expect(activityBlock).toContain('modelActivityName(');
   });
 });

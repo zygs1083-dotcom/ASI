@@ -68,7 +68,7 @@ export function localPorts(ctx: Context, storageRoot: string): Omit<SensePorts, 
                   if (!inside(base, path)) return;
                   try {
                     if (
-                      !existsSync(base) ||
+                      (base !== '/' && !existsSync(base)) ||
                       (base !== target &&
                         existsSync(target) &&
                         (dirname(target) !== base || statSync(target).isDirectory()))
@@ -77,6 +77,7 @@ export function localPorts(ctx: Context, storageRoot: string): Omit<SensePorts, 
                     }
                   } catch (error) {
                     fail(error);
+                    return;
                   }
                   if (!inside(target, path) || filename === null) return;
                   let at = Date.now();

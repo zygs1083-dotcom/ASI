@@ -1,6 +1,15 @@
-import { realpathSync } from 'node:fs';
 import path from 'node:path';
 import { type CompiledGlob, compileGlob } from '../attention/glob.ts';
+import {
+  foldNormalized,
+  foldPath,
+  normalizeAbsPath,
+  normalizeWatchPath,
+  resolvePathVariants,
+  resolveRealPath,
+} from '../attention/path.ts';
+
+export { foldPath, normalizeAbsPath, normalizeWatchPath, resolvePathVariants, resolveRealPath };
 
 export const MAX_FILE_EXCLUSION_LENGTH = 1024;
 export const MAX_FILE_EXCLUSIONS = 200;
@@ -27,109 +36,13 @@ export const DEFAULT_FILE_EXCLUSIONS: readonly string[] = [
   '__pycache__',
 ];
 
-const MAC_ALIAS_PAIRS: readonly [string, string][] = [
-  ['/var', '/private/var'],
-  ['/tmp', '/private/tmp'],
-  ['/etc', '/private/etc'],
-];
-
-const NON_ASCII_OR_CTRL = /[^\x20-\x7f]/;
-const UPPER_ASCII = /[A-Z]/;
 const REGEX_ESC = /[.*+?^${}()|[\]\\]/g;
 
 const escapeLiteral = (s: string) => s.replace(REGEX_ESC, '\\$&');
 
-/** Normalizes an absolute POSIX path to NFC and strips redundant slashes/dots. */
-export function normalizeAbsPath(p: string): string | undefined {
-  if (!p) return undefined;
-  const nfc = NON_ASCII_OR_CTRL.test(p) ? p.normalize('NFC') : p;
-  if (nfc.charCodeAt(0) !== 47) return undefined;
-  if (!nfc.includes('//') && !nfc.includes('/.') && (nfc.length === 1 || nfc.charCodeAt(nfc.length - 1) !== 47)) {
-    return nfc;
-  }
-  const norm = path.posix.normalize(nfc);
-  return norm.length > 1 ? norm.replace(/\/+$/, '') : norm;
-}
-
-/** Applies NFC normalization and macOS case folding when `platform === 'darwin'`. */
-export function foldPath(p: string, platform: string = process.platform): string {
-  const nfc = NON_ASCII_OR_CTRL.test(p) ? p.normalize('NFC') : p;
-  if (platform !== 'darwin') return nfc;
-  return NON_ASCII_OR_CTRL.test(nfc) || UPPER_ASCII.test(nfc) ? nfc.toLowerCase() : nfc;
-}
-
-function foldNormalized(nfc: string, platform: string): string {
-  if (platform !== 'darwin') return nfc;
-  return NON_ASCII_OR_CTRL.test(nfc) || UPPER_ASCII.test(nfc) ? nfc.toLowerCase() : nfc;
-}
-
 /** Canonical deduplication key for a normalized exclusion pattern. */
 export function exclusionKey(pattern: string, platform: string = process.platform): string {
   return foldPath(pattern, platform);
-}
-
-/**
- * Resolves the realpath of an absolute path, walking up to the nearest
- * existing ancestor if the path itself has not been created yet.
- */
-export function resolveRealPath(absPath: string): string | undefined {
-  const norm = normalizeAbsPath(absPath);
-  if (!norm) return undefined;
-  try {
-    return normalizeAbsPath(realpathSync(norm));
-  } catch {
-    const suffix: string[] = [];
-    let cur = norm;
-    while (cur !== '/') {
-      const parent = path.posix.dirname(cur);
-      suffix.push(path.posix.basename(cur));
-      cur = parent;
-      try {
-        const realBase = realpathSync(cur);
-        return normalizeAbsPath(path.posix.join(realBase, ...suffix.reverse()));
-      } catch {
-        // Keep walking up until an existing ancestor is found.
-      }
-    }
-    return norm;
-  }
-}
-
-function expandKnownAliases(absPath: string, platform: string): string[] {
-  const out = [absPath];
-  const folded = foldPath(absPath, platform);
-  for (const [short, priv] of MAC_ALIAS_PAIRS) {
-    if (folded === short || folded.startsWith(`${short}/`)) {
-      out.push(`${priv}${absPath.slice(short.length)}`);
-    } else if (folded === priv || folded.startsWith(`${priv}/`)) {
-      out.push(`${short}${absPath.slice(priv.length)}`);
-    }
-  }
-  if (platform === 'darwin' && folded === '/private') {
-    out.push('/var', '/tmp', '/etc');
-  }
-  return out;
-}
-
-/** Returns normalized raw + realpath + known alias variants for an absolute path. */
-export function resolvePathVariants(absPath: string, platform: string = process.platform): string[] {
-  const norm = normalizeAbsPath(absPath);
-  if (!norm) return [];
-  const candidates: string[] = [];
-  const seen = new Set<string>();
-  const push = (value: string | undefined) => {
-    if (!value) return;
-    for (const alias of expandKnownAliases(value, platform)) {
-      const key = foldPath(alias, platform);
-      if (!seen.has(key)) {
-        seen.add(key);
-        candidates.push(alias);
-      }
-    }
-  };
-  push(norm);
-  push(resolveRealPath(norm));
-  return candidates;
 }
 
 /** Normalizes and validates one user-configurable file exclusion pattern. */
@@ -178,6 +91,8 @@ function normalizeHome(homedir: string): string | undefined {
   return normalizeAbsPath(homedir);
 }
 
+const MAX_EXCLUSION_DIR_CACHE = 4096;
+
 /**
  * Compiled, allocation-light matcher for whole-disk file exclusions.
  * Rebuilt only when settings or runtime data directories change.
@@ -190,6 +105,8 @@ export class ExclusionMatcher {
   private readonly absGlobs: CompiledGlob[] = [];
   private readonly absGlobKeys = new Set<string>();
   private readonly segmentGlobs: CompiledGlob[] = [];
+  private readonly dirCache = new Map<string, boolean>();
+  private readonly empty: boolean;
 
   constructor(
     patterns: readonly string[],
@@ -267,6 +184,13 @@ export class ExclusionMatcher {
       const alts = [...this.segments].sort((a, b) => b.length - a.length).map(escapeLiteral);
       this.segmentRe = new RegExp(`/(?:${alts.join('|')})(?:/|$)`);
     }
+    this.empty =
+      this.prefixRe === undefined &&
+      this.segmentRe === undefined &&
+      this.exactPrefixes.size === 0 &&
+      this.segments.size === 0 &&
+      this.segmentGlobs.length === 0 &&
+      this.absGlobs.length === 0;
   }
 
   isExcluded(absPath: string): boolean {
@@ -274,11 +198,21 @@ export class ExclusionMatcher {
     return norm ? this.isExcludedNormalized(norm) : false;
   }
 
-  isExcludedNormalized(normAbsPath: string): boolean {
-    const folded = foldNormalized(normAbsPath, this.platform);
+  private isDirExcluded(foldedDir: string): boolean {
+    const cached = this.dirCache.get(foldedDir);
+    if (cached !== undefined) return cached;
+    const hit = this.matchesFull(foldedDir);
+    if (this.dirCache.size >= MAX_EXCLUSION_DIR_CACHE) {
+      const first = this.dirCache.keys().next().value;
+      if (first !== undefined) this.dirCache.delete(first);
+    }
+    this.dirCache.set(foldedDir, hit);
+    return hit;
+  }
+
+  private matchesFull(folded: string): boolean {
     if (this.prefixRe?.test(folded)) return true;
     if (this.segmentRe?.test(folded)) return true;
-
     if (this.segmentGlobs.length > 0) {
       let start = 1;
       while (start <= folded.length) {
@@ -292,6 +226,25 @@ export class ExclusionMatcher {
         if (end < 0) break;
         start = end + 1;
       }
+    }
+    for (let i = 0; i < this.absGlobs.length; i++) {
+      if ((this.absGlobs[i] as CompiledGlob).test(folded)) return true;
+    }
+    return false;
+  }
+
+  isExcludedNormalized(normAbsPath: string): boolean {
+    if (this.empty) return false;
+    const folded = foldNormalized(normAbsPath, this.platform);
+    const lastSlash = folded.lastIndexOf('/');
+    if (lastSlash <= 0) return this.matchesFull(folded);
+    const dir = folded.slice(0, lastSlash);
+    if (this.isDirExcluded(dir)) return true;
+    if (this.exactPrefixes.has(folded)) return true;
+    const base = folded.slice(lastSlash + 1);
+    if (this.segments.has(base)) return true;
+    for (let i = 0; i < this.segmentGlobs.length; i++) {
+      if ((this.segmentGlobs[i] as CompiledGlob).test(base)) return true;
     }
     for (let i = 0; i < this.absGlobs.length; i++) {
       if ((this.absGlobs[i] as CompiledGlob).test(folded)) return true;

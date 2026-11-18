@@ -139,6 +139,7 @@ function changeLines(ch: EnvChange, includeTitles: boolean, includeJobCommands: 
       }
     }
     if (s.data.externalDeletionExceeded === true) main += ' externalDeletionExceeded=true';
+    if (s.kind === 'file.burst' && s.data.rolledUp === true) main += ' rolledUp=true';
   } else if (s.kind === 'file.activity') {
     const directory = typeof s.data?.directory === 'string' && s.data.directory.trim() ? s.data.directory : '';
     const head = directory || str(s.subject) || '[path]';

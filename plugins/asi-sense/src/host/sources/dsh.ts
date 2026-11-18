@@ -3,6 +3,7 @@ import type { SenseState, Signal } from '@asi/sense-types';
 import { classifyCause, isUnderDir, type ToolWindow } from '../attention/selfcause.ts';
 import type { RuntimeAttention } from '../runtime/attention.ts';
 import type { AgentEvent, Clock, DshPort, JobEvent, ToolEvent, Unsubscribe } from '../runtime/ports.ts';
+import { initialState } from '../state/facts.ts';
 import { StateStore } from '../state/store.ts';
 
 export type NowReadings = Record<
@@ -143,7 +144,6 @@ export class DshSource {
   }
   stateFor(session: string | undefined, state: SenseState): SenseState {
     const store = session === undefined ? undefined : this.sessions.get(session);
-    const view = store ?? new StateStore(() => this.clock.wall());
     const extended = this.port as DshPort & { nowReadings?: (sessionId?: string) => NowReadings };
     const paths = [
       'self.activity',
@@ -153,7 +153,9 @@ export class DshSource {
       'env.where.toolExec',
       'env.activeJobs',
     ];
+    let own: SenseState;
     if (store || extended.nowReadings) {
+      const view = store ?? new StateStore(() => this.clock.wall());
       let readings: NowReadings = {};
       try {
         readings = extended.nowReadings?.(session) ?? {};
@@ -173,8 +175,10 @@ export class DshSource {
           data: { path, ...reading, ttlMs: 30_000 },
         });
       }
+      own = view.snapshot();
+    } else {
+      own = initialState(this.clock.wall(), 60_000);
     }
-    const own = view.snapshot();
     if (!store) {
       const reason = session === undefined ? '没有活动会话' : '会话不可用';
       for (const fact of [
