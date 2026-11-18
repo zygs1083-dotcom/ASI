@@ -52,6 +52,11 @@ const safeMatches = new Set(
       '/env/focusedWindow',
       '/env/watchedPaths',
       '/env/activeJobs',
+      '/env/system',
+      // Built-in global file-watch exclusion prefixes.
+      '/private/var',
+      '/private/tmp',
+      '/private/etc',
       '/usr/bin/vm_stat',
       '/usr/sbin/sysctl',
       '/usr/bin/pmset',
