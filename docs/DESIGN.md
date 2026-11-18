@@ -106,7 +106,7 @@ interface SenseState {
 - `where` 四项分开，是为了以后 harness 与被观察机器不是同一台（远程 DSH、SSH 工具执行）时不出错；首版四项通常相同，但必须分别填写来源。
 - 当前事实按事件及定时刷新。DSH 固定版 `packages/core/agent/src/runtime-types.ts:61,77-79,133-140,194-205,400` 提供会话模型、收件箱、idle/running 和流事件；Gateway 的待响应转发事件可识别等待用户（`packages/api/gateway/src/types.ts:148-165`）。其他 running 阶段不能推测；工具执行事件和注册表见 `packages/core/tools/src/events.ts:18-49`、`packages/core/tools/src/index.ts:245-255,299-307`，条件工具只在步骤 admission 时确定，面板仅列当前可确认可执行项。
 - 任务列表按各会话及无主任务合并去重（`packages/jobs/jobs/src/index.ts:116-121`、`packages/jobs/jobs/src/view.ts:72-87`）。模型 endpoint 只采用配置服务的脱敏显式 `baseURL`（`packages/llm/llm/src/index.ts:566-572`、`packages/llm/llm/src/types.ts:247-280`、`packages/settings/settings/src/index.ts:298-330`），只展示 origin，不把缺省或可能因模型不同而改变的地址当成实际地址。
-- 本机 Harness 信息来自 Node，观察会话标为本机控制台会话而非用户名。DSH 的 subprocess 服务将执行目标身份留给 provider（`packages/subprocess/subprocess/src/index.ts:100-106`），所以不能仅凭会话工作目录推断实际工具执行宿主；缺少可核实宿主时该事实显示原因。辅助功能权限来自 helper，其余权限未知；关注路径来自已启用的 `file.changed` 规则，空集表示未配置。
+- 本机 Harness 信息来自 Node，观察会话标为本机控制台会话而非用户名。DSH 的 subprocess 服务将执行目标身份留给 provider（`packages/subprocess/subprocess/src/index.ts:100-106`），所以不能仅凭会话工作目录推断实际工具执行宿主；缺少可核实宿主时该事实显示原因。辅助功能权限来自 helper，其余权限未知；关注路径来自已启用的 `file.changed` 规则；全盘监视另见 §2.8。
 
 ### 2.2b 身体状况（vitals）
 
@@ -259,9 +259,11 @@ note: 测试失败时看日志并决定是否提醒我
 
 ### 2.8 0.1.4 产品决定（2026-11-17，负责人定）
 
-**文件监视默认不看任何目录（方案 A）**
-- 内置 `watched-file`、`file-burst*` 规则不带目录时**不生效**，侧栏规则区和「现在」区都明确显示「文件监视：尚未配置目录」，并提供「添加目录」入口；`env_state` 的关注路径事实状态为 `unconfigured`（不是 ok 的空集）。
-- 添加目录 = 为该目录生成已批准的 `file.changed` + `file.burst` 规则（`<目录>/**`）；可列出、移除。只接受存在的本地目录；拒绝 `/`、用户主目录本身、系统目录（`/System`、`/Library`、`/usr`、`/private` 等）。不自动推荐目录。
+**文件监视默认全盘（负责人 2026-11-17 改定，取代原「只看授权目录」）**
+- 默认监视整个磁盘（FSEvents，根 `/`，含用户目录与外接卷可选），只记录路径与增/改/删，**不读文件内容**。默认排除：`/System`、`/Library`、`/private`、`/dev`、`/usr`、`/bin`、`/sbin`、`/cores`、`/opt/homebrew`、`~/Library`、`~/.Trash`、任意层级的 `node_modules`、`.git`、`.cache`、`Caches`、`DerivedData`、`.pnpm-store`、`__pycache__`，以及 DSH 数据目录与本插件自己的数据目录（防自激）。侧栏可查看/增删排除项、整体关闭全盘监视。
+- 如需「完全磁盘访问」才能收到受保护目录（桌面/文稿/下载等）的事件：不弹系统对话框，侧栏显示该范围 `denied` 并给授权引导；拿不到时其余范围照常工作。
+- 事件量控制：全盘变更在源头按「目录 × 时间窗」聚合为 `file.activity`（目录脱敏、增/改/删计数、top 若干文件名），不逐文件进入注意力管线与历史；默认等级 `record`（不发给模型）。外部大批删除仍由 `file-burst-external-deletion` 判定为 `wake`。原有「用户指定目录」规则保留，命中时按原 `file.changed` 等级（context）。
+- 资源预算：稳态 CPU < 1%、内存增量 < 50 MB；超预算自动降级（加大聚合窗、只保留计数）并在侧栏提示。
 
 **事件历史保留 30 天 + 每月一份总结**
 - 事件按天写入插件数据目录 `history/events/YYYY-MM-DD.jsonl`（仅本机，权限 0600），启动时加载、超过 30 天的整天文件删除；单日超 20 MB 停止写入当天明细并记一条 `source.error`。侧栏提供「清除历史」。
