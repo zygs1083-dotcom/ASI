@@ -29,7 +29,8 @@ function truncateName(value: string, limit = MAX_ACTIVITY_NAME): string {
 }
 
 export function modelActivityName(raw: string, maskHomeRoot = false): string {
-  if (maskHomeRoot && isHomeRoot(raw)) return '~';
+  // Stored summaries already contain the '~' placeholder; keep it instead of re-redacting it to [path].
+  if (maskHomeRoot && (raw === '~' || isHomeRoot(raw))) return '~';
   const base = modelPath(raw);
   const masked = modelTitle(truncateName(base));
   return masked.trim() ? masked : '[file]';

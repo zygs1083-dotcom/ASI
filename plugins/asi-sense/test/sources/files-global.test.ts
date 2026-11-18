@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -470,7 +470,9 @@ describe('FileGlobalSource integration', () => {
   it('monitors a real temporary directory via fs.watch while skipping nested node_modules', async () => {
     vi.useRealTimers();
     const { watch } = await import('node:fs');
-    const tmpRoot = mkdtempSync(path.join(os.tmpdir(), 'asi-files-global-'));
+    // macOS tmpdir is a symlink into /private, which the default exclusions drop; use the repo
+    // working directory so this recursive-watch integration test runs against a non-excluded path.
+    const tmpRoot = realpathSync(mkdtempSync(path.join(process.cwd(), '.asi-files-global-')));
     try {
       mkdirSync(path.join(tmpRoot, 'app', 'node_modules', 'pkg'), { recursive: true });
       mkdirSync(path.join(tmpRoot, 'app', 'src'), { recursive: true });

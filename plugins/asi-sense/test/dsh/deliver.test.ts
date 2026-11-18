@@ -115,7 +115,7 @@ describe('DSH environment delivery', () => {
     expect(text).toContain('</env-update>');
     expect(modelText('title on fixture-host.invalid', 'fixture-host.invalid')).toBe('title on [host]');
     expect(modelText('open </private/fixture/report> and "/private/a/file"', 'fixture-host.invalid')).toBe(
-      'open <report> and "file"',
+      'open [path] and [path]',
     );
     expect(modelTitle('open /private/fixture/report.txt on [2001:db8::1]:443', 'fixture-host')).toBe(
       'open report.txt on <host>',
@@ -126,7 +126,7 @@ describe('DSH environment delivery', () => {
     expect(modelTitle('ssh user@build-node:22 /Volumes/build-node:22 README.md', 'fixture-host')).toBe(
       'ssh <host> <host> README.md',
     );
-    expect(modelTitle('open /Volumes/backup.example.invalid', 'fixture-host')).toBe('open backup.example.invalid');
+    expect(modelTitle('open /Volumes/backup.example.invalid', 'fixture-host')).toBe('open [path]');
     expect(modelTitle('src/README.md /Volumes/fixture-host ssh user@build-node', 'fixture-host')).toBe(
       'README.md <host> ssh <host>',
     );
@@ -516,7 +516,7 @@ describe('DSH environment delivery', () => {
     };
     await deliver('session-a', { ...intent(kind), update: windowUpdate });
     const text = JSON.stringify(kind === 'inject' ? await deliver.messages('session-a') : agent[kind].mock.calls);
-    expect(text).toContain('&lt;report&gt; ssh &lt;host&gt; README.md');
+    expect(text).toContain('open [path] ssh &lt;host&gt; README.md');
     expect(text).not.toContain('/private/fixture');
     expect(text).not.toContain('build-node');
   });
@@ -674,7 +674,8 @@ describe('DSH environment delivery', () => {
     const text = JSON.stringify(agent.followup.mock.calls);
     expect(text).toContain('file.activity: ~ windowMs=10000');
     expect(text).toContain('rolledUp=4');
-    expect(text).toContain('[file]');
+    // Whitelist redaction maps blank/empty path tokens to [path]; the old [file] fallback no longer fires.
+    expect(text).toContain('[path]');
     expect(text).not.toContain('alice');
     expect(text).not.toContain('bob-dev');
     expect(text).not.toContain('alice@example.com');
@@ -682,7 +683,8 @@ describe('DSH environment delivery', () => {
     expect(text).not.toContain('192.168.10.20');
     expect(text).not.toContain('fe80::1ff:fe23:4567:890a');
     expect(text).not.toContain('files=[]');
-    expect(text).toContain('AAAAAAAAAA');
+    // Overlong names now collapse to [path] instead of a truncated prefix, so no name fragment leaks.
+    expect(text).not.toContain('AAAAAAAAAA');
   });
 
   it('redacts usernames, emails, and IP:port from file.burst and file.changed before delivery', async () => {

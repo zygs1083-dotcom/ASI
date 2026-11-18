@@ -449,7 +449,7 @@ describe('model-facing tools', () => {
   it('projects consented titles and excludes arbitrary notes and colliding private paths', async () => {
     const h = await fixture();
     const title = 'open </private/fixture/report> ssh user@build-node:22 README.md';
-    const projected = 'open <report> ssh <host> README.md';
+    const projected = 'open [path] ssh <host> README.md';
     h.state.env.focusedWindow.value = { title };
     if (!h.state.env.frontApp.value) throw new Error('fixture missing');
     h.state.env.frontApp.value.bundleId = 'backup.example.invalid';
@@ -507,20 +507,23 @@ describe('model-facing tools', () => {
     });
   });
 
-  it.each(['ssh user@服务器:22/tmp/report', 'ssh 服务器:22/tmp/report'])(
-    'hides Unicode hosts in both model tools: %s',
-    async (title) => {
-      const h = await fixture();
-      h.state.env.focusedWindow.value = { title };
-      expect((await h.call('env_state', { section: 'env' })).value).toMatchObject({
-        focusedWindow: { value: { title: 'ssh <host>' } },
-      });
-      expect((await h.call('env_detail', { window: 'ssh <host>' })).value).toMatchObject({
-        current: true,
-        window: { value: { title: 'ssh <host>' } },
-      });
-    },
-  );
+  it.each([
+    ['ssh user@服务器:22/tmp/report', 'ssh <host>'],
+    ['ssh 服务器:22/tmp/report', 'ssh <host>'],
+    ['ssh u\u0301ser@se\u0301rver:22/tmp/report', 'ssh <host>'],
+    ['ssh se\u0301rver:22/tmp/report', 'ssh <host>'],
+    ['open re\u0301po/se\u0301cret/README.md', 'open README.md'],
+  ])('hides Unicode hosts and paths in both model tools: %s', async (title, expected) => {
+    const h = await fixture();
+    h.state.env.focusedWindow.value = { title };
+    expect((await h.call('env_state', { section: 'env' })).value).toMatchObject({
+      focusedWindow: { value: { title: expected } },
+    });
+    expect((await h.call('env_detail', { window: expected })).value).toMatchObject({
+      current: true,
+      window: { value: { title: expected } },
+    });
+  });
 
   it('isolates actual model state by caller and selects the local panel session', async () => {
     const h = await fixture(true);
@@ -737,8 +740,12 @@ describe('model-facing tools', () => {
   it('bounds complete results and removes tool and prompt contributions on disposal', async () => {
     const h = await fixture();
     h.state.env.focusedWindow.value = { title: '汉'.repeat(20_000) };
+    const longSingle = await h.call('env_state', { section: 'env' });
+    expect(longSingle).toMatchObject({ isError: false, value: { focusedWindow: { value: { title: '[long]' } } } });
+
+    h.state.env.focusedWindow.value = { title: '汉 '.repeat(20_000) };
     const result = await h.call('env_state', { section: 'env' });
-    expect(result).toMatchObject({ isError: false, value: { focusedWindow: { value: { title: '' } } } });
+    expect(result).toMatchObject({ isError: false, value: { focusedWindow: { value: { title: '汉 '.repeat(256) } } } });
     expect(Buffer.byteLength(JSON.stringify(result.value), 'utf8')).toBeLessThan(32_768);
     expect(modelOutput({ text: 'x '.repeat(17_000) })).toMatchObject({ truncated: true });
     expect((await h.ctx.systemPrompt.assemble()).sections.some((section) => section.name === 'asi-sense')).toBe(true);

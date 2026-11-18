@@ -8,7 +8,7 @@ import type {
   SummaryQueryResult,
 } from '../runtime/ports.ts';
 import { modelActivityName } from './deliver.ts';
-import { modelAppName, modelOutput, modelPath, modelText, modelTitle } from './tool-output.ts';
+import { modelAppName, modelOutput, modelPath, modelProjectedOutput, modelText, modelTitle } from './tool-output.ts';
 import type { JsonValue } from './wire-types.ts';
 
 const SAFE_IDENTIFIERS = new Set([
@@ -45,9 +45,10 @@ const SAFE_IDENTIFIERS = new Set([
   'body.rate',
   'body.anomaly',
   'delivery.target-unavailable',
+  'delivery-unknown',
 ]);
 
-const KNOWN_EVENT_KINDS = new Set([
+export const KNOWN_EVENT_KINDS = new Set([
   'app.activated',
   'app.launched',
   'app.terminated',
@@ -67,11 +68,42 @@ const KNOWN_EVENT_KINDS = new Set([
   'body.anomaly',
   'fact.updated',
   'delivery.target-unavailable',
+  'delivery-unknown',
 ]);
+
+const VALID_LEVELS = new Set(['record', 'context', 'wake']);
+const VALID_CAUSES = new Set(['agent', 'user', 'unknown']);
+const VALID_FEEDBACK = new Set(['useful', 'noise']);
+const STRICT_WORD_ID_RE = /^[A-Za-z0-9_][A-Za-z0-9_-]{0,127}$/;
+const STRICT_COLON_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_:-]{0,127}$/;
+const HELPER_DROPPED_REASON_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63} \(dropped=\d{1,12}\)$/;
+const HASHED_SIGNAL_ID_RE = /^(?:body\.rate|file\.burst):[A-Za-z0-9_-]{1,100}$/;
+const CUSTOM_EVENT_KIND_RE = /^[a-z]+(?:\.[a-z-]+)+$/;
 
 function safeIdentifier(value: string): string {
   if (SAFE_IDENTIFIERS.has(value)) return value;
-  return /^[\w-]+$/.test(value) ? modelText(value) : '[redacted]';
+  return STRICT_WORD_ID_RE.test(value) ? value : '[redacted]';
+}
+
+function safeEventKind(kind: string): string {
+  if (KNOWN_EVENT_KINDS.has(kind)) return kind;
+  return kind.length <= 128 && CUSTOM_EVENT_KIND_RE.test(kind) ? kind : '[redacted]';
+}
+
+function safeEventLevel(level: string): string {
+  return VALID_LEVELS.has(level) ? level : '[redacted]';
+}
+
+function safeEventCause(cause: string): string {
+  return VALID_CAUSES.has(cause) ? cause : '[redacted]';
+}
+
+function safeFeedback(feedback: string): string {
+  return VALID_FEEDBACK.has(feedback) ? feedback : '[redacted]';
+}
+
+function safeReason(reason: string): string {
+  return STRICT_COLON_ID_RE.test(reason) || HELPER_DROPPED_REASON_RE.test(reason) ? reason : '[redacted]';
 }
 
 function projectPathBase(value: string): string {
@@ -94,6 +126,8 @@ function projectMetric(value: string): string {
 }
 
 const COMMAND_BASENAME_RE = /^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$/;
+const SAFE_COMMAND_NAME_RE = /^[A-Za-z][A-Za-z0-9+_-]*(?:\d+(?:\.\d+){0,2})?$/;
+const SAFE_APP_BUNDLE_COMMAND_RE = /^[A-Za-z][A-Za-z0-9+_-]*\.app$/;
 const VERSIONED_COMMAND_RE = /^[A-Za-z][A-Za-z0-9_+-]*\d+(?:\.\d+){1,2}$/;
 const EXECUTABLE_EXTENSIONS = new Set([
   'sh',
@@ -396,9 +430,10 @@ function isSafeCommandBasename(base: string): boolean {
   if (!COMMAND_BASENAME_RE.test(base)) return false;
   if (!/[A-Za-z]/.test(base)) return false;
   if (!base.includes('.')) return true;
-  if (VERSIONED_COMMAND_RE.test(base)) return true;
+  if (SAFE_COMMAND_NAME_RE.test(base) || VERSIONED_COMMAND_RE.test(base)) return true;
+  if (SAFE_APP_BUNDLE_COMMAND_RE.test(base)) return true;
   const parts = base.split('.');
-  if (parts.length !== 2 || !parts[0]) return false;
+  if (parts.length !== 2 || !parts[0] || !/[A-Za-z]/.test(parts[0])) return false;
   return EXECUTABLE_EXTENSIONS.has(parts[1].toLowerCase());
 }
 
@@ -412,7 +447,7 @@ function projectCommandSubject(subject: string): string {
   const normalized = token.replaceAll('\\', '/').replace(/\/+$/, '');
   const base = path.posix.basename(normalized);
   if (!base || !isSafeCommandBasename(base)) return '[command]';
-  return modelTitle(base);
+  return base;
 }
 
 function projectBodySubject(subject: string): string {
@@ -435,11 +470,16 @@ function projectBodySubject(subject: string): string {
 }
 
 function projectEventId(id: string): string {
-  const replaced = id.replace(/disk:([^:]+)/g, (_match, mount: string) => `disk:${projectDiskMount(mount)}`);
-  if (/[\\/ @]|^[a-z][a-z0-9+.-]*:\/\//i.test(replaced)) {
-    return `id:r-${createHash('sha256').update(id).digest('hex').slice(0, 8)}`;
-  }
-  return replaced;
+  if (HASHED_SIGNAL_ID_RE.test(id)) return id;
+  let diskError = false;
+  const replaced = id.replace(/disk:([^:]+)/g, (_match, mount: string) => {
+    const safeMount = projectDiskMount(mount);
+    if (!safeMount || safeMount.includes(':')) diskError = true;
+    return `disk:${safeMount}`;
+  });
+  if (diskError || replaced.length > 256) return '[redacted]';
+  const template = id.replace(/disk:([^:]+)/g, 'disk:mount');
+  return STRICT_COLON_ID_RE.test(template) ? replaced : '[redacted]';
 }
 
 function projectSource(source: SourceRef): { id: string; api: string } {
@@ -520,17 +560,18 @@ function projectSubject(entry: PersistedEventEntry): string {
 function projectEvent(entry: PersistedEventEntry, titlesAllowed: boolean): Record<string, unknown> {
   const isWindow = entry.kind.startsWith('window');
   const safeId = projectEventId(entry.id);
-  const safeKind = KNOWN_EVENT_KINDS.has(entry.kind) ? entry.kind : safeIdentifier(entry.kind);
+  const safeKind = safeEventKind(entry.kind);
+  const safeLevel = safeEventLevel(entry.level);
   if (isWindow && !titlesAllowed) {
     return {
       id: safeId,
       kind: safeKind,
       subject: '',
-      level: entry.level,
+      level: safeLevel,
       at: entry.at,
-      ...(entry.cause !== undefined ? { cause: entry.cause } : {}),
+      ...(entry.cause !== undefined ? { cause: safeEventCause(entry.cause) } : {}),
       source: projectSource(entry.source),
-      ...(entry.feedback !== undefined ? { feedback: entry.feedback } : {}),
+      ...(entry.feedback !== undefined ? { feedback: safeFeedback(entry.feedback) } : {}),
     };
   }
   const detail = projectDetail(entry.detail);
@@ -538,21 +579,50 @@ function projectEvent(entry: PersistedEventEntry, titlesAllowed: boolean): Recor
     id: safeId,
     kind: safeKind,
     subject: projectSubject(entry),
-    level: entry.level,
+    level: safeLevel,
     at: entry.at,
-    // `modelOutput` applies `modelTitle` once via `minimize` on `.title` paths.
+    // `modelProjectedOutput` applies `modelTitle` once via `minimize` on `.title` paths.
     ...(isWindow && entry.title !== undefined ? { title: entry.title } : {}),
-    ...(entry.reason !== undefined ? { reason: modelText(entry.reason) } : {}),
+    ...(entry.reason !== undefined ? { reason: safeReason(entry.reason) } : {}),
     ...(entry.ruleId !== undefined ? { ruleId: safeIdentifier(entry.ruleId) } : {}),
-    ...(entry.cause !== undefined ? { cause: entry.cause } : {}),
+    ...(entry.cause !== undefined ? { cause: safeEventCause(entry.cause) } : {}),
     ...(entry.restarts !== undefined ? { restarts: entry.restarts } : {}),
     source: projectSource(entry.source),
     ...(detail !== undefined ? { detail } : {}),
     ...(entry.currentEta !== undefined ? { currentEta: entry.currentEta } : {}),
-    ...(entry.feedback !== undefined ? { feedback: entry.feedback } : {}),
+    ...(entry.feedback !== undefined ? { feedback: safeFeedback(entry.feedback) } : {}),
     ...(entry.feedbackAvailable !== undefined ? { feedbackAvailable: entry.feedbackAvailable } : {}),
   };
 }
+
+const HISTORY_PREPROJECTED_PATHS = [
+  'events.id',
+  'events.kind',
+  'events.subject',
+  'events.level',
+  'events.reason',
+  'events.ruleId',
+  'events.cause',
+  'events.source.id',
+  'events.source.api',
+  'events.feedback',
+  'events.detail.directory',
+  'events.detail.dir',
+  'events.detail.metric',
+  'events.detail.ruleId',
+  'events.detail.type',
+  'events.detail.severity',
+  'events.detail.direction',
+  'events.detail.confidence',
+] as const;
+
+const SUMMARY_PREPROJECTED_DICT_PATHS = [
+  'summary.apps',
+  'summary.deliveries.byRule',
+  'summary.fileBursts',
+  'summary.fileActivity',
+  'summary.bodyAnomalies.byMetric',
+] as const;
 
 function projectRecord<V>(
   source: Record<string, V>,
@@ -592,17 +662,20 @@ export function modelHistory(result: HistoryQueryResult): JsonValue {
   let events = result.events.map((ev) => projectEvent(ev, result.titlesAllowed));
   let truncated = result.truncated;
   for (;;) {
-    const candidate = modelOutput({
-      available: true,
-      from: result.from,
-      to: result.to,
-      ...(result.rangeClamped ? { rangeClamped: true, note: result.note } : {}),
-      limit: result.limit,
-      total: result.total,
-      truncated,
-      titlesAllowed: result.titlesAllowed,
-      events,
-    });
+    const candidate = modelProjectedOutput(
+      {
+        available: true,
+        from: result.from,
+        to: result.to,
+        ...(result.rangeClamped ? { rangeClamped: true, note: result.note } : {}),
+        limit: result.limit,
+        total: result.total,
+        truncated,
+        titlesAllowed: result.titlesAllowed,
+        events,
+      },
+      HISTORY_PREPROJECTED_PATHS,
+    );
     if (
       candidate !== null &&
       typeof candidate === 'object' &&
@@ -730,7 +803,9 @@ export function modelSummary(result: SummaryQueryResult): JsonValue {
   };
 
   const sortedFa = sortDirEntries(fileActivity);
-  const faFit = fitTopEntries(sortedFa, (faSubset, faTruncated) => modelOutput(buildPayload(faSubset, faTruncated)));
+  const faFit = fitTopEntries(sortedFa, (faSubset, faTruncated) =>
+    modelProjectedOutput(buildPayload(faSubset, faTruncated), [], SUMMARY_PREPROJECTED_DICT_PATHS),
+  );
   if (faFit) return faFit.out;
 
   const emptyFa: Record<string, DailyDirectoryStats> = Object.create(null);
@@ -741,7 +816,7 @@ export function modelSummary(result: SummaryQueryResult): JsonValue {
   const curByMetric = byMetric;
 
   const burstFit = fitTopEntries(sortDirEntries(curBursts), (sub) =>
-    modelOutput(
+    modelProjectedOutput(
       buildPayload(emptyFa, faTruncated, {
         apps: curApps,
         byRule: curByRule,
@@ -749,6 +824,8 @@ export function modelSummary(result: SummaryQueryResult): JsonValue {
         byMetric: curByMetric,
         extraTruncated: true,
       }),
+      [],
+      SUMMARY_PREPROJECTED_DICT_PATHS,
     ),
   );
   if (burstFit) return burstFit.out;
@@ -758,7 +835,7 @@ export function modelSummary(result: SummaryQueryResult): JsonValue {
     ([ak, a], [bk, b]) => b.foregroundMs - a.foregroundMs || b.switches - a.switches || ak.localeCompare(bk),
   );
   const appsFit = fitTopEntries(sortedApps, (sub) =>
-    modelOutput(
+    modelProjectedOutput(
       buildPayload(emptyFa, faTruncated, {
         apps: sub,
         byRule: curByRule,
@@ -766,6 +843,8 @@ export function modelSummary(result: SummaryQueryResult): JsonValue {
         byMetric: curByMetric,
         extraTruncated: true,
       }),
+      [],
+      SUMMARY_PREPROJECTED_DICT_PATHS,
     ),
   );
   if (appsFit) return appsFit.out;
@@ -776,7 +855,7 @@ export function modelSummary(result: SummaryQueryResult): JsonValue {
       b.wake + b.context + b.suppressed - (a.wake + a.context + a.suppressed) || ak.localeCompare(bk),
   );
   const ruleFit = fitTopEntries(sortedRules, (sub) =>
-    modelOutput(
+    modelProjectedOutput(
       buildPayload(emptyFa, faTruncated, {
         apps: noApps,
         byRule: sub,
@@ -784,6 +863,8 @@ export function modelSummary(result: SummaryQueryResult): JsonValue {
         byMetric: curByMetric,
         extraTruncated: true,
       }),
+      [],
+      SUMMARY_PREPROJECTED_DICT_PATHS,
     ),
   );
   if (ruleFit) return ruleFit.out;
@@ -791,7 +872,7 @@ export function modelSummary(result: SummaryQueryResult): JsonValue {
 
   const sortedMetrics = Object.entries(curByMetric).sort(([ak, a], [bk, b]) => b - a || ak.localeCompare(bk));
   const metricFit = fitTopEntries(sortedMetrics, (sub) =>
-    modelOutput(
+    modelProjectedOutput(
       buildPayload(emptyFa, faTruncated, {
         apps: noApps,
         byRule: noRules,
@@ -799,11 +880,13 @@ export function modelSummary(result: SummaryQueryResult): JsonValue {
         byMetric: sub,
         extraTruncated: true,
       }),
+      [],
+      SUMMARY_PREPROJECTED_DICT_PATHS,
     ),
   );
   if (metricFit) return metricFit.out;
 
-  return modelOutput(
+  return modelProjectedOutput(
     buildPayload(emptyFa, faTruncated, {
       apps: Object.create(null),
       byRule: Object.create(null),
@@ -811,5 +894,7 @@ export function modelSummary(result: SummaryQueryResult): JsonValue {
       byMetric: Object.create(null),
       extraTruncated: true,
     }),
+    [],
+    SUMMARY_PREPROJECTED_DICT_PATHS,
   );
 }
