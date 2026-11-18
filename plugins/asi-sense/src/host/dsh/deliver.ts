@@ -7,7 +7,7 @@ import { DeliveryFailure } from '../attention/drain.ts';
 import { isHomeRoot } from '../attention/path.ts';
 import type { DeliveryIntent } from '../attention/pipeline.ts';
 import { formatEnvUpdate } from '../delivery/format.ts';
-import { modelAppName, modelLabel, modelPath, modelTitle } from './tool-output.ts';
+import { modelActivityName, modelAppName, modelLabel, modelPath, modelTitle } from './tool-output.ts';
 
 declare module '@deepseek-ai/dsh-llm' {
   interface MessageSourceMap {
@@ -15,25 +15,17 @@ declare module '@deepseek-ai/dsh-llm' {
   }
 }
 
-const MAX_ACTIVITY_NAME = 512;
+export { modelActivityName };
 
-function truncateName(value: string, limit = MAX_ACTIVITY_NAME): string {
-  if (value.length <= limit) return value;
-  const max = Math.max(0, limit - 3);
-  let end = 0;
-  for (const ch of value) {
-    if (end + ch.length > max) break;
-    end += ch.length;
+/** Masks a `files` entry that resolves to the user's home root, keeping subdirectory names intact. */
+export function modelFileEntry(directory: string | undefined, item: string): string {
+  if (item === '~') return '~';
+  const dir = directory?.trim();
+  if (dir) {
+    const separator = dir.endsWith('/') || dir.endsWith('\\') ? '' : '/';
+    if (isHomeRoot(`${dir}${separator}${item}`)) return '~';
   }
-  return `${value.slice(0, end)}...`;
-}
-
-export function modelActivityName(raw: string, maskHomeRoot = false): string {
-  // Stored summaries already contain the '~' placeholder; keep it instead of re-redacting it to [path].
-  if (maskHomeRoot && (raw === '~' || isHomeRoot(raw))) return '~';
-  const base = modelPath(raw);
-  const masked = modelTitle(truncateName(base));
-  return masked.trim() ? masked : '[file]';
+  return modelActivityName(item, false);
 }
 
 function metric(value: unknown): string {
@@ -150,12 +142,11 @@ function modelUpdate(update: EnvUpdate): EnvUpdate {
         if (signal.data.externalDeletionExceeded === true) data.externalDeletionExceeded = true;
         if (signal.kind === 'file.burst' && signal.data.rolledUp === true) data.rolledUp = true;
       } else if (signal.kind === 'file.activity') {
-        const maskedDir = modelActivityName(
+        const rawDir =
           typeof signal.data.directory === 'string' && signal.data.directory.trim()
             ? signal.data.directory
-            : signal.subject,
-          true,
-        );
+            : signal.subject;
+        const maskedDir = modelActivityName(rawDir, true);
         subject = maskedDir;
         data.directory = maskedDir;
         for (const key of ['windowMs', 'created', 'modified', 'deleted', 'rolledUp']) {
@@ -166,7 +157,7 @@ function modelUpdate(update: EnvUpdate): EnvUpdate {
           const files = signal.data.files
             .filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
             .slice(0, 5)
-            .map((item) => modelActivityName(item, false));
+            .map((item) => modelFileEntry(rawDir, item));
           if (files.length > 0) data.files = files;
         }
         if (signal.data.degraded === true) data.degraded = true;

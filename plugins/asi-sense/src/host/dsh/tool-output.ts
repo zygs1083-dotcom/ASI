@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import os from 'node:os';
 import type { Fact, SenseState, WatchRule } from '@asi/sense-types';
 import { isRemoteJsonValue } from '@deepseek-ai/dsh-typert-protocol';
+import { isHomeRoot } from '../attention/path.ts';
 import type { createSenseRuntime } from '../runtime/index.ts';
 import type { JsonValue } from './wire-types.ts';
 
@@ -1660,6 +1661,27 @@ export function modelTitle(value: string, hostname = os.hostname()): string {
   return projectModelString(value, hostname, MAX_TITLE_LENGTH, true);
 }
 
+const MAX_ACTIVITY_NAME = 512;
+
+function truncateName(value: string, limit = MAX_ACTIVITY_NAME): string {
+  if (value.length <= limit) return value;
+  const max = Math.max(0, limit - 3);
+  let end = 0;
+  for (const ch of value) {
+    if (end + ch.length > max) break;
+    end += ch.length;
+  }
+  return `${value.slice(0, end)}...`;
+}
+
+export function modelActivityName(raw: string, maskHomeRoot = false): string {
+  // Stored summaries already contain the '~' placeholder; keep it instead of re-redacting it to [path].
+  if (maskHomeRoot && (raw === '~' || isHomeRoot(raw))) return '~';
+  const base = modelPath(raw);
+  const masked = modelTitle(truncateName(base));
+  return masked.trim() ? masked : '[file]';
+}
+
 function minimize(
   value: JsonValue,
   hostname: string,
@@ -1978,14 +2000,15 @@ export function modelRules(rules: WatchRule[]): JsonValue {
             rule.match.kind === 'file.activity' ||
             rule.match.kind === 'file.burst') &&
           rule.match.subject !== undefined
-            ? { subject: modelPath(rule.match.subject) }
+            ? { subject: modelActivityName(rule.match.subject, true) }
             : {}),
           ...(Object.keys(where).length ? { where } : {}),
         },
       };
     }),
     undefined,
-    ['match.kind'],
+    // `match.subject` is already masked by `modelActivityName`, so keep its `~` placeholder verbatim.
+    ['match.kind', 'match.subject'],
   );
 }
 

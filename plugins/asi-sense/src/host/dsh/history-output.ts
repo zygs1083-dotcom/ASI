@@ -7,7 +7,7 @@ import type {
   PersistedEventEntry,
   SummaryQueryResult,
 } from '../runtime/ports.ts';
-import { modelActivityName } from './deliver.ts';
+import { modelActivityName, modelFileEntry } from './deliver.ts';
 import { modelAppName, modelOutput, modelPath, modelProjectedOutput, modelText, modelTitle } from './tool-output.ts';
 import type { JsonValue } from './wire-types.ts';
 
@@ -493,6 +493,8 @@ function projectDetail(
   detail: Record<string, string | number | boolean | string[]> | undefined,
 ): Record<string, string | number | boolean | string[]> | undefined {
   if (!detail) return undefined;
+  const rawDirectory =
+    typeof detail.directory === 'string' ? detail.directory : typeof detail.dir === 'string' ? detail.dir : undefined;
   const out: Record<string, string | number | boolean | string[]> = {};
   for (const [key, value] of Object.entries(detail)) {
     if (Array.isArray(value)) {
@@ -500,7 +502,7 @@ function projectDetail(
         const files = value
           .filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
           .slice(0, 5)
-          .map((item) => modelActivityName(item, false));
+          .map((item) => modelFileEntry(rawDirectory, item));
         if (files.length > 0) out[key] = files;
       } else {
         const items = value.filter((item): item is string => typeof item === 'string').map((item) => modelText(item));
@@ -608,6 +610,7 @@ const HISTORY_PREPROJECTED_PATHS = [
   'events.feedback',
   'events.detail.directory',
   'events.detail.dir',
+  'events.detail.files',
   'events.detail.metric',
   'events.detail.ruleId',
   'events.detail.type',

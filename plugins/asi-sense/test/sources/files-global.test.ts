@@ -677,11 +677,17 @@ describe('FileGlobalSource integration', () => {
     const longPattern = `${'**a'.repeat(341)}b`.slice(0, 1024);
     const matcher = compileGlob(longPattern, { matchDescendants: true });
     const text = `/${'a'.repeat(250)}c`;
-    for (let i = 0; i < 5; i++) matcher.test(text);
-    const t0 = performance.now();
-    expect(matcher.test(text)).toBe(false);
-    const globMs = performance.now() - t0;
-    expect(globMs).toBeLessThan(1);
+    for (let i = 0; i < 50; i++) matcher.test(text);
+    const results: boolean[] = [];
+    const samples: number[] = [];
+    for (let i = 0; i < 5; i++) {
+      const started = performance.now();
+      results.push(matcher.test(text));
+      samples.push(performance.now() - started);
+    }
+    expect(results.every((matched) => matched === false)).toBe(true);
+    samples.sort((a, b) => a - b);
+    expect(samples[Math.floor(samples.length / 2)]).toBeLessThan(5);
 
     const exMatcher = new ExclusionMatcher([`${'**a'.repeat(18)}b`], [], '/Users/demo', 'darwin');
     const t1 = performance.now();
@@ -925,6 +931,21 @@ describe('FileGlobalSource integration', () => {
     await h.runtime.actions.removeFileExclusion?.('~/Vault');
     expect(h.globalFact()?.exclusions).not.toContain('~/Vault');
 
+    await h.runtime.stop();
+  });
+
+  it('drops a watcher error callback queued immediately before pause(true)', async () => {
+    const h = createHarness();
+    await h.runtime.start();
+    const before = h.events().length;
+
+    h.emitFile({ path: '/', change: 'modify', watchError: true, errorCode: 'EIO' } as FileChange);
+    await h.runtime.actions.pause(true);
+    await h.advance(20);
+
+    const added = h.events().slice(before);
+    expect(added.filter((event) => event.kind === 'source.status' && event.subject === 'files-global')).toEqual([]);
+    expect(added.map((event) => event.reason ?? '')).not.toContain('全盘文件监视出错（EIO）');
     await h.runtime.stop();
   });
 

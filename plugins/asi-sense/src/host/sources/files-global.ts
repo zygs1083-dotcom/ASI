@@ -2,7 +2,13 @@ import os from 'node:os';
 import path from 'node:path';
 import { performance } from 'node:perf_hooks';
 import type { GlobalFileWatchStatus, GlobalFileWatchValue, Signal } from '@asi/sense-types';
-import { canonicalizeDarwinAlias, normalizeAbsPath, normalizeWatchPath, resolveRealPath } from '../attention/path.ts';
+import {
+  canonicalizeDarwinAlias,
+  isHomeRoot,
+  normalizeAbsPath,
+  normalizeWatchPath,
+  resolveRealPath,
+} from '../attention/path.ts';
 import type { BurstTarget } from '../body/burst.ts';
 import type { RuntimeAttention } from '../runtime/attention.ts';
 import type { Clock, FileChange, FileWatcher, GlobalFileWatchOptions } from '../runtime/ports.ts';
@@ -110,6 +116,7 @@ export class FileGlobalSource {
   private readonly degradedWindowMs: number;
   private readonly recoveryWindowMs: number;
   private readonly homedir: string;
+  private readonly homeRoot: string | undefined;
   private readonly dataDirs: string[];
 
   private handle?: { close(): void | Promise<void> };
@@ -179,6 +186,7 @@ export class FileGlobalSource {
     this.degradedWindowMs = options.degradedWindowMs ?? DEFAULT_DEGRADED_WINDOW_MS;
     this.recoveryWindowMs = options.recoveryWindowMs ?? DEFAULT_RECOVERY_WINDOW_MS;
     this.homedir = options.homedir ?? os.homedir();
+    this.homeRoot = normalizeWatchPath(this.homedir, this.platform);
     this.dataDirs = resolveDataDirs(options.dataDirs, this.platform);
     this.exclusions = new ExclusionMatcher(this.settings.fileExclusions(), this.dataDirs, this.homedir, this.platform);
   }
@@ -581,7 +589,7 @@ export class FileGlobalSource {
         if (!isRoot && this.exclusions.isExcludedNormalized(target)) return;
         const display = normalizeDeniedDisplayPath(rawTarget, this.platform) ?? target;
         const run = this.tail.then(async () => {
-          if (this.handle !== handle) return;
+          if (this.handle !== handle || this.paused()) return;
           if (isRoot) {
             await this.handleDenied(target, display, true);
             return;
@@ -608,10 +616,13 @@ export class FileGlobalSource {
       }
       this.flushEpoch++;
       const run = this.tail.then(async () => {
-        if (this.handle !== handle) return;
+        if (this.handle !== handle || this.paused()) return;
         await this.closeWatcher();
         this.resetRuntimeState();
         this.reschedule();
+        // pause(true) can land while the watcher is being torn down; refresh() finishes the
+        // transition, so a late error callback must not write source.status into history.
+        if (this.paused()) return;
         if (this.wantsWatch() && this.supportedPlatform() && !this.immediateRebuildUsed) {
           this.immediateRebuildUsed = true;
           const ok = await this.openWatcher(false);
@@ -680,7 +691,13 @@ export class FileGlobalSource {
     if (!this.countOnly && group.files.size < MAX_FILES_PER_BUCKET) {
       const slash = absPath.lastIndexOf('/');
       const base = slash < 0 ? absPath : absPath.slice(slash + 1);
-      if (base.length > 0) group.files.add(base);
+      // The home root itself must never contribute the account name to `files`; `directory` alone
+      // (e.g. '/users') stays generic, so write the '~' placeholder instead of the basename.
+      if (isHomeRoot(absPath, this.platform) || (this.homeRoot !== undefined && absPath === this.homeRoot)) {
+        group.files.add('~');
+      } else if (base.length > 0) {
+        group.files.add(base);
+      }
     }
 
     const immediateCap =

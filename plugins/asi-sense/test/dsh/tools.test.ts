@@ -823,4 +823,46 @@ describe('model-facing tools', () => {
     expect(stateJson).not.toContain('Mail');
     expect(stateJson).not.toContain('custom-root');
   });
+
+  it('masks home-root rule subjects in modelRules but keeps child directory names', () => {
+    const projected = JSON.parse(
+      JSON.stringify(
+        modelRules([
+          {
+            id: 'root-activity',
+            approved: true,
+            level: 'context',
+            createdBy: 'user',
+            match: { kind: 'file.activity', subject: '/Users/alice' },
+          },
+          {
+            id: 'root-burst',
+            approved: true,
+            level: 'wake',
+            createdBy: 'user',
+            match: { kind: 'file.burst', subject: '/home/bob-dev' },
+          },
+          {
+            id: 'root-changed',
+            approved: true,
+            level: 'record',
+            createdBy: 'user',
+            match: { kind: 'file.changed', subject: os.homedir() },
+          },
+          {
+            id: 'child-changed',
+            approved: true,
+            level: 'context',
+            createdBy: 'user',
+            match: { kind: 'file.changed', subject: '/Users/alice/secret-repo/src' },
+          },
+        ]),
+      ),
+    ) as Array<{ id: string; match: { subject: string } }>;
+    const subjects = new Map(projected.map((rule) => [rule.id, rule.match.subject]));
+    expect(subjects.get('root-activity')).toBe('~');
+    expect(subjects.get('root-burst')).toBe('~');
+    expect(subjects.get('root-changed')).toBe('~');
+    expect(subjects.get('child-changed')).toBe('src');
+  });
 });

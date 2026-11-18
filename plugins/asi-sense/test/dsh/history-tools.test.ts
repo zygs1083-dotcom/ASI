@@ -7,6 +7,7 @@ import { PassThrough } from 'node:stream';
 import { fileURLToPath } from 'node:url';
 import { ToolArgsError, type ToolRunContext } from '@deepseek-ai/dsh-tools';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { createDelivery } from '../../src/host/dsh/deliver.ts';
 import { KNOWN_EVENT_KINDS, modelHistory, modelSummary } from '../../src/host/dsh/history-output.ts';
 import { FileHistoryStoragePort } from '../../src/host/dsh/history-storage.ts';
 import { createSenseTools } from '../../src/host/dsh/tools.ts';
@@ -1487,6 +1488,112 @@ describe('env_detail, env_history, and env_summary tools', () => {
     expect(src).toContain("entry.kind.startsWith('file.')");
     expect(src).toContain('projectRecord(s.fileBursts, (key) => modelActivityName(');
     expect(src).toContain('projectRecord(s.fileActivity, (key) => modelActivityName(');
+  });
+
+  it('masks a global-watch event whose own path is the user home root', async () => {
+    const dir = await makeTempDir();
+    const port = new FileHistoryStoragePort(dir);
+    let wallMs = Date.UTC(2026, 10, 18, 12, 0, 0);
+    let monoMs = 1_000;
+    let watchCb: ((event: FileChange) => void) | undefined;
+    const saved = new Map<string, string>();
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'Date'] });
+    try {
+      const rt = createSenseRuntime(
+        {
+          clock: { wall: () => wallMs, mono: () => monoMs },
+          history: port,
+          storage: {
+            load: async (key) => saved.get(key),
+            save: async (key, json) => {
+              saved.set(key, json);
+            },
+          },
+          dsh: {
+            onAgentEvent: () => () => {},
+            onTool: () => () => {},
+            onJob: () => () => {},
+            deliver: async () => {},
+            tokenSnapshot: async () => undefined,
+          },
+          helper: { spawn: () => undefined },
+          probe: { create: () => ({ onSample: () => () => {}, start: () => {}, stop: async () => {} }) },
+          files: {
+            watch: (root, cb) => {
+              if (root === '/') watchCb = cb;
+              return { close: () => {} };
+            },
+          },
+        },
+        {
+          platform: 'darwin',
+          timeZone: 'UTC',
+          intervalMs: 600_000,
+          globalFileWatch: { root: '/', windowMs: 30, homedir: '/Users/alice', dataDirs: [dir] },
+        },
+      );
+      await rt.start();
+      expect(watchCb).toBeDefined();
+
+      // The watched path is the home root itself, not a child: the bucket directory is '/users',
+      // so only the `files` basename could leak the account name.
+      watchCb?.({ path: '/Users/alice', change: 'modify', at: wallMs });
+      wallMs += 100;
+      monoMs += 100;
+      await vi.advanceTimersByTimeAsync(100);
+
+      const envHistory = createSenseTools(rt, () => wallMs).find((tool) => tool.name === 'env_history');
+      if (!envHistory) throw new Error('missing env_history tool');
+      const hist = (await envHistory.execute({ kinds: ['file.activity'] }, makeExec())) as {
+        events: Array<{ kind: string; subject: string; detail?: { directory?: string; files?: string[] } }>;
+      };
+      expect(hist.events).toHaveLength(1);
+      expect(hist.events[0].detail).toMatchObject({ directory: 'users', files: ['~'] });
+      expect(JSON.stringify(hist)).not.toContain('alice');
+
+      const send = vi.fn();
+      const agent = { send, followup: vi.fn(), inject: vi.fn() };
+      const deliver = createDelivery(
+        () => agent,
+        () => true,
+        async () => false,
+      );
+      const event = rt.events().find((entry) => entry.kind === 'file.activity');
+      if (!event) throw new Error('missing file.activity event');
+      await deliver('s1', {
+        kind: 'send',
+        target: 'user',
+        wakeup: false,
+        sessionId: 's1',
+        deliveryId: 'home-root',
+        update: {
+          since: wallMs,
+          suppressed: 0,
+          summary: 'synthetic',
+          changes: [
+            {
+              level: 'context',
+              signal: {
+                id: event.id,
+                kind: event.kind,
+                at: event.at,
+                source: event.source,
+                subject: event.subject,
+                cause: 'unknown',
+                data: event.detail ?? {},
+              },
+            },
+          ],
+        },
+      } as never);
+      expect(send).toHaveBeenCalledTimes(1);
+      const deliveredText = JSON.stringify(send.mock.calls);
+      expect(deliveredText).not.toContain('alice');
+      expect(deliveredText).toContain('~');
+      await rt.stop();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('outputs only known event kinds from env_history and preserves strict system identifiers without modelText redaction', async () => {
