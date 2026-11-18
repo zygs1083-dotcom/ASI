@@ -509,4 +509,117 @@ describe('formatEnvUpdate', () => {
     expect(out).toContain('screen: locked');
     expect(out).toContain('session: active after 60s');
   });
+
+  it('uses real away totals, prioritizes anomalous metrics, shows omitted count, and caps away.summary output at 2KB', () => {
+    const out = formatEnvUpdate(
+      update([
+        change({
+          level: 'wake',
+          ruleId: 'away-summary',
+          note: 'note-'.repeat(400),
+          signal: sig({
+            id: 'away:1',
+            kind: 'away.summary',
+            at: T0,
+            subject: 'away',
+            data: {
+              awayFrom: T0 - 3_600_000,
+              returnAt: T0,
+              durationMs: 3_600_000,
+              sleepMs: 0,
+              lockMs: 3_600_000,
+              hasAnomaly: true,
+              anomalies: ['alerts', 'failed-jobs', 'external-deletion', 'metric-warning'],
+              metrics: [
+                { metric: 'cpu', unit: 'ratio', start: 0.2, end: 0.2, min: 0.2, max: 0.2 },
+                { metric: 'load1', unit: 'load', start: 1, end: 1, min: 1, max: 1 },
+                { metric: 'load5', unit: 'load', start: 1, end: 1, min: 1, max: 1 },
+                {
+                  metric: 'disk',
+                  unit: 'bytes',
+                  start: 500,
+                  end: 40,
+                  min: 40,
+                  max: 500,
+                  ratioStart: 0.5,
+                  ratioMin: 0.04,
+                },
+              ],
+              alerts: [{ metric: 'context', severity: 'critical', count: 1 }],
+              failed: [{ id: 'job-0', kind: 'job.exited', exitCode: 1 }],
+              bursts: [{ directory: '甲'.repeat(511), deleted: 100 }],
+              alertCount: 7,
+              failedCount: 300,
+              deletedCount: 1000,
+              omitted: 295,
+            },
+          }),
+        }),
+      ]),
+    );
+    expect(Buffer.byteLength(out, 'utf8')).toBeLessThanOrEqual(2048);
+    expect(out).toContain('metrics=disk=4%');
+    expect(out).toContain('alerts=7');
+    expect(out).toContain('failed=300');
+    expect(out).toContain('deletes=1000');
+    expect(out).toContain('另有 295 项');
+  });
+
+  it('drops oldest context lines first and never drops wake or budget-downgraded away.summary lines within 2048 UTF-8 bytes', () => {
+    const contextChanges = Array.from({ length: 14 }, (_, i) =>
+      change({
+        level: 'context',
+        signal: sig({
+          id: `fc-${i}`,
+          kind: 'file.changed',
+          at: T0 + i * 100,
+          subject: `src/mod-${i}/${'中文目录-'.repeat(12)}file-${i}.ts`,
+          data: { path: `src/mod-${i}/${'中文目录-'.repeat(12)}file-${i}.ts`, change: 'modify' },
+        }),
+      }),
+    );
+    const wakeChange = change({
+      level: 'wake',
+      ruleId: 'job-failed',
+      signal: sig({
+        id: 'wake-1',
+        kind: 'job.exited',
+        at: T0 + 1500,
+        subject: 'build',
+        data: { id: 'build', exitCode: 1, durationMs: 12_000 },
+      }),
+    });
+    const awayChange = change({
+      level: 'context',
+      reason: 'wake-budget',
+      ruleId: 'away-summary',
+      signal: sig({
+        id: 'away:1',
+        kind: 'away.summary',
+        at: T0 + 2000,
+        subject: 'away',
+        data: {
+          awayFrom: T0 - 3_600_000,
+          returnAt: T0 + 2000,
+          durationMs: 3_600_000,
+          sleepMs: 0,
+          lockMs: 3_600_000,
+          hasAnomaly: true,
+          anomalies: ['alerts'],
+          alerts: [{ metric: 'thermal', severity: 'critical', count: 1 }],
+          alertCount: 1,
+          failedCount: 0,
+          deletedCount: 0,
+        },
+      }),
+    });
+
+    const out = formatEnvUpdate(update([...contextChanges, wakeChange, awayChange], { suppressed: 1 }));
+    expect(Buffer.byteLength(out, 'utf8')).toBeLessThanOrEqual(2048);
+    expect(out).toContain('away.summary:');
+    expect(out).toContain('job: `build` exited 1 after 12s');
+    expect(out).toContain('suppressed: 1');
+    expect(out).not.toContain('file-0.ts');
+    expect(out).toContain('file-13.ts');
+  });
 });

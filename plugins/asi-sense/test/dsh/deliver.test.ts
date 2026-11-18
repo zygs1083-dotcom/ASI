@@ -1468,4 +1468,286 @@ describe('DSH environment delivery', () => {
       reason: 'EACCES: open x',
     });
   });
+
+  it('bounds away.summary projection under 2KB by priority, preserves totals/anomalyCount/omitted, and drops negative numbers', () => {
+    const longCjkBurst = modelUpdate({
+      since: update.since,
+      at: update.at,
+      suppressed: 0,
+      changes: [
+        {
+          count: 1,
+          level: 'wake',
+          signal: {
+            id: 'away:cjk',
+            kind: 'away.summary',
+            at: update.at,
+            source: { id: 'away', api: 'detector', host: 'local' },
+            subject: 'away',
+            data: {
+              awayFrom: update.since - 3_600_000,
+              returnAt: update.at,
+              durationMs: -5,
+              sleepMs: -1,
+              lockMs: 3_600_000,
+              hasAnomaly: true,
+              anomalies: ['external-deletion'],
+              alerts: [],
+              metrics: [],
+              failed: [],
+              bursts: [{ directory: `/Users/alice/${'甲'.repeat(511)}`, deleted: 80 }],
+              alertCount: 0,
+              failedCount: 0,
+              deletedCount: 80,
+            },
+          },
+        },
+      ],
+    });
+    expect(Buffer.byteLength(JSON.stringify(longCjkBurst), 'utf8')).toBeLessThanOrEqual(2048);
+    const cjkData = longCjkBurst.changes[0]?.signal.data as Record<string, unknown>;
+    expect(cjkData.durationMs).toBeUndefined();
+    expect(cjkData.sleepMs).toBeUndefined();
+    expect(cjkData.lockMs).toBe(3_600_000);
+    expect(cjkData.bursts as Array<Record<string, unknown>>).toHaveLength(1);
+    expect(cjkData.anomalyCount).toBe(1);
+    expect(cjkData.omitted).toBeUndefined();
+
+    const prioritized = modelUpdate({
+      since: update.since,
+      at: update.at,
+      suppressed: 0,
+      changes: [
+        {
+          count: 1,
+          level: 'wake',
+          signal: {
+            id: 'away:prio',
+            kind: 'away.summary',
+            at: update.at,
+            source: { id: 'away', api: 'detector', host: 'local' },
+            subject: 'away',
+            data: {
+              awayFrom: update.since - 3_600_000,
+              returnAt: update.at,
+              durationMs: 3_600_000,
+              sleepMs: 0,
+              lockMs: 3_600_000,
+              hasAnomaly: true,
+              anomalies: ['alerts', 'failed-jobs', 'external-deletion', 'metric-warning'],
+              alerts: [
+                { metric: 'memory', severity: 'warn', count: 2 },
+                { metric: 'context', severity: 'critical', count: 1 },
+              ],
+              metrics: [
+                { metric: 'cpu', unit: 'ratio', start: 0.2, end: 0.2, min: 0.2, max: 0.2 },
+                {
+                  metric: 'disk',
+                  unit: 'bytes',
+                  start: 500,
+                  end: 40,
+                  min: 40,
+                  max: 500,
+                  ratioStart: 0.5,
+                  ratioMin: 0.04,
+                },
+              ],
+              failed: Array.from({ length: 40 }, (_, i) => ({
+                id: `job-${i}-${'word '.repeat(25)}`,
+                kind: 'job.exited',
+                exitCode: 1,
+              })),
+              bursts: [{ directory: '/Users/alice/build', deleted: 100 }],
+              alertCount: 3,
+              failedCount: 40,
+              deletedCount: 100,
+            },
+          },
+        },
+      ],
+    });
+    expect(Buffer.byteLength(JSON.stringify(prioritized), 'utf8')).toBeLessThanOrEqual(2048);
+    const prioData = prioritized.changes[0]?.signal.data as Record<string, unknown>;
+    expect(prioData.failedCount).toBe(40);
+    expect(prioData.deletedCount).toBe(100);
+    expect(prioData.anomalyCount).toBe(44);
+    expect(typeof prioData.omitted).toBe('number');
+    expect(prioData.omitted as number).toBeGreaterThan(0);
+    expect((prioData.alerts as Array<{ severity: string; metric: string }>).map((a) => a.severity)).toEqual([
+      'critical',
+      'warn',
+    ]);
+  });
+
+  it('strips reasons from all entries first and drops by priority critical alerts > critical metrics > bursts > warn alerts > warn metrics > failed > normal metrics', () => {
+    const p1 = modelUpdate({
+      since: update.since,
+      at: update.at,
+      suppressed: 0,
+      changes: [
+        {
+          count: 1,
+          level: 'wake',
+          signal: {
+            id: 'away:p1',
+            kind: 'away.summary',
+            at: update.at,
+            source: { id: 'away', api: 'detector', host: 'local' },
+            subject: 'away',
+            data: {
+              awayFrom: update.since - 3_600_000,
+              returnAt: update.at,
+              durationMs: 3_600_000,
+              sleepMs: 0,
+              lockMs: 3_600_000,
+              hasAnomaly: true,
+              anomalies: ['alerts', 'failed-jobs', 'external-deletion', 'metric-warning', 'metric-growth'],
+              alerts: [
+                { metric: 'memory', severity: 'warn', count: 2 },
+                { metric: 'thermal', severity: 'critical', count: 1 },
+              ],
+              metrics: [
+                { metric: 'load1', unit: 'load', start: 1, end: 1, min: 1, max: 1 },
+                { metric: 'cpu', unit: 'ratio', start: 0.1, end: 0.5, min: 0.1, max: 0.5 },
+                {
+                  metric: 'disk',
+                  unit: 'bytes',
+                  start: 1000,
+                  end: 20,
+                  min: 20,
+                  max: 1000,
+                  ratioStart: 0.5,
+                  ratioMin: 0.02,
+                },
+              ],
+              failed: Array.from({ length: 20 }, (_, i) => ({
+                id: `job-${i}-${'alpha beta '.repeat(10)}`,
+                kind: 'job.exited',
+                exitCode: 1,
+              })),
+              bursts: [{ directory: '/Users/alice/important-data', deleted: 200 }],
+              alertCount: 3,
+              failedCount: 20,
+              deletedCount: 200,
+            },
+          },
+        },
+      ],
+    });
+    expect(Buffer.byteLength(JSON.stringify(p1), 'utf8')).toBeLessThanOrEqual(2048);
+    const p1Data = p1.changes[0]?.signal.data as Record<string, unknown>;
+    expect(p1Data.bursts).toEqual([{ directory: 'important-data', deleted: 200 }]);
+    expect((p1Data.metrics as Array<{ metric: string }>).map((m) => m.metric)).toEqual(['disk', 'cpu']);
+    expect(
+      (p1Data.alerts as Array<{ metric: string; severity: string }>).map((a) => `${a.severity}:${a.metric}`),
+    ).toEqual(['critical:thermal', 'warn:memory']);
+    const p1Text = formatEnvUpdate(p1);
+    expect(p1Text).toContain('metrics=disk=2%,cpu=+400%');
+    expect(p1Text).toContain('deletes=200@important-data');
+
+    const p2 = modelUpdate({
+      since: update.since,
+      at: update.at,
+      suppressed: 0,
+      changes: [
+        {
+          count: 1,
+          level: 'wake',
+          signal: {
+            id: 'away:p2',
+            kind: 'away.summary',
+            at: update.at,
+            source: { id: 'away', api: 'detector', host: 'local' },
+            subject: 'away',
+            data: {
+              awayFrom: update.since - 3_600_000,
+              returnAt: update.at,
+              durationMs: 3_600_000,
+              sleepMs: 0,
+              lockMs: 3_600_000,
+              hasAnomaly: true,
+              anomalies: ['alerts'],
+              alerts: Array.from({ length: 12 }, (_, i) => ({
+                metric: `disk:/Volumes/volume-${i}-${'x'.repeat(40)}`,
+                severity: 'critical',
+                count: 1,
+                reason: `critical disk pressure on volume-${i} ${'detail '.repeat(15)}`,
+              })),
+              metrics: [],
+              failed: [],
+              bursts: [],
+              alertCount: 12,
+              failedCount: 0,
+              deletedCount: 0,
+            },
+          },
+        },
+      ],
+    });
+    expect(Buffer.byteLength(JSON.stringify(p2), 'utf8')).toBeLessThanOrEqual(2048);
+    const p2Data = p2.changes[0]?.signal.data as Record<string, unknown>;
+    expect(p2Data.alerts as unknown[]).toHaveLength(12);
+    expect(p2Data.omitted).toBeUndefined();
+    expect((p2Data.alerts as Array<Record<string, unknown>>).every((a) => a.reason === undefined)).toBe(true);
+
+    // When 30 bursts saturate 2KB even after shrinking, warn alert & warn metric drop before bursts/critical.
+    const p3 = modelUpdate({
+      since: update.since,
+      at: update.at,
+      suppressed: 0,
+      changes: [
+        {
+          count: 1,
+          level: 'wake',
+          signal: {
+            id: 'away:p3',
+            kind: 'away.summary',
+            at: update.at,
+            source: { id: 'away', api: 'detector', host: 'local' },
+            subject: 'away',
+            data: {
+              awayFrom: update.since - 3_600_000,
+              returnAt: update.at,
+              durationMs: 3_600_000,
+              sleepMs: 0,
+              lockMs: 3_600_000,
+              hasAnomaly: true,
+              anomalies: ['alerts', 'failed-jobs', 'external-deletion', 'metric-warning', 'metric-growth'],
+              alerts: [
+                { metric: 'memory', severity: 'warn', count: 1 },
+                { metric: 'thermal', severity: 'critical', count: 1 },
+              ],
+              metrics: [
+                { metric: 'cpu', unit: 'ratio', start: 0.1, end: 0.5, min: 0.1, max: 0.5 },
+                {
+                  metric: 'battery',
+                  unit: 'percent',
+                  start: 50,
+                  end: 3,
+                  min: 3,
+                  max: 50,
+                  ratioStart: 0.5,
+                  ratioMin: 0.03,
+                },
+              ],
+              failed: [{ id: 'job-fail', kind: 'job.failed', exitCode: 1 }],
+              bursts: Array.from({ length: 30 }, (_, i) => ({
+                directory: `/Users/alice/workspace/dir-${i}-${'seg-'.repeat(8)}`,
+                deleted: 100,
+              })),
+              alertCount: 2,
+              failedCount: 1,
+              deletedCount: 3000,
+            },
+          },
+        },
+      ],
+    });
+    expect(Buffer.byteLength(JSON.stringify(p3), 'utf8')).toBeLessThanOrEqual(2048);
+    const p3Data = p3.changes[0]?.signal.data as Record<string, unknown>;
+    expect((p3Data.alerts as Array<{ severity: string }>).map((a) => a.severity)).toEqual(['critical']);
+    expect((p3Data.metrics as Array<{ metric: string }>).map((m) => m.metric)).toEqual(['battery']);
+    expect(p3Data.failed).toBeUndefined();
+    expect((p3Data.bursts as unknown[]).length).toBeGreaterThan(0);
+  });
 });

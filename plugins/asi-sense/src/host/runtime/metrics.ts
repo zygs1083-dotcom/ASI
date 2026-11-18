@@ -65,12 +65,20 @@ interface InternalMetricStats {
   last: number;
 }
 
+const SAMPLE_STRIDE = 2 + METRIC_KEYS.length;
+
 interface MetricBucket {
   start: number;
   samples: number;
   slots: Array<InternalMetricStats | undefined>;
   diskTotal?: number;
   memoryTotal?: number;
+  minMono: number;
+  maxMono: number;
+  inOrder: boolean;
+  /** Flat [at, mono, v0..v7, ...] per sample to avoid per-metric array churn. */
+  sampleData: number[];
+  diskTotals?: number[];
 }
 
 export interface Timeline24hPoint {
@@ -135,6 +143,11 @@ export interface MetricTrend {
   ratioEnd?: number;
 }
 
+export interface MetricTrendRange {
+  from: number;
+  to: number;
+}
+
 export interface MetricDayExtension {
   version: 1;
   bucketMs: number;
@@ -167,6 +180,10 @@ function createBucket(start: number): MetricBucket {
     start,
     samples: 0,
     slots: [undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined],
+    minMono: Number.POSITIVE_INFINITY,
+    maxMono: Number.NEGATIVE_INFINITY,
+    inOrder: true,
+    sampleData: [],
   };
 }
 
@@ -261,6 +278,41 @@ export function measureBody(body: Body, at: number): MeasuredValues {
   return diskTotal === undefined ? { values } : { values, diskTotal };
 }
 
+type LocalParts = ReturnType<LocalCalendar['parts']>;
+
+function sameLocalHour(a: LocalParts, b: LocalParts): boolean {
+  return a.year === b.year && a.month === b.month && a.day === b.day && a.hour === b.hour;
+}
+
+function localOffsetMs(p: LocalParts, secMs: number): number {
+  return Date.UTC(p.year, p.month - 1, p.day, p.hour, p.minute, p.second, 0) - secMs;
+}
+
+function visitMatchingSamples(
+  bucket: MetricBucket,
+  slotIdx: number,
+  from: number,
+  to: number,
+  monoBounds: MetricTrendRange | undefined,
+  onSample: (value: number, diskTotal: number | undefined, sampleAt: number, sampleMono: number, order: number) => void,
+): void {
+  const data = bucket.sampleData;
+  for (let base = 0, order = 0; base < data.length; base += SAMPLE_STRIDE, order++) {
+    const value = data[base + 2 + slotIdx];
+    if (value === undefined || Number.isNaN(value)) continue;
+    const sampleAt = data[base] as number;
+    const sampleMono = data[base + 1] as number;
+    const inWall =
+      sampleAt >= from &&
+      sampleAt <= to &&
+      (!monoBounds || (sampleMono >= monoBounds.from && sampleMono <= monoBounds.to));
+    const inMono = monoBounds !== undefined && sampleMono > monoBounds.from && sampleMono <= monoBounds.to;
+    if (!inWall && !inMono) continue;
+    const diskTotal = bucket.diskTotals ? (bucket.diskTotals[order] ?? bucket.diskTotal) : bucket.diskTotal;
+    onSample(value, diskTotal, sampleAt, sampleMono, order);
+  }
+}
+
 export class MetricTimeline {
   private readonly buckets = new Map<number, MetricBucket>();
   private readonly hours = new Map<number, HourBucket>();
@@ -268,6 +320,7 @@ export class MetricTimeline {
   private readonly sampleScratch = new Float64Array(METRIC_KEYS.length);
   private lastBucket?: MetricBucket;
   private lastHour?: HourBucket;
+  private lastHourEnd = Number.NEGATIVE_INFINITY;
   private bucketVersion = 0;
 
   constructor(
@@ -282,8 +335,7 @@ export class MetricTimeline {
     if (!finite(at) || at < 0) return;
 
     let bucket = this.lastBucket;
-    let hour = this.lastHour;
-    if (!bucket || !hour || at < bucket.start || at >= bucket.start + METRIC_BUCKET_MS) {
+    if (!bucket || at < bucket.start || at >= bucket.start + METRIC_BUCKET_MS) {
       const start = Math.floor(at / METRIC_BUCKET_MS) * METRIC_BUCKET_MS;
       bucket = this.buckets.get(start);
       if (!bucket) {
@@ -293,32 +345,66 @@ export class MetricTimeline {
       }
       this.lastBucket = bucket;
       this.pruneBuckets(at);
+    }
 
-      const hourStart = Math.floor(start / METRIC_HOUR_MS) * METRIC_HOUR_MS;
-      if (!hour || hour.start !== hourStart) {
-        hour = this.hours.get(hourStart);
-        if (!hour) {
-          hour = createBucket(hourStart);
-          this.hours.set(hourStart, hour);
-        }
-        this.lastHour = hour;
-        this.pruneHours(at);
+    let hour = this.lastHour;
+    if (!hour || at < hour.start || at >= this.lastHourEnd) {
+      const bounds = this.localHourBounds(at);
+      hour = this.hours.get(bounds.start);
+      if (!hour) {
+        hour = createBucket(bounds.start);
+        this.hours.set(bounds.start, hour);
       }
+      this.lastHour = hour;
+      this.lastHourEnd = bounds.end;
+      this.pruneHours(at);
     }
 
     bucket.samples += 1;
     hour.samples += 1;
 
+    const rawMono = this.clock.mono();
+    const mono = finite(rawMono) ? rawMono : 0;
+    const data = bucket.sampleData;
+    const dataLen = data.length;
+    if (bucket.inOrder && dataLen > 0) {
+      const prevAt = data[dataLen - SAMPLE_STRIDE] as number;
+      const prevMono = data[dataLen - SAMPLE_STRIDE + 1] as number;
+      if (at < prevAt || mono < prevMono) bucket.inOrder = false;
+    }
+    if (mono < bucket.minMono) bucket.minMono = mono;
+    if (mono > bucket.maxMono) bucket.maxMono = mono;
+
     const scratch = this.sampleScratch;
     const diskTotal = readBodyInto(body, at, scratch);
     for (let i = 0; i < METRIC_KEYS.length; i++) {
-      const value = scratch[i];
+      const value = scratch[i] as number;
       if (!Number.isNaN(value)) {
         addSlotInPlace(bucket.slots, i, value);
         addSlotInPlace(hour.slots, i, value);
       }
     }
+    data.push(
+      at,
+      mono,
+      scratch[0] as number,
+      scratch[1] as number,
+      scratch[2] as number,
+      scratch[3] as number,
+      scratch[4] as number,
+      scratch[5] as number,
+      scratch[6] as number,
+      scratch[7] as number,
+    );
     if (diskTotal !== undefined) {
+      const sampleIdx = dataLen / SAMPLE_STRIDE;
+      if (bucket.diskTotal !== undefined && diskTotal !== bucket.diskTotal && !bucket.diskTotals) {
+        bucket.diskTotals = new Array<number>(sampleIdx).fill(bucket.diskTotal);
+      }
+      if (bucket.diskTotals) {
+        while (bucket.diskTotals.length < sampleIdx) bucket.diskTotals.push(bucket.diskTotal ?? diskTotal);
+        bucket.diskTotals.push(diskTotal);
+      }
       bucket.diskTotal = diskTotal;
       hour.diskTotal = diskTotal;
     }
@@ -377,6 +463,7 @@ export class MetricTimeline {
     this.hours.clear();
     this.lastBucket = undefined;
     this.lastHour = undefined;
+    this.lastHourEnd = Number.NEGATIVE_INFINITY;
     this.bucketVersion += 1;
   }
 
@@ -401,24 +488,27 @@ export class MetricTimeline {
     if ((fromRaw !== undefined && clampedFrom !== from) || (toRaw !== undefined && clampedTo !== to)) {
       rangeClamped = true;
     }
-    if (clampedFrom > clampedTo) clampedFrom = clampedTo;
+    const emptyRange = clampedFrom > clampedTo;
+    if (emptyRange) clampedFrom = clampedTo;
 
     const slotIdx = METRIC_INDEX[key];
     const groups = new Map<number, { min: number; max: number; sum: number; count: number; samples: number }>();
-    const starts = [...this.buckets.keys()].sort((a, b) => a - b);
-    for (const start of starts) {
-      if (start < clampedFrom || start > clampedTo) continue;
-      const bucket = this.buckets.get(start);
-      const stats = bucket?.slots[slotIdx];
-      if (!bucket || !stats) continue;
-      const at = Math.floor(start / stepMs) * stepMs;
-      const group = groups.get(at) ?? { min: stats.min, max: stats.max, sum: 0, count: 0, samples: 0 };
-      group.min = Math.min(group.min, stats.min);
-      group.max = Math.max(group.max, stats.max);
-      group.sum += stats.sum;
-      group.count += stats.count;
-      group.samples += bucket.samples;
-      groups.set(at, group);
+    if (!emptyRange) {
+      const starts = [...this.buckets.keys()].sort((a, b) => a - b);
+      for (const start of starts) {
+        if (start + METRIC_BUCKET_MS <= clampedFrom || start > clampedTo) continue;
+        const bucket = this.buckets.get(start);
+        const stats = bucket?.slots[slotIdx];
+        if (!bucket || !stats) continue;
+        const at = Math.floor(start / stepMs) * stepMs;
+        const group = groups.get(at) ?? { min: stats.min, max: stats.max, sum: 0, count: 0, samples: 0 };
+        group.min = Math.min(group.min, stats.min);
+        group.max = Math.max(group.max, stats.max);
+        group.sum += stats.sum;
+        group.count += stats.count;
+        group.samples += bucket.samples;
+        groups.set(at, group);
+      }
     }
     let points: MetricSeriesPoint[] = [...groups.entries()]
       .sort(([a], [b]) => a - b)
@@ -453,54 +543,127 @@ export class MetricTimeline {
   }
 
   /** First/last aggregated values and extremes for an away episode. */
-  trend(metric: MetricKey, from: number, to: number): MetricTrend | undefined {
+  trend(metric: MetricKey, from: number, to: number, monoRange?: MetricTrendRange): MetricTrend | undefined {
     if (!finite(from) || !finite(to) || to < from) return undefined;
     const slotIdx = METRIC_INDEX[metric];
-    const starts = [...this.buckets.keys()].sort((a, b) => a - b);
-    let first: { bucket: MetricBucket; stats: InternalMetricStats; value: number } | undefined;
-    let last: { bucket: MetricBucket; stats: InternalMetricStats; value: number } | undefined;
+    const monoBounds = monoRange && finite(monoRange.from) && finite(monoRange.to) ? monoRange : undefined;
+    const matchedBuckets: MetricBucket[] = [];
+    for (const bucket of this.buckets.values()) {
+      if (!bucket.slots[slotIdx]) continue;
+      const wallOverlap = bucket.start + METRIC_BUCKET_MS > from && bucket.start <= to;
+      const monoOverlap =
+        monoBounds !== undefined && bucket.maxMono > monoBounds.from && bucket.minMono <= monoBounds.to;
+      if (wallOverlap || monoOverlap) matchedBuckets.push(bucket);
+    }
+    if (matchedBuckets.length === 0) return undefined;
+    matchedBuckets.sort((a, b) => a.start - b.start);
+
+    let canUseFastPath = true;
+    let prevMaxMono = Number.NEGATIVE_INFINITY;
+    for (const bucket of matchedBuckets) {
+      if (
+        !bucket.inOrder ||
+        bucket.minMono < prevMaxMono ||
+        (monoBounds !== undefined && bucket.start + METRIC_BUCKET_MS <= from)
+      ) {
+        canUseFastPath = false;
+        break;
+      }
+      prevMaxMono = bucket.maxMono;
+    }
+
+    let firstValue: number | undefined;
+    let firstDiskTotal: number | undefined;
+    let lastValue: number | undefined;
+    let lastDiskTotal: number | undefined;
     let min = Number.POSITIVE_INFINITY;
     let max = Number.NEGATIVE_INFINITY;
     let samples = 0;
     let ratioMin = Number.POSITIVE_INFINITY;
-    for (const start of starts) {
-      if (start < from - METRIC_BUCKET_MS) continue;
-      if (start > to) break;
-      const bucket = this.buckets.get(start);
-      const stats = bucket?.slots[slotIdx];
-      if (!bucket || !stats) continue;
-      if (!first) first = { bucket, stats, value: stats.first };
-      last = { bucket, stats, value: stats.last };
-      min = Math.min(min, stats.min);
-      max = Math.max(max, stats.max);
-      samples += stats.count;
-      if (metric === 'disk' && bucket.diskTotal !== undefined && bucket.diskTotal > 0) {
-        ratioMin = Math.min(ratioMin, stats.min / bucket.diskTotal);
-      } else if (metric === 'battery') {
-        ratioMin = Math.min(ratioMin, stats.min / 100);
+
+    const acceptSample = (value: number, diskTotal: number | undefined) => {
+      if (firstValue === undefined) {
+        firstValue = value;
+        firstDiskTotal = diskTotal;
       }
+      lastValue = value;
+      lastDiskTotal = diskTotal;
+      if (value < min) min = value;
+      if (value > max) max = value;
+      samples += 1;
+      if (metric === 'disk' && diskTotal !== undefined && diskTotal > 0) {
+        ratioMin = Math.min(ratioMin, value / diskTotal);
+      } else if (metric === 'battery') {
+        ratioMin = Math.min(ratioMin, value / 100);
+      }
+    };
+
+    if (canUseFastPath) {
+      for (const bucket of matchedBuckets) {
+        const stats = bucket.slots[slotIdx];
+        if (!stats) continue;
+        const wallFullyInside = bucket.start >= from && bucket.start + METRIC_BUCKET_MS - 1 <= to;
+        const monoOk =
+          monoBounds === undefined || (bucket.minMono >= monoBounds.from && bucket.maxMono <= monoBounds.to);
+        if (wallFullyInside && monoOk && !bucket.diskTotals) {
+          if (firstValue === undefined) {
+            firstValue = stats.first;
+            firstDiskTotal = bucket.diskTotal;
+          }
+          lastValue = stats.last;
+          lastDiskTotal = bucket.diskTotal;
+          if (stats.min < min) min = stats.min;
+          if (stats.max > max) max = stats.max;
+          samples += stats.count;
+          if (metric === 'disk' && bucket.diskTotal !== undefined && bucket.diskTotal > 0) {
+            ratioMin = Math.min(ratioMin, stats.min / bucket.diskTotal);
+          } else if (metric === 'battery') {
+            ratioMin = Math.min(ratioMin, stats.min / 100);
+          }
+          continue;
+        }
+        visitMatchingSamples(bucket, slotIdx, from, to, monoBounds, (value, diskTotal) => {
+          acceptSample(value, diskTotal);
+        });
+      }
+    } else {
+      const collected: Array<{
+        mono: number;
+        at: number;
+        order: number;
+        value: number;
+        diskTotal: number | undefined;
+      }> = [];
+      for (const bucket of matchedBuckets) {
+        visitMatchingSamples(bucket, slotIdx, from, to, monoBounds, (value, diskTotal, sampleAt, sampleMono, order) => {
+          collected.push({ mono: sampleMono, at: sampleAt, order, value, diskTotal });
+        });
+      }
+      collected.sort((a, b) => (a.mono !== b.mono ? a.mono - b.mono : a.at !== b.at ? a.at - b.at : a.order - b.order));
+      for (const item of collected) acceptSample(item.value, item.diskTotal);
     }
-    if (!first || !last) return undefined;
+
+    if (firstValue === undefined || lastValue === undefined) return undefined;
     const result: MetricTrend = {
       metric,
       unit: METRIC_UNITS[metric],
-      start: first.value,
-      end: last.value,
+      start: firstValue,
+      end: lastValue,
       min,
       max,
       samples,
     };
     if (metric === 'disk') {
-      if (first.bucket.diskTotal !== undefined && first.bucket.diskTotal > 0) {
-        result.ratioStart = first.value / first.bucket.diskTotal;
+      if (firstDiskTotal !== undefined && firstDiskTotal > 0) {
+        result.ratioStart = firstValue / firstDiskTotal;
       }
-      if (last.bucket.diskTotal !== undefined && last.bucket.diskTotal > 0) {
-        result.ratioEnd = last.value / last.bucket.diskTotal;
+      if (lastDiskTotal !== undefined && lastDiskTotal > 0) {
+        result.ratioEnd = lastValue / lastDiskTotal;
       }
       if (ratioMin !== Number.POSITIVE_INFINITY) result.ratioMin = ratioMin;
     } else if (metric === 'battery') {
-      result.ratioStart = first.value / 100;
-      result.ratioEnd = last.value / 100;
+      result.ratioStart = firstValue / 100;
+      result.ratioEnd = lastValue / 100;
       if (ratioMin !== Number.POSITIVE_INFINITY) result.ratioMin = ratioMin;
     }
     return result;
@@ -548,6 +711,66 @@ export class MetricTimeline {
     };
   }
 
+  private localHourBounds(at: number): { start: number; end: number } {
+    const secMs = Math.floor(at / 1000) * 1000;
+    const p = this.calendar.parts(secMs);
+    const guess = secMs - (p.minute * 60_000 + p.second * 1000);
+    let start: number;
+    let sp: LocalParts;
+    if (guess >= 0) {
+      const gp = this.calendar.parts(guess);
+      if (sameLocalHour(gp, p) && gp.minute === 0 && gp.second === 0) {
+        start = guess;
+        sp = gp;
+      } else {
+        start = this.findLocalHourStart(secMs, p);
+        sp = this.calendar.parts(start);
+      }
+    } else {
+      start = this.findLocalHourStart(secMs, p);
+      sp = this.calendar.parts(start);
+    }
+    const nextProbe = start + METRIC_HOUR_MS;
+    const ep = this.calendar.parts(nextProbe);
+    const startOffset = localOffsetMs(sp, Math.floor(start / 1000) * 1000);
+    const end =
+      ep.minute === 0 && ep.second === 0 && (!sameLocalHour(ep, sp) || localOffsetMs(ep, nextProbe) !== startOffset)
+        ? nextProbe
+        : this.findLocalHourEnd(start, sp, startOffset);
+    return { start, end };
+  }
+
+  private findLocalHourStart(secMs: number, p: LocalParts): number {
+    const targetOffset = localOffsetMs(p, secMs);
+    let lo = Math.max(0, secMs - METRIC_HOUR_MS);
+    let hi = secMs;
+    while (lo < hi) {
+      const mid = Math.floor((lo + hi) / 2);
+      const mp = this.calendar.parts(mid);
+      if (sameLocalHour(mp, p) && localOffsetMs(mp, Math.floor(mid / 1000) * 1000) === targetOffset) {
+        hi = mid;
+      } else {
+        lo = mid + 1;
+      }
+    }
+    return lo;
+  }
+
+  private findLocalHourEnd(start: number, sp: LocalParts, startOffset: number): number {
+    let lo = start + 1;
+    let hi = start + METRIC_HOUR_MS;
+    while (lo < hi) {
+      const mid = Math.floor((lo + hi) / 2);
+      const mp = this.calendar.parts(mid);
+      if (sameLocalHour(mp, sp) && localOffsetMs(mp, Math.floor(mid / 1000) * 1000) === startOffset) {
+        lo = mid + 1;
+      } else {
+        hi = mid;
+      }
+    }
+    return lo;
+  }
+
   private pruneBuckets(at: number): void {
     const bucketCutoff = Math.floor((at - METRIC_RETENTION_MS) / METRIC_BUCKET_MS) * METRIC_BUCKET_MS;
     for (const start of this.buckets.keys()) {
@@ -556,7 +779,9 @@ export class MetricTimeline {
   }
 
   private pruneHours(at: number): void {
-    const hourCutoff = Math.floor((at - METRIC_HOUR_RETENTION_MS) / METRIC_HOUR_MS) * METRIC_HOUR_MS;
+    const cutoffPoint = at - METRIC_HOUR_RETENTION_MS;
+    if (cutoffPoint <= 0) return;
+    const hourCutoff = this.localHourBounds(cutoffPoint).start;
     for (const start of this.hours.keys()) {
       if (start < hourCutoff) this.hours.delete(start);
     }
