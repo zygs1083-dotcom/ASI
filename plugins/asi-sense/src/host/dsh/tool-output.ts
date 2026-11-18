@@ -1999,6 +1999,7 @@ export const MODEL_RULE_KINDS: ReadonlySet<string> = new Set([
   'screen.unlocked',
   'session.active',
   'session.inactive',
+  'away.summary',
 ]);
 
 export function modelRules(rules: WatchRule[]): JsonValue {

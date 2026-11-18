@@ -44,6 +44,36 @@ function hhmmss(ms: number): string {
   return new Date(ms).toISOString().slice(11, 19);
 }
 
+function compactDuration(ms: number): string {
+  const total = Math.max(0, Math.round(ms / 1000));
+  const hours = Math.floor(total / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  if (hours > 0) return minutes > 0 ? `${hours}h${minutes}m` : `${hours}h`;
+  return `${minutes}m`;
+}
+
+function percentDelta(current: number, start: number): string | undefined {
+  if (!Number.isFinite(current) || !Number.isFinite(start) || start <= 0) return undefined;
+  const ratio = (current - start) / start;
+  return `${ratio >= 0 ? '+' : ''}${Math.round(ratio * 100)}%`;
+}
+
+function awayMetricLabel(entry: Record<string, unknown>): string | undefined {
+  const name = str(entry.metric);
+  if (!name) return undefined;
+  const ratioMin = entry.ratioMin;
+  if ((name === 'disk' || name === 'battery') && typeof ratioMin === 'number' && Number.isFinite(ratioMin)) {
+    return `${name}=${Math.round(ratioMin * 100)}%`;
+  }
+  const start = entry.start;
+  const end = entry.end;
+  if (typeof start === 'number' && typeof end === 'number') {
+    const delta = percentDelta(end, start);
+    if (delta) return `${name}=${delta}`;
+  }
+  return name;
+}
+
 function durationMs(s: Signal): number | undefined {
   if (typeof s.data.durationMs === 'number' && Number.isFinite(s.data.durationMs)) {
     return s.data.durationMs;
@@ -203,6 +233,51 @@ function changeLines(ch: EnvChange, includeTitles: boolean, includeJobCommands: 
     main = `${esc(domain)}: ${esc(verb)}`;
     const dur = durationMs(s);
     if (dur !== undefined) main += ` after ${Math.round(dur / 1000)}s`;
+  } else if (s.kind === 'away.summary') {
+    const total = typeof s.data.durationMs === 'number' ? s.data.durationMs : undefined;
+    main = 'away.summary:';
+    if (total !== undefined) main += ` away=${compactDuration(total)}`;
+    for (const [key, label] of [
+      ['sleepMs', 'sleep'],
+      ['lockMs', 'lock'],
+      ['inactiveMs', 'inactive'],
+    ] as const) {
+      const value = s.data[key];
+      if (typeof value === 'number' && Number.isFinite(value) && value > 0) {
+        main += ` ${label}=${compactDuration(value)}`;
+      }
+    }
+    if (Array.isArray(s.data.metrics)) {
+      const metrics = s.data.metrics
+        .flatMap((item: unknown) =>
+          item && typeof item === 'object' ? [awayMetricLabel(item as Record<string, unknown>)] : [],
+        )
+        .filter((item): item is string => item !== undefined)
+        .slice(0, 3);
+      if (metrics.length > 0) main += ` metrics=${metrics.map((item) => esc(item)).join(',')}`;
+    }
+    if (Array.isArray(s.data.alerts) && s.data.alerts.length > 0) {
+      let alerts = 0;
+      for (const item of s.data.alerts) {
+        if (!item || typeof item !== 'object') continue;
+        const count = (item as Record<string, unknown>).count;
+        alerts += typeof count === 'number' && Number.isFinite(count) ? count : 1;
+      }
+      main += ` alerts=${alerts}`;
+    }
+    if (Array.isArray(s.data.failed) && s.data.failed.length > 0) main += ` failed=${s.data.failed.length}`;
+    if (Array.isArray(s.data.bursts) && s.data.bursts.length > 0) {
+      let deleted = 0;
+      let directory = '';
+      for (const item of s.data.bursts) {
+        if (!item || typeof item !== 'object') continue;
+        const source = item as Record<string, unknown>;
+        if (typeof source.deleted === 'number' && Number.isFinite(source.deleted)) deleted += source.deleted;
+        if (!directory && typeof source.directory === 'string') directory = source.directory;
+      }
+      main += ` deletes=${deleted}${directory ? `@${esc(directory)}` : ''}`;
+    }
+    if (s.data.hasAnomaly !== true) main += ' anomalies=none';
   } else if (s.kind === 'delivery.target-unavailable') {
     main = `delivery: ${esc(str(s.subject) || 'delivery-target')} unavailable`;
   } else if (s.kind === 'fact.updated') {

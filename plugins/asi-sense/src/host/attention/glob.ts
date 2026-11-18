@@ -1,6 +1,6 @@
 const SLASH = 47; // '/'
 
-const enum Op {
+enum Op {
   LITERAL = 0,
   ANY_NON_SLASH = 1,
   STAR_NON_SLASH = 2,

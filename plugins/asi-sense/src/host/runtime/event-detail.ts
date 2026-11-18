@@ -46,6 +46,18 @@ const detailFields: Record<string, readonly string[]> = {
   'screen.unlocked': ['at', 'durationMs'],
   'session.active': ['at', 'durationMs'],
   'session.inactive': ['at', 'durationMs'],
+  'away.summary': [
+    'awayFrom',
+    'returnAt',
+    'durationMs',
+    'sleepMs',
+    'lockMs',
+    'inactiveMs',
+    'hasAnomaly',
+    'alertCount',
+    'failedCount',
+    'deletedCount',
+  ],
 };
 
 export function eventDetail(signal: Signal): EventEntry['detail'] {

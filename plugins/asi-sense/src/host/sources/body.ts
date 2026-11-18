@@ -14,6 +14,7 @@ import { captureRateTimes, type RateTimes } from '../body/rate.ts';
 import { markTuningSnapshot, migrateTuningSnapshot } from '../body/tuning-migration.ts';
 import type { RuntimeAttention } from '../runtime/attention.ts';
 import type { FactExpiry } from '../runtime/expiry.ts';
+import type { MetricTimeline } from '../runtime/metrics.ts';
 import type { Clock, DshPort, ProbeFactory, StoragePort, TokenSnapshot } from '../runtime/ports.ts';
 import { TokenFacts } from './token-facts.ts';
 
@@ -87,6 +88,7 @@ export class BodySource {
     private readonly expiry: FactExpiry,
     private readonly paused: () => boolean,
     private readonly changed: () => void,
+    private readonly metrics?: MetricTimeline,
   ) {
     this.probe = factory.create();
     this.tokenFacts = new TokenFacts(
@@ -309,6 +311,8 @@ export class BodySource {
     },
   ): Promise<void> {
     if (this.stopped || this.paused()) return;
+    // In-memory only: folding this sample into the metric buckets never awaits or touches disk.
+    this.metrics?.record(body, at);
     const { sessionId, contextSession, tokens, tokenTime, tokenSource } = captured;
     const current = this.thermal ? this.attention.state().self.body : undefined;
     if (tokens) body.tokens = tokens;

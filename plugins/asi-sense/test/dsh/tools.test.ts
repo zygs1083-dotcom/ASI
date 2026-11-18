@@ -905,4 +905,19 @@ describe('model-facing tools', () => {
     ) as Array<{ match: { kind: string } }>;
     expect(projected.map((item) => item.match.kind)).toEqual(kinds);
   });
+
+  it('registers env_metrics and rejects unknown metrics, inverted ranges and invalid steps', async () => {
+    const h = await fixture();
+    const unknown = await h.call('env_metrics', { metric: 'gpu' });
+    expect(unknown.isError).toBe(true);
+    const inverted = await h.call('env_metrics', { metric: 'cpu', from: 2_000, to: 1_000 });
+    expect(inverted.isError).toBe(true);
+    const badStep = await h.call('env_metrics', { metric: 'cpu', step: 299 });
+    expect(badStep.isError).toBe(true);
+    const valid = await h.call('env_metrics', { metric: 'cpu', step: 300 });
+    expect(valid).toMatchObject({
+      isError: false,
+      value: { available: false, metric: 'cpu', unit: 'ratio', stepMs: 300_000, points: [] },
+    });
+  });
 });

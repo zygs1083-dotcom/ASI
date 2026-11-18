@@ -81,6 +81,7 @@ export const KNOWN_EVENT_KINDS = new Set([
   'screen.unlocked',
   'session.active',
   'session.inactive',
+  'away.summary',
 ]);
 
 const VALID_LEVELS = new Set(['record', 'context', 'wake']);

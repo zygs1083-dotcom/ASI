@@ -73,8 +73,29 @@ export const DELIVERABLE_KINDS: ReadonlySet<string> = new Set([
   'screen.unlocked',
   'session.active',
   'session.inactive',
+  'away.summary',
   'delivery.target-unavailable',
 ]);
+
+const AWAY_METRIC_NAMES: ReadonlySet<string> = new Set([
+  'cpu',
+  'load1',
+  'load5',
+  'load15',
+  'memory',
+  'swap',
+  'disk',
+  'battery',
+]);
+const AWAY_UNITS: ReadonlySet<string> = new Set(['ratio', 'load', 'bytes', 'percent']);
+const AWAY_ANOMALIES: ReadonlySet<string> = new Set([
+  'alerts',
+  'metric-warning',
+  'metric-growth',
+  'failed-jobs',
+  'external-deletion',
+]);
+const AWAY_FAILED_KINDS: ReadonlySet<string> = new Set(['job.failed', 'job.exited', 'process.exited']);
 
 function sanitizeReason(value: string): string {
   const trimmed = value.trim();
@@ -196,6 +217,88 @@ export function modelUpdate(update: EnvUpdate): EnvUpdate {
         signal.data.durationMs >= 0
       ) {
         data.durationMs = signal.data.durationMs;
+      }
+    } else if (signal.kind === 'away.summary') {
+      subject = 'away';
+      for (const key of [
+        'awayFrom',
+        'returnAt',
+        'durationMs',
+        'sleepMs',
+        'lockMs',
+        'inactiveMs',
+        'alertCount',
+        'failedCount',
+        'deletedCount',
+      ]) {
+        const value = signal.data[key];
+        if (typeof value === 'number' && Number.isFinite(value)) data[key] = value;
+      }
+      data.hasAnomaly = signal.data.hasAnomaly === true;
+      if (Array.isArray(signal.data.anomalies)) {
+        const anomalies = signal.data.anomalies
+          .filter((item): item is string => typeof item === 'string' && AWAY_ANOMALIES.has(item))
+          .slice(0, 8);
+        if (anomalies.length > 0) data.anomalies = anomalies;
+      }
+      if (Array.isArray(signal.data.alerts)) {
+        const alerts = signal.data.alerts.flatMap((item: unknown) => {
+          if (!item || typeof item !== 'object') return [];
+          const { metric: rawMetric, severity, count } = item as Record<string, unknown>;
+          if (typeof rawMetric !== 'string' || typeof severity !== 'string') return [];
+          if (severity !== 'warn' && severity !== 'critical') return [];
+          const safeMetric = metric(rawMetric);
+          const safeCount = typeof count === 'number' && Number.isFinite(count) ? Math.max(1, Math.round(count)) : 1;
+          return [{ metric: safeMetric, severity, count: safeCount }];
+        });
+        if (alerts.length > 0) data.alerts = alerts.slice(0, 5);
+      }
+      if (Array.isArray(signal.data.metrics)) {
+        const metrics = signal.data.metrics.flatMap((item: unknown) => {
+          if (!item || typeof item !== 'object') return [];
+          const source = item as Record<string, unknown>;
+          const name = source.metric;
+          if (typeof name !== 'string' || !AWAY_METRIC_NAMES.has(name)) return [];
+          const unit = typeof source.unit === 'string' && AWAY_UNITS.has(source.unit) ? source.unit : undefined;
+          const numbers: Record<string, number> = {};
+          for (const key of ['start', 'end', 'min', 'max', 'ratioMin']) {
+            const value = source[key];
+            if (typeof value === 'number' && Number.isFinite(value)) numbers[key] = value;
+          }
+          if (!unit || numbers.start === undefined || numbers.end === undefined) return [];
+          return [{ metric: name, unit, ...numbers }];
+        });
+        if (metrics.length > 0) data.metrics = metrics.slice(0, 8);
+      }
+      if (Array.isArray(signal.data.failed)) {
+        const failed = signal.data.failed.flatMap((item: unknown) => {
+          if (!item || typeof item !== 'object') return [];
+          const source = item as Record<string, unknown>;
+          const kind = source.kind;
+          if (typeof kind !== 'string' || !AWAY_FAILED_KINDS.has(kind)) return [];
+          const rawId = typeof source.id === 'string' && source.id.trim() ? source.id : 'job';
+          const id = modelLabel(rawId) || 'job';
+          return [
+            {
+              id,
+              kind,
+              ...(typeof source.exitCode === 'number' && Number.isFinite(source.exitCode)
+                ? { exitCode: source.exitCode }
+                : {}),
+            },
+          ];
+        });
+        if (failed.length > 0) data.failed = failed.slice(0, 5);
+      }
+      if (Array.isArray(signal.data.bursts)) {
+        const bursts = signal.data.bursts.flatMap((item: unknown) => {
+          if (!item || typeof item !== 'object') return [];
+          const source = item as Record<string, unknown>;
+          const rawDir = typeof source.directory === 'string' ? source.directory : '';
+          const deleted = typeof source.deleted === 'number' && Number.isFinite(source.deleted) ? source.deleted : 0;
+          return [{ directory: modelActivityName(rawDir, true), deleted: Math.max(0, Math.round(deleted)) }];
+        });
+        if (bursts.length > 0) data.bursts = bursts.slice(0, 5);
       }
     } else if (signal.kind === 'delivery.target-unavailable') {
       subject = 'delivery-target';

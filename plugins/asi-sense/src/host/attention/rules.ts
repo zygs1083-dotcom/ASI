@@ -328,4 +328,6 @@ export const DEFAULT_RULES: readonly WatchRule[] = [
   def('screen-unlocked', { kind: 'screen.unlocked' }, 'record'),
   def('session-active', { kind: 'session.active' }, 'record'),
   def('session-inactive', { kind: 'session.inactive' }, 'record'),
+  // Only an anomalous away period reaches the agent; quiet periods stay in history.
+  def('away-summary', { kind: 'away.summary', where: { hasAnomaly: true } }, 'wake'),
 ];

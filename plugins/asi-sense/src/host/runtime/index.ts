@@ -7,10 +7,12 @@ import { FileGlobalSource } from '../sources/files-global.ts';
 import { HelperSource } from '../sources/helper.ts';
 import { boundedShutdown, guardActions } from './action-guard.ts';
 import { RuntimeAttention } from './attention.ts';
+import { AwayReporter } from './away.ts';
 import { createChanges, createStateListeners, observableActions, settleShutdown } from './changes.ts';
 import { deliveryRetry } from './delivery-retry.ts';
 import { FactExpiry } from './expiry.ts';
 import { HistoryManager } from './history/index.ts';
+import { MetricTimeline } from './metrics.ts';
 import type { SenseActions, SenseOptions, SensePorts } from './ports.ts';
 import { createSessionTarget } from './session-target.ts';
 import { Settings } from './settings.ts';
@@ -50,6 +52,15 @@ export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}
   const expiry = new FactExpiry(clock);
   const deliveryPort = deliveryRetry(ports.dsh, clock, () => attention);
   let attentionRef: RuntimeAttention | undefined;
+  const metrics = new MetricTimeline(clock, options.timeZone);
+  const away = new AwayReporter(metrics, clock, (signal) => {
+    // The observer runs inside the store's synchronous apply callback; defer
+    // the synthetic wake/record so it cannot re-enter that apply.
+    queueMicrotask(() => {
+      if (stopping || !attentionRef) return;
+      void attentionRef.accept(signal).catch(() => {});
+    });
+  });
   const history = new HistoryManager({
     port: ports.history,
     clock,
@@ -84,6 +95,10 @@ export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}
         .catch(() => {});
     },
     timeZone: options.timeZone,
+    dayExtensions: (date) => {
+      const extension = metrics.dailyExtension(date);
+      return extension ? { metrics: extension } : undefined;
+    },
   });
   const attention = new RuntimeAttention(
     clock,
@@ -97,10 +112,21 @@ export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}
     () => target.canEnsure(),
     history,
     platform,
+    (signal) => away.observe(signal),
   );
   attentionRef = attention;
   const listeners = createStateListeners();
-  const body = new BodySource(ports.probe, ports.dsh, ports.storage, clock, attention, expiry, isPaused, changed);
+  const body = new BodySource(
+    ports.probe,
+    ports.dsh,
+    ports.storage,
+    clock,
+    attention,
+    expiry,
+    isPaused,
+    changed,
+    metrics,
+  );
   const dsh = new DshSource(
     deliveryPort,
     clock,
@@ -397,6 +423,7 @@ export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}
       changed,
       deliveryPort,
       dsh,
+      metrics,
     ),
     envHistory: (params?: Parameters<HistoryManager['query']>[0]) => history.query(params),
     envSummary: (params?: Parameters<HistoryManager['summary']>[0]) => history.summary(params),
