@@ -118,6 +118,19 @@ export interface GlobalFileWatchValue {
   retryAt?: number;
 }
 
+/** System power/lock state tracked in `env.system`. */
+export interface SystemStateValue {
+  locked: boolean;
+  lastSleepAt?: number;
+  lastWakeAt?: number;
+}
+
+/** Data payload for normalized system/screen/session lifecycle signals. */
+export interface SystemEventData {
+  at: number;
+  durationMs?: number;
+}
+
 /** Observed environment state. */
 export interface EnvState {
   where: EnvWhere;
@@ -126,6 +139,7 @@ export interface EnvState {
   activeJobs: Fact<JobSummary[]>;
   watchedPaths: Fact<Record<string, { lastChange: number; changes: number }>>;
   globalFileWatch?: Fact<GlobalFileWatchValue>;
+  system?: Fact<SystemStateValue>;
 }
 
 /** Per-source health bookkeeping. */
@@ -297,6 +311,12 @@ export interface KnownSignalData {
   'body.anomaly': BodyAnomalyData;
   'file.burst': FileBurstData;
   'file.activity': FileActivityData;
+  'system.sleep': SystemEventData;
+  'system.wake': SystemEventData;
+  'screen.locked': SystemEventData;
+  'screen.unlocked': SystemEventData;
+  'session.active': SystemEventData;
+  'session.inactive': SystemEventData;
 }
 
 /** A {@link Signal} narrowed to a kind with a known data schema. */

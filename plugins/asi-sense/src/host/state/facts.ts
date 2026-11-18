@@ -35,6 +35,7 @@ export const FACT_PATHS: ReadonlySet<string> = new Set([
   'env.activeJobs',
   'env.watchedPaths',
   'env.globalFileWatch',
+  'env.system',
 ]);
 
 export function str(v: unknown): string {
@@ -87,6 +88,7 @@ export function initialState(at: number, ttlMs: number): SenseState {
       activeJobs: f(),
       watchedPaths: f(),
       globalFileWatch: f(),
+      system: f(),
     },
     // Null-prototype dictionary: '__proto__'/'constructor' source ids are safe.
     observation: {

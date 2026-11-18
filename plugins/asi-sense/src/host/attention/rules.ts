@@ -322,4 +322,10 @@ export const DEFAULT_RULES: readonly WatchRule[] = [
   def('source-error', { kind: 'source.error' }, 'context'),
   def('body-warn', { kind: 'body.threshold', where: { severity: 'warn' } }, 'context'),
   def('body-critical', { kind: 'body.threshold', where: { severity: 'critical' } }, 'wake'),
+  def('system-sleep', { kind: 'system.sleep' }, 'record'),
+  def('system-wake', { kind: 'system.wake' }, 'record'),
+  def('screen-locked', { kind: 'screen.locked' }, 'record'),
+  def('screen-unlocked', { kind: 'screen.unlocked' }, 'record'),
+  def('session-active', { kind: 'session.active' }, 'record'),
+  def('session-inactive', { kind: 'session.inactive' }, 'record'),
 ];

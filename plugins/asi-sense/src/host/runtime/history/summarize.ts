@@ -5,6 +5,7 @@ import {
   type DailyDeliveryCounts,
   type DailyDirectoryStats,
   type DailySummary,
+  type DailySystemStats,
   type HistoryLifecycleRecord,
   type HistoryLifecycleState,
   isNonEmptyString,
@@ -13,6 +14,83 @@ import {
   sanitizeAppName,
   sanitizeDirPath,
 } from './types.ts';
+
+type SystemSummaryKind = 'system.sleep' | 'system.wake' | 'screen.locked' | 'screen.unlocked';
+interface SystemEventItem {
+  kind: SystemSummaryKind;
+  at: number;
+  durationMs?: number;
+}
+
+function isSystemSummaryKind(kind: string): kind is SystemSummaryKind {
+  return kind === 'system.sleep' || kind === 'system.wake' || kind === 'screen.locked' || kind === 'screen.unlocked';
+}
+
+function summarizeSystemEvents(items: readonly SystemEventItem[], bounds: DayBounds): DailySystemStats {
+  const { startMs, endMs } = bounds;
+  const sorted = [...items].sort((a, b) => a.at - b.at);
+  let sleepCount = 0;
+  let sleepDurationMs = 0;
+  let lockDurationMs = 0;
+  let firstWakeAt: number | undefined;
+  let lastSleepAt: number | undefined;
+  let openSleepAt: number | undefined;
+  let openLockAt: number | undefined;
+  let lastSleepEnd = startMs;
+  let lastLockEnd = startMs;
+
+  const addClosedDuration = (startAt: number, endAt: number, lastEnd: number): [number, number] => {
+    const segStart = Math.max(startMs, lastEnd, startAt);
+    const segEnd = Math.min(endMs, endAt);
+    if (segEnd <= segStart) return [0, lastEnd];
+    return [segEnd - segStart, segEnd];
+  };
+
+  for (const item of sorted) {
+    if (item.kind === 'system.sleep') {
+      lastSleepAt = lastSleepAt === undefined ? item.at : Math.max(lastSleepAt, item.at);
+      if (openSleepAt === undefined) sleepCount += 1;
+      openSleepAt = item.at;
+    } else if (item.kind === 'system.wake') {
+      firstWakeAt = firstWakeAt === undefined ? item.at : Math.min(firstWakeAt, item.at);
+      const inferredStart =
+        openSleepAt !== undefined
+          ? openSleepAt
+          : item.durationMs !== undefined && item.durationMs > 0
+            ? item.at - item.durationMs
+            : undefined;
+      openSleepAt = undefined;
+      if (inferredStart !== undefined) {
+        const [added, nextEnd] = addClosedDuration(inferredStart, item.at, lastSleepEnd);
+        sleepDurationMs += added;
+        lastSleepEnd = nextEnd;
+      }
+    } else if (item.kind === 'screen.locked') {
+      openLockAt = item.at;
+    } else {
+      const inferredStart =
+        openLockAt !== undefined
+          ? openLockAt
+          : item.durationMs !== undefined && item.durationMs > 0
+            ? item.at - item.durationMs
+            : undefined;
+      openLockAt = undefined;
+      if (inferredStart !== undefined) {
+        const [added, nextEnd] = addClosedDuration(inferredStart, item.at, lastLockEnd);
+        lockDurationMs += added;
+        lastLockEnd = nextEnd;
+      }
+    }
+  }
+
+  return {
+    sleepCount,
+    sleepDurationMs,
+    lockDurationMs,
+    ...(firstWakeAt !== undefined ? { firstWakeAt } : {}),
+    ...(lastSleepAt !== undefined ? { lastSleepAt } : {}),
+  };
+}
 
 export interface ParsedHistoryDay {
   events: PersistedEventEntry[];
@@ -516,6 +594,9 @@ export function createDailySummaryAccumulator(date: string, bounds: DayBounds, o
   const bodyTypes: number[] = [];
   const bodyMetricIds: number[] = [];
 
+  const sysOtherIdx: number[] = [];
+  const sysItems: (SystemEventItem | undefined)[] = [];
+
   const applyDelivery = (levelCode: number, reasonCode: number, ruleIdx: number, delta: 1 | -1) => {
     const suppressed = reasonCode !== 0;
     const isWake = levelCode === 2 && reasonCode !== 1;
@@ -608,6 +689,9 @@ export function createDailySummaryAccumulator(date: string, bounds: DayBounds, o
         if (nextCount <= 0) delete bodyAnomalies.byMetric[metric];
         else bodyAnomalies.byMetric[metric] = nextCount;
       }
+    } else if (kindTag === 5) {
+      otherAt[sysOtherIdx[slotIdx]] = Number.NaN;
+      sysItems[slotIdx] = undefined;
     }
   };
 
@@ -756,6 +840,16 @@ export function createDailySummaryAccumulator(date: string, bounds: DayBounds, o
           kindTag = 0;
           slotIdx = pushOtherAt(at);
         }
+      } else if (isSystemSummaryKind(kind)) {
+        const detail = isRecordObject(parsed.detail) ? parsed.detail : undefined;
+        const dur =
+          typeof detail?.durationMs === 'number' && Number.isFinite(detail.durationMs) && detail.durationMs >= 0
+            ? detail.durationMs
+            : undefined;
+        kindTag = 5;
+        slotIdx = sysItems.length;
+        sysOtherIdx.push(pushOtherAt(at));
+        sysItems.push({ kind, at, ...(dur !== undefined ? { durationMs: dur } : {}) });
       } else {
         kindTag = 0;
         slotIdx = pushOtherAt(at);
@@ -886,10 +980,17 @@ export function createDailySummaryAccumulator(date: string, bounds: DayBounds, o
         notRunningMs = durationMs;
       }
 
+      const system = summarizeSystemEvents(
+        sysItems.filter((item): item is SystemEventItem => item !== undefined),
+        bounds,
+      );
+
       // Release large temporary containers promptly for GC.
       seenEvents.clear();
       lifecycle.length = 0;
       emptyActAts.length = 0;
+      sysOtherIdx.length = 0;
+      sysItems.length = 0;
       actAt = new Float64Array(0);
       actApp = new Int32Array(0);
       otherAt = new Float64Array(0);
@@ -906,6 +1007,7 @@ export function createDailySummaryAccumulator(date: string, bounds: DayBounds, o
         fileBursts,
         fileActivity,
         bodyAnomalies,
+        system,
         coverage: { observedMs, pausedMs, notRunningMs },
         totalEvents,
         ...(options.truncatedAtLimit ? { truncatedAtLimit: true } : {}),
@@ -1006,6 +1108,7 @@ export function summarizeDay(
     anomaly: 0,
     byMetric: Object.create(null) as Record<string, number>,
   };
+  const sysItems: SystemEventItem[] = [];
 
   for (const ev of events) {
     const suppressed = ev.reason === 'wake-budget' || ev.reason === 'no-session' || ev.reason === 'self-caused';
@@ -1040,8 +1143,16 @@ export function summarizeDay(
       if (bodyInfo.metric) {
         bodyAnomalies.byMetric[bodyInfo.metric] = (bodyAnomalies.byMetric[bodyInfo.metric] ?? 0) + 1;
       }
+    } else if (isSystemSummaryKind(ev.kind)) {
+      const dur =
+        typeof ev.detail?.durationMs === 'number' && Number.isFinite(ev.detail.durationMs) && ev.detail.durationMs >= 0
+          ? ev.detail.durationMs
+          : undefined;
+      sysItems.push({ kind: ev.kind, at: ev.at, ...(dur !== undefined ? { durationMs: dur } : {}) });
     }
   }
+
+  const system = summarizeSystemEvents(sysItems, bounds);
 
   return {
     version: 1,
@@ -1055,6 +1166,7 @@ export function summarizeDay(
     fileBursts,
     fileActivity,
     bodyAnomalies,
+    system,
     coverage: { observedMs, pausedMs, notRunningMs },
     totalEvents: events.length,
     ...(options.truncatedAtLimit ? { truncatedAtLimit: true } : {}),
@@ -1103,6 +1215,17 @@ function allRecordEntriesValid<T>(value: unknown, check: (entry: unknown) => ent
   return true;
 }
 
+function isValidSystemStats(value: unknown): value is DailySystemStats {
+  return (
+    isRecordObject(value) &&
+    isFiniteNonNeg(value.sleepCount) &&
+    isFiniteNonNeg(value.sleepDurationMs) &&
+    isFiniteNonNeg(value.lockDurationMs) &&
+    (value.firstWakeAt === undefined || isFiniteNonNeg(value.firstWakeAt)) &&
+    (value.lastSleepAt === undefined || isFiniteNonNeg(value.lastSleepAt))
+  );
+}
+
 export function parseDailySummary(raw: string): DailySummary | undefined {
   let parsed: unknown;
   try {
@@ -1148,6 +1271,8 @@ export function parseDailySummary(raw: string): DailySummary | undefined {
   ) {
     return undefined;
   }
+  if (parsed.system !== undefined && !isValidSystemStats(parsed.system)) return undefined;
+  if (parsed.extensions !== undefined && !isRecordObject(parsed.extensions)) return undefined;
   return parsed as unknown as DailySummary;
 }
 
@@ -1204,6 +1329,8 @@ export function parseMonthlySummary(raw: string): MonthlySummary | undefined {
   ) {
     return undefined;
   }
+  if (parsed.system !== undefined && !isValidSystemStats(parsed.system)) return undefined;
+  if (parsed.extensions !== undefined && !isRecordObject(parsed.extensions)) return undefined;
   return parsed as unknown as MonthlySummary;
 }
 
@@ -1261,6 +1388,11 @@ export function synthesizeMonth(month: string, dailies: readonly DailySummary[],
     byMetric: Object.create(null) as Record<string, number>,
   };
   const coverage = { totalDayMs: 0, observedMs: 0, pausedMs: 0, notRunningMs: 0 };
+  let sleepCount = 0;
+  let sleepDurationMs = 0;
+  let lockDurationMs = 0;
+  let firstWakeAt: number | undefined;
+  let lastSleepAt: number | undefined;
   let totalEvents = 0;
 
   for (const date of includedDays) {
@@ -1272,6 +1404,17 @@ export function synthesizeMonth(month: string, dailies: readonly DailySummary[],
     coverage.observedMs += finiteCount(d.coverage?.observedMs);
     coverage.pausedMs += finiteCount(d.coverage?.pausedMs);
     coverage.notRunningMs += finiteCount(d.coverage?.notRunningMs);
+    if (isRecordObject(d.system)) {
+      sleepCount += finiteCount(d.system.sleepCount);
+      sleepDurationMs += finiteCount(d.system.sleepDurationMs);
+      lockDurationMs += finiteCount(d.system.lockDurationMs);
+      if (isFiniteNonNeg(d.system.firstWakeAt)) {
+        firstWakeAt = firstWakeAt === undefined ? d.system.firstWakeAt : Math.min(firstWakeAt, d.system.firstWakeAt);
+      }
+      if (isFiniteNonNeg(d.system.lastSleepAt)) {
+        lastSleepAt = lastSleepAt === undefined ? d.system.lastSleepAt : Math.max(lastSleepAt, d.system.lastSleepAt);
+      }
+    }
 
     for (const [app, stats] of Object.entries(d.apps ?? {})) {
       if (!isRecordObject(stats)) continue;
@@ -1316,6 +1459,13 @@ export function synthesizeMonth(month: string, dailies: readonly DailySummary[],
     fileBursts,
     fileActivity,
     bodyAnomalies,
+    system: {
+      sleepCount,
+      sleepDurationMs,
+      lockDurationMs,
+      ...(firstWakeAt !== undefined ? { firstWakeAt } : {}),
+      ...(lastSleepAt !== undefined ? { lastSleepAt } : {}),
+    },
     coverage,
     totalEvents,
     generatedAt,

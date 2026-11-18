@@ -1,11 +1,16 @@
 import { readFileSync } from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { EnvUpdate } from '@asi/sense-types';
 import { describe, expect, it, vi } from 'vitest';
 import type { DeliveryIntent } from '../../src/host/attention/pipeline.ts';
-import { createDelivery } from '../../src/host/dsh/deliver.ts';
-import { modelText, modelTitle } from '../../src/host/dsh/tool-output.ts';
+import { DEFAULT_RULES } from '../../src/host/attention/rules.ts';
+import { defaultBodyRules } from '../../src/host/body/rules.ts';
+import { formatEnvUpdate } from '../../src/host/delivery/format.ts';
+import { createDelivery, DELIVERABLE_KINDS, modelUpdate } from '../../src/host/dsh/deliver.ts';
+import { KNOWN_EVENT_KINDS } from '../../src/host/dsh/history-output.ts';
+import { MODEL_RULE_KINDS, modelText, modelTitle } from '../../src/host/dsh/tool-output.ts';
 
 const update: EnvUpdate = {
   since: Date.UTC(2026, 0, 1, 12, 1, 3),
@@ -787,5 +792,273 @@ describe('DSH environment delivery', () => {
     const activityBlock = body.slice(activityIdx, body.indexOf('const summary =', activityIdx));
     expect(activityBlock).toContain('subject = maskedDir');
     expect(activityBlock).toContain('modelActivityName(');
+  });
+
+  it('projects source.status, source.error, app.launched/terminated, system.* and file.activity cleanly', () => {
+    const home = os.homedir();
+    const projected = modelUpdate({
+      since: update.since,
+      at: update.at,
+      suppressed: 0,
+      changes: [
+        {
+          count: 1,
+          level: 'context',
+          signal: {
+            id: 'ss-home',
+            kind: 'source.status',
+            at: update.at,
+            source: { id: 'files-global-denied', api: 'watch', host: 'local' },
+            subject: home,
+            data: {
+              status: 'denied',
+              error: 'permission-denied',
+              path: home,
+              reason: '部分受保护目录无访问权限 https://secret-token@host.example.invalid:8443',
+            },
+          },
+        },
+        {
+          count: 1,
+          level: 'context',
+          signal: {
+            id: 'ss-path',
+            kind: 'source.status',
+            at: update.at + 1,
+            source: { id: 'helper', api: 'ndjson', host: 'local' },
+            subject: 'helper',
+            data: { status: 'error', reason: `${home}/Documents` },
+          },
+        },
+        {
+          count: 1,
+          level: 'context',
+          signal: {
+            id: 'se-1',
+            kind: 'source.error',
+            at: update.at + 2,
+            source: { id: 'body', api: 'probe', host: 'local' },
+            subject: 'body-tuning',
+            data: { error: 'tuning-error' },
+          },
+        },
+        {
+          count: 1,
+          level: 'context',
+          signal: {
+            id: 'al-1',
+            kind: 'app.launched',
+            at: update.at + 3,
+            source: { id: 'helper', api: 'ndjson', host: 'local' },
+            subject: 'com.example.App',
+            data: { name: 'Syntax\nEditor', bundleId: 'com.example.App' },
+          },
+        },
+        {
+          count: 1,
+          level: 'context',
+          signal: {
+            id: 'at-1',
+            kind: 'app.terminated',
+            at: update.at + 4,
+            source: { id: 'helper', api: 'ndjson', host: 'local' },
+            subject: 'com.example.Term',
+            data: { bundleId: 'com.example.Term' },
+          },
+        },
+        {
+          count: 1,
+          level: 'context',
+          signal: {
+            id: 'sw-1',
+            kind: 'system.wake',
+            at: update.at + 5,
+            source: { id: 'helper', api: 'ndjson', host: 'local' },
+            subject: 'system',
+            data: { at: update.at + 5, durationMs: 120_000 },
+          },
+        },
+        {
+          count: 1,
+          level: 'context',
+          signal: {
+            id: 'fa-home',
+            kind: 'file.activity',
+            at: update.at + 6,
+            source: { id: 'files-global', api: 'watch', host: 'local' },
+            subject: home,
+            data: { directory: home, windowMs: 10_000, created: 1, modified: 0, deleted: 0 },
+          },
+        },
+      ],
+    });
+
+    expect(projected.changes).toHaveLength(7);
+    const byId = new Map(projected.changes.map((c) => [c.signal.id, c.signal]));
+    expect(byId.get('ss-home')).toMatchObject({
+      kind: 'source.status',
+      subject: 'files-global-denied',
+      data: {
+        source: 'files-global-denied',
+        status: 'denied',
+        path: '~',
+        error: 'permission-denied',
+      },
+    });
+    expect(String(byId.get('ss-home')?.data.reason)).not.toContain('secret-token');
+    expect(String(byId.get('ss-home')?.data.reason)).not.toContain('host.example.invalid');
+    expect(byId.get('ss-path')).toMatchObject({
+      kind: 'source.status',
+      subject: 'helper',
+      data: { source: 'helper', status: 'error', reason: 'Documents' },
+    });
+    expect(byId.get('se-1')).toMatchObject({
+      kind: 'source.error',
+      subject: 'body',
+      data: { source: 'body', error: 'tuning-error' },
+    });
+    expect(byId.get('al-1')).toMatchObject({
+      kind: 'app.launched',
+      subject: 'SyntaxEditor',
+      data: { name: 'SyntaxEditor' },
+    });
+    expect(byId.get('at-1')).toMatchObject({
+      kind: 'app.terminated',
+      subject: 'com.example.Term',
+      data: { name: 'com.example.Term' },
+    });
+    expect(byId.get('sw-1')).toMatchObject({
+      kind: 'system.wake',
+      subject: 'system',
+      data: { at: update.at + 5, durationMs: 120_000 },
+    });
+    expect(byId.get('fa-home')).toMatchObject({
+      kind: 'file.activity',
+      subject: '~',
+      data: { directory: '~', windowMs: 10_000, created: 1, modified: 0, deleted: 0 },
+    });
+    expect(JSON.stringify(projected)).not.toContain(home);
+  });
+
+  it('drops unknown kinds into suppressed and skips unknown-only deliveries without sending empty observations', async () => {
+    const unknownChange: EnvUpdate['changes'][number] = {
+      count: 2,
+      level: 'context',
+      signal: {
+        id: 'unk-1',
+        kind: 'mystery.unlisted',
+        at: update.at,
+        source: { id: 'helper', api: 'ndjson', host: 'local' },
+        subject: 'raw-secret',
+        data: { secret: 'do-not-deliver' },
+      },
+    };
+    const internalChange: EnvUpdate['changes'][number] = {
+      count: 1,
+      level: 'context',
+      signal: {
+        id: 'fact-1',
+        kind: 'fact.updated',
+        at: update.at + 1,
+        source: { id: 'asi-sense', api: 'state', host: 'local' },
+        subject: 'env.system',
+        data: { path: 'env.system', value: { locked: true } },
+      },
+    };
+
+    const { agent, deliver } = fixture();
+    const skipped: Array<{ sessionId: string; id: string; kind: string }> = [];
+    const onSkippedDeliver = createDelivery(
+      () => agent,
+      () => true,
+      async () => false,
+      (sessionId, id, kind) => {
+        skipped.push({ sessionId, id, kind });
+      },
+    );
+
+    const onlyUnknown = { ...update, suppressed: 1, changes: [unknownChange, internalChange] };
+    expect(modelUpdate(onlyUnknown)).toMatchObject({ suppressed: 4, changes: [] });
+
+    await onSkippedDeliver('session-a', {
+      ...intent('followup', 'skip-unknown'),
+      update: onlyUnknown,
+    });
+    expect(agent.followup).not.toHaveBeenCalled();
+    expect(skipped).toEqual([{ sessionId: 'session-a', id: 'asi-sense:skip-unknown', kind: 'followup' }]);
+
+    await deliver('session-a', {
+      ...intent('send', 'mixed-unknown'),
+      update: {
+        ...update,
+        suppressed: 0,
+        changes: [
+          unknownChange,
+          {
+            count: 1,
+            level: 'context',
+            signal: {
+              id: 'sys-1',
+              kind: 'system.sleep',
+              at: update.at + 2,
+              source: { id: 'helper', api: 'ndjson', host: 'local' },
+              subject: 'system',
+              data: { at: update.at + 2 },
+            },
+          },
+        ],
+      },
+    });
+    expect(agent.send).toHaveBeenCalledTimes(1);
+    const rendered = JSON.stringify(agent.send.mock.calls[0]?.[0]);
+    expect(rendered).toContain('system: sleep');
+    expect(rendered).toContain('suppressed: 2');
+    expect(rendered).not.toContain('observation');
+    expect(rendered).not.toContain('mystery.unlisted');
+    expect(rendered).not.toContain('do-not-deliver');
+  });
+
+  it('architecture: every default rule and deliverable kind projects with non-observation subject and non-empty data', () => {
+    const internalOnlyKinds = new Set(['fact.updated', 'delivery-unknown']);
+    const expectedDeliverableKinds = new Set<string>([
+      ...DEFAULT_RULES.map((rule) => rule.match.kind),
+      ...defaultBodyRules().map((rule) => rule.match.kind),
+      ...DELIVERABLE_KINDS,
+      ...[...MODEL_RULE_KINDS].filter((kind) => !internalOnlyKinds.has(kind)),
+      ...[...KNOWN_EVENT_KINDS].filter((kind) => !internalOnlyKinds.has(kind)),
+    ]);
+
+    for (const kind of expectedDeliverableKinds) {
+      expect(DELIVERABLE_KINDS.has(kind)).toBe(true);
+      const projected = modelUpdate({
+        since: update.since,
+        at: update.at,
+        suppressed: 0,
+        changes: [
+          {
+            count: 1,
+            level: 'context',
+            signal: {
+              id: `arch-${kind}`,
+              kind,
+              at: update.at,
+              source: { id: 'helper', api: 'ndjson', host: 'local' },
+              subject: '',
+              data: {},
+            },
+          },
+        ],
+      });
+      expect(projected.suppressed).toBe(0);
+      expect(projected.changes).toHaveLength(1);
+      const sig = projected.changes[0]?.signal;
+      expect(sig?.kind).toBe(kind);
+      expect(sig?.subject).not.toBe('observation');
+      expect(Object.keys(sig?.data ?? {}).length).toBeGreaterThan(0);
+
+      const formatted = formatEnvUpdate(projected);
+      expect(formatted.length).toBeGreaterThan(0);
+      expect(formatted).not.toContain('observation');
+    }
   });
 });

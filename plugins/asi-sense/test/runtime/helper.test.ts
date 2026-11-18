@@ -1230,4 +1230,70 @@ describe('helper protocol integration', () => {
     expect(h.runtime.rules.settings().sendTitles).toBe(false);
     await h.runtime.stop();
   });
+
+  it('normalizes all 6 power/screen/session helper events, pairs durationMs safely, and updates env.system', async () => {
+    const h = setup();
+    await h.runtime.start();
+    await h.settle();
+    const child = h.children[0];
+    child.snapshotReply = false;
+
+    const baseAt = Date.now();
+    // Unpaired wake / unlock / active before any start omit durationMs.
+    child.send({ type: 'power.wake', at: baseAt + 100 });
+    child.send({ type: 'screen.unlocked', at: baseAt + 200 });
+    child.send({ type: 'session.active', at: baseAt + 300 });
+    await h.settle();
+
+    // Paired sleep / wake, lock / unlock, inactive / active; extra raw properties are stripped from data.
+    child.send({ type: 'screen.locked', at: baseAt + 1_000, extra: 'ignored' });
+    child.send({ type: 'power.sleep', at: baseAt + 2_000, extra: 'ignored' });
+    child.send({ type: 'session.inactive', at: baseAt + 3_000, reason: 'idle' });
+    // Duplicate sleep overwrites sleep start; missing wake does not leak previous gap.
+    child.send({ type: 'power.sleep', at: baseAt + 5_000 });
+    child.send({ type: 'power.wake', at: baseAt + 9_000 });
+    child.send({ type: 'screen.unlocked', at: baseAt + 10_000 });
+    child.send({ type: 'session.active', at: baseAt + 11_000 });
+    await h.settle();
+
+    // Clock rollback: wake before sleep omits negative durationMs and clears state for next pair.
+    child.send({ type: 'power.sleep', at: baseAt + 50_000 });
+    child.send({ type: 'power.wake', at: baseAt + 40_000 });
+    child.send({ type: 'power.sleep', at: baseAt + 42_000 });
+    child.send({ type: 'power.wake', at: baseAt + 45_500 });
+    await h.settle();
+
+    const sysEvents = h.runtime
+      .events()
+      .filter(
+        (entry) =>
+          entry.kind.startsWith('system.') || entry.kind.startsWith('screen.') || entry.kind.startsWith('session.'),
+      );
+    expect(sysEvents.map((e) => [e.kind, e.subject, e.level, e.detail])).toEqual([
+      ['system.wake', 'system', 'record', { at: baseAt + 100 }],
+      ['screen.unlocked', 'screen', 'record', { at: baseAt + 200 }],
+      ['session.active', 'session', 'record', { at: baseAt + 300 }],
+      ['screen.locked', 'screen', 'record', { at: baseAt + 1_000 }],
+      ['system.sleep', 'system', 'record', { at: baseAt + 2_000 }],
+      ['session.inactive', 'session', 'record', { at: baseAt + 3_000 }],
+      ['system.sleep', 'system', 'record', { at: baseAt + 5_000 }],
+      ['system.wake', 'system', 'record', { at: baseAt + 9_000, durationMs: 4_000 }],
+      ['screen.unlocked', 'screen', 'record', { at: baseAt + 10_000, durationMs: 9_000 }],
+      ['session.active', 'session', 'record', { at: baseAt + 11_000, durationMs: 8_000 }],
+      ['system.sleep', 'system', 'record', { at: baseAt + 50_000 }],
+      ['system.wake', 'system', 'record', { at: baseAt + 40_000 }],
+      ['system.sleep', 'system', 'record', { at: baseAt + 42_000 }],
+      ['system.wake', 'system', 'record', { at: baseAt + 45_500, durationMs: 3_500 }],
+    ]);
+
+    expect(h.runtime.state().env.system).toMatchObject({
+      status: 'ok',
+      value: {
+        locked: false,
+        lastSleepAt: baseAt + 42_000,
+        lastWakeAt: baseAt + 45_500,
+      },
+    });
+    await h.runtime.stop();
+  });
 });

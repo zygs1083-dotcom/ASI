@@ -865,4 +865,44 @@ describe('model-facing tools', () => {
     expect(subjects.get('root-changed')).toBe('~');
     expect(subjects.get('child-changed')).toBe('src');
   });
+
+  it('exposes env.system in env_state and keeps system/screen/session/job.failed rule kinds unredacted in modelRules', async () => {
+    const h = await fixture();
+    h.state.env.system = {
+      value: { locked: true, lastSleepAt: 500, lastWakeAt: 900 },
+      status: 'ok',
+      source: { id: 'helper', api: 'ndjson', host: 'local' },
+      observedAt: 900,
+      ttlMs: 86_400_000,
+    };
+    const envResult = (await h.call('env_state', { section: 'env' })).value as Record<string, unknown>;
+    expect(envResult.system).toMatchObject({
+      status: 'ok',
+      value: { locked: true, lastSleepAt: 500, lastWakeAt: 900 },
+    });
+
+    const kinds = [
+      'system.sleep',
+      'system.wake',
+      'screen.locked',
+      'screen.unlocked',
+      'session.active',
+      'session.inactive',
+      'job.failed',
+    ];
+    const projected = JSON.parse(
+      JSON.stringify(
+        modelRules(
+          kinds.map((kind, i) => ({
+            id: `sys-rule-${i}`,
+            approved: true,
+            level: 'context' as const,
+            createdBy: 'user' as const,
+            match: { kind },
+          })),
+        ),
+      ),
+    ) as Array<{ match: { kind: string } }>;
+    expect(projected.map((item) => item.match.kind)).toEqual(kinds);
+  });
 });

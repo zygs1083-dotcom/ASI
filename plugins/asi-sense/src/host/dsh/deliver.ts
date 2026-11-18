@@ -7,7 +7,7 @@ import { DeliveryFailure } from '../attention/drain.ts';
 import { isHomeRoot } from '../attention/path.ts';
 import type { DeliveryIntent } from '../attention/pipeline.ts';
 import { formatEnvUpdate } from '../delivery/format.ts';
-import { modelActivityName, modelAppName, modelLabel, modelTitle } from './tool-output.ts';
+import { modelActivityName, modelAppName, modelLabel, modelText, modelTitle, sourceIdentifier } from './tool-output.ts';
 
 declare module '@deepseek-ai/dsh-llm' {
   interface MessageSourceMap {
@@ -47,178 +47,327 @@ function metric(value: unknown): string {
     : 'body';
 }
 
-function modelUpdate(update: EnvUpdate): EnvUpdate {
+/** Explicitly supported deliverable signal kinds; unknown kinds are dropped and counted as `suppressed`. */
+export const DELIVERABLE_KINDS: ReadonlySet<string> = new Set([
+  'app.activated',
+  'app.launched',
+  'app.terminated',
+  'window.focused',
+  'window.title-changed',
+  'file.changed',
+  'file.burst',
+  'file.activity',
+  'job.started',
+  'job.exited',
+  'job.failed',
+  'process.started',
+  'process.exited',
+  'source.status',
+  'source.error',
+  'body.threshold',
+  'body.rate',
+  'body.anomaly',
+  'system.sleep',
+  'system.wake',
+  'screen.locked',
+  'screen.unlocked',
+  'session.active',
+  'session.inactive',
+  'delivery.target-unavailable',
+]);
+
+function sanitizeReason(value: string): string {
+  const trimmed = value.trim();
+  if (!trimmed) return '';
+  if (isHomeRoot(trimmed) || /^(?:~?[/\\]|[A-Za-z]:[/\\])/.test(trimmed)) {
+    return modelActivityName(trimmed, true);
+  }
+  return modelText(trimmed) || '[redacted]';
+}
+
+const SYSTEM_SIGNAL_KINDS: ReadonlySet<string> = new Set([
+  'system.sleep',
+  'system.wake',
+  'screen.locked',
+  'screen.unlocked',
+  'session.active',
+  'session.inactive',
+]);
+
+export function modelUpdate(update: EnvUpdate): EnvUpdate {
+  let suppressed = update.suppressed;
+  const changes: EnvUpdate['changes'] = [];
+  for (const { signal, count, level, ruleId } of update.changes) {
+    if (!DELIVERABLE_KINDS.has(signal.kind)) {
+      suppressed += count > 0 ? count : 1;
+      continue;
+    }
+    const data: typeof signal.data = {};
+    let subject = 'observation';
+    if (typeof signal.data.feedbackAvailable === 'boolean') {
+      data.feedbackAvailable = signal.data.feedbackAvailable && /^[\w.:-]+$/.test(signal.id);
+    }
+    if (signal.kind === 'app.activated' || signal.kind === 'app.launched' || signal.kind === 'app.terminated') {
+      const fallbackName =
+        modelAppName(
+          typeof signal.data.name === 'string' && signal.data.name.trim()
+            ? signal.data.name
+            : typeof signal.data.bundleId === 'string' && signal.data.bundleId.trim()
+              ? signal.data.bundleId
+              : signal.subject,
+        ) || 'app';
+      subject = fallbackName;
+      if (typeof signal.data.name === 'string') {
+        const maskedName = modelAppName(signal.data.name);
+        data.name = signal.kind === 'app.activated' ? maskedName : maskedName || fallbackName;
+      } else {
+        data.name = fallbackName;
+      }
+      if (typeof signal.data.previousName === 'string') data.previousName = modelAppName(signal.data.previousName);
+    } else if (signal.kind === 'window.focused' || signal.kind === 'window.title-changed') {
+      subject =
+        modelAppName(
+          typeof signal.data.bundleId === 'string' && signal.data.bundleId.trim()
+            ? signal.data.bundleId
+            : signal.subject,
+        ) || 'window';
+      data.title = typeof signal.data.title === 'string' ? modelTitle(signal.data.title) : '';
+    } else if (signal.kind === 'source.status') {
+      const srcId = sourceIdentifier(signal.source.id || signal.subject || 'source');
+      subject = srcId;
+      data.source = srcId;
+      data.status =
+        typeof signal.data.status === 'string' && signal.data.status.trim()
+          ? modelLabel(signal.data.status.trim())
+          : 'unknown';
+      const rawPath =
+        typeof signal.data.path === 'string' && signal.data.path.trim()
+          ? signal.data.path.trim()
+          : srcId === 'files-global-denied' && typeof signal.subject === 'string' && signal.subject.trim()
+            ? signal.subject.trim()
+            : '';
+      if (rawPath && rawPath !== srcId) data.path = modelActivityName(rawPath, true);
+      const rawReason =
+        typeof signal.data.reason === 'string' && signal.data.reason.trim()
+          ? signal.data.reason
+          : typeof signal.data.lastFailure === 'string' && signal.data.lastFailure.trim()
+            ? signal.data.lastFailure
+            : '';
+      if (rawReason) data.reason = sanitizeReason(rawReason);
+      if (typeof signal.data.error === 'string' && signal.data.error.trim()) {
+        data.error = sanitizeReason(signal.data.error);
+      }
+      if (typeof signal.data.restarts === 'number' && Number.isFinite(signal.data.restarts)) {
+        data.restarts = signal.data.restarts;
+      }
+    } else if (signal.kind === 'source.error') {
+      const srcId = sourceIdentifier(signal.source.id || signal.subject || 'source');
+      subject = srcId;
+      data.source = srcId;
+      const rawError =
+        typeof signal.data.error === 'string' && signal.data.error.trim()
+          ? signal.data.error
+          : typeof signal.data.category === 'string' && signal.data.category.trim()
+            ? signal.data.category
+            : typeof signal.data.reason === 'string' && signal.data.reason.trim()
+              ? signal.data.reason
+              : 'error';
+      data.error = sanitizeReason(rawError);
+      if (typeof signal.data.status === 'string' && signal.data.status.trim()) {
+        data.status = modelLabel(signal.data.status.trim());
+      }
+      if (typeof signal.data.reason === 'string' && signal.data.reason.trim()) {
+        data.reason = sanitizeReason(signal.data.reason);
+      }
+      if (typeof signal.data.dropped === 'number' && Number.isFinite(signal.data.dropped)) {
+        data.dropped = signal.data.dropped;
+      }
+    } else if (SYSTEM_SIGNAL_KINDS.has(signal.kind)) {
+      subject = signal.kind.startsWith('screen.')
+        ? 'screen'
+        : signal.kind.startsWith('session.')
+          ? 'session'
+          : 'system';
+      const rawAt = typeof signal.data.at === 'number' && Number.isFinite(signal.data.at) ? signal.data.at : signal.at;
+      data.at = rawAt;
+      if (
+        typeof signal.data.durationMs === 'number' &&
+        Number.isFinite(signal.data.durationMs) &&
+        signal.data.durationMs >= 0
+      ) {
+        data.durationMs = signal.data.durationMs;
+      }
+    } else if (signal.kind === 'delivery.target-unavailable') {
+      subject = 'delivery-target';
+      data.status = 'unavailable';
+    } else if (signal.kind === 'file.changed') {
+      const maskedPath = modelActivityName(
+        typeof signal.data.path === 'string' && signal.data.path.trim() ? signal.data.path : signal.subject,
+        true,
+      );
+      subject = maskedPath;
+      data.path = maskedPath;
+      if (
+        typeof signal.data.change === 'string' &&
+        ['add', 'create', 'created', 'modify', 'save', 'saved', 'delete', 'deleted', 'rename', 'renamed'].includes(
+          signal.data.change,
+        )
+      ) {
+        data.change = signal.data.change;
+      }
+    } else if (
+      signal.kind === 'job.started' ||
+      signal.kind === 'job.exited' ||
+      signal.kind === 'job.failed' ||
+      signal.kind === 'process.started' ||
+      signal.kind === 'process.exited'
+    ) {
+      const rawJobId =
+        typeof signal.data.id === 'string' && signal.data.id.trim() ? signal.data.id : signal.subject || 'job';
+      subject = modelLabel(rawJobId);
+      if (subject === '[redacted]') subject = signal.kind.startsWith('process.') ? 'process' : 'job';
+      if (typeof signal.data.id === 'string') data.id = modelLabel(signal.data.id);
+      if (typeof signal.data.exitCode === 'number') data.exitCode = signal.data.exitCode;
+      if (typeof signal.data.durationMs === 'number') data.durationMs = signal.data.durationMs;
+      if (typeof signal.data.startedAt === 'number') data.startedAt = signal.data.startedAt;
+      if (Object.keys(data).length === 0) {
+        data.status =
+          signal.kind === 'job.started' || signal.kind === 'process.started'
+            ? 'running'
+            : signal.kind === 'job.failed'
+              ? 'failed'
+              : 'exited';
+      }
+    } else if (signal.kind === 'body.threshold') {
+      subject = metric(signal.subject);
+      if (['normal', 'warn', 'critical'].includes(String(signal.data.severity))) data.severity = signal.data.severity;
+      if (typeof signal.data.value === 'number' && Number.isFinite(signal.data.value)) data.value = signal.data.value;
+      if (Object.keys(data).length === 0) data.metric = subject;
+    } else if (signal.kind === 'body.rate' || signal.kind === 'body.anomaly' || signal.kind === 'file.burst') {
+      const rawMetric =
+        signal.data.metric ??
+        (signal.kind === 'body.anomaly' && signal.data.type === 'rebaseline-suggestion'
+          ? signal.subject.replace(/^(?:rebaseline|baseline):/, '')
+          : undefined);
+      if (signal.kind === 'file.burst') {
+        const maskedDir = modelActivityName(
+          typeof signal.data.directory === 'string' && signal.data.directory.trim()
+            ? signal.data.directory
+            : signal.subject,
+          true,
+        );
+        subject = maskedDir;
+        data.directory = maskedDir;
+      } else {
+        subject = metric(rawMetric);
+      }
+      if (signal.kind === 'body.anomaly' && signal.data.type === 'rebaseline-suggestion') {
+        data.type = 'rebaseline-suggestion';
+      }
+      const ruleId = signal.data.ruleId;
+      if (typeof ruleId === 'string' && (/^[\w-]+$/.test(ruleId) || ruleId === 'file.burst')) data.ruleId = ruleId;
+      if (['normal', 'warn', 'critical'].includes(String(signal.data.severity))) data.severity = signal.data.severity;
+      for (const key of [
+        'value',
+        'baseline',
+        'deviation',
+        'slope',
+        'delta',
+        'etaToFloorMs',
+        'timeToFloorMs',
+        'windowMs',
+        'created',
+        'modified',
+        'deleted',
+        'agentDeleted',
+      ]) {
+        const value = signal.data[key];
+        if (typeof value === 'number' && Number.isFinite(value)) data[key] = value;
+      }
+      const { deleted, agentDeleted } = signal.data;
+      if (
+        typeof deleted === 'number' &&
+        Number.isFinite(deleted) &&
+        typeof agentDeleted === 'number' &&
+        Number.isFinite(agentDeleted) &&
+        agentDeleted >= 0 &&
+        deleted >= agentDeleted
+      )
+        data.externalDeleted = deleted - agentDeleted;
+      if (signal.data.externalDeletionExceeded === true) data.externalDeletionExceeded = true;
+      if (signal.kind === 'file.burst' && signal.data.rolledUp === true) data.rolledUp = true;
+      if ((signal.kind === 'body.rate' || signal.kind === 'body.anomaly') && Object.keys(data).length === 0) {
+        data.metric = subject;
+      }
+    } else if (signal.kind === 'file.activity') {
+      const rawDir =
+        typeof signal.data.directory === 'string' && signal.data.directory.trim()
+          ? signal.data.directory
+          : signal.subject;
+      const maskedDir = modelActivityName(rawDir, true);
+      subject = maskedDir;
+      data.directory = maskedDir;
+      for (const key of ['windowMs', 'created', 'modified', 'deleted', 'rolledUp']) {
+        const value = signal.data[key];
+        if (typeof value === 'number' && Number.isFinite(value)) data[key] = value;
+      }
+      if (Array.isArray(signal.data.files)) {
+        const files = signal.data.files
+          .filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
+          .slice(0, 5)
+          .map((item) => modelFileEntry(rawDir, item));
+        if (files.length > 0) data.files = files;
+      }
+      if (signal.data.degraded === true) data.degraded = true;
+    }
+    const summary = signal.data.jobSummary;
+    if (summary && typeof summary === 'object' && !Array.isArray(summary)) {
+      const { total, omitted, recent } = summary as Record<string, unknown>;
+      if (typeof total === 'number' && typeof omitted === 'number' && Array.isArray(recent)) {
+        data.jobSummary = {
+          total,
+          omitted,
+          recent: recent.slice(-20).flatMap((item: unknown) => {
+            if (!item || typeof item !== 'object') return [];
+            const { id, kind, count, exitCode } = item as Record<string, unknown>;
+            if (typeof id !== 'string' || !['job.started', 'job.exited'].includes(String(kind))) return [];
+            return [
+              {
+                id: modelLabel(id),
+                kind,
+                count: typeof count === 'number' ? count : 1,
+                ...(typeof exitCode === 'number' ? { exitCode } : {}),
+              },
+            ];
+          }),
+        };
+      }
+    }
+    changes.push({
+      count,
+      level,
+      ...(signal.kind === 'body.threshold' &&
+      (subject === 'disk' || subject.startsWith('disk:')) &&
+      typeof ruleId === 'string' &&
+      /^[\w-]+$/.test(ruleId)
+        ? { ruleId }
+        : {}),
+      signal: {
+        id: signal.id,
+        kind: signal.kind,
+        at: signal.at,
+        source: { id: 'asi-sense', api: 'delivery', host: 'local' },
+        subject,
+        data,
+      },
+    });
+  }
   return {
     since: update.since,
     at: update.at,
-    suppressed: update.suppressed,
+    suppressed,
     alreadyInjected: update.alreadyInjected,
-    changes: update.changes.map(({ signal, count, level, ruleId }) => {
-      const data: typeof signal.data = {};
-      let subject = 'observation';
-      if (typeof signal.data.feedbackAvailable === 'boolean') {
-        data.feedbackAvailable = signal.data.feedbackAvailable && /^[\w.:-]+$/.test(signal.id);
-      }
-      if (signal.kind === 'app.activated') {
-        if (typeof signal.data.name === 'string') data.name = modelAppName(signal.data.name);
-        if (typeof signal.data.previousName === 'string') data.previousName = modelAppName(signal.data.previousName);
-      } else if (signal.kind === 'window.focused' || signal.kind === 'window.title-changed') {
-        if (typeof signal.data.title === 'string') data.title = modelTitle(signal.data.title);
-      } else if (signal.kind === 'file.changed') {
-        const maskedPath = modelActivityName(
-          typeof signal.data.path === 'string' && signal.data.path.trim() ? signal.data.path : signal.subject,
-          true,
-        );
-        subject = maskedPath;
-        data.path = maskedPath;
-        if (
-          typeof signal.data.change === 'string' &&
-          ['add', 'create', 'created', 'modify', 'save', 'saved', 'delete', 'deleted', 'rename', 'renamed'].includes(
-            signal.data.change,
-          )
-        ) {
-          data.change = signal.data.change;
-        }
-      } else if (signal.kind === 'job.started' || signal.kind === 'job.exited' || signal.kind === 'process.exited') {
-        if (typeof signal.data.id === 'string') data.id = modelLabel(signal.data.id);
-        if (typeof signal.data.exitCode === 'number') data.exitCode = signal.data.exitCode;
-        if (typeof signal.data.durationMs === 'number') data.durationMs = signal.data.durationMs;
-        if (typeof signal.data.startedAt === 'number') data.startedAt = signal.data.startedAt;
-      } else if (signal.kind === 'body.threshold') {
-        subject = metric(signal.subject);
-        if (['normal', 'warn', 'critical'].includes(String(signal.data.severity))) data.severity = signal.data.severity;
-        if (typeof signal.data.value === 'number' && Number.isFinite(signal.data.value)) data.value = signal.data.value;
-      } else if (signal.kind === 'body.rate' || signal.kind === 'body.anomaly' || signal.kind === 'file.burst') {
-        const rawMetric =
-          signal.data.metric ??
-          (signal.kind === 'body.anomaly' && signal.data.type === 'rebaseline-suggestion'
-            ? signal.subject.replace(/^(?:rebaseline|baseline):/, '')
-            : undefined);
-        if (signal.kind === 'file.burst') {
-          const maskedDir = modelActivityName(
-            typeof signal.data.directory === 'string' && signal.data.directory.trim()
-              ? signal.data.directory
-              : signal.subject,
-            true,
-          );
-          subject = maskedDir;
-          data.directory = maskedDir;
-        } else {
-          subject = metric(rawMetric);
-        }
-        if (signal.kind === 'body.anomaly' && signal.data.type === 'rebaseline-suggestion') {
-          data.type = 'rebaseline-suggestion';
-        }
-        const ruleId = signal.data.ruleId;
-        if (typeof ruleId === 'string' && (/^[\w-]+$/.test(ruleId) || ruleId === 'file.burst')) data.ruleId = ruleId;
-        if (['normal', 'warn', 'critical'].includes(String(signal.data.severity))) data.severity = signal.data.severity;
-        for (const key of [
-          'value',
-          'baseline',
-          'deviation',
-          'slope',
-          'delta',
-          'etaToFloorMs',
-          'timeToFloorMs',
-          'windowMs',
-          'created',
-          'modified',
-          'deleted',
-          'agentDeleted',
-        ]) {
-          const value = signal.data[key];
-          if (typeof value === 'number' && Number.isFinite(value)) data[key] = value;
-        }
-        const { deleted, agentDeleted } = signal.data;
-        if (
-          typeof deleted === 'number' &&
-          Number.isFinite(deleted) &&
-          typeof agentDeleted === 'number' &&
-          Number.isFinite(agentDeleted) &&
-          agentDeleted >= 0 &&
-          deleted >= agentDeleted
-        )
-          data.externalDeleted = deleted - agentDeleted;
-        if (signal.data.externalDeletionExceeded === true) data.externalDeletionExceeded = true;
-        if (signal.kind === 'file.burst' && signal.data.rolledUp === true) data.rolledUp = true;
-      } else if (signal.kind === 'file.activity') {
-        const rawDir =
-          typeof signal.data.directory === 'string' && signal.data.directory.trim()
-            ? signal.data.directory
-            : signal.subject;
-        const maskedDir = modelActivityName(rawDir, true);
-        subject = maskedDir;
-        data.directory = maskedDir;
-        for (const key of ['windowMs', 'created', 'modified', 'deleted', 'rolledUp']) {
-          const value = signal.data[key];
-          if (typeof value === 'number' && Number.isFinite(value)) data[key] = value;
-        }
-        if (Array.isArray(signal.data.files)) {
-          const files = signal.data.files
-            .filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
-            .slice(0, 5)
-            .map((item) => modelFileEntry(rawDir, item));
-          if (files.length > 0) data.files = files;
-        }
-        if (signal.data.degraded === true) data.degraded = true;
-      }
-      const summary = signal.data.jobSummary;
-      if (summary && typeof summary === 'object' && !Array.isArray(summary)) {
-        const { total, omitted, recent } = summary as Record<string, unknown>;
-        if (typeof total === 'number' && typeof omitted === 'number' && Array.isArray(recent)) {
-          data.jobSummary = {
-            total,
-            omitted,
-            recent: recent.slice(-20).flatMap((item: unknown) => {
-              if (!item || typeof item !== 'object') return [];
-              const { id, kind, count, exitCode } = item as Record<string, unknown>;
-              if (typeof id !== 'string' || !['job.started', 'job.exited'].includes(String(kind))) return [];
-              return [
-                {
-                  id: modelLabel(id),
-                  kind,
-                  count: typeof count === 'number' ? count : 1,
-                  ...(typeof exitCode === 'number' ? { exitCode } : {}),
-                },
-              ];
-            }),
-          };
-        }
-      }
-      const kinds = [
-        'app.activated',
-        'window.focused',
-        'window.title-changed',
-        'file.changed',
-        'job.exited',
-        'job.started',
-        'job.failed',
-        'process.exited',
-        'body.threshold',
-        'body.rate',
-        'body.anomaly',
-        'file.burst',
-        'file.activity',
-      ];
-      return {
-        count,
-        level,
-        ...(signal.kind === 'body.threshold' &&
-        (subject === 'disk' || subject.startsWith('disk:')) &&
-        typeof ruleId === 'string' &&
-        /^[\w-]+$/.test(ruleId)
-          ? { ruleId }
-          : {}),
-        signal: {
-          id: signal.id,
-          kind: kinds.includes(signal.kind) ? signal.kind : 'observation',
-          at: signal.at,
-          source: { id: 'asi-sense', api: 'delivery', host: 'local' },
-          subject,
-          data,
-        },
-      };
-    }),
+    changes,
   };
 }
 
@@ -233,11 +382,18 @@ export function createDelivery(
   const staged = new Map<string, Map<string, { intent: DeliveryIntent; step?: Step; returned: boolean }>>();
   const steps = new Map<string, Step>();
   const inflight = new Map<string, Promise<void>>();
-  const render = (intent: DeliveryIntent): string =>
-    formatEnvUpdate(modelUpdate(intent.update), {
+  const render = (intent: DeliveryIntent): string => {
+    const projected = modelUpdate(intent.update);
+    const opts = {
       includeWindowTitles: sendTitles(),
       includeJobCommands: false,
-    });
+    };
+    if (intent.update.changes.length > 0) {
+      if (projected.changes.length === 0) return '';
+      if (!formatEnvUpdate({ ...projected, suppressed: 0, alreadyInjected: 0 }, opts)) return '';
+    }
+    return formatEnvUpdate(projected, opts);
+  };
   const message = (id: string, text: string): UserMessage =>
     freezeMessage({
       id: MessageId(id),

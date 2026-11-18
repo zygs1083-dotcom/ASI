@@ -80,14 +80,24 @@ function changeLines(ch: EnvChange, includeTitles: boolean, includeJobCommands: 
     main = `front-app: ${esc(typeof s.data.name === 'string' ? s.data.name : s.subject)}`;
     const prev = str(s.data.previousName);
     if (prev) main += ` (was: ${esc(prev)})`;
+  } else if (s.kind === 'app.launched' || s.kind === 'app.terminated') {
+    const verb = s.kind === 'app.launched' ? 'launched' : 'terminated';
+    main = `app: ${esc(str(s.data.name) || s.subject)} ${verb}`;
   } else if (WINDOW_KINDS.has(s.kind)) {
     if (!includeTitles) return [];
     main = `window: ${esc(str(s.data.title))}`;
   } else if (s.kind === 'file.changed') {
     const path = str(s.data.path) || s.subject;
     main = `file: ${esc(path)} ${fileVerb(s.data.change)}${ch.count > 1 ? ` ×${ch.count}` : ''}`;
-  } else if (s.kind === 'job.started') {
-    main = `job: \`${esc(str(s.data.id) || s.subject)}\` started`;
+  } else if (s.kind === 'job.started' || s.kind === 'process.started') {
+    const label = s.kind === 'job.started' ? 'job' : 'process';
+    main = `${label}: \`${esc(str(s.data.id) || s.subject)}\` started`;
+  } else if (s.kind === 'job.failed') {
+    const cmd = includeJobCommands ? str(s.data.command) || s.subject : str(s.data.id) || s.subject;
+    main = `job.failed: \`${esc(cmd)}\``;
+    if (typeof s.data.exitCode === 'number') main += ` ${s.data.exitCode}`;
+    const dur = durationMs(s);
+    if (dur !== undefined) main += ` after ${Math.round(dur / 1000)}s`;
   } else if (s.kind === 'job.exited' || s.kind === 'process.exited') {
     const label = s.kind === 'job.exited' ? 'job' : 'process';
     const cmd = includeJobCommands ? str(s.data.command) || s.subject : str(s.data.id) || label;
@@ -161,6 +171,40 @@ function changeLines(ch: EnvChange, includeTitles: boolean, includeJobCommands: 
       if (files.length > 0) main += ` files=[${files.join(', ')}]`;
     }
     if (s.data?.degraded === true) main += ' degraded=true';
+  } else if (s.kind === 'source.status') {
+    const src = str(s.data.source) || s.subject;
+    main = `source.status: ${esc(src)}`;
+    const status = str(s.data.status);
+    if (status) main += ` status=${esc(status)}`;
+    const path = str(s.data.path);
+    if (path) main += ` path=${esc(path)}`;
+    const reason = str(s.data.reason);
+    if (reason) main += ` reason=${esc(reason)}`;
+    const error = str(s.data.error);
+    if (error && error !== reason) main += ` error=${esc(error)}`;
+  } else if (s.kind === 'source.error') {
+    const src = str(s.data.source) || s.subject;
+    main = `source.error: ${esc(src)}`;
+    const error = str(s.data.error) || str(s.data.category);
+    if (error) main += ` error=${esc(error)}`;
+    const status = str(s.data.status);
+    if (status) main += ` status=${esc(status)}`;
+    const reason = str(s.data.reason);
+    if (reason && reason !== error) main += ` reason=${esc(reason)}`;
+  } else if (
+    s.kind === 'system.sleep' ||
+    s.kind === 'system.wake' ||
+    s.kind === 'screen.locked' ||
+    s.kind === 'screen.unlocked' ||
+    s.kind === 'session.active' ||
+    s.kind === 'session.inactive'
+  ) {
+    const [domain, verb] = s.kind.split('.');
+    main = `${esc(domain)}: ${esc(verb)}`;
+    const dur = durationMs(s);
+    if (dur !== undefined) main += ` after ${Math.round(dur / 1000)}s`;
+  } else if (s.kind === 'delivery.target-unavailable') {
+    main = `delivery: ${esc(str(s.subject) || 'delivery-target')} unavailable`;
   } else if (s.kind === 'fact.updated') {
     // Internal seam: a focused-window fact update still carries a title —
     // hide it entirely when titles are disabled.

@@ -1,5 +1,5 @@
 import { performance } from 'node:perf_hooks';
-import type { Fact, FactStatus, JobSummary, SenseState, Signal } from '@asi/sense-types';
+import type { Fact, FactStatus, JobSummary, SenseState, Signal, SystemStateValue } from '@asi/sense-types';
 import { FactExpiry } from './expiry.ts';
 import { FACT_PATHS, factAt, initialState, num, recomputeStatuses, str, ttlOf } from './facts.ts';
 import { type ApplyResult, SignalIntake } from './intake.ts';
@@ -30,6 +30,7 @@ type Activity = 'idle' | 'thinking' | 'tool' | 'waiting-user';
 export class StateStore {
   private static readonly DEDUP_MAX = 1024;
   private static readonly JOB_RETENTION_MS = 600_000;
+  private static readonly SYSTEM_MIN_TTL_MS = 86_400_000;
   private readonly wallClock: () => number;
   private readonly monotonic: () => number;
   private readonly defaultTtlMs: number;
@@ -158,6 +159,12 @@ export class StateStore {
           this.setFact(this.state.self.activity, d.activity as Activity, s);
         }
         break;
+      case 'system.sleep':
+      case 'system.wake':
+      case 'screen.locked':
+      case 'screen.unlocked':
+        this.noteSystem(s);
+        break;
       case 'fact.updated':
         this.applyFactUpdate(s);
         break;
@@ -203,6 +210,27 @@ export class StateStore {
     fact.source = signal.source;
     fact.observedAt = signal.at;
     fact.ttlMs = ttlOf(signal.data.ttlMs, this.defaultTtlMs);
+    delete fact.reason;
+  }
+
+  private noteSystem(signal: Signal): void {
+    const fact = this.state.env.system;
+    if (!fact) return;
+    const prev: SystemStateValue = fact.value ? { ...fact.value } : { locked: false };
+    const at = num(signal.data.at) ?? signal.at;
+    if (signal.kind === 'system.sleep') prev.lastSleepAt = at;
+    else if (signal.kind === 'system.wake') prev.lastWakeAt = at;
+    else if (signal.kind === 'screen.locked') prev.locked = true;
+    else if (signal.kind === 'screen.unlocked') prev.locked = false;
+    fact.value = prev;
+    fact.status = 'ok';
+    fact.source = signal.source;
+    fact.observedAt = signal.at;
+    const explicitTtl = num(signal.data.ttlMs);
+    fact.ttlMs =
+      explicitTtl !== undefined && explicitTtl >= 0
+        ? explicitTtl
+        : Math.max(this.defaultTtlMs, StateStore.SYSTEM_MIN_TTL_MS);
     delete fact.reason;
   }
 

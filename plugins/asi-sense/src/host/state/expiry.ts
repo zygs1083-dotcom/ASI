@@ -56,7 +56,12 @@ export class FactExpiry {
                   ? '/env/activeJobs'
                   : signal.kind === 'agent.status'
                     ? '/self/activity'
-                    : '';
+                    : signal.kind === 'system.sleep' ||
+                        signal.kind === 'system.wake' ||
+                        signal.kind === 'screen.locked' ||
+                        signal.kind === 'screen.unlocked'
+                      ? '/env/system'
+                      : '';
       if (path) touched.set(path, signal);
     }
     const visit = (value: unknown, path: string, reference?: number): void => {

@@ -422,4 +422,91 @@ describe('formatEnvUpdate', () => {
       'file.activity: ~ windowMs=10000 created=5 modified=0 deleted=0 rolledUp=7 files=[[file]]',
     );
   });
+
+  it('formats source.status, source.error, app.launched/terminated, job.failed and system.* changes', () => {
+    const out = formatEnvUpdate(
+      update([
+        change({
+          signal: sig({
+            id: 'ss-1',
+            kind: 'source.status',
+            at: T0,
+            subject: 'files-global-denied',
+            data: { source: 'files-global-denied', status: 'denied', path: '~', reason: 'permission-denied' },
+          }),
+        }),
+        change({
+          signal: sig({
+            id: 'se-1',
+            kind: 'source.error',
+            at: T0 + 1,
+            subject: 'body',
+            data: { source: 'body', error: 'tuning-error' },
+          }),
+        }),
+        change({
+          signal: sig({
+            id: 'al-1',
+            kind: 'app.launched',
+            at: T0 + 2,
+            subject: 'FixtureIDE',
+            data: { name: 'FixtureIDE' },
+          }),
+        }),
+        change({
+          signal: sig({
+            id: 'at-1',
+            kind: 'app.terminated',
+            at: T0 + 3,
+            subject: 'FixtureTerm',
+            data: { name: 'FixtureTerm' },
+          }),
+        }),
+        change({
+          signal: sig({
+            id: 'jf-1',
+            kind: 'job.failed',
+            at: T0 + 4,
+            subject: 'build',
+            data: { id: 'build', exitCode: 2 },
+          }),
+        }),
+        change({
+          signal: sig({
+            id: 'sw-1',
+            kind: 'system.wake',
+            at: T0 + 5,
+            subject: 'system',
+            data: { at: T0 + 5, durationMs: 300_000 },
+          }),
+        }),
+        change({
+          signal: sig({
+            id: 'sl-1',
+            kind: 'screen.locked',
+            at: T0 + 6,
+            subject: 'screen',
+            data: { at: T0 + 6 },
+          }),
+        }),
+        change({
+          signal: sig({
+            id: 'sa-1',
+            kind: 'session.active',
+            at: T0 + 7,
+            subject: 'session',
+            data: { at: T0 + 7, durationMs: 60_000 },
+          }),
+        }),
+      ]),
+    );
+    expect(out).toContain('source.status: files-global-denied status=denied path=~ reason=permission-denied');
+    expect(out).toContain('source.error: body error=tuning-error');
+    expect(out).toContain('app: FixtureIDE launched');
+    expect(out).toContain('app: FixtureTerm terminated');
+    expect(out).toContain('job.failed: `build` 2');
+    expect(out).toContain('system: wake after 300s');
+    expect(out).toContain('screen: locked');
+    expect(out).toContain('session: active after 60s');
+  });
 });
