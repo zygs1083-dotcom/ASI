@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { PassThrough } from 'node:stream';
 import { ToolArgsError, type ToolRunContext } from '@deepseek-ai/dsh-tools';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { modelHistory, modelSummary } from '../../src/host/dsh/history-output.ts';
+import { KNOWN_EVENT_KINDS, modelHistory, modelSummary } from '../../src/host/dsh/history-output.ts';
 import { FileHistoryStoragePort } from '../../src/host/dsh/history-storage.ts';
 import { createSenseTools } from '../../src/host/dsh/tools.ts';
 import { createSenseRuntime, type DailySummary, type HistoryStoragePort } from '../../src/host/runtime/index.ts';
@@ -353,7 +353,8 @@ describe('env_detail, env_history, and env_summary tools', () => {
     if (localHost.length > 0) expect(String(winEv.title)).not.toContain(localHost);
 
     const fileEv = events[2];
-    expect(fileEv.subject).toBe('secrets.env');
+    // `.env` is not in tool-output.ts `SAFE_FILE_EXTENSIONS`, so modelPath redacts `secrets.env` to `[path]`.
+    expect(fileEv.subject).toBe('[path]');
     expect(JSON.stringify(fileEv)).not.toContain('/home/tester/private-repo');
     expect(String((fileEv.source as { id: string }).id)).toMatch(/^files:r-[a-f0-9]{8}$/);
     expect((fileEv.source as Record<string, unknown>).host).toBeUndefined();
@@ -383,6 +384,7 @@ describe('env_detail, env_history, and env_summary tools', () => {
 
     // Size cap (> 32 KiB) trims oldest events cleanly while preserving newest events
     const bigLines: string[] = [];
+    const fillerSummary = Array.from({ length: 45 }, () => 'entry').join(' ');
     for (let i = 0; i < 120; i++) {
       bigLines.push(
         JSON.stringify({
@@ -391,6 +393,7 @@ describe('env_detail, env_history, and env_summary tools', () => {
           kind: 'source.status',
           subject: 'history',
           reason: `synthetic-reason-${i}-${'x'.repeat(300)}`,
+          detail: { summary: fillerSummary },
           level: 'record',
           at: now - 10_000 + i,
           source: { id: 'files:/tmp/synthetic-root', api: 'watch', host: 'local' },
@@ -1196,5 +1199,317 @@ describe('env_detail, env_history, and env_summary tools', () => {
       else process.env.TZ = origTz;
       await rm(tzDir, { recursive: true, force: true });
     }
+  });
+
+  it('outputs only known event kinds from env_history and preserves strict system identifiers without modelText redaction', async () => {
+    const now = Date.UTC(2026, 10, 18, 12, 0, 0);
+    let currentWall = now;
+    const history = createMemoryHistoryPort();
+    let jobCb:
+      | ((ev: {
+          type: 'started' | 'exited';
+          id: string;
+          command?: string;
+          exitCode?: number;
+          at?: number;
+        }) => Promise<void>)
+      | undefined;
+    let fileCb: ((ev: { path: string; change: 'add' | 'modify' | 'delete'; at?: number }) => void) | undefined;
+    const saved = new Map<string, string>();
+    let helperOut: PassThrough | undefined;
+
+    const rt = createSenseRuntime(
+      {
+        clock: { wall: () => currentWall, mono: () => 1_000 },
+        history,
+        storage: {
+          load: async (key) => saved.get(key),
+          save: async (key, json) => {
+            saved.set(key, json);
+          },
+        },
+        dsh: {
+          listSessions: async () => [{ id: 's1', title: 'Synthetic', updatedAt: now, running: true }],
+          onAgentEvent: () => () => {},
+          onTool: () => () => {},
+          onJob: (cb) => {
+            jobCb = cb as typeof jobCb;
+            return () => {};
+          },
+          deliver: async () => {},
+          tokenSnapshot: async () => undefined,
+        },
+        helper: {
+          spawn: () => {
+            let gen = 0;
+            const child = new EventEmitter() as EventEmitter & {
+              stdin: PassThrough;
+              stdout: PassThrough;
+              stderr: PassThrough;
+              pid: number;
+              killed: boolean;
+              kill: () => boolean;
+            };
+            child.stdin = new PassThrough();
+            child.stdout = new PassThrough();
+            child.stderr = new PassThrough();
+            child.pid = 4242;
+            child.killed = false;
+            child.kill = () => {
+              child.killed = true;
+              child.stdout.end();
+              child.stderr.end();
+              child.emit('exit', 0, null);
+              child.emit('close', 0, null);
+              return true;
+            };
+            child.stdin.on('data', (chunk) => {
+              for (const raw of chunk.toString('utf8').split('\n').filter(Boolean)) {
+                const req = JSON.parse(raw) as { id?: string; enabled?: boolean; cmd?: string };
+                if (req.cmd === 'titles' && typeof req.id === 'string' && typeof req.enabled === 'boolean') {
+                  child.stdout.write(
+                    `${JSON.stringify({
+                      v: 1,
+                      type: 'titles.ack',
+                      session: 'fixture-session',
+                      id: req.id,
+                      enabled: req.enabled,
+                      gen: ++gen,
+                      at: now,
+                    })}\n`,
+                  );
+                } else if (req.cmd === 'snapshot') {
+                  child.stdout.write(
+                    `${JSON.stringify({
+                      v: 1,
+                      type: 'snapshot',
+                      at: now,
+                      permissions: { accessibility: 'granted' },
+                    })}\n`,
+                  );
+                }
+              }
+            });
+            helperOut = child.stdout;
+            child.stdout.write(
+              `${JSON.stringify({
+                v: 1,
+                type: 'hello',
+                at: now,
+                version: '0.1.0',
+                pid: 4242,
+                session: 'fixture-session',
+                permissions: { accessibility: 'granted' },
+              })}\n`,
+            );
+            return child as never;
+          },
+        },
+        probe: { create: () => ({ onSample: () => () => {}, start: () => {}, stop: async () => {} }) },
+        files: {
+          watch: (_path, cb) => {
+            fileCb = cb;
+            return { close: () => {} };
+          },
+        },
+      },
+      { platform: 'darwin', helperPath: '/synthetic/asi-helper', timeZone: 'UTC', intervalMs: 600_000 },
+    );
+
+    await rt.start();
+    await vi.waitFor(() => expect(helperOut).toBeDefined(), { timeout: 2_000, interval: 5 });
+    await vi.waitFor(
+      () => expect(rt.events().some((e) => e.source.id === 'helper' && e.reason === 'ready')).toBe(true),
+      { timeout: 2_000, interval: 5 },
+    );
+
+    await rt.tools.envWatch({
+      action: 'add',
+      rule: { id: 'watch-src', match: { kind: 'file.changed', subject: '/tmp/watched/**' }, level: 'context' },
+    });
+    await vi.waitFor(() => expect(fileCb).toBeDefined(), { timeout: 2_000, interval: 5 });
+
+    currentWall = now + 700;
+    helperOut?.write(
+      `${JSON.stringify({ v: 1, type: 'app.activated', at: now + 100, name: 'CodeApp', bundleId: 'com.example.Code', pid: 10 })}\n`,
+    );
+    helperOut?.write(
+      `${JSON.stringify({ v: 1, type: 'window.focused', at: now + 200, title: 'README.md', bundleId: 'com.example.Code', pid: 10, window: 1 })}\n`,
+    );
+    helperOut?.write(
+      `${JSON.stringify({ v: 1, type: 'window.title', at: now + 300, title: 'index.ts', bundleId: 'com.example.Code', pid: 10, window: 1 })}\n`,
+    );
+    helperOut?.write(
+      `${JSON.stringify({ v: 1, type: 'error', at: now + 400, code: 'output_overflow', dropped: 7 })}\n`,
+    );
+    fileCb?.({ path: '/tmp/watched/main.ts', change: 'modify', at: now + 500 });
+    await jobCb?.({ type: 'started', id: 'j-1', command: '"/Applications/MyTool.app" --flag', at: now + 600 });
+    await jobCb?.({ type: 'exited', id: 'j-1', command: '/usr/bin/python3.12 -m app', exitCode: 1, at: now + 700 });
+
+    await vi.waitFor(
+      () =>
+        expect(rt.events().map((e) => e.kind)).toEqual(
+          expect.arrayContaining([
+            'source.status',
+            'app.activated',
+            'window.focused',
+            'window.title-changed',
+            'source.error',
+            'file.changed',
+            'job.started',
+            'job.exited',
+          ]),
+        ),
+      { timeout: 2_000, interval: 5 },
+    );
+
+    currentWall = now + 1_000;
+    const envHistory = createSenseTools(rt, () => currentWall).find((t) => t.name === 'env_history');
+    if (!envHistory) throw new Error('missing env_history tool');
+    const out = (await envHistory.execute({ limit: 200 }, makeExec())) as {
+      events: Array<{
+        id: string;
+        kind: string;
+        subject: string;
+        reason?: string;
+        source: { id: string; api: string };
+      }>;
+    };
+
+    expect(out.events.length).toBeGreaterThanOrEqual(7);
+    for (const ev of out.events) {
+      expect(KNOWN_EVENT_KINDS.has(ev.kind), `unexpected kind: ${ev.kind}`).toBe(true);
+      expect(ev.id).not.toBe('[host]');
+      expect(ev.id).not.toBe('<host>');
+    }
+    expect(out.events.map((e) => e.kind)).toEqual(
+      expect.arrayContaining([
+        'source.status',
+        'app.activated',
+        'window.focused',
+        'window.title-changed',
+        'source.error',
+        'file.changed',
+        'job.started',
+        'job.exited',
+      ]),
+    );
+    expect(out.events.find((e) => e.kind === 'job.started')?.subject).toBe('MyTool.app');
+    expect(out.events.find((e) => e.kind === 'job.exited')?.subject).toBe('python3.12');
+    expect(out.events.find((e) => e.kind === 'source.error')?.reason).toBe('output_overflow (dropped=7)');
+
+    await rt.stop();
+
+    // Direct projection: system fields use strict identifier validation without modelText/modelTitle,
+    // while invalid/secret system fields and untrusted command basenames are redacted.
+    const uuidId = '550e8400-e29b-41d4-a716-446655440000:12';
+    const hash64 = 'a'.repeat(64);
+    const strictCheck = modelHistory({
+      available: true,
+      from: 1_000,
+      to: 2_000,
+      limit: 50,
+      total: 6,
+      truncated: false,
+      titlesAllowed: true,
+      events: [
+        {
+          id: uuidId,
+          kind: 'delivery-unknown',
+          subject: 'delivery',
+          level: 'context',
+          reason: 'pending-evicted:1',
+          cause: 'agent',
+          ruleId: 'r-delivery',
+          at: 1_500,
+          source: { id: 'helper.thermal', api: 'history', host: 'local' },
+        },
+        {
+          id: `body.rate:${hash64}`,
+          kind: 'body.rate',
+          subject: 'rate:disk-drop:disk:/',
+          level: 'wake',
+          reason: 'wake-budget',
+          cause: 'unknown',
+          ruleId: 'disk-drop',
+          at: 1_400,
+          source: { id: 'body', api: 'probe', host: 'local' },
+        },
+        {
+          id: 'body:disk:/:1300:warn',
+          kind: 'body.threshold',
+          subject: 'disk:/',
+          level: 'context',
+          at: 1_300,
+          source: { id: 'body', api: 'probe', host: 'local' },
+        },
+        {
+          id: 'evil.host.internal:5432',
+          kind: 'secret host/kind' as never,
+          subject: 'evil.com',
+          level: 'invalid-level' as never,
+          reason: 'secret.corp.internal',
+          cause: 'invalid-cause' as never,
+          ruleId: 'secret.corp.internal',
+          at: 1_200,
+          source: { id: 'secret.corp.internal', api: 'user@host', host: 'local' },
+        },
+        {
+          id: 'cmd-app-bad',
+          kind: 'job.exited',
+          subject: 'host.1',
+          level: 'record',
+          at: 1_100,
+          source: { id: 'dsh', api: 'events', host: 'local' },
+        },
+        {
+          id: 'cmd-app-dot-bad',
+          kind: 'job.exited',
+          subject: 'evil.com.app',
+          level: 'record',
+          at: 1_050,
+          source: { id: 'dsh', api: 'events', host: 'local' },
+        },
+      ],
+    }) as { events: Array<Record<string, unknown>> };
+
+    expect(strictCheck.events[0]).toMatchObject({
+      id: uuidId,
+      kind: 'delivery-unknown',
+      level: 'context',
+      reason: 'pending-evicted:1',
+      cause: 'agent',
+      ruleId: 'r-delivery',
+      source: { id: 'helper.thermal', api: 'history' },
+    });
+    expect(strictCheck.events[1]).toMatchObject({
+      id: `body.rate:${hash64}`,
+      kind: 'body.rate',
+      subject: 'rate:disk-drop:disk:[path]',
+      reason: 'wake-budget',
+      ruleId: 'disk-drop',
+    });
+    expect(strictCheck.events[2]).toMatchObject({
+      id: 'body:disk:[path]:1300:warn',
+      subject: 'disk:[path]',
+    });
+    expect(strictCheck.events[3]).toMatchObject({
+      id: '[redacted]',
+      kind: '[redacted]',
+      level: '[redacted]',
+      reason: '[redacted]',
+      cause: '[redacted]',
+      ruleId: '[redacted]',
+      source: { id: '[redacted]', api: '[redacted]' },
+    });
+    expect(strictCheck.events[4]).toMatchObject({
+      subject: '[command]',
+    });
+    expect(strictCheck.events[5]).toMatchObject({
+      subject: '[command]',
+    });
+    expect(JSON.stringify(strictCheck)).not.toContain('secret.corp.internal');
+    expect(JSON.stringify(strictCheck)).not.toContain('evil.host.internal');
+    expect(JSON.stringify(strictCheck)).not.toContain('evil.com');
   });
 });
