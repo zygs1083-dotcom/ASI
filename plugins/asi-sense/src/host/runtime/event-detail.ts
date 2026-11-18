@@ -2,6 +2,7 @@ import type { Signal } from '@asi/sense-types';
 import type { EventEntry } from './attention.ts';
 
 const detailFields: Record<string, readonly string[]> = {
+  'body.threshold': ['severity', 'value'],
   'body.rate': [
     'metric',
     'windowMs',
@@ -14,7 +15,18 @@ const detailFields: Record<string, readonly string[]> = {
     'evidenceAt',
     'evidenceMono',
   ],
-  'body.anomaly': ['metric', 'value', 'baseline', 'deviation', 'k', 'confidence', 'dates', 'severity', 'ruleId'],
+  'body.anomaly': [
+    'type',
+    'metric',
+    'value',
+    'baseline',
+    'deviation',
+    'k',
+    'confidence',
+    'dates',
+    'severity',
+    'ruleId',
+  ],
   'file.burst': [
     'directory',
     'windowMs',
@@ -26,6 +38,7 @@ const detailFields: Record<string, readonly string[]> = {
     'agentDeleted',
     'externalDeletionExceeded',
   ],
+  'file.activity': ['directory', 'dir', 'created', 'modified', 'deleted', 'windowMs'],
 };
 
 export function eventDetail(signal: Signal): EventEntry['detail'] {
