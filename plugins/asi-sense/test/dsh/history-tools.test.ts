@@ -1,14 +1,22 @@
 import { EventEmitter } from 'node:events';
+import { readFileSync } from 'node:fs';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
-import { hostname, tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { homedir, hostname, tmpdir } from 'node:os';
+import { dirname, join, resolve } from 'node:path';
 import { PassThrough } from 'node:stream';
+import { fileURLToPath } from 'node:url';
 import { ToolArgsError, type ToolRunContext } from '@deepseek-ai/dsh-tools';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { createDelivery } from '../../src/host/dsh/deliver.ts';
 import { KNOWN_EVENT_KINDS, modelHistory, modelSummary } from '../../src/host/dsh/history-output.ts';
 import { FileHistoryStoragePort } from '../../src/host/dsh/history-storage.ts';
 import { createSenseTools } from '../../src/host/dsh/tools.ts';
-import { createSenseRuntime, type DailySummary, type HistoryStoragePort } from '../../src/host/runtime/index.ts';
+import {
+  createSenseRuntime,
+  type DailySummary,
+  type FileChange,
+  type HistoryStoragePort,
+} from '../../src/host/runtime/index.ts';
 
 const tempDirs: string[] = [];
 
@@ -193,6 +201,7 @@ function createRuntimeHarness(nowMs: number, history: HistoryStoragePort, withHe
       ...(withHelper ? { helperPath: '/synthetic/asi-helper' } : {}),
       timeZone: 'UTC',
       intervalMs: 600_000,
+      globalFileWatch: { disableInTests: true },
     },
   );
 
@@ -1179,7 +1188,7 @@ describe('env_detail, env_history, and env_summary tools', () => {
           probe: { create: () => ({ onSample: () => () => {}, start: () => {}, stop: async () => {} }) },
           files: { watch: () => ({ close: () => {} }) },
         },
-        { platform: 'linux', intervalMs: 600_000 },
+        { platform: 'linux', intervalMs: 600_000, globalFileWatch: { disableInTests: true } },
       );
       await rtTz.start();
       await tzJobCb({ type: 'started', id: 'tokyo-job', at: tzWall + 1_000 });
@@ -1198,6 +1207,392 @@ describe('env_detail, env_history, and env_summary tools', () => {
       if (origTz === undefined) delete process.env.TZ;
       else process.env.TZ = origTz;
       await rm(tzDir, { recursive: true, force: true });
+    }
+  });
+
+  it('persists file.activity locally, summarizes into daily/monthly fileActivity, and routes file.* paths through modelActivityName/modelPath', async () => {
+    const dir = await makeTempDir();
+    const port = new FileHistoryStoragePort(dir);
+    let wallMs = Date.UTC(2026, 9, 15, 23, 59, 0);
+    let monoMs = 1_000;
+    let watchCb: ((event: FileChange) => void) | undefined;
+    const saved = new Map<string, string>();
+
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'Date'] });
+    try {
+      const rt = createSenseRuntime(
+        {
+          clock: { wall: () => wallMs, mono: () => monoMs },
+          history: port,
+          storage: {
+            load: async (key) => saved.get(key),
+            save: async (key, json) => {
+              saved.set(key, json);
+            },
+          },
+          dsh: {
+            onAgentEvent: () => () => {},
+            onTool: () => () => {},
+            onJob: () => () => {},
+            deliver: async () => {},
+            tokenSnapshot: async () => undefined,
+          },
+          helper: { spawn: () => undefined },
+          probe: { create: () => ({ onSample: () => () => {}, start: () => {}, stop: async () => {} }) },
+          files: {
+            watch: (root, cb) => {
+              if (root === '/') watchCb = cb;
+              return { close: () => {} };
+            },
+          },
+        },
+        {
+          platform: 'darwin',
+          timeZone: 'UTC',
+          intervalMs: 600_000,
+          globalFileWatch: {
+            root: '/',
+            windowMs: 5_000,
+            homedir: '/Users/alice',
+            dataDirs: [dir],
+          },
+        },
+      );
+      await rt.start();
+      expect(watchCb).toBeDefined();
+
+      // Emit file changes across project subdir, user home root, and path containing email + IP:port.
+      // The foreign home is under /Users (not /home) because macOS maps /home into /System, which is a
+      // default file exclusion; /Users keeps the redaction assertions portable across platforms.
+      watchCb?.({ path: '/Users/alice/secret-workspace/app.ts', change: 'add', at: wallMs + 100 });
+      watchCb?.({ path: '/Users/alice/secret-workspace/notes.md', change: 'modify', at: wallMs + 200 });
+      watchCb?.({ path: '/Users/alice/.bashrc', change: 'modify', at: wallMs + 300 });
+      watchCb?.({
+        path: '/users/bob-dev/alice@corp.com-192.168.1.50:5432/leak.log',
+        change: 'delete',
+        at: wallMs + 400,
+      });
+
+      wallMs += 5_000;
+      monoMs += 5_000;
+      await vi.advanceTimersByTimeAsync(5_000);
+
+      const tools = createSenseTools(rt, () => wallMs);
+      const envHistory = tools.find((t) => t.name === 'env_history');
+      if (!envHistory) throw new Error('missing env_history tool');
+
+      const histRes = (await envHistory.execute({ kinds: ['file.activity'] }, makeExec())) as {
+        events: Array<{
+          kind: string;
+          subject: string;
+          detail?: {
+            directory?: string;
+            created?: number;
+            modified?: number;
+            deleted?: number;
+            files?: string[];
+          };
+        }>;
+      };
+
+      // Local event log keeps full local paths on disk (case-folded on darwin)
+      const rawEvents = (await port.readEvents('2026-10-15')) ?? '';
+      expect(rawEvents).toContain('/users/alice/secret-workspace');
+      expect(rawEvents).toContain('"subject":"/users/alice"');
+      expect(rawEvents).toContain('.bashrc');
+      expect(rawEvents).toContain('/users/bob-dev/alice@corp.com-192.168.1.50:5432');
+
+      // Model-facing env_history output masks home root, strips directory prefixes, and redacts email/IP
+      expect(histRes.events).toHaveLength(3);
+      const bySubject = new Map(histRes.events.map((ev) => [ev.subject, ev]));
+      expect(bySubject.get('secret-workspace')?.detail).toMatchObject({
+        directory: 'secret-workspace',
+        created: 1,
+        modified: 1,
+        deleted: 0,
+        files: ['app.ts', 'notes.md'],
+      });
+      expect(bySubject.get('~')?.detail).toMatchObject({
+        directory: '~',
+        created: 0,
+        modified: 1,
+        deleted: 0,
+        // Dotfiles are hidden metadata under the whitelist projection, so the name becomes [path].
+        files: ['[path]'],
+      });
+      // Endpoint-like directory (email + IP:port) is fully redacted to [path] now.
+      expect(bySubject.get('[path]')?.detail).toMatchObject({
+        directory: '[path]',
+        created: 0,
+        modified: 0,
+        deleted: 1,
+        files: ['leak.log'],
+      });
+      const histSerialized = JSON.stringify(histRes);
+      for (const secret of ['/Users/alice', '/users/bob-dev', 'alice', 'bob-dev', '192.168.1.50', '5432']) {
+        expect(histSerialized).not.toContain(secret);
+      }
+
+      // Cross midnight to generate 2026-10-15 daily summary
+      wallMs = Date.UTC(2026, 9, 16, 0, 1, 0);
+      monoMs += 120_000;
+      await vi.advanceTimersByTimeAsync(120_000);
+      await rt.tools.envHistory({});
+
+      const dailyRaw = await port.readDaily('2026-10-15');
+      expect(dailyRaw).toBeDefined();
+      const daily = JSON.parse(dailyRaw ?? '{}') as DailySummary;
+      expect(daily.fileActivity['secret-workspace']).toEqual({ events: 1, created: 1, modified: 1, deleted: 0 });
+      expect(daily.fileActivity['~']).toEqual({ events: 1, created: 0, modified: 1, deleted: 0 });
+      expect(daily.fileActivity['alice@corp.com-192.168.1.50:5432']).toEqual({
+        events: 1,
+        created: 0,
+        modified: 0,
+        deleted: 1,
+      });
+
+      await rt.stop();
+
+      // Next month runtime queries env_summary and routes fileActivity/fileBursts through modelActivityName/modelPath
+      const novWall = Date.UTC(2026, 10, 2, 10, 0, 0);
+      const rtNov = createSenseRuntime(
+        {
+          clock: { wall: () => novWall, mono: () => 1_000 },
+          history: port,
+          storage: { load: async () => undefined, save: async () => {} },
+          dsh: {
+            onAgentEvent: () => () => {},
+            onTool: () => () => {},
+            onJob: () => () => {},
+            deliver: async () => {},
+            tokenSnapshot: async () => undefined,
+          },
+          helper: { spawn: () => undefined },
+          probe: { create: () => ({ onSample: () => () => {}, start: () => {}, stop: async () => {} }) },
+          files: { watch: () => ({ close: () => {} }) },
+        },
+        { platform: 'linux', timeZone: 'UTC', intervalMs: 600_000 },
+      );
+      await rtNov.start();
+      const envSummary = createSenseTools(rtNov, () => novWall).find((t) => t.name === 'env_summary');
+      if (!envSummary) throw new Error('missing env_summary tool');
+      const octSum = (await envSummary.execute({ month: '2026-10' }, makeExec())) as {
+        available: boolean;
+        summary: {
+          fileActivity: Record<string, { events: number; created: number; modified: number; deleted: number }>;
+        };
+      };
+      expect(octSum.available).toBe(true);
+      expect(octSum.summary.fileActivity['secret-workspace']).toEqual({
+        events: 1,
+        created: 1,
+        modified: 1,
+        deleted: 0,
+      });
+      expect(octSum.summary.fileActivity['~']).toEqual({ events: 1, created: 0, modified: 1, deleted: 0 });
+      expect(octSum.summary.fileActivity['[path]']).toEqual({ events: 1, created: 0, modified: 0, deleted: 1 });
+      const sumSerialized = JSON.stringify(octSum);
+      for (const secret of ['/Users/alice', '/users/bob-dev', 'alice', 'bob-dev', '192.168.1.50', '5432']) {
+        expect(sumSerialized).not.toContain(secret);
+      }
+      await rtNov.stop();
+    } finally {
+      vi.useRealTimers();
+    }
+
+    // Direct projection check for file.* variants including os.homedir(), long names, and blank tokens
+    const localHome = homedir();
+    const directHist = modelHistory({
+      available: true,
+      from: 1_000,
+      to: 2_000,
+      limit: 50,
+      total: 2,
+      truncated: false,
+      titlesAllowed: true,
+      events: [
+        {
+          id: 'fa-home',
+          kind: 'file.activity',
+          subject: localHome,
+          level: 'record',
+          at: 1_500,
+          source: { id: 'files-global', api: 'watch', host: 'local' },
+          detail: {
+            directory: localHome,
+            created: 1,
+            modified: 0,
+            deleted: 0,
+            files: ['/Users/alice/alice@example.com.log', `${'Z'.repeat(600)}.txt`, '/   '],
+          },
+        },
+        {
+          id: 'fb-home',
+          kind: 'file.burst',
+          subject: '/users/bob-dev',
+          level: 'wake',
+          at: 1_600,
+          source: { id: 'files-global', api: 'watch', host: 'local' },
+          detail: { directory: '/users/bob-dev', deleted: 60 },
+        },
+      ],
+    }) as { events: Array<{ subject: string; detail?: { directory?: string; files?: string[] } }> };
+    expect(directHist.events[0]).toMatchObject({
+      subject: '~',
+      detail: {
+        directory: '~',
+        // Strict whitelist projection redacts email-like, overlong, and blank path tokens to [path].
+        files: ['[path]', '[path]', '[path]'],
+      },
+    });
+    expect(directHist.events[1]).toMatchObject({
+      subject: '~',
+      detail: { directory: '~' },
+    });
+    expect(JSON.stringify(directHist)).not.toContain('alice');
+    expect(JSON.stringify(directHist)).not.toContain('bob-dev');
+    if (localHome !== '/') {
+      const homeBase = localHome.replaceAll('\\', '/').replace(/\/+$/, '').split('/').at(-1);
+      if (homeBase && homeBase !== '~') expect(JSON.stringify(directHist)).not.toContain(homeBase);
+    }
+
+    const directSum = modelSummary({
+      available: true,
+      summary: {
+        version: 1,
+        month: '2026-10',
+        daysInMonth: 31,
+        coveredDays: 1,
+        missingDays: [],
+        includedDays: ['2026-10-01'],
+        apps: {},
+        appSwitches: 0,
+        deliveries: { wake: 0, context: 0, suppressed: 0, byRule: {} },
+        fileBursts: { '/Users/alice': { events: 1, created: 0, modified: 0, deleted: 55 } },
+        fileActivity: { '/users/bob-dev': { events: 2, created: 1, modified: 2, deleted: 0 } },
+        bodyAnomalies: { total: 0, threshold: 0, rate: 0, anomaly: 0, byMetric: {} },
+        coverage: { totalDayMs: 86_400_000, observedMs: 1_000, pausedMs: 0, notRunningMs: 86_399_000 },
+        totalEvents: 3,
+        generatedAt: 1_000,
+      },
+    }) as { summary: { fileBursts: Record<string, unknown>; fileActivity: Record<string, unknown> } };
+    expect(directSum.summary.fileBursts['~']).toBeDefined();
+    expect(directSum.summary.fileActivity['~']).toBeDefined();
+    expect(JSON.stringify(directSum)).not.toContain('alice');
+    expect(JSON.stringify(directSum)).not.toContain('bob-dev');
+
+    // Architecture check: history-output.ts routes file.* paths through modelActivityName/modelPath
+    const here = dirname(fileURLToPath(import.meta.url));
+    const src = readFileSync(resolve(here, '../../src/host/dsh/history-output.ts'), 'utf8');
+    expect(src).toContain('modelActivityName(');
+    expect(src).toContain("entry.kind.startsWith('file.')");
+    expect(src).toContain('projectRecord(s.fileBursts, (key) => modelActivityName(');
+    expect(src).toContain('projectRecord(s.fileActivity, (key) => modelActivityName(');
+  });
+
+  it('masks a global-watch event whose own path is the user home root', async () => {
+    const dir = await makeTempDir();
+    const port = new FileHistoryStoragePort(dir);
+    let wallMs = Date.UTC(2026, 10, 18, 12, 0, 0);
+    let monoMs = 1_000;
+    let watchCb: ((event: FileChange) => void) | undefined;
+    const saved = new Map<string, string>();
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'Date'] });
+    try {
+      const rt = createSenseRuntime(
+        {
+          clock: { wall: () => wallMs, mono: () => monoMs },
+          history: port,
+          storage: {
+            load: async (key) => saved.get(key),
+            save: async (key, json) => {
+              saved.set(key, json);
+            },
+          },
+          dsh: {
+            onAgentEvent: () => () => {},
+            onTool: () => () => {},
+            onJob: () => () => {},
+            deliver: async () => {},
+            tokenSnapshot: async () => undefined,
+          },
+          helper: { spawn: () => undefined },
+          probe: { create: () => ({ onSample: () => () => {}, start: () => {}, stop: async () => {} }) },
+          files: {
+            watch: (root, cb) => {
+              if (root === '/') watchCb = cb;
+              return { close: () => {} };
+            },
+          },
+        },
+        {
+          platform: 'darwin',
+          timeZone: 'UTC',
+          intervalMs: 600_000,
+          globalFileWatch: { root: '/', windowMs: 30, homedir: '/Users/alice', dataDirs: [dir] },
+        },
+      );
+      await rt.start();
+      expect(watchCb).toBeDefined();
+
+      // The watched path is the home root itself, not a child: the bucket directory is '/users',
+      // so only the `files` basename could leak the account name.
+      watchCb?.({ path: '/Users/alice', change: 'modify', at: wallMs });
+      wallMs += 100;
+      monoMs += 100;
+      await vi.advanceTimersByTimeAsync(100);
+
+      const envHistory = createSenseTools(rt, () => wallMs).find((tool) => tool.name === 'env_history');
+      if (!envHistory) throw new Error('missing env_history tool');
+      const hist = (await envHistory.execute({ kinds: ['file.activity'] }, makeExec())) as {
+        events: Array<{ kind: string; subject: string; detail?: { directory?: string; files?: string[] } }>;
+      };
+      expect(hist.events).toHaveLength(1);
+      expect(hist.events[0].detail).toMatchObject({ directory: 'users', files: ['~'] });
+      expect(JSON.stringify(hist)).not.toContain('alice');
+
+      const send = vi.fn();
+      const agent = { send, followup: vi.fn(), inject: vi.fn() };
+      const deliver = createDelivery(
+        () => agent,
+        () => true,
+        async () => false,
+      );
+      const event = rt.events().find((entry) => entry.kind === 'file.activity');
+      if (!event) throw new Error('missing file.activity event');
+      await deliver('s1', {
+        kind: 'send',
+        target: 'user',
+        wakeup: false,
+        sessionId: 's1',
+        deliveryId: 'home-root',
+        update: {
+          since: wallMs,
+          suppressed: 0,
+          summary: 'synthetic',
+          changes: [
+            {
+              level: 'context',
+              signal: {
+                id: event.id,
+                kind: event.kind,
+                at: event.at,
+                source: event.source,
+                subject: event.subject,
+                cause: 'unknown',
+                data: event.detail ?? {},
+              },
+            },
+          ],
+        },
+      } as never);
+      expect(send).toHaveBeenCalledTimes(1);
+      const deliveredText = JSON.stringify(send.mock.calls);
+      expect(deliveredText).not.toContain('alice');
+      expect(deliveredText).toContain('~');
+      await rt.stop();
+    } finally {
+      vi.useRealTimers();
     }
   });
 

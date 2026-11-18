@@ -1,8 +1,9 @@
 import os from 'node:os';
 import type { SenseState, Signal } from '@asi/sense-types';
-import { classifyCause, type ToolWindow } from '../attention/selfcause.ts';
+import { classifyCause, isUnderDir, type ToolWindow } from '../attention/selfcause.ts';
 import type { RuntimeAttention } from '../runtime/attention.ts';
 import type { AgentEvent, Clock, DshPort, JobEvent, ToolEvent, Unsubscribe } from '../runtime/ports.ts';
+import { initialState } from '../state/facts.ts';
 import { StateStore } from '../state/store.ts';
 
 export type NowReadings = Record<
@@ -41,6 +42,7 @@ export class DshSource {
     private readonly paused: () => boolean,
     private readonly selfCauseGraceMs = 2_000,
     private readonly onAgentDisposed?: (sessionId: string) => void,
+    private readonly platform: string = process.platform,
   ) {}
   start(): void {
     this.active = true;
@@ -142,7 +144,6 @@ export class DshSource {
   }
   stateFor(session: string | undefined, state: SenseState): SenseState {
     const store = session === undefined ? undefined : this.sessions.get(session);
-    const view = store ?? new StateStore(() => this.clock.wall());
     const extended = this.port as DshPort & { nowReadings?: (sessionId?: string) => NowReadings };
     const paths = [
       'self.activity',
@@ -152,7 +153,9 @@ export class DshSource {
       'env.where.toolExec',
       'env.activeJobs',
     ];
+    let own: SenseState;
     if (store || extended.nowReadings) {
+      const view = store ?? new StateStore(() => this.clock.wall());
       let readings: NowReadings = {};
       try {
         readings = extended.nowReadings?.(session) ?? {};
@@ -172,8 +175,10 @@ export class DshSource {
           data: { path, ...reading, ttlMs: 30_000 },
         });
       }
+      own = view.snapshot();
+    } else {
+      own = initialState(this.clock.wall(), 60_000);
     }
-    const own = view.snapshot();
     if (!store) {
       const reason = session === undefined ? '没有活动会话' : '会话不可用';
       for (const fact of [
@@ -214,8 +219,19 @@ export class DshSource {
   classify(signal: Signal): Signal {
     return {
       ...signal,
-      cause: classifyCause(signal, [...this.windows.values()], this.selfCauseGraceMs, this.clock.mono()),
+      cause: classifyCause(signal, [...this.windows.values()], this.selfCauseGraceMs, this.clock.mono(), this.platform),
     };
+  }
+  /** Allocation-light self-cause check for high-rate file events. */
+  classifyFilePath(absPath: string): 'agent' | 'unknown' {
+    if (this.windows.size === 0) return 'unknown';
+    const mono = this.clock.mono();
+    for (const w of this.windows.values()) {
+      if (w.startedMono === undefined || mono < w.startedMono) continue;
+      if (w.endedMono !== undefined && mono >= w.endedMono + this.selfCauseGraceMs) continue;
+      if (w.cwd !== undefined && isUnderDir(w.cwd, absPath, this.platform)) return 'agent';
+    }
+    return 'unknown';
   }
   private async agent(event: AgentEvent): Promise<void> {
     if (event.type === 'created') {

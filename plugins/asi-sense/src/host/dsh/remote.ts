@@ -1,6 +1,7 @@
 import type { Context } from '@deepseek-ai/cordis';
 import { principalOf, Remote, RemoteError, TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol';
 import type { SenseActions } from '../runtime/ports.ts';
+import { normalizeFileExclusion } from '../sources/file-exclusions.ts';
 import type { FramesSource } from './frames.ts';
 import { toWirePanelModel } from './wire.ts';
 import type { WirePanelModel } from './wire-types.ts';
@@ -130,6 +131,57 @@ export class AsiSenseRemote extends TypertRemoteService {
   @Remote
   async retryTuningBackup(): Promise<void> {
     await this.userAction(() => this.actions.retryTuningBackup());
+  }
+
+  private async updateExclusion(
+    pattern: string,
+    action: ((pattern: string) => Promise<void>) | undefined,
+  ): Promise<void> {
+    await this.userAction(async () => {
+      if (typeof pattern !== 'string' || !pattern.trim()) {
+        throw new RemoteError('gateway/bad-request', 'Exclusion pattern is required', {});
+      }
+      if (!action) throw new Error('File exclusion management unavailable');
+      try {
+        normalizeFileExclusion(pattern);
+        await action(pattern);
+      } catch (error) {
+        if (error instanceof RemoteError) throw error;
+        if (error instanceof TypeError || error instanceof RangeError) {
+          throw new RemoteError('gateway/bad-request', error.message, {});
+        }
+        throw error;
+      }
+    });
+  }
+
+  @Remote
+  async setGlobalFileWatch(enabled: boolean): Promise<void> {
+    await this.userAction(() => {
+      if (typeof enabled !== 'boolean') {
+        throw new RemoteError('gateway/bad-request', 'Global file watch toggle must be a boolean', {});
+      }
+      if (!this.actions.setGlobalFileWatch) throw new Error('Global file watch unavailable');
+      return this.actions.setGlobalFileWatch(enabled);
+    });
+  }
+
+  @Remote
+  async retryGlobalFileWatch(): Promise<void> {
+    await this.userAction(() => {
+      if (!this.actions.retryGlobalFileWatch) throw new Error('Global file watch unavailable');
+      return this.actions.retryGlobalFileWatch();
+    });
+  }
+
+  @Remote
+  async addFileExclusion(pattern: string): Promise<void> {
+    await this.updateExclusion(pattern, this.actions.addFileExclusion);
+  }
+
+  @Remote
+  async removeFileExclusion(pattern: string): Promise<void> {
+    await this.updateExclusion(pattern, this.actions.removeFileExclusion);
   }
 
   @Remote

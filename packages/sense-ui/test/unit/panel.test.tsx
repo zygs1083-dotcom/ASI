@@ -735,3 +735,285 @@ describe('余额状态权威', () => {
     expect(screen.getByText(/余额不可用（接口超时）/)).toBeTruthy();
   });
 });
+
+describe('全盘文件监视与活动视图', () => {
+  it('显示运行中/已降级/部分无权限/已关闭状态，支持开关与排除项增删', async () => {
+    const state = makeState();
+    state.env.globalFileWatch = fact({
+      enabled: true,
+      status: 'running',
+      root: '/',
+      windowMs: 10_000,
+      eventsPerSec: 12,
+      degraded: false,
+      countOnly: false,
+      deniedPaths: [],
+      exclusions: ['/System', 'node_modules'],
+    });
+    const onToggleGlobalFileWatch = vi.fn();
+    const onAddFileExclusion = vi.fn().mockResolvedValue(undefined);
+    const onRemoveFileExclusion = vi.fn().mockResolvedValue(undefined);
+    const first = renderPanel(
+      { ...makeScenario('healthy'), state },
+      { onToggleGlobalFileWatch, onAddFileExclusion, onRemoveFileExclusion },
+    );
+
+    expect(screen.getByText('全盘文件监视')).toBeTruthy();
+    expect(screen.getByText('运行中')).toBeTruthy();
+    const toggle = screen.getByLabelText('全盘文件监视');
+    fireEvent.click(toggle);
+    expect(onToggleGlobalFileWatch).toHaveBeenCalledWith(false);
+
+    fireEvent.click(screen.getByText('排除项 2 条'));
+    fireEvent.change(screen.getByLabelText('新增排除路径或模式'), { target: { value: '~/CustomCache' } });
+    fireEvent.click(screen.getByRole('button', { name: '添加' }));
+    await waitFor(() => expect(onAddFileExclusion).toHaveBeenCalledWith('~/CustomCache'));
+
+    fireEvent.click(screen.getByRole('button', { name: '移除排除项 node_modules' }));
+    await waitFor(() => expect(onRemoveFileExclusion).toHaveBeenCalledWith('node_modules'));
+    first.view.unmount();
+
+    const degState = makeState();
+    degState.env.globalFileWatch = fact({
+      enabled: true,
+      status: 'degraded',
+      root: '/',
+      windowMs: 60_000,
+      eventsPerSec: 2500,
+      degraded: true,
+      countOnly: true,
+      deniedPaths: [],
+      exclusions: ['/System'],
+    });
+    const degView = renderPanel({ ...makeScenario('healthy'), state: degState });
+    expect(screen.getByText(/已降级/)).toBeTruthy();
+    degView.view.unmount();
+
+    const partialState = makeState();
+    partialState.env.globalFileWatch = fact({
+      enabled: true,
+      status: 'partial-denied',
+      root: '/',
+      windowMs: 10_000,
+      eventsPerSec: 0,
+      degraded: false,
+      countOnly: false,
+      deniedPaths: ['/Library/Mail'],
+      exclusions: ['/System'],
+    });
+    const partialView = renderPanel({ ...makeScenario('healthy'), state: partialState });
+    expect(screen.getByText(/部分无权限/)).toBeTruthy();
+    partialView.view.unmount();
+
+    const disabledState = makeState();
+    disabledState.env.globalFileWatch = fact({
+      enabled: false,
+      status: 'disabled',
+      root: '/',
+      windowMs: 10_000,
+      eventsPerSec: 0,
+      degraded: false,
+      countOnly: false,
+      deniedPaths: [],
+      exclusions: [],
+    });
+    renderPanel({ ...makeScenario('healthy'), state: disabledState });
+    expect(screen.getByText('已关闭')).toBeTruthy();
+  });
+
+  it('在事件流渲染 file.activity 细节并在规则区显示 file-activity 说明', () => {
+    const base = makeScenario('healthy');
+    const model: SensePanelModel = {
+      ...base,
+      events: [
+        {
+          signal: {
+            id: 'fa-1',
+            kind: 'file.activity',
+            at: T0 - 2_000,
+            source: { id: 'files-global', api: 'watch', host: 'local' },
+            subject: '/demo/project/src',
+            data: {},
+            cause: 'unknown',
+          },
+          level: 'record',
+          reason: 'file-activity',
+          cause: 'unknown',
+          detail: {
+            kind: 'file.activity',
+            directory: '/demo/project/src',
+            windowMs: 10_000,
+            created: 1,
+            modified: 2,
+            deleted: 0,
+            files: ['a.ts', 'b.ts'],
+          },
+        },
+      ],
+      rules: [
+        ...base.rules,
+        {
+          id: 'file-activity',
+          name: 'file-activity',
+          enabled: true,
+          confirmed: true,
+          match: { kind: 'file.activity' },
+          level: 'record',
+          createdBy: 'user',
+        },
+      ],
+    };
+    renderPanel(model);
+    expect(screen.getByText(/新增 1 · 修改 2 · 删除 0 · 文件：a\.ts、b\.ts/)).toBeTruthy();
+    expect(screen.getByText(/全盘按目录与时间窗聚合的文件活动/)).toBeTruthy();
+  });
+
+  it('unsupported 时禁选关闭全盘开关，显示含上卷计数与已上卷爆发，并在排除项校验失败时展示错误', async () => {
+    const base = makeScenario('healthy');
+    const unsupportedState = makeState();
+    unsupportedState.env.globalFileWatch = {
+      value: {
+        enabled: true,
+        status: 'unsupported',
+        reason: '当前平台不支持全盘 FSEvents 监视',
+        root: '/',
+        windowMs: 10_000,
+        eventsPerSec: 0,
+        degraded: false,
+        countOnly: false,
+        deniedPaths: [],
+        exclusions: ['node_modules'],
+      },
+      status: 'unsupported',
+      reason: '当前平台不支持全盘 FSEvents 监视',
+      observedAt: T0,
+      ttlMs: 60_000,
+      source: { id: 'files-global', api: 'watch', host: 'local' },
+    };
+    const onAddFileExclusion = vi.fn().mockRejectedValue(new Error('仅支持绝对路径、~/ 路径或单段目录名'));
+    renderPanel(
+      {
+        ...base,
+        state: unsupportedState,
+        events: [
+          {
+            signal: {
+              id: 'fa-roll',
+              kind: 'file.activity',
+              at: T0 - 1_000,
+              source: { id: 'files-global', api: 'watch', host: 'local' },
+              subject: '/demo/mono',
+              data: {},
+              cause: 'unknown',
+            },
+            level: 'record',
+            reason: 'file-activity',
+            cause: 'unknown',
+            detail: {
+              kind: 'file.activity',
+              directory: '/demo/mono',
+              windowMs: 10_000,
+              created: 3,
+              modified: 1,
+              deleted: 0,
+              rolledUp: 4,
+              files: ['report, final.pdf'],
+            },
+          },
+          {
+            signal: {
+              id: 'fb-roll',
+              kind: 'file.burst',
+              at: T0 - 500,
+              source: { id: 'files-global', api: 'watch', host: 'local' },
+              subject: '/demo/mono',
+              data: {},
+              cause: 'unknown',
+            },
+            level: 'wake',
+            reason: 'file-burst',
+            cause: 'unknown',
+            detail: {
+              kind: 'file.burst',
+              directory: '/demo/mono',
+              windowMs: 10_000,
+              created: 20,
+              modified: 5,
+              deleted: 0,
+              excessiveDeletion: false,
+              rolledUp: true,
+            },
+          },
+        ],
+      },
+      { onAddFileExclusion },
+    );
+
+    const checkbox = screen.getByLabelText('全盘文件监视') as HTMLInputElement;
+    expect(checkbox.checked).toBe(false);
+    expect(checkbox.disabled).toBe(true);
+    expect(screen.getAllByText(/不支持/).length).toBeGreaterThanOrEqual(1);
+    expect(screen.queryByRole('button', { name: '重试' })).toBeNull();
+    expect(screen.getByText(/含上卷 4 条/)).toBeTruthy();
+    expect(screen.getByText(/report, final\.pdf/)).toBeTruthy();
+    expect(screen.getByText(/已上卷/)).toBeTruthy();
+
+    fireEvent.click(screen.getByText('排除项 1 条'));
+    fireEvent.change(screen.getByLabelText('新增排除路径或模式'), { target: { value: './rel' } });
+    fireEvent.click(screen.getByRole('button', { name: '添加' }));
+    await waitFor(() => expect(screen.getByText('仅支持绝对路径、~/ 路径或单段目录名')).toBeTruthy());
+  });
+
+  it('unavailable 时展示原因与自动重试倒计时，允许开关与立即重试并呈现失败提示', async () => {
+    const base = makeScenario('healthy');
+    const unavailableState = makeState();
+    unavailableState.env.globalFileWatch = {
+      value: {
+        enabled: true,
+        status: 'unavailable',
+        reason: 'FSEvents 启动失败',
+        retryAt: T0 + 30_000,
+        root: '/',
+        windowMs: 10_000,
+        eventsPerSec: 0,
+        degraded: false,
+        countOnly: false,
+        deniedPaths: [],
+        exclusions: [],
+      },
+      status: 'unavailable',
+      reason: 'FSEvents 启动失败',
+      observedAt: T0,
+      ttlMs: 60_000,
+      source: { id: 'files-global', api: 'watch', host: 'local' },
+    };
+
+    const onToggleGlobalFileWatch = vi.fn();
+    let rejectRetry: (err: Error) => void = () => {};
+    const onRetryGlobalFileWatch = vi.fn(
+      () =>
+        new Promise<void>((_resolve, reject) => {
+          rejectRetry = reject;
+        }),
+    );
+
+    renderPanel({ ...base, now: T0, state: unavailableState }, { onToggleGlobalFileWatch, onRetryGlobalFileWatch });
+
+    const checkbox = screen.getByLabelText('全盘文件监视') as HTMLInputElement;
+    expect(checkbox.checked).toBe(true);
+    expect(checkbox.disabled).toBe(false);
+    expect(screen.getByText(/不可用（FSEvents 启动失败） · 30 秒后自动重试/)).toBeTruthy();
+
+    fireEvent.click(checkbox);
+    expect(onToggleGlobalFileWatch).toHaveBeenCalledWith(false);
+
+    const retryBtn = screen.getByRole('button', { name: '重试' }) as HTMLButtonElement;
+    fireEvent.click(retryBtn);
+    expect(onRetryGlobalFileWatch).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole('button', { name: '重试中' }).hasAttribute('disabled')).toBe(true);
+
+    rejectRetry(new Error('重试仍失败'));
+    await waitFor(() => expect(screen.getByRole('alert').textContent).toBe('重试仍失败'));
+    expect(screen.getByRole('button', { name: '重试' })).toBeTruthy();
+  });
+});

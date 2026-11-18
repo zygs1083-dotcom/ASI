@@ -22,18 +22,53 @@ const CAUSAL_KINDS: ReadonlySet<string> = new Set([
   'process.exited',
 ]);
 
+const ALIAS_PREFIXES: readonly [string, string][] = [
+  ['/var', '/private/var'],
+  ['/tmp', '/private/tmp'],
+  ['/etc', '/private/etc'],
+];
+
 function signalPath(signal: Signal): string | undefined {
   if (typeof signal.data.path === 'string' && signal.data.path.length > 0) return signal.data.path;
   if (signal.kind === 'file.changed' && signal.subject.length > 0) return signal.subject;
   return undefined;
 }
 
-function underDir(cwd: string, p: string): boolean {
+function normalizeForPlatform(absPath: string, platform: string): string {
+  const nfc = path.resolve(absPath).normalize('NFC');
+  return platform === 'darwin' ? nfc.toLowerCase() : nfc;
+}
+
+function underNormalized(base: string, target: string): boolean {
+  const rel = path.relative(base, target);
+  return rel === '' || (rel !== '..' && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel));
+}
+
+function aliasVariants(normPath: string): string[] {
+  const out = [normPath];
+  for (const [short, priv] of ALIAS_PREFIXES) {
+    if (normPath === short || normPath.startsWith(`${short}/`)) {
+      out.push(`${priv}${normPath.slice(short.length)}`);
+    } else if (normPath === priv || normPath.startsWith(`${priv}/`)) {
+      out.push(`${short}${normPath.slice(priv.length)}`);
+    }
+  }
+  return out;
+}
+
+export function isUnderDir(cwd: string, p: string, platform: string = process.platform): boolean {
   // Both paths must be absolute: a relative signal path is never resolved
   // against the process cwd (that is not part of the source contract).
   if (!path.isAbsolute(cwd) || !path.isAbsolute(p)) return false;
-  const rel = path.relative(path.resolve(cwd), path.resolve(p));
-  return rel === '' || (rel !== '..' && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel));
+  const normCwd = normalizeForPlatform(cwd, platform);
+  const normP = normalizeForPlatform(p, platform);
+  if (underNormalized(normCwd, normP)) return true;
+  if (platform === 'darwin') {
+    for (const c of aliasVariants(normCwd)) {
+      if (underNormalized(c, normP)) return true;
+    }
+  }
+  return false;
 }
 
 /**
@@ -64,6 +99,7 @@ export function classifyCause(
   toolWindows: readonly ToolWindow[] = [],
   graceMs = 0,
   receivedMono?: number,
+  platform: string = process.platform,
 ): SignalCause {
   if (signal.cause === 'agent') return 'agent';
   const base = signal.cause ?? 'unknown';
@@ -80,11 +116,11 @@ export function classifyCause(
       } else if (receivedMono > w.endedMono) continue;
     }
     if (signal.kind === 'file.changed') {
-      if (w.cwd !== undefined && p !== undefined && underDir(w.cwd, p)) return 'agent';
+      if (w.cwd !== undefined && p !== undefined && isUnderDir(w.cwd, p, platform)) return 'agent';
       continue;
     }
     if (w.pid !== undefined && relatedToShell(signal, w.pid)) return 'agent';
-    if (w.cwd !== undefined && p !== undefined && underDir(w.cwd, p)) return 'agent';
+    if (w.cwd !== undefined && p !== undefined && isUnderDir(w.cwd, p, platform)) return 'agent';
   }
   return base;
 }

@@ -119,6 +119,7 @@ function harness(
         approved: true,
       },
     ],
+    globalFileWatch: { disableInTests: true },
     ...options,
   });
   return {
@@ -4175,5 +4176,58 @@ describe('host runtime', () => {
     await h.agent({ type: 'pre-step', sessionId: 's' });
     expect(attempts[1]).toEqual(attempts[0]);
     await h.runtime.stop();
+  });
+
+  it('persists globalFileWatch toggle and exclusions across runtime restarts when enabled', async () => {
+    let saved: string | undefined;
+    let watchOpens = 0;
+    let watchCloses = 0;
+    const h1 = harness(undefined, {
+      platform: 'darwin',
+      globalFileWatch: { homedir: '/Users/demo' },
+    });
+    h1.ports.storage.load = async (key) => (key === 'settings' ? saved : undefined);
+    h1.ports.storage.save = async (key, json) => {
+      if (key === 'settings') saved = json;
+    };
+    h1.ports.files.watch = () => {
+      watchOpens++;
+      return {
+        close: () => {
+          watchCloses++;
+        },
+      };
+    };
+
+    await h1.runtime.start();
+    // 1 watcher for legacy files-wake rule (/workspace/**) + 1 watcher for files-global (/)
+    expect(watchOpens).toBe(2);
+    expect(h1.runtime.state().env.globalFileWatch?.value?.status).toBe('running');
+
+    await h1.runtime.actions.addFileExclusion?.('~/PrivateTmp');
+    expect(h1.runtime.state().env.globalFileWatch?.value?.exclusions).toContain('~/PrivateTmp');
+    await h1.runtime.actions.removeFileExclusion?.('~/PrivateTmp');
+    expect(h1.runtime.state().env.globalFileWatch?.value?.exclusions).not.toContain('~/PrivateTmp');
+    await h1.runtime.actions.addFileExclusion?.('/custom/cache');
+    await h1.runtime.actions.setGlobalFileWatch?.(false);
+    expect(watchCloses).toBe(1);
+    expect(h1.runtime.state().env.globalFileWatch?.value?.status).toBe('disabled');
+    await h1.runtime.stop();
+
+    const h2 = harness(saved, {
+      platform: 'darwin',
+      globalFileWatch: { homedir: '/Users/demo' },
+    });
+    h2.ports.storage.load = async (key) => (key === 'settings' ? saved : undefined);
+    h2.ports.files.watch = () => {
+      watchOpens++;
+      return { close: () => {} };
+    };
+    await h2.runtime.start();
+    // Only legacy files-wake rule watcher opens on restart; files-global stays disabled
+    expect(watchOpens).toBe(3);
+    expect(h2.runtime.state().env.globalFileWatch?.value?.enabled).toBe(false);
+    expect(h2.runtime.state().env.globalFileWatch?.value?.exclusions).toContain('/custom/cache');
+    await h2.runtime.stop();
   });
 });

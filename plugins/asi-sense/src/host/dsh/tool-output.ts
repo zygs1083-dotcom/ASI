@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import os from 'node:os';
 import type { Fact, SenseState, WatchRule } from '@asi/sense-types';
 import { isRemoteJsonValue } from '@deepseek-ai/dsh-typert-protocol';
+import { isHomeRootShape, toHomeRelative } from '../attention/path.ts';
 import type { createSenseRuntime } from '../runtime/index.ts';
 import type { JsonValue } from './wire-types.ts';
 
@@ -1660,6 +1661,31 @@ export function modelTitle(value: string, hostname = os.hostname()): string {
   return projectModelString(value, hostname, MAX_TITLE_LENGTH, true);
 }
 
+const MAX_ACTIVITY_NAME = 512;
+
+function truncateName(value: string, limit = MAX_ACTIVITY_NAME): string {
+  if (value.length <= limit) return value;
+  const max = Math.max(0, limit - 3);
+  let end = 0;
+  for (const ch of value) {
+    if (end + ch.length > max) break;
+    end += ch.length;
+  }
+  return `${value.slice(0, end)}...`;
+}
+
+export function modelActivityName(raw: string, maskHomeRoot = false): string {
+  // Stored summaries already contain the '~' placeholder; keep it instead of re-redacting it to [path].
+  if (raw === '~') return '~';
+  // Paths at or below a home alias collapse to `~`/`~/…` before the basename projection, so a
+  // custom `globalFileWatch.homedir` is masked exactly like `os.homedir()`.
+  const relative = maskHomeRoot ? toHomeRelative(raw) : undefined;
+  if (relative === '~' || (maskHomeRoot && isHomeRootShape(raw))) return '~';
+  const base = modelPath(relative ?? raw);
+  const masked = modelTitle(truncateName(base));
+  return masked.trim() ? masked : '[file]';
+}
+
 function minimize(
   value: JsonValue,
   hostname: string,
@@ -1869,7 +1895,7 @@ export function modelState(state: SenseState, now: number, section?: 'self' | 'e
         disks: fact(body.disks, (value) =>
           value.map((disk) => ({
             ...pick(disk, ['total', 'free', 'status', 'observedAt', 'ttlMs']),
-            mount: modelPath(disk.mount),
+            mount: modelActivityName(disk.mount, true),
           })),
         ),
         battery: fact(body.battery, (value) =>
@@ -1892,7 +1918,7 @@ export function modelState(state: SenseState, now: number, section?: 'self' | 'e
         model: fact(env.where.model, (value) => ({ provider: identifier(value.provider), local: value.local })),
         harness: fact(env.where.harness, (value) => ({ os: modelLabel(value.os) })),
         observed: fact(env.where.observed, () => ({})),
-        toolExec: fact(env.where.toolExec, (value) => ({ cwd: modelPath(value.cwd) })),
+        toolExec: fact(env.where.toolExec, (value) => ({ cwd: modelActivityName(value.cwd, true) })),
       },
       frontApp: fact(env.frontApp, (value) => ({ name: modelAppName(value.name) })),
       focusedWindow: fact(env.focusedWindow, (value) => ({ title: value.title })),
@@ -1900,8 +1926,26 @@ export function modelState(state: SenseState, now: number, section?: 'self' | 'e
         value.map((job) => ({ ...pick(job, ['startedAt', 'status', 'exitCode']), id: identifier(job.id) })),
       ),
       watchedPaths: fact(env.watchedPaths, (value) =>
-        dictionary(value, modelPath, (item) => pick(item, ['lastChange', 'changes'])),
+        dictionary(
+          value,
+          (key) => modelActivityName(key, true),
+          (item) => pick(item, ['lastChange', 'changes']),
+        ),
       ),
+      ...(env.globalFileWatch
+        ? {
+            globalFileWatch: fact(env.globalFileWatch, (value) => ({
+              enabled: value.enabled,
+              status: value.status,
+              windowMs: value.windowMs,
+              eventsPerSec: value.eventsPerSec,
+              degraded: value.degraded,
+              countOnly: value.countOnly,
+              deniedCount: value.deniedPaths.length,
+              exclusionCount: value.exclusions.length,
+            })),
+          }
+        : {}),
     },
     observation: observations(state.observation),
   };
@@ -1921,8 +1965,10 @@ export function modelRules(rules: WatchRule[]): JsonValue {
     'window.focused',
     'window.title-changed',
     'file.changed',
+    'file.activity',
     'job.started',
     'job.exited',
+    'process.started',
     'process.exited',
     'source.status',
     'source.error',
@@ -1931,6 +1977,7 @@ export function modelRules(rules: WatchRule[]): JsonValue {
     'body.anomaly',
     'file.burst',
     'fact.updated',
+    'delivery.target-unavailable',
   ]);
   return modelOutput(
     rules.map((rule) => {
@@ -1957,15 +2004,19 @@ export function modelRules(rules: WatchRule[]): JsonValue {
         id: identifier(rule.id),
         match: {
           kind: kinds.has(rule.match.kind) ? rule.match.kind : '[redacted]',
-          ...(rule.match.kind === 'file.changed' && rule.match.subject !== undefined
-            ? { subject: modelPath(rule.match.subject) }
+          ...((rule.match.kind === 'file.changed' ||
+            rule.match.kind === 'file.activity' ||
+            rule.match.kind === 'file.burst') &&
+          rule.match.subject !== undefined
+            ? { subject: modelActivityName(rule.match.subject, true) }
             : {}),
           ...(Object.keys(where).length ? { where } : {}),
         },
       };
     }),
     undefined,
-    ['match.kind'],
+    // `match.subject` is already masked by `modelActivityName`, so keep its `~` placeholder verbatim.
+    ['match.kind', 'match.subject'],
   );
 }
 

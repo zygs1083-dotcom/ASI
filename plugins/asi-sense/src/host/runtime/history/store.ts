@@ -48,7 +48,7 @@ export interface HistoryEventInput {
   at: number;
   restarts?: number;
   source: SourceRef;
-  detail?: Record<string, string | number | boolean>;
+  detail?: Record<string, string | number | boolean | string[]>;
   currentEta?: { asOf: number; ratePerMinute: number; timeToThresholdMs?: number };
   feedback?: 'useful' | 'noise';
   feedbackAvailable?: boolean;
@@ -289,7 +289,13 @@ export class HistoryManager {
       ...(entry.ruleId !== undefined ? { ruleId: entry.ruleId } : {}),
       ...(entry.cause !== undefined ? { cause: entry.cause } : {}),
       ...(entry.restarts !== undefined ? { restarts: entry.restarts } : {}),
-      ...(entry.detail !== undefined ? { detail: { ...entry.detail } } : {}),
+      ...(entry.detail !== undefined
+        ? {
+            detail: Object.fromEntries(
+              Object.entries(entry.detail).map(([key, val]) => [key, Array.isArray(val) ? [...val] : val]),
+            ),
+          }
+        : {}),
       ...(entry.currentEta !== undefined ? { currentEta: { ...entry.currentEta } } : {}),
       ...(entry.feedback !== undefined ? { feedback: entry.feedback } : {}),
       ...(entry.feedbackAvailable !== undefined ? { feedbackAvailable: entry.feedbackAvailable } : {}),

@@ -136,3 +136,56 @@ it('redacts old and new window events when title sharing is disabled', async () 
   titles = false;
   expect(JSON.stringify(attention.events())).not.toContain('synthetic-title');
 });
+
+it('preserves file.activity filenames containing comma-space and rolledUp across eventDetail and projectEvents', async () => {
+  const attention = new RuntimeAttention(
+    { wall: () => 1_700_000_000_000, mono: () => 500 },
+    {
+      deliver: async () => {},
+      onAgentEvent: () => () => {},
+      onTool: () => () => {},
+      onJob: () => () => {},
+      tokenSnapshot: async () => undefined,
+    },
+    () => [
+      { id: 'file-activity', match: { kind: 'file.activity' }, level: 'record', createdBy: 'user', approved: true },
+    ],
+    () => {},
+    () => true,
+    vi.fn(),
+    new FactExpiry({ mono: () => 500 }),
+  );
+  await attention.accept({
+    id: 'fa-comma',
+    kind: 'file.activity',
+    subject: '/work/docs',
+    at: 1_700_000_000_000,
+    cause: 'unknown',
+    source: { id: 'files-global', api: 'watch', host: 'local' },
+    data: {
+      directory: '/work/docs',
+      windowMs: 10_000,
+      created: 2,
+      modified: 0,
+      deleted: 0,
+      rolledUp: 3,
+      files: ['report, final.pdf', 'notes.md'],
+    },
+  });
+  const [entry] = attention.events();
+  expect(entry?.detail?.files).toEqual(['report, final.pdf', 'notes.md']);
+  expect(entry?.detail?.rolledUp).toBe(3);
+
+  const [projected] = projectEvents(
+    [entry!],
+    true,
+    (mono) => 1_700_000_000_000 + mono,
+    (wall) => wall,
+  );
+  expect(projected?.detail).toMatchObject({
+    kind: 'file.activity',
+    files: ['report, final.pdf', 'notes.md'],
+    rolledUp: 3,
+  });
+  await attention.stop();
+});

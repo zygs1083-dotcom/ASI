@@ -11,6 +11,10 @@ type Api = Pick<
   | 'deleteRule'
   | 'pause'
   | 'setSendTitles'
+  | 'setGlobalFileWatch'
+  | 'retryGlobalFileWatch'
+  | 'addFileExclusion'
+  | 'removeFileExclusion'
   | 'openPermissionSettings'
   | 'revertTuning'
   | 'lockParam'
@@ -46,6 +50,15 @@ export function createActions(api: Api) {
       if (!result.ok) throw result.error;
     } catch (error) {
       if (error instanceof Error && error.message.trim()) throw error;
+      if (
+        error &&
+        typeof error === 'object' &&
+        'message' in error &&
+        typeof error.message === 'string' &&
+        error.message.trim()
+      ) {
+        throw new Error(error.message);
+      }
       const message = typeof error === 'string' ? error.trim() : '';
       throw new Error(message || '操作失败，请重试。');
     }
@@ -58,6 +71,10 @@ export function createActions(api: Api) {
     onDeleteRule: (id) => fire(api.deleteRule(id)),
     onPause: (paused) => fire(api.pause(paused)),
     onToggleTitles: (enabled) => fire(api.setSendTitles(enabled)),
+    onToggleGlobalFileWatch: (enabled) => fire(api.setGlobalFileWatch(enabled)),
+    onRetryGlobalFileWatch: () => complete(() => api.retryGlobalFileWatch()),
+    onAddFileExclusion: (pattern) => complete(() => api.addFileExclusion(pattern)),
+    onRemoveFileExclusion: (pattern) => complete(() => api.removeFileExclusion(pattern)),
     onOpenPermissionSettings: () => fire(api.openPermissionSettings()),
     onRevertTuning: (id) => fire(api.revertTuning(id)),
     onLockParam: (param, locked) => fire(api.lockParam(param, locked)),

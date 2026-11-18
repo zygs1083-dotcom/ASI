@@ -1,3 +1,6 @@
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import type { EnvUpdate } from '@asi/sense-types';
 import { describe, expect, it, vi } from 'vitest';
 import type { DeliveryIntent } from '../../src/host/attention/pipeline.ts';
@@ -574,5 +577,215 @@ describe('DSH environment delivery', () => {
     expect(text).toContain('file.burst: fallback-dir deleted=12');
     expect(text).toContain('file.burst: blank-dir deleted=8');
     expect(text).not.toContain('/synthetic/');
+  });
+
+  it('sanitizes file.activity directory and file names through modelPath', async () => {
+    const { agent, deliver } = fixture();
+    await deliver('session-a', {
+      ...intent('followup', 'file-activity-sanitized'),
+      update: {
+        ...update,
+        changes: [
+          {
+            count: 1,
+            level: 'record',
+            signal: {
+              id: 'fa-sec',
+              kind: 'file.activity',
+              at: update.at,
+              source: { id: 'files-global', api: 'watch', host: 'local' },
+              subject: '/private/secret-user/workspace/src',
+              data: {
+                directory: '/private/secret-user/workspace/src',
+                windowMs: 10_000,
+                created: 1,
+                modified: 2,
+                deleted: 0,
+                files: ['/private/secret-user/workspace/src/app.ts', 'readme.md'],
+              },
+            },
+          },
+        ],
+      },
+    });
+    const text = JSON.stringify(agent.followup.mock.calls);
+    expect(text).toContain('file.activity: src');
+    expect(text).toContain('files=[app.ts, readme.md]');
+    expect(text).not.toContain('/private/');
+    expect(text).not.toContain('secret-user');
+  });
+
+  it('redacts file.activity emails, ips, usernames, overlong names, and empty token fallbacks without clearing files', async () => {
+    const { agent, deliver } = fixture();
+    const longName = `${'A'.repeat(600)}.log`;
+    await deliver('session-a', {
+      ...intent('followup', 'file-activity-privacy'),
+      update: {
+        ...update,
+        changes: [
+          {
+            count: 1,
+            level: 'record',
+            signal: {
+              id: 'fa-priv',
+              kind: 'file.activity',
+              at: update.at,
+              source: { id: 'files-global', api: 'watch', host: 'local' },
+              subject: '/Users/alice',
+              data: {
+                directory: '/Users/alice',
+                windowMs: 10_000,
+                created: 1,
+                modified: 2,
+                deleted: 1,
+                rolledUp: 4,
+                files: [
+                  '/Users/alice/alice@example.com-dump.log',
+                  '192.168.10.20.log',
+                  longName,
+                  'mailto:bob@example.com',
+                  '/   ',
+                ],
+              },
+            },
+          },
+          {
+            count: 1,
+            level: 'record',
+            signal: {
+              id: 'fa-home2',
+              kind: 'file.activity',
+              at: update.at + 1,
+              source: { id: 'files-global', api: 'watch', host: 'local' },
+              subject: '/home/bob-dev',
+              data: {
+                directory: '/home/bob-dev',
+                windowMs: 10_000,
+                created: 1,
+                modified: 0,
+                deleted: 0,
+                files: ['fe80::1ff:fe23:4567:890a.log'],
+              },
+            },
+          },
+        ],
+      },
+    });
+    const text = JSON.stringify(agent.followup.mock.calls);
+    expect(text).toContain('file.activity: ~ windowMs=10000');
+    expect(text).toContain('rolledUp=4');
+    // Whitelist redaction maps blank/empty path tokens to [path]; the old [file] fallback no longer fires.
+    expect(text).toContain('[path]');
+    expect(text).not.toContain('alice');
+    expect(text).not.toContain('bob-dev');
+    expect(text).not.toContain('alice@example.com');
+    expect(text).not.toContain('bob@example.com');
+    expect(text).not.toContain('192.168.10.20');
+    expect(text).not.toContain('fe80::1ff:fe23:4567:890a');
+    expect(text).not.toContain('files=[]');
+    // Overlong names now collapse to [path] instead of a truncated prefix, so no name fragment leaks.
+    expect(text).not.toContain('AAAAAAAAAA');
+  });
+
+  it('redacts usernames, emails, and IP:port from file.burst and file.changed before delivery', async () => {
+    const { deliver, agent } = fixture();
+    await deliver('session-a', {
+      kind: 'followup',
+      sessionId: 'session-a',
+      deliveryId: 'file-burst-redact',
+      update: {
+        since: update.since,
+        at: update.at,
+        suppressed: 0,
+        changes: [
+          {
+            count: 1,
+            level: 'wake',
+            signal: {
+              id: 'fb-p1',
+              kind: 'file.burst',
+              at: update.at,
+              source: { id: 'files-global', api: 'watch', host: 'local' },
+              subject: 'alice@corp.com-192.168.1.50:5432',
+              data: {
+                directory: '/Users/alice/alice@corp.com-192.168.1.50:5432',
+                windowMs: 60_000,
+                created: 1,
+                modified: 2,
+                deleted: 120,
+                rolledUp: true,
+              },
+            },
+          },
+          {
+            count: 1,
+            level: 'context',
+            signal: {
+              id: 'fc-p1',
+              kind: 'file.changed',
+              at: update.at + 1,
+              source: { id: 'files', api: 'watch', host: 'local' },
+              subject: '/home/bob-dev/alice@corp.com-192.168.1.50:5432/secret.log',
+              data: {
+                path: '/home/bob-dev/alice@corp.com-192.168.1.50:5432/secret.log',
+                change: 'delete',
+              },
+            },
+          },
+          {
+            count: 1,
+            level: 'wake',
+            signal: {
+              id: 'fb-home',
+              kind: 'file.burst',
+              at: update.at + 2,
+              source: { id: 'files-global', api: 'watch', host: 'local' },
+              subject: '/Users/alice',
+              data: { directory: '/Users/alice', windowMs: 10_000, deleted: 5 },
+            },
+          },
+        ],
+      },
+    });
+    const text = JSON.stringify(agent.followup.mock.calls);
+    expect(text).toContain('rolledUp=true');
+    expect(text).not.toContain('alice');
+    expect(text).not.toContain('bob-dev');
+    expect(text).not.toContain('alice@corp.com');
+    expect(text).not.toContain('192.168.1.50');
+    expect(text).not.toContain('5432');
+  });
+
+  it('architecture: routes every file.* subject in deliver.ts through modelActivityName', () => {
+    const here = path.dirname(fileURLToPath(import.meta.url));
+    const src = readFileSync(path.resolve(here, '../../src/host/dsh/deliver.ts'), 'utf8');
+    const fnStart = src.indexOf('function modelUpdate(');
+    const fnEnd = src.indexOf('export function createDelivery(');
+    expect(fnStart).toBeGreaterThan(-1);
+    expect(fnEnd).toBeGreaterThan(fnStart);
+    const body = src.slice(fnStart, fnEnd);
+
+    for (const kind of ['file.changed', 'file.burst', 'file.activity'] as const) {
+      expect(body).toContain(kind);
+    }
+
+    const changedIdx = body.indexOf("signal.kind === 'file.changed'");
+    const burstIdx = body.indexOf("signal.kind === 'file.burst'");
+    const activityIdx = body.indexOf("signal.kind === 'file.activity'");
+    expect(changedIdx).toBeGreaterThan(-1);
+    expect(burstIdx).toBeGreaterThan(-1);
+    expect(activityIdx).toBeGreaterThan(-1);
+
+    const changedBlock = body.slice(changedIdx, body.indexOf('} else if', changedIdx));
+    expect(changedBlock).toContain('subject = maskedPath');
+    expect(changedBlock).toContain('modelActivityName(');
+
+    const burstBlock = body.slice(burstIdx, body.indexOf('} else {', burstIdx));
+    expect(burstBlock).toContain('subject = maskedDir');
+    expect(burstBlock).toContain('modelActivityName(');
+
+    const activityBlock = body.slice(activityIdx, body.indexOf('const summary =', activityIdx));
+    expect(activityBlock).toContain('subject = maskedDir');
+    expect(activityBlock).toContain('modelActivityName(');
   });
 });

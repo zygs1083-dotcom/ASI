@@ -85,6 +85,14 @@ export function observableActions(actions: SenseActions, changed: () => void): S
     deleteRule: (id) => publish(actions.deleteRule(id)),
     pause: (value) => publish(actions.pause(value)),
     setSendTitles: (value) => publish(actions.setSendTitles(value)),
+    setGlobalFileWatch: (value) =>
+      publish(actions.setGlobalFileWatch?.(value) ?? Promise.reject(new Error('globalFileWatch unavailable'))),
+    retryGlobalFileWatch: () =>
+      publish(actions.retryGlobalFileWatch?.() ?? Promise.reject(new Error('globalFileWatch unavailable'))),
+    addFileExclusion: (pattern) =>
+      publish(actions.addFileExclusion?.(pattern) ?? Promise.reject(new Error('addFileExclusion unavailable'))),
+    removeFileExclusion: (pattern) =>
+      publish(actions.removeFileExclusion?.(pattern) ?? Promise.reject(new Error('removeFileExclusion unavailable'))),
     openPermissionSettings: () => publish(actions.openPermissionSettings()),
     revertTuning: (id) => publish(actions.revertTuning(id)),
     lockParam: (param, locked) => publish(actions.lockParam(param, locked)),

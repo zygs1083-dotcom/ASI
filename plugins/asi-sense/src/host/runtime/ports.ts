@@ -102,6 +102,9 @@ export interface FileChange {
   path: string;
   change: 'add' | 'modify' | 'delete';
   at?: number;
+  watchError?: boolean;
+  errorCode?: string;
+  errorPath?: string;
 }
 export interface FileWatcher {
   /**
@@ -125,6 +128,20 @@ export interface SensePorts {
   clock: Clock;
   history?: HistoryStoragePort;
 }
+export interface GlobalFileWatchOptions {
+  root?: string;
+  windowMs?: number;
+  dataDirs?: readonly string[];
+  homedir?: string;
+  budgetPerSec?: number;
+  budgetSustainMs?: number;
+  degradedWindowMs?: number;
+  recoveryWindowMs?: number;
+  allowNonDarwinRoot?: boolean;
+  disableInTests?: boolean;
+  protectedDirs?: readonly string[];
+  probeAccess?: (dir: string) => boolean | undefined;
+}
 export interface SenseOptions {
   platform?: string;
   helperPath?: string;
@@ -132,6 +149,7 @@ export interface SenseOptions {
   rules?: WatchRule[];
   selfCauseGraceMs?: number;
   targetStorageKey?: string;
+  globalFileWatch?: GlobalFileWatchOptions;
   timeZone?: string;
 }
 export interface SenseActions {
@@ -142,6 +160,10 @@ export interface SenseActions {
   deleteRule(id: string): Promise<void>;
   pause(paused: boolean): Promise<void>;
   setSendTitles(enabled: boolean): Promise<void>;
+  setGlobalFileWatch?(enabled: boolean): Promise<void>;
+  retryGlobalFileWatch?(): Promise<void>;
+  addFileExclusion?(pattern: string): Promise<void>;
+  removeFileExclusion?(pattern: string): Promise<void>;
   openPermissionSettings(): Promise<void>;
   revertTuning(id: string): Promise<unknown>;
   lockParam(param: string, locked: boolean): Promise<unknown>;

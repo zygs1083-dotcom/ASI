@@ -352,4 +352,74 @@ describe('formatEnvUpdate', () => {
     expect(out).toContain('file.burst: array-fallback deleted=20');
     expect(out).toContain('file.burst: [path] deleted=30');
   });
+
+  it('formats file.activity with counts, capped filenames, and degraded flag safely', () => {
+    const out = formatEnvUpdate(
+      update([
+        change({
+          signal: sig({
+            id: 'fa-ok',
+            kind: 'file.activity',
+            at: T0,
+            subject: 'proj',
+            data: {
+              directory: 'proj',
+              windowMs: 10_000,
+              created: 2,
+              modified: 3,
+              deleted: 1,
+              files: ['a.ts', 'b.ts', 'c.ts', 'd.ts', 'e.ts', 'f.ts'],
+            },
+          }),
+        }),
+        change({
+          signal: sig({
+            id: 'fa-deg',
+            kind: 'file.activity',
+            at: T0 + 1,
+            subject: 'logs',
+            data: {
+              directory: '   ',
+              windowMs: 60_000,
+              created: 0,
+              modified: 500,
+              deleted: 0,
+              files: [],
+              degraded: true,
+            },
+          }),
+        }),
+      ]),
+    );
+    expect(out).toContain(
+      'file.activity: proj windowMs=10000 created=2 modified=3 deleted=1 files=[a.ts, b.ts, c.ts, d.ts, e.ts]',
+    );
+    expect(out).not.toContain('f.ts');
+    expect(out).toContain('file.activity: logs windowMs=60000 created=0 modified=500 deleted=0 degraded=true');
+
+    const rolled = formatEnvUpdate(
+      update([
+        change({
+          signal: sig({
+            id: 'fa-roll',
+            kind: 'file.activity',
+            at: T0 + 2,
+            subject: '~',
+            data: {
+              directory: '~',
+              windowMs: 10_000,
+              created: 5,
+              modified: 0,
+              deleted: 0,
+              rolledUp: 7,
+              files: ['[file]'],
+            },
+          }),
+        }),
+      ]),
+    );
+    expect(rolled).toContain(
+      'file.activity: ~ windowMs=10000 created=5 modified=0 deleted=0 rolledUp=7 files=[[file]]',
+    );
+  });
 });

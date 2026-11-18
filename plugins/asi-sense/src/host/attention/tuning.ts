@@ -15,6 +15,7 @@ export function tunedRule(
   signal: Signal,
   now: number,
   levels: AlertLevels,
+  platform: string = process.platform,
 ): WatchRule | undefined {
   const kind = signal.kind as AlertKind;
   const target = rules[kind];
@@ -25,7 +26,7 @@ export function tunedRule(
       signal.data.severity === 'warn' &&
       ((typeof eta === 'number' && Number.isFinite(eta) && eta <= 600_000) ||
         (signal.data.ruleId === 'context-eta' && (typeof eta !== 'number' || !Number.isFinite(eta)))));
-  if (!target || protectedAlert) return selectRule(items, signal, now);
+  if (!target || protectedAlert) return selectRule(items, signal, now, platform);
   return selectRule(
     items.map((rule) =>
       rule.id === target.id &&
@@ -40,5 +41,6 @@ export function tunedRule(
     ),
     signal,
     now,
+    platform,
   );
 }

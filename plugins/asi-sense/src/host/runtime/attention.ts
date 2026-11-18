@@ -32,7 +32,7 @@ export interface EventEntry {
   mono?: number;
   restarts?: number;
   source: SourceRef;
-  detail?: Record<string, string | number | boolean>;
+  detail?: Record<string, string | number | boolean | string[]>;
   currentEta?: { asOf: number; ratePerMinute: number; timeToThresholdMs?: number };
   feedback?: 'useful' | 'noise';
   feedbackAvailable?: boolean;
@@ -74,6 +74,7 @@ export class RuntimeAttention {
     private readonly ensureTarget?: () => void,
     private readonly canEnsureTarget?: () => boolean,
     private readonly history?: AttentionHistorySink,
+    platform: string = process.platform,
   ) {
     const staged = dsh as DshPort & {
       onDeliveryCommitted?: (cb: (session: string, id: string) => void) => () => void;
@@ -90,6 +91,7 @@ export class RuntimeAttention {
     this.pipeline = new AttentionPipeline({
       store: this.store,
       rules: rules(),
+      platform,
       clock: () => clock.mono(),
       wallClock: () => clock.wall(),
       isCurrent: () => {
@@ -491,7 +493,7 @@ export class RuntimeAttention {
     if (this.stopped) return;
     const session = this.selected && this.sessions.get(this.selected);
     if (!session) {
-      const prior = this.store.snapshot().observation.sources[signal.source.id];
+      const priorStatus = this.store.sourceStatus(signal.source.id);
       await new Promise<void>((resolve, reject) =>
         this.store.apply(signal, (result) => {
           try {
@@ -509,7 +511,7 @@ export class RuntimeAttention {
             }
             if (
               (signal.kind === 'source.status' || signal.kind === 'source.error') &&
-              prior?.status === sourceObservation(signal).status
+              priorStatus === sourceObservation(signal).status
             ) {
               level = 'record';
             }
@@ -532,6 +534,90 @@ export class RuntimeAttention {
       this.reschedule();
     });
   }
+  async acceptBatch(signals: readonly Signal[]): Promise<void> {
+    if (this.stopped || signals.length === 0) return;
+    if (
+      signals.length === 1 ||
+      signals.some((s) => isSessionOwned(s) || (s.source.id === 'dsh' && s.kind.startsWith('job.')))
+    ) {
+      for (const s of signals) await this.accept(s);
+      return;
+    }
+    const rules = this.rules();
+    if (this.needsRestore()) {
+      for (const signal of signals) {
+        if (signal.cause !== 'agent') {
+          const level = this.pipeline.selectRule(signal, rules)?.level;
+          if (level && level !== 'record') {
+            this.ensureTarget?.();
+            break;
+          }
+        }
+      }
+      if (this.stopped) return;
+    }
+    const nowMono = this.clock.mono();
+    const nowWall = this.clock.wall();
+    const monoFor = (signal: Signal) => nowMono - Math.max(0, nowWall - signal.at);
+    const session = this.selected && this.sessions.get(this.selected);
+    if (!session) {
+      const priorStatuses = new Map<string, ReturnType<typeof this.store.sourceStatus>>();
+      for (const s of signals) {
+        if (!priorStatuses.has(s.source.id)) priorStatuses.set(s.source.id, this.store.sourceStatus(s.source.id));
+      }
+      await new Promise<void>((resolve, reject) =>
+        this.store.applyBatch(signals, (results) => {
+          try {
+            for (let i = 0; i < signals.length; i++) {
+              const signal = signals[i]!;
+              const result = results[i];
+              const mono = monoFor(signal);
+              if (result !== 'applied') {
+                this.logEntry(
+                  { signal, level: 'record', reason: result === 'older' ? 'older-sequence' : 'duplicate' },
+                  mono,
+                );
+                continue;
+              }
+              const rule = signal.cause === 'agent' ? undefined : this.pipeline.selectRule(signal, rules);
+              let level = rule?.level ?? 'record';
+              let reason = signal.cause === 'agent' ? 'self-caused' : undefined;
+              if (level === 'wake' && rule && !isRuleApproved(rule)) {
+                level = 'context';
+                reason = 'rule-pending-approval';
+              }
+              if (
+                (signal.kind === 'source.status' || signal.kind === 'source.error') &&
+                priorStatuses.get(signal.source.id) === sourceObservation(signal).status
+              ) {
+                level = 'record';
+              }
+              if (level === 'wake') reason = 'no-session';
+              if (level === 'context') {
+                const evicted = this.pending.add(signal, { rule, reason });
+                if (evicted !== undefined) reason = `pending-evicted:${evicted}`;
+              }
+              this.logEntry({ signal, level, ruleId: rule?.id, reason }, mono);
+            }
+            this.changed();
+            resolve();
+          } catch (error) {
+            reject(error);
+          }
+        }),
+      );
+      return;
+    }
+    await this.pipeline.acceptBatch(signals, session, (changes) => {
+      let needsSchedule = false;
+      for (const change of changes) {
+        this.logEntry(change, monoFor(change.signal));
+        if (change.level !== 'record') needsSchedule = true;
+      }
+      this.changed();
+      if (needsSchedule) this.reschedule();
+    });
+  }
   async flush(): Promise<void> {
     try {
       this.pipeline.pruneSessions();
@@ -546,6 +632,9 @@ export class RuntimeAttention {
     return !!this.pinned && (this.selected !== this.pinned || !this.sessions.has(this.pinned));
   }
   private normalizeEventSubject(signal: Signal): { subject: string; bundleId?: string; title?: string } {
+    if (!signal.kind.startsWith('app.') && !signal.kind.startsWith('window')) {
+      return { subject: signal.subject };
+    }
     const front = this.store.snapshot().env.frontApp.value;
     if (signal.kind.startsWith('app.')) {
       const dataName = typeof signal.data.name === 'string' && signal.data.name.trim() ? signal.data.name : undefined;
@@ -603,6 +692,13 @@ export class RuntimeAttention {
     return { subject: signal.subject };
   }
   private log(change: { signal: Signal; level: DeliveryLevel; ruleId?: string; reason?: string }, mono: number): void {
+    this.logEntry(change, mono);
+    this.changed();
+  }
+  private logEntry(
+    change: { signal: Signal; level: DeliveryLevel; ruleId?: string; reason?: string },
+    mono: number,
+  ): void {
     const { signal, level, ruleId, reason } = change;
     const { subject, bundleId, title } = this.normalizeEventSubject(signal);
     const sourceReason =
@@ -644,7 +740,6 @@ export class RuntimeAttention {
     this.entries.push(entry);
     if (this.entries.length > 200) this.pending.forget(this.entries.shift()?.id);
     this.history?.recordEvent(entry, bundleId !== undefined || title !== undefined ? { bundleId, title } : undefined);
-    this.changed();
   }
   private mark(id: string, reason?: string, level?: DeliveryLevel): void {
     const entry = this.entries.find((item) => item.id === id);

@@ -23,14 +23,43 @@ export class TimeWindow<T extends { at: number }> {
     this.n++;
   }
 
+  get capacity(): number {
+    return this.buf.length;
+  }
+
+  clear(): void {
+    if (this.n === 1) {
+      this.buf[this.head] = undefined;
+    } else if (this.n > 1) {
+      const len = this.buf.length;
+      for (let i = 0; i < this.n; i++) {
+        this.buf[(this.head + i) % len] = undefined;
+      }
+    }
+    this.head = 0;
+    this.n = 0;
+  }
+
+  /** Removes and returns the oldest item if `at < cutoff`, else `undefined`. */
+  shiftBefore(cutoff: number): T | undefined {
+    if (this.n === 0) return undefined;
+    const item = this.buf[this.head];
+    if (item === undefined || item.at >= cutoff) return undefined;
+    this.buf[this.head] = undefined;
+    this.head = (this.head + 1) % this.buf.length;
+    this.n--;
+    return item;
+  }
+
   /** Evicts every item with `at < cutoff`; items at the cutoff are retained. */
-  prune(cutoff: number): void {
+  prune(cutoff: number, onEvict?: (item: T) => void): void {
     while (this.n > 0) {
       const item = this.buf[this.head];
       if (item === undefined || item.at >= cutoff) break;
       this.buf[this.head] = undefined;
       this.head = (this.head + 1) % this.buf.length;
       this.n--;
+      onEvict?.(item);
     }
   }
 

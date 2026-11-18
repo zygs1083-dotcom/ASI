@@ -37,21 +37,27 @@ const detailFields: Record<string, readonly string[]> = {
     'agentModified',
     'agentDeleted',
     'externalDeletionExceeded',
+    'rolledUp',
   ],
-  'file.activity': ['directory', 'dir', 'created', 'modified', 'deleted', 'windowMs'],
+  'file.activity': ['directory', 'windowMs', 'created', 'modified', 'deleted', 'rolledUp', 'degraded'],
 };
 
 export function eventDetail(signal: Signal): EventEntry['detail'] {
   const fields = detailFields[signal.kind];
   if (!fields) return undefined;
-  return Object.fromEntries(
-    fields.flatMap((key) => {
-      const value = signal.data[key];
-      return typeof value === 'string' ||
-        typeof value === 'boolean' ||
-        (typeof value === 'number' && Number.isFinite(value))
-        ? [[key, value]]
-        : [];
-    }),
-  );
+  const entries: [string, string | number | boolean | string[]][] = fields.flatMap((key) => {
+    const value = signal.data[key];
+    return typeof value === 'string' ||
+      typeof value === 'boolean' ||
+      (typeof value === 'number' && Number.isFinite(value))
+      ? [[key, value]]
+      : [];
+  });
+  if (signal.kind === 'file.activity' && Array.isArray(signal.data.files)) {
+    const files = signal.data.files
+      .filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
+      .slice(0, 5);
+    if (files.length > 0) entries.push(['files', files]);
+  }
+  return Object.fromEntries(entries);
 }

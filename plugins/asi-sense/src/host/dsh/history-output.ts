@@ -1,12 +1,14 @@
 import { createHash } from 'node:crypto';
 import path from 'node:path';
 import type { SourceRef } from '@asi/sense-types';
+import { isHomeRoot } from '../attention/path.ts';
 import type {
   DailyDirectoryStats,
   HistoryQueryResult,
   PersistedEventEntry,
   SummaryQueryResult,
 } from '../runtime/ports.ts';
+import { modelActivityName, modelFileEntry } from './deliver.ts';
 import { modelAppName, modelOutput, modelPath, modelProjectedOutput, modelText, modelTitle } from './tool-output.ts';
 import type { JsonValue } from './wire-types.ts';
 
@@ -106,6 +108,7 @@ function safeReason(reason: string): string {
 }
 
 function projectPathBase(value: string): string {
+  if (isHomeRoot(value)) return '~';
   return modelTitle(modelPath(value));
 }
 
@@ -489,16 +492,31 @@ function projectSource(source: SourceRef): { id: string; api: string } {
 }
 
 function projectDetail(
-  detail: Record<string, string | number | boolean> | undefined,
-): Record<string, string | number | boolean> | undefined {
+  detail: Record<string, string | number | boolean | string[]> | undefined,
+): Record<string, string | number | boolean | string[]> | undefined {
   if (!detail) return undefined;
-  const out: Record<string, string | number | boolean> = {};
+  const rawDirectory =
+    typeof detail.directory === 'string' ? detail.directory : typeof detail.dir === 'string' ? detail.dir : undefined;
+  const out: Record<string, string | number | boolean | string[]> = {};
   for (const [key, value] of Object.entries(detail)) {
+    if (Array.isArray(value)) {
+      if (key === 'files') {
+        const files = value
+          .filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
+          .slice(0, 5)
+          .map((item) => modelFileEntry(rawDirectory, item));
+        if (files.length > 0) out[key] = files;
+      } else {
+        const items = value.filter((item): item is string => typeof item === 'string').map((item) => modelText(item));
+        if (items.length > 0) out[key] = items;
+      }
+      continue;
+    }
     if (typeof value !== 'string') {
       out[key] = value;
       continue;
     }
-    if (key === 'directory' || key === 'dir') out[key] = projectPathBase(value);
+    if (key === 'directory' || key === 'dir') out[key] = modelActivityName(value, true);
     else if (key === 'metric') out[key] = projectMetric(value);
     else if (key === 'ruleId' || key === 'type' || key === 'severity' || key === 'direction' || key === 'confidence') {
       out[key] = safeIdentifier(value);
@@ -526,7 +544,7 @@ function projectSubject(entry: PersistedEventEntry): string {
     return projectAppSubject(entry.subject);
   }
   if (entry.kind.startsWith('file.')) {
-    return projectPathBase(entry.subject);
+    return modelActivityName(entry.subject, true);
   }
   if (entry.kind.startsWith('job.') || entry.kind.startsWith('process.')) {
     return projectCommandSubject(entry.subject);
@@ -594,6 +612,7 @@ const HISTORY_PREPROJECTED_PATHS = [
   'events.feedback',
   'events.detail.directory',
   'events.detail.dir',
+  'events.detail.files',
   'events.detail.metric',
   'events.detail.ruleId',
   'events.detail.type',
@@ -740,8 +759,8 @@ export function modelSummary(result: SummaryQueryResult): JsonValue {
     context: a.context + b.context,
     suppressed: a.suppressed + b.suppressed,
   }));
-  const fileBursts = projectRecord(s.fileBursts, projectPathBase, mergeDirStats);
-  const fileActivity = projectRecord(s.fileActivity, projectPathBase, mergeDirStats);
+  const fileBursts = projectRecord(s.fileBursts, (key) => modelActivityName(key, true), mergeDirStats);
+  const fileActivity = projectRecord(s.fileActivity, (key) => modelActivityName(key, true), mergeDirStats);
   const byMetric = projectRecord(s.bodyAnomalies.byMetric, projectMetric, (a, b) => a + b);
 
   const buildPayload = (

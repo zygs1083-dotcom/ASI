@@ -1,6 +1,7 @@
 import path from 'node:path';
 import type { Signal, WatchRule } from '@asi/sense-types';
-import { burstScopeId, matchesRule, subjectNeedsDeep, subjectScope } from '../attention/rules.ts';
+import { normalizeAbsPath, normalizeWatchPath } from '../attention/path.ts';
+import { burstScopeId, matchesRule, type SubjectMatcher, subjectNeedsDeep, subjectScope } from '../attention/rules.ts';
 import type { BurstTarget } from '../body/burst.ts';
 import type { RuntimeAttention } from '../runtime/attention.ts';
 import type { Clock, FileChange, FileWatcher } from '../runtime/ports.ts';
@@ -24,8 +25,10 @@ function root(pattern: string): string | undefined {
 }
 
 interface WatchScope {
+  /** Canonical normalized watched root for first-level glob directory extraction. */
+  readonly normBase: string;
   /** Distinct observable scopes on this root, keyed by canonical scope id. */
-  readonly scopes: { id: string; re: RegExp; subtree: boolean }[];
+  readonly scopes: { id: string; re: SubjectMatcher; subtree: boolean }[];
   /** Whether any rule on this root can see below the root's first level. */
   deep: boolean;
 }
@@ -52,6 +55,8 @@ export class FileSource {
   private readonly statuses = new Map<string, string>();
   private readonly failedWatches = new WeakSet<object>();
   private readonly dispatch = new Map<string, Map<string, number>>();
+  private activeScopes: { watched: string; scopes: SubjectMatcher[] }[] = [];
+  private readonly dirCache = new Map<string, string>();
   private clearDispatch?: ReturnType<typeof setImmediate>;
   private expiryTimer?: ReturnType<typeof setTimeout>;
   constructor(
@@ -61,8 +66,9 @@ export class FileSource {
     private readonly dsh: DshSource,
     private readonly rules: () => WatchRule[],
     private readonly paused: () => boolean,
-    private readonly burst: (signal: Signal, dirs: readonly BurstTarget[]) => Promise<void>,
+    private readonly burst: (signal: Signal, dirs: readonly BurstTarget[]) => Promise<void> | undefined,
     private readonly setScopes: (scopes: string[]) => void,
+    private readonly platform: string = process.platform,
   ) {}
   private eligible(rule: WatchRule): boolean {
     return rule.approved && (rule.expiresAt === undefined || this.clock.wall() < rule.expiresAt);
@@ -85,15 +91,18 @@ export class FileSource {
       )
         continue;
       const watched = root(rule.match.subject);
-      const scope = subjectScope(rule.match.subject);
-      const id = burstScopeId(rule.match.subject);
+      const normSubject = normalizeWatchPath(rule.match.subject, this.platform);
+      const scope = normSubject ? subjectScope(normSubject) : undefined;
+      const id = burstScopeId(rule.match.subject, this.platform);
       if (watched === undefined || scope === undefined || id === undefined) continue;
       let entry = out.get(watched);
       if (!entry) {
-        entry = { scopes: [], deep: false };
+        entry = { normBase: normalizeWatchPath(watched, this.platform) ?? watched, scopes: [], deep: false };
         out.set(watched, entry);
       }
-      if (!entry.scopes.some((s) => s.id === id)) entry.scopes.push({ id, re: scope, subtree: id.startsWith('dir:') });
+      if (!entry.scopes.some((s) => s.id === id)) {
+        entry.scopes.push({ id, re: scope, subtree: id.startsWith('dir:') });
+      }
       entry.deep ||= subjectNeedsDeep(rule.match.subject);
     }
     return out;
@@ -223,9 +232,14 @@ export class FileSource {
         }
       }
       const failed = new Set<string>();
+      this.dirCache.clear();
       for (;;) {
         this.active = !this.stopped && !this.paused();
         const scopes = this.scopes();
+        this.activeScopes = [...scopes.entries()].map(([watched, entry]) => ({
+          watched,
+          scopes: entry.scopes.map((s) => s.re),
+        }));
         this.setScopes([...new Set([...scopes.values()].flatMap((e) => e.scopes.map((s) => s.id)))]);
         const obsolete = [...this.watches].find(
           ([watched]) => !scopes.has(watched) && (!this.active || !this.leases.has(watched)),
@@ -291,9 +305,24 @@ export class FileSource {
     this.tail = run.catch(() => {});
     return run;
   }
+  hasDirScope(pathOrDir: string): boolean {
+    if (!this.active || this.activeScopes.length === 0 || this.paused()) return false;
+    const clean = normalizeWatchPath(pathOrDir, this.platform, this.dirCache);
+    if (!clean) return false;
+    for (const entry of this.activeScopes) {
+      const handle = this.watches.get(entry.watched);
+      if (!handle || this.failedWatches.has(handle)) continue;
+      for (const match of entry.scopes) {
+        if (match.test(clean)) return true;
+      }
+    }
+    return false;
+  }
   async stop(): Promise<void> {
     this.stopped = true;
     this.active = false;
+    this.activeScopes = [];
+    this.dirCache.clear();
     this.leases.clear();
     if (this.clearDispatch) clearImmediate(this.clearDispatch);
     this.dispatch.clear();
@@ -303,7 +332,9 @@ export class FileSource {
     if (!this.active || this.paused() || !path.isAbsolute(event.path)) return;
     const scopes = this.scopes();
     if (!scopes.has(watched)) return;
-    const absolute = path.normalize(event.path);
+    const norm = normalizeWatchPath(event.path, this.platform, this.dirCache);
+    if (!norm) return;
+    const absolute = normalizeAbsPath(event.path) ?? path.normalize(event.path);
     // Strict scope: an event counts only toward scopes whose eligible rules
     // can observe it — each scope keeps its own bucket (subtree scopes at
     // their root, globs at the concrete first-level directory), so sibling
@@ -312,15 +343,15 @@ export class FileSource {
     const seen = new Set<string>();
     for (const [base, entry] of scopes) {
       for (const scope of entry.scopes) {
-        if (!scope.re.test(absolute)) continue;
-        const dir = scope.subtree ? base : firstLevelDir(base, absolute);
+        if (!scope.re.test(norm)) continue;
+        const dir = scope.subtree ? base : firstLevelDir(entry.normBase, norm);
         if (seen.has(`${scope.id}${dir}`)) continue;
         seen.add(`${scope.id}${dir}`);
         dirs.push({ scope: scope.id, dir });
       }
     }
     if (dirs.length === 0) return;
-    const key = JSON.stringify([absolute, event.change, event.at ?? this.clock.wall()]);
+    const key = JSON.stringify([norm, event.change, event.at ?? this.clock.wall()]);
     const roots = this.dispatch.get(key) ?? new Map<string, number>();
     const count = (roots.get(watched) ?? 0) + 1;
     const duplicate = [...roots].some(([other, seen]) => other !== watched && seen >= count);
@@ -346,7 +377,7 @@ export class FileSource {
         this.eligible(r) &&
         r.match.kind === signal.kind &&
         r.match.subject &&
-        matchesRule(r, signal, this.clock.wall()),
+        matchesRule(r, signal, this.clock.wall(), this.platform),
     );
     if (matching.length) {
       signal.data.watchedPaths = matching.map((rule) => rule.match.subject);

@@ -1,5 +1,5 @@
 import { Context } from '@deepseek-ai/cordis';
-import { remoteMethods } from '@deepseek-ai/dsh-typert-protocol';
+import { RemoteError, remoteMethods } from '@deepseek-ai/dsh-typert-protocol';
 import { describe, expect, it, onTestFinished, vi } from 'vitest';
 import type { FramesSource } from '../../src/host/dsh/frames.ts';
 import { AsiSenseRemote } from '../../src/host/dsh/remote.ts';
@@ -14,6 +14,10 @@ function fixture() {
     deleteRule: vi.fn(async () => {}),
     pause: vi.fn(async () => {}),
     setSendTitles: vi.fn(async () => {}),
+    setGlobalFileWatch: vi.fn(async () => {}),
+    retryGlobalFileWatch: vi.fn(async () => {}),
+    addFileExclusion: vi.fn(async () => {}),
+    removeFileExclusion: vi.fn(async () => {}),
     openPermissionSettings: vi.fn(async () => {}),
     revertTuning: vi.fn(async () => ({ applied: true })),
     lockParam: vi.fn(async () => ({ applied: true })),
@@ -81,5 +85,38 @@ describe('DSH remote service', () => {
     vi.mocked(actions.acceptRebaseline).mockRejectedValueOnce(new Error('storage unavailable'));
     await expect(remote.acceptRebaseline('baseline')).rejects.toThrow('storage unavailable');
     expect(invalidate).toHaveBeenCalledTimes(3);
+  });
+
+  it('validates and forwards global file watch toggle and exclusion endpoints', async () => {
+    const { remote, actions, invalidate } = fixture();
+    await expect(Reflect.apply(remote.setGlobalFileWatch, remote, ['yes'])).rejects.toThrow();
+    expect(actions.setGlobalFileWatch).not.toHaveBeenCalled();
+    for (const bad of [undefined, null, '', '   ', 42]) {
+      await expect(Reflect.apply(remote.addFileExclusion, remote, [bad])).rejects.toThrow();
+      await expect(Reflect.apply(remote.removeFileExclusion, remote, [bad])).rejects.toThrow();
+    }
+    expect(actions.addFileExclusion).not.toHaveBeenCalled();
+    expect(actions.removeFileExclusion).not.toHaveBeenCalled();
+
+    invalidate.mockClear();
+    await remote.setGlobalFileWatch(false);
+    await remote.retryGlobalFileWatch();
+    await remote.addFileExclusion('~/custom-cache');
+    await remote.removeFileExclusion('~/custom-cache');
+    expect(actions.setGlobalFileWatch).toHaveBeenCalledWith(false);
+    expect(actions.retryGlobalFileWatch).toHaveBeenCalledOnce();
+    expect(actions.addFileExclusion).toHaveBeenCalledWith('~/custom-cache');
+    expect(actions.removeFileExclusion).toHaveBeenCalledWith('~/custom-cache');
+    expect(invalidate).toHaveBeenCalledTimes(4);
+  });
+
+  it('rejects relative, root, home-root, and oversized exclusions with RemoteError', async () => {
+    const { remote, actions } = fixture();
+    for (const bad of ['./secret', '../secret', 'foo/bar', '/', '///', '~', '~/', '.'.repeat(1025)]) {
+      await expect(remote.addFileExclusion(bad)).rejects.toBeInstanceOf(RemoteError);
+      await expect(remote.removeFileExclusion(bad)).rejects.toBeInstanceOf(RemoteError);
+    }
+    expect(actions.addFileExclusion).not.toHaveBeenCalled();
+    expect(actions.removeFileExclusion).not.toHaveBeenCalled();
   });
 });

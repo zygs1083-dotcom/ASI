@@ -4,9 +4,10 @@ import type { Agent } from '@deepseek-ai/dsh-agent';
 import { freezeMessage, MessageId, type UserMessage } from '@deepseek-ai/dsh-llm';
 import { isSessionContext } from '../attention/buckets.ts';
 import { DeliveryFailure } from '../attention/drain.ts';
+import { isHomeRoot } from '../attention/path.ts';
 import type { DeliveryIntent } from '../attention/pipeline.ts';
 import { formatEnvUpdate } from '../delivery/format.ts';
-import { modelAppName, modelLabel, modelPath, modelTitle } from './tool-output.ts';
+import { modelActivityName, modelAppName, modelLabel, modelTitle } from './tool-output.ts';
 
 declare module '@deepseek-ai/dsh-llm' {
   interface MessageSourceMap {
@@ -14,9 +15,22 @@ declare module '@deepseek-ai/dsh-llm' {
   }
 }
 
+export { modelActivityName };
+
+/** Masks a `files` entry that resolves to the user's home root, keeping subdirectory names intact. */
+export function modelFileEntry(directory: string | undefined, item: string): string {
+  if (item === '~') return '~';
+  const dir = directory?.trim();
+  if (dir) {
+    const separator = dir.endsWith('/') || dir.endsWith('\\') ? '' : '/';
+    if (isHomeRoot(`${dir}${separator}${item}`)) return '~';
+  }
+  return modelActivityName(item, false);
+}
+
 function metric(value: unknown): string {
   if (typeof value !== 'string') return 'body';
-  if (value.startsWith('disk:')) return `disk:${modelPath(value.slice(5))}`;
+  if (value.startsWith('disk:')) return `disk:${modelActivityName(value.slice(5), true)}`;
   return [
     'cpu',
     'memory',
@@ -51,7 +65,12 @@ function modelUpdate(update: EnvUpdate): EnvUpdate {
       } else if (signal.kind === 'window.focused' || signal.kind === 'window.title-changed') {
         if (typeof signal.data.title === 'string') data.title = modelTitle(signal.data.title);
       } else if (signal.kind === 'file.changed') {
-        data.path = modelPath(typeof signal.data.path === 'string' ? signal.data.path : signal.subject);
+        const maskedPath = modelActivityName(
+          typeof signal.data.path === 'string' && signal.data.path.trim() ? signal.data.path : signal.subject,
+          true,
+        );
+        subject = maskedPath;
+        data.path = maskedPath;
         if (
           typeof signal.data.change === 'string' &&
           ['add', 'create', 'created', 'modify', 'save', 'saved', 'delete', 'deleted', 'rename', 'renamed'].includes(
@@ -75,14 +94,18 @@ function modelUpdate(update: EnvUpdate): EnvUpdate {
           (signal.kind === 'body.anomaly' && signal.data.type === 'rebaseline-suggestion'
             ? signal.subject.replace(/^(?:rebaseline|baseline):/, '')
             : undefined);
-        subject =
-          signal.kind === 'file.burst'
-            ? modelPath(
-                typeof signal.data.directory === 'string' && signal.data.directory.trim()
-                  ? signal.data.directory
-                  : signal.subject,
-              )
-            : metric(rawMetric);
+        if (signal.kind === 'file.burst') {
+          const maskedDir = modelActivityName(
+            typeof signal.data.directory === 'string' && signal.data.directory.trim()
+              ? signal.data.directory
+              : signal.subject,
+            true,
+          );
+          subject = maskedDir;
+          data.directory = maskedDir;
+        } else {
+          subject = metric(rawMetric);
+        }
         if (signal.kind === 'body.anomaly' && signal.data.type === 'rebaseline-suggestion') {
           data.type = 'rebaseline-suggestion';
         }
@@ -117,6 +140,27 @@ function modelUpdate(update: EnvUpdate): EnvUpdate {
         )
           data.externalDeleted = deleted - agentDeleted;
         if (signal.data.externalDeletionExceeded === true) data.externalDeletionExceeded = true;
+        if (signal.kind === 'file.burst' && signal.data.rolledUp === true) data.rolledUp = true;
+      } else if (signal.kind === 'file.activity') {
+        const rawDir =
+          typeof signal.data.directory === 'string' && signal.data.directory.trim()
+            ? signal.data.directory
+            : signal.subject;
+        const maskedDir = modelActivityName(rawDir, true);
+        subject = maskedDir;
+        data.directory = maskedDir;
+        for (const key of ['windowMs', 'created', 'modified', 'deleted', 'rolledUp']) {
+          const value = signal.data[key];
+          if (typeof value === 'number' && Number.isFinite(value)) data[key] = value;
+        }
+        if (Array.isArray(signal.data.files)) {
+          const files = signal.data.files
+            .filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
+            .slice(0, 5)
+            .map((item) => modelFileEntry(rawDir, item));
+          if (files.length > 0) data.files = files;
+        }
+        if (signal.data.degraded === true) data.degraded = true;
       }
       const summary = signal.data.jobSummary;
       if (summary && typeof summary === 'object' && !Array.isArray(summary)) {
@@ -154,6 +198,7 @@ function modelUpdate(update: EnvUpdate): EnvUpdate {
         'body.rate',
         'body.anomaly',
         'file.burst',
+        'file.activity',
       ];
       return {
         count,

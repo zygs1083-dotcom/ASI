@@ -32,6 +32,11 @@ function RuleList({ model, onToggleRule, onConfirmRule, onDeleteRule }: SensePan
       {model.rules.length === 0 && <li className={css.empty}>暂无规则</li>}
       {model.rules.map((r) => {
         const pending = isPending(r);
+        const note =
+          r.note ??
+          (r.id === 'file-activity' || r.match.kind === 'file.activity'
+            ? '全盘按目录与时间窗聚合的文件活动（10 秒窗，最多 5 个文件名，排除目录自动忽略）'
+            : undefined);
         return (
           <li key={r.id} className={css.rule} data-pending={pending || undefined}>
             <div className={css.ruleMain}>
@@ -44,7 +49,7 @@ function RuleList({ model, onToggleRule, onConfirmRule, onDeleteRule }: SensePan
                 {r.match.subject ? ` · ${r.match.subject}` : ''} · {LEVEL_TEXT[r.level]}
                 {r.createdBy === 'agent' ? ' · Agent 提议' : ''}
               </span>
-              {r.note && <span className={css.ruleNote}>{r.note}</span>}
+              {note && <span className={css.ruleNote}>{note}</span>}
             </div>
             <div className={css.ruleOps}>
               {pending ? (

@@ -102,7 +102,7 @@ function latestTriggerEvent(key: MetricKey, events: SenseEvent[], now: number): 
   let latest: SenseEvent | null = null;
   for (const e of events) {
     const d = e.detail;
-    if (!d || d.kind === 'file.burst') continue;
+    if (!d || (d.kind !== 'body.rate' && d.kind !== 'body.anomaly')) continue;
     if (d.metric !== key) continue;
     const at = e.signal.at;
     if (!Number.isFinite(at) || at > now) continue;

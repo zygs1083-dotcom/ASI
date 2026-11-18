@@ -59,6 +59,9 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     {
       helperPath: config.helperPath ?? fileURLToPath(new URL('./asi-sense-helper', import.meta.url)),
       targetStorageKey: `session-target-${createHash('sha256').update(ctx.profileContext.dir).digest('hex')}`,
+      globalFileWatch: {
+        dataDirs: [config.storageRoot, ctx.profileContext.dir],
+      },
       ...(config.intervalMs === undefined ? {} : { intervalMs: config.intervalMs }),
       ...(config.selfCauseGraceMs === undefined ? {} : { selfCauseGraceMs: config.selfCauseGraceMs }),
     },

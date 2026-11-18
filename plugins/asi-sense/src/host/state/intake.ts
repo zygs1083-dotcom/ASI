@@ -18,6 +18,62 @@ export class SignalIntake {
     this.drain();
   }
 
+  applyBatch(
+    signals: readonly Signal[],
+    afterAll?: (results: ApplyResult[]) => void,
+    valid?: () => boolean,
+    shouldEmit?: (applied: readonly Signal[]) => boolean,
+  ): void {
+    if (signals.length === 0) {
+      afterAll?.([]);
+      return;
+    }
+    if (this.processing || this.deferred) {
+      const results: ApplyResult[] = [];
+      for (let i = 0; i < signals.length; i++) {
+        const isLast = i === signals.length - 1;
+        this.apply(
+          signals[i]!,
+          (res) => {
+            results.push(res);
+            if (isLast) afterAll?.(results);
+          },
+          valid,
+        );
+      }
+      return;
+    }
+    this.processing = true;
+    const applied: Signal[] = [];
+    const results: ApplyResult[] = new Array(signals.length);
+    let error: unknown;
+    let hasError = false;
+    try {
+      for (let i = 0; i < signals.length; i++) {
+        const cloned = structuredClone(signals[i]!);
+        const result = valid && !valid() ? 'invalid' : this.applyOne(cloned);
+        results[i] = result;
+        if (result === 'applied') applied.push(cloned);
+      }
+      if (applied.length > 0) {
+        this.commit(applied);
+        if (!shouldEmit || shouldEmit(applied)) {
+          this.emit(applied[applied.length - 1]!);
+        }
+      }
+      try {
+        afterAll?.(results);
+      } catch (err) {
+        error = err;
+        hasError = true;
+      }
+    } finally {
+      this.processing = false;
+      this.drain();
+    }
+    if (hasError) throw error;
+  }
+
   batch<T>(work: () => T, publish: () => void): T {
     if (this.deferred) return work();
     this.deferred = [];

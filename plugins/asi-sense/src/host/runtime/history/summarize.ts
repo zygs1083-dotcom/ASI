@@ -36,14 +36,20 @@ function validSource(value: unknown): SourceRef {
   };
 }
 
-function validDetail(value: unknown): Record<string, string | number | boolean> | undefined {
+function validDetail(value: unknown): Record<string, string | number | boolean | string[]> | undefined {
   if (!isRecordObject(value)) return undefined;
-  const out: Record<string, string | number | boolean> = {};
+  const out: Record<string, string | number | boolean | string[]> = {};
   let hasAny = false;
   for (const [k, v] of Object.entries(value)) {
     if (typeof v === 'string' || typeof v === 'boolean' || (typeof v === 'number' && Number.isFinite(v))) {
       out[k] = v;
       hasAny = true;
+    } else if (Array.isArray(v)) {
+      const items = v.filter((item): item is string => typeof item === 'string');
+      if (items.length > 0) {
+        out[k] = items;
+        hasAny = true;
+      }
     }
   }
   return hasAny ? out : undefined;

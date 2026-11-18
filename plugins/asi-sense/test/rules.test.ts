@@ -4,8 +4,10 @@ import {
   createWatchRule,
   DEFAULT_RULES,
   isRuleApproved,
+  MAX_RULE_SUBJECT_LENGTH,
   matchesRule,
   selectRule,
+  validateRule,
 } from '../src/host/attention/rules.ts';
 import { sig } from './helpers.ts';
 
@@ -249,6 +251,25 @@ describe('matchesRule', () => {
     expect(matchesRule(r, sig({ id: '1', kind: 'k' }), 99)).toBe(true);
     expect(matchesRule(r, sig({ id: '1', kind: 'k' }), 100)).toBe(false);
   });
+
+  it('normalizes darwin case and NFC on file.* subjects and rejects oversized subjects', () => {
+    const darwinRule = rule({ id: 'mac', match: { kind: 'file.burst', subject: '/Users/Demo/Cafe\u0301/**' } });
+    const burst = sig({ id: 'b1', kind: 'file.burst', subject: '/users/demo/caf\u00e9/src' });
+    expect(matchesRule(darwinRule, burst, 0, 'darwin')).toBe(true);
+    expect(matchesRule(darwinRule, burst, 0, 'linux')).toBe(false);
+
+    const tooLong = `/${'a'.repeat(MAX_RULE_SUBJECT_LENGTH)}`;
+    expect(tooLong.length).toBe(MAX_RULE_SUBJECT_LENGTH + 1);
+    const oversized = rule({ id: 'long', match: { kind: 'file.changed', subject: tooLong } });
+    expect(validateRule(oversized).length).toBeGreaterThan(0);
+    expect(matchesRule(oversized, sig({ id: 'b2', kind: 'file.changed', subject: tooLong }), 0)).toBe(false);
+
+    const boundary = rule({
+      id: 'max',
+      match: { kind: 'file.changed', subject: `/${'a'.repeat(MAX_RULE_SUBJECT_LENGTH - 1)}` },
+    });
+    expect(validateRule(boundary)).toEqual([]);
+  });
 });
 
 describe('selectRule', () => {
@@ -315,6 +336,7 @@ describe('DEFAULT_RULES', () => {
     expect(sel(sig({ id: '1', kind: 'app.activated' }))?.level).toBe('record');
     expect(sel(sig({ id: '2', kind: 'window.title-changed' }))?.level).toBe('record');
     expect(sel(sig({ id: '3', kind: 'file.changed' }))?.level).toBe('context');
+    expect(sel(sig({ id: '3b', kind: 'file.activity' }))?.level).toBe('record');
     expect(sel(sig({ id: '4', kind: 'job.exited', data: { exitCode: 1 } }))?.level).toBe('wake');
     expect(sel(sig({ id: '5', kind: 'job.exited', data: { exitCode: 0 } }))?.level).toBe('context');
     expect(sel(sig({ id: '6', kind: 'job.exited' }))?.level).toBe('context'); // no catchall wake

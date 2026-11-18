@@ -56,7 +56,11 @@ export class StateStore {
         : this.ordering.earlier(signal) || !this.applyOne(signal)
           ? 'older'
           : 'applied',
-    (signals) => this.expiry.observe(this.state, signals),
+    (signals) => {
+      if (signals.some((s) => s.kind !== 'file.activity')) {
+        this.expiry.observe(this.state, signals);
+      }
+    },
     () => this.emit(),
   );
   /**
@@ -85,6 +89,14 @@ export class StateStore {
    */
   apply(signal: Signal, afterApply?: (result: ApplyResult) => void, valid?: () => boolean): void {
     this.intake.apply(signal, afterApply, valid);
+  }
+  applyBatch(signals: readonly Signal[], afterAll?: (results: ApplyResult[]) => void, valid?: () => boolean): void {
+    this.intake.applyBatch(signals, afterAll, valid, (applied) =>
+      applied.some((s) => s.kind !== 'file.activity' || s.data.preserveSourceStatus !== true),
+    );
+  }
+  sourceStatus(id: string): FactStatus | undefined {
+    return this.state.observation.sources[id]?.status;
   }
   batch<T>(work: () => T, publish: () => void = () => {}): T {
     if (this.batchState) return work();

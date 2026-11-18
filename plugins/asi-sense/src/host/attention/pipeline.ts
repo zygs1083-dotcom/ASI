@@ -40,6 +40,7 @@ export class AttentionPipeline {
   private readonly drain: BucketDrain;
   private readonly clock: () => number;
   private readonly wallClock: () => number;
+  private readonly platform: string;
   private readonly rules: WatchRule[];
   private mergeWindowMs: number;
   private fileMergeWindowMs: number;
@@ -60,6 +61,7 @@ export class AttentionPipeline {
     this.store = options.store;
     this.clock = options.clock ?? (() => performance.now());
     this.wallClock = options.wallClock ?? Date.now;
+    this.platform = options.platform ?? process.platform;
     this.rules = (options.rules ?? DEFAULT_RULES).map((r) => {
       const errors = validateRule(r);
       if (errors.length > 0) {
@@ -122,7 +124,7 @@ export class AttentionPipeline {
     this.levels = { ...levels };
   }
   selectRule(signal: Signal, rules: readonly WatchRule[] = this.rules): WatchRule | undefined {
-    return tunedRule(rules, signal, this.wallClock(), this.levels);
+    return tunedRule(rules, signal, this.wallClock(), this.levels, this.platform);
   }
   refreshFeedback(available: (id: string) => boolean): void {
     this.drain.refreshFeedback(available);
@@ -203,6 +205,47 @@ export class AttentionPipeline {
   ): Promise<EnvChange> {
     return this.process(signal, session, 1, true, false, onIntake, undefined, valid);
   }
+  async acceptBatch(
+    signals: readonly Signal[],
+    session: SessionContext,
+    onIntake?: (changes: readonly EnvChange[]) => void,
+    valid?: () => boolean,
+  ): Promise<EnvChange[]> {
+    if (signals.length === 0) return [];
+    const now = this.clock();
+    const evs: Signal[] = new Array(signals.length);
+    for (let i = 0; i < signals.length; i++) {
+      const ev = structuredClone(signals[i]!);
+      ev.cause = classifyCause(ev, session.toolWindows ?? [], 0, now, this.platform);
+      evs[i] = ev;
+    }
+    return await new Promise<EnvChange[]>((resolve, reject) => {
+      this.store.applyBatch(
+        evs,
+        (results) => {
+          try {
+            const intakeClock = this.clock();
+            const changes: EnvChange[] = new Array(evs.length);
+            for (let i = 0; i < evs.length; i++) {
+              const ev = evs[i]!;
+              const result = results[i];
+              changes[i] =
+                result === 'invalid' || (valid && !valid())
+                  ? { signal: ev, count: 1, level: 'record', reason: 'session-private' }
+                  : result === 'older'
+                    ? { signal: ev, count: 1, level: 'record', reason: 'older-sequence' }
+                    : this.intake(ev, session, intakeClock, 1);
+            }
+            onIntake?.(changes);
+            resolve(changes);
+          } catch (e) {
+            reject(e);
+          }
+        },
+        valid,
+      );
+    });
+  }
   async acceptCount(
     signal: Signal,
     session: SessionContext,
@@ -223,7 +266,7 @@ export class AttentionPipeline {
     valid?: () => boolean,
   ): Promise<EnvChange> {
     const ev = structuredClone(signal);
-    if (!pending) ev.cause = classifyCause(ev, session.toolWindows ?? [], 0, this.clock());
+    if (!pending) ev.cause = classifyCause(ev, session.toolWindows ?? [], 0, this.clock(), this.platform);
     if (!apply) return this.intake(ev, session, this.clock(), count, other, pending);
     return await new Promise<EnvChange>((resolve, reject) => {
       this.store.apply(

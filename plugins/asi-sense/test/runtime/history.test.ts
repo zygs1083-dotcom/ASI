@@ -133,6 +133,7 @@ function createRuntimeHarness(opts: {
       timeZone: opts.timeZone ?? 'UTC',
       intervalMs: 600_000,
       rules: opts.rules,
+      globalFileWatch: { disableInTests: true },
     },
   );
 

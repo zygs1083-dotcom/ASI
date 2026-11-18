@@ -12,6 +12,10 @@ function fixture() {
     deleteRule: method(),
     pause: method(),
     setSendTitles: method(),
+    setGlobalFileWatch: method(),
+    retryGlobalFileWatch: method(),
+    addFileExclusion: method(),
+    removeFileExclusion: method(),
     openPermissionSettings: method(),
     revertTuning: method(),
     lockParam: method(),
@@ -37,6 +41,7 @@ describe('sidebar action boundary', () => {
     a.onDeleteRule('rule');
     a.onPause(true);
     a.onToggleTitles(false);
+    a.onToggleGlobalFileWatch?.(false);
     a.onOpenPermissionSettings();
     a.onRevertTuning('change');
     a.onLockParam('rate.cpu', true);
@@ -50,6 +55,7 @@ describe('sidebar action boundary', () => {
     expect(api.deleteRule).toHaveBeenCalledWith('rule');
     expect(api.pause).toHaveBeenCalledWith(true);
     expect(api.setSendTitles).toHaveBeenCalledWith(false);
+    expect(api.setGlobalFileWatch).toHaveBeenCalledWith(false);
     expect(api.openPermissionSettings).toHaveBeenCalledOnce();
     expect(api.revertTuning).toHaveBeenCalledWith('change');
     expect(api.lockParam).toHaveBeenCalledWith('rate.cpu', true);
@@ -118,6 +124,36 @@ describe('sidebar action boundary', () => {
     complete({ ok: true, value: undefined });
     await pending;
     expect(done).toHaveBeenCalledOnce();
+    controller.dispose();
+  });
+
+  it('routes exclusion mutations via complete and surfaces validation failures without global banner', async () => {
+    const { api, controller } = fixture();
+    await expect(controller.actions.onAddFileExclusion?.('node_modules')).resolves.toBeUndefined();
+    await expect(controller.actions.onRemoveFileExclusion?.('node_modules')).resolves.toBeUndefined();
+    expect(api.addFileExclusion).toHaveBeenCalledWith('node_modules');
+    expect(api.removeFileExclusion).toHaveBeenCalledWith('node_modules');
+
+    api.addFileExclusion.mockResolvedValueOnce({
+      ok: false,
+      error: new RemoteError('gateway/bad-request', 'invalid exclusion', {}),
+    });
+    await expect(controller.actions.onAddFileExclusion?.('bad/pat')).rejects.toThrow('invalid exclusion');
+    expect(controller.getSnapshot()).toBe(false);
+    controller.dispose();
+  });
+
+  it('routes retryGlobalFileWatch via complete and surfaces failures without global banner', async () => {
+    const { api, controller } = fixture();
+    await expect(controller.actions.onRetryGlobalFileWatch?.()).resolves.toBeUndefined();
+    expect(api.retryGlobalFileWatch).toHaveBeenCalledOnce();
+
+    api.retryGlobalFileWatch.mockResolvedValueOnce({
+      ok: false,
+      error: new RemoteError('gateway/bad-request', 'watch retry failed', {}),
+    });
+    await expect(controller.actions.onRetryGlobalFileWatch?.()).rejects.toThrow('watch retry failed');
+    expect(controller.getSnapshot()).toBe(false);
     controller.dispose();
   });
 });

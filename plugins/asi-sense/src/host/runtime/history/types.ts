@@ -1,4 +1,5 @@
 import type { DeliveryLevel, SignalCause, SourceRef } from '@asi/sense-types';
+import { isHomeRoot } from '../../attention/path.ts';
 
 export const HISTORY_RETENTION_DAYS = 30;
 export const DAILY_SUMMARY_RETENTION_DAYS = 400;
@@ -19,7 +20,7 @@ export interface PersistedEventEntry {
   at: number;
   restarts?: number;
   source: SourceRef;
-  detail?: Record<string, string | number | boolean>;
+  detail?: Record<string, string | number | boolean | string[]>;
   currentEta?: { asOf: number; ratePerMinute: number; timeToThresholdMs?: number };
   feedback?: 'useful' | 'noise';
   feedbackAvailable?: boolean;
@@ -193,6 +194,7 @@ export function sanitizeAppName(value: string): string {
 }
 
 export function sanitizeDirPath(value: string): string {
+  if (isHomeRoot(value)) return '~';
   const normalized = value.replaceAll('\\', '/').replace(/\/+$/, '');
   const parts = normalized.split('/').filter(Boolean);
   return parts.at(-1) ?? '[path]';

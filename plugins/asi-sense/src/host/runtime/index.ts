@@ -1,7 +1,9 @@
 import type { WatchRule } from '@asi/sense-types';
 import { BodySource } from '../sources/body.ts';
 import { DshSource } from '../sources/dsh.ts';
+import { exclusionKey, MAX_FILE_EXCLUSIONS, normalizeFileExclusion } from '../sources/file-exclusions.ts';
 import { FileSource } from '../sources/files.ts';
+import { FileGlobalSource } from '../sources/files-global.ts';
 import { HelperSource } from '../sources/helper.ts';
 import { boundedShutdown, guardActions } from './action-guard.ts';
 import { RuntimeAttention } from './attention.ts';
@@ -23,7 +25,8 @@ export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}
   )
     throw new TypeError('selfCauseGraceMs must be a non-negative finite number');
   const { clock } = ports;
-  const settings = new Settings(ports.storage, options.rules);
+  const platform = options.platform ?? process.platform;
+  const settings = new Settings(ports.storage, options.rules, platform);
   let running = false;
   let started = false;
   let generation = 0;
@@ -93,14 +96,24 @@ export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}
     () => target.ensure(),
     () => target.canEnsure(),
     history,
+    platform,
   );
   attentionRef = attention;
   const listeners = createStateListeners();
   const body = new BodySource(ports.probe, ports.dsh, ports.storage, clock, attention, expiry, isPaused, changed);
-  const dsh = new DshSource(deliveryPort, clock, attention, body, isPaused, options.selfCauseGraceMs, (id) => {
-    target.unload(id);
-    attention.rescheduleDelivery();
-  });
+  const dsh = new DshSource(
+    deliveryPort,
+    clock,
+    attention,
+    body,
+    isPaused,
+    options.selfCauseGraceMs,
+    (id) => {
+      target.unload(id);
+      attention.rescheduleDelivery();
+    },
+    platform,
+  );
   const target = createSessionTarget(
     ports.dsh,
     ports.storage,
@@ -135,6 +148,21 @@ export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}
     isPaused,
     (signal, dirs) => body.burst(signal, dirs),
     (scopes) => body.setScopes(scopes),
+    platform,
+  );
+  const filesGlobal = new FileGlobalSource(
+    ports.files,
+    clock,
+    attention,
+    dsh,
+    settings,
+    isPaused,
+    (signal, dirs, receivedMono) => body.burst(signal, dirs, receivedMono),
+    (enabled) => body.setGlobalScope(enabled),
+    (absPath) => files.hasDirScope(absPath),
+    () => schedule(),
+    options.globalFileWatch,
+    platform,
   );
   const helper = new HelperSource(
     ports.helper,
@@ -153,6 +181,7 @@ export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}
     const due = paused ? undefined : attention.pipeline.nextDeadline();
     const deadline = Math.min(
       due === undefined ? Infinity : Math.max(due, retryAfter),
+      filesGlobal.nextDeadline() ?? Infinity,
       helper.nextDeadline() ?? Infinity,
       nextToken,
       expiry.next() ?? Infinity,
@@ -181,6 +210,7 @@ export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}
       if (session && !paused) void body.tokens(session, () => attention.currentSessionId() === session);
     }
     helper.tick();
+    await filesGlobal.tick();
     attention.pipeline.pruneSessions();
     const due = attention.pipeline.nextDeadline();
     if (!paused && due !== undefined && due <= clock.mono() && clock.mono() >= retryAfter) {
@@ -195,7 +225,18 @@ export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}
     const rules = settings.enabled();
     for (const rule of rules) attention.pipeline.addRule(rule);
     installed = rules.map((rule) => rule.id);
-    if (running) await files.refresh();
+    if (running) {
+      await files.refresh();
+      await filesGlobal.refresh();
+    }
+  }
+  async function updateGlobalWatch(change: Parameters<Settings['update']>[0]): Promise<void> {
+    const epoch = generation;
+    check(epoch);
+    await settings.update(change);
+    check(epoch);
+    if (running) await filesGlobal.refresh();
+    changed();
   }
   async function update(change: Parameters<Settings['update']>[0]): Promise<void> {
     const epoch = generation;
@@ -219,11 +260,13 @@ export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}
       paused = value;
       if (value) {
         schedule();
-        await settleShutdown([body.setPaused(true), files.refresh(), helper.stop()]);
+        await settleShutdown([body.setPaused(true), files.refresh(), filesGlobal.refresh(), helper.stop()]);
       } else {
         await body.setPaused(false);
         check();
         await files.refresh();
+        check();
+        await filesGlobal.refresh();
         check();
         helper.start(settings.sendTitles);
         schedule();
@@ -252,7 +295,7 @@ export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}
       }),
     pause: async (value) => {
       await applyPause(value);
-      history.setPaused(paused);
+      history.setPaused(value);
     },
     setSendTitles: async (enabled) => {
       const epoch = generation;
@@ -300,6 +343,43 @@ export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}
         body.sync();
       }),
     dismissTuningBackup: () => body.asUser(() => body.monitor.dismissBackup()),
+    setGlobalFileWatch: async (enabled) => {
+      filesGlobal.resetWatchAvailability();
+      await updateGlobalWatch((draft) => {
+        draft.globalFileWatch = enabled;
+      });
+    },
+    retryGlobalFileWatch: async () => {
+      const epoch = generation;
+      check(epoch);
+      if (running) await filesGlobal.retry();
+      check(epoch);
+      changed();
+    },
+    addFileExclusion: (pattern) => {
+      check();
+      const norm = normalizeFileExclusion(pattern);
+      const key = exclusionKey(norm, platform);
+      return updateGlobalWatch((draft) => {
+        const list = draft.fileExclusions ?? [];
+        if (list.some((item) => exclusionKey(item, platform) === key)) {
+          throw new TypeError('Exclusion pattern already exists');
+        }
+        if (list.length >= MAX_FILE_EXCLUSIONS) {
+          throw new RangeError(`Maximum of ${MAX_FILE_EXCLUSIONS} exclusion patterns reached`);
+        }
+        list.push(norm);
+        draft.fileExclusions = list;
+      });
+    },
+    removeFileExclusion: (pattern) => {
+      check();
+      const norm = normalizeFileExclusion(pattern);
+      const key = exclusionKey(norm, platform);
+      return updateGlobalWatch((draft) => {
+        draft.fileExclusions = (draft.fileExclusions ?? []).filter((item) => exclusionKey(item, platform) !== key);
+      });
+    },
   };
   const guarded = guardActions(unguarded, () => generation, check);
   const actions = guarded.actions;
@@ -340,6 +420,7 @@ export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}
       callbacks,
       guarded.wait(),
       files.stop(),
+      filesGlobal.stop(),
       helper.stop(),
       body.stop(),
       history.stop(),
@@ -369,6 +450,8 @@ export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}
         await target.start();
         check(epoch);
         await files.refresh();
+        check(epoch);
+        await filesGlobal.refresh();
         check(epoch);
         if (!paused) helper.start(settings.sendTitles);
         nextToken = clock.mono() + 5_000;

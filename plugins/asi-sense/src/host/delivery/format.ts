@@ -139,6 +139,28 @@ function changeLines(ch: EnvChange, includeTitles: boolean, includeJobCommands: 
       }
     }
     if (s.data.externalDeletionExceeded === true) main += ' externalDeletionExceeded=true';
+    if (s.kind === 'file.burst' && s.data.rolledUp === true) main += ' rolledUp=true';
+  } else if (s.kind === 'file.activity') {
+    const directory = typeof s.data?.directory === 'string' && s.data.directory.trim() ? s.data.directory : '';
+    const head = directory || str(s.subject) || '[path]';
+    main = `file.activity: ${esc(head)}`;
+    for (const key of ['windowMs', 'created', 'modified', 'deleted']) {
+      const value = s.data?.[key];
+      if (typeof value === 'number' && Number.isFinite(value)) {
+        main += ` ${key}=${value}`;
+      }
+    }
+    if (typeof s.data?.rolledUp === 'number' && Number.isFinite(s.data.rolledUp) && s.data.rolledUp > 0) {
+      main += ` rolledUp=${s.data.rolledUp}`;
+    }
+    if (Array.isArray(s.data?.files)) {
+      const files = s.data.files
+        .filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
+        .slice(0, 5)
+        .map((item) => esc(item));
+      if (files.length > 0) main += ` files=[${files.join(', ')}]`;
+    }
+    if (s.data?.degraded === true) main += ' degraded=true';
   } else if (s.kind === 'fact.updated') {
     // Internal seam: a focused-window fact update still carries a title —
     // hide it entirely when titles are disabled.

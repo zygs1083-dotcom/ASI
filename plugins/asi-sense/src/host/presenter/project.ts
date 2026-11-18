@@ -108,6 +108,32 @@ function eventDetail(entry: EventEntry): SenseEvent['detail'] {
       modified: d.modified,
       deleted: d.deleted,
       excessiveDeletion: d.externalDeletionExceeded === true,
+      ...(d.rolledUp === true ? { rolledUp: true } : {}),
+    };
+  }
+  if (
+    entry.kind === 'file.activity' &&
+    typeof d.directory === 'string' &&
+    typeof d.windowMs === 'number' &&
+    typeof d.created === 'number' &&
+    typeof d.modified === 'number' &&
+    typeof d.deleted === 'number'
+  ) {
+    const files = Array.isArray(d.files)
+      ? d.files.filter((item): item is string => typeof item === 'string' && item.length > 0).slice(0, 5)
+      : typeof d.files === 'string' && d.files.length > 0
+        ? d.files.split(', ').filter(Boolean).slice(0, 5)
+        : [];
+    return {
+      kind: 'file.activity',
+      directory: d.directory,
+      windowMs: d.windowMs,
+      created: d.created,
+      modified: d.modified,
+      deleted: d.deleted,
+      files,
+      ...(typeof d.rolledUp === 'number' && d.rolledUp > 0 ? { rolledUp: d.rolledUp } : {}),
+      ...(d.degraded === true ? { degraded: true } : {}),
     };
   }
   return undefined;

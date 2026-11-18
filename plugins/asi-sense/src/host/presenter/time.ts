@@ -27,7 +27,7 @@ export function createTimeline(runtime: Runtime, clock: Clock) {
         return;
       }
       const entry = value as Record<string, unknown>;
-      for (const key of ['lastSignalAt', 'lastChange', 'startedAt']) {
+      for (const key of ['lastSignalAt', 'lastChange', 'startedAt', 'retryAt']) {
         if (typeof entry[key] === 'number') entry[key] = stable(`${path}/${key}`, entry[key]);
       }
       if (typeof entry.observedAt === 'number') {

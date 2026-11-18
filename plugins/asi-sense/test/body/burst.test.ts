@@ -1,6 +1,7 @@
 import type { Signal } from '@asi/sense-types';
 import { describe, expect, it } from 'vitest';
 import { type BurstTarget, FileBurstDetector as Detector } from '../../src/host/body/burst.ts';
+import { sig } from '../helpers.ts';
 import { fileChanged } from './helpers.ts';
 
 let seq = 0;
@@ -205,5 +206,109 @@ describe('FileBurstDetector per-scope windows', () => {
     const out2 = d.accept(del(3, '/w/d'), 3, [dirScope, globScope]);
     expect(out2).toHaveLength(2); // 3rd delete in EACH scope → two tagged signals
     expect(out2.map((s) => s.data.scope).sort()).toEqual(['dir:/w', 'glob:/w/*']);
+  });
+
+  it('counts aggregated file.activity deletions and keeps agent cause from waking', () => {
+    const d = new FileBurstDetector({ windowMs: 60_000, maxChanges: 100, maxDeleted: 50 });
+    d.setScopes(['global']);
+    const globalTarget = [{ scope: 'global', dir: '/workspace/proj' }];
+    const agentAct = sig({
+      id: 'act-agent',
+      kind: 'file.activity',
+      at: 100,
+      subject: '/workspace/proj',
+      cause: 'agent',
+      data: { directory: '/workspace/proj', windowMs: 10_000, created: 0, modified: 0, deleted: 60, files: ['a.ts'] },
+    });
+    const agentOut = d.accept(agentAct, 100, globalTarget);
+    expect(agentOut).toHaveLength(1);
+    expect(agentOut[0]).toMatchObject({
+      kind: 'file.burst',
+      cause: 'agent',
+      data: {
+        agentDeleted: 60,
+        deleted: 60,
+        externalDeletionExceeded: false,
+        wake: false,
+        level: 'record',
+      },
+    });
+
+    const extAct = sig({
+      id: 'act-ext',
+      kind: 'file.activity',
+      at: 200,
+      subject: '/workspace/proj',
+      data: { directory: '/workspace/proj', windowMs: 10_000, created: 1, modified: 2, deleted: 51, files: ['b.ts'] },
+    });
+    const out = d.accept(extAct, 200, globalTarget);
+    expect(out).toHaveLength(1);
+    expect(out[0]).toMatchObject({
+      kind: 'file.burst',
+      subject: '/workspace/proj',
+      data: {
+        created: 1,
+        modified: 2,
+        deleted: 111,
+        agentDeleted: 60,
+        externalDeletionExceeded: true,
+        wake: true,
+        scope: 'global',
+      },
+    });
+  });
+
+  it('rolls up overflow directories into parent directory with rolledUp: true when exceeding maxDirectories', () => {
+    const d = new FileBurstDetector({ windowMs: 60_000, maxChanges: 8, maxDeleted: 3, maxDirectories: 4 });
+    d.setScopes(['global']);
+    const emitAct = (at: number, dir: string, deleted: number) =>
+      d.accept(
+        sig({
+          id: `act-${at}-${dir}`,
+          kind: 'file.activity',
+          at,
+          subject: dir,
+          data: { directory: dir, windowMs: 10_000, created: 1, modified: 0, deleted, files: ['a.ts'] },
+        }),
+        at,
+        [{ scope: 'global', dir }],
+      );
+
+    expect(emitAct(100, '/work/proj/d1', 1)).toHaveLength(0);
+    expect(emitAct(200, '/work/proj/d2', 1)).toHaveLength(0);
+    expect(emitAct(300, '/work/proj/d3', 1)).toHaveLength(0);
+    expect(emitAct(400, '/work/proj/d4', 1)).toHaveLength(0);
+    // 5th distinct dir exceeds maxDirectories=4: d1 & d2 roll up into /work/proj (deleted=2, created=2),
+    // and d5 folds into ancestor /work/proj (deleted=3, created=3, total=6 <= maxChanges=8 & deleted=3 <= maxDeleted=3)
+    const r1 = emitAct(500, '/work/proj/d5', 1);
+    expect(r1).toHaveLength(0);
+    // 6th activity directly pushes rolled-up /work/proj over maxDeleted=3 -> wake with rolledUp: true
+    const out = emitAct(600, '/work/proj', 1);
+    expect(out).toHaveLength(1);
+    expect(out[0]).toMatchObject({
+      kind: 'file.burst',
+      subject: '/work/proj',
+      data: {
+        deleted: 4,
+        created: 4,
+        rolledUp: true,
+        wake: true,
+        scope: 'global',
+      },
+    });
+  });
+
+  it('keeps bounded slotted ring memory without storing individual events under high throughput', () => {
+    const d = new FileBurstDetector({ windowMs: 60_000, maxChanges: 1_000_000, maxDeleted: 1_000_000 });
+    for (let i = 0; i < 50_000; i++) {
+      d.accept(mod(i, '/work/hot/file.ts'), i);
+    }
+    const dirs = (d as unknown as { dirs: Map<string, Record<string, unknown>> }).dirs;
+    expect(dirs.size).toBe(1);
+    const state = dirs.get('dir:/work/hot\0/work/hot');
+    expect(state).toBeDefined();
+    expect(state?.slotIds).toBeInstanceOf(Float64Array);
+    expect(state?.slotCounts).toBeInstanceOf(Uint32Array);
+    expect(Object.keys(state ?? {})).not.toContain('events');
   });
 });
