@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { modelText, modelTitle } from '../../src/host/dsh/tool-output.ts';
+import { modelPath, modelText, modelTitle } from '../../src/host/dsh/tool-output.ts';
 
 const LONE_SURROGATE_RE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
 
@@ -98,7 +98,8 @@ function buildSecret(rng: () => number): FuzzCase {
       ['203.0.113.77:8443', ['203.0', '0.113', '113.77', '8443']],
       ['198.51.100.42\u0301', ['198.51', '51.100', '100.42']],
       ['198\u0301.51.100.42', ['198.51', '51.100', '100.42']],
-      ['198.51', ['198.51']],
+      ['198.51.100.1', ['198.51', '51.100', '100.1']],
+      ['198.51/24', ['198.51']],
       ['(203.0.113.77)', ['203.0', '0.113', '113.77']],
       ['zqvx-node.com', ['zqvx-node']],
       ['zqvx-corp.nz', ['zqvx-corp']],
@@ -304,7 +305,12 @@ describe('conservative redaction fuzz suite', () => {
         ['ping zqvx-fe80%eth0', 'fixture-host', 'eth0'],
         ['ping zqvx-link%en0', 'fixture-host', 'en0'],
         ['ping zqvx-id％eth0', 'fixture-host', 'eth0'],
+        ['open host%eth0/README.md', 'fixture-host', 'eth0'],
       ]);
+      // M2a: path containing % before / must be rejected as host rather than stripped to basename README.md
+      for (const fn of [modelTitle, modelText]) {
+        expect(fn('open host%eth0/README.md', 'fixture-host')).not.toContain('README.md');
+      }
     });
 
     it('M3: rejects bracketed host/address tokens without :: or /', () => {
@@ -312,7 +318,12 @@ describe('conservative redaction fuzz suite', () => {
         ['open [zqvx-node]', 'fixture-host', 'zqvx-node'],
         ['open [198-51]', 'fixture-host', '198-51'],
         ['open ［zqvx-box］', 'fixture-host', 'zqvx-box'],
+        ['open [secret-org]/repo/README.md', 'fixture-host', 'secret-org'],
       ]);
+      // M3a: bracketed endpoint in path must redact the whole path instead of keeping README.md
+      for (const fn of [modelTitle, modelText]) {
+        expect(fn('open [secret-org]/repo/README.md', 'fixture-host')).not.toContain('README.md');
+      }
     });
 
     it('M4: rejects colon host:port, standalone :port, and host: port tokens', () => {
@@ -323,7 +334,14 @@ describe('conservative redaction fuzz suite', () => {
         ['connect zqvx-node：8443', 'fixture-host', '8443'],
         ['connect zqvx-node∶8080', 'fixture-host', '8080'],
         ['connect foo:zqvx.corp:8080', 'fixture-host', 'zqvx'],
+        ['connect host\uff1a 8443', 'fixture-host', '8443'],
+        ['connect host\u2236 9090', 'fixture-host', '9090'],
       ]);
+      // M10b & M11: fullwidth/ratio colon before space still triggers port redaction and NFKC colon output
+      expect(modelTitle('connect host\uff1a 8443', 'fixture-host')).toBe('connect host: <host>');
+      expect(modelText('connect host\uff1a 8443', 'fixture-host')).toBe('connect host: [host]');
+      expect(modelTitle('connect host\u2236 9090', 'fixture-host')).toBe('connect host: <host>');
+      expect(modelText('connect host\u2236 9090', 'fixture-host')).toBe('connect host: [host]');
     });
 
     it('M5: rejects 1-2 segment UNC and //server paths including mixed slashes', () => {
@@ -334,6 +352,11 @@ describe('conservative redaction fuzz suite', () => {
         ['open \\/zqvx-srv/mkgp-share', 'fixture-host', 'mkgp-share'],
         ['open /\\zqvx-srv\\mkgp-share', 'fixture-host', 'mkgp-share'],
       ]);
+      // M5b: modelPath must redact UNC/server paths and mid-dot hostnames rather than exposing basename
+      expect(modelPath('//corp-fs/secret-share')).toBe('[path]');
+      expect(modelPath('\\\\corp-fs\\secret-share')).toBe('[path]');
+      expect(modelPath('//corp-fs')).toBe('[path]');
+      expect(modelPath('/Users/alice/dir/secret\u00b7corp\u00b7internal')).toBe('[path]');
     });
 
     it('M6: rejects :: IPv6/colon tokens without dots or brackets', () => {
@@ -344,13 +367,19 @@ describe('conservative redaction fuzz suite', () => {
       ]);
     });
 
-    it('M7: rejects 3+ dot segments without :// or :', () => {
+    it('M7: rejects 3+ dot segments without :// or : unless valid multi-dot safe filename', () => {
       assertHidden([
         ['visit zqvx.mkgp.internal', 'fixture-host', 'zqvx'],
         ['ping 198.51.100.42', 'fixture-host', '198.51'],
         ['ping 198．51．100．42', 'fixture-host', '198.51'],
         ['ping 198․51․100․42', 'fixture-host', '198.51'],
+        ['open secret.corp.nz', 'fixture-host', 'secret'],
+        ['open 192.168.1.1.md', 'fixture-host', '192.168'],
+        ['open a.b.c.d.md', 'fixture-host', 'a.b.c.d'],
+        ['open secret\u00b7corp\u00b7md', 'fixture-host', 'secret'],
+        ['open .secret.md', 'fixture-host', 'secret'],
       ]);
+      expect(modelTitle('open report.final.pdf', 'fixture-host')).toBe('open report.final.pdf');
     });
 
     it('M8: rejects :// scheme tokens without extra dots or ports', () => {
@@ -359,7 +388,11 @@ describe('conservative redaction fuzz suite', () => {
         ['open ssh://zqvx-box', 'fixture-host', 'zqvx-box'],
         ['open https：//zqvx-db', 'fixture-host', 'zqvx-db'],
         ['open https：∕∕zqvx-db', 'fixture-host', 'zqvx-db'],
+        ['open c://secret-host/dir/file.md', 'fixture-host', 'secret-host'],
       ]);
+      // M8: drive-letter scheme form must redact the whole endpoint instead of exposing file.md
+      expect(modelTitle('open c://secret-host/dir/file.md', 'fixture-host')).toBe('open <host>');
+      expect(modelText('open c://secret-host/dir/file.md', 'fixture-host')).toBe('open [endpoint]');
     });
 
     it('M9: splits on non-ASCII Unicode whitespace and strips zero-width bypasses', () => {
@@ -369,7 +402,14 @@ describe('conservative redaction fuzz suite', () => {
         ['open\u2028Zqvx\u00a0Node', 'Zqvx Node', 'node'],
         ['open zqvx\u200b-node', 'zqvx-node', 'zqvx'],
         ['ping 198\u200b.51\u200c.100\ufeff.42', 'fixture-host', '198.51'],
+        ['on build-host', 'build\u200b-host', 'build'],
       ]);
+      // M9a: Unicode whitespace collapses and splits tokens rather than treating the whole run as opaque
+      expect(modelTitle('open\u00a0README.md\u3000ok', 'fixture-host')).toBe('open README.md ok');
+      expect(modelText('open\u00a0Zqvx Node', 'Zqvx Node')).toBe('open [host]');
+      // M9b: default-ignorable code points are stripped from both input and hostname
+      expect(modelTitle('on a\u200bb', 'fixture-host')).toBe('on ab');
+      expect(modelTitle('on build-host', 'build\u200b-host')).toBe('on <host>');
     });
 
     it('M10: enforces full Unicode case folding and NFC/NFD/NFKC hostname equivalence', () => {

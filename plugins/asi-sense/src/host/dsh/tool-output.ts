@@ -7,27 +7,24 @@ import type { JsonValue } from './wire-types.ts';
 
 const MAX_BYTES = 32_768;
 const MAX_TITLE_LENGTH = 512;
-const PLACEHOLDERS = ['<host>', '[host]', '[endpoint]', '[path]', '[redacted]'] as const;
+const MAX_TOKEN_CODEPOINTS = 256;
+const MAX_RAW_NORMALIZE_CODEPOINTS = 1024;
+const PLACEHOLDERS = ['<host>', '[host]', '[endpoint]', '[path]', '[redacted]', '[long]'] as const;
 const PLACEHOLDERS_SET = new Set<string>(PLACEHOLDERS);
 const COMBINING_MARK_AT_RE = /\p{M}/uy;
+const COMBINING_MARK_TEST_RE = /\p{M}/u;
+const COMBINING_MARK_RE = /\p{M}/gu;
+const ASCII_ENDPOINT_META_RE = /[:@%[\]]/;
+const DOUBLE_SLASH_ASCII_RE = /\/\/|\\\\|\/\\|\\\//;
 const SURROGATE_RE = /[\ud800-\udfff]/;
 const NON_ASCII_RE = /[\u0080-\uffff]/;
 const FAST_TRUNCATE_UNSAFE_RE = /[\p{M}\u1160-\u11ff\ud7b0-\ud7ff<[]/u;
-const NEEDS_CLUSTER_NFC_RE =
-  /[\p{M}\u1100-\u11ff\ud7b0-\ud7ff\u00b5\u00df\u0130\u0149\u017f\u01f0\u037e\u03c2\u03d0-\u03f5\u0587\u1c80-\u1c88\u1e96-\u1e9e\u1f80-\u1ffc\u1fef\u2100-\u214f\ufb00-\ufb17\uff01-\uff5e]/u;
+const NEEDS_CLUSTER_NFC_RE = /[\p{M}\u1100-\u11ff\ud7b0-\ud7ff\u00df\u0130\u01f0\u03c2\u1e9e]|\ufe0f/u;
+const ASCII_HOST_NEEDS_CLUSTER_RE = /[\u00df\u1e9e]/;
 const CLUSTER_BOUND_LOOKAHEAD = '(?![\\p{M}\\u1160-\\u11ff\\ud7b0-\\ud7ff])';
 
-const ZERO_WIDTH_QUICK_RE = /\u034f|[\u00ad\u061c\u180e\u200b-\u200f\u202a-\u202e\u2060-\u2064\u2066-\u2069\ufeff]/;
-const ZERO_WIDTH_UNCONDITIONAL_RE =
-  /\u034f+|[\u00ad\u061c\u180e\u200b\u200c\u200e\u200f\u202a-\u202e\u2060-\u2064\u2066-\u2069\ufeff]+/g;
-
-// Covers ASCII / \ plus every Unicode char whose NFKC or homoglyph mapping produces / or \.
-const MAYBE_SLASH_RE =
-  /[/\\\u00bc-\u00be\u2044\u2100\u2101\u2105\u2106\u2150-\u215f\u2189\u2215\u2216\u2571\u2572\u29f5\u29f8\u29f9\u33a7\u33a8\u33ae\u33af\u33c6\u33de\u33df\ufe68\uff0f\uff3c]/;
-
-// Covers ASCII @ % [ ] : plus Unicode/NFKC/homoglyph equivalents.
-const MAYBE_ENDPOINT_META_RE =
-  /[:@%[\]\u02d0\u02f8\u0589\u05c3\u066a\u0703\u1361\u1803\u2052\u205a\u205d\u2236\u2a74\ua789\ufe13\ufe47\ufe48\ufe55\ufe6a\ufe6b\uff05\uff1a\uff20\uff3b\uff3d]/;
+const DEFAULT_IGNORABLE_QUICK_RE =
+  /\u034f|[\u180b-\u180f]|[\ufe00-\ufe0f]|[\u00ad\u061c\u115f\u1160\u17b4\u17b5\u200b-\u200f\u202a-\u202e\u2060-\u206f\u3164\ufeff\uffa0\ufff0-\ufff8]|\ud82f[\udca0-\udca3]|\ud834[\udd73-\udd7a]|\udb40[\udc00-\udfff]/;
 
 const SINGLE_CHAR_HOMOGLYPHS: Readonly<Record<string, string>> = {
   '\u2215': '/',
@@ -49,13 +46,25 @@ const SINGLE_CHAR_HOMOGLYPHS: Readonly<Record<string, string>> = {
   '\u205a': ':',
   '\u205d': ':',
   '\ua789': ':',
-  '\u2024': '.',
-  '\u2027': '.',
-  '\u3002': '.',
-  '\uff61': '.',
   '\u066a': '%',
   '\u2052': '%',
+  '\u2010': '-',
+  '\u2212': '-',
 };
+
+const HOMOGLYPH_QUICK_RE =
+  /[\u02d0\u02f8\u0589\u05c3\u066a\u0703\u1361\u1803\u2010\u2044\u2052\u205a\u205d\u2212\u2215\u2216\u2236\u2571\u2572\u29f5\u29f8\u29f9\ua789]/;
+
+const CONNECTOR_TEST_RE = /[·•‧∙・—–‒'’‘…。‥]|\.{2,}/;
+const CONNECTOR_SPLIT_RE = /[·•‧∙・—–‒'’‘…。‥]+|\.{2,}/;
+const CN_PUNCT_TEST_RE = /[【】「」『』《》〈〉“”、]/;
+const CN_PUNCT_SPLIT_RE = /[【】「」『』《》〈〉“”、]+/;
+const STANDALONE_SEPARATORS = new Set(['-', '–', '—', '|', '·', '•']);
+const VALID_TIME_RE = /^(?:[01]?\d|2[0-3]):[0-5]\d(?::[0-5]\d)?$/;
+const VALID_VERSION_HEAD_RE = /^v?\d+$/i;
+const PURE_DIGITS_RE = /^\d+$/;
+const SAFE_EXT_RE = /^[a-zA-Z]{1,5}$/;
+const ASCII_LIST_ENUM_RE = /^[a-z0-9-]+(?:、[a-z0-9-]+)+$/i;
 
 const SAFE_FILE_EXTENSIONS = new Set([
   'md',
@@ -158,6 +167,18 @@ function countCodePoints(text: string): number {
   return count;
 }
 
+function readCodePointAt(text: string, index: number): { cp: number; len: number; valid: boolean } {
+  const code = text.charCodeAt(index);
+  if (code < 0xd800 || code > 0xdfff) return { cp: code, len: 1, valid: true };
+  if (code <= 0xdbff && index + 1 < text.length) {
+    const low = text.charCodeAt(index + 1);
+    if (low >= 0xdc00 && low <= 0xdfff) {
+      return { cp: 0x10000 + ((code - 0xd800) << 10) + (low - 0xdc00), len: 2, valid: true };
+    }
+  }
+  return { cp: code, len: 1, valid: false };
+}
+
 function sliceByCodePoints(text: string, maxCodePoints: number): string {
   if (maxCodePoints <= 0) return '';
   if (text.length <= maxCodePoints) return text;
@@ -172,6 +193,16 @@ function sliceByCodePoints(text: string, maxCodePoints: number): string {
     i += cp > 0xffff ? 2 : 1;
   }
   return i === text.length ? text : text.slice(0, i);
+}
+
+function isClusterContinuation(text: string, index: number, cp: number): boolean {
+  if (index === 0) return false;
+  if (cp < 0x0300 || (cp >= 0x4e00 && cp <= 0x9fff) || (cp >= 0xac00 && cp <= 0xd7a3)) return false;
+  if (cp <= 0x036f) return true;
+  if (cp >= 0x1160 && cp <= 0x11ff) return true;
+  if (cp >= 0xd7b0 && cp <= 0xd7ff) return true;
+  COMBINING_MARK_AT_RE.lastIndex = index;
+  return COMBINING_MARK_AT_RE.test(text);
 }
 
 function truncateRedacted(text: string, limit: number): string {
@@ -228,53 +259,214 @@ function isAsciiLetter(code: number): boolean {
   return (code >= 65 && code <= 90) || (code >= 97 && code <= 122);
 }
 
-const EP_SINGLE_RE = /^\p{Extended_Pictographic}$/u;
-const EP_MOD_OR_VS_RE = /^[\ufe0e\ufe0f\p{Emoji_Modifier}]$/u;
-
-function hasEmojiBeforeOffset(str: string, offset: number): boolean {
-  if (offset <= 0) return false;
-  let prevStart = offset - 1;
-  const prevUnit = str.charCodeAt(prevStart);
-  if (prevUnit >= 0xdc00 && prevUnit <= 0xdfff && prevStart > 0) {
-    const high = str.charCodeAt(prevStart - 1);
-    if (high >= 0xd800 && high <= 0xdbff) prevStart--;
-  }
-  const prevCh = str.slice(prevStart, offset);
-  if (EP_SINGLE_RE.test(prevCh)) return true;
-  if (!EP_MOD_OR_VS_RE.test(prevCh) || prevStart <= 0) return false;
-  let baseStart = prevStart - 1;
-  const baseUnit = str.charCodeAt(baseStart);
-  if (baseUnit >= 0xdc00 && baseUnit <= 0xdfff && baseStart > 0) {
-    const high = str.charCodeAt(baseStart - 1);
-    if (high >= 0xd800 && high <= 0xdbff) baseStart--;
-  }
-  return EP_SINGLE_RE.test(str.slice(baseStart, prevStart));
+function isWhitespaceCode(code: number): boolean {
+  if (code === 32 || (code >= 9 && code <= 13)) return true;
+  if (code < 0xa0) return false;
+  return (
+    code === 0x00a0 ||
+    code === 0x1680 ||
+    (code >= 0x2000 && code <= 0x200a) ||
+    code === 0x2028 ||
+    code === 0x2029 ||
+    code === 0x202f ||
+    code === 0x205f ||
+    code === 0x3000
+  );
 }
 
-function stripZeroWidth(text: string): string {
-  if (!ZERO_WIDTH_QUICK_RE.test(text)) return text;
-  const stripped = text.replace(ZERO_WIDTH_UNCONDITIONAL_RE, '');
-  if (!stripped.includes('\u200d')) return stripped;
-  let out = '';
-  let last = 0;
-  for (let i = 0; i < stripped.length; i++) {
-    if (stripped.charCodeAt(i) !== 0x200d) continue;
-    const afterSlice = stripped.slice(i + 1, i + 3);
-    const afterCp = afterSlice.codePointAt(0);
-    const afterChar = afterCp === undefined ? '' : String.fromCodePoint(afterCp);
-    if (hasEmojiBeforeOffset(stripped, i) && EP_SINGLE_RE.test(afterChar)) continue;
-    out += stripped.slice(last, i);
-    last = i + 1;
+function isDefaultIgnorableCode(cp: number): boolean {
+  if (cp < 0x00ad) return false;
+  if (cp <= 0x206f) {
+    return (
+      cp === 0x00ad ||
+      cp === 0x034f ||
+      cp === 0x061c ||
+      cp === 0x115f ||
+      cp === 0x1160 ||
+      cp === 0x17b4 ||
+      cp === 0x17b5 ||
+      (cp >= 0x180b && cp <= 0x180f) ||
+      (cp >= 0x200b && cp <= 0x200f) ||
+      (cp >= 0x202a && cp <= 0x202e) ||
+      (cp >= 0x2060 && cp <= 0x206f)
+    );
   }
-  return last === 0 ? stripped : out + stripped.slice(last);
+  if (cp <= 0xffff) {
+    return (
+      cp === 0x3164 ||
+      (cp >= 0xfe00 && cp <= 0xfe0f) ||
+      cp === 0xfeff ||
+      cp === 0xffa0 ||
+      (cp >= 0xfff0 && cp <= 0xfff8)
+    );
+  }
+  return (cp >= 0x1bca0 && cp <= 0x1bca3) || (cp >= 0x1d173 && cp <= 0x1d17a) || (cp >= 0xe0000 && cp <= 0xe0fff);
+}
+
+const EP_SINGLE_RE = /^\p{Extended_Pictographic}$/u;
+const EP_MOD_OR_VS_RE = /^[\ufe0f\p{Emoji_Modifier}]$/u;
+
+function prevCharStart(str: string, end: number): number {
+  let start = end - 1;
+  const unit = str.charCodeAt(start);
+  if (unit >= 0xdc00 && unit <= 0xdfff && start > 0) {
+    const high = str.charCodeAt(start - 1);
+    if (high >= 0xd800 && high <= 0xdbff) start--;
+  }
+  return start;
+}
+
+function endsWithEmojiSingle(str: string): boolean {
+  if (!str) return false;
+  return EP_SINGLE_RE.test(str.slice(prevCharStart(str, str.length)));
+}
+
+function endsWithEmojiForZwj(str: string): boolean {
+  if (!str) return false;
+  const prevStart = prevCharStart(str, str.length);
+  const prevCh = str.slice(prevStart);
+  if (EP_SINGLE_RE.test(prevCh)) return true;
+  if (!EP_MOD_OR_VS_RE.test(prevCh) || prevStart <= 0) return false;
+  return EP_SINGLE_RE.test(str.slice(prevCharStart(str, prevStart), prevStart));
+}
+
+function startsWithEmojiSingle(str: string, offset: number): boolean {
+  if (offset >= str.length) return false;
+  const { cp, len, valid } = readCodePointAt(str, offset);
+  if (!valid) return false;
+  return cp >= 0x80 && EP_SINGLE_RE.test(str.slice(offset, offset + len));
+}
+
+/**
+ * Strips all `\p{Default_Ignorable_Code_Point}` except `U+FE0F` immediately following
+ * `\p{Extended_Pictographic}` and `U+200D` joining `\p{Extended_Pictographic}` sequences.
+ */
+function stripDefaultIgnorables(text: string): string {
+  if (!DEFAULT_IGNORABLE_QUICK_RE.test(text)) return text;
+  let pre = '';
+  let lastPre = 0;
+  for (let i = 0; i < text.length; ) {
+    const { cp, len, valid } = readCodePointAt(text, i);
+    if (valid && cp !== 0x200d && cp !== 0xfe0f && isDefaultIgnorableCode(cp)) {
+      pre += text.slice(lastPre, i);
+      lastPre = i + len;
+    }
+    i += len;
+  }
+  const clean = lastPre === 0 ? text : pre + text.slice(lastPre);
+  if (!clean.includes('\u200d') && !clean.includes('\ufe0f')) return clean;
+
+  let out = '';
+  for (let i = 0; i < clean.length; ) {
+    const { cp, len, valid } = readCodePointAt(clean, i);
+    if (valid && cp === 0xfe0f) {
+      if (endsWithEmojiSingle(out)) out += '\ufe0f';
+    } else if (valid && cp === 0x200d) {
+      if (endsWithEmojiForZwj(out) && startsWithEmojiSingle(clean, i + len)) out += '\u200d';
+    } else {
+      out += clean.slice(i, i + len);
+    }
+    i += len;
+  }
+  return out;
+}
+
+function applyHomoglyphs(text: string): string {
+  if (!HOMOGLYPH_QUICK_RE.test(text)) return text;
+  let out = '';
+  for (let i = 0; i < text.length; ) {
+    const ch = text[i] as string;
+    const mapped = SINGLE_CHAR_HOMOGLYPHS[ch];
+    if (mapped !== undefined) {
+      out += mapped;
+      i += 1;
+      continue;
+    }
+    const { len } = readCodePointAt(text, i);
+    out += text.slice(i, i + len);
+    i += len;
+  }
+  return out;
+}
+
+/** Normalizes a short segment (<= MAX_RAW_NORMALIZE_CODEPOINTS) into canonical output text. */
+function normalizeShortSegment(raw: string): string {
+  if (!NON_ASCII_RE.test(raw)) return raw;
+  let needsNorm = false;
+  for (let i = 0; i < raw.length; i++) {
+    const code = raw.charCodeAt(i);
+    if (code < 0x80) continue;
+    if (
+      (code >= 0x4e00 && code <= 0x9fff) ||
+      (code >= 0xac00 && code <= 0xd7a3) ||
+      (code >= 0x3400 && code <= 0x4dbf)
+    ) {
+      continue;
+    }
+    needsNorm = true;
+    break;
+  }
+  if (!needsNorm) return raw;
+  let norm = raw.normalize('NFKC');
+  const stripped = stripDefaultIgnorables(norm);
+  if (stripped.length !== norm.length) norm = stripped.normalize('NFKC');
+  return applyHomoglyphs(norm);
+}
+
+/** Collapses Unicode whitespace runs in a short normalized string to single ASCII spaces. */
+function collapseNormalizedWhitespace(text: string): string {
+  let hasWs = false;
+  for (let i = 0; i < text.length; i++) {
+    const code = text.charCodeAt(i);
+    if (isWhitespaceCode(code)) {
+      hasWs = true;
+      break;
+    }
+  }
+  if (!hasWs) return text;
+  let out = '';
+  let inSpace = false;
+  for (let i = 0; i < text.length; ) {
+    const code = text.charCodeAt(i);
+    if (isWhitespaceCode(code)) {
+      if (!inSpace) {
+        out += ' ';
+        inSpace = true;
+      }
+      i += 1;
+      continue;
+    }
+    inSpace = false;
+    const len = code >= 0xd800 && code <= 0xdbff && i + 1 < text.length ? 2 : 1;
+    out += text.slice(i, i + len);
+    i += len;
+  }
+  return out;
+}
+
+function normalizeFullShort(raw: string): string {
+  return collapseNormalizedWhitespace(normalizeShortSegment(raw));
 }
 
 function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
+function stripEmojiVsForMatch(value: string): string {
+  if (!value.includes('\ufe0f')) return value;
+  let out = '';
+  for (let i = 0; i < value.length; ) {
+    const { cp, len, valid } = readCodePointAt(value, i);
+    if (!(valid && cp === 0xfe0f && endsWithEmojiSingle(out))) {
+      out += value.slice(i, i + len);
+    }
+    i += len;
+  }
+  return out;
+}
+
 function foldCaseNfc(value: string): string {
-  const nfkc = value.normalize('NFKC');
+  const nfkc = stripEmojiVsForMatch(value.normalize('NFKC'));
   const lowered = nfkc.includes('\u0130') ? nfkc.replaceAll('\u0130', 'i\u0307').normalize('NFKC') : nfkc;
   if (lowered.includes('\u0131')) {
     return lowered
@@ -285,26 +477,16 @@ function foldCaseNfc(value: string): string {
   return lowered.toLowerCase().toUpperCase().toLowerCase().normalize('NFKC');
 }
 
-function isClusterContinuation(text: string, index: number, cp: number): boolean {
-  if (index === 0) return false;
-  if (cp < 0x0300 || (cp >= 0x4e00 && cp <= 0x9fff) || (cp >= 0xac00 && cp <= 0xd7a3)) return false;
-  if (cp <= 0x036f) return true;
-  if (cp >= 0x1160 && cp <= 0x11ff) return true;
-  if (cp >= 0xd7b0 && cp <= 0xd7ff) return true;
-  COMBINING_MARK_AT_RE.lastIndex = index;
-  return COMBINING_MARK_AT_RE.test(text);
-}
-
 interface HostSpec {
+  rawNormalized: string;
   folded: string;
-  escapedPattern: string;
   asciiRe: RegExp;
   nfcRe: RegExp;
   ascii: boolean;
   clusters: number;
   maxNfdClusterCps: number;
   hasDelimiters: boolean;
-  allDelimiters: boolean;
+  tailGuardClusters: number;
   unmatchable: string;
 }
 
@@ -344,123 +526,48 @@ function measureNfdClusters(value: string): { clusters: number; maxNfdClusterCps
 }
 
 function analyzeHost(hostname: string): HostSpec | undefined {
-  const cleanHost = stripZeroWidth(hostname);
-  if (!cleanHost) return undefined;
-  const cached = HOST_SPEC_CACHE.get(cleanHost);
+  if (!hostname) return undefined;
+  const cached = HOST_SPEC_CACHE.get(hostname);
   if (cached) return cached;
-  const asciiInput = isAscii(cleanHost);
-  const foldedRaw = asciiInput ? cleanHost.toLowerCase() : foldCaseNfc(cleanHost);
-  const folded = foldedRaw.replace(/\s+/gu, ' ');
+  const boundedHost = sliceByCodePoints(hostname, MAX_RAW_NORMALIZE_CODEPOINTS);
+  const rawNormalized = normalizeFullShort(boundedHost).trim();
+  if (!rawNormalized) return undefined;
+
+  const asciiInput = isAscii(rawNormalized);
+  const foldedRaw = asciiInput ? rawNormalized.toLowerCase() : foldCaseNfc(rawNormalized);
+  const folded = foldedRaw.replace(/ +/g, ' ');
   const ascii = asciiInput || isAscii(folded);
   let clusters: number;
   let maxNfdClusterCps = 1;
   if (asciiInput) {
     clusters = folded.length;
   } else {
-    const rawStats = measureNfdClusters(cleanHost);
+    const rawStats = measureNfdClusters(rawNormalized);
     const foldedStats = measureNfdClusters(folded);
     clusters = Math.max(rawStats.clusters, foldedStats.clusters);
     maxNfdClusterCps = Math.max(rawStats.maxNfdClusterCps, foldedStats.maxNfdClusterCps);
   }
-  const hasDelimiters = /\s/u.test(folded);
-  const allDelimiters = hasDelimiters && folded.replace(/\s+/gu, '').length === 0;
-  const escapedPattern = folded.split(/\s+/u).map(escapeRegExp).join('\\s+');
+  const hasDelimiters = folded.includes(' ');
+  const escapedPattern = folded.split(' ').map(escapeRegExp).join(' ');
+  const tailGuardClusters = Math.max(clusters, rawNormalized.length, folded.length) + 2;
   const spec: HostSpec = {
+    rawNormalized,
     folded,
-    escapedPattern,
     asciiRe: new RegExp(`${escapedPattern}${CLUSTER_BOUND_LOOKAHEAD}`, 'giu'),
     nfcRe: new RegExp(escapedPattern, 'gu'),
     ascii,
     clusters,
     maxNfdClusterCps,
     hasDelimiters,
-    allDelimiters,
+    tailGuardClusters,
     unmatchable: pickUnmatchable(folded),
   };
   if (HOST_SPEC_CACHE.size >= 32) {
     const oldest = HOST_SPEC_CACHE.keys().next().value;
     if (oldest !== undefined) HOST_SPEC_CACHE.delete(oldest);
   }
-  HOST_SPEC_CACHE.set(cleanHost, spec);
+  HOST_SPEC_CACHE.set(hostname, spec);
   return spec;
-}
-
-function sliceAsciiBound(text: string, maxCodePoints: number): string {
-  if (maxCodePoints <= 0) return '';
-  if (text.length <= maxCodePoints) return text;
-  let i = 0;
-  const candidate = text.slice(0, maxCodePoints);
-  if (!SURROGATE_RE.test(candidate)) {
-    i = maxCodePoints;
-  } else {
-    let cps = 0;
-    while (i < text.length && cps < maxCodePoints) {
-      const cp = text.codePointAt(i) ?? 0;
-      cps += 1;
-      i += cp > 0xffff ? 2 : 1;
-    }
-  }
-  // Only need at most one trailing combining mark past bound for CLUSTER_BOUND_LOOKAHEAD.
-  if (i < text.length) {
-    const nextCp = text.codePointAt(i) ?? 0;
-    if (isClusterContinuation(text, i, nextCp)) {
-      i += nextCp > 0xffff ? 2 : 1;
-    }
-  }
-  return i >= text.length ? text : text.slice(0, i);
-}
-
-function sliceToClusterBound(text: string, maxClusters: number, limit?: number, maxMatchClusterCps = 33): string {
-  if (text.length <= maxClusters && (limit === undefined || text.length <= limit)) return text;
-  const candidate = text.slice(0, maxClusters);
-  if (text.length > maxClusters && !NEEDS_CLUSTER_NFC_RE.test(candidate) && !/[\ud800-\udfff]/.test(candidate)) {
-    const nextCp = text.codePointAt(maxClusters) ?? 0;
-    if (!isClusterContinuation(text, maxClusters, nextCp)) return candidate;
-  }
-  let clusters = 0;
-  let i = 0;
-  let clusterCps = 0;
-  let permanentCps = 0;
-  while (i < text.length) {
-    const code = text.charCodeAt(i);
-    if (code < 0x300 || (code >= 0x4e00 && code <= 0x9fff) || (code >= 0xac00 && code <= 0xd7a3)) {
-      if (i > 0 && ++clusters >= maxClusters) return text.slice(0, i);
-      clusterCps = 1;
-      i += 1;
-      continue;
-    }
-    if (
-      i > 0 &&
-      ((code >= 0x0300 && code <= 0x036f) || (code >= 0x1160 && code <= 0x11ff) || (code >= 0xd7b0 && code <= 0xd7ff))
-    ) {
-      clusterCps++;
-      if (clusterCps === maxMatchClusterCps + 1) {
-        permanentCps += clusterCps;
-      } else if (clusterCps > maxMatchClusterCps + 1) {
-        permanentCps++;
-      }
-      if (limit !== undefined && permanentCps >= limit) return text.slice(0, i + 1);
-      i += 1;
-      continue;
-    }
-    const cp = code >= 0xd800 && code <= 0xdbff ? (text.codePointAt(i) ?? code) : code;
-    const len = cp > 0xffff ? 2 : 1;
-    if (isClusterContinuation(text, i, cp)) {
-      clusterCps++;
-      if (clusterCps === maxMatchClusterCps + 1) {
-        permanentCps += clusterCps;
-      } else if (clusterCps > maxMatchClusterCps + 1) {
-        permanentCps++;
-      }
-      if (limit !== undefined && permanentCps >= limit) return text.slice(0, i + len);
-      i += len;
-      continue;
-    }
-    if (i > 0 && ++clusters >= maxClusters) return text.slice(0, i);
-    clusterCps = 1;
-    i += len;
-  }
-  return text;
 }
 
 function segmentNfcClusters(
@@ -492,11 +599,9 @@ function segmentNfcClusters(
     } else if (segLen === 1) {
       const c0 = text.charCodeAt(segStart);
       if (c0 < 0x0080) {
-        if (c0 >= 65 && c0 <= 90) {
-          pushChanged(String.fromCharCode(c0 + 32), end);
-        }
+        if (c0 >= 65 && c0 <= 90) pushChanged(String.fromCharCode(c0 + 32), end);
         nfcLen += 1;
-      } else if (c0 >= 0x4e00 && c0 <= 0x9fff) {
+      } else if ((c0 >= 0x4e00 && c0 <= 0x9fff) || (c0 >= 0xac00 && c0 <= 0xd7a3) || (c0 >= 0x3400 && c0 <= 0x4dbf)) {
         nfcLen += 1;
       } else {
         const seg = text.slice(segStart, end);
@@ -508,15 +613,6 @@ function segmentNfcClusters(
         if (norm !== seg) pushChanged(norm, end);
         nfcLen += norm.length;
       }
-    } else if (
-      segLen === 2 &&
-      text.charCodeAt(segStart) >= 0x4e00 &&
-      text.charCodeAt(segStart) <= 0x9fff &&
-      text.charCodeAt(segStart + 1) >= 0x0300 &&
-      text.charCodeAt(segStart + 1) <= 0x036f &&
-      (text.charCodeAt(segStart + 1) < 0x0340 || text.charCodeAt(segStart + 1) > 0x0344)
-    ) {
-      nfcLen += 2;
     } else {
       const seg = text.slice(segStart, end);
       let norm = normCache.get(seg);
@@ -565,93 +661,51 @@ function segmentNfcClusters(
   return { rawStarts, nfcStarts, nfc };
 }
 
-const ASCII_HOST_NEEDS_CLUSTER_RE =
-  /[\u00df\u1e9e\u0130\u0149\u037e\u1fef\u1e9a\ufb00-\ufb06\uff01-\uff5e\u2100-\u214f]/u;
-
 /**
- * Replaces case-insensitive NFC-equivalent matches of `host` in `text`
- * without altering non-matching NFD sequences or splitting combining clusters.
- * Also returns the offset after the last replacement (`tailStart`).
+ * Replaces case-insensitive NFC-equivalent matches of `host` in normalized `text`
+ * without splitting combining clusters. Returns the replaced text and `tailStart`
+ * (output offset immediately after the last replacement).
  */
-function replaceHostWithTail(
-  text: string,
-  host: HostSpec,
-  replacement: string,
-  limit?: number,
-): { text: string; tailStart: number } {
+function replaceHostWithTail(text: string, host: HostSpec, replacement: string): { text: string; tailStart: number } {
   if (!text) return { text, tailStart: 0 };
-  if (host.ascii) {
-    if (text.length < host.folded.length && (isAscii(text) || !ASCII_HOST_NEEDS_CLUSTER_RE.test(text))) {
-      return { text, tailStart: 0 };
-    }
-    const boundCps =
-      limit === undefined
-        ? undefined
-        : Math.ceil(limit * Math.max(1, host.folded.length / replacement.length)) + host.folded.length + 1;
-    const bounded = boundCps === undefined ? text : sliceAsciiBound(text, boundCps);
-    if (isAscii(bounded) || !ASCII_HOST_NEEDS_CLUSTER_RE.test(bounded)) {
-      const hostRe = host.asciiRe;
-      hostRe.lastIndex = 0;
-      if (limit === undefined || bounded.length <= limit * 2) {
-        let out = '';
-        let last = 0;
-        let tailStart = 0;
-        for (let match = hostRe.exec(bounded); match !== null; match = hostRe.exec(bounded)) {
-          out += bounded.slice(last, match.index) + replacement;
-          tailStart = out.length;
-          last = match.index + match[0].length;
-          if (match[0].length === 0) hostRe.lastIndex++;
-        }
-        return last === 0 ? { text: bounded, tailStart: 0 } : { text: out + bounded.slice(last), tailStart };
-      }
-      let out = '';
-      let last = 0;
-      let outCps = 0;
-      for (let match = hostRe.exec(bounded); match !== null; match = hostRe.exec(bounded)) {
-        const gap = bounded.slice(last, match.index);
-        out += gap + replacement;
-        outCps += countCodePoints(gap) + replacement.length;
-        last = match.index + match[0].length;
-        if (match[0].length === 0) hostRe.lastIndex++;
-        if (outCps >= limit) return { text: out, tailStart: out.length };
-      }
-      return last === 0 ? { text: bounded, tailStart: 0 } : { text: out + bounded.slice(last), tailStart: out.length };
-    }
-  }
-  const maxClusters =
-    limit === undefined
-      ? Number.POSITIVE_INFINITY
-      : Math.ceil(limit * Math.max(1, host.clusters / replacement.length)) + host.clusters;
-  const clusterCap = host.maxNfdClusterCps;
-  const bounded = limit === undefined ? text : sliceToClusterBound(text, maxClusters, limit, clusterCap);
-  if (!host.ascii && isAscii(bounded)) {
-    return { text: bounded, tailStart: 0 };
-  }
-  if (!NEEDS_CLUSTER_NFC_RE.test(bounded) && bounded.normalize('NFKC') === bounded) {
+  if (host.ascii && (isAscii(text) || !ASCII_HOST_NEEDS_CLUSTER_RE.test(text))) {
+    if (text.length < host.folded.length) return { text, tailStart: 0 };
     const hostRe = host.asciiRe;
     hostRe.lastIndex = 0;
     let out = '';
     let last = 0;
-    let outCps = 0;
     let tailStart = 0;
-    for (let match = hostRe.exec(bounded); match !== null; match = hostRe.exec(bounded)) {
-      const gap = bounded.slice(last, match.index);
-      out += gap + replacement;
+    for (let match = hostRe.exec(text); match !== null; match = hostRe.exec(text)) {
+      out += text.slice(last, match.index) + replacement;
       tailStart = out.length;
-      outCps += countCodePoints(gap) + replacement.length;
       last = match.index + match[0].length;
       if (match[0].length === 0) hostRe.lastIndex++;
-      if (limit !== undefined && outCps >= limit) return { text: out, tailStart: out.length };
     }
-    return last === 0 ? { text: bounded, tailStart: 0 } : { text: out + bounded.slice(last), tailStart };
+    return last === 0 ? { text, tailStart: 0 } : { text: out + text.slice(last), tailStart };
   }
-  const { rawStarts, nfcStarts, nfc } = segmentNfcClusters(bounded, clusterCap, host.unmatchable);
+  if (!host.ascii && isAscii(text)) {
+    return { text, tailStart: 0 };
+  }
+  if (!host.ascii && !NEEDS_CLUSTER_NFC_RE.test(text)) {
+    const hostRe = host.asciiRe;
+    hostRe.lastIndex = 0;
+    let out = '';
+    let last = 0;
+    let tailStart = 0;
+    for (let match = hostRe.exec(text); match !== null; match = hostRe.exec(text)) {
+      out += text.slice(last, match.index) + replacement;
+      tailStart = out.length;
+      last = match.index + match[0].length;
+      if (match[0].length === 0) hostRe.lastIndex++;
+    }
+    return last === 0 ? { text, tailStart: 0 } : { text: out + text.slice(last), tailStart };
+  }
+  const { rawStarts, nfcStarts, nfc } = segmentNfcClusters(text, host.maxNfdClusterCps, host.unmatchable);
   const hostRe = host.nfcRe;
   hostRe.lastIndex = 0;
   let out = '';
   let lastRaw = 0;
   let segCursor = 0;
-  let outCps = 0;
   let tailStart = 0;
   const numSegs = nfcStarts.length - 1;
   for (let match = hostRe.exec(nfc); match !== null; match = hostRe.exec(nfc)) {
@@ -669,517 +723,394 @@ function replaceHostWithTail(
     const rawFrom = rawStarts[segCursor];
     const rawTo = rawStarts[endCursor];
     if (rawFrom < lastRaw) continue;
-    const gap = bounded.slice(lastRaw, rawFrom);
-    out += gap + replacement;
+    out += text.slice(lastRaw, rawFrom) + replacement;
     tailStart = out.length;
-    outCps += countCodePoints(gap) + replacement.length;
     lastRaw = rawTo;
     segCursor = endCursor;
-    if (limit !== undefined && outCps >= limit) return { text: out, tailStart: out.length };
   }
-  return lastRaw === 0 ? { text: bounded, tailStart: 0 } : { text: out + bounded.slice(lastRaw), tailStart };
+  return lastRaw === 0 ? { text, tailStart: 0 } : { text: out + text.slice(lastRaw), tailStart };
+}
+
+function hostMatchesText(text: string, host: HostSpec | undefined): boolean {
+  if (!host || !text) return false;
+  return replaceHostWithTail(text, host, 'x').tailStart > 0;
 }
 
 const CLS_BASE = 0;
-const CLS_MID_PUNCT = 1;
-const CLS_TRAILING_ONLY = 2;
-const CLS_DOT = 3;
-const CLS_SLASH = 4;
-const CLS_MARK = 5;
-const CLS_EMOJI = 6;
-const CLS_EMOJI_MOD = 7;
-const CLS_ZWJ = 8;
-const CLS_UNSAFE = 9;
+const CLS_HYPHEN_UNDER = 1;
+const CLS_MARK = 2;
+const CLS_EMOJI = 3;
+const CLS_EMOJI_MOD = 4;
+const CLS_EMOJI_VS = 5;
+const CLS_ZWJ = 6;
+const CLS_UNSAFE = 7;
 
-const ASCII_CHAR_CLASS = new Uint8Array(128);
-ASCII_CHAR_CLASS.fill(CLS_UNSAFE);
-for (let c = 48; c <= 57; c++) ASCII_CHAR_CLASS[c] = CLS_BASE;
-for (let c = 65; c <= 90; c++) ASCII_CHAR_CLASS[c] = CLS_BASE;
-for (let c = 97; c <= 122; c++) ASCII_CHAR_CLASS[c] = CLS_BASE;
-for (const ch of ['-', '_', "'", '!', '?']) ASCII_CHAR_CLASS[ch.charCodeAt(0)] = CLS_MID_PUNCT;
-for (const ch of [',', ';', ':', ')', ']']) ASCII_CHAR_CLASS[ch.charCodeAt(0)] = CLS_TRAILING_ONLY;
-ASCII_CHAR_CLASS[46] = CLS_DOT;
-ASCII_CHAR_CLASS[47] = CLS_SLASH;
-ASCII_CHAR_CLASS[92] = CLS_SLASH;
+const ASCII_ATOM_CLASS = new Uint8Array(128);
+ASCII_ATOM_CLASS.fill(CLS_UNSAFE);
+for (let c = 48; c <= 57; c++) ASCII_ATOM_CLASS[c] = CLS_BASE;
+for (let c = 65; c <= 90; c++) ASCII_ATOM_CLASS[c] = CLS_BASE;
+for (let c = 97; c <= 122; c++) ASCII_ATOM_CLASS[c] = CLS_BASE;
+ASCII_ATOM_CLASS[45] = CLS_HYPHEN_UNDER; // -
+ASCII_ATOM_CLASS[95] = CLS_HYPHEN_UNDER; // _
 
 const UNICODE_LETTER_OR_NUM_RE = /^[\p{L}\p{N}]$/u;
 const UNICODE_MARK_RE = /^\p{M}$/u;
 const UNICODE_EMOJI_MOD_RE = /^\p{Emoji_Modifier}$/u;
-const NON_ASCII_DET_CACHE = new Map<number, { mapped: string; kinds: Uint8Array }>();
+const NON_ASCII_CLASS_CACHE = new Map<number, number>();
 
-function classifyMappedChar(ch: string): number {
-  const code = ch.charCodeAt(0);
-  if (ch.length === 1 && code < 0x80) return ASCII_CHAR_CLASS[code] ?? CLS_UNSAFE;
-  if (ch === '\u2019' || ch === '\u2026' || ch === '\u00b7' || ch === '\u2014') return CLS_MID_PUNCT;
-  if (UNICODE_LETTER_OR_NUM_RE.test(ch)) return CLS_BASE;
-  if (UNICODE_MARK_RE.test(ch)) return CLS_MARK;
-  if (EP_SINGLE_RE.test(ch)) return CLS_EMOJI;
-  if (UNICODE_EMOJI_MOD_RE.test(ch)) return CLS_EMOJI_MOD;
-  if (ch === '\u200d') return CLS_ZWJ;
-  return CLS_UNSAFE;
-}
-
-function getNonAsciiDetInfo(cp: number): { mapped: string; kinds: Uint8Array } {
-  const cached = NON_ASCII_DET_CACHE.get(cp);
-  if (cached) return cached;
-  let info: { mapped: string; kinds: Uint8Array };
-  if (cp >= 0xd800 && cp <= 0xdfff) {
-    info = { mapped: '', kinds: Uint8Array.of(CLS_UNSAFE) };
-  } else {
-    const raw = String.fromCodePoint(cp);
-    const nfkc = cp === 0x2026 ? '\u2026' : raw.normalize('NFKC');
-    let mapped = '';
-    for (const ch of nfkc) {
-      mapped += SINGLE_CHAR_HOMOGLYPHS[ch] ?? ch;
-    }
-    const chars = Array.from(mapped);
-    const kinds = new Uint8Array(chars.length);
-    for (let i = 0; i < chars.length; i++) {
-      kinds[i] = classifyMappedChar(chars[i] as string);
-    }
-    info = { mapped, kinds };
+function classifyNonAsciiAtomCodePoint(cp: number): number {
+  if (
+    (cp >= 0x3400 && cp <= 0x4dbf) ||
+    (cp >= 0x4e00 && cp <= 0x9fff) ||
+    (cp >= 0xac00 && cp <= 0xd7a3) ||
+    (cp >= 0x3041 && cp <= 0x3096) ||
+    (cp >= 0x30a1 && cp <= 0x30fa)
+  ) {
+    return CLS_BASE;
   }
-  if (NON_ASCII_DET_CACHE.size >= 4096) {
-    const oldest = NON_ASCII_DET_CACHE.keys().next().value;
-    if (oldest !== undefined) NON_ASCII_DET_CACHE.delete(oldest);
+  if (cp >= 0x0300 && cp <= 0x036f) return CLS_MARK;
+  if (cp === 0x200d) return CLS_ZWJ;
+  if (cp === 0xfe0f) return CLS_EMOJI_VS;
+
+  const cached = NON_ASCII_CLASS_CACHE.get(cp);
+  if (cached !== undefined) return cached;
+
+  const ch = String.fromCodePoint(cp);
+  let cls = CLS_UNSAFE;
+  if (UNICODE_LETTER_OR_NUM_RE.test(ch)) cls = CLS_BASE;
+  else if (UNICODE_MARK_RE.test(ch)) cls = CLS_MARK;
+  else if (EP_SINGLE_RE.test(ch)) cls = CLS_EMOJI;
+  else if (UNICODE_EMOJI_MOD_RE.test(ch)) cls = CLS_EMOJI_MOD;
+
+  if (NON_ASCII_CLASS_CACHE.size >= 16_384) {
+    const oldest = NON_ASCII_CLASS_CACHE.keys().next().value;
+    if (oldest !== undefined) NON_ASCII_CLASS_CACHE.delete(oldest);
   }
-  NON_ASCII_DET_CACHE.set(cp, info);
-  return info;
+  NON_ASCII_CLASS_CACHE.set(cp, cls);
+  return cls;
 }
 
-function readCodePointAt(text: string, index: number): { cp: number; len: number; valid: boolean } {
-  const code = text.charCodeAt(index);
-  if (code < 0xd800 || code > 0xdfff) return { cp: code, len: 1, valid: true };
-  if (code <= 0xdbff && index + 1 < text.length) {
-    const low = text.charCodeAt(index + 1);
-    if (low >= 0xdc00 && low <= 0xdfff) {
-      return { cp: 0x10000 + ((code - 0xd800) << 10) + (low - 0xdc00), len: 2, valid: true };
-    }
-  }
-  return { cp: code, len: 1, valid: false };
-}
-
-function isWhitespaceCode(code: number): boolean {
-  if (code === 32 || (code >= 9 && code <= 13)) return true;
-  if (code < 0xa0) return false;
-  return (
-    code === 0x00a0 ||
-    code === 0x1680 ||
-    (code >= 0x2000 && code <= 0x200a) ||
-    code === 0x2028 ||
-    code === 0x2029 ||
-    code === 0x202f ||
-    code === 0x205f ||
-    code === 0x3000 ||
-    code === 0xfeff
-  );
-}
-
-function endsWithDetectionColon(rawToken: string): boolean {
-  if (!rawToken) return false;
-  const lastCode = rawToken.charCodeAt(rawToken.length - 1);
-  if (lastCode < 0x80) return lastCode === 58;
-  let start = rawToken.length - 1;
-  if (lastCode >= 0xdc00 && lastCode <= 0xdfff && start > 0) {
-    const high = rawToken.charCodeAt(start - 1);
-    if (high >= 0xd800 && high <= 0xdbff) start--;
-  }
-  const { cp, valid } = readCodePointAt(rawToken, start);
-  if (!valid) return false;
-  return getNonAsciiDetInfo(cp).mapped.endsWith(':');
-}
-
-function isTrailingPortPunct(ch: string): boolean {
-  const cls = classifyMappedChar(ch);
-  return cls === CLS_TRAILING_ONLY || cls === CLS_DOT || cls === CLS_MID_PUNCT;
-}
-
-function isDetectionDigitsWithOptionalTrailingPunct(rawToken: string): boolean {
-  let sawDigit = false;
-  for (let i = 0; i < rawToken.length; ) {
-    const code = rawToken.charCodeAt(i);
-    if (code < 0x80) {
-      const isLast = i + 1 === rawToken.length;
-      if (code >= 48 && code <= 57) {
-        sawDigit = true;
-        i++;
-        continue;
-      }
-      if (isLast && sawDigit && isTrailingPortPunct(rawToken[i] as string)) {
-        return true;
-      }
-      return false;
-    }
-    const { cp, len, valid } = readCodePointAt(rawToken, i);
-    if (!valid) return false;
-    const { mapped } = getNonAsciiDetInfo(cp);
-    const isLastRaw = i + len === rawToken.length;
-    for (let k = 0; k < mapped.length; k++) {
-      const mc = mapped.charCodeAt(k);
-      if (mc >= 48 && mc <= 57) {
-        sawDigit = true;
-        continue;
-      }
-      const isVeryLast = isLastRaw && k + 1 === mapped.length;
-      if (isVeryLast && sawDigit && isTrailingPortPunct(mapped[k] as string)) {
-        return true;
-      }
-      return false;
-    }
-    i += len;
-  }
-  return sawDigit;
-}
-
-function isSafeNonPathToken(rawToken: string): boolean {
-  if (!rawToken) return false;
-  let hasBaseOrEmoji = false;
-  let hasStemAlnum = false;
+/** Validates a single segment (no dots, slashes, structural chars, or connectors). */
+function isSafeSingleAtom(seg: string): boolean {
+  if (!seg) return false;
   let lastWasMarkable = false;
   let lastWasEmoji = false;
   let lastWasEmojiChain = false;
-  let dotCount = 0;
-  let ext = '';
-  let finishedWithTrailingPunct = false;
-
-  const stepChar = (cls: number, asciiCharCode: number, isVeryLast: boolean): boolean => {
-    if (finishedWithTrailingPunct) return false;
-    if (dotCount === 1) {
-      if (
-        isVeryLast &&
-        (cls === CLS_TRAILING_ONLY || cls === CLS_DOT || asciiCharCode === 33 || asciiCharCode === 63)
-      ) {
-        finishedWithTrailingPunct = true;
-        return true;
-      }
-      if (cls === CLS_BASE && isAsciiLetter(asciiCharCode) && ext.length < 5) {
-        ext += String.fromCharCode(asciiCharCode);
-        return true;
-      }
-      return false;
-    }
-    if (cls === CLS_BASE) {
-      hasBaseOrEmoji = true;
-      hasStemAlnum = true;
-      lastWasMarkable = true;
-      lastWasEmoji = false;
-      lastWasEmojiChain = false;
-      return true;
-    }
-    if (cls === CLS_EMOJI) {
-      hasBaseOrEmoji = true;
-      lastWasMarkable = true;
-      lastWasEmoji = true;
-      lastWasEmojiChain = true;
-      return true;
-    }
-    if (cls === CLS_MARK) {
-      if (!lastWasMarkable) return false;
-      lastWasEmoji = false;
-      return true;
-    }
-    if (cls === CLS_EMOJI_MOD) {
-      if (!lastWasEmoji) return false;
-      lastWasEmoji = false;
-      lastWasMarkable = true;
-      lastWasEmojiChain = true;
-      return true;
-    }
-    if (cls === CLS_ZWJ) {
-      if (!lastWasEmojiChain) return false;
-      lastWasEmoji = false;
-      lastWasMarkable = false;
-      return true;
-    }
-    if (cls === CLS_MID_PUNCT) {
-      lastWasMarkable = false;
-      lastWasEmoji = false;
-      lastWasEmojiChain = false;
-      return true;
-    }
-    if (cls === CLS_TRAILING_ONLY) {
-      if (!isVeryLast || !hasBaseOrEmoji) return false;
-      finishedWithTrailingPunct = true;
-      return true;
-    }
-    if (cls === CLS_DOT) {
-      if (isVeryLast) {
-        if (!hasBaseOrEmoji) return false;
-        finishedWithTrailingPunct = true;
-        return true;
-      }
-      if (!hasStemAlnum) return false;
-      dotCount = 1;
-      lastWasMarkable = false;
-      lastWasEmoji = false;
-      lastWasEmojiChain = false;
-      return true;
-    }
-    return false;
-  };
-
-  for (let i = 0; i < rawToken.length; ) {
-    const code = rawToken.charCodeAt(i);
+  for (let i = 0; i < seg.length; ) {
+    const code = seg.charCodeAt(i);
     if (code < 0x80) {
-      const cls = ASCII_CHAR_CLASS[code] ?? CLS_UNSAFE;
-      if (cls === CLS_BASE && dotCount === 0 && !finishedWithTrailingPunct) {
-        hasBaseOrEmoji = true;
-        hasStemAlnum = true;
+      const cls = ASCII_ATOM_CLASS[code] ?? CLS_UNSAFE;
+      if (cls === CLS_BASE) {
         lastWasMarkable = true;
         lastWasEmoji = false;
         lastWasEmojiChain = false;
         i += 1;
         continue;
       }
-      if (!stepChar(cls, code, i + 1 === rawToken.length)) return false;
-      i += 1;
-      continue;
+      if (cls === CLS_HYPHEN_UNDER) {
+        lastWasMarkable = false;
+        lastWasEmoji = false;
+        lastWasEmojiChain = false;
+        i += 1;
+        continue;
+      }
+      return false;
     }
-    if (code >= 0x4e00 && code <= 0x9fff && dotCount === 0 && !finishedWithTrailingPunct) {
-      hasBaseOrEmoji = true;
-      hasStemAlnum = true;
+    if (
+      (code >= 0x3400 && code <= 0x4dbf) ||
+      (code >= 0x4e00 && code <= 0x9fff) ||
+      (code >= 0xac00 && code <= 0xd7a3)
+    ) {
       lastWasMarkable = true;
       lastWasEmoji = false;
       lastWasEmojiChain = false;
       i += 1;
       continue;
     }
-    if (code >= 0x0300 && code <= 0x036f && dotCount === 0 && !finishedWithTrailingPunct) {
+    const { cp, len, valid } = readCodePointAt(seg, i);
+    if (!valid) return false;
+    const cls = classifyNonAsciiAtomCodePoint(cp);
+    if (cls === CLS_BASE) {
+      lastWasMarkable = true;
+      lastWasEmoji = false;
+      lastWasEmojiChain = false;
+    } else if (cls === CLS_EMOJI) {
+      lastWasMarkable = true;
+      lastWasEmoji = true;
+      lastWasEmojiChain = true;
+    } else if (cls === CLS_MARK) {
       if (!lastWasMarkable) return false;
       lastWasEmoji = false;
-      i += 1;
-      continue;
-    }
-    if (code >= 0x4e00 && code <= 0x9fff) {
-      if (!stepChar(CLS_BASE, 0, i + 1 === rawToken.length)) return false;
-      i += 1;
-      continue;
-    }
-    if (code >= 0x0300 && code <= 0x036f) {
-      if (!stepChar(CLS_MARK, 0, i + 1 === rawToken.length)) return false;
-      i += 1;
-      continue;
-    }
-    const { cp, len, valid } = readCodePointAt(rawToken, i);
-    if (!valid) return false;
-    const info = getNonAsciiDetInfo(cp);
-    const isLastRaw = i + len === rawToken.length;
-    if (info.mapped.length === 0) return false;
-    let mOff = 0;
-    for (let k = 0; k < info.kinds.length; k++) {
-      const mcp = info.mapped.codePointAt(mOff) ?? 0;
-      const mLen = mcp > 0xffff ? 2 : 1;
-      const isVeryLast = isLastRaw && mOff + mLen === info.mapped.length;
-      if (!stepChar(info.kinds[k] ?? CLS_UNSAFE, mcp < 0x80 ? mcp : 0, isVeryLast)) return false;
-      mOff += mLen;
+    } else if (cls === CLS_EMOJI_MOD) {
+      if (!lastWasEmoji) return false;
+      lastWasEmoji = false;
+      lastWasMarkable = true;
+      lastWasEmojiChain = true;
+    } else if (cls === CLS_EMOJI_VS) {
+      if (!lastWasEmoji) return false;
+      lastWasEmoji = false;
+      lastWasMarkable = false;
+      lastWasEmojiChain = true;
+    } else if (cls === CLS_ZWJ) {
+      if (!lastWasEmojiChain) return false;
+      lastWasEmoji = false;
+      lastWasMarkable = false;
+    } else {
+      return false;
     }
     i += len;
-  }
-
-  if (dotCount === 1) {
-    return ext.length >= 1 && SAFE_FILE_EXTENSIONS.has(ext.toLowerCase());
   }
   return true;
 }
 
-function isRawSingleSlashChar(rawToken: string, index: number): boolean {
-  const code = rawToken.charCodeAt(index);
-  if (code === 47 || code === 92) return true;
-  if (code < 0x80) return false;
-  const ch = rawToken[index] as string;
-  const mapped = SINGLE_CHAR_HOMOGLYPHS[ch];
-  if (mapped === '/' || mapped === '\\') return true;
-  return ch === '\uff0f' || ch === '\uff3c' || ch === '\ufe68';
+function isIpv4OctetTuple(parts: readonly string[]): boolean {
+  if (parts.length !== 4) return false;
+  for (let i = 0; i < 4; i++) {
+    const part = parts[i];
+    if (part === undefined) return false;
+    const raw = i === 0 ? part.replace(/^v/i, '') : part;
+    if (!PURE_DIGITS_RE.test(raw)) return false;
+    const n = Number(raw);
+    if (!Number.isInteger(n) || n < 0 || n > 255) return false;
+  }
+  return true;
 }
 
-function containsDetectionScheme(rawToken: string): boolean {
-  if (rawToken.includes('://')) return true;
-  if (!NON_ASCII_RE.test(rawToken) || !MAYBE_ENDPOINT_META_RE.test(rawToken)) return false;
-  let p2 = '';
-  let p1 = '';
-  for (let i = 0; i < rawToken.length; ) {
-    const code = rawToken.charCodeAt(i);
-    if (code < 0x80) {
-      const ch = rawToken[i] as string;
-      if (p2 === ':' && p1 === '/' && ch === '/') return true;
-      p2 = p1;
-      p1 = ch;
-      i += 1;
+function isSafeDotToken(core: string, allowFileAndVersionWhitelist: boolean): boolean {
+  if (!core || core.startsWith('.') || core.endsWith('.')) return false;
+  const parts = core.split('.');
+  if (parts.some((p) => p.length === 0)) return false;
+
+  const first = parts[0];
+  if (first === undefined) return false;
+
+  if (!allowFileAndVersionWhitelist) {
+    return parts.length === 1 && isSafeSingleAtom(first);
+  }
+
+  if (
+    parts.length >= 2 &&
+    parts.length <= 4 &&
+    VALID_VERSION_HEAD_RE.test(first) &&
+    parts.slice(1).every((p) => PURE_DIGITS_RE.test(p))
+  ) {
+    return !isIpv4OctetTuple(parts);
+  }
+
+  if (parts.length >= 2 && parts.length <= 4) {
+    const ext = parts[parts.length - 1];
+    if (ext !== undefined && SAFE_EXT_RE.test(ext) && SAFE_FILE_EXTENSIONS.has(ext.toLowerCase())) {
+      return parts.slice(0, -1).every((stem) => isSafeSingleAtom(stem));
+    }
+  }
+
+  return false;
+}
+
+function isSimpleTrailingPunctCode(code: number): boolean {
+  return (
+    code === 33 || // !
+    code === 63 || // ?
+    code === 44 || // ,
+    code === 59 || // ;
+    code === 58 || // :
+    code === 46 || // .
+    code === 0x3002 || // 。
+    code === 0x3001 // 、
+  );
+}
+
+/**
+ * Strips trailing punctuation run (`!?,;:.)]}` plus Chinese `。、`), keeping matched
+ * closing brackets `)`, `]`, `}` intact when their opener appears inside `core`.
+ */
+function splitTrailingPunct(token: string): { core: string; trail: string } {
+  let end = token.length;
+  if (end === 0) return { core: '', trail: '' };
+  let openParen = 0;
+  let closeParen = 0;
+  let openBracket = 0;
+  let closeBracket = 0;
+  let openBrace = 0;
+  let closeBrace = 0;
+  const last = token.charCodeAt(end - 1);
+  if (last === 41 || last === 93 || last === 125 || isSimpleTrailingPunctCode(last)) {
+    for (let i = 0; i < end; i++) {
+      const c = token.charCodeAt(i);
+      if (c === 40) openParen++;
+      else if (c === 41) closeParen++;
+      else if (c === 91) openBracket++;
+      else if (c === 93) closeBracket++;
+      else if (c === 123) openBrace++;
+      else if (c === 125) closeBrace++;
+    }
+  }
+  while (end > 0) {
+    const c = token.charCodeAt(end - 1);
+    if (isSimpleTrailingPunctCode(c)) {
+      end--;
       continue;
     }
-    if ((code >= 0x4e00 && code <= 0x9fff) || (code >= 0x0300 && code <= 0x036f)) {
-      p2 = '';
-      p1 = '';
-      i += 1;
+    if (c === 41 && closeParen > openParen) {
+      closeParen--;
+      end--;
       continue;
     }
-    const { cp, len, valid } = readCodePointAt(rawToken, i);
-    if (!valid) {
-      p2 = '';
-      p1 = '';
-      i += 1;
+    if (c === 93 && closeBracket > openBracket) {
+      closeBracket--;
+      end--;
       continue;
     }
-    const { mapped } = getNonAsciiDetInfo(cp);
-    for (let k = 0; k < mapped.length; k++) {
-      const ch = mapped[k] as string;
-      if (p2 === ':' && p1 === '/' && ch === '/') return true;
-      p2 = p1;
-      p1 = ch;
+    if (c === 125 && closeBrace > openBrace) {
+      closeBrace--;
+      end--;
+      continue;
     }
-    i += len;
+    break;
+  }
+  if (end === 0) return { core: token, trail: '' };
+  if (end === token.length) return { core: token, trail: '' };
+  return { core: token.slice(0, end), trail: token.slice(end) };
+}
+
+function rawEndsWithColon(value: string, start: number, end: number): boolean {
+  let i = end;
+  while (i > start) {
+    const c = value.charCodeAt(i - 1);
+    if (c < 0x80) {
+      if (c === 58) return true;
+      if (c === 39 || c === 34) {
+        i--;
+        continue;
+      }
+      return false;
+    }
+    if (c < 0xd800 || c > 0xdfff) {
+      if ((c >= 0x0300 && c <= 0x036f) || c === 0x2019 || c === 0x201d) {
+        i--;
+        continue;
+      }
+      if (c >= 0x00ad && isDefaultIgnorableCode(c)) {
+        i--;
+        continue;
+      }
+      const ch = value.charAt(i - 1);
+      if (UNICODE_MARK_RE.test(ch)) {
+        i--;
+        continue;
+      }
+      return normalizeShortSegment(ch).endsWith(':');
+    }
+    const chStart = prevCharStart(value, i);
+    const { cp, valid } = readCodePointAt(value, chStart);
+    if (!valid) return false;
+    if (isDefaultIgnorableCode(cp)) {
+      i = chStart;
+      continue;
+    }
+    const ch = value.slice(chStart, i);
+    if (UNICODE_MARK_RE.test(ch)) {
+      i = chStart;
+      continue;
+    }
+    return normalizeShortSegment(ch).endsWith(':');
   }
   return false;
 }
 
-function hasPathEndpointMeta(rawToken: string): boolean {
-  if (!MAYBE_ENDPOINT_META_RE.test(rawToken)) return false;
+function endsWithDetectionColon(normToken: string): boolean {
+  if (!normToken) return false;
+  let i = normToken.length;
+  while (i > 0) {
+    const start = prevCharStart(normToken, i);
+    const cp = normToken.codePointAt(start) ?? 0;
+    if (cp === 58) return true;
+    const ch = normToken.slice(start, i);
+    if (UNICODE_MARK_RE.test(ch) || cp === 39 || cp === 34 || cp === 0x2019 || cp === 0x201d) {
+      i = start;
+      continue;
+    }
+    return false;
+  }
+  return false;
+}
+
+function isSlashChar(code: number): boolean {
+  return code === 47 || code === 92;
+}
+
+function hasSlash(token: string): boolean {
+  return token.includes('/') || token.includes('\\');
+}
+
+function hasPathEndpointMetaNormalized(normToken: string): boolean {
+  if (!ASCII_ENDPOINT_META_RE.test(normToken)) return false;
+  let hasDrivePrefix = false;
+  let deferredColon = false;
   let detIndex = 0;
   let d0 = 0;
   let d1 = 0;
-  let hasDrivePrefix = false;
-  let deferredColon = false;
-  for (let i = 0; i < rawToken.length; ) {
-    const code = rawToken.charCodeAt(i);
-    if (code < 0x80) {
-      if (detIndex === 0) d0 = code;
-      else if (detIndex === 1) d1 = code;
-      else if (detIndex === 2) {
-        hasDrivePrefix = isAsciiLetter(d0) && d1 === 58 && (code === 47 || code === 92);
-        if (deferredColon && !hasDrivePrefix) return true;
-        deferredColon = false;
-      }
-      if (code === 64 || code === 37 || code === 91 || code === 93) return true;
-      if (code === 58) {
-        if (detIndex === 1) deferredColon = true;
-        else return true;
-      }
-      detIndex++;
-      i += 1;
-      continue;
+  for (let i = 0; i < normToken.length; ) {
+    const code = normToken.charCodeAt(i);
+    const len = code >= 0xd800 && code <= 0xdbff && i + 1 < normToken.length ? 2 : 1;
+    if (len === 1 && code >= 0xd800 && code <= 0xdfff) return true;
+    if (detIndex === 0) d0 = code;
+    else if (detIndex === 1) d1 = code;
+    else if (detIndex === 2) {
+      hasDrivePrefix = isAsciiLetter(d0) && d1 === 58 && isSlashChar(code);
+      if (deferredColon && !hasDrivePrefix) return true;
+      deferredColon = false;
     }
-    if ((code >= 0x4e00 && code <= 0x9fff) || (code >= 0x0300 && code <= 0x036f)) {
-      if (deferredColon) return true;
-      detIndex++;
-      i += 1;
-      continue;
+    if (code === 64 || code === 37 || code === 91 || code === 93) return true;
+    if (code === 58) {
+      if (detIndex === 1) deferredColon = true;
+      else return true;
     }
-    const { cp, len, valid } = readCodePointAt(rawToken, i);
-    if (!valid) {
-      if (deferredColon) return true;
-      detIndex++;
-      i += 1;
-      continue;
-    }
-    const { mapped } = getNonAsciiDetInfo(cp);
-    for (let k = 0; k < mapped.length; k++) {
-      const mc = mapped.charCodeAt(k);
-      if (detIndex === 0) d0 = mc;
-      else if (detIndex === 1) d1 = mc;
-      else if (detIndex === 2) {
-        hasDrivePrefix = isAsciiLetter(d0) && d1 === 58 && (mc === 47 || mc === 92);
-        if (deferredColon && !hasDrivePrefix) return true;
-        deferredColon = false;
-      }
-      if (mc === 64 || mc === 37 || mc === 91 || mc === 93) return true;
-      if (mc === 58) {
-        if (detIndex === 1) deferredColon = true;
-        else return true;
-      }
-      detIndex++;
-    }
+    detIndex++;
     i += len;
   }
   return deferredColon && !hasDrivePrefix;
 }
 
-const DOUBLE_SLASH_QUICK_RE =
-  /(?:[/\\]|[\u2044\u2215\u2216\u2571\u2572\u29f5\u29f8\u29f9\ufe68\uff0f\uff3c]){2}|[\u00bc-\u00be\u2100\u2101\u2105\u2106\u2150-\u215f\u2189\u33a7\u33a8\u33ae\u33af\u33c6\u33de\u33df]/;
-
-function isUncOrTwoPartServerPath(rawToken: string): boolean {
-  if (!DOUBLE_SLASH_QUICK_RE.test(rawToken)) return false;
+function isUncOrTwoPartServerPathNormalized(detNoMarks: string): boolean {
+  if (!DOUBLE_SLASH_ASCII_RE.test(detNoMarks)) return false;
   let prevWasSlash = false;
   let foundDouble = false;
   let doubleAtStart = false;
   let inSeg = false;
   let segsAfterDouble = 0;
-  let detIndex = 0;
-  for (let i = 0; i < rawToken.length; ) {
-    const code = rawToken.charCodeAt(i);
-    if (code < 0x80) {
-      const isSlash = code === 47 || code === 92;
-      if (!foundDouble) {
-        if (isSlash && prevWasSlash) {
-          foundDouble = true;
-          doubleAtStart = detIndex === 1;
-        }
-        prevWasSlash = isSlash;
-      } else if (isSlash) {
-        inSeg = false;
-      } else if (!inSeg) {
-        inSeg = true;
-        segsAfterDouble++;
-        if (segsAfterDouble >= 3) return false;
+  for (let i = 0; i < detNoMarks.length; i++) {
+    const code = detNoMarks.charCodeAt(i);
+    const isSlash = isSlashChar(code);
+    if (!foundDouble) {
+      if (isSlash && prevWasSlash) {
+        foundDouble = true;
+        doubleAtStart = i === 1;
       }
-      detIndex++;
-      i += 1;
-      continue;
+      prevWasSlash = isSlash;
+    } else if (isSlash) {
+      inSeg = false;
+    } else if (!inSeg) {
+      inSeg = true;
+      segsAfterDouble++;
+      if (segsAfterDouble >= 3) return false;
     }
-    if ((code >= 0x4e00 && code <= 0x9fff) || (code >= 0x0300 && code <= 0x036f)) {
-      if (!foundDouble) prevWasSlash = false;
-      else if (!inSeg) {
-        inSeg = true;
-        segsAfterDouble++;
-        if (segsAfterDouble >= 3) return false;
-      }
-      detIndex++;
-      i += 1;
-      continue;
-    }
-    const { cp, len, valid } = readCodePointAt(rawToken, i);
-    if (!valid) {
-      if (!foundDouble) prevWasSlash = false;
-      else if (!inSeg) {
-        inSeg = true;
-        segsAfterDouble++;
-        if (segsAfterDouble >= 3) return false;
-      }
-      detIndex++;
-      i += 1;
-      continue;
-    }
-    const { mapped } = getNonAsciiDetInfo(cp);
-    for (let k = 0; k < mapped.length; k++) {
-      const mc = mapped.charCodeAt(k);
-      const isSlash = mc === 47 || mc === 92;
-      if (!foundDouble) {
-        if (isSlash && prevWasSlash) {
-          foundDouble = true;
-          doubleAtStart = detIndex === 1;
-        }
-        prevWasSlash = isSlash;
-      } else if (isSlash) {
-        inSeg = false;
-      } else if (!inSeg) {
-        inSeg = true;
-        segsAfterDouble++;
-        if (segsAfterDouble >= 3) return false;
-      }
-      detIndex++;
-    }
-    i += len;
   }
   if (!foundDouble) return false;
   return doubleAtStart ? segsAfterDouble <= 2 : segsAfterDouble >= 1 && segsAfterDouble <= 2;
 }
 
-function extractRawBasename(rawToken: string): string {
-  let end = rawToken.length;
-  while (end > 0 && isRawSingleSlashChar(rawToken, end - 1)) end--;
+function extractBasenameNormalized(normToken: string): string {
+  let end = normToken.length;
+  while (end > 0 && isSlashChar(normToken.charCodeAt(end - 1))) end--;
   if (end === 0) return '';
   let start = end;
-  while (start > 0 && !isRawSingleSlashChar(rawToken, start - 1)) start--;
-  return rawToken.slice(start, end);
+  while (start > 0 && !isSlashChar(normToken.charCodeAt(start - 1))) start--;
+  return normToken.slice(start, end);
+}
+
+function isDriveRootBaseNormalized(base: string): boolean {
+  return base.length === 2 && isAsciiLetter(base.charCodeAt(0)) && base.charCodeAt(1) === 58;
 }
 
 type TokenClassification =
@@ -1187,78 +1118,176 @@ type TokenClassification =
   | { kind: 'basename'; text: string }
   | { kind: 'replaced'; text: string };
 
-function isDriveRootBase(rawBase: string): boolean {
-  if (rawBase.length !== 2) return false;
-  const p0 = readCodePointAt(rawBase, 0);
-  if (!p0.valid || p0.len !== 1) return false;
-  const p1 = readCodePointAt(rawBase, 1);
-  if (!p1.valid || p1.len !== 1) return false;
-  const m0 = p0.cp < 0x80 ? String.fromCharCode(p0.cp) : getNonAsciiDetInfo(p0.cp).mapped;
-  const m1 = p1.cp < 0x80 ? String.fromCharCode(p1.cp) : getNonAsciiDetInfo(p1.cp).mapped;
-  return m0.length === 1 && isAsciiLetter(m0.charCodeAt(0)) && m1 === ':';
+function isPortCoreAfterColon(core: string): { isPort: boolean; keepTrail: boolean } {
+  const noMarks = stripCombiningMarksIfAny(core);
+  if (PURE_DIGITS_RE.test(noMarks)) return { isPort: true, keepTrail: true };
+  const unwrapped = noMarks.replace(/^['"‘“([—–‒-]+/, '').replace(/['"’”)\]—–‒-]+$/, '');
+  if (unwrapped.length > 0 && PURE_DIGITS_RE.test(unwrapped)) {
+    return { isPort: true, keepTrail: false };
+  }
+  return { isPort: false, keepTrail: false };
 }
 
-function classifyToken(rawToken: string, isTitle: boolean, prevEndedWithColon: boolean): TokenClassification {
-  const hostPlaceholder = isTitle ? '<host>' : '[host]';
+function isSafeNonPathCore(core: string, host: HostSpec | undefined): boolean {
+  if (!core) return false;
+
+  if (STANDALONE_SEPARATORS.has(core)) {
+    return !hostMatchesText(core, host);
+  }
+
+  if (core.startsWith('(') && core.endsWith(')') && PURE_DIGITS_RE.test(core.slice(1, -1))) {
+    return !hostMatchesText(core, host);
+  }
+
   if (
-    rawToken.length <= 12 &&
-    (rawToken.charCodeAt(0) === 60 || rawToken.charCodeAt(0) === 91 || rawToken.charCodeAt(0) >= 0xfe47)
+    core.includes('@') ||
+    core.includes('%') ||
+    core.includes('[') ||
+    core.includes(']') ||
+    core.includes('(') ||
+    core.includes(')') ||
+    core.includes('{') ||
+    core.includes('}')
   ) {
-    let det = '';
-    for (let i = 0; i < rawToken.length; ) {
-      const { cp, len, valid } = readCodePointAt(rawToken, i);
-      if (!valid) {
-        det = '';
-        break;
-      }
-      det += cp < 0x80 ? (rawToken[i] as string) : getNonAsciiDetInfo(cp).mapped;
-      i += len;
+    return false;
+  }
+
+  if (core.includes(':')) {
+    return VALID_TIME_RE.test(core) && !hostMatchesText(core, host);
+  }
+
+  if (CONNECTOR_TEST_RE.test(core)) {
+    // Word-internal connectors are treated as potential dot/host separators (Decision 2).
+    const segments = core.split(CONNECTOR_SPLIT_RE).filter(Boolean);
+    if (segments.length !== 1) {
+      return false;
     }
-    if (PLACEHOLDERS_SET.has(det)) {
-      return { kind: 'replaced', text: det };
+    // Single remaining segment had leading/trailing connector (e.g. '8080', —8080); only allow if not secret and not host?
+    // Keep conservative: reject leading/trailing connector wrappers unless plain prose check explicitly allows.
+    return false;
+  }
+
+  if (CN_PUNCT_TEST_RE.test(core)) {
+    if (ASCII_LIST_ENUM_RE.test(core)) return false;
+    const parts = core.split(CN_PUNCT_SPLIT_RE).filter(Boolean);
+    if (parts.length === 0) return false;
+    return parts.every(
+      (part) =>
+        !CONNECTOR_TEST_RE.test(part) &&
+        !part.includes(':') &&
+        !part.includes('@') &&
+        !part.includes('%') &&
+        !part.includes('[') &&
+        !part.includes(']') &&
+        !part.includes('(') &&
+        !part.includes(')') &&
+        !part.includes('{') &&
+        !part.includes('}') &&
+        !hostMatchesText(part, host) &&
+        (part.includes('.') ? isSafeDotToken(part, true) : isSafeSingleAtom(part)),
+    );
+  }
+
+  if (core.includes('.')) {
+    return isSafeDotToken(core, true);
+  }
+
+  return isSafeSingleAtom(core);
+}
+
+function isSimpleAsciiAlnumWord(text: string): boolean {
+  for (let i = 0; i < text.length; i++) {
+    const c = text.charCodeAt(i);
+    if ((c >= 97 && c <= 122) || (c >= 65 && c <= 90) || (c >= 48 && c <= 57) || c === 45 || c === 95) continue;
+    return false;
+  }
+  return text.length > 0;
+}
+
+function classifyNonPathToken(
+  normToken: string,
+  isTitle: boolean,
+  prevEndedWithColon: boolean,
+  host: HostSpec | undefined,
+): TokenClassification {
+  if (!prevEndedWithColon && isSimpleAsciiAlnumWord(normToken)) {
+    return { kind: 'plain', text: normToken };
+  }
+  const hostPlaceholder = isTitle ? '<host>' : '[host]';
+  const { core, trail } = splitTrailingPunct(normToken);
+
+  if (PLACEHOLDERS_SET.has(core)) {
+    return { kind: 'replaced', text: core + trail };
+  }
+
+  if (prevEndedWithColon) {
+    const port = isPortCoreAfterColon(core);
+    if (port.isPort) {
+      return { kind: 'replaced', text: port.keepTrail ? hostPlaceholder + trail : hostPlaceholder };
     }
   }
 
-  if (prevEndedWithColon && isDetectionDigitsWithOptionalTrailingPunct(rawToken)) {
-    return { kind: 'replaced', text: hostPlaceholder };
+  if (isSafeNonPathCore(core, host)) {
+    return { kind: 'plain', text: core + trail };
   }
 
-  if (!MAYBE_SLASH_RE.test(rawToken)) {
-    return isSafeNonPathToken(rawToken)
-      ? { kind: 'plain', text: rawToken }
-      : { kind: 'replaced', text: hostPlaceholder };
+  return {
+    kind: 'replaced',
+    text: hostPlaceholder + (trail && !core.includes('[') && !core.includes('(') && !core.includes('{') ? trail : ''),
+  };
+}
+
+function stripCombiningMarksIfAny(text: string): string {
+  return NON_ASCII_RE.test(text) && COMBINING_MARK_TEST_RE.test(text) ? text.replace(COMBINING_MARK_RE, '') : text;
+}
+
+function classifyNormalizedToken(
+  normToken: string,
+  isTitle: boolean,
+  prevEndedWithColon: boolean,
+  host: HostSpec | undefined,
+): TokenClassification {
+  const hostPlaceholder = isTitle ? '<host>' : '[host]';
+
+  if (!hasSlash(normToken)) {
+    return classifyNonPathToken(normToken, isTitle, prevEndedWithColon, host);
   }
 
-  if (containsDetectionScheme(rawToken)) {
+  const detNoMarks = stripCombiningMarksIfAny(normToken);
+  if (detNoMarks.includes('://')) {
     return { kind: 'replaced', text: isTitle ? '<host>' : '[endpoint]' };
   }
-  if (hasPathEndpointMeta(rawToken)) {
+  if (hasPathEndpointMetaNormalized(normToken)) {
     return { kind: 'replaced', text: hostPlaceholder };
   }
-  if (isUncOrTwoPartServerPath(rawToken)) {
+  if (isUncOrTwoPartServerPathNormalized(detNoMarks)) {
     return { kind: 'replaced', text: '[path]' };
   }
-  const rawBase = extractRawBasename(rawToken);
-  if (!rawBase || rawBase === '.' || rawBase === '..' || isDriveRootBase(rawBase) || MAYBE_SLASH_RE.test(rawBase)) {
+  const rawBase = extractBasenameNormalized(normToken);
+  if (!rawBase || rawBase === '.' || rawBase === '..' || isDriveRootBaseNormalized(rawBase) || hasSlash(rawBase)) {
     return { kind: 'replaced', text: '[path]' };
   }
-  if (!isSafeNonPathToken(rawBase)) {
+  const baseClassified = classifyNonPathToken(rawBase, isTitle, false, host);
+  if (baseClassified.kind === 'replaced') {
+    if (hostMatchesText(rawBase, host)) {
+      return { kind: 'replaced', text: hostPlaceholder };
+    }
     return { kind: 'replaced', text: '[path]' };
   }
-  return { kind: 'basename', text: rawBase };
+  return { kind: 'basename', text: baseClassified.text };
 }
 
 function splitTailClusters(text: string, tailClusters: number): [string, string] {
   if (!text || tailClusters <= 0) return [text, ''];
+  if (isAscii(text)) {
+    if (text.length <= tailClusters) return ['', text];
+    const cut = text.length - tailClusters;
+    return [text.slice(0, cut), text.slice(cut)];
+  }
   let clusters = 0;
   let i = text.length;
   while (i > 0) {
-    const prevUnit = text.charCodeAt(i - 1);
-    let cpStart = i - 1;
-    if (prevUnit >= 0xdc00 && prevUnit <= 0xdfff && i >= 2) {
-      const high = text.charCodeAt(i - 2);
-      if (high >= 0xd800 && high <= 0xdbff) cpStart = i - 2;
-    }
+    const cpStart = prevCharStart(text, i);
     const cp = text.codePointAt(cpStart) ?? 0;
     if (!isClusterContinuation(text, cpStart, cp)) {
       clusters++;
@@ -1278,6 +1307,21 @@ function findBoundaryHostMatch(
   const joint = left + right;
   const splitAt = left.length;
   if (host.ascii && (isAscii(joint) || !ASCII_HOST_NEEDS_CLUSTER_RE.test(joint))) {
+    const hostRe = host.asciiRe;
+    hostRe.lastIndex = 0;
+    for (let match = hostRe.exec(joint); match !== null; match = hostRe.exec(joint)) {
+      const mStart = match.index;
+      const mEnd = mStart + match[0].length;
+      if (mStart < splitAt && mEnd > splitAt) {
+        return { trimLeftLen: splitAt - mStart, trimRightLen: mEnd - splitAt };
+      }
+      if (mStart >= splitAt) break;
+      if (match[0].length === 0) hostRe.lastIndex++;
+    }
+    return undefined;
+  }
+  if (!host.ascii && isAscii(joint)) return undefined;
+  if (!host.ascii && !NEEDS_CLUSTER_NFC_RE.test(joint)) {
     const hostRe = host.asciiRe;
     hostRe.lastIndex = 0;
     for (let match = hostRe.exec(joint); match !== null; match = hostRe.exec(joint)) {
@@ -1319,128 +1363,292 @@ function findBoundaryHostMatch(
 }
 
 function projectModelString(value: string, hostname: string, limit: number, isTitle: boolean): string {
-  const cleanValue = stripZeroWidth(value);
-  if (!cleanValue) return cleanValue;
-  const hostPlaceholder = isTitle ? '<host>' : '[host]';
+  if (!value) return '';
   const host = analyzeHost(hostname);
-  const chunks: string[] = [];
-  let outCps = 0;
-  let pos = 0;
+  const hostPlaceholder = isTitle ? '<host>' : '[host]';
+  const tailGuard = host ? host.tailGuardClusters : 0;
+  const flushThreshold = Math.max(Math.min(limit * 2, 4096), tailGuard * 2 + 256);
 
-  const carryClusters = host?.hasDelimiters ? Math.max(0, host.clusters - 1) : 0;
-  const flushThreshold = Math.max(Math.min(limit * 2, 16_384), host ? host.clusters * 2 + 256 : 1024);
-  let carry = '';
-  let plainParts: string[] = [];
-  let plainLen = 0;
+  const chunks: string[] = [];
+  let finalizedCps = 0;
+  let pendingParts: string[] = [];
+  let pendingLen = 0;
+  let lastWasSpace = false;
+  let prevEndedWithColon = false;
   let prevReplacedTail = '';
 
-  const flushPlain = (isEndOfSegment: boolean) => {
-    const plain = plainParts.join('');
-    plainParts = [];
-    plainLen = 0;
-    let combined = carry ? carry + plain : plain;
-    carry = '';
-    if (host?.hasDelimiters && prevReplacedTail && combined) {
-      const rightHead = sliceToClusterBound(combined, host.clusters * 2 + 16);
-      const cross = findBoundaryHostMatch(prevReplacedTail, rightHead, host);
-      if (cross) {
-        combined = combined.slice(cross.trimRightLen);
-      }
-      prevReplacedTail = '';
-    }
-    if (!combined) return;
-    const remaining = Math.max(1, limit - outCps);
-    const { text: replaced, tailStart } = host
-      ? replaceHostWithTail(combined, host, hostPlaceholder, remaining)
-      : { text: combined, tailStart: 0 };
-    if (isEndOfSegment || carryClusters === 0) {
-      const bounded = sliceByCodePoints(replaced, remaining + 12);
-      chunks.push(bounded);
-      outCps += countCodePoints(bounded);
-      return;
-    }
-    if (tailStart > 0) {
-      const finalized = replaced.slice(0, tailStart);
-      chunks.push(finalized);
-      outCps += countCodePoints(finalized);
-    }
-    const unmatched = replaced.slice(tailStart);
-    const [prefix, nextCarry] = splitTailClusters(unmatched, carryClusters);
-    if (prefix) {
-      chunks.push(prefix);
-      outCps += countCodePoints(prefix);
-    }
-    if (outCps < limit) carry = nextCarry;
+  const drainPendingString = (): string => {
+    if (pendingLen === 0) return '';
+    const joined = pendingParts.length === 1 ? (pendingParts[0] ?? '') : pendingParts.join('');
+    pendingParts = [];
+    pendingLen = 0;
+    return joined;
   };
 
-  let prevEndedWithColon = false;
-  while (pos < cleanValue.length && outCps < limit) {
-    if (isWhitespaceCode(cleanValue.charCodeAt(pos))) {
-      const start = pos;
-      const maxDelim = host?.allDelimiters
-        ? (limit - outCps + 12) * Math.max(1, host.clusters) + host.clusters
-        : limit - outCps + 12 + (host?.folded.length ?? 0);
+  const applyPrevReplacedTrim = (text: string): string => {
+    if (!host?.hasDelimiters || !prevReplacedTail || !text) return text;
+    const rightHead = sliceByCodePoints(text, tailGuard * 2);
+    const cross = findBoundaryHostMatch(prevReplacedTail, rightHead, host);
+    prevReplacedTail = '';
+    return cross ? text.slice(cross.trimRightLen) : text;
+  };
+
+  const commitPending = (commitAll: boolean) => {
+    let pending = drainPendingString();
+    pending = applyPrevReplacedTrim(pending);
+    if (!pending) return;
+    const replaced = host ? replaceHostWithTail(pending, host, hostPlaceholder).text : pending;
+    if (commitAll || tailGuard === 0) {
+      chunks.push(replaced);
+      finalizedCps += countCodePoints(replaced);
+      return;
+    }
+    const [prefix, nextCarry] = splitTailClusters(replaced, tailGuard);
+    if (prefix) {
+      chunks.push(prefix);
+      finalizedCps += countCodePoints(prefix);
+    }
+    if (nextCarry) {
+      pendingParts.push(nextCarry);
+      pendingLen = nextCarry.length;
+    }
+  };
+
+  const emitPlainOrSpace = (text: string) => {
+    if (!text) return;
+    pendingParts.push(text);
+    pendingLen += text.length;
+    lastWasSpace = text.endsWith(' ');
+    if (pendingLen >= flushThreshold) commitPending(false);
+  };
+
+  const trimPendingBeforeRawToken = (rawSub: string) => {
+    if (!host?.hasDelimiters || (!pendingLen && !prevReplacedTail)) return;
+    if (prevReplacedTail) {
+      let pending = applyPrevReplacedTrim(drainPendingString());
+      if (pending) {
+        const [, leftTail] = splitTailClusters(pending, tailGuard * 2);
+        const rightHead = sliceByCodePoints(rawSub, tailGuard * 2);
+        const cross = findBoundaryHostMatch(leftTail, rightHead, host);
+        if (cross) {
+          const trimLen = Math.min(pending.length, cross.trimLeftLen);
+          pending = pending.slice(0, pending.length - trimLen);
+        }
+        if (pending) {
+          pendingParts.push(pending);
+          pendingLen = pending.length;
+        }
+      }
+      return;
+    }
+    if (pendingParts.length === 0) return;
+    const neededClusters = tailGuard * 2;
+    const popped: string[] = [];
+    let poppedLen = 0;
+    let tail = '';
+    let keepPrefix = '';
+    let leftTail = '';
+    while (pendingParts.length > 0) {
+      const part = pendingParts.pop();
+      if (part === undefined) break;
+      popped.push(part);
+      poppedLen += part.length;
+      if (poppedLen < neededClusters && pendingParts.length > 0) continue;
+      tail = popped.length === 1 ? (popped[0] ?? '') : popped.slice().reverse().join('');
+      [keepPrefix, leftTail] = splitTailClusters(tail, neededClusters);
+      if (keepPrefix.length > 0 || pendingParts.length === 0) break;
+    }
+    pendingLen -= poppedLen;
+    if (!tail) return;
+    const rightHead = sliceByCodePoints(rawSub, neededClusters);
+    const cross = findBoundaryHostMatch(leftTail, rightHead, host);
+    const keepRight = cross
+      ? leftTail.slice(0, leftTail.length - Math.min(leftTail.length, cross.trimLeftLen))
+      : leftTail;
+    if (keepPrefix) {
+      pendingParts.push(keepPrefix);
+      pendingLen += keepPrefix.length;
+    }
+    if (keepRight) {
+      pendingParts.push(keepRight);
+      pendingLen += keepRight.length;
+    }
+  };
+
+  const emitReplaced = (text: string, rawSubForBoundary?: string) => {
+    if (host?.hasDelimiters && rawSubForBoundary) {
+      trimPendingBeforeRawToken(rawSubForBoundary);
+    }
+    commitPending(true);
+    chunks.push(text);
+    finalizedCps += countCodePoints(text);
+    lastWasSpace = false;
+    if (host?.hasDelimiters && rawSubForBoundary) {
+      const tailWindow = rawSubForBoundary.slice(Math.max(0, rawSubForBoundary.length - tailGuard * 4));
+      const [, tokTail] = splitTailClusters(tailWindow, tailGuard * 2);
+      prevReplacedTail = tokTail;
+    } else {
+      prevReplacedTail = '';
+    }
+  };
+
+  const processNormalizedSubToken = (sub: string) => {
+    if (!sub) return;
+    if (countCodePoints(sub) > MAX_TOKEN_CODEPOINTS) {
+      emitReplaced('[long]', sub);
+      prevEndedWithColon = endsWithDetectionColon(sub);
+      return;
+    }
+    const classified = classifyNormalizedToken(sub, isTitle, prevEndedWithColon, host);
+    prevEndedWithColon = endsWithDetectionColon(sub);
+    if (classified.kind === 'replaced') {
+      emitReplaced(classified.text, sub);
+    } else {
+      if (classified.kind === 'basename' && host?.hasDelimiters) {
+        trimPendingBeforeRawToken(sub);
+      }
+      emitPlainOrSpace(classified.text);
+    }
+  };
+
+  let pos = 0;
+  while (pos < value.length && finalizedCps < limit) {
+    const code = value.charCodeAt(pos);
+    if (isWhitespaceCode(code)) {
       pos++;
-      while (pos < cleanValue.length && pos - start < maxDelim && isWhitespaceCode(cleanValue.charCodeAt(pos))) {
-        pos++;
+      while (pos < value.length) {
+        const c = value.charCodeAt(pos);
+        if (isWhitespaceCode(c)) {
+          pos++;
+          continue;
+        }
+        if (c < 0x00ad) break;
+        const { cp, len, valid } = readCodePointAt(value, pos);
+        if (valid && cp !== 0x200d && cp !== 0xfe0f && isDefaultIgnorableCode(cp)) {
+          pos += len;
+          continue;
+        }
+        break;
       }
-      const delim = cleanValue.slice(start, pos);
-      plainParts.push(delim);
-      plainLen += delim.length;
-      if (pos - start >= maxDelim) {
-        flushPlain(false);
-        if (outCps >= limit) break;
-        while (pos < cleanValue.length && isWhitespaceCode(cleanValue.charCodeAt(pos))) pos++;
-      } else if (plainLen >= flushThreshold) {
-        flushPlain(false);
-      }
+      if (!lastWasSpace) emitPlainOrSpace(' ');
       continue;
     }
 
+    // Skip leading non-ZWJ/VS default-ignorable codepoints before a token or inside whitespace.
+    if (code >= 0x00ad) {
+      const first = readCodePointAt(value, pos);
+      if (first.valid && first.cp !== 0x200d && first.cp !== 0xfe0f && isDefaultIgnorableCode(first.cp)) {
+        pos += first.len;
+        continue;
+      }
+    }
+
     const tokStart = pos;
-    pos++;
-    while (pos < cleanValue.length && !isWhitespaceCode(cleanValue.charCodeAt(pos))) pos++;
-    const rawToken = cleanValue.slice(tokStart, pos);
-    const classified = classifyToken(rawToken, isTitle, prevEndedWithColon);
-    prevEndedWithColon = endsWithDetectionColon(rawToken);
-    if (classified.kind === 'replaced') {
-      if (host?.hasDelimiters && (carry || plainLen > 0 || prevReplacedTail)) {
-        const rawPlain = plainParts.join('');
-        let combined = carry ? carry + rawPlain : rawPlain;
-        carry = '';
-        plainParts = [];
-        plainLen = 0;
-        const tailBound = host.clusters * 2 + 16;
-        const [, plainTail] = splitTailClusters(combined, tailBound);
-        const rawHead = sliceToClusterBound(rawToken, tailBound);
-        const leftCheck = prevReplacedTail ? prevReplacedTail + plainTail : plainTail;
-        const cross = findBoundaryHostMatch(leftCheck, rawHead, host);
-        if (cross) {
-          const trimFromPlain = Math.min(combined.length, cross.trimLeftLen);
-          combined = combined.slice(0, combined.length - trimFromPlain);
+    let nonDiCps = 0;
+    let asciiOnly = true;
+    let exceededRawCap = false;
+
+    while (pos < value.length) {
+      const c = value.charCodeAt(pos);
+      if (c <= 32) {
+        if (c === 32 || (c >= 9 && c <= 13)) break;
+        nonDiCps++;
+        pos++;
+        if (nonDiCps > MAX_RAW_NORMALIZE_CODEPOINTS) {
+          exceededRawCap = true;
+          break;
         }
-        if (combined) {
-          plainParts.push(combined);
-          plainLen = combined.length;
+        continue;
+      }
+      if (c < 0x80) {
+        nonDiCps++;
+        pos++;
+        if (nonDiCps > MAX_RAW_NORMALIZE_CODEPOINTS) {
+          exceededRawCap = true;
+          break;
+        }
+        continue;
+      }
+      if (isWhitespaceCode(c)) break;
+      asciiOnly = false;
+      if (c < 0xd800 || c > 0xdfff) {
+        if (c === 0x200d || c === 0xfe0f || !isDefaultIgnorableCode(c)) {
+          nonDiCps++;
+          if (nonDiCps > MAX_RAW_NORMALIZE_CODEPOINTS) {
+            exceededRawCap = true;
+            break;
+          }
+        }
+        pos += 1;
+        continue;
+      }
+      const { cp, len, valid } = readCodePointAt(value, pos);
+      if (!valid || !isDefaultIgnorableCode(cp)) {
+        nonDiCps++;
+        if (nonDiCps > MAX_RAW_NORMALIZE_CODEPOINTS) {
+          exceededRawCap = true;
+          break;
         }
       }
-      flushPlain(true);
+      pos += len;
+    }
+
+    if (exceededRawCap) {
+      while (pos < value.length) {
+        const c = value.charCodeAt(pos);
+        if (c === 32 || (c >= 9 && c <= 13) || (c >= 0xa0 && isWhitespaceCode(c))) break;
+        pos++;
+      }
       if (host?.hasDelimiters) {
-        const tailWindow = rawToken.slice(Math.max(0, rawToken.length - (host.clusters * 4 + 64)));
-        const [, tokTail] = splitTailClusters(tailWindow, host.clusters * 2 + 16);
+        const headRaw = value.slice(tokStart, Math.min(pos, tokStart + Math.min(tailGuard * 4, 256)));
+        const normHead = normalizeShortSegment(headRaw);
+        emitReplaced('[long]', normHead);
+        const tailRaw = value.slice(Math.max(tokStart, pos - Math.min(tailGuard * 4, 256)), pos);
+        const normTail = normalizeShortSegment(tailRaw);
+        const [, tokTail] = splitTailClusters(normTail, tailGuard * 2);
         prevReplacedTail = tokTail;
+      } else {
+        emitReplaced('[long]');
       }
-      if (outCps >= limit || outCps + classified.text.length > limit) break;
-      chunks.push(classified.text);
-      outCps += classified.text.length;
-    } else {
-      plainParts.push(classified.text);
-      plainLen += classified.text.length;
-      if (plainLen >= flushThreshold) flushPlain(false);
+      prevEndedWithColon = rawEndsWithColon(value, tokStart, pos);
+      continue;
+    }
+
+    const rawToken = value.slice(tokStart, pos);
+    if (asciiOnly) {
+      if (rawToken.length > MAX_TOKEN_CODEPOINTS) {
+        emitReplaced('[long]', rawToken);
+        prevEndedWithColon = endsWithDetectionColon(rawToken);
+        continue;
+      }
+      processNormalizedSubToken(rawToken);
+      continue;
+    }
+
+    const normSegment = normalizeShortSegment(rawToken);
+    if (!normSegment) continue;
+    const collapsed = collapseNormalizedWhitespace(normSegment);
+    if (!collapsed) continue;
+    if (!collapsed.includes(' ')) {
+      processNormalizedSubToken(collapsed);
+      continue;
+    }
+    for (let sPos = 0; sPos < collapsed.length; ) {
+      if (collapsed.charCodeAt(sPos) === 32) {
+        if (!lastWasSpace) emitPlainOrSpace(' ');
+        prevEndedWithColon = false;
+        sPos++;
+        continue;
+      }
+      let sEnd = sPos + 1;
+      while (sEnd < collapsed.length && collapsed.charCodeAt(sEnd) !== 32) sEnd++;
+      processNormalizedSubToken(collapsed.slice(sPos, sEnd));
+      if (finalizedCps >= limit) break;
+      sPos = sEnd;
     }
   }
 
-  if ((plainLen > 0 || carry) && outCps < limit) flushPlain(true);
+  commitPending(true);
   return truncateRedacted(chunks.join(''), limit);
 }
 
@@ -1484,23 +1692,84 @@ function minimize(
   return entries;
 }
 
+function isRawSlashOrHomoglyph(raw: string, i: number): boolean {
+  const code = raw.charCodeAt(i);
+  if (code === 47 || code === 92) return true;
+  if (code < 0x80) return false;
+  const ch = raw[i] as string;
+  const mapped = SINGLE_CHAR_HOMOGLYPHS[ch];
+  return mapped === '/' || mapped === '\\' || ch === '\uff0f' || ch === '\uff3c' || ch === '\ufe68';
+}
+
 export function modelPath(value: string): string {
-  const clean = stripZeroWidth(value);
-  if (!clean) return '[path]';
-  if (containsDetectionScheme(clean) || hasPathEndpointMeta(clean) || isUncOrTwoPartServerPath(clean)) {
+  if (!value) return '[path]';
+  if (value.length <= MAX_RAW_NORMALIZE_CODEPOINTS * 4) {
+    const norm = normalizeFullShort(value);
+    if (!norm) return '[path]';
+    if (hasSlash(norm)) {
+      const detNoMarks = stripCombiningMarksIfAny(norm);
+      if (
+        detNoMarks.includes('://') ||
+        hasPathEndpointMetaNormalized(norm) ||
+        isUncOrTwoPartServerPathNormalized(detNoMarks)
+      ) {
+        return '[path]';
+      }
+      const rawBase = extractBasenameNormalized(norm);
+      if (!rawBase || rawBase === '.' || rawBase === '..' || isDriveRootBaseNormalized(rawBase) || hasSlash(rawBase)) {
+        return '[path]';
+      }
+      const parts = rawBase.split(' ').filter(Boolean);
+      if (
+        parts.length === 0 ||
+        parts.some((p) => countCodePoints(p) > MAX_TOKEN_CODEPOINTS) ||
+        !parts.every((part) => classifyNonPathToken(part, false, false, undefined).kind === 'plain')
+      ) {
+        return '[path]';
+      }
+      return modelText(rawBase);
+    }
+    const parts = norm.split(' ').filter(Boolean);
+    if (
+      parts.length === 0 ||
+      parts.some((p) => countCodePoints(p) > MAX_TOKEN_CODEPOINTS) ||
+      !parts.every((part) => classifyNonPathToken(part, false, false, undefined).kind === 'plain')
+    ) {
+      return '[path]';
+    }
+    return modelText(norm);
+  }
+
+  // Long path fast-path: reject endpoint metadata anywhere, extract trailing segment if bounded.
+  let end = value.length;
+  while (end > 0 && isRawSlashOrHomoglyph(value, end - 1)) end--;
+  if (end === 0) return '[path]';
+  let start = end;
+  while (start > 0 && !isRawSlashOrHomoglyph(value, start - 1)) start--;
+  if (end - start > MAX_RAW_NORMALIZE_CODEPOINTS) return '[path]';
+  if (start === 0) return '[path]';
+  const prefix = value.slice(0, start);
+  if (/[:@%[\]]/.test(prefix) || prefix.includes('//') || prefix.includes('\\\\')) return '[path]';
+  const baseRaw = value.slice(start, end);
+  const normBase = normalizeFullShort(baseRaw);
+  if (!normBase || normBase === '.' || normBase === '..' || isDriveRootBaseNormalized(normBase) || hasSlash(normBase)) {
     return '[path]';
   }
-  const rawBase = MAYBE_SLASH_RE.test(clean) ? extractRawBasename(clean) : clean;
-  if (!rawBase || rawBase === '.' || rawBase === '..' || isDriveRootBase(rawBase) || MAYBE_SLASH_RE.test(rawBase)) {
+  const parts = normBase.split(' ').filter(Boolean);
+  if (
+    parts.length === 0 ||
+    parts.some((p) => countCodePoints(p) > MAX_TOKEN_CODEPOINTS) ||
+    !parts.every((part) => classifyNonPathToken(part, false, false, undefined).kind === 'plain')
+  ) {
     return '[path]';
   }
-  const parts = rawBase.split(/\s+/u).filter(Boolean);
-  if (parts.length === 0 || !parts.every((part) => isSafeNonPathToken(part))) return '[path]';
-  return modelText(rawBase);
+  return modelText(normBase);
 }
 
 export function modelLabel(value: string): string {
-  return /^[\p{L}\p{N}_ -]+$/u.test(value) ? modelText(value) : '[redacted]';
+  if (!value || value.length > MAX_RAW_NORMALIZE_CODEPOINTS) return '[redacted]';
+  const norm = normalizeFullShort(value);
+  return /^[\p{L}\p{N}_ -]+$/u.test(norm) ? modelText(norm) : '[redacted]';
 }
 
 export function modelAppName(value: string): string {

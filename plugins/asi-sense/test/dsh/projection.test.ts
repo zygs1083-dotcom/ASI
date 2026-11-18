@@ -10,7 +10,7 @@ describe('bounded model projections', () => {
     ['a@', 'a@'.repeat(10_000)],
   ] as const;
 
-  it.each(cases)('projects 20,000 characters of %s within 50ms', (name, value) => {
+  it.each(cases)('projects 20,000 characters of %s within 1000ms (design target <50ms)', (name, value) => {
     for (const [label, project] of [
       ['title', modelTitle],
       ['text', modelText],
@@ -24,20 +24,23 @@ describe('bounded model projections', () => {
     }
   });
 
-  it.each(['汉', 'a.', 'a:', '/a', 'a@'])('projects full-length %s inputs within 50ms', (unit) => {
-    for (const [label, project, limit] of [
-      ['title', modelTitle, 512],
-      ['text', modelText, 32_768],
-    ] as const) {
-      const value = unit.repeat(limit / unit.length);
-      const start = performance.now();
-      project(value, 'fixture-host');
-      const elapsed = performance.now() - start;
-      console.log(`projection full ${unit} ${label}: ${elapsed.toFixed(2)}ms`);
-      // Target <50ms (<200ms worst-case); relaxed to 1000ms on U1 for shared-host/JIT warmup jitter.
-      expect(elapsed).toBeLessThanOrEqual(1000);
-    }
-  });
+  it.each(['汉', 'a.', 'a:', '/a', 'a@'])(
+    'projects full-length %s inputs within 1000ms (design target <50ms)',
+    (unit) => {
+      for (const [label, project, limit] of [
+        ['title', modelTitle, 512],
+        ['text', modelText, 32_768],
+      ] as const) {
+        const value = unit.repeat(limit / unit.length);
+        const start = performance.now();
+        project(value, 'fixture-host');
+        const elapsed = performance.now() - start;
+        console.log(`projection full ${unit} ${label}: ${elapsed.toFixed(2)}ms`);
+        // Target <50ms (<200ms worst-case); relaxed to 1000ms on U1 for shared-host/JIT warmup jitter.
+        expect(elapsed).toBeLessThanOrEqual(1000);
+      }
+    },
+  );
 
   it.each([
     ['title', modelTitle, 512],
@@ -90,53 +93,77 @@ describe('bounded model projections', () => {
   });
 
   it('retains a complete title token at the limit', () => {
-    expect(modelTitle('汉'.repeat(512), 'fixture-host')).toBe('汉'.repeat(512));
+    const exact512MultiToken = `${'汉'.repeat(256)} ${'字'.repeat(255)}`;
+    expect(modelTitle(exact512MultiToken, 'fixture-host')).toBe(exact512MultiToken);
+    expect(modelTitle('汉'.repeat(256), 'fixture-host')).toBe('汉'.repeat(256));
+    expect(modelTitle('汉'.repeat(512), 'fixture-host')).toBe('[long]');
   });
 
   it('keeps non-empty output when inputs exceed limits without delimiters or shrink before secrets', () => {
-    expect(modelTitle('汉'.repeat(20_000), 'fixture-host')).toBe('汉'.repeat(512));
-    expect(modelText('汉'.repeat(40_000), 'fixture-host')).toBe('汉'.repeat(32_768));
+    expect(modelTitle('汉'.repeat(20_000), 'fixture-host')).toBe('[long]');
+    expect(modelText('汉'.repeat(40_000), 'fixture-host')).toBe('[long]');
+    expect(Array.from(modelTitle(`${'汉 '.repeat(10_000)}`, 'fixture-host'))).toHaveLength(512);
+    expect(Array.from(modelText(`${'汉 '.repeat(20_000)}`, 'fixture-host'))).toHaveLength(32_768);
 
-    expect(modelTitle(`${'a'.repeat(505)}secret-host.invalid`, 'secret-host.invalid')).toBe('<host>');
-    expect(modelTitle(`${'a'.repeat(509)}secret-host.invalid`, 'secret-host.invalid')).toBe('<host>');
-    expect(modelText(`${'a'.repeat(32_760)}https://secret-host.invalid/p`, 'secret-host.invalid')).toBe('[endpoint]');
-    expect(modelText(`${'a'.repeat(32_758)}https://secret-host.invalid/p`, 'secret-host.invalid')).toBe('[endpoint]');
+    expect(modelTitle(`${'a'.repeat(505)}secret-host.invalid`, 'secret-host.invalid')).toBe('[long]');
+    expect(modelTitle(`${'a'.repeat(200)}secret-host.invalid`, 'secret-host.invalid')).toBe('<host>');
+    expect(modelText(`${'a'.repeat(32_760)}https://secret-host.invalid/p`, 'secret-host.invalid')).toBe('[long]');
+    expect(modelText(`${'a'.repeat(200)}https://secret-host.invalid/p`, 'secret-host.invalid')).toBe('[endpoint]');
 
-    expect(modelTitle(`${'a'.repeat(504)} secret-host.invalid`, 'secret-host.invalid')).toBe(
-      `${'a'.repeat(504)} <host>`,
-    );
-    expect(modelTitle(`${'a'.repeat(508)} secret-host.invalid`, 'secret-host.invalid')).toBe(`${'a'.repeat(508)} `);
-    expect(modelText(`${'a'.repeat(32_759)} https://secret-host.invalid/p`, 'secret-host.invalid')).toBe(
-      `${'a'.repeat(32_759)} `,
-    );
-    expect(modelText(`${'a'.repeat(32_757)} https://secret-host.invalid/p`, 'secret-host.invalid')).toBe(
-      `${'a'.repeat(32_757)} [endpoint]`,
-    );
+    const p504 = `${'a'.repeat(252)} ${'b'.repeat(251)}`;
+    const p508 = `${'a'.repeat(254)} ${'b'.repeat(253)}`;
+    expect(modelTitle(`${p504} secret-host.invalid`, 'secret-host.invalid')).toBe(`${p504} <host>`);
+    expect(modelTitle(`${p508} secret-host.invalid`, 'secret-host.invalid')).toBe(`${p508} `);
+
+    const p32757 = `${`${'a'.repeat(255)} `.repeat(127)}${'b'.repeat(245)}`;
+    const p32759 = `${`${'a'.repeat(255)} `.repeat(127)}${'b'.repeat(247)}`;
+    expect(modelText(`${p32759} https://secret-host.invalid/p`, 'secret-host.invalid')).toBe(`${p32759} `);
+    expect(modelText(`${p32757} https://secret-host.invalid/p`, 'secret-host.invalid')).toBe(`${p32757} [endpoint]`);
 
     expect(modelTitle(`https://a.invalid/${'x'.repeat(20_000)} secret-host.invalid`, 'secret-host.invalid')).toBe(
+      '[long] <host>',
+    );
+    expect(modelTitle(`https://a.invalid/${'x'.repeat(200)} secret-host.invalid`, 'secret-host.invalid')).toBe(
       '<host> <host>',
     );
-    expect(modelTitle(`/${'secret/'.repeat(500)}public.txt`, 'secret-host.invalid')).toBe('public.txt');
+    expect(modelTitle(`/${'secret/'.repeat(500)}public.txt`, 'secret-host.invalid')).toBe('[long]');
+    expect(modelTitle(`/${'secret/'.repeat(25)}public.txt`, 'secret-host.invalid')).toBe('public.txt');
     expect(modelText(`https://a.invalid/${'x'.repeat(200_000)} secret-host.invalid`, 'secret-host.invalid')).toBe(
+      '[long] [host]',
+    );
+    expect(modelText(`https://a.invalid/${'x'.repeat(200)} secret-host.invalid`, 'secret-host.invalid')).toBe(
       '[endpoint] [host]',
     );
   });
 
   it('truncates by code points without splitting surrogate pairs or redaction placeholders', () => {
-    expect(modelTitle('😀'.repeat(600), 'fixture-host')).toBe('😀'.repeat(512));
-    expect(modelTitle(`${'a'.repeat(511)}😀`, 'fixture-host')).toBe(`${'a'.repeat(511)}😀`);
-    expect(modelTitle(`${'a'.repeat(512)}😀`, 'fixture-host')).toBe('a'.repeat(512));
-    expect(modelTitle(`${'😀'.repeat(506)}fixture-host`, 'fixture-host')).toBe(`${'😀'.repeat(506)}<host>`);
-    expect(modelTitle(`${'😀'.repeat(507)}fixture-host`, 'fixture-host')).toBe('😀'.repeat(507));
+    expect(modelTitle('😀'.repeat(600), 'fixture-host')).toBe('[long]');
+    expect(Array.from(modelTitle(`${'😀 '.repeat(300)}`, 'fixture-host'))).toHaveLength(512);
+    expect(modelTitle(`${'a'.repeat(255)} ${'b'.repeat(255)}😀`, 'fixture-host')).toBe(
+      `${'a'.repeat(255)} ${'b'.repeat(255)}😀`,
+    );
+    expect(modelTitle(`${'a'.repeat(255)} ${'b'.repeat(255)} 😀`, 'fixture-host')).toBe(
+      `${'a'.repeat(255)} ${'b'.repeat(255)} `,
+    );
+    expect(modelTitle(`${'😀 '.repeat(252)}😀😀fixture-host`, 'fixture-host')).toBe(`${'😀 '.repeat(252)}😀😀<host>`);
+    expect(modelTitle(`${'😀 '.repeat(252)}😀😀😀fixture-host`, 'fixture-host')).toBe(`${'😀 '.repeat(252)}😀😀😀`);
 
-    expect(modelText('😀'.repeat(33_000), 'fixture-host')).toBe('😀'.repeat(32_768));
-    expect(modelText(`${'a'.repeat(32_767)}😀`, 'fixture-host')).toBe(`${'a'.repeat(32_767)}😀`);
-    expect(modelText(`${'a'.repeat(32_768)}😀`, 'fixture-host')).toBe('a'.repeat(32_768));
-    expect(modelText(`${'a'.repeat(32_765)}fixture-host`, 'fixture-host')).toBe('a'.repeat(32_765));
-    expect(modelText(`${'a'.repeat(32_764)} /`, 'fixture-host')).toBe(`${'a'.repeat(32_764)} `);
-    expect(modelText(`${'a'.repeat(32_761)} /`, 'fixture-host')).toBe(`${'a'.repeat(32_761)} [path]`);
-    expect(modelTitle(`${'a'.repeat(508)} /`, 'fixture-host')).toBe(`${'a'.repeat(508)} `);
-    expect(modelTitle(`${'a'.repeat(505)} /`, 'fixture-host')).toBe(`${'a'.repeat(505)} [path]`);
+    expect(modelText('😀'.repeat(33_000), 'fixture-host')).toBe('[long]');
+    expect(Array.from(modelText(`${'😀 '.repeat(20_000)}`, 'fixture-host'))).toHaveLength(32_768);
+    const t32761 = `${`${'a'.repeat(255)} `.repeat(127)}${'b'.repeat(249)}`;
+    const t32764 = `${`${'a'.repeat(255)} `.repeat(127)}${'b'.repeat(252)}`;
+    const t32765 = `${`${'a'.repeat(255)} `.repeat(127)}${'b'.repeat(253)}`;
+    const t32767 = `${`${'a'.repeat(255)} `.repeat(127)}${'b'.repeat(255)}`;
+    const t32768 = `${`${'a'.repeat(255)} `.repeat(128)}`;
+    expect(modelText(`${t32767}😀`, 'fixture-host')).toBe(`${t32767}😀`);
+    expect(modelText(`${t32768}😀`, 'fixture-host')).toBe(t32768);
+    expect(modelText(`${t32765} fixture-host`, 'fixture-host')).toBe(`${t32765} `);
+    expect(modelText(`${t32764} /`, 'fixture-host')).toBe(`${t32764} `);
+    expect(modelText(`${t32761} /`, 'fixture-host')).toBe(`${t32761} [path]`);
+    const p505 = `${'a'.repeat(255)} ${'b'.repeat(249)}`;
+    const p508 = `${'a'.repeat(255)} ${'b'.repeat(252)}`;
+    expect(modelTitle(`${p508} /`, 'fixture-host')).toBe(`${p508} `);
+    expect(modelTitle(`${p505} /`, 'fixture-host')).toBe(`${p505} [path]`);
   });
 
   it('matches local hostnames with NFC normalization and case-insensitivity', () => {
@@ -150,7 +177,7 @@ describe('bounded model projections', () => {
     expect(modelTitle('open /Volumes/Cafe\u0301-no\u0308de', nfcHost)).toBe('open <host>');
     expect(modelText(`on ${nfdHost} and ${mixedNfd}`, nfcHost)).toBe('on [host] and [host]');
     expect(modelText(`on ${nfcHost} and ${mixedNfc}`, nfdHost)).toBe('on [host] and [host]');
-    expect(modelTitle('Cafe\u0301-note on host\u0301 vs host', 'host')).toBe('Cafe\u0301-note on host\u0301 vs <host>');
+    expect(modelTitle('Cafe\u0301-note on host\u0301 vs host', 'host')).toBe('Café-note on host\u0301 vs <host>');
   });
 
   it('hides entire tokens containing Unicode combining marks in modelTitle', () => {

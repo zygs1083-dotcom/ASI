@@ -740,8 +740,12 @@ describe('model-facing tools', () => {
   it('bounds complete results and removes tool and prompt contributions on disposal', async () => {
     const h = await fixture();
     h.state.env.focusedWindow.value = { title: '汉'.repeat(20_000) };
+    const longSingle = await h.call('env_state', { section: 'env' });
+    expect(longSingle).toMatchObject({ isError: false, value: { focusedWindow: { value: { title: '[long]' } } } });
+
+    h.state.env.focusedWindow.value = { title: '汉 '.repeat(20_000) };
     const result = await h.call('env_state', { section: 'env' });
-    expect(result).toMatchObject({ isError: false, value: { focusedWindow: { value: { title: '汉'.repeat(512) } } } });
+    expect(result).toMatchObject({ isError: false, value: { focusedWindow: { value: { title: '汉 '.repeat(256) } } } });
     expect(Buffer.byteLength(JSON.stringify(result.value), 'utf8')).toBeLessThan(32_768);
     expect(modelOutput({ text: 'x '.repeat(17_000) })).toMatchObject({ truncated: true });
     expect((await h.ctx.systemPrompt.assemble()).sections.some((section) => section.name === 'asi-sense')).toBe(true);
