@@ -422,4 +422,204 @@ describe('formatEnvUpdate', () => {
       'file.activity: ~ windowMs=10000 created=5 modified=0 deleted=0 rolledUp=7 files=[[file]]',
     );
   });
+
+  it('formats source.status, source.error, app.launched/terminated, job.failed and system.* changes', () => {
+    const out = formatEnvUpdate(
+      update([
+        change({
+          signal: sig({
+            id: 'ss-1',
+            kind: 'source.status',
+            at: T0,
+            subject: 'files-global-denied',
+            data: { source: 'files-global-denied', status: 'denied', path: '~', reason: 'permission-denied' },
+          }),
+        }),
+        change({
+          signal: sig({
+            id: 'se-1',
+            kind: 'source.error',
+            at: T0 + 1,
+            subject: 'body',
+            data: { source: 'body', error: 'tuning-error' },
+          }),
+        }),
+        change({
+          signal: sig({
+            id: 'al-1',
+            kind: 'app.launched',
+            at: T0 + 2,
+            subject: 'FixtureIDE',
+            data: { name: 'FixtureIDE' },
+          }),
+        }),
+        change({
+          signal: sig({
+            id: 'at-1',
+            kind: 'app.terminated',
+            at: T0 + 3,
+            subject: 'FixtureTerm',
+            data: { name: 'FixtureTerm' },
+          }),
+        }),
+        change({
+          signal: sig({
+            id: 'jf-1',
+            kind: 'job.failed',
+            at: T0 + 4,
+            subject: 'build',
+            data: { id: 'build', exitCode: 2 },
+          }),
+        }),
+        change({
+          signal: sig({
+            id: 'sw-1',
+            kind: 'system.wake',
+            at: T0 + 5,
+            subject: 'system',
+            data: { at: T0 + 5, durationMs: 300_000 },
+          }),
+        }),
+        change({
+          signal: sig({
+            id: 'sl-1',
+            kind: 'screen.locked',
+            at: T0 + 6,
+            subject: 'screen',
+            data: { at: T0 + 6 },
+          }),
+        }),
+        change({
+          signal: sig({
+            id: 'sa-1',
+            kind: 'session.active',
+            at: T0 + 7,
+            subject: 'session',
+            data: { at: T0 + 7, durationMs: 60_000 },
+          }),
+        }),
+      ]),
+    );
+    expect(out).toContain('source.status: files-global-denied status=denied path=~ reason=permission-denied');
+    expect(out).toContain('source.error: body error=tuning-error');
+    expect(out).toContain('app: FixtureIDE launched');
+    expect(out).toContain('app: FixtureTerm terminated');
+    expect(out).toContain('job.failed: `build` 2');
+    expect(out).toContain('system: wake after 300s');
+    expect(out).toContain('screen: locked');
+    expect(out).toContain('session: active after 60s');
+  });
+
+  it('uses real away totals, prioritizes anomalous metrics, shows omitted count, and caps away.summary output at 2KB', () => {
+    const out = formatEnvUpdate(
+      update([
+        change({
+          level: 'wake',
+          ruleId: 'away-summary',
+          note: 'note-'.repeat(400),
+          signal: sig({
+            id: 'away:1',
+            kind: 'away.summary',
+            at: T0,
+            subject: 'away',
+            data: {
+              awayFrom: T0 - 3_600_000,
+              returnAt: T0,
+              durationMs: 3_600_000,
+              sleepMs: 0,
+              lockMs: 3_600_000,
+              hasAnomaly: true,
+              anomalies: ['alerts', 'failed-jobs', 'external-deletion', 'metric-warning'],
+              metrics: [
+                { metric: 'cpu', unit: 'ratio', start: 0.2, end: 0.2, min: 0.2, max: 0.2 },
+                { metric: 'load1', unit: 'load', start: 1, end: 1, min: 1, max: 1 },
+                { metric: 'load5', unit: 'load', start: 1, end: 1, min: 1, max: 1 },
+                {
+                  metric: 'disk',
+                  unit: 'bytes',
+                  start: 500,
+                  end: 40,
+                  min: 40,
+                  max: 500,
+                  ratioStart: 0.5,
+                  ratioMin: 0.04,
+                },
+              ],
+              alerts: [{ metric: 'context', severity: 'critical', count: 1 }],
+              failed: [{ id: 'job-0', kind: 'job.exited', exitCode: 1 }],
+              bursts: [{ directory: '甲'.repeat(511), deleted: 100 }],
+              alertCount: 7,
+              failedCount: 300,
+              deletedCount: 1000,
+              omitted: 295,
+            },
+          }),
+        }),
+      ]),
+    );
+    expect(Buffer.byteLength(out, 'utf8')).toBeLessThanOrEqual(2048);
+    expect(out).toContain('metrics=disk=4%');
+    expect(out).toContain('alerts=7');
+    expect(out).toContain('failed=300');
+    expect(out).toContain('deletes=1000');
+    expect(out).toContain('另有 295 项');
+  });
+
+  it('drops oldest context lines first and never drops wake or budget-downgraded away.summary lines within 2048 UTF-8 bytes', () => {
+    const contextChanges = Array.from({ length: 14 }, (_, i) =>
+      change({
+        level: 'context',
+        signal: sig({
+          id: `fc-${i}`,
+          kind: 'file.changed',
+          at: T0 + i * 100,
+          subject: `src/mod-${i}/${'中文目录-'.repeat(12)}file-${i}.ts`,
+          data: { path: `src/mod-${i}/${'中文目录-'.repeat(12)}file-${i}.ts`, change: 'modify' },
+        }),
+      }),
+    );
+    const wakeChange = change({
+      level: 'wake',
+      ruleId: 'job-failed',
+      signal: sig({
+        id: 'wake-1',
+        kind: 'job.exited',
+        at: T0 + 1500,
+        subject: 'build',
+        data: { id: 'build', exitCode: 1, durationMs: 12_000 },
+      }),
+    });
+    const awayChange = change({
+      level: 'context',
+      reason: 'wake-budget',
+      ruleId: 'away-summary',
+      signal: sig({
+        id: 'away:1',
+        kind: 'away.summary',
+        at: T0 + 2000,
+        subject: 'away',
+        data: {
+          awayFrom: T0 - 3_600_000,
+          returnAt: T0 + 2000,
+          durationMs: 3_600_000,
+          sleepMs: 0,
+          lockMs: 3_600_000,
+          hasAnomaly: true,
+          anomalies: ['alerts'],
+          alerts: [{ metric: 'thermal', severity: 'critical', count: 1 }],
+          alertCount: 1,
+          failedCount: 0,
+          deletedCount: 0,
+        },
+      }),
+    });
+
+    const out = formatEnvUpdate(update([...contextChanges, wakeChange, awayChange], { suppressed: 1 }));
+    expect(Buffer.byteLength(out, 'utf8')).toBeLessThanOrEqual(2048);
+    expect(out).toContain('away.summary:');
+    expect(out).toContain('job: `build` exited 1 after 12s');
+    expect(out).toContain('suppressed: 1');
+    expect(out).not.toContain('file-0.ts');
+    expect(out).toContain('file-13.ts');
+  });
 });

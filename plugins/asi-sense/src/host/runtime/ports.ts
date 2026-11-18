@@ -5,6 +5,7 @@ import type { DeliveryIntent } from '../attention/pipeline.ts';
 import type {
   DailyDirectoryStats,
   DailySummary,
+  DailySystemStats,
   HistoryQuery,
   HistoryQueryResult,
   HistoryStoragePort,
@@ -18,6 +19,7 @@ import type {
 export type {
   DailyDirectoryStats,
   DailySummary,
+  DailySystemStats,
   HistoryQuery,
   HistoryQueryResult,
   HistoryStoragePort,

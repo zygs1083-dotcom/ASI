@@ -8,10 +8,17 @@ import type {
   DiskVolume as SharedDiskVolume,
   Fact as SharedFact,
   SourceRef,
+  SystemStateValue,
 } from '@asi/sense-types';
 import type { TuningState } from './tuning-model';
 
-export type { FactStatus, GlobalFileWatchStatus, GlobalFileWatchValue, SourceRef } from '@asi/sense-types';
+export type {
+  FactStatus,
+  GlobalFileWatchStatus,
+  GlobalFileWatchValue,
+  SourceRef,
+  SystemStateValue,
+} from '@asi/sense-types';
 export type { TuningEntry, TuningParam, TuningState } from './tuning-model';
 
 /** UI 事实：共享 Fact 骨架 + 宿主可读原因（denied/unavailable 时展示）。 */
@@ -110,6 +117,7 @@ export interface SenseState {
     activeJobs: Fact<JobSummary[]>;
     watchedPaths: Fact<Record<string, { lastChange: number; changes: number }>>;
     globalFileWatch?: Fact<GlobalFileWatchValue>;
+    system?: Fact<SystemStateValue>;
   };
   observation: {
     sources: Record<string, { status: FactStatus; lastSignalAt: number; error?: string }>;

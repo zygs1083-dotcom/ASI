@@ -18,8 +18,11 @@ import {
   LocalCalendar,
   MAX_DAILY_EVENT_BYTES,
   type MonthlySummary,
+  parseDailySummary,
   parseHistoryLines,
+  parseMonthlySummary,
   summarizeDay,
+  synthesizeMonth,
 } from '../../src/host/runtime/history/index.ts';
 import {
   type AgentEvent,
@@ -2076,4 +2079,317 @@ describe('runtime history persistence, rollups, retention, and recovery', () => 
       await mgr5.stop();
     }
   }, 20_000);
+
+  it('aggregates sleepCount/sleepDurationMs/lockDurationMs/firstWakeAt/lastSleepAt across accumulator parity, cross-day, DST, and extensions', () => {
+    const nyCal = new LocalCalendar('America/New_York');
+
+    // 1) Accumulator parity across duplicate-id overwrite, duplicate sleep, missing wake, and clock rollback.
+    const normalDate = '2026-11-18';
+    const normalBounds = nyCal.dayBounds(normalDate);
+    const s1 = normalBounds.startMs + 3_600_000;
+    const w1 = s1 + 7_200_000;
+    const dupS1 = normalBounds.startMs + 12_000_000;
+    const dupS2 = normalBounds.startMs + 13_000_000;
+    const dupW = dupS2 + 1_800_000;
+    const lock1 = normalBounds.startMs + 15_000_000;
+    const unlock1 = lock1 + 900_000;
+    const rollbackSleep = normalBounds.startMs + 20_000_000;
+    const rollbackWake = normalBounds.startMs + 19_000_000;
+    const missingWakeSleep = normalBounds.startMs + 22_000_000;
+
+    const lines = [
+      JSON.stringify({
+        record: 'event',
+        id: 's1',
+        kind: 'system.sleep',
+        subject: 'system',
+        level: 'record',
+        at: s1,
+        detail: { at: s1 },
+        source: { id: 'helper', api: 'ndjson', host: 'local' },
+      }),
+      // Duplicate id 'w1' overwrites earlier wake duration cleanly
+      JSON.stringify({
+        record: 'event',
+        id: 'w1',
+        kind: 'system.wake',
+        subject: 'system',
+        level: 'record',
+        at: w1 - 1_000,
+        detail: { at: w1 - 1_000, durationMs: 1_000 },
+        source: { id: 'helper', api: 'ndjson', host: 'local' },
+      }),
+      JSON.stringify({
+        record: 'event',
+        id: 'w1',
+        kind: 'system.wake',
+        subject: 'system',
+        level: 'record',
+        at: w1,
+        detail: { at: w1, durationMs: 7_200_000 },
+        source: { id: 'helper', api: 'ndjson', host: 'local' },
+      }),
+      JSON.stringify({
+        record: 'event',
+        id: 'ds1',
+        kind: 'system.sleep',
+        subject: 'system',
+        level: 'record',
+        at: dupS1,
+        detail: { at: dupS1 },
+        source: { id: 'helper', api: 'ndjson', host: 'local' },
+      }),
+      JSON.stringify({
+        record: 'event',
+        id: 'ds2',
+        kind: 'system.sleep',
+        subject: 'system',
+        level: 'record',
+        at: dupS2,
+        detail: { at: dupS2 },
+        source: { id: 'helper', api: 'ndjson', host: 'local' },
+      }),
+      JSON.stringify({
+        record: 'event',
+        id: 'dw',
+        kind: 'system.wake',
+        subject: 'system',
+        level: 'record',
+        at: dupW,
+        detail: { at: dupW, durationMs: 1_800_000 },
+        source: { id: 'helper', api: 'ndjson', host: 'local' },
+      }),
+      JSON.stringify({
+        record: 'event',
+        id: 'l1',
+        kind: 'screen.locked',
+        subject: 'screen',
+        level: 'record',
+        at: lock1,
+        detail: { at: lock1 },
+        source: { id: 'helper', api: 'ndjson', host: 'local' },
+      }),
+      JSON.stringify({
+        record: 'event',
+        id: 'u1',
+        kind: 'screen.unlocked',
+        subject: 'screen',
+        level: 'record',
+        at: unlock1,
+        detail: { at: unlock1, durationMs: 900_000 },
+        source: { id: 'helper', api: 'ndjson', host: 'local' },
+      }),
+      JSON.stringify({
+        record: 'event',
+        id: 'rb-s',
+        kind: 'system.sleep',
+        subject: 'system',
+        level: 'record',
+        at: rollbackSleep,
+        detail: { at: rollbackSleep },
+        source: { id: 'helper', api: 'ndjson', host: 'local' },
+      }),
+      JSON.stringify({
+        record: 'event',
+        id: 'rb-w',
+        kind: 'system.wake',
+        subject: 'system',
+        level: 'record',
+        at: rollbackWake,
+        detail: { at: rollbackWake },
+        source: { id: 'helper', api: 'ndjson', host: 'local' },
+      }),
+      JSON.stringify({
+        record: 'event',
+        id: 'mw-s',
+        kind: 'system.sleep',
+        subject: 'system',
+        level: 'record',
+        at: missingWakeSleep,
+        detail: { at: missingWakeSleep },
+        source: { id: 'helper', api: 'ndjson', host: 'local' },
+      }),
+    ].join('\n');
+
+    const acc = createDailySummaryAccumulator(normalDate, normalBounds);
+    for (const line of lines.split('\n')) acc.feed(line);
+    const accSummary = acc.finish();
+    const daySummary = summarizeDay(normalDate, parseHistoryLines(lines), normalBounds);
+    expect(accSummary).toEqual(daySummary);
+    expect(daySummary.system).toEqual({
+      // s1->w1 (1), ds1->ds2->dw (2), rb-s + mw-s without intervening wake after rb-w sorted before rb-s (3)
+      sleepCount: 3,
+      sleepDurationMs: 7_200_000 + 1_800_000,
+      lockDurationMs: 900_000,
+      firstWakeAt: w1,
+      lastSleepAt: missingWakeSleep,
+    });
+
+    // 2) Cross-day sleep (23:00 Day 1 -> 07:00 Day 2) and lock across local midnight
+    const d1Date = '2026-11-16';
+    const d2Date = '2026-11-17';
+    const d1Bounds = nyCal.dayBounds(d1Date);
+    const d2Bounds = nyCal.dayBounds(d2Date);
+    const d1SleepAt = d1Bounds.endMs - 3_600_000;
+    const d2WakeAt = d2Bounds.startMs + 7 * 3_600_000;
+    const d1Summary = summarizeDay(
+      d1Date,
+      {
+        events: [
+          {
+            id: 'c1',
+            kind: 'system.sleep',
+            subject: 'system',
+            level: 'record',
+            at: d1SleepAt,
+            source: { id: 'helper', api: 'ndjson', host: 'local' },
+          },
+        ],
+        lifecycle: [],
+      },
+      d1Bounds,
+    );
+    const d2Summary = summarizeDay(
+      d2Date,
+      {
+        events: [
+          {
+            id: 'c2',
+            kind: 'system.wake',
+            subject: 'system',
+            level: 'record',
+            at: d2WakeAt,
+            detail: { at: d2WakeAt, durationMs: 8 * 3_600_000 },
+            source: { id: 'helper', api: 'ndjson', host: 'local' },
+          },
+          {
+            id: 'c3',
+            kind: 'screen.unlocked',
+            subject: 'screen',
+            level: 'record',
+            at: d2Bounds.startMs + 1_800_000,
+            detail: { at: d2Bounds.startMs + 1_800_000, durationMs: 3_600_000 },
+            source: { id: 'helper', api: 'ndjson', host: 'local' },
+          },
+        ],
+        lifecycle: [],
+      },
+      d2Bounds,
+    );
+    expect(d1Summary.system).toEqual({
+      sleepCount: 1,
+      sleepDurationMs: 0,
+      lockDurationMs: 0,
+      lastSleepAt: d1SleepAt,
+    });
+    expect(d2Summary.system).toEqual({
+      sleepCount: 0,
+      sleepDurationMs: 7 * 3_600_000,
+      lockDurationMs: 1_800_000,
+      firstWakeAt: d2WakeAt,
+    });
+
+    const monthly = synthesizeMonth('2026-11', [d1Summary, d2Summary], d2Bounds.endMs);
+    expect(monthly.system).toEqual({
+      sleepCount: 1,
+      sleepDurationMs: 7 * 3_600_000,
+      lockDurationMs: 1_800_000,
+      firstWakeAt: d2WakeAt,
+      lastSleepAt: d1SleepAt,
+    });
+
+    // 3) DST transitions (23h spring-forward and 25h fall-back in America/New_York)
+    const springBounds = nyCal.dayBounds('2026-03-08'); // 23h
+    const springSleep = springBounds.startMs + 3_600_000; // 01:00 EST
+    const springWake = springBounds.startMs + 6 * 3_600_000; // 08:00 EDT (5 real hours elapsed)
+    const springSummary = summarizeDay(
+      '2026-03-08',
+      {
+        events: [
+          {
+            id: 'sp-s',
+            kind: 'system.sleep',
+            subject: 'system',
+            level: 'record',
+            at: springSleep,
+            source: { id: 'helper', api: 'ndjson', host: 'local' },
+          },
+          {
+            id: 'sp-w',
+            kind: 'system.wake',
+            subject: 'system',
+            level: 'record',
+            at: springWake,
+            detail: { at: springWake, durationMs: 5 * 3_600_000 },
+            source: { id: 'helper', api: 'ndjson', host: 'local' },
+          },
+        ],
+        lifecycle: [],
+      },
+      springBounds,
+    );
+    expect(springSummary.system).toEqual({
+      sleepCount: 1,
+      sleepDurationMs: 5 * 3_600_000,
+      lockDurationMs: 0,
+      firstWakeAt: springWake,
+      lastSleepAt: springSleep,
+    });
+
+    const fallBounds = nyCal.dayBounds('2026-11-01'); // 25h
+    const fallSleep = fallBounds.startMs + 1_800_000; // 00:30 EDT
+    const fallWake = fallBounds.startMs + 24.5 * 3_600_000; // 23:30 EST (24 real hours elapsed)
+    const fallSummary = summarizeDay(
+      '2026-11-01',
+      {
+        events: [
+          {
+            id: 'fl-s',
+            kind: 'system.sleep',
+            subject: 'system',
+            level: 'record',
+            at: fallSleep,
+            source: { id: 'helper', api: 'ndjson', host: 'local' },
+          },
+          {
+            id: 'fl-w',
+            kind: 'system.wake',
+            subject: 'system',
+            level: 'record',
+            at: fallWake,
+            detail: { at: fallWake, durationMs: 24 * 3_600_000 },
+            source: { id: 'helper', api: 'ndjson', host: 'local' },
+          },
+        ],
+        lifecycle: [],
+      },
+      fallBounds,
+    );
+    expect(fallSummary.system).toEqual({
+      sleepCount: 1,
+      sleepDurationMs: 24 * 3_600_000,
+      lockDurationMs: 0,
+      firstWakeAt: fallWake,
+      lastSleepAt: fallSleep,
+    });
+    expect(fallSummary.system!.sleepDurationMs).toBeLessThanOrEqual(fallBounds.durationMs);
+
+    // 4) Extensibility and backwards compatibility in parseDailySummary / parseMonthlySummary
+    const legacyRaw = JSON.stringify({ ...daySummary, system: undefined });
+    expect(parseDailySummary(legacyRaw)).toBeDefined();
+    const extendedRaw = JSON.stringify({
+      ...daySummary,
+      extensions: { metricBucketsVersion: 1 },
+      envMetrics: { bucketMs: 300_000, buckets: [] },
+    });
+    const parsedExtended = parseDailySummary(extendedRaw) as DailySummary & { envMetrics?: unknown };
+    expect(parsedExtended.extensions).toEqual({ metricBucketsVersion: 1 });
+    expect(parsedExtended.envMetrics).toEqual({ bucketMs: 300_000, buckets: [] });
+
+    const monthlyExtended = parseMonthlySummary(
+      JSON.stringify({ ...monthly, extensions: { custom: true }, sliceB: 42 }),
+    ) as MonthlySummary & { sliceB?: unknown };
+    expect(monthlyExtended.extensions).toEqual({ custom: true });
+    expect(monthlyExtended.sliceB).toBe(42);
+  });
 });

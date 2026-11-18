@@ -30,6 +30,7 @@ export {
   type DailyDeliveryCounts,
   type DailyDirectoryStats,
   type DailySummary,
+  type DailySystemStats,
   DEFAULT_HISTORY_LIMIT,
   HISTORY_HEARTBEAT_MS,
   HISTORY_RETENTION_DAYS,

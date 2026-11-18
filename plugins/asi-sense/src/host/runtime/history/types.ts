@@ -68,6 +68,14 @@ export interface DailyDeliveryCounts {
   suppressed: number;
 }
 
+export interface DailySystemStats {
+  sleepCount: number;
+  sleepDurationMs: number;
+  lockDurationMs: number;
+  firstWakeAt?: number;
+  lastSleepAt?: number;
+}
+
 export interface DailySummary {
   version: 1;
   date: string;
@@ -88,6 +96,7 @@ export interface DailySummary {
     anomaly: number;
     byMetric: Record<string, number>;
   };
+  system?: DailySystemStats;
   coverage: {
     observedMs: number;
     pausedMs: number;
@@ -95,6 +104,7 @@ export interface DailySummary {
   };
   totalEvents: number;
   truncatedAtLimit?: boolean;
+  extensions?: Record<string, unknown>;
 }
 
 export interface MonthlySummary {
@@ -118,6 +128,7 @@ export interface MonthlySummary {
     anomaly: number;
     byMetric: Record<string, number>;
   };
+  system?: DailySystemStats;
   coverage: {
     totalDayMs: number;
     observedMs: number;
@@ -127,6 +138,7 @@ export interface MonthlySummary {
   totalEvents: number;
   generatedAt: number;
   partial?: boolean;
+  extensions?: Record<string, unknown>;
 }
 
 export interface HistoryUnsafeEntry {

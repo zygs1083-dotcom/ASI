@@ -75,6 +75,7 @@ export class RuntimeAttention {
     private readonly canEnsureTarget?: () => boolean,
     private readonly history?: AttentionHistorySink,
     platform: string = process.platform,
+    private readonly onSignal?: (signal: Signal) => void,
   ) {
     const staged = dsh as DshPort & {
       onDeliveryCommitted?: (cb: (session: string, id: string) => void) => () => void;
@@ -740,6 +741,14 @@ export class RuntimeAttention {
     this.entries.push(entry);
     if (this.entries.length > 200) this.pending.forget(this.entries.shift()?.id);
     this.history?.recordEvent(entry, bundleId !== undefined || title !== undefined ? { bundleId, title } : undefined);
+    if (
+      signal.kind !== 'away.summary' &&
+      reason !== 'duplicate' &&
+      reason !== 'older-sequence' &&
+      reason !== 'session-private'
+    ) {
+      this.onSignal?.(signal);
+    }
   }
   private mark(id: string, reason?: string, level?: DeliveryLevel): void {
     const entry = this.entries.find((item) => item.id === id);

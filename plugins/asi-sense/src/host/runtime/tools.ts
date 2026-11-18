@@ -5,6 +5,7 @@ import type { DshSource } from '../sources/dsh.ts';
 import type { FileSource } from '../sources/files.ts';
 import type { HelperSource } from '../sources/helper.ts';
 import type { RuntimeAttention } from './attention.ts';
+import type { MetricQueryParams, MetricTimeline } from './metrics.ts';
 import type { DshPort, SenseActions, TuneRequest } from './ports.ts';
 import type { Settings } from './settings.ts';
 
@@ -59,9 +60,11 @@ export function runtimeTools(
   changed: () => void,
   dsh: DshPort,
   dshSource: DshSource,
+  metrics: MetricTimeline,
 ) {
   return {
     refreshDetail: () => helper.refreshDetail(),
+    envMetrics: (params?: MetricQueryParams) => metrics.query(params),
     envState: (section?: 'self' | 'env' | 'observation', sessionId?: string) => {
       const state = dshSource.stateFor(sessionId ?? attention.currentSessionId(), attention.state());
       if (!titlesAllowed()) state.env.focusedWindow.value = null;

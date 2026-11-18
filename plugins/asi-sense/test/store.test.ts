@@ -461,4 +461,80 @@ describe('StateStore', () => {
       lastSignalAt: 3,
     });
   });
+
+  it('tracks env.system lock, sleep, wake timestamps, long TTL, and independent lock/power ordering', () => {
+    let wall = 1_000;
+    const st = new StateStore(
+      () => wall,
+      60_000,
+      () => wall,
+    );
+    expect(st.snapshot().env.system).toMatchObject({ status: 'unknown', value: null });
+
+    st.apply(
+      sig({ id: 'sys-1', kind: 'screen.locked', at: 1_000, subject: 'screen', data: { at: 1_000, sequence: 2 } }),
+    );
+    expect(st.snapshot().env.system?.status).toBe('ok');
+    expect(st.snapshot().env.system?.value).toEqual({ locked: true });
+    expect(st.snapshot().env.system?.ttlMs).toBeGreaterThanOrEqual(86_400_000);
+
+    // Older power sequence does not collide with lock sequence; lock status stays intact.
+    st.apply(
+      sig({ id: 'sys-2', kind: 'system.sleep', at: 2_000, subject: 'system', data: { at: 2_000, sequence: 1 } }),
+    );
+    expect(st.snapshot().env.system?.value).toEqual({ locked: true, lastSleepAt: 2_000 });
+
+    // Stale unlock with older lock sequence (< 2) is ignored.
+    st.apply(
+      sig({ id: 'sys-stale', kind: 'screen.unlocked', at: 2_500, subject: 'screen', data: { at: 2_500, sequence: 1 } }),
+    );
+    expect(st.snapshot().env.system?.value?.locked).toBe(true);
+
+    // Across an 8-hour sleep, env.system remains ok instead of expiring at defaultTtlMs (60s).
+    wall = 28_802_000;
+    expect(st.snapshot().env.system?.status).toBe('ok');
+
+    st.apply(
+      sig({
+        id: 'sys-3',
+        kind: 'system.wake',
+        at: wall,
+        subject: 'system',
+        data: { at: wall, durationMs: 28_800_000, sequence: 2 },
+      }),
+    );
+    expect(st.snapshot().env.system?.value).toEqual({
+      locked: true,
+      lastSleepAt: 2_000,
+      lastWakeAt: 28_802_000,
+    });
+
+    st.apply(
+      sig({
+        id: 'sys-4',
+        kind: 'screen.unlocked',
+        at: 28_805_000,
+        subject: 'screen',
+        data: { at: 28_805_000, durationMs: 28_804_000, sequence: 3 },
+      }),
+    );
+    expect(st.snapshot().env.system?.value).toEqual({
+      locked: false,
+      lastSleepAt: 2_000,
+      lastWakeAt: 28_802_000,
+    });
+
+    // Explicit ttlMs override in data still honors expiry when specified.
+    st.apply(
+      sig({
+        id: 'sys-5',
+        kind: 'system.sleep',
+        at: 28_806_000,
+        subject: 'system',
+        data: { at: 28_806_000, ttlMs: 100 },
+      }),
+    );
+    wall = 28_806_150;
+    expect(st.snapshot().env.system?.status).toBe('stale');
+  });
 });

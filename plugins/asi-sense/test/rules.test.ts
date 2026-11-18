@@ -353,5 +353,15 @@ describe('DEFAULT_RULES', () => {
         }),
       )?.level,
     ).toBe('wake');
+    for (const kind of [
+      'system.sleep',
+      'system.wake',
+      'screen.locked',
+      'screen.unlocked',
+      'session.active',
+      'session.inactive',
+    ] as const) {
+      expect(sel(sig({ id: `sys-${kind}`, kind }))?.level).toBe('record');
+    }
   });
 });

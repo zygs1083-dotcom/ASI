@@ -1,11 +1,23 @@
 import { readFileSync } from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { EnvUpdate } from '@asi/sense-types';
 import { describe, expect, it, vi } from 'vitest';
+import { setExtraHomes } from '../../src/host/attention/path.ts';
 import type { DeliveryIntent } from '../../src/host/attention/pipeline.ts';
-import { createDelivery } from '../../src/host/dsh/deliver.ts';
-import { modelText, modelTitle } from '../../src/host/dsh/tool-output.ts';
+import { DEFAULT_RULES } from '../../src/host/attention/rules.ts';
+import { defaultBodyRules } from '../../src/host/body/rules.ts';
+import { formatEnvUpdate } from '../../src/host/delivery/format.ts';
+import {
+  createDelivery,
+  DELIVERABLE_KINDS,
+  modelUpdate,
+  replacePathTokens,
+  sanitizeReason,
+} from '../../src/host/dsh/deliver.ts';
+import { KNOWN_EVENT_KINDS } from '../../src/host/dsh/history-output.ts';
+import { MODEL_RULE_KINDS, modelText, modelTitle } from '../../src/host/dsh/tool-output.ts';
 
 const update: EnvUpdate = {
   since: Date.UTC(2026, 0, 1, 12, 1, 3),
@@ -787,5 +799,955 @@ describe('DSH environment delivery', () => {
     const activityBlock = body.slice(activityIdx, body.indexOf('const summary =', activityIdx));
     expect(activityBlock).toContain('subject = maskedDir');
     expect(activityBlock).toContain('modelActivityName(');
+  });
+
+  it('projects source.status, source.error, app.launched/terminated, system.* and file.activity cleanly', () => {
+    const home = os.homedir();
+    const projected = modelUpdate({
+      since: update.since,
+      at: update.at,
+      suppressed: 0,
+      changes: [
+        {
+          count: 1,
+          level: 'context',
+          signal: {
+            id: 'ss-home',
+            kind: 'source.status',
+            at: update.at,
+            source: { id: 'files-global-denied', api: 'watch', host: 'local' },
+            subject: home,
+            data: {
+              status: 'denied',
+              error: 'permission-denied',
+              path: home,
+              reason: '部分受保护目录无访问权限 https://secret-token@host.example.invalid:8443',
+            },
+          },
+        },
+        {
+          count: 1,
+          level: 'context',
+          signal: {
+            id: 'ss-path',
+            kind: 'source.status',
+            at: update.at + 1,
+            source: { id: 'helper', api: 'ndjson', host: 'local' },
+            subject: 'helper',
+            data: { status: 'error', reason: `${home}/Documents` },
+          },
+        },
+        {
+          count: 1,
+          level: 'context',
+          signal: {
+            id: 'se-1',
+            kind: 'source.error',
+            at: update.at + 2,
+            source: { id: 'body', api: 'probe', host: 'local' },
+            subject: 'body-tuning',
+            data: { error: 'tuning-error' },
+          },
+        },
+        {
+          count: 1,
+          level: 'context',
+          signal: {
+            id: 'al-1',
+            kind: 'app.launched',
+            at: update.at + 3,
+            source: { id: 'helper', api: 'ndjson', host: 'local' },
+            subject: 'com.example.App',
+            data: { name: 'Syntax\nEditor', bundleId: 'com.example.App' },
+          },
+        },
+        {
+          count: 1,
+          level: 'context',
+          signal: {
+            id: 'at-1',
+            kind: 'app.terminated',
+            at: update.at + 4,
+            source: { id: 'helper', api: 'ndjson', host: 'local' },
+            subject: 'com.example.Term',
+            data: { bundleId: 'com.example.Term' },
+          },
+        },
+        {
+          count: 1,
+          level: 'context',
+          signal: {
+            id: 'sw-1',
+            kind: 'system.wake',
+            at: update.at + 5,
+            source: { id: 'helper', api: 'ndjson', host: 'local' },
+            subject: 'system',
+            data: { at: update.at + 5, durationMs: 120_000 },
+          },
+        },
+        {
+          count: 1,
+          level: 'context',
+          signal: {
+            id: 'fa-home',
+            kind: 'file.activity',
+            at: update.at + 6,
+            source: { id: 'files-global', api: 'watch', host: 'local' },
+            subject: home,
+            data: { directory: home, windowMs: 10_000, created: 1, modified: 0, deleted: 0 },
+          },
+        },
+      ],
+    });
+
+    expect(projected.changes).toHaveLength(7);
+    const byId = new Map(projected.changes.map((c) => [c.signal.id, c.signal]));
+    expect(byId.get('ss-home')).toMatchObject({
+      kind: 'source.status',
+      subject: 'files-global-denied',
+      data: {
+        source: 'files-global-denied',
+        status: 'denied',
+        path: '~',
+        error: 'permission-denied',
+      },
+    });
+    expect(String(byId.get('ss-home')?.data.reason)).not.toContain('secret-token');
+    expect(String(byId.get('ss-home')?.data.reason)).not.toContain('host.example.invalid');
+    expect(byId.get('ss-path')).toMatchObject({
+      kind: 'source.status',
+      subject: 'helper',
+      data: { source: 'helper', status: 'error', reason: 'Documents' },
+    });
+    expect(byId.get('se-1')).toMatchObject({
+      kind: 'source.error',
+      subject: 'body',
+      data: { source: 'body', error: 'tuning-error' },
+    });
+    expect(byId.get('al-1')).toMatchObject({
+      kind: 'app.launched',
+      subject: 'SyntaxEditor',
+      data: { name: 'SyntaxEditor' },
+    });
+    expect(byId.get('at-1')).toMatchObject({
+      kind: 'app.terminated',
+      subject: 'com.example.Term',
+      data: { name: 'com.example.Term' },
+    });
+    expect(byId.get('sw-1')).toMatchObject({
+      kind: 'system.wake',
+      subject: 'system',
+      data: { at: update.at + 5, durationMs: 120_000 },
+    });
+    expect(byId.get('fa-home')).toMatchObject({
+      kind: 'file.activity',
+      subject: '~',
+      data: { directory: '~', windowMs: 10_000, created: 1, modified: 0, deleted: 0 },
+    });
+    expect(JSON.stringify(projected)).not.toContain(home);
+  });
+
+  it('drops unknown kinds into suppressed and skips unknown-only deliveries without sending empty observations', async () => {
+    const unknownChange: EnvUpdate['changes'][number] = {
+      count: 2,
+      level: 'context',
+      signal: {
+        id: 'unk-1',
+        kind: 'mystery.unlisted',
+        at: update.at,
+        source: { id: 'helper', api: 'ndjson', host: 'local' },
+        subject: 'raw-secret',
+        data: { secret: 'do-not-deliver' },
+      },
+    };
+    const internalChange: EnvUpdate['changes'][number] = {
+      count: 1,
+      level: 'context',
+      signal: {
+        id: 'fact-1',
+        kind: 'fact.updated',
+        at: update.at + 1,
+        source: { id: 'asi-sense', api: 'state', host: 'local' },
+        subject: 'env.system',
+        data: { path: 'env.system', value: { locked: true } },
+      },
+    };
+
+    const { agent, deliver } = fixture();
+    const skipped: Array<{ sessionId: string; id: string; kind: string }> = [];
+    const onSkippedDeliver = createDelivery(
+      () => agent,
+      () => true,
+      async () => false,
+      (sessionId, id, kind) => {
+        skipped.push({ sessionId, id, kind });
+      },
+    );
+
+    const onlyUnknown = { ...update, suppressed: 1, changes: [unknownChange, internalChange] };
+    expect(modelUpdate(onlyUnknown)).toMatchObject({ suppressed: 4, changes: [] });
+
+    await onSkippedDeliver('session-a', {
+      ...intent('followup', 'skip-unknown'),
+      update: onlyUnknown,
+    });
+    expect(agent.followup).not.toHaveBeenCalled();
+    expect(skipped).toEqual([{ sessionId: 'session-a', id: 'asi-sense:skip-unknown', kind: 'followup' }]);
+
+    await deliver('session-a', {
+      ...intent('send', 'mixed-unknown'),
+      update: {
+        ...update,
+        suppressed: 0,
+        changes: [
+          unknownChange,
+          {
+            count: 1,
+            level: 'context',
+            signal: {
+              id: 'sys-1',
+              kind: 'system.sleep',
+              at: update.at + 2,
+              source: { id: 'helper', api: 'ndjson', host: 'local' },
+              subject: 'system',
+              data: { at: update.at + 2 },
+            },
+          },
+        ],
+      },
+    });
+    expect(agent.send).toHaveBeenCalledTimes(1);
+    const rendered = JSON.stringify(agent.send.mock.calls[0]?.[0]);
+    expect(rendered).toContain('system: sleep');
+    expect(rendered).toContain('suppressed: 2');
+    expect(rendered).not.toContain('observation');
+    expect(rendered).not.toContain('mystery.unlisted');
+    expect(rendered).not.toContain('do-not-deliver');
+  });
+
+  it('architecture: every default rule and deliverable kind projects with non-observation subject and non-empty data', () => {
+    const internalOnlyKinds = new Set(['fact.updated', 'delivery-unknown']);
+    const expectedDeliverableKinds = new Set<string>([
+      ...DEFAULT_RULES.map((rule) => rule.match.kind),
+      ...defaultBodyRules().map((rule) => rule.match.kind),
+      ...DELIVERABLE_KINDS,
+      ...[...MODEL_RULE_KINDS].filter((kind) => !internalOnlyKinds.has(kind)),
+      ...[...KNOWN_EVENT_KINDS].filter((kind) => !internalOnlyKinds.has(kind)),
+    ]);
+
+    for (const kind of expectedDeliverableKinds) {
+      expect(DELIVERABLE_KINDS.has(kind)).toBe(true);
+      const projected = modelUpdate({
+        since: update.since,
+        at: update.at,
+        suppressed: 0,
+        changes: [
+          {
+            count: 1,
+            level: 'context',
+            signal: {
+              id: `arch-${kind}`,
+              kind,
+              at: update.at,
+              source: { id: 'helper', api: 'ndjson', host: 'local' },
+              subject: '',
+              data: {},
+            },
+          },
+        ],
+      });
+      expect(projected.suppressed).toBe(0);
+      expect(projected.changes).toHaveLength(1);
+      const sig = projected.changes[0]?.signal;
+      expect(sig?.kind).toBe(kind);
+      expect(sig?.subject).not.toBe('observation');
+      expect(Object.keys(sig?.data ?? {}).length).toBeGreaterThan(0);
+
+      const formatted = formatEnvUpdate(projected);
+      expect(formatted.length).toBeGreaterThan(0);
+      expect(formatted).not.toContain('observation');
+    }
+  });
+
+  it('replaces embedded POSIX, tilde, Windows, and delimited paths in reason/lastFailure/error without leaking usernames', () => {
+    const home = os.homedir();
+    const homeBase = path.basename(home);
+    expect(replacePathTokens('EACCES: permission denied, scandir /Users/alice')).toBe(
+      'EACCES: permission denied, scandir ~',
+    );
+    expect(replacePathTokens(`EACCES: scandir ${home}`)).toBe('EACCES: scandir ~');
+    expect(replacePathTokens('open /home/bob')).toBe('open ~');
+    expect(replacePathTokens('EACCES: scandir /Users/alice, permission denied')).toBe(
+      'EACCES: scandir ~, permission denied',
+    );
+    expect(replacePathTokens("open '/Users/alice/.ssh/config'")).toBe("open 'config'");
+    expect(replacePathTokens('(/home/bob/x)')).toBe('(x)');
+    expect(replacePathTokens('C:\\Users\\carol\\a.txt,')).toBe('a.txt,');
+    expect(replacePathTokens('Error opening C:\\Users\\alice')).toBe('Error opening ~');
+    expect(replacePathTokens('open ~/secret/file.txt')).toBe('open file.txt');
+    expect(replacePathTokens('open ~/')).toBe('open [path]');
+    expect(replacePathTokens('path:/Users/alice: denied')).toBe('path:~: denied');
+    expect(replacePathTokens('/Users/alice:/home/bob')).toBe('~:~');
+    expect(replacePathTokens('C:\\Users\\alice;C:\\Users\\bob')).toBe('~;~');
+    expect(replacePathTokens('https://secret-token@host.example.invalid:8443/Users/alice')).toBe(
+      'https://secret-token@host.example.invalid:8443/Users/alice',
+    );
+
+    const projected = modelUpdate({
+      since: update.since,
+      at: update.at,
+      suppressed: 0,
+      changes: [
+        {
+          count: 1,
+          level: 'context',
+          signal: {
+            id: 'r1',
+            kind: 'source.status',
+            at: update.at,
+            source: { id: 'files-global', api: 'watch', host: 'local' },
+            subject: 'files-global',
+            data: { status: 'denied', reason: 'EACCES: permission denied, scandir /Users/alice' },
+          },
+        },
+        {
+          count: 1,
+          level: 'context',
+          signal: {
+            id: 'r2',
+            kind: 'source.status',
+            at: update.at + 1,
+            source: { id: 'files-global', api: 'watch', host: 'local' },
+            subject: 'files-global',
+            data: { status: 'denied', reason: `EACCES: scandir ${home}` },
+          },
+        },
+        {
+          count: 1,
+          level: 'context',
+          signal: {
+            id: 'r3',
+            kind: 'source.error',
+            at: update.at + 2,
+            source: { id: 'files-global', api: 'watch', host: 'local' },
+            subject: 'files-global',
+            data: { error: 'open /home/bob', reason: 'EACCES: scandir /Users/alice, permission denied' },
+          },
+        },
+        {
+          count: 1,
+          level: 'context',
+          signal: {
+            id: 'r4',
+            kind: 'source.status',
+            at: update.at + 3,
+            source: { id: 'files-global', api: 'watch', host: 'local' },
+            subject: 'files-global',
+            data: { status: 'error', lastFailure: "open '/Users/alice/.ssh/config'" },
+          },
+        },
+        {
+          count: 1,
+          level: 'context',
+          signal: {
+            id: 'r5',
+            kind: 'source.status',
+            at: update.at + 4,
+            source: { id: 'files-global', api: 'watch', host: 'local' },
+            subject: 'files-global',
+            data: { status: 'error', reason: '(/home/bob/x)' },
+          },
+        },
+        {
+          count: 1,
+          level: 'context',
+          signal: {
+            id: 'r6',
+            kind: 'source.error',
+            at: update.at + 5,
+            source: { id: 'files-global', api: 'watch', host: 'local' },
+            subject: 'files-global',
+            data: { error: 'C:\\Users\\carol\\a.txt,', reason: 'Error opening C:\\Users\\alice' },
+          },
+        },
+        {
+          count: 1,
+          level: 'context',
+          signal: {
+            id: 'r7',
+            kind: 'source.status',
+            at: update.at + 6,
+            source: { id: 'files-global', api: 'watch', host: 'local' },
+            subject: 'files-global',
+            data: {
+              status: 'error',
+              reason: 'open ~/secret/file.txt and https://secret-token@host.example.invalid/Users/alice',
+            },
+          },
+        },
+      ],
+    });
+
+    const serialized = JSON.stringify(projected);
+    expect(serialized).not.toContain('alice');
+    expect(serialized).not.toContain('bob');
+    expect(serialized).not.toContain('carol');
+    expect(serialized).not.toContain('secret-token');
+    expect(serialized).not.toContain('host.example.invalid');
+    if (homeBase && homeBase !== '/' && homeBase.length > 2) {
+      expect(serialized).not.toContain(homeBase);
+    }
+    const formatted = formatEnvUpdate(projected);
+    expect(formatted).not.toContain('alice');
+    expect(formatted).not.toContain('bob');
+    expect(formatted).not.toContain('carol');
+  });
+
+  it('strips path prefixes before modelAppName on app.* and window.* fallback subjects and handles Windows paths', () => {
+    const projected = modelUpdate({
+      since: update.since,
+      at: update.at,
+      suppressed: 0,
+      changes: [
+        {
+          count: 1,
+          level: 'context',
+          signal: {
+            id: 'a1',
+            kind: 'app.launched',
+            at: update.at,
+            source: { id: 'helper', api: 'ndjson', host: 'local' },
+            subject: '/Users/alice/Tools/SecretTool.app',
+            data: { bundleId: '/Users/alice/Tools/SecretTool.app' },
+          },
+        },
+        {
+          count: 1,
+          level: 'context',
+          signal: {
+            id: 'a2',
+            kind: 'app.terminated',
+            at: update.at + 1,
+            source: { id: 'helper', api: 'ndjson', host: 'local' },
+            subject: 'C:\\Users\\carol\\Tools\\WinTool.exe',
+            data: {},
+          },
+        },
+        {
+          count: 1,
+          level: 'context',
+          signal: {
+            id: 'a3',
+            kind: 'app.activated',
+            at: update.at + 2,
+            source: { id: 'helper', api: 'ndjson', host: 'local' },
+            subject: `/Users/alice/${'sub/'.repeat(100)}LongTool.app`,
+            data: { name: '/Users/alice/Tools/NamedTool.app' },
+          },
+        },
+        {
+          count: 1,
+          level: 'context',
+          signal: {
+            id: 'a4',
+            kind: 'app.launched',
+            at: update.at + 3,
+            source: { id: 'helper', api: 'ndjson', host: 'local' },
+            subject: '/Users/alice',
+            data: {},
+          },
+        },
+        {
+          count: 1,
+          level: 'context',
+          signal: {
+            id: 'w1',
+            kind: 'window.focused',
+            at: update.at + 4,
+            source: { id: 'helper.ax', api: 'accessibility', host: 'local' },
+            subject: 'alice@10.0.0.1 - /Users/alice/notes.md',
+            data: { title: 'notes' },
+          },
+        },
+        {
+          count: 1,
+          level: 'context',
+          signal: {
+            id: 'w2',
+            kind: 'window.title-changed',
+            at: update.at + 5,
+            source: { id: 'helper.ax', api: 'accessibility', host: 'local' },
+            subject: 'C:\\Users\\bob\\Editor.exe',
+            data: { title: 'notes' },
+          },
+        },
+      ],
+    });
+
+    const byId = new Map(projected.changes.map((c) => [c.signal.id, c.signal]));
+    expect(byId.get('a1')).toMatchObject({ subject: 'SecretTool.app', data: { name: 'SecretTool.app' } });
+    expect(byId.get('a2')).toMatchObject({ subject: 'WinTool.exe', data: { name: 'WinTool.exe' } });
+    expect(byId.get('a3')).toMatchObject({ subject: 'NamedTool.app', data: { name: 'NamedTool.app' } });
+    expect(byId.get('a4')).toMatchObject({ subject: '~', data: { name: '~' } });
+    expect(byId.get('w1')).toMatchObject({ subject: 'notes.md', data: { title: 'notes' } });
+    expect(byId.get('w2')).toMatchObject({ subject: 'Editor.exe', data: { title: 'notes' } });
+    const serialized = JSON.stringify(projected);
+    expect(serialized).not.toContain('alice');
+    expect(serialized).not.toContain('bob');
+    expect(serialized).not.toContain('carol');
+    expect(serialized).not.toContain('10.0.0.1');
+    const formatted = formatEnvUpdate(projected);
+    expect(formatted).toContain('app: SecretTool.app launched');
+    expect(formatted).toContain('app: WinTool.exe terminated');
+    expect(formatted).not.toContain('/Users/');
+  });
+
+  it('fast-paths known source statuses, caches sanitizeReason with <=256 LRU entries, and queries os.hostname() once per batch', () => {
+    const hostnameSpy = vi.spyOn(os, 'hostname').mockReturnValue('local-host-fixture');
+    try {
+      const batch = Array.from({ length: 50 }, (_, i) => ({
+        count: 1,
+        level: 'context' as const,
+        signal: {
+          id: `st-${i}`,
+          kind: 'source.status',
+          at: update.at + i,
+          source: { id: 'files-global', api: 'watch', host: 'local' },
+          subject: 'files-global',
+          data: { status: 'denied', reason: 'permission-denied-fixture' },
+        },
+      }));
+      const out = modelUpdate({ since: update.since, at: update.at + 50, suppressed: 0, changes: batch });
+      expect(out.changes).toHaveLength(50);
+      expect(out.changes[0]?.signal.data).toMatchObject({ status: 'denied', reason: 'permission-denied-fixture' });
+      expect(hostnameSpy).toHaveBeenCalledTimes(1);
+
+      // Non-enum status still uses modelLabel and hostname redaction.
+      const hostStatusOut = modelUpdate({
+        since: update.since,
+        at: update.at,
+        suppressed: 0,
+        changes: [
+          {
+            count: 1,
+            level: 'context',
+            signal: {
+              id: 'bad-status',
+              kind: 'source.status',
+              at: update.at,
+              source: { id: 'helper', api: 'ndjson', host: 'local' },
+              subject: 'helper',
+              data: { status: 'local-host-fixture', reason: 'on local-host-fixture' },
+            },
+          },
+        ],
+      });
+      expect(hostStatusOut.changes[0]?.signal.data).toMatchObject({
+        status: '[host]',
+        reason: 'on [host]',
+      });
+
+      // Hostname and extraHomes changes invalidate the sanitizeReason cache safely.
+      expect(sanitizeReason('custom /srv/home/demo_user')).toBe('custom demo_user');
+      setExtraHomes(['/srv/home/demo_user']);
+      expect(sanitizeReason('custom /srv/home/demo_user')).toBe('custom [host]');
+      setExtraHomes([]);
+      expect(sanitizeReason('custom /srv/home/demo_user')).toBe('custom demo_user');
+
+      // Eviction above 256 entries keeps working without throwing or retaining stale results.
+      for (let i = 0; i < 270; i++) {
+        expect(sanitizeReason(`err-${i}`)).toBe(`err-${i}`);
+      }
+      expect(sanitizeReason('err-0')).toBe('err-0');
+    } finally {
+      setExtraHomes([]);
+      hostnameSpy.mockRestore();
+    }
+  });
+
+  it('projects 10,000 source.status signals within 300ms without leaking paths', () => {
+    const T = Date.UTC(2026, 10, 18, 12, 0, 0);
+    const changes = Array.from({ length: 10_000 }, (_, i) => ({
+      count: 1,
+      level: 'context' as const,
+      signal: {
+        id: `ss-${i}`,
+        kind: 'source.status',
+        at: T + i,
+        source: { id: 'files-global', api: 'watch', host: 'local' },
+        subject: 'files-global',
+        data: { status: 'error', reason: "EACCES: permission denied, open '/Users/alice/.ssh/config'" },
+      },
+    }));
+    modelUpdate({ since: T, at: T + 10_000, suppressed: 0, changes: changes.slice(0, 500) });
+    const t0 = performance.now();
+    const out = modelUpdate({ since: T, at: T + 10_000, suppressed: 0, changes });
+    const elapsed = performance.now() - t0;
+    expect(out.changes).toHaveLength(10_000);
+    expect(out.changes[0]?.signal.data.status).toBe('error');
+    expect(String(out.changes[0]?.signal.data.reason)).not.toContain('alice');
+    expect(elapsed).toBeLessThanOrEqual(300);
+  });
+
+  it('sanitizes embedded paths and hostnames in away.summary text fields', () => {
+    const projected = modelUpdate({
+      since: update.since,
+      at: update.at,
+      suppressed: 0,
+      changes: [
+        {
+          count: 1,
+          level: 'wake',
+          signal: {
+            id: 'away:1',
+            kind: 'away.summary',
+            at: update.at,
+            source: { id: 'away', api: 'detector', host: 'local' },
+            subject: 'away',
+            data: {
+              awayFrom: update.since - 3_600_000,
+              returnAt: update.at,
+              durationMs: 3_600_000,
+              sleepMs: 3_600_000,
+              lockMs: 0,
+              hasAnomaly: true,
+              anomalies: ['alerts', 'failed-jobs', 'external-deletion'],
+              reason: 'EACCES: open /Users/alice/x',
+              error: 'EACCES: open /Users/alice/x',
+              alerts: [
+                {
+                  metric: 'disk:/Users/alice/x',
+                  severity: 'warn',
+                  count: 2,
+                  reason: 'EACCES: open /Users/alice/x',
+                },
+              ],
+              failed: [
+                {
+                  id: 'EACCES: open /Users/alice/x',
+                  kind: 'job.failed',
+                  exitCode: 1,
+                  reason: 'EACCES: open /Users/alice/x',
+                },
+              ],
+              bursts: [
+                {
+                  directory: '/Users/alice/x',
+                  deleted: 60,
+                  reason: 'EACCES: open /Users/alice/x',
+                },
+              ],
+            },
+          },
+        },
+      ],
+    });
+
+    const serialized = JSON.stringify(projected);
+    expect(serialized).not.toContain('alice');
+    expect(serialized).not.toContain('/Users/alice');
+    expect(formatEnvUpdate(projected)).not.toContain('alice');
+    const data = projected.changes[0]?.signal.data as Record<string, unknown>;
+    expect(data.reason).toBe('EACCES: open x');
+    expect(data.error).toBe('EACCES: open x');
+    expect((data.alerts as Array<Record<string, unknown>>)[0]).toMatchObject({
+      metric: 'disk:x',
+      severity: 'warn',
+      count: 2,
+      reason: 'EACCES: open x',
+    });
+    expect((data.failed as Array<Record<string, unknown>>)[0]).toMatchObject({
+      id: 'EACCES: open x',
+      kind: 'job.failed',
+      exitCode: 1,
+      reason: 'EACCES: open x',
+    });
+    expect((data.bursts as Array<Record<string, unknown>>)[0]).toMatchObject({
+      directory: 'x',
+      deleted: 60,
+      reason: 'EACCES: open x',
+    });
+  });
+
+  it('bounds away.summary projection under 2KB by priority, preserves totals/anomalyCount/omitted, and drops negative numbers', () => {
+    const longCjkBurst = modelUpdate({
+      since: update.since,
+      at: update.at,
+      suppressed: 0,
+      changes: [
+        {
+          count: 1,
+          level: 'wake',
+          signal: {
+            id: 'away:cjk',
+            kind: 'away.summary',
+            at: update.at,
+            source: { id: 'away', api: 'detector', host: 'local' },
+            subject: 'away',
+            data: {
+              awayFrom: update.since - 3_600_000,
+              returnAt: update.at,
+              durationMs: -5,
+              sleepMs: -1,
+              lockMs: 3_600_000,
+              hasAnomaly: true,
+              anomalies: ['external-deletion'],
+              alerts: [],
+              metrics: [],
+              failed: [],
+              bursts: [{ directory: `/Users/alice/${'甲'.repeat(511)}`, deleted: 80 }],
+              alertCount: 0,
+              failedCount: 0,
+              deletedCount: 80,
+            },
+          },
+        },
+      ],
+    });
+    expect(Buffer.byteLength(JSON.stringify(longCjkBurst), 'utf8')).toBeLessThanOrEqual(2048);
+    const cjkData = longCjkBurst.changes[0]?.signal.data as Record<string, unknown>;
+    expect(cjkData.durationMs).toBeUndefined();
+    expect(cjkData.sleepMs).toBeUndefined();
+    expect(cjkData.lockMs).toBe(3_600_000);
+    expect(cjkData.bursts as Array<Record<string, unknown>>).toHaveLength(1);
+    expect(cjkData.anomalyCount).toBe(1);
+    expect(cjkData.omitted).toBeUndefined();
+
+    const prioritized = modelUpdate({
+      since: update.since,
+      at: update.at,
+      suppressed: 0,
+      changes: [
+        {
+          count: 1,
+          level: 'wake',
+          signal: {
+            id: 'away:prio',
+            kind: 'away.summary',
+            at: update.at,
+            source: { id: 'away', api: 'detector', host: 'local' },
+            subject: 'away',
+            data: {
+              awayFrom: update.since - 3_600_000,
+              returnAt: update.at,
+              durationMs: 3_600_000,
+              sleepMs: 0,
+              lockMs: 3_600_000,
+              hasAnomaly: true,
+              anomalies: ['alerts', 'failed-jobs', 'external-deletion', 'metric-warning'],
+              alerts: [
+                { metric: 'memory', severity: 'warn', count: 2 },
+                { metric: 'context', severity: 'critical', count: 1 },
+              ],
+              metrics: [
+                { metric: 'cpu', unit: 'ratio', start: 0.2, end: 0.2, min: 0.2, max: 0.2 },
+                {
+                  metric: 'disk',
+                  unit: 'bytes',
+                  start: 500,
+                  end: 40,
+                  min: 40,
+                  max: 500,
+                  ratioStart: 0.5,
+                  ratioMin: 0.04,
+                },
+              ],
+              failed: Array.from({ length: 40 }, (_, i) => ({
+                id: `job-${i}-${'word '.repeat(25)}`,
+                kind: 'job.exited',
+                exitCode: 1,
+              })),
+              bursts: [{ directory: '/Users/alice/build', deleted: 100 }],
+              alertCount: 3,
+              failedCount: 40,
+              deletedCount: 100,
+            },
+          },
+        },
+      ],
+    });
+    expect(Buffer.byteLength(JSON.stringify(prioritized), 'utf8')).toBeLessThanOrEqual(2048);
+    const prioData = prioritized.changes[0]?.signal.data as Record<string, unknown>;
+    expect(prioData.failedCount).toBe(40);
+    expect(prioData.deletedCount).toBe(100);
+    expect(prioData.anomalyCount).toBe(44);
+    expect(typeof prioData.omitted).toBe('number');
+    expect(prioData.omitted as number).toBeGreaterThan(0);
+    expect((prioData.alerts as Array<{ severity: string; metric: string }>).map((a) => a.severity)).toEqual([
+      'critical',
+      'warn',
+    ]);
+  });
+
+  it('strips reasons from all entries first and drops by priority critical alerts > critical metrics > bursts > warn alerts > warn metrics > failed > normal metrics', () => {
+    const p1 = modelUpdate({
+      since: update.since,
+      at: update.at,
+      suppressed: 0,
+      changes: [
+        {
+          count: 1,
+          level: 'wake',
+          signal: {
+            id: 'away:p1',
+            kind: 'away.summary',
+            at: update.at,
+            source: { id: 'away', api: 'detector', host: 'local' },
+            subject: 'away',
+            data: {
+              awayFrom: update.since - 3_600_000,
+              returnAt: update.at,
+              durationMs: 3_600_000,
+              sleepMs: 0,
+              lockMs: 3_600_000,
+              hasAnomaly: true,
+              anomalies: ['alerts', 'failed-jobs', 'external-deletion', 'metric-warning', 'metric-growth'],
+              alerts: [
+                { metric: 'memory', severity: 'warn', count: 2 },
+                { metric: 'thermal', severity: 'critical', count: 1 },
+              ],
+              metrics: [
+                { metric: 'load1', unit: 'load', start: 1, end: 1, min: 1, max: 1 },
+                { metric: 'cpu', unit: 'ratio', start: 0.1, end: 0.5, min: 0.1, max: 0.5 },
+                {
+                  metric: 'disk',
+                  unit: 'bytes',
+                  start: 1000,
+                  end: 20,
+                  min: 20,
+                  max: 1000,
+                  ratioStart: 0.5,
+                  ratioMin: 0.02,
+                },
+              ],
+              failed: Array.from({ length: 20 }, (_, i) => ({
+                id: `job-${i}-${'alpha beta '.repeat(10)}`,
+                kind: 'job.exited',
+                exitCode: 1,
+              })),
+              bursts: [{ directory: '/Users/alice/important-data', deleted: 200 }],
+              alertCount: 3,
+              failedCount: 20,
+              deletedCount: 200,
+            },
+          },
+        },
+      ],
+    });
+    expect(Buffer.byteLength(JSON.stringify(p1), 'utf8')).toBeLessThanOrEqual(2048);
+    const p1Data = p1.changes[0]?.signal.data as Record<string, unknown>;
+    expect(p1Data.bursts).toEqual([{ directory: 'important-data', deleted: 200 }]);
+    expect((p1Data.metrics as Array<{ metric: string }>).map((m) => m.metric)).toEqual(['disk', 'cpu']);
+    expect(
+      (p1Data.alerts as Array<{ metric: string; severity: string }>).map((a) => `${a.severity}:${a.metric}`),
+    ).toEqual(['critical:thermal', 'warn:memory']);
+    const p1Text = formatEnvUpdate(p1);
+    expect(p1Text).toContain('metrics=disk=2%,cpu=+400%');
+    expect(p1Text).toContain('deletes=200@important-data');
+
+    const p2 = modelUpdate({
+      since: update.since,
+      at: update.at,
+      suppressed: 0,
+      changes: [
+        {
+          count: 1,
+          level: 'wake',
+          signal: {
+            id: 'away:p2',
+            kind: 'away.summary',
+            at: update.at,
+            source: { id: 'away', api: 'detector', host: 'local' },
+            subject: 'away',
+            data: {
+              awayFrom: update.since - 3_600_000,
+              returnAt: update.at,
+              durationMs: 3_600_000,
+              sleepMs: 0,
+              lockMs: 3_600_000,
+              hasAnomaly: true,
+              anomalies: ['alerts'],
+              alerts: Array.from({ length: 12 }, (_, i) => ({
+                metric: `disk:/Volumes/volume-${i}-${'x'.repeat(40)}`,
+                severity: 'critical',
+                count: 1,
+                reason: `critical disk pressure on volume-${i} ${'detail '.repeat(15)}`,
+              })),
+              metrics: [],
+              failed: [],
+              bursts: [],
+              alertCount: 12,
+              failedCount: 0,
+              deletedCount: 0,
+            },
+          },
+        },
+      ],
+    });
+    expect(Buffer.byteLength(JSON.stringify(p2), 'utf8')).toBeLessThanOrEqual(2048);
+    const p2Data = p2.changes[0]?.signal.data as Record<string, unknown>;
+    expect(p2Data.alerts as unknown[]).toHaveLength(12);
+    expect(p2Data.omitted).toBeUndefined();
+    expect((p2Data.alerts as Array<Record<string, unknown>>).every((a) => a.reason === undefined)).toBe(true);
+
+    // When 30 bursts saturate 2KB even after shrinking, warn alert & warn metric drop before bursts/critical.
+    const p3 = modelUpdate({
+      since: update.since,
+      at: update.at,
+      suppressed: 0,
+      changes: [
+        {
+          count: 1,
+          level: 'wake',
+          signal: {
+            id: 'away:p3',
+            kind: 'away.summary',
+            at: update.at,
+            source: { id: 'away', api: 'detector', host: 'local' },
+            subject: 'away',
+            data: {
+              awayFrom: update.since - 3_600_000,
+              returnAt: update.at,
+              durationMs: 3_600_000,
+              sleepMs: 0,
+              lockMs: 3_600_000,
+              hasAnomaly: true,
+              anomalies: ['alerts', 'failed-jobs', 'external-deletion', 'metric-warning', 'metric-growth'],
+              alerts: [
+                { metric: 'memory', severity: 'warn', count: 1 },
+                { metric: 'thermal', severity: 'critical', count: 1 },
+              ],
+              metrics: [
+                { metric: 'cpu', unit: 'ratio', start: 0.1, end: 0.5, min: 0.1, max: 0.5 },
+                {
+                  metric: 'battery',
+                  unit: 'percent',
+                  start: 50,
+                  end: 3,
+                  min: 3,
+                  max: 50,
+                  ratioStart: 0.5,
+                  ratioMin: 0.03,
+                },
+              ],
+              failed: [{ id: 'job-fail', kind: 'job.failed', exitCode: 1 }],
+              bursts: Array.from({ length: 30 }, (_, i) => ({
+                directory: `/Users/alice/workspace/dir-${i}-${'seg-'.repeat(8)}`,
+                deleted: 100,
+              })),
+              alertCount: 2,
+              failedCount: 1,
+              deletedCount: 3000,
+            },
+          },
+        },
+      ],
+    });
+    expect(Buffer.byteLength(JSON.stringify(p3), 'utf8')).toBeLessThanOrEqual(2048);
+    const p3Data = p3.changes[0]?.signal.data as Record<string, unknown>;
+    expect((p3Data.alerts as Array<{ severity: string }>).map((a) => a.severity)).toEqual(['critical']);
+    expect((p3Data.metrics as Array<{ metric: string }>).map((m) => m.metric)).toEqual(['battery']);
+    expect(p3Data.failed).toBeUndefined();
+    expect((p3Data.bursts as unknown[]).length).toBeGreaterThan(0);
   });
 });

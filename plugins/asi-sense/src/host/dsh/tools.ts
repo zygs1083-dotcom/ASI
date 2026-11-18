@@ -5,8 +5,9 @@ import type {} from '@deepseek-ai/dsh-system-prompt';
 import { defineTool, ToolArgsError, ToolContextUnavailableError, type ToolRunContext } from '@deepseek-ai/dsh-tools';
 import { HistoryArgsError } from '../runtime/history/index.ts';
 import type { createSenseRuntime } from '../runtime/index.ts';
+import { MetricsArgsError } from '../runtime/metrics.ts';
 import { modelHistory, modelSummary } from './history-output.ts';
-import { environmentDetail, modelRules, modelState, modelTune } from './tool-output.ts';
+import { environmentDetail, modelOutput, modelRules, modelState, modelTune } from './tool-output.ts';
 
 type Runtime = Pick<ReturnType<typeof createSenseRuntime>, 'tools' | 'events' | 'rules' | 'targetMode'>;
 
@@ -148,6 +149,41 @@ export function createSenseTools(runtime: Runtime, now: () => number) {
       }
     },
   });
+  const envMetrics = defineTool({
+    name: 'env_metrics',
+    description:
+      'Read an in-memory body-metric time series for the last 24 hours (5-minute buckets, at most 288 points). Values are in natural units reported by `unit`.',
+    parameters: {
+      metric: {
+        type: 'string',
+        required: true,
+        description: 'One of cpu, load1, load5, load15, memory, swap, disk, battery.',
+      },
+      from: {
+        oneOf: [{ type: 'number' }, { type: 'string' }],
+        description: 'Start time (epoch ms, ISO string or YYYY-MM-DD). Defaults to 24 hours before `to`.',
+      },
+      to: {
+        oneOf: [{ type: 'number' }, { type: 'string' }],
+        description: 'End time (epoch ms, ISO string or YYYY-MM-DD). Defaults to now.',
+      },
+      step: {
+        type: 'integer',
+        description: 'Grouping step in seconds (300-86400, default 300).',
+      },
+    },
+    output,
+    async execute(args, exec) {
+      requireAgent(exec);
+      bounded(args);
+      try {
+        return modelOutput(runtime.tools.envMetrics(args));
+      } catch (error) {
+        if (error instanceof MetricsArgsError) throw new ToolArgsError([error.message]);
+        throw error;
+      }
+    },
+  });
   const envHistory = defineTool({
     name: 'env_history',
     description:
@@ -213,7 +249,7 @@ export function createSenseTools(runtime: Runtime, now: () => number) {
       }
     },
   });
-  return [envState, envWatch, envDetail, bodyTune, envHistory, envSummary];
+  return [envState, envWatch, envDetail, bodyTune, envMetrics, envHistory, envSummary];
 }
 
 export function registerSenseTools(ctx: Context, runtime: Runtime, now: () => number): () => void {

@@ -148,6 +148,8 @@ const FIXED_IDENTIFIERS = new Set([
   'events',
   'registry',
   'files',
+  'files-global',
+  'files-global-denied',
   'watch',
   'body',
   'probe',
@@ -1816,7 +1818,7 @@ function isHashedFileSource(value: string): boolean {
   return /^files:r-[a-f0-9]{8}$/.test(value);
 }
 
-function sourceIdentifier(value: string): string {
+export function sourceIdentifier(value: string): string {
   if (value.startsWith('files:')) {
     const id = value.slice('files:'.length);
     return `files:r-${createHash('sha256').update(id).digest('hex').slice(0, 8)}`;
@@ -1946,6 +1948,19 @@ export function modelState(state: SenseState, now: number, section?: 'self' | 'e
             })),
           }
         : {}),
+      ...(env.system
+        ? {
+            system: fact(env.system, (value) => ({
+              locked: Boolean(value.locked),
+              ...(typeof value.lastSleepAt === 'number' && Number.isFinite(value.lastSleepAt)
+                ? { lastSleepAt: value.lastSleepAt }
+                : {}),
+              ...(typeof value.lastWakeAt === 'number' && Number.isFinite(value.lastWakeAt)
+                ? { lastWakeAt: value.lastWakeAt }
+                : {}),
+            })),
+          }
+        : {}),
     },
     observation: observations(state.observation),
   };
@@ -1957,28 +1972,38 @@ export function modelState(state: SenseState, now: number, section?: 'self' | 'e
   );
 }
 
+export const MODEL_RULE_KINDS: ReadonlySet<string> = new Set([
+  'app.activated',
+  'app.launched',
+  'app.terminated',
+  'window.focused',
+  'window.title-changed',
+  'file.changed',
+  'file.activity',
+  'job.started',
+  'job.exited',
+  'job.failed',
+  'process.started',
+  'process.exited',
+  'source.status',
+  'source.error',
+  'body.threshold',
+  'body.rate',
+  'body.anomaly',
+  'file.burst',
+  'fact.updated',
+  'delivery.target-unavailable',
+  'system.sleep',
+  'system.wake',
+  'screen.locked',
+  'screen.unlocked',
+  'session.active',
+  'session.inactive',
+  'away.summary',
+]);
+
 export function modelRules(rules: WatchRule[]): JsonValue {
-  const kinds = new Set([
-    'app.activated',
-    'app.launched',
-    'app.terminated',
-    'window.focused',
-    'window.title-changed',
-    'file.changed',
-    'file.activity',
-    'job.started',
-    'job.exited',
-    'process.started',
-    'process.exited',
-    'source.status',
-    'source.error',
-    'body.threshold',
-    'body.rate',
-    'body.anomaly',
-    'file.burst',
-    'fact.updated',
-    'delivery.target-unavailable',
-  ]);
+  const kinds = MODEL_RULE_KINDS;
   return modelOutput(
     rules.map((rule) => {
       const where: Record<string, unknown> = {};

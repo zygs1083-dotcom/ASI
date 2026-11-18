@@ -16,6 +16,7 @@ import {
   type DailySummary,
   type FileChange,
   type HistoryStoragePort,
+  type MonthlySummary,
 } from '../../src/host/runtime/index.ts';
 
 const tempDirs: string[] = [];
@@ -1906,5 +1907,114 @@ describe('env_detail, env_history, and env_summary tools', () => {
     expect(JSON.stringify(strictCheck)).not.toContain('secret.corp.internal');
     expect(JSON.stringify(strictCheck)).not.toContain('evil.host.internal');
     expect(JSON.stringify(strictCheck)).not.toContain('evil.com');
+  });
+
+  it('persists normalized system/screen/session events into env_history and env_summary without redacting fixed subjects', async () => {
+    const startMs = Date.UTC(2026, 9, 31, 12, 0, 0);
+    const history = createMemoryHistoryPort();
+    const h = createRuntimeHarness(startMs, history, true);
+    await h.runtime.start();
+    await vi.waitFor(
+      () => expect(h.runtime.events().some((e) => e.source.id === 'helper' && e.reason === 'ready')).toBe(true),
+      { timeout: 2_000, interval: 5 },
+    );
+
+    await h.emitHelper({ type: 'screen.locked', at: startMs + 1_000 });
+    await h.emitHelper({ type: 'power.sleep', at: startMs + 2_000 });
+    await h.emitHelper({ type: 'session.inactive', at: startMs + 3_000 });
+    await h.emitHelper({ type: 'power.wake', at: startMs + 10_000 });
+    await h.emitHelper({ type: 'screen.unlocked', at: startMs + 11_000 });
+    await h.emitHelper({ type: 'session.active', at: startMs + 12_000 });
+
+    await vi.waitFor(() => expect(h.runtime.events().filter((e) => e.kind === 'session.active')).toHaveLength(1), {
+      timeout: 2_000,
+      interval: 20,
+    });
+    h.setNow(startMs + 20_000);
+
+    const tools = createSenseTools(h.runtime, () => startMs + 20_000);
+    const envHistory = tools.find((tool) => tool.name === 'env_history');
+    const envState = tools.find((tool) => tool.name === 'env_state');
+    if (!envHistory || !envState) throw new Error('missing tools');
+
+    const histOut = (await envHistory.execute({}, makeExec())) as {
+      events: Array<{ kind: string; subject: string; detail?: Record<string, unknown> }>;
+    };
+    const byKind = new Map(histOut.events.map((ev) => [ev.kind, ev]));
+    expect(byKind.get('system.sleep')).toMatchObject({ subject: 'system', detail: { at: startMs + 2_000 } });
+    expect(byKind.get('system.wake')).toMatchObject({
+      subject: 'system',
+      detail: { at: startMs + 10_000, durationMs: 8_000 },
+    });
+    expect(byKind.get('screen.locked')).toMatchObject({ subject: 'screen', detail: { at: startMs + 1_000 } });
+    expect(byKind.get('screen.unlocked')).toMatchObject({
+      subject: 'screen',
+      detail: { at: startMs + 11_000, durationMs: 10_000 },
+    });
+    expect(byKind.get('session.inactive')).toMatchObject({ subject: 'session', detail: { at: startMs + 3_000 } });
+    expect(byKind.get('session.active')).toMatchObject({
+      subject: 'session',
+      detail: { at: startMs + 12_000, durationMs: 9_000 },
+    });
+
+    const stateOut = (await envState.execute({ section: 'env' }, makeExec())) as {
+      system?: { status: string; value: { locked: boolean; lastSleepAt?: number; lastWakeAt?: number } | null };
+    };
+    expect(stateOut.system).toMatchObject({
+      status: 'ok',
+      value: {
+        locked: false,
+        lastSleepAt: startMs + 2_000,
+        lastWakeAt: startMs + 10_000,
+      },
+    });
+    await h.runtime.stop();
+
+    // Start next month runtime to backfill 2026-10-31 daily and query completed month via env_summary.
+    const nextMonthNow = Date.UTC(2026, 10, 5, 12, 0, 0);
+    const h2 = createRuntimeHarness(nextMonthNow, history, false);
+    await h2.runtime.start();
+    const tools2 = createSenseTools(h2.runtime, () => nextMonthNow);
+    const envSummary = tools2.find((tool) => tool.name === 'env_summary');
+    if (!envSummary) throw new Error('missing env_summary tool');
+
+    await vi.waitFor(
+      async () => {
+        const res = (await envSummary.execute({ month: '2026-10' }, makeExec())) as {
+          available: boolean;
+          partial?: boolean;
+          summary?: { system?: DailySummary['system'] };
+        };
+        expect(res.available).toBe(true);
+        expect(res.partial).toBeUndefined();
+      },
+      { timeout: 3_000, interval: 20 },
+    );
+
+    const summaryOut = (await envSummary.execute({ month: '2026-10' }, makeExec())) as {
+      available: boolean;
+      summary: { system?: DailySummary['system'] };
+    };
+    expect(summaryOut.available).toBe(true);
+    expect(summaryOut.summary.system).toEqual({
+      sleepCount: 1,
+      sleepDurationMs: 8_000,
+      lockDurationMs: 10_000,
+      firstWakeAt: startMs + 10_000,
+      lastSleepAt: startMs + 2_000,
+    });
+
+    const projectedWithExtension = modelSummary({
+      available: true,
+      summary: {
+        ...(summaryOut.summary as MonthlySummary),
+        extensions: { futureKey: 1 },
+        customSlot: 'preserved',
+      } as MonthlySummary & { customSlot: string },
+    }) as { summary: { extensions?: unknown; customSlot?: unknown } };
+    expect(projectedWithExtension.summary.extensions).toEqual({ futureKey: 1 });
+    expect(projectedWithExtension.summary.customSlot).toBe('preserved');
+
+    await h2.runtime.stop();
   });
 });

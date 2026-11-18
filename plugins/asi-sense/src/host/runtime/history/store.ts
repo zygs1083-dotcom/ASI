@@ -67,6 +67,8 @@ export interface HistoryManagerOptions {
   timeZone?: string;
   maxDailyBytes?: number;
   heartbeatIntervalMs?: number;
+  /** Extra `extensions` entries (e.g. metric buckets) for a day being summarized. */
+  dayExtensions?: (date: string) => Record<string, unknown> | undefined;
 }
 
 const DATE_ONLY_RE = /^\d{4}-\d{2}-\d{2}$/;
@@ -187,6 +189,7 @@ export class HistoryManager {
   private readonly calendar: LocalCalendar;
   private readonly maxDailyBytes: number;
   private readonly heartbeatIntervalMs: number;
+  private readonly dayExtensions?: (date: string) => Record<string, unknown> | undefined;
 
   private tail: Promise<void> = Promise.resolve();
   private started = false;
@@ -226,6 +229,7 @@ export class HistoryManager {
     this.calendar = new LocalCalendar(options.timeZone);
     this.maxDailyBytes = options.maxDailyBytes ?? MAX_DAILY_EVENT_BYTES;
     this.heartbeatIntervalMs = options.heartbeatIntervalMs ?? HISTORY_HEARTBEAT_MS;
+    this.dayExtensions = options.dayExtensions;
   }
 
   async start(paused: boolean): Promise<void> {
@@ -828,6 +832,7 @@ export class HistoryManager {
         if (this.isEpochStale(epoch)) return;
         if (sawLine || size > 0) {
           const daily = acc.finish();
+          this.applyDayExtensions(daily, prevDate);
           await this.port.writeDaily(prevDate, JSON.stringify(daily));
           if (this.isEpochStale(epoch)) return;
           if (this.pendingBackfillEpoch === epoch) {
@@ -1266,7 +1271,9 @@ export class HistoryManager {
         return;
       }
       if (sawLine || size > 0) {
-        const dailyJson = JSON.stringify(acc.finish());
+        const daily = acc.finish();
+        this.applyDayExtensions(daily, nextDate);
+        const dailyJson = JSON.stringify(daily);
         if (this.isEpochStale(epoch)) {
           this.clearPendingForEpoch(epoch);
           return;
@@ -1659,6 +1666,18 @@ export class HistoryManager {
     if (this.summaryDegraded) return;
     this.summaryDegraded = true;
     this.safeEmitSourceError(errorCode, { date });
+  }
+
+  private applyDayExtensions(daily: DailySummary, date: string): void {
+    if (!this.dayExtensions) return;
+    let extra: Record<string, unknown> | undefined;
+    try {
+      extra = this.dayExtensions(date);
+    } catch {
+      return;
+    }
+    if (!extra || Object.keys(extra).length === 0) return;
+    daily.extensions = { ...(daily.extensions ?? {}), ...extra };
   }
 
   private clearSummaryDegraded(): void {

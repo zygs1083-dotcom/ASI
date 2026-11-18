@@ -6,6 +6,39 @@ export const source: SourceRef = { id: 'helper', api: 'ndjson', host: 'local' };
 export const ax: SourceRef = { id: 'helper.ax', api: 'accessibility', host: 'local' };
 export type Message = Record<string, unknown>;
 
+type SystemSlot = 'sleepAt' | 'lockedAt' | 'inactiveAt';
+interface SystemTracker {
+  sleepAt?: number;
+  lockedAt?: number;
+  inactiveAt?: number;
+}
+interface SystemEventSpec {
+  kind: 'system.sleep' | 'system.wake' | 'screen.locked' | 'screen.unlocked' | 'session.active' | 'session.inactive';
+  subject: 'system' | 'screen' | 'session';
+  slot: SystemSlot;
+  phase: 'start' | 'end';
+}
+
+const SYSTEM_EVENT_SPECS: Readonly<Record<string, SystemEventSpec>> = {
+  'power.sleep': { kind: 'system.sleep', subject: 'system', slot: 'sleepAt', phase: 'start' },
+  'power.wake': { kind: 'system.wake', subject: 'system', slot: 'sleepAt', phase: 'end' },
+  'screen.locked': { kind: 'screen.locked', subject: 'screen', slot: 'lockedAt', phase: 'start' },
+  'screen.unlocked': { kind: 'screen.unlocked', subject: 'screen', slot: 'lockedAt', phase: 'end' },
+  'session.inactive': { kind: 'session.inactive', subject: 'session', slot: 'inactiveAt', phase: 'start' },
+  'session.active': { kind: 'session.active', subject: 'session', slot: 'inactiveAt', phase: 'end' },
+};
+
+const systemTrackers = new WeakMap<RuntimeAttention, SystemTracker>();
+
+function getSystemTracker(attention: RuntimeAttention): SystemTracker {
+  let tracker = systemTrackers.get(attention);
+  if (!tracker) {
+    tracker = {};
+    systemTrackers.set(attention, tracker);
+  }
+  return tracker;
+}
+
 export function strip(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(strip);
   if (!value || typeof value !== 'object') return value;
@@ -249,5 +282,27 @@ export async function helperEvent(
     await emit(event.type === 'window.title' ? 'window.title-changed' : event.type, event);
   } else if (event.type === 'window.focused') {
     clearWindow(attention, at);
+  } else if (typeof event.type === 'string' && Object.hasOwn(SYSTEM_EVENT_SPECS, event.type)) {
+    if (typeof at !== 'number' || !Number.isFinite(at)) return;
+    const spec = SYSTEM_EVENT_SPECS[event.type] as SystemEventSpec;
+    const tracker = getSystemTracker(attention);
+    const data: Message = { at };
+    if (spec.phase === 'start') {
+      tracker[spec.slot] = at;
+    } else {
+      const startAt = tracker[spec.slot];
+      tracker[spec.slot] = undefined;
+      if (startAt !== undefined && at - startAt >= 0) {
+        data.durationMs = at - startAt;
+      }
+    }
+    await attention.accept({
+      id: attention.id(),
+      kind: spec.kind,
+      at,
+      source,
+      subject: spec.subject,
+      data: recovering ? { ...data, preserveSourceStatus: true } : data,
+    });
   }
 }

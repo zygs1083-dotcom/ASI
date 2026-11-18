@@ -26,7 +26,12 @@ const SAFE_IDENTIFIERS = new Set([
   'events',
   'registry',
   'files',
+  'files-global',
+  'files-global-denied',
   'watch',
+  'system',
+  'screen',
+  'session',
   'body',
   'probe',
   'tokens',
@@ -70,6 +75,13 @@ export const KNOWN_EVENT_KINDS = new Set([
   'fact.updated',
   'delivery.target-unavailable',
   'delivery-unknown',
+  'system.sleep',
+  'system.wake',
+  'screen.locked',
+  'screen.unlocked',
+  'session.active',
+  'session.inactive',
+  'away.summary',
 ]);
 
 const VALID_LEVELS = new Set(['record', 'context', 'wake']);
@@ -556,6 +568,9 @@ function projectSubject(entry: PersistedEventEntry): string {
     if (entry.subject.startsWith('files:')) {
       return `files:r-${createHash('sha256').update(entry.subject.slice('files:'.length)).digest('hex').slice(0, 8)}`;
     }
+    return safeIdentifier(entry.subject);
+  }
+  if (entry.kind.startsWith('system.') || entry.kind.startsWith('screen.') || entry.kind.startsWith('session.')) {
     return safeIdentifier(entry.subject);
   }
   return modelText(entry.subject);

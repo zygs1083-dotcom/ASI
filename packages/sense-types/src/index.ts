@@ -118,6 +118,81 @@ export interface GlobalFileWatchValue {
   retryAt?: number;
 }
 
+/** System power/lock state tracked in `env.system`. */
+export interface SystemStateValue {
+  locked: boolean;
+  lastSleepAt?: number;
+  lastWakeAt?: number;
+}
+
+/** Data payload for normalized system/screen/session lifecycle signals. */
+export interface SystemEventData {
+  at: number;
+  durationMs?: number;
+}
+
+/** Metric names tracked by the in-memory body-metric timeline. */
+export type AwayMetricName = 'cpu' | 'load1' | 'load5' | 'load15' | 'memory' | 'swap' | 'disk' | 'battery';
+
+/** One metric's walk across an away episode (natural units, see `unit`). */
+export interface AwayMetricTrend {
+  metric: AwayMetricName;
+  unit: 'ratio' | 'load' | 'bytes' | 'percent';
+  start: number;
+  end: number;
+  min: number;
+  max: number;
+  /** 0..1 ratio at the episode start, only for disk/battery. */
+  ratioStart?: number;
+  /** 0..1 ratio of the minimum to capacity, only for disk/battery. */
+  ratioMin?: number;
+}
+
+/** Warning captured during an away episode. */
+export interface AwayAlert {
+  metric: string;
+  severity: 'warn' | 'critical';
+  count: number;
+}
+
+/** Failed job/process captured during an away episode. */
+export interface AwayFailedJob {
+  id: string;
+  kind: string;
+  exitCode?: number;
+}
+
+/** External bulk deletion captured during an away episode. */
+export interface AwayDeletion {
+  directory: string;
+  deleted: number;
+}
+
+/** Categories that make an away summary worth pushing (change 4). */
+export type AwayAnomaly = 'alerts' | 'metric-warning' | 'metric-growth' | 'failed-jobs' | 'external-deletion';
+
+/** Data payload for `away.summary` (one per away episode, only pushed when anomalous). */
+export interface AwaySummaryData {
+  [key: string]: unknown;
+  awayFrom: number;
+  returnAt: number;
+  durationMs: number;
+  sleepMs: number;
+  lockMs: number;
+  inactiveMs?: number;
+  hasAnomaly: boolean;
+  anomalies: AwayAnomaly[];
+  alerts: AwayAlert[];
+  metrics: AwayMetricTrend[];
+  failed: AwayFailedJob[];
+  bursts: AwayDeletion[];
+  alertCount: number;
+  failedCount: number;
+  deletedCount: number;
+  anomalyCount?: number;
+  omitted?: number;
+}
+
 /** Observed environment state. */
 export interface EnvState {
   where: EnvWhere;
@@ -126,6 +201,7 @@ export interface EnvState {
   activeJobs: Fact<JobSummary[]>;
   watchedPaths: Fact<Record<string, { lastChange: number; changes: number }>>;
   globalFileWatch?: Fact<GlobalFileWatchValue>;
+  system?: Fact<SystemStateValue>;
 }
 
 /** Per-source health bookkeeping. */
@@ -297,6 +373,13 @@ export interface KnownSignalData {
   'body.anomaly': BodyAnomalyData;
   'file.burst': FileBurstData;
   'file.activity': FileActivityData;
+  'system.sleep': SystemEventData;
+  'system.wake': SystemEventData;
+  'screen.locked': SystemEventData;
+  'screen.unlocked': SystemEventData;
+  'session.active': SystemEventData;
+  'session.inactive': SystemEventData;
+  'away.summary': AwaySummaryData;
 }
 
 /** A {@link Signal} narrowed to a kind with a known data schema. */

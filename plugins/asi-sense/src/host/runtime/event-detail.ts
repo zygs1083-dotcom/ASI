@@ -40,6 +40,24 @@ const detailFields: Record<string, readonly string[]> = {
     'rolledUp',
   ],
   'file.activity': ['directory', 'windowMs', 'created', 'modified', 'deleted', 'rolledUp', 'degraded'],
+  'system.sleep': ['at', 'durationMs'],
+  'system.wake': ['at', 'durationMs'],
+  'screen.locked': ['at', 'durationMs'],
+  'screen.unlocked': ['at', 'durationMs'],
+  'session.active': ['at', 'durationMs'],
+  'session.inactive': ['at', 'durationMs'],
+  'away.summary': [
+    'awayFrom',
+    'returnAt',
+    'durationMs',
+    'sleepMs',
+    'lockMs',
+    'inactiveMs',
+    'hasAnomaly',
+    'alertCount',
+    'failedCount',
+    'deletedCount',
+  ],
 };
 
 export function eventDetail(signal: Signal): EventEntry['detail'] {
