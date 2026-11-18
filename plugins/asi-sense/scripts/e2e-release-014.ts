@@ -126,10 +126,7 @@ const timer = setInterval(() => {
 timer.unref();
 `;
 
-async function prepare(
-  profile: { root: string },
-  opts: { limit: number; burstDir: string },
-): Promise<Rig> {
+async function prepare(profile: { root: string }, opts: { limit: number; burstDir: string }): Promise<Rig> {
   const root = await realpath(profile.root);
   const home = join(root, 'home');
   const workspace = join(root, 'deepseek-harness/default-workspace');
@@ -153,7 +150,13 @@ async function prepare(
   await chmod(wrapper, 0o755);
   await writeFile(
     join(storageRoot, 'settings.json'),
-    JSON.stringify({ version: 1, paused: false, sendTitles: false, rules: [...DEFAULT_RULES, ...defaultBodyRules()], disabled: [] }),
+    JSON.stringify({
+      version: 1,
+      paused: false,
+      sendTitles: false,
+      rules: [...DEFAULT_RULES, ...defaultBodyRules()],
+      disabled: [],
+    }),
     { mode: 0o600 },
   );
   const overlay = join(root, 'overlay.yml');
@@ -273,7 +276,11 @@ async function spawnDsh(rig: Rig): Promise<{ server: ChildProcess; url: string }
 }
 
 async function waitHelper(pattern: string = helper, timeoutMs = 20_000): Promise<string[]> {
-  return waitFor(async () => (helperPids(pattern).length ? helperPids(pattern) : undefined), timeoutMs, 'helper startup');
+  return waitFor(
+    async () => (helperPids(pattern).length ? helperPids(pattern) : undefined),
+    timeoutMs,
+    'helper startup',
+  );
 }
 
 async function dismissNotices(page: Page, timeoutMs: number): Promise<void> {
@@ -311,10 +318,7 @@ async function expandHistory(panel: Locator): Promise<Locator> {
   const summary = section.locator('summary').first();
   for (let attempt = 0; attempt < 5; attempt++) {
     await summary.dispatchEvent('click');
-    const open = await expect(
-      section.locator('text=日汇总'),
-      'history section open',
-    )
+    const open = await expect(section.locator('text=日汇总'), 'history section open')
       .toBeVisible({ timeout: 3000 })
       .then(() => true)
       .catch(() => false);
@@ -427,7 +431,11 @@ async function phaseBody(): Promise<void> {
     await history.getByRole('button', { name: '昨天', exact: true }).dispatchEvent('click');
     await expect(history.locator('text=昨日暂无汇总数据')).toBeVisible({ timeout: 10_000 });
     await history.getByRole('button', { name: '今天', exact: true }).dispatchEvent('click');
-    await expect(history.locator('text=暂无已完成的月度总结（每月结束后生成）').or(history.locator('select[aria-label="选择月份"]'))).toBeVisible({ timeout: 10_000 });
+    await expect(
+      history
+        .locator('text=暂无已完成的月度总结（每月结束后生成）')
+        .or(history.locator('select[aria-label="选择月份"]')),
+    ).toBeVisible({ timeout: 10_000 });
     console.log('5a today counts / 24h curves / yesterday empty / monthly empty: ok');
 
     // 5b part 1 — whole-disk watch: ≥30 create+delete ops outside any
@@ -435,10 +443,18 @@ async function phaseBody(): Promise<void> {
     st.phase = 'global watch burst';
     const dirEvent = panel.locator('li[data-level]').filter({ hasText: `asi-e2e-g-${suffix}` });
     await burstOps(rig.burstDir, 80);
-    await waitFor(async () => ((await dirEvent.count()) >= 1 ? true : undefined), 90_000, 'global watch events for burst dir');
+    await waitFor(
+      async () => ((await dirEvent.count()) >= 1 ? true : undefined),
+      90_000,
+      'global watch events for burst dir',
+    );
     const dirTexts = await dirEvent.allTextContents();
-    console.log(`burst dir events (${dirTexts.length}): ${dirTexts.map((t) => t.replace(/\s+/g, ' ').slice(0, 140)).join(' | ')}`);
-    expect(dirTexts.some((t) => t.includes('新增') || t.includes('删除') || /created=\d+|deleted=\d+/.test(t))).toBe(true);
+    console.log(
+      `burst dir events (${dirTexts.length}): ${dirTexts.map((t) => t.replace(/\s+/g, ' ').slice(0, 140)).join(' | ')}`,
+    );
+    expect(dirTexts.some((t) => t.includes('新增') || t.includes('删除') || /created=\d+|deleted=\d+/.test(t))).toBe(
+      true,
+    );
     await delay(20_000); // let first-burst rollup events finish landing
 
     // 5d part 2 — an ≥1h episode containing an external-deletion burst:
@@ -463,7 +479,9 @@ async function phaseBody(): Promise<void> {
     await delay(3000);
     const awayLi = panel.locator('li[data-level]').filter({ hasText: '离开' });
     const awayEvents1 = await awayLi.count();
-    console.log(`away stream items (${awayEvents1}): ${(await awayLi.allTextContents()).map((t) => t.replace(/\s+/g, ' ').slice(0, 120)).join(' | ')}`);
+    console.log(
+      `away stream items (${awayEvents1}): ${(await awayLi.allTextContents()).map((t) => t.replace(/\s+/g, ' ').slice(0, 120)).join(' | ')}`,
+    );
     // With no conversation there is no delivery target, so a suppressed
     // away.summary may not leave a stream item — the anomaly detection is
     // proven by 发现异常 above and the single delivery is asserted in the
@@ -736,7 +754,17 @@ async function phaseModel(): Promise<void> {
     for (const e of log2) {
       if (typeof e.type !== 'string' || !e.type.startsWith('tool/')) continue;
       const points = findMetricPoints(e);
-      if (points && points.length && points.every((p) => Number.isFinite(record(p).at) && Number.isFinite(record(p).avg) && Number.isFinite(record(p).min) && Number.isFinite(record(p).max))) {
+      if (
+        points &&
+        points.length &&
+        points.every(
+          (p) =>
+            Number.isFinite(record(p).at) &&
+            Number.isFinite(record(p).avg) &&
+            Number.isFinite(record(p).min) &&
+            Number.isFinite(record(p).max),
+        )
+      ) {
         pointsLen = points.length;
         pointKeys = Object.keys(record(points[0])).sort();
         break;

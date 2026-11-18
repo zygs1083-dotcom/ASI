@@ -138,7 +138,12 @@ test.describe('展开明细截图（Token / 磁盘，420px × 明暗）', () => 
 });
 
 test.describe('历史分区截图（320/420 × 明暗）', () => {
-  const HISTORY_SCENARIOS = ['history-ready', 'history-empty', 'history-away-anomaly', 'history-monthly-error'] as const;
+  const HISTORY_SCENARIOS = [
+    'history-ready',
+    'history-empty',
+    'history-away-anomaly',
+    'history-monthly-error',
+  ] as const;
   for (const scenario of HISTORY_SCENARIOS) {
     for (const theme of THEMES) {
       for (const width of WIDTHS) {
