@@ -51,7 +51,7 @@ async function expectNoOverflow(page: Page) {
 }
 
 async function expectSectionsVisible(page: Page) {
-  for (const name of ['身体', '现在', '事件流', '规则']) {
+  for (const name of ['身体', '现在', '事件流', '历史', '规则']) {
     await expect(page.locator('details > summary', { hasText: name }).first()).toBeVisible();
   }
 }
@@ -137,6 +137,47 @@ test.describe('展开明细截图（Token / 磁盘，420px × 明暗）', () => 
   }
 });
 
+test.describe('历史分区截图（320/420 × 明暗）', () => {
+  const HISTORY_SCENARIOS = ['history-ready', 'history-empty', 'history-away-anomaly', 'history-monthly-error'] as const;
+  for (const scenario of HISTORY_SCENARIOS) {
+    for (const theme of THEMES) {
+      for (const width of WIDTHS) {
+        test(`${scenario} ${width}px ${theme}`, async ({ page }) => {
+          const errors = watchErrors(page);
+          await page.setViewportSize({ width, height: 900 });
+          await open(page, scenario, theme);
+          await openSection(page, '历史');
+          await expect(page.getByText('24 小时走势')).toBeVisible();
+          const monthSelect = page.locator('select[aria-label="选择月份"]');
+          if (scenario === 'history-empty') {
+            await expect(page.getByText('今日暂无汇总数据')).toBeVisible();
+            await expect(page.getByText('暂无 24 小时指标数据')).toBeVisible();
+            await expect(page.getByText('暂无已完成的月度总结（每月结束后生成）')).toBeVisible();
+          } else {
+            await expect(monthSelect.locator('option', { hasText: '2026-10' })).toHaveCount(1);
+          }
+          if (scenario === 'history-ready' || scenario === 'history-monthly-error') {
+            await monthSelect.selectOption('2026-10');
+            if (scenario === 'history-ready') {
+              await expect(page.getByText(/2026-10 · 已覆盖 29\/31 天/)).toBeVisible();
+            } else {
+              await expect(page.getByText('月度汇总读取失败（模拟错误）')).toBeVisible();
+            }
+          }
+          if (scenario === 'history-away-anomaly') {
+            await expect(page.getByText('已推送', { exact: true })).toBeVisible();
+            await expect(page.getByText('外部删除 14 个文件（workspace-demo）')).toBeVisible();
+          }
+          await expectNoOverflow(page);
+          await axeCheck(page);
+          await expect(page).toHaveScreenshot(`${scenario}-${width}-${theme}.png`, { fullPage: true });
+          expect(errors).toEqual([]);
+        });
+      }
+    }
+  }
+});
+
 test.describe('宽度冒烟（无截图）', () => {
   for (const width of [280, 768, 1440]) {
     test(`healthy ${width}px light 无横向溢出`, async ({ page }) => {
@@ -151,7 +192,7 @@ test.describe('宽度冒烟（无截图）', () => {
 });
 
 test.describe('布局几何', () => {
-  test('healthy 420px 面板高度 ≤1650，测量证据写入 test-results', async ({ page }) => {
+  test('healthy 420px 面板高度 ≤1750，测量证据写入 test-results', async ({ page }) => {
     await page.setViewportSize({ width: 420, height: 900 });
     await open(page, 'healthy', 'light');
     const rect = await page.locator('[data-panel]').boundingBox();
@@ -161,7 +202,7 @@ test.describe('布局几何', () => {
       path.join(RESULTS_DIR, 'panel-height.json'),
       JSON.stringify({ selector: '[data-panel]', viewport: 420, boundingRect: rect }, null, 2),
     );
-    expect(rect!.height).toBeLessThanOrEqual(1650);
+    expect(rect!.height).toBeLessThanOrEqual(1750);
   });
 
   test('两列网格：Token 跨满整行，CPU 迷你柱同一行', async ({ page }) => {
