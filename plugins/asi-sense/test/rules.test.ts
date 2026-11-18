@@ -315,6 +315,7 @@ describe('DEFAULT_RULES', () => {
     expect(sel(sig({ id: '1', kind: 'app.activated' }))?.level).toBe('record');
     expect(sel(sig({ id: '2', kind: 'window.title-changed' }))?.level).toBe('record');
     expect(sel(sig({ id: '3', kind: 'file.changed' }))?.level).toBe('context');
+    expect(sel(sig({ id: '3b', kind: 'file.activity' }))?.level).toBe('record');
     expect(sel(sig({ id: '4', kind: 'job.exited', data: { exitCode: 1 } }))?.level).toBe('wake');
     expect(sel(sig({ id: '5', kind: 'job.exited', data: { exitCode: 0 } }))?.level).toBe('context');
     expect(sel(sig({ id: '6', kind: 'job.exited' }))?.level).toBe('context'); // no catchall wake

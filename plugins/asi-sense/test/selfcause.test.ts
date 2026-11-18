@@ -212,4 +212,23 @@ describe('classifyCause', () => {
     expect(classifyReceived({ ...event, data: { pid: 42 } }, [window], 2_000, 2_110)).toBe('unknown');
     expect(classifyReceived({ ...event, data: { pid: 42 } }, [window], 0, 111)).toBe('unknown');
   });
+
+  it('classifies file.activity signals using data.directory or subject', () => {
+    const inside = sig({
+      id: 'fa-1',
+      kind: 'file.activity',
+      at: 150,
+      subject: '/repo/src',
+      data: { directory: '/repo/src' },
+    });
+    const outside = sig({
+      id: 'fa-2',
+      kind: 'file.activity',
+      at: 150,
+      subject: '/other/dir',
+      data: { directory: '/other/dir' },
+    });
+    expect(classifyCause(inside, [W])).toBe('agent');
+    expect(classifyCause(outside, [W])).toBe('unknown');
+  });
 });

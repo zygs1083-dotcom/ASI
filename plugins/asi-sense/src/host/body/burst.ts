@@ -25,6 +25,11 @@ interface FileEvent {
   at: number;
   change: Change;
   agent: boolean;
+  count?: number;
+}
+
+function activityCount(v: unknown): number | undefined {
+  return typeof v === 'number' && Number.isSafeInteger(v) && v >= 0 ? v : undefined;
 }
 
 /**
@@ -140,8 +145,11 @@ export class FileBurstDetector {
   }
 
   /** Every watched root containing `path`, or `[dirname]` without roots. */
-  private groups(path: string): BurstTarget[] {
-    if (!this.roots) return [{ scope: `dir:${posix.dirname(path)}`, dir: posix.dirname(path) }];
+  private groups(path: string, isDir = false): BurstTarget[] {
+    if (!this.roots) {
+      const dir = isDir ? path : posix.dirname(path);
+      return [{ scope: `dir:${dir}`, dir }];
+    }
     const out: BurstTarget[] = [];
     for (const r of this.roots) {
       if (path === r || path.startsWith(r === '/' ? '/' : `${r}/`)) out.push({ scope: `dir:${r}`, dir: r });
@@ -158,13 +166,36 @@ export class FileBurstDetector {
     // All cheap validation first: a malformed or backward event must never
     // touch (and thereby erase) healthy per-directory history.
     if (!Number.isFinite(receivedAt)) throw new TypeError('file.burst: receivedAt must be finite');
-    if (signal.kind !== 'file.changed' || !Number.isFinite(signal.at) || receivedAt < this.lastReceived) return [];
-    const change = signal.data.change as Change | undefined;
-    if (change !== 'add' && change !== 'modify' && change !== 'delete') return [];
-    const path = typeof signal.data.path === 'string' ? signal.data.path : signal.subject;
+    if (
+      (signal.kind !== 'file.changed' && signal.kind !== 'file.activity') ||
+      !Number.isFinite(signal.at) ||
+      receivedAt < this.lastReceived
+    )
+      return [];
+    const items: { change: Change; count: number }[] = [];
+    let path: string;
+    if (signal.kind === 'file.changed') {
+      const change = signal.data.change as Change | undefined;
+      if (change !== 'add' && change !== 'modify' && change !== 'delete') return [];
+      items.push({ change, count: 1 });
+      path = typeof signal.data.path === 'string' ? signal.data.path : signal.subject;
+    } else {
+      const created = activityCount(signal.data.created);
+      const modified = activityCount(signal.data.modified);
+      const deleted = activityCount(signal.data.deleted);
+      if (created === undefined || modified === undefined || deleted === undefined) return [];
+      if (created > 0) items.push({ change: 'add', count: created });
+      if (modified > 0) items.push({ change: 'modify', count: modified });
+      if (deleted > 0) items.push({ change: 'delete', count: deleted });
+      if (items.length === 0) return [];
+      path =
+        typeof signal.data.directory === 'string' && signal.data.directory.length > 0
+          ? signal.data.directory
+          : signal.subject;
+    }
     const targets =
       dirs === undefined
-        ? this.groups(path)
+        ? this.groups(path, signal.kind === 'file.activity')
         : [...new Map(dirs.map((t) => [`${t.scope}${t.dir}`, t] as const)).values()];
     if (targets.length === 0) return []; // outside every watched scope
     const lim = this.limits();
@@ -175,17 +206,17 @@ export class FileBurstDetector {
     }
     const out: BodySignal[] = [];
     for (const target of targets) {
-      const emitted = this.record(target, signal, change, receivedAt, lim);
+      const emitted = this.record(target, signal, items, receivedAt, lim);
       if (emitted) out.push(emitted);
     }
     return out;
   }
 
-  /** Counts one event against a single scope window; emits on a new crossing. */
+  /** Counts one event (or aggregated `file.activity` batch) against a single scope window; emits on a new crossing. */
   private record(
     target: BurstTarget,
     signal: Signal,
-    change: Change,
+    items: readonly { change: Change; count: number }[],
     receivedAt: number,
     lim: { windowMs: number; maxChanges: number; maxDeleted: number },
   ): BodySignal | undefined {
@@ -223,7 +254,10 @@ export class FileBurstDetector {
       this.dirs.set(key, st);
     }
     st.lastAt = receivedAt;
-    st.win.push({ at: receivedAt, change, agent: signal.cause === 'agent' });
+    const agent = signal.cause === 'agent';
+    for (const item of items) {
+      st.win.push({ at: receivedAt, change: item.change, agent, ...(item.count === 1 ? {} : { count: item.count }) });
+    }
     const counts = this.count(st.win);
     const extDeleted = counts.deleted - counts.agentDeleted;
     const extTotal = counts.created + counts.modified + counts.deleted - extCounts(counts);
@@ -254,15 +288,16 @@ export class FileBurstDetector {
   private count(win: TimeWindow<FileEvent>): Counts {
     const c: Counts = { created: 0, modified: 0, deleted: 0, agentCreated: 0, agentModified: 0, agentDeleted: 0 };
     for (const e of win.values()) {
+      const n = e.count ?? 1;
       if (e.change === 'add') {
-        c.created++;
-        if (e.agent) c.agentCreated++;
+        c.created += n;
+        if (e.agent) c.agentCreated += n;
       } else if (e.change === 'modify') {
-        c.modified++;
-        if (e.agent) c.agentModified++;
+        c.modified += n;
+        if (e.agent) c.agentModified += n;
       } else {
-        c.deleted++;
-        if (e.agent) c.agentDeleted++;
+        c.deleted += n;
+        if (e.agent) c.agentDeleted += n;
       }
     }
     return c;

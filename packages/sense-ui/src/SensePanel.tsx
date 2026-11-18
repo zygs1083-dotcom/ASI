@@ -99,7 +99,13 @@ export function SensePanel(props: SensePanelProps) {
       <details open className={css.section}>
         <summary>现在</summary>
         <div className={css.sectionBody}>
-          <NowSection model={model} onOpenPermissionSettings={props.onOpenPermissionSettings} />
+          <NowSection
+            model={model}
+            onOpenPermissionSettings={props.onOpenPermissionSettings}
+            onToggleGlobalFileWatch={props.onToggleGlobalFileWatch}
+            onAddFileExclusion={props.onAddFileExclusion}
+            onRemoveFileExclusion={props.onRemoveFileExclusion}
+          />
         </div>
       </details>
 

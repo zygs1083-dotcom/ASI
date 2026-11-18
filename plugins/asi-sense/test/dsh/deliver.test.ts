@@ -575,4 +575,40 @@ describe('DSH environment delivery', () => {
     expect(text).toContain('file.burst: blank-dir deleted=8');
     expect(text).not.toContain('/synthetic/');
   });
+
+  it('sanitizes file.activity directory and file names through modelPath', async () => {
+    const { agent, deliver } = fixture();
+    await deliver('session-a', {
+      ...intent('followup', 'file-activity-sanitized'),
+      update: {
+        ...update,
+        changes: [
+          {
+            count: 1,
+            level: 'record',
+            signal: {
+              id: 'fa-sec',
+              kind: 'file.activity',
+              at: update.at,
+              source: { id: 'files-global', api: 'watch', host: 'local' },
+              subject: '/private/secret-user/workspace/src',
+              data: {
+                directory: '/private/secret-user/workspace/src',
+                windowMs: 10_000,
+                created: 1,
+                modified: 2,
+                deleted: 0,
+                files: ['/private/secret-user/workspace/src/app.ts', 'readme.md'],
+              },
+            },
+          },
+        ],
+      },
+    });
+    const text = JSON.stringify(agent.followup.mock.calls);
+    expect(text).toContain('file.activity: src');
+    expect(text).toContain('files=[app.ts, readme.md]');
+    expect(text).not.toContain('/private/');
+    expect(text).not.toContain('secret-user');
+  });
 });

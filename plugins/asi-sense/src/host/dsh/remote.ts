@@ -132,6 +132,40 @@ export class AsiSenseRemote extends TypertRemoteService {
     await this.userAction(() => this.actions.retryTuningBackup());
   }
 
+  private async updateExclusion(
+    pattern: string,
+    action: ((pattern: string) => Promise<void>) | undefined,
+  ): Promise<void> {
+    await this.userAction(() => {
+      if (typeof pattern !== 'string' || !pattern.trim()) {
+        throw new RemoteError('gateway/bad-request', 'Exclusion pattern is required', {});
+      }
+      if (!action) throw new Error('File exclusion management unavailable');
+      return action(pattern);
+    });
+  }
+
+  @Remote
+  async setGlobalFileWatch(enabled: boolean): Promise<void> {
+    await this.userAction(() => {
+      if (typeof enabled !== 'boolean') {
+        throw new RemoteError('gateway/bad-request', 'Global file watch toggle must be a boolean', {});
+      }
+      if (!this.actions.setGlobalFileWatch) throw new Error('Global file watch unavailable');
+      return this.actions.setGlobalFileWatch(enabled);
+    });
+  }
+
+  @Remote
+  async addFileExclusion(pattern: string): Promise<void> {
+    await this.updateExclusion(pattern, this.actions.addFileExclusion);
+  }
+
+  @Remote
+  async removeFileExclusion(pattern: string): Promise<void> {
+    await this.updateExclusion(pattern, this.actions.removeFileExclusion);
+  }
+
   @Remote
   async dismissTuningBackup(): Promise<void> {
     await this.userAction(() => this.actions.dismissTuningBackup());

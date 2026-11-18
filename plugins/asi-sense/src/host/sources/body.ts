@@ -61,6 +61,8 @@ export class BodySource {
   private thermal?: Body['thermal'];
   private thermalRecovering = false;
   private burstScopes = '';
+  private ruleScopes: string[] = [];
+  private globalScope = false;
   private readonly detector = new FileBurstDetector({
     threshold: (param, fallback) => this.tuner.number(param, fallback),
   });
@@ -219,7 +221,16 @@ export class BodySource {
   }
   setScopes(scopes: string[]): void {
     // Dedupe so a spellings-union cannot split burst windows.
-    const ordered = [...new Set(scopes)].sort();
+    this.ruleScopes = [...new Set(scopes)];
+    this.syncScopes();
+  }
+  setGlobalScope(enabled: boolean): void {
+    if (this.globalScope === enabled) return;
+    this.globalScope = enabled;
+    this.syncScopes();
+  }
+  private syncScopes(): void {
+    const ordered = [...new Set(this.globalScope ? [...this.ruleScopes, 'global'] : this.ruleScopes)].sort();
     const key = JSON.stringify(ordered);
     if (key === this.burstScopes) return;
     this.burstScopes = key;

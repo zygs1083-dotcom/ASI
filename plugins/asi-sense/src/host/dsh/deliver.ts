@@ -117,6 +117,26 @@ function modelUpdate(update: EnvUpdate): EnvUpdate {
         )
           data.externalDeleted = deleted - agentDeleted;
         if (signal.data.externalDeletionExceeded === true) data.externalDeletionExceeded = true;
+      } else if (signal.kind === 'file.activity') {
+        const maskedDir = modelPath(
+          typeof signal.data.directory === 'string' && signal.data.directory.trim()
+            ? signal.data.directory
+            : signal.subject,
+        );
+        subject = maskedDir;
+        data.directory = maskedDir;
+        for (const key of ['windowMs', 'created', 'modified', 'deleted']) {
+          const value = signal.data[key];
+          if (typeof value === 'number' && Number.isFinite(value)) data[key] = value;
+        }
+        if (Array.isArray(signal.data.files)) {
+          const files = signal.data.files
+            .filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
+            .slice(0, 5)
+            .map((item) => modelPath(item));
+          if (files.length > 0) data.files = files;
+        }
+        if (signal.data.degraded === true) data.degraded = true;
       }
       const summary = signal.data.jobSummary;
       if (summary && typeof summary === 'object' && !Array.isArray(summary)) {
@@ -154,6 +174,7 @@ function modelUpdate(update: EnvUpdate): EnvUpdate {
         'body.rate',
         'body.anomaly',
         'file.burst',
+        'file.activity',
       ];
       return {
         count,

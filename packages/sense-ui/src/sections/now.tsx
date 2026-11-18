@@ -4,9 +4,13 @@ import { formatAge } from '../format';
 import { effectiveStatus, isUsable } from '../health';
 import { AppIcon } from '../icons';
 import type { Fact, SensePanelProps } from '../view-model';
+import { GlobalWatchBlock } from './global-watch';
 import css from './now.module.css';
 
-type Panel = Pick<SensePanelProps, 'model' | 'onOpenPermissionSettings'>;
+type Panel = Pick<
+  SensePanelProps,
+  'model' | 'onOpenPermissionSettings' | 'onToggleGlobalFileWatch' | 'onAddFileExclusion' | 'onRemoveFileExclusion'
+>;
 type Where = SensePanelProps['model']['state']['env']['where'];
 
 function FocusAppMeta({ fact, now }: { fact: Fact<unknown>; now: number }) {
@@ -203,7 +207,13 @@ function Item({
   );
 }
 
-export function NowSection({ model, onOpenPermissionSettings }: Panel) {
+export function NowSection({
+  model,
+  onOpenPermissionSettings,
+  onToggleGlobalFileWatch,
+  onAddFileExclusion,
+  onRemoveFileExclusion,
+}: Panel) {
   const { self, env, observation } = model.state;
   const { now, sendTitles } = model;
   const ops = onOpenPermissionSettings;
@@ -269,6 +279,16 @@ export function NowSection({ model, onOpenPermissionSettings }: Panel) {
                 })
                 .join('；'))}
       </Item>
+
+      {env.globalFileWatch && (
+        <GlobalWatchBlock
+          fact={env.globalFileWatch}
+          onOpenPermissionSettings={ops}
+          onToggleGlobalFileWatch={onToggleGlobalFileWatch}
+          onAddFileExclusion={onAddFileExclusion}
+          onRemoveFileExclusion={onRemoveFileExclusion}
+        />
+      )}
 
       <Item label="权限" fact={self.permissions} now={now} onOpenPermissionSettings={ops}>
         {self.permissions.value &&

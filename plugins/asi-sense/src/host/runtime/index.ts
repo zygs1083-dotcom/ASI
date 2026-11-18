@@ -1,7 +1,9 @@
 import type { WatchRule } from '@asi/sense-types';
 import { BodySource } from '../sources/body.ts';
 import { DshSource } from '../sources/dsh.ts';
+import { normalizeFileExclusion } from '../sources/file-exclusions.ts';
 import { FileSource } from '../sources/files.ts';
+import { FileGlobalSource } from '../sources/files-global.ts';
 import { HelperSource } from '../sources/helper.ts';
 import { boundedShutdown, guardActions } from './action-guard.ts';
 import { RuntimeAttention } from './attention.ts';
@@ -97,6 +99,20 @@ export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}
     (signal, dirs) => body.burst(signal, dirs),
     (scopes) => body.setScopes(scopes),
   );
+  const filesGlobal = new FileGlobalSource(
+    ports.files,
+    clock,
+    attention,
+    dsh,
+    settings,
+    isPaused,
+    (signal, dirs) => body.burst(signal, dirs),
+    (enabled) => body.setGlobalScope(enabled),
+    (dir) => files.hasDirScope(dir),
+    () => schedule(),
+    options.globalFileWatch,
+    options.platform,
+  );
   const helper = new HelperSource(
     ports.helper,
     options.helperPath,
@@ -114,6 +130,7 @@ export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}
     const due = paused ? undefined : attention.pipeline.nextDeadline();
     const deadline = Math.min(
       due === undefined ? Infinity : Math.max(due, retryAfter),
+      filesGlobal.nextDeadline() ?? Infinity,
       helper.nextDeadline() ?? Infinity,
       nextToken,
       expiry.next() ?? Infinity,
@@ -141,6 +158,7 @@ export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}
       if (session && !paused) void body.tokens(session, () => attention.currentSessionId() === session);
     }
     helper.tick();
+    await filesGlobal.tick();
     attention.pipeline.pruneSessions();
     const due = attention.pipeline.nextDeadline();
     if (!paused && due !== undefined && due <= clock.mono() && clock.mono() >= retryAfter) {
@@ -154,7 +172,18 @@ export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}
     const rules = settings.enabled();
     for (const rule of rules) attention.pipeline.addRule(rule);
     installed = rules.map((rule) => rule.id);
-    if (running) await files.refresh();
+    if (running) {
+      await files.refresh();
+      await filesGlobal.refresh();
+    }
+  }
+  async function updateGlobalWatch(change: Parameters<Settings['update']>[0]): Promise<void> {
+    const epoch = generation;
+    check(epoch);
+    await settings.update(change);
+    check(epoch);
+    if (running) await filesGlobal.refresh();
+    changed();
   }
   async function update(change: Parameters<Settings['update']>[0]): Promise<void> {
     const epoch = generation;
@@ -197,11 +226,13 @@ export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}
         paused = value;
         if (value) {
           schedule();
-          await settleShutdown([body.setPaused(true), files.refresh(), helper.stop()]);
+          await settleShutdown([body.setPaused(true), files.refresh(), filesGlobal.refresh(), helper.stop()]);
         } else {
           await body.setPaused(false);
           check();
           await files.refresh();
+          check();
+          await filesGlobal.refresh();
           check();
           helper.start(settings.sendTitles);
           schedule();
@@ -255,6 +286,26 @@ export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}
         body.sync();
       }),
     dismissTuningBackup: () => body.asUser(() => body.monitor.dismissBackup()),
+    setGlobalFileWatch: (enabled) =>
+      updateGlobalWatch((draft) => {
+        draft.globalFileWatch = enabled;
+      }),
+    addFileExclusion: (pattern) => {
+      check();
+      const norm = normalizeFileExclusion(pattern);
+      return updateGlobalWatch((draft) => {
+        const list = draft.fileExclusions ?? [];
+        if (!list.includes(norm)) list.push(norm);
+        draft.fileExclusions = list;
+      });
+    },
+    removeFileExclusion: (pattern) => {
+      check();
+      const norm = normalizeFileExclusion(pattern);
+      return updateGlobalWatch((draft) => {
+        draft.fileExclusions = (draft.fileExclusions ?? []).filter((item) => item !== norm);
+      });
+    },
   };
   const guarded = guardActions(unguarded, () => generation, check);
   const actions = guarded.actions;
@@ -291,6 +342,7 @@ export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}
       callbacks,
       guarded.wait(),
       files.stop(),
+      filesGlobal.stop(),
       helper.stop(),
       body.stop(),
       settings.close(),
@@ -317,6 +369,8 @@ export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}
         await target.start();
         check(epoch);
         await files.refresh();
+        check(epoch);
+        await filesGlobal.refresh();
         check(epoch);
         if (!paused) helper.start(settings.sendTitles);
         nextToken = clock.mono() + 5_000;

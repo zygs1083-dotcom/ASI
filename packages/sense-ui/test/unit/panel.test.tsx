@@ -735,3 +735,136 @@ describe('余额状态权威', () => {
     expect(screen.getByText(/余额不可用（接口超时）/)).toBeTruthy();
   });
 });
+
+describe('全盘文件监视与活动视图', () => {
+  it('显示运行中/已降级/部分无权限/已关闭状态，支持开关与排除项增删', async () => {
+    const state = makeState();
+    state.env.globalFileWatch = fact({
+      enabled: true,
+      status: 'running',
+      root: '/',
+      windowMs: 10_000,
+      eventsPerSec: 12,
+      degraded: false,
+      countOnly: false,
+      deniedPaths: [],
+      exclusions: ['/System', 'node_modules'],
+    });
+    const onToggleGlobalFileWatch = vi.fn();
+    const onAddFileExclusion = vi.fn().mockResolvedValue(undefined);
+    const onRemoveFileExclusion = vi.fn().mockResolvedValue(undefined);
+    const first = renderPanel(
+      { ...makeScenario('healthy'), state },
+      { onToggleGlobalFileWatch, onAddFileExclusion, onRemoveFileExclusion },
+    );
+
+    expect(screen.getByText('全盘文件监视')).toBeTruthy();
+    expect(screen.getByText('运行中')).toBeTruthy();
+    const toggle = screen.getByLabelText('全盘文件监视');
+    fireEvent.click(toggle);
+    expect(onToggleGlobalFileWatch).toHaveBeenCalledWith(false);
+
+    fireEvent.click(screen.getByText('排除项 2 条'));
+    fireEvent.change(screen.getByLabelText('新增排除路径或模式'), { target: { value: '~/CustomCache' } });
+    fireEvent.click(screen.getByRole('button', { name: '添加' }));
+    await waitFor(() => expect(onAddFileExclusion).toHaveBeenCalledWith('~/CustomCache'));
+
+    fireEvent.click(screen.getByRole('button', { name: '移除排除项 node_modules' }));
+    await waitFor(() => expect(onRemoveFileExclusion).toHaveBeenCalledWith('node_modules'));
+    first.view.unmount();
+
+    const degState = makeState();
+    degState.env.globalFileWatch = fact({
+      enabled: true,
+      status: 'degraded',
+      root: '/',
+      windowMs: 60_000,
+      eventsPerSec: 2500,
+      degraded: true,
+      countOnly: true,
+      deniedPaths: [],
+      exclusions: ['/System'],
+    });
+    const degView = renderPanel({ ...makeScenario('healthy'), state: degState });
+    expect(screen.getByText(/已降级/)).toBeTruthy();
+    degView.view.unmount();
+
+    const partialState = makeState();
+    partialState.env.globalFileWatch = fact({
+      enabled: true,
+      status: 'partial-denied',
+      root: '/',
+      windowMs: 10_000,
+      eventsPerSec: 0,
+      degraded: false,
+      countOnly: false,
+      deniedPaths: ['/Library/Mail'],
+      exclusions: ['/System'],
+    });
+    const partialView = renderPanel({ ...makeScenario('healthy'), state: partialState });
+    expect(screen.getByText(/部分无权限/)).toBeTruthy();
+    partialView.view.unmount();
+
+    const disabledState = makeState();
+    disabledState.env.globalFileWatch = fact({
+      enabled: false,
+      status: 'disabled',
+      root: '/',
+      windowMs: 10_000,
+      eventsPerSec: 0,
+      degraded: false,
+      countOnly: false,
+      deniedPaths: [],
+      exclusions: [],
+    });
+    renderPanel({ ...makeScenario('healthy'), state: disabledState });
+    expect(screen.getByText('已关闭')).toBeTruthy();
+  });
+
+  it('在事件流渲染 file.activity 细节并在规则区显示 file-activity 说明', () => {
+    const base = makeScenario('healthy');
+    const model: SensePanelModel = {
+      ...base,
+      events: [
+        {
+          signal: {
+            id: 'fa-1',
+            kind: 'file.activity',
+            at: T0 - 2_000,
+            source: { id: 'files-global', api: 'watch', host: 'local' },
+            subject: '/demo/project/src',
+            data: {},
+            cause: 'unknown',
+          },
+          level: 'record',
+          reason: 'file-activity',
+          cause: 'unknown',
+          detail: {
+            kind: 'file.activity',
+            directory: '/demo/project/src',
+            windowMs: 10_000,
+            created: 1,
+            modified: 2,
+            deleted: 0,
+            files: ['a.ts', 'b.ts'],
+          },
+        },
+      ],
+      rules: [
+        ...base.rules,
+        {
+          id: 'file-activity',
+          name: 'file-activity',
+          enabled: true,
+          confirmed: true,
+          match: { kind: 'file.activity' },
+          level: 'record',
+          createdBy: 'user',
+        },
+      ],
+    };
+    renderPanel(model);
+    expect(screen.getByText(/新增 1 · 修改 2 · 删除 0 · 文件：a\.ts、b\.ts/)).toBeTruthy();
+    expect(screen.getByText(/全盘按目录与时间窗聚合的文件活动/)).toBeTruthy();
+  });
+});

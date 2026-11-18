@@ -1,6 +1,7 @@
 import type { Signal } from '@asi/sense-types';
 import { describe, expect, it } from 'vitest';
 import { type BurstTarget, FileBurstDetector as Detector } from '../../src/host/body/burst.ts';
+import { sig } from '../helpers.ts';
 import { fileChanged } from './helpers.ts';
 
 let seq = 0;
@@ -205,5 +206,55 @@ describe('FileBurstDetector per-scope windows', () => {
     const out2 = d.accept(del(3, '/w/d'), 3, [dirScope, globScope]);
     expect(out2).toHaveLength(2); // 3rd delete in EACH scope → two tagged signals
     expect(out2.map((s) => s.data.scope).sort()).toEqual(['dir:/w', 'glob:/w/*']);
+  });
+
+  it('counts aggregated file.activity deletions and keeps agent cause from waking', () => {
+    const d = new FileBurstDetector({ windowMs: 60_000, maxChanges: 100, maxDeleted: 50 });
+    d.setScopes(['global']);
+    const globalTarget = [{ scope: 'global', dir: '/workspace/proj' }];
+    const agentAct = sig({
+      id: 'act-agent',
+      kind: 'file.activity',
+      at: 100,
+      subject: '/workspace/proj',
+      cause: 'agent',
+      data: { directory: '/workspace/proj', windowMs: 10_000, created: 0, modified: 0, deleted: 60, files: ['a.ts'] },
+    });
+    const agentOut = d.accept(agentAct, 100, globalTarget);
+    expect(agentOut).toHaveLength(1);
+    expect(agentOut[0]).toMatchObject({
+      kind: 'file.burst',
+      cause: 'agent',
+      data: {
+        agentDeleted: 60,
+        deleted: 60,
+        externalDeletionExceeded: false,
+        wake: false,
+        level: 'record',
+      },
+    });
+
+    const extAct = sig({
+      id: 'act-ext',
+      kind: 'file.activity',
+      at: 200,
+      subject: '/workspace/proj',
+      data: { directory: '/workspace/proj', windowMs: 10_000, created: 1, modified: 2, deleted: 51, files: ['b.ts'] },
+    });
+    const out = d.accept(extAct, 200, globalTarget);
+    expect(out).toHaveLength(1);
+    expect(out[0]).toMatchObject({
+      kind: 'file.burst',
+      subject: '/workspace/proj',
+      data: {
+        created: 1,
+        modified: 2,
+        deleted: 111,
+        agentDeleted: 60,
+        externalDeletionExceeded: true,
+        wake: true,
+        scope: 'global',
+      },
+    });
   });
 });

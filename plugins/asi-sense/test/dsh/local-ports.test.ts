@@ -178,7 +178,9 @@ describe('missing file watcher roots', () => {
     const watcher = ports.files.watch('/sandbox/root', (event) => events.push(event));
     failed = true;
     emit('rename', null);
-    expect(events).toEqual([{ path: '/sandbox/root', change: 'modify', watchError: true }]);
+    expect(events).toEqual([
+      { path: '/sandbox/root', change: 'modify', watchError: true, errorCode: 'EACCES', errorPath: '/sandbox/root' },
+    ]);
     watcher.close();
   });
 });

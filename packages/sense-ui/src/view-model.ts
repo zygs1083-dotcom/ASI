@@ -3,6 +3,7 @@
 
 import type {
   FactStatus,
+  GlobalFileWatchValue,
   DisksFact as SharedDisksFact,
   DiskVolume as SharedDiskVolume,
   Fact as SharedFact,
@@ -10,7 +11,7 @@ import type {
 } from '@asi/sense-types';
 import type { TuningState } from './tuning-model';
 
-export type { FactStatus, SourceRef } from '@asi/sense-types';
+export type { FactStatus, GlobalFileWatchStatus, GlobalFileWatchValue, SourceRef } from '@asi/sense-types';
 export type { TuningEntry, TuningParam, TuningState } from './tuning-model';
 
 /** UI 事实：共享 Fact 骨架 + 宿主可读原因（denied/unavailable 时展示）。 */
@@ -108,6 +109,7 @@ export interface SenseState {
     focusedWindow: Fact<{ title: string }>;
     activeJobs: Fact<JobSummary[]>;
     watchedPaths: Fact<Record<string, { lastChange: number; changes: number }>>;
+    globalFileWatch?: Fact<GlobalFileWatchValue>;
   };
   observation: {
     sources: Record<string, { status: FactStatus; lastSignalAt: number; error?: string }>;
@@ -151,6 +153,16 @@ export type EventDetail =
       modified: number;
       deleted: number;
       excessiveDeletion: boolean;
+    }
+  | {
+      kind: 'file.activity';
+      directory: string;
+      windowMs: number;
+      created: number;
+      modified: number;
+      deleted: number;
+      files: string[];
+      degraded?: boolean;
     };
 
 export interface SenseEvent {
@@ -290,6 +302,9 @@ export interface SensePanelProps {
   onDeleteRule: (id: string) => void;
   onPause: (paused: boolean) => void;
   onToggleTitles: (enabled: boolean) => void;
+  onToggleGlobalFileWatch?: (enabled: boolean) => void;
+  onAddFileExclusion?: (pattern: string) => Promise<void>;
+  onRemoveFileExclusion?: (pattern: string) => Promise<void>;
   onOpenPermissionSettings: () => void;
   onRevertTuning: (id: string) => void;
   onLockParam: (key: string, locked: boolean) => void;

@@ -27,9 +27,18 @@ export function localPorts(ctx: Context, storageRoot: string): Omit<SensePorts, 
         const startedAt = Date.now();
         let watcher: ReturnType<typeof watch>;
         let closed = false;
-        const fail = () => {
+        const fail = (error?: unknown) => {
           ctx.logger.warn('asi-sense file watcher failed');
-          const event = { path: target, change: 'modify' as const, watchError: true };
+          const code = (error as NodeJS.ErrnoException | undefined)?.code;
+          const rawPath = (error as { path?: unknown } | undefined)?.path;
+          const event = {
+            path: target,
+            change: 'modify' as const,
+            watchError: true,
+            ...(typeof code === 'string' && code.length > 0
+              ? { errorCode: code, errorPath: typeof rawPath === 'string' && rawPath.trim() ? rawPath : target }
+              : {}),
+          };
           callback(event);
         };
         const inside = (parent: string, child: string) => {
@@ -65,8 +74,8 @@ export function localPorts(ctx: Context, storageRoot: string): Omit<SensePorts, 
                     ) {
                       attach();
                     }
-                  } catch {
-                    fail();
+                  } catch (error) {
+                    fail(error);
                   }
                   if (!inside(target, path) || filename === null) return;
                   let at = Date.now();
@@ -80,9 +89,9 @@ export function localPorts(ctx: Context, storageRoot: string): Omit<SensePorts, 
                   callback({ path, change, at });
                 },
               );
-              next.on('error', () => {
+              next.on('error', (error) => {
                 if (closed || watcher !== next) return;
-                fail();
+                fail(error);
               });
               const previous = watcher;
               watcher = next;

@@ -52,6 +52,7 @@ export class FileSource {
   private readonly statuses = new Map<string, string>();
   private readonly failedWatches = new WeakSet<object>();
   private readonly dispatch = new Map<string, Map<string, number>>();
+  private dirSubtreeRes: RegExp[] = [];
   private clearDispatch?: ReturnType<typeof setImmediate>;
   private expiryTimer?: ReturnType<typeof setTimeout>;
   constructor(
@@ -226,6 +227,7 @@ export class FileSource {
       for (;;) {
         this.active = !this.stopped && !this.paused();
         const scopes = this.scopes();
+        this.dirSubtreeRes = [...scopes.values()].flatMap((e) => e.scopes.filter((s) => s.subtree).map((s) => s.re));
         this.setScopes([...new Set([...scopes.values()].flatMap((e) => e.scopes.map((s) => s.id)))]);
         const obsolete = [...this.watches].find(
           ([watched]) => !scopes.has(watched) && (!this.active || !this.leases.has(watched)),
@@ -291,9 +293,13 @@ export class FileSource {
     this.tail = run.catch(() => {});
     return run;
   }
+  hasDirScope(dir: string): boolean {
+    return this.active && this.dirSubtreeRes.some((re) => re.test(dir));
+  }
   async stop(): Promise<void> {
     this.stopped = true;
     this.active = false;
+    this.dirSubtreeRes = [];
     this.leases.clear();
     if (this.clearDispatch) clearImmediate(this.clearDispatch);
     this.dispatch.clear();

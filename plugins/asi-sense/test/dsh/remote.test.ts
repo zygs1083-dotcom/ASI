@@ -14,6 +14,9 @@ function fixture() {
     deleteRule: vi.fn(async () => {}),
     pause: vi.fn(async () => {}),
     setSendTitles: vi.fn(async () => {}),
+    setGlobalFileWatch: vi.fn(async () => {}),
+    addFileExclusion: vi.fn(async () => {}),
+    removeFileExclusion: vi.fn(async () => {}),
     openPermissionSettings: vi.fn(async () => {}),
     revertTuning: vi.fn(async () => ({ applied: true })),
     lockParam: vi.fn(async () => ({ applied: true })),
@@ -80,6 +83,27 @@ describe('DSH remote service', () => {
     await expect(remote.acceptRebaseline('baseline')).rejects.toThrow('stale suggestion');
     vi.mocked(actions.acceptRebaseline).mockRejectedValueOnce(new Error('storage unavailable'));
     await expect(remote.acceptRebaseline('baseline')).rejects.toThrow('storage unavailable');
+    expect(invalidate).toHaveBeenCalledTimes(3);
+  });
+
+  it('validates and forwards global file watch toggle and exclusion endpoints', async () => {
+    const { remote, actions, invalidate } = fixture();
+    await expect(Reflect.apply(remote.setGlobalFileWatch, remote, ['yes'])).rejects.toThrow();
+    expect(actions.setGlobalFileWatch).not.toHaveBeenCalled();
+    for (const bad of [undefined, null, '', '   ', 42]) {
+      await expect(Reflect.apply(remote.addFileExclusion, remote, [bad])).rejects.toThrow();
+      await expect(Reflect.apply(remote.removeFileExclusion, remote, [bad])).rejects.toThrow();
+    }
+    expect(actions.addFileExclusion).not.toHaveBeenCalled();
+    expect(actions.removeFileExclusion).not.toHaveBeenCalled();
+
+    invalidate.mockClear();
+    await remote.setGlobalFileWatch(false);
+    await remote.addFileExclusion('~/custom-cache');
+    await remote.removeFileExclusion('~/custom-cache');
+    expect(actions.setGlobalFileWatch).toHaveBeenCalledWith(false);
+    expect(actions.addFileExclusion).toHaveBeenCalledWith('~/custom-cache');
+    expect(actions.removeFileExclusion).toHaveBeenCalledWith('~/custom-cache');
     expect(invalidate).toHaveBeenCalledTimes(3);
   });
 });

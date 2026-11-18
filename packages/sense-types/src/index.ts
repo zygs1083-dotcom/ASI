@@ -93,6 +93,22 @@ export interface EnvWhere {
   toolExec: Fact<{ host: string; cwd: string }>;
 }
 
+/** Status of the whole-disk file watcher. */
+export type GlobalFileWatchStatus = 'running' | 'degraded' | 'partial-denied' | 'denied' | 'disabled';
+
+/** Summary value for `env.globalFileWatch`. */
+export interface GlobalFileWatchValue {
+  enabled: boolean;
+  status: GlobalFileWatchStatus;
+  root: string;
+  windowMs: number;
+  eventsPerSec: number;
+  degraded: boolean;
+  countOnly: boolean;
+  deniedPaths: string[];
+  exclusions: string[];
+}
+
 /** Observed environment state. */
 export interface EnvState {
   where: EnvWhere;
@@ -100,6 +116,7 @@ export interface EnvState {
   focusedWindow: Fact<{ title: string }>;
   activeJobs: Fact<JobSummary[]>;
   watchedPaths: Fact<Record<string, { lastChange: number; changes: number }>>;
+  globalFileWatch?: Fact<GlobalFileWatchValue>;
 }
 
 /** Per-source health bookkeeping. */
@@ -253,11 +270,23 @@ export type FileBurstData = {
   externalDeletionExceeded?: boolean;
 };
 
+/** Aggregated per-directory file activity signal payload (`file.activity`). */
+export type FileActivityData = {
+  directory: string;
+  windowMs: number;
+  created: number;
+  modified: number;
+  deleted: number;
+  files: string[];
+  degraded?: boolean;
+};
+
 /** Typed `data` contracts for signal kinds with a fixed schema. */
 export interface KnownSignalData {
   'body.rate': BodyRateData;
   'body.anomaly': BodyAnomalyData;
   'file.burst': FileBurstData;
+  'file.activity': FileActivityData;
 }
 
 /** A {@link Signal} narrowed to a kind with a known data schema. */

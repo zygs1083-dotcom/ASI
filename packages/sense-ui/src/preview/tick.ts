@@ -186,12 +186,14 @@ export function tick(m: SensePanelModel): SensePanelModel {
   const focusedWindow = renew(e0.focusedWindow, now);
   const activeJobs = renew(e0.activeJobs, now);
   const watchedPaths = renew(e0.watchedPaths, now);
+  const globalFileWatch = e0.globalFileWatch ? renew(e0.globalFileWatch, now) : undefined;
   const env =
     whereSame &&
     frontApp === e0.frontApp &&
     focusedWindow === e0.focusedWindow &&
     activeJobs === e0.activeJobs &&
-    watchedPaths === e0.watchedPaths
+    watchedPaths === e0.watchedPaths &&
+    globalFileWatch === e0.globalFileWatch
       ? e0
       : {
           ...e0,
@@ -200,6 +202,7 @@ export function tick(m: SensePanelModel): SensePanelModel {
           focusedWindow,
           activeJobs,
           watchedPaths,
+          ...(globalFileWatch ? { globalFileWatch } : {}),
         };
   return {
     ...m,

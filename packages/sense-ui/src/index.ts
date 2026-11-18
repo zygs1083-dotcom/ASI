@@ -9,6 +9,8 @@ export type {
   EventLevel,
   Fact,
   FactStatus,
+  GlobalFileWatchStatus,
+  GlobalFileWatchValue,
   JobSummary,
   LearningState,
   MetricInsight,

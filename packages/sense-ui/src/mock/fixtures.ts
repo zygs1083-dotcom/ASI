@@ -153,6 +153,17 @@ export function makeState(over: Partial<SenseState> = {}): SenseState {
       focusedWindow: fact({ title: 'demo.ts — project' }),
       activeJobs: fact([{ id: 'job-1', name: 'pnpm test', owner: 'fixture-session', status: 'running' }]),
       watchedPaths: fact({ 'src/**': { lastChange: T0 - 32_000, changes: 7 } }),
+      globalFileWatch: fact({
+        enabled: true,
+        status: 'running',
+        root: '/',
+        windowMs: 10_000,
+        eventsPerSec: 0,
+        degraded: false,
+        countOnly: false,
+        deniedPaths: [],
+        exclusions: ['/System', '/Library', '~/Library', 'node_modules', '.git'],
+      }),
     },
     observation: {
       sources: {

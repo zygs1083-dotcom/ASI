@@ -234,7 +234,7 @@ export function matchesRule(rule: WatchRule, signal: Signal, now: number): boole
     // Only file signals carry paths — normalize their subject spelling; every
     // other kind (job.*, window.*, …) keeps raw glob semantics.
     const pattern =
-      signal.kind === 'file.changed' || signal.kind === 'file.burst'
+      signal.kind === 'file.changed' || signal.kind === 'file.burst' || signal.kind === 'file.activity'
         ? normalizeFileSubject(rule.match.subject)
         : rule.match.subject;
     const subject = signal.subject;
@@ -313,6 +313,7 @@ export const DEFAULT_RULES: readonly WatchRule[] = [
   def('window-activity', { kind: 'window.focused' }, 'record'),
   def('window-title', { kind: 'window.title-changed' }, 'record'),
   def('watched-file', { kind: 'file.changed' }, 'context'),
+  def('file-activity', { kind: 'file.activity' }, 'record'),
   def('job-failed', { kind: 'job.exited', where: { exitCode: { '!=': 0 } } }, 'wake'),
   def('job-done', { kind: 'job.exited' }, 'context'),
   def('process-failed', { kind: 'process.exited', where: { exitCode: { '!=': 0 } } }, 'wake'),

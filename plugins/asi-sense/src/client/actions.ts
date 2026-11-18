@@ -11,6 +11,9 @@ type Api = Pick<
   | 'deleteRule'
   | 'pause'
   | 'setSendTitles'
+  | 'setGlobalFileWatch'
+  | 'addFileExclusion'
+  | 'removeFileExclusion'
   | 'openPermissionSettings'
   | 'revertTuning'
   | 'lockParam'
@@ -58,6 +61,9 @@ export function createActions(api: Api) {
     onDeleteRule: (id) => fire(api.deleteRule(id)),
     onPause: (paused) => fire(api.pause(paused)),
     onToggleTitles: (enabled) => fire(api.setSendTitles(enabled)),
+    onToggleGlobalFileWatch: (enabled) => fire(api.setGlobalFileWatch(enabled)),
+    onAddFileExclusion: (pattern) => complete(() => api.addFileExclusion(pattern)),
+    onRemoveFileExclusion: (pattern) => complete(() => api.removeFileExclusion(pattern)),
     onOpenPermissionSettings: () => fire(api.openPermissionSettings()),
     onRevertTuning: (id) => fire(api.revertTuning(id)),
     onLockParam: (param, locked) => fire(api.lockParam(param, locked)),

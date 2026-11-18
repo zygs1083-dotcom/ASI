@@ -83,6 +83,67 @@ export function App() {
             setModel((m) => ({ ...m, sendTitles: on }));
             act(on ? '窗口标题发给模型' : '窗口标题已隐藏');
           }}
+          onToggleGlobalFileWatch={(on) => {
+            setModel((m) => {
+              const cur = m.state.env.globalFileWatch;
+              if (!cur?.value) return m;
+              return {
+                ...m,
+                state: {
+                  ...m.state,
+                  env: {
+                    ...m.state.env,
+                    globalFileWatch: {
+                      ...cur,
+                      value: {
+                        ...cur.value,
+                        enabled: on,
+                        status: on ? (cur.value.degraded ? 'degraded' : 'running') : 'disabled',
+                      },
+                    },
+                  },
+                },
+              };
+            });
+            act(on ? '开启全盘文件监视' : '关闭全盘文件监视');
+          }}
+          onAddFileExclusion={async (pattern) => {
+            setModel((m) => {
+              const cur = m.state.env.globalFileWatch;
+              if (!cur?.value) return m;
+              const next = cur.value.exclusions.includes(pattern)
+                ? cur.value.exclusions
+                : [...cur.value.exclusions, pattern];
+              return {
+                ...m,
+                state: {
+                  ...m.state,
+                  env: { ...m.state.env, globalFileWatch: { ...cur, value: { ...cur.value, exclusions: next } } },
+                },
+              };
+            });
+            act(`添加排除项 ${pattern}`);
+          }}
+          onRemoveFileExclusion={async (pattern) => {
+            setModel((m) => {
+              const cur = m.state.env.globalFileWatch;
+              if (!cur?.value) return m;
+              return {
+                ...m,
+                state: {
+                  ...m.state,
+                  env: {
+                    ...m.state.env,
+                    globalFileWatch: {
+                      ...cur,
+                      value: { ...cur.value, exclusions: cur.value.exclusions.filter((x) => x !== pattern) },
+                    },
+                  },
+                },
+              };
+            });
+            act(`移除排除项 ${pattern}`);
+          }}
           onToggleRule={(id, enabled) => {
             setModel((m) => ({
               ...m,

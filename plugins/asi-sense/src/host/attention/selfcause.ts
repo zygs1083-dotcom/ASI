@@ -16,6 +16,7 @@ export interface ToolWindow {
 
 const CAUSAL_KINDS: ReadonlySet<string> = new Set([
   'file.changed',
+  'file.activity',
   'job.started',
   'job.exited',
   'process.started',
@@ -24,11 +25,15 @@ const CAUSAL_KINDS: ReadonlySet<string> = new Set([
 
 function signalPath(signal: Signal): string | undefined {
   if (typeof signal.data.path === 'string' && signal.data.path.length > 0) return signal.data.path;
+  if (signal.kind === 'file.activity') {
+    if (typeof signal.data.directory === 'string' && signal.data.directory.length > 0) return signal.data.directory;
+    if (signal.subject.length > 0) return signal.subject;
+  }
   if (signal.kind === 'file.changed' && signal.subject.length > 0) return signal.subject;
   return undefined;
 }
 
-function underDir(cwd: string, p: string): boolean {
+export function isUnderDir(cwd: string, p: string): boolean {
   // Both paths must be absolute: a relative signal path is never resolved
   // against the process cwd (that is not part of the source contract).
   if (!path.isAbsolute(cwd) || !path.isAbsolute(p)) return false;
@@ -72,19 +77,19 @@ export function classifyCause(
     const p = signalPath(signal);
     if (receivedMono === undefined || w.startedMono === undefined || receivedMono < w.startedMono) continue;
     if (w.endedMono !== undefined) {
-      if (signal.kind === 'file.changed') {
+      if (signal.kind === 'file.changed' || signal.kind === 'file.activity') {
         if (receivedMono >= w.endedMono + graceMs) continue;
       } else if (signal.kind === 'job.exited' && receivedMono >= w.endedMono) {
         if (w.pid !== undefined && signal.data.pid === w.pid && receivedMono < w.endedMono + graceMs) return 'agent';
         continue;
       } else if (receivedMono > w.endedMono) continue;
     }
-    if (signal.kind === 'file.changed') {
-      if (w.cwd !== undefined && p !== undefined && underDir(w.cwd, p)) return 'agent';
+    if (signal.kind === 'file.changed' || signal.kind === 'file.activity') {
+      if (w.cwd !== undefined && p !== undefined && isUnderDir(w.cwd, p)) return 'agent';
       continue;
     }
     if (w.pid !== undefined && relatedToShell(signal, w.pid)) return 'agent';
-    if (w.cwd !== undefined && p !== undefined && underDir(w.cwd, p)) return 'agent';
+    if (w.cwd !== undefined && p !== undefined && isUnderDir(w.cwd, p)) return 'agent';
   }
   return base;
 }

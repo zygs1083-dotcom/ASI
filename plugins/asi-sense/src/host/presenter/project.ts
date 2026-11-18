@@ -110,6 +110,27 @@ function eventDetail(entry: EventEntry): SenseEvent['detail'] {
       excessiveDeletion: d.externalDeletionExceeded === true,
     };
   }
+  if (
+    entry.kind === 'file.activity' &&
+    typeof d.directory === 'string' &&
+    typeof d.windowMs === 'number' &&
+    typeof d.created === 'number' &&
+    typeof d.modified === 'number' &&
+    typeof d.deleted === 'number'
+  ) {
+    const files =
+      typeof d.files === 'string' && d.files.length > 0 ? d.files.split(', ').filter(Boolean).slice(0, 5) : [];
+    return {
+      kind: 'file.activity',
+      directory: d.directory,
+      windowMs: d.windowMs,
+      created: d.created,
+      modified: d.modified,
+      deleted: d.deleted,
+      files,
+      ...(d.degraded === true ? { degraded: true } : {}),
+    };
+  }
   return undefined;
 }
 

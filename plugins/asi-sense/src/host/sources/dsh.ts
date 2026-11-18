@@ -1,6 +1,6 @@
 import os from 'node:os';
 import type { SenseState, Signal } from '@asi/sense-types';
-import { classifyCause, type ToolWindow } from '../attention/selfcause.ts';
+import { classifyCause, isUnderDir, type ToolWindow } from '../attention/selfcause.ts';
 import type { RuntimeAttention } from '../runtime/attention.ts';
 import type { AgentEvent, Clock, DshPort, JobEvent, ToolEvent, Unsubscribe } from '../runtime/ports.ts';
 import { StateStore } from '../state/store.ts';
@@ -216,6 +216,17 @@ export class DshSource {
       ...signal,
       cause: classifyCause(signal, [...this.windows.values()], this.selfCauseGraceMs, this.clock.mono()),
     };
+  }
+  /** Allocation-light self-cause check for high-rate file events. */
+  classifyFilePath(absPath: string): 'agent' | 'unknown' {
+    if (this.windows.size === 0) return 'unknown';
+    const mono = this.clock.mono();
+    for (const w of this.windows.values()) {
+      if (w.startedMono === undefined || mono < w.startedMono) continue;
+      if (w.endedMono !== undefined && mono >= w.endedMono + this.selfCauseGraceMs) continue;
+      if (w.cwd !== undefined && isUnderDir(w.cwd, absPath)) return 'agent';
+    }
+    return 'unknown';
   }
   private async agent(event: AgentEvent): Promise<void> {
     if (event.type === 'created') {
