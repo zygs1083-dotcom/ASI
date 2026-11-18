@@ -726,7 +726,8 @@ describe('FileGlobalSource integration', () => {
       h.emitFile({ path: `/work/huge/dir-${i}/file.ts`, change: 'add' });
     }
     await h.advance(10_000);
-    for (let i = 0; i < 100; i++) {
+    // Worst-case adaptive sliceCap=8 across ~2,000 buckets requires up to 250 setImmediate turns.
+    for (let i = 0; i < 300; i++) {
       if (collectActivity(h.events()).some((e) => e.detail?.directory === '/work/huge')) break;
       await new Promise((r) => setImmediate(r));
     }
