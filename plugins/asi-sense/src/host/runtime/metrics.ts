@@ -1,5 +1,4 @@
 import type { Body, Fact } from '@asi/sense-types';
-import { effectiveDisks, factStatusAt } from '@asi/sense-types';
 import { type DayBounds, LocalCalendar } from './history/time.ts';
 import type { Clock } from './ports.ts';
 
@@ -37,6 +36,16 @@ export const METRIC_UNITS: Readonly<Record<MetricKey, MetricUnit>> = {
 };
 
 const METRIC_KEY_SET: ReadonlySet<string> = new Set(METRIC_KEYS);
+const METRIC_INDEX: Readonly<Record<MetricKey, number>> = {
+  cpu: 0,
+  load1: 1,
+  load5: 2,
+  load15: 3,
+  memory: 4,
+  swap: 5,
+  disk: 6,
+  battery: 7,
+};
 const DATE_ONLY_RE = /^\d{4}-\d{2}-\d{2}$/;
 
 export interface MetricStats {
@@ -46,12 +55,20 @@ export interface MetricStats {
   count: number;
 }
 
+interface InternalMetricStats {
+  min: number;
+  sum: number;
+  max: number;
+  count: number;
+  /** First/last raw sample in this bucket, used for away trend edges. */
+  first: number;
+  last: number;
+}
+
 interface MetricBucket {
   start: number;
   samples: number;
-  metrics: Partial<Record<MetricKey, MetricStats>>;
-  /** First/last raw sample per metric, used for away start/end values (not persisted). */
-  edges?: Partial<Record<MetricKey, { first: number; last: number }>>;
+  slots: Array<InternalMetricStats | undefined>;
   diskTotal?: number;
 }
 
@@ -122,20 +139,28 @@ function finite(value: unknown): value is number {
 }
 
 function okFact<T>(fact: Fact<T>, at: number): T | undefined {
-  return factStatusAt(fact as Fact<unknown> & { kind?: never }, at) === 'ok' && fact.value !== null
-    ? fact.value
-    : undefined;
+  return fact.status === 'ok' && fact.value !== null && !(at >= fact.observedAt + fact.ttlMs) ? fact.value : undefined;
 }
 
-function addValue(stats: MetricStats | undefined, value: number, count = 1): MetricStats {
-  if (!stats) return { min: value, avg: value, max: value, count };
-  const next = stats.count + count;
+function createBucket(start: number): MetricBucket {
   return {
-    min: Math.min(stats.min, value),
-    max: Math.max(stats.max, value),
-    avg: roundAvg((stats.avg * stats.count + value * count) / next),
-    count: next,
+    start,
+    samples: 0,
+    slots: [undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined],
   };
+}
+
+function addSlotInPlace(slots: Array<InternalMetricStats | undefined>, idx: number, value: number): void {
+  const stats = slots[idx];
+  if (!stats) {
+    slots[idx] = { min: value, sum: value, max: value, count: 1, first: value, last: value };
+    return;
+  }
+  if (value < stats.min) stats.min = value;
+  if (value > stats.max) stats.max = value;
+  stats.sum += value;
+  stats.count += 1;
+  stats.last = value;
 }
 
 /** Trims binary floating-point noise so repeated averages stay exact decimals. */
@@ -143,16 +168,62 @@ function roundAvg(value: number): number {
   return Math.round(value * 1e9) / 1e9;
 }
 
-function mergeStats(target: MetricStats | undefined, source: MetricStats): MetricStats {
-  if (!target) return { ...source };
-  const count = target.count + source.count;
-  return {
-    min: Math.min(target.min, source.min),
-    max: Math.max(target.max, source.max),
-    avg: roundAvg((target.avg * target.count + source.avg * source.count) / count),
-    count,
-  };
+function isDiskVolumeOk(
+  disks: Body['disks'],
+  volume: NonNullable<Body['disks']['value']>[number],
+  at: number,
+): boolean {
+  if (disks.unavailableMounts?.includes(volume.mount)) return false;
+  const observedAt = volume.observedAt ?? disks.observedAt;
+  const deadline = observedAt + (volume.ttlMs ?? disks.ttlMs);
+  if (volume.status !== undefined) {
+    return volume.status === 'ok' && !(at >= deadline);
+  }
+  const factDeadline = disks.observedAt + disks.ttlMs;
+  return disks.status === 'ok' && !(at >= factDeadline) && !(at >= Math.min(deadline, factDeadline));
 }
+
+function readBodyInto(body: Body, at: number, out: Float64Array): number | undefined {
+  out.fill(Number.NaN);
+  const cpu = okFact(body.cpu, at);
+  if (cpu) {
+    if (finite(cpu.usage) && cpu.usage >= 0 && cpu.usage <= 1) out[0] = cpu.usage;
+    if (finite(cpu.load1) && cpu.load1 >= 0) out[1] = cpu.load1;
+    if (finite(cpu.load5) && cpu.load5 >= 0) out[2] = cpu.load5;
+    if (finite(cpu.load15) && cpu.load15 >= 0) out[3] = cpu.load15;
+  }
+  const memory = okFact(body.memory, at);
+  if (memory && finite(memory.total) && memory.total > 0 && finite(memory.used) && memory.used >= 0) {
+    out[4] = memory.used;
+    if (finite(memory.swapUsed) && memory.swapUsed >= 0) out[5] = memory.swapUsed;
+  }
+  let diskTotal: number | undefined;
+  let diskFree: number | undefined;
+  let diskRatio = Number.POSITIVE_INFINITY;
+  const volumes = body.disks.value;
+  if (volumes && volumes.length > 0) {
+    for (const disk of volumes) {
+      if (!isDiskVolumeOk(body.disks, disk, at)) continue;
+      if (!finite(disk.total) || disk.total <= 0 || !finite(disk.free) || disk.free < 0 || disk.free > disk.total)
+        continue;
+      const ratio = disk.free / disk.total;
+      // Track the tightest volume; `disk` means "available disk headroom".
+      if (ratio < diskRatio) {
+        diskRatio = ratio;
+        diskFree = disk.free;
+        diskTotal = disk.total;
+      }
+    }
+    if (diskFree !== undefined) out[6] = diskFree;
+  }
+  const battery = okFact(body.battery, at);
+  if (battery && finite(battery.percent) && battery.percent >= 0 && battery.percent <= 100) {
+    out[7] = battery.percent;
+  }
+  return diskTotal;
+}
+
+const measureScratch = new Float64Array(METRIC_KEYS.length);
 
 interface MeasuredValues {
   values: Partial<Record<MetricKey, number>>;
@@ -161,39 +232,11 @@ interface MeasuredValues {
 
 /** Reads the change 3 metrics out of one body sample; missing/invalid facts are omitted. */
 export function measureBody(body: Body, at: number): MeasuredValues {
+  const diskTotal = readBodyInto(body, at, measureScratch);
   const values: Partial<Record<MetricKey, number>> = {};
-  const cpu = okFact(body.cpu, at);
-  if (cpu && finite(cpu.usage) && cpu.usage >= 0 && cpu.usage <= 1) values.cpu = cpu.usage;
-  if (cpu) {
-    for (const key of ['load1', 'load5', 'load15'] as const) {
-      const load = cpu[key];
-      if (finite(load) && load >= 0) values[key] = load;
-    }
-  }
-  const memory = okFact(body.memory, at);
-  if (memory && finite(memory.total) && memory.total > 0 && finite(memory.used) && memory.used >= 0) {
-    values.memory = memory.used;
-    if (finite(memory.swapUsed) && memory.swapUsed >= 0) values.swap = memory.swapUsed;
-  }
-  let diskTotal: number | undefined;
-  let diskFree: number | undefined;
-  let diskRatio = Number.POSITIVE_INFINITY;
-  for (const disk of effectiveDisks(body.disks, at).value ?? []) {
-    if (disk.status !== 'ok') continue;
-    if (!finite(disk.total) || disk.total <= 0 || !finite(disk.free) || disk.free < 0 || disk.free > disk.total)
-      continue;
-    const ratio = disk.free / disk.total;
-    // Track the tightest volume; `disk` means "available disk headroom".
-    if (ratio < diskRatio) {
-      diskRatio = ratio;
-      diskFree = disk.free;
-      diskTotal = disk.total;
-    }
-  }
-  if (diskFree !== undefined) values.disk = diskFree;
-  const battery = okFact(body.battery, at);
-  if (battery && finite(battery.percent) && battery.percent >= 0 && battery.percent <= 100) {
-    values.battery = battery.percent;
+  for (let i = 0; i < METRIC_KEYS.length; i++) {
+    const value = measureScratch[i];
+    if (!Number.isNaN(value)) values[METRIC_KEYS[i]] = value;
   }
   return diskTotal === undefined ? { values } : { values, diskTotal };
 }
@@ -202,6 +245,9 @@ export class MetricTimeline {
   private readonly buckets = new Map<number, MetricBucket>();
   private readonly hours = new Map<number, HourBucket>();
   private readonly calendar: LocalCalendar;
+  private readonly sampleScratch = new Float64Array(METRIC_KEYS.length);
+  private lastBucket?: MetricBucket;
+  private lastHour?: HourBucket;
 
   constructor(
     private readonly clock: Clock,
@@ -213,32 +259,47 @@ export class MetricTimeline {
   /** Folds one probe sample into the 5-minute and hourly buckets. Synchronous, no IO. */
   record(body: Body, at: number): void {
     if (!finite(at) || at < 0) return;
-    const start = Math.floor(at / METRIC_BUCKET_MS) * METRIC_BUCKET_MS;
-    const { values, diskTotal } = measureBody(body, at);
-    const bucket = this.buckets.get(start) ?? { start, samples: 0, metrics: {} };
+
+    let bucket = this.lastBucket;
+    let hour = this.lastHour;
+    if (!bucket || !hour || at < bucket.start || at >= bucket.start + METRIC_BUCKET_MS) {
+      const start = Math.floor(at / METRIC_BUCKET_MS) * METRIC_BUCKET_MS;
+      bucket = this.buckets.get(start);
+      if (!bucket) {
+        bucket = createBucket(start);
+        this.buckets.set(start, bucket);
+      }
+      this.lastBucket = bucket;
+      this.pruneBuckets(at);
+
+      const hourStart = Math.floor(start / METRIC_HOUR_MS) * METRIC_HOUR_MS;
+      if (!hour || hour.start !== hourStart) {
+        hour = this.hours.get(hourStart);
+        if (!hour) {
+          hour = createBucket(hourStart);
+          this.hours.set(hourStart, hour);
+        }
+        this.lastHour = hour;
+        this.pruneHours(at);
+      }
+    }
+
     bucket.samples += 1;
-    for (const key of METRIC_KEYS) {
-      const value = values[key];
-      if (value === undefined) continue;
-      bucket.metrics[key] = addValue(bucket.metrics[key], value);
-      const edge = bucket.edges?.[key];
-      if (edge) edge.last = value;
-      else bucket.edges = { ...bucket.edges, [key]: { first: value, last: value } };
-    }
-    if (diskTotal !== undefined) bucket.diskTotal = diskTotal;
-    this.buckets.set(start, bucket);
-
-    const hourStart = Math.floor(start / METRIC_HOUR_MS) * METRIC_HOUR_MS;
-    const hour = this.hours.get(hourStart) ?? { start: hourStart, samples: 0, metrics: {} };
     hour.samples += 1;
-    for (const key of METRIC_KEYS) {
-      const value = values[key];
-      if (value !== undefined) hour.metrics[key] = addValue(hour.metrics[key], value);
-    }
-    if (diskTotal !== undefined) hour.diskTotal = diskTotal;
-    this.hours.set(hourStart, hour);
 
-    this.prune(at);
+    const scratch = this.sampleScratch;
+    const diskTotal = readBodyInto(body, at, scratch);
+    for (let i = 0; i < METRIC_KEYS.length; i++) {
+      const value = scratch[i];
+      if (!Number.isNaN(value)) {
+        addSlotInPlace(bucket.slots, i, value);
+        addSlotInPlace(hour.slots, i, value);
+      }
+    }
+    if (diskTotal !== undefined) {
+      bucket.diskTotal = diskTotal;
+      hour.diskTotal = diskTotal;
+    }
   }
 
   query(params: MetricQueryParams = {}): MetricQueryResult {
@@ -264,18 +325,19 @@ export class MetricTimeline {
     }
     if (clampedFrom > clampedTo) clampedFrom = clampedTo;
 
+    const slotIdx = METRIC_INDEX[key];
     const groups = new Map<number, { min: number; max: number; sum: number; count: number; samples: number }>();
     const starts = [...this.buckets.keys()].sort((a, b) => a - b);
     for (const start of starts) {
       if (start < clampedFrom || start > clampedTo) continue;
       const bucket = this.buckets.get(start);
-      const stats = bucket?.metrics[key];
+      const stats = bucket?.slots[slotIdx];
       if (!bucket || !stats) continue;
       const at = Math.floor(start / stepMs) * stepMs;
       const group = groups.get(at) ?? { min: stats.min, max: stats.max, sum: 0, count: 0, samples: 0 };
       group.min = Math.min(group.min, stats.min);
       group.max = Math.max(group.max, stats.max);
-      group.sum += stats.avg * stats.count;
+      group.sum += stats.sum;
       group.count += stats.count;
       group.samples += bucket.samples;
       groups.set(at, group);
@@ -315,9 +377,10 @@ export class MetricTimeline {
   /** First/last aggregated values and extremes for an away episode. */
   trend(metric: MetricKey, from: number, to: number): MetricTrend | undefined {
     if (!finite(from) || !finite(to) || to < from) return undefined;
+    const slotIdx = METRIC_INDEX[metric];
     const starts = [...this.buckets.keys()].sort((a, b) => a - b);
-    let first: { bucket: MetricBucket; stats: MetricStats; value: number } | undefined;
-    let last: { bucket: MetricBucket; stats: MetricStats; value: number } | undefined;
+    let first: { bucket: MetricBucket; stats: InternalMetricStats; value: number } | undefined;
+    let last: { bucket: MetricBucket; stats: InternalMetricStats; value: number } | undefined;
     let min = Number.POSITIVE_INFINITY;
     let max = Number.NEGATIVE_INFINITY;
     let samples = 0;
@@ -326,11 +389,10 @@ export class MetricTimeline {
       if (start < from - METRIC_BUCKET_MS) continue;
       if (start > to) break;
       const bucket = this.buckets.get(start);
-      const stats = bucket?.metrics[metric];
+      const stats = bucket?.slots[slotIdx];
       if (!bucket || !stats) continue;
-      const edge = bucket.edges?.[metric];
-      if (!first) first = { bucket, stats, value: edge?.first ?? stats.avg };
-      last = { bucket, stats, value: edge?.last ?? stats.avg };
+      if (!first) first = { bucket, stats, value: stats.first };
+      last = { bucket, stats, value: stats.last };
       min = Math.min(min, stats.min);
       max = Math.max(max, stats.max);
       samples += stats.count;
@@ -373,9 +435,16 @@ export class MetricTimeline {
     for (const [start, hour] of [...this.hours.entries()].sort(([a], [b]) => a - b)) {
       if (start < bounds.startMs || start >= bounds.endMs) continue;
       const metrics: Record<string, MetricStats> = {};
-      for (const key of METRIC_KEYS) {
-        const stats = hour.metrics[key];
-        if (stats) metrics[key] = { ...stats };
+      for (let i = 0; i < METRIC_KEYS.length; i++) {
+        const stats = hour.slots[i];
+        if (stats) {
+          metrics[METRIC_KEYS[i]] = {
+            min: stats.min,
+            avg: roundAvg(stats.sum / stats.count),
+            max: stats.max,
+            count: stats.count,
+          };
+        }
       }
       hours.push({
         start,
@@ -401,11 +470,14 @@ export class MetricTimeline {
     };
   }
 
-  private prune(at: number): void {
+  private pruneBuckets(at: number): void {
     const bucketCutoff = Math.floor((at - METRIC_RETENTION_MS) / METRIC_BUCKET_MS) * METRIC_BUCKET_MS;
     for (const start of this.buckets.keys()) {
       if (start < bucketCutoff) this.buckets.delete(start);
     }
+  }
+
+  private pruneHours(at: number): void {
     const hourCutoff = Math.floor((at - METRIC_HOUR_RETENTION_MS) / METRIC_HOUR_MS) * METRIC_HOUR_MS;
     for (const start of this.hours.keys()) {
       if (start < hourCutoff) this.hours.delete(start);
