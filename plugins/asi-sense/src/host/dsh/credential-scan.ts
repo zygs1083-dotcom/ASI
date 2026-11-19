@@ -997,15 +997,11 @@ export function scanCredentials(input: string): CredentialSpan[] {
           }
         }
 
-        // 3c. Unquoted `=` or `:` (allowing up to 4 horizontal spaces before delimiter)
+        // 3c. Unquoted `=` or `:` (horizontal whitespace before delimiter is unbounded and stays linear)
         let sepPos = keyEnd;
         if (isHws(delim)) {
           let p = sepPos + 1;
-          let wsCount = 1;
-          while (p < len && wsCount < 4 && isHws(input.charCodeAt(p))) {
-            p++;
-            wsCount++;
-          }
+          while (p < len && isHws(input.charCodeAt(p))) p++;
           if (p < len && (input.charCodeAt(p) === 58 || input.charCodeAt(p) === 61)) sepPos = p;
         }
         const sep = sepPos < len ? input.charCodeAt(sepPos) : -1;

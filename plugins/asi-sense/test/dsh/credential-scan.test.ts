@@ -223,6 +223,18 @@ describe('credential scanner contracts (契约 1–5) and single-entry normaliza
     expect(sanitizeForModel('token-bucket-rate-limiter')).toBe('token-bucket-rate-limiter');
   });
 
+  it('accepts unbounded horizontal whitespace before a KV delimiter (rrv-015a-3 contract-3 leak)', () => {
+    // Report input: `secret     =aligned9Val` (5 spaces) leaked verbatim; boundary 4/5/20 spaces
+    expect(sanitizeForModel('secret     =aligned9Val')).toBe('secret     =[redacted]');
+    for (const n of [4, 5, 20]) {
+      const input = `secret${' '.repeat(n)}=val${n}pad9`;
+      expect(sanitizeForModel(input), input).toBe(`secret${' '.repeat(n)}=[redacted]`);
+    }
+    expect(sanitizeForModel('password\t\t=mixedTab9')).toBe('password  =[redacted]');
+    // A whitespace run with no `=`/`:` after it still redacts nothing
+    expect(sanitizeForModel(`secret${' '.repeat(30)} notakey`)).toBe(`secret${' '.repeat(30)} notakey`);
+  });
+
   it('detects Contract 4 URL userinfo passwords and Contract 5 high-entropy / >=40 hex strings', () => {
     expect(sanitizeForModel('https://alice:SuperSecretPass99@api.example.com/v1')).toBe(
       'https://alice:[redacted]@api.example.com/v1',
@@ -437,6 +449,10 @@ const LEAK_CORPUS: LeakSample[] = [
     input: 'abababababababababababababababababababab',
     secret: 'abababababababababababababababababababab',
   },
+
+  // --- rrv-015a-3: unbounded horizontal whitespace before KV `=`/`:` ---
+  { id: 'f4-kv-ws5', input: 'secret     =aligned9Val', secret: 'aligned9Val' },
+  { id: 'f4-kv-ws20', input: `secret${' '.repeat(20)}=val20spaces9`, secret: 'val20spaces9' },
 ];
 
 describe('leak corpus across all 4 real model exits (env_detail, env_state, deliver, env_history)', () => {
@@ -851,6 +867,7 @@ describe('linear O(N) performance on 4 worst-case patterns from rrv-015a-2', () 
     { name: "'-eyJ'.repeat(...)", build: (n) => '-eyJ'.repeat(Math.ceil(n / 4)).slice(0, n) },
     { name: "'api-key-'.repeat(...)", build: (n) => 'api-key-'.repeat(Math.ceil(n / 8)).slice(0, n) },
     { name: "'token-aaaa-bbbb-'.repeat(...) + '1'", build: (n) => `${'token-aaaa-bbbb-'.repeat(Math.floor(n / 16))}1` },
+    { name: "'secret' + n spaces + '='", build: (n) => `secret${' '.repeat(n - 8)}=v` },
   ];
 
   it('processes 10k < 5ms and 100k < 50ms normalized linearly without quadratic blowup', () => {
