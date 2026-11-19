@@ -315,16 +315,18 @@ export function NowSection({
       <details className={css.srcDetails}>
         <summary>信号源 {Object.keys(observation.sources).length} 个</summary>
         {Object.entries(observation.sources).map(([id, s]) => {
-          const isHistoryDailyLimit =
+          const isLegacyHistoryDailyLimit =
             id === 'history' && (s.error === 'daily-limit-exceeded' || s.error === '今日已达上限，后续只记汇总');
+          const isCapped = id === 'history' && (s.capped === true || isLegacyHistoryDailyLimit);
+          const realError = s.error && !isLegacyHistoryDailyLimit ? s.error : undefined;
+          const statusLabel =
+            (isCapped && s.status === 'ok' && !realError) || (isLegacyHistoryDailyLimit && !realError)
+              ? '今日已达上限，后续只记汇总'
+              : `${STATUS_TEXT[s.status] || '正常'}${realError ? `（${realError}）` : ''}${isCapped ? ' · 今日已达上限，后续只记汇总' : ''}`;
           return (
             <div className={css.item} key={id}>
               <span className={css.itemLabel}>{id}</span>
-              <span className={css.itemValue}>
-                {isHistoryDailyLimit
-                  ? '今日已达上限，后续只记汇总'
-                  : `${STATUS_TEXT[s.status] || '正常'}${s.error ? `（${s.error}）` : ''}`}
-              </span>
+              <span className={css.itemValue}>{statusLabel}</span>
               <span className={css.factMeta}>
                 {formatAge(now, s.lastSignalAt) === '刚刚' ? '' : formatAge(now, s.lastSignalAt)}
               </span>

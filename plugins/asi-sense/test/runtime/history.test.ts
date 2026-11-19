@@ -17,6 +17,7 @@ import {
   type DailySummary,
   HistoryManager,
   LocalCalendar,
+  MAX_DAILY_CRITICAL_EVENT_BYTES,
   MAX_DAILY_EVENT_BYTES,
   MAX_DAILY_FILE_EVENT_BYTES,
   MAX_DAILY_NON_FILE_EVENT_BYTES,
@@ -3299,7 +3300,11 @@ describe('runtime history persistence, rollups, retention, and recovery', () => 
     await new Promise((r) => setTimeout(r, 50));
     expect(deliveredWithSess.some((d) => d.includes('daily-limit-exceeded'))).toBe(false);
     expect(h1.runtime.events().find((e) => e.reason === 'daily-limit-exceeded')?.level).toBe('record');
-    expect(projectState(h1.runtime.state()).observation.sources.history?.error).toBe('今日已达上限，后续只记汇总');
+    expect(projectState(h1.runtime.state()).observation.sources.history).toMatchObject({
+      status: 'ok',
+      capped: true,
+    });
+    expect(projectState(h1.runtime.state()).observation.sources.history?.error).toBeUndefined();
     await h1.runtime.stop();
 
     // Restart on the same date: must NOT emit a duplicate daily-limit-exceeded event or push to model
@@ -3315,7 +3320,11 @@ describe('runtime history persistence, rollups, retention, and recovery', () => 
       },
     });
     await h2.runtime.start();
-    expect(projectState(h2.runtime.state()).observation.sources.history?.error).toBe('今日已达上限，后续只记汇总');
+    expect(projectState(h2.runtime.state()).observation.sources.history).toMatchObject({
+      status: 'ok',
+      capped: true,
+    });
+    expect(projectState(h2.runtime.state()).observation.sources.history?.error).toBeUndefined();
     await h2.emitJob({
       type: 'started',
       id: `cap-sess-after-restart-${'x'.repeat(60)}`,
@@ -3399,7 +3408,11 @@ describe('runtime history persistence, rollups, retention, and recovery', () => 
         ).toHaveLength(1),
       { timeout: 2_000, interval: 5 },
     );
-    expect(projectState(rtNoSess.state()).observation.sources.history?.error).toBe('今日已达上限，后续只记汇总');
+    expect(projectState(rtNoSess.state()).observation.sources.history).toMatchObject({
+      status: 'ok',
+      capped: true,
+    });
+    expect(projectState(rtNoSess.state()).observation.sources.history?.error).toBeUndefined();
 
     // Now bring a session online and deliver an event on it: daily-limit-exceeded must NEVER be pending or delivered
     sessionList = [{ id: 's-late', title: 'Late', updatedAt: wall + 1_000, running: true }];
@@ -3413,6 +3426,292 @@ describe('runtime history persistence, rollups, retention, and recovery', () => 
     });
     await new Promise((r) => setTimeout(r, 80));
     expect(deliveredNoSess.some((d) => d.includes('daily-limit-exceeded'))).toBe(false);
+    await rtNoSess.stop();
+  });
+
+  it('B1: keeps history source ok+capped on daily-limit-exceeded so subsequent real write failures still deliver and transient emitSourceOk preserves cap notice', async () => {
+    // 1) Active session: daily-limit-exceeded keeps status='ok' + capped=true; subsequent ENOSPC delivers; recovery preserves capped=true
+    const dirSess = await makeTempDir();
+    const baseSess = new FileHistoryStoragePort(dirSess);
+    const wall = Date.UTC(2026, 10, 18, 12, 0, 0);
+    let failWrites = false;
+    let simulatedBytes = MAX_DAILY_EVENT_BYTES - 80;
+    let sessAgentCb: ((ev: AgentEvent) => Promise<void>) | undefined;
+    let sessJobCb: ((ev: JobEvent) => Promise<void>) | undefined;
+    const deliveredSess: string[] = [];
+    const rtSess = createSenseRuntime(
+      {
+        clock: { wall: () => wall, mono: () => 1_000 },
+        history: {
+          eventFileSize: async (d) => (d === '2026-11-18' ? simulatedBytes : 0),
+          appendEvent: async (d, line) => {
+            if (failWrites) throw Object.assign(new Error('ENOSPC'), { code: 'ENOSPC' });
+            if (d === '2026-11-18') simulatedBytes += Buffer.byteLength(line, 'utf8');
+            await baseSess.appendEvent(d, line);
+          },
+          readEvents: (d) => baseSess.readEvents(d),
+          readEventLines: (d) => baseSess.readEventLines(d),
+          readEventLinesDesc: (d) => baseSess.readEventLinesDesc(d),
+          listEventDates: () => baseSess.listEventDates(),
+          deleteEventDate: (d) => baseSess.deleteEventDate(d),
+          readDaily: (d) => baseSess.readDaily(d),
+          writeDaily: (d, j) => baseSess.writeDaily(d, j),
+          listDailyDates: () => baseSess.listDailyDates(),
+          deleteDailyDate: (d) => baseSess.deleteDailyDate(d),
+          readMonthly: (m) => baseSess.readMonthly(m),
+          writeMonthly: (m, j) => baseSess.writeMonthly(m, j),
+          listMonthlyMonths: () => baseSess.listMonthlyMonths(),
+          clearAll: () => baseSess.clearAll(),
+        },
+        storage: { load: async () => undefined, save: async () => {} },
+        dsh: {
+          listSessions: async () => [{ id: 's1', title: 'Active', updatedAt: wall, running: true }],
+          onAgentEvent: (cb) => {
+            sessAgentCb = cb;
+            return () => {};
+          },
+          onTool: () => () => {},
+          onJob: (cb) => {
+            sessJobCb = cb;
+            return () => {};
+          },
+          deliver: async (_sid, intent) => {
+            for (const c of intent.update.changes) {
+              deliveredSess.push(`${c.signal.kind}:${c.signal.subject}:${String(c.signal.data.error ?? '')}`);
+            }
+          },
+          tokenSnapshot: async () => undefined,
+        },
+        helper: { spawn: () => undefined },
+        probe: { create: () => ({ onSample: () => () => {}, start: () => {}, stop: async () => {} }) },
+        files: { watch: () => ({ close: () => {} }) },
+      },
+      { platform: 'linux', timeZone: 'UTC', intervalMs: 600_000, globalFileWatch: { disableInTests: true } },
+    );
+    await rtSess.start();
+    await sessAgentCb?.({ type: 'created', sessionId: 's1' });
+    await sessAgentCb?.({ type: 'pre-step', sessionId: 's1' });
+    await sessAgentCb?.({ type: 'post-step', sessionId: 's1' });
+    for (let i = 0; i < 3; i++) {
+      await sessJobCb?.({
+        type: 'started',
+        id: `b1-sess-${i}-${'a'.repeat(60)}`,
+        sessionId: 's1',
+        command: 'echo test',
+        at: wall + (i + 1) * 100,
+      });
+    }
+    await vi.waitFor(
+      () =>
+        expect(
+          rtSess.events().filter((e) => e.kind === 'source.error' && e.reason === 'daily-limit-exceeded'),
+        ).toHaveLength(1),
+      { timeout: 2_000, interval: 5 },
+    );
+    expect(rtSess.state().observation.sources.history).toMatchObject({
+      status: 'ok',
+      capped: true,
+    });
+    expect(rtSess.state().observation.sources.history?.error).toBeUndefined();
+
+    // Now inject real ENOSPC on critical write: MUST still be delivered to active session s1!
+    failWrites = true;
+    await sessJobCb?.({
+      type: 'started',
+      id: 'b1-fail-job',
+      sessionId: 's1',
+      command: 'pnpm test',
+      at: wall + 1_900,
+    });
+    await sessJobCb?.({
+      type: 'exited',
+      id: 'b1-fail-job',
+      sessionId: 's1',
+      command: 'pnpm test',
+      exitCode: 1,
+      at: wall + 2_000,
+    });
+    await vi.waitFor(() => expect(rtSess.state().observation.sources.history?.status).toBe('unavailable'), {
+      timeout: 2_000,
+      interval: 10,
+    });
+    await sessAgentCb?.({ type: 'pre-step', sessionId: 's1' });
+    await vi.waitFor(
+      () => expect(deliveredSess.some((d) => d === 'source.error:history:history-write-failed')).toBe(true),
+      { timeout: 3_000, interval: 10 },
+    );
+    expect(rtSess.state().observation.sources.history).toMatchObject({
+      status: 'unavailable',
+      error: 'history-write-failed',
+      capped: true,
+    });
+
+    // Transient write recovery (emitSourceOk) MUST restore status='ok' WITHOUT wiping capped=true
+    failWrites = false;
+    await sessJobCb?.({
+      type: 'started',
+      id: 'b1-recover-job',
+      sessionId: 's1',
+      command: 'pnpm test',
+      at: wall + 2_900,
+    });
+    await sessJobCb?.({
+      type: 'exited',
+      id: 'b1-recover-job',
+      sessionId: 's1',
+      command: 'pnpm test',
+      exitCode: 0,
+      at: wall + 3_000,
+    });
+    await vi.waitFor(() => expect(rtSess.state().observation.sources.history?.status).toBe('ok'), {
+      timeout: 2_000,
+      interval: 10,
+    });
+    expect(rtSess.state().observation.sources.history).toMatchObject({
+      status: 'ok',
+      capped: true,
+    });
+    expect(rtSess.state().observation.sources.history?.error).toBeUndefined();
+    expect(deliveredSess.some((d) => d.includes('daily-limit-exceeded'))).toBe(false);
+    await rtSess.stop();
+
+    // 2) No-session pending path: daily-limit-exceeded followed by ENOSPC still queues history-write-failed into pending
+    const dirNoSess = await makeTempDir();
+    const baseNoSess = new FileHistoryStoragePort(dirNoSess);
+    let noSessFail = false;
+    let noSessBytes = MAX_DAILY_EVENT_BYTES - 80;
+    let agentCb: ((ev: AgentEvent) => Promise<void>) | undefined;
+    let jobCb: ((ev: JobEvent) => Promise<void>) | undefined;
+    let probeCb: ((body: Body) => void) | undefined;
+    const sessions: Array<{ id: string; title: string; updatedAt: number; running: boolean }> = [];
+    const deliveredPending: string[] = [];
+    const diskBody = (free: number, at: number): Body => {
+      const src = { id: 'body', api: 'probe', host: 'local' };
+      const ok = <T>(value: T) => ({ value, status: 'ok' as const, source: src, observedAt: at, ttlMs: 10_000 });
+      return {
+        cpu: ok({ usage: 0.1, perCore: [0.1], load1: 0.1, load5: 0.1, load15: 0.1 }),
+        memory: ok({ total: 1000, used: 200, pressure: 'normal' as const, swapUsed: 0 }),
+        disks: {
+          kind: 'disks',
+          value: [{ mount: '/Volumes/Work', total: 1000, free, status: 'ok', observedAt: at, ttlMs: 10_000 }],
+          status: 'ok',
+          source: src,
+          observedAt: at,
+          ttlMs: 10_000,
+        },
+        battery: { value: null, status: 'unavailable', source: src, observedAt: at, ttlMs: 10_000 },
+        thermal: ok('nominal' as const),
+        network: ok({ online: true, rxBps: 0, txBps: 0 }),
+        harnessProcess: ok({ rss: 100, cpu: 0.1, uptimeSec: 10 }),
+        tokens: {
+          value: null,
+          status: 'unavailable',
+          source: { id: 'tokens', api: 'dsh', host: 'local' },
+          observedAt: at,
+          ttlMs: 10_000,
+        },
+      };
+    };
+    let noSessWall = wall;
+    let noSessMono = 1_000;
+    const rtNoSess = createSenseRuntime(
+      {
+        clock: { wall: () => noSessWall, mono: () => noSessMono },
+        history: {
+          eventFileSize: async (d) => (d === '2026-11-18' ? noSessBytes : 0),
+          appendEvent: async (d, line) => {
+            if (noSessFail) throw Object.assign(new Error('EACCES'), { code: 'EACCES' });
+            if (d === '2026-11-18') noSessBytes += Buffer.byteLength(line, 'utf8');
+            await baseNoSess.appendEvent(d, line);
+          },
+          readEvents: (d) => baseNoSess.readEvents(d),
+          readEventLines: (d) => baseNoSess.readEventLines(d),
+          readEventLinesDesc: (d) => baseNoSess.readEventLinesDesc(d),
+          listEventDates: () => baseNoSess.listEventDates(),
+          deleteEventDate: (d) => baseNoSess.deleteEventDate(d),
+          readDaily: (d) => baseNoSess.readDaily(d),
+          writeDaily: (d, j) => baseNoSess.writeDaily(d, j),
+          listDailyDates: () => baseNoSess.listDailyDates(),
+          deleteDailyDate: (d) => baseNoSess.deleteDailyDate(d),
+          readMonthly: (m) => baseNoSess.readMonthly(m),
+          writeMonthly: (m, j) => baseNoSess.writeMonthly(m, j),
+          listMonthlyMonths: () => baseNoSess.listMonthlyMonths(),
+          clearAll: () => baseNoSess.clearAll(),
+        },
+        storage: { load: async () => undefined, save: async () => {} },
+        dsh: {
+          listSessions: async () => sessions,
+          onAgentEvent: (cb) => {
+            agentCb = cb;
+            return () => {};
+          },
+          onTool: () => () => {},
+          onJob: (cb) => {
+            jobCb = cb;
+            return () => {};
+          },
+          deliver: async (_sid, intent) => {
+            for (const c of intent.update.changes) {
+              deliveredPending.push(`${c.signal.kind}:${c.signal.subject}:${String(c.signal.data.error ?? '')}`);
+            }
+          },
+          tokenSnapshot: async () => undefined,
+        },
+        helper: { spawn: () => undefined },
+        probe: {
+          create: () => ({
+            onSample: (cb) => {
+              probeCb = cb;
+              return () => {};
+            },
+            start: () => {},
+            stop: async () => {},
+          }),
+        },
+        files: { watch: () => ({ close: () => {} }) },
+      },
+      { platform: 'linux', timeZone: 'UTC', intervalMs: 600_000, globalFileWatch: { disableInTests: true } },
+    );
+    await rtNoSess.start();
+    probeCb?.(diskBody(800, noSessWall));
+    // Hit daily limit while no session exists
+    for (let i = 0; i < 2; i++) {
+      await jobCb?.({
+        type: 'started',
+        id: `b1-nosess-${i}-${'z'.repeat(60)}`,
+        sessionId: 'no-sess',
+        command: 'echo synthetic',
+        at: noSessWall + (i + 1) * 100,
+      });
+    }
+    await vi.waitFor(
+      () =>
+        expect(
+          rtNoSess.events().filter((e) => e.kind === 'source.error' && e.reason === 'daily-limit-exceeded'),
+        ).toHaveLength(1),
+      { timeout: 2_000, interval: 5 },
+    );
+    expect(rtNoSess.state().observation.sources.history).toMatchObject({ status: 'ok', capped: true });
+
+    // Real EACCES while still no session -> must queue history-write-failed into pending
+    noSessFail = true;
+    noSessWall += 2_000;
+    noSessMono += 2_000;
+    probeCb?.(diskBody(50, noSessWall));
+    await vi.waitFor(() => expect(rtNoSess.state().observation.sources.history?.status).toBe('unavailable'), {
+      timeout: 2_000,
+      interval: 10,
+    });
+
+    // Bring session online and preStep it -> pending history-write-failed MUST deliver!
+    sessions.push({ id: 's-late', title: 'Late', updatedAt: noSessWall + 2_000, running: true });
+    await agentCb?.({ type: 'created', sessionId: 's-late' });
+    await agentCb?.({ type: 'pre-step', sessionId: 's-late' });
+    await vi.waitFor(
+      () => expect(deliveredPending.some((d) => d === 'source.error:history:history-write-failed')).toBe(true),
+      { timeout: 3_000, interval: 10 },
+    );
+    expect(deliveredPending.some((d) => d.includes('daily-limit-exceeded'))).toBe(false);
     await rtNoSess.stop();
   });
 
@@ -3517,5 +3816,1026 @@ describe('runtime history persistence, rollups, retention, and recovery', () => 
     expect(rebuiltToday?.totalEvents).toBeGreaterThanOrEqual(midDiskCount);
     expect(rebuiltToday?.truncatedAtLimit).toBe(true);
     await mgrMid2.stop();
+  });
+
+  it('B2: clear() failure rollback restores pendingActivity buffers, concurrent live buffers, and same-day cap state', async () => {
+    const dirA = await makeTempDir();
+    const portA = new FileHistoryStoragePort(dirA);
+    let wallA = Date.UTC(2026, 10, 21, 12, 0, 0);
+    let monoA = 1_000;
+    const errorsA: Array<{ error: string; extra?: Record<string, unknown> }> = [];
+    let injectFailA = false;
+    const origClearAllA = portA.clearAll.bind(portA);
+    portA.clearAll = async () => {
+      if (injectFailA) {
+        await Promise.resolve();
+        throw Object.assign(new Error('EACCES: permission denied'), { code: 'EACCES' });
+      }
+      return origClearAllA();
+    };
+
+    const mgrA = new HistoryManager({
+      port: portA,
+      clock: { wall: () => wallA, mono: () => monoA },
+      isPaused: () => false,
+      titlesAllowed: () => true,
+      restoreEntries: () => {},
+      clearMemoryEntries: () => {},
+      emitSourceError: (error, extra) => errorsA.push({ error, extra }),
+      emitSourceOk: () => {},
+      timeZone: 'UTC',
+      maxFileDailyBytes: 240,
+    });
+    await mgrA.start(false);
+
+    for (let i = 0; i < 6; i++) {
+      mgrA.recordEvent({
+        id: `b2-cap-${i}`,
+        kind: 'file.changed',
+        subject: `/work/cap-${i}-${'z'.repeat(30)}.ts`,
+        level: 'record',
+        at: wallA + (i + 1) * 100,
+        source: { id: 'files-global', api: 'watch', host: 'local' },
+      });
+    }
+    await mgrA.tick();
+    expect(errorsA.filter((e) => e.error === 'daily-limit-exceeded')).toHaveLength(1);
+    expect(mgrA.timelineSnapshots().today?.truncatedAtLimit).toBe(true);
+
+    // Buffer an unflushed file.activity bucket before clear() fails.
+    wallA += 1_000;
+    monoA += 1_000;
+    mgrA.recordEvent({
+      id: 'b2-pend-cap',
+      kind: 'file.activity',
+      subject: '/work/pending-b2',
+      level: 'record',
+      cause: 'unknown',
+      at: wallA,
+      source: { id: 'files-global', api: 'watch', host: 'local' },
+      detail: { directory: '/work/pending-b2', windowMs: 10_000, created: 2, modified: 3, deleted: 1 },
+    });
+
+    injectFailA = true;
+    await expect(mgrA.clear()).rejects.toThrow('EACCES');
+
+    // Same-day cap state & pending summary must survive failed clear without re-emitting daily-limit-exceeded.
+    expect(mgrA.timelineSnapshots().today?.truncatedAtLimit).toBe(true);
+    expect(mgrA.timelineSnapshots().today?.fileActivity['pending-b2']).toEqual({
+      events: 1,
+      created: 2,
+      modified: 3,
+      deleted: 1,
+    });
+
+    const linesBeforeExtra = (await portA.readEvents('2026-11-21')) ?? '';
+    mgrA.recordEvent({
+      id: 'b2-cap-after',
+      kind: 'file.changed',
+      subject: `/work/cap-after-${'z'.repeat(30)}.ts`,
+      level: 'record',
+      at: wallA + 500,
+      source: { id: 'files-global', api: 'watch', host: 'local' },
+    });
+    await mgrA.tick();
+    expect(errorsA.filter((e) => e.error === 'daily-limit-exceeded')).toHaveLength(1);
+    expect((await portA.readEvents('2026-11-21')) ?? '').toBe(linesBeforeExtra);
+    await mgrA.stop();
+
+    // Case B: uncapped pendingActivity bucket + concurrent live bucket during failed clear() flush to disk on stop().
+    const dirB = await makeTempDir();
+    const portB = new FileHistoryStoragePort(dirB);
+    const wallB = Date.UTC(2026, 10, 21, 14, 0, 0);
+    const monoB = 5_000;
+    let injectFailB = false;
+    const origClearAllB = portB.clearAll.bind(portB);
+    let mgrB!: HistoryManager;
+    portB.clearAll = async () => {
+      if (injectFailB) {
+        await Promise.resolve();
+        mgrB.recordEvent({
+          id: 'b2-live-1',
+          kind: 'file.activity',
+          subject: '/work/live-b2',
+          level: 'record',
+          cause: 'unknown',
+          at: wallB + 200,
+          source: { id: 'files-global', api: 'watch', host: 'local' },
+          detail: { directory: '/work/live-b2', windowMs: 10_000, created: 1, modified: 0, deleted: 0 },
+        });
+        mgrB.recordEvent({
+          id: 'b2-live-merge',
+          kind: 'file.activity',
+          subject: '/work/pending-b2',
+          level: 'record',
+          cause: 'unknown',
+          at: wallB + 250,
+          source: { id: 'files-global', api: 'watch', host: 'local' },
+          detail: { directory: '/work/pending-b2', windowMs: 10_000, created: 0, modified: 1, deleted: 0 },
+        });
+        throw Object.assign(new Error('EACCES: denied'), { code: 'EACCES' });
+      }
+      return origClearAllB();
+    };
+    mgrB = new HistoryManager({
+      port: portB,
+      clock: { wall: () => wallB, mono: () => monoB },
+      isPaused: () => false,
+      titlesAllowed: () => true,
+      restoreEntries: () => {},
+      clearMemoryEntries: () => {},
+      emitSourceError: () => {},
+      emitSourceOk: () => {},
+      timeZone: 'UTC',
+    });
+    await mgrB.start(false);
+    mgrB.recordEvent({
+      id: 'b2-ok-1',
+      kind: 'file.activity',
+      subject: '/work/pending-b2',
+      level: 'record',
+      cause: 'unknown',
+      at: wallB,
+      source: { id: 'files-global', api: 'watch', host: 'local' },
+      detail: { directory: '/work/pending-b2', windowMs: 10_000, created: 2, modified: 3, deleted: 1 },
+    });
+
+    injectFailB = true;
+    await expect(mgrB.clear()).rejects.toThrow('EACCES');
+    expect(mgrB.timelineSnapshots().today?.fileActivity['pending-b2']).toEqual({
+      events: 1,
+      created: 2,
+      modified: 4,
+      deleted: 1,
+    });
+    expect(mgrB.timelineSnapshots().today?.fileActivity['live-b2']).toEqual({
+      events: 1,
+      created: 1,
+      modified: 0,
+      deleted: 0,
+    });
+    // Patch by pre-clear entryId must still target restored/merged pending bucket
+    mgrB.patchEvent('b2-ok-1', { feedback: 'useful' });
+    await mgrB.stop();
+
+    const parsedB = parseHistoryLines((await portB.readEvents('2026-11-21')) ?? '');
+    const activitiesB = parsedB.events.filter((e) => e.kind === 'file.activity');
+    expect(activitiesB).toHaveLength(2);
+    const mergedPend = activitiesB.find((e) => e.subject === '/work/pending-b2');
+    expect(mergedPend?.detail).toMatchObject({ created: 2, modified: 4, deleted: 1 });
+    expect(mergedPend?.feedback).toBe('useful');
+  });
+
+  it('B3: preserves patchEvent short-id mapping across 4096+ file.activity events, reconstructs evicted UUID ids, and emits zero orphan patches', async () => {
+    const dir = await makeTempDir();
+    const port = new FileHistoryStoragePort(dir);
+    let wall = Date.UTC(2026, 10, 22, 9, 0, 0);
+    let mono = 1_000;
+    const mkMgr = () =>
+      new HistoryManager({
+        port,
+        clock: { wall: () => wall, mono: () => mono },
+        isPaused: () => false,
+        titlesAllowed: () => true,
+        restoreEntries: () => {},
+        clearMemoryEntries: () => {},
+        emitSourceError: () => {},
+        emitSourceOk: () => {},
+        timeZone: 'UTC',
+      });
+
+    const mgr1 = mkMgr();
+    await mgr1.start(false);
+
+    const targetUuid = '550e8400-e29b-41d4-a716-446655440001';
+    const earlyId = `${targetUuid}:1`;
+    mgr1.recordEvent({
+      id: earlyId,
+      kind: 'app.activated',
+      subject: 'EarlyApp',
+      level: 'record',
+      at: wall,
+      source: { id: 'helper', api: 'ndjson', host: 'local' },
+    });
+
+    // Overflow eventMetaById capacity (4096) with 4200 file.activity events
+    const actUuid = '550e8400-e29b-41d4-a716-446655440002';
+    for (let i = 0; i < 4_200; i++) {
+      mgr1.recordEvent({
+        id: `${actUuid}:${i + 1}`,
+        kind: 'file.activity',
+        subject: `/work/b3-${i % 10}`,
+        level: 'record',
+        cause: 'unknown',
+        at: wall + (i + 1) * 10,
+        source: { id: 'files-global', api: 'watch', host: 'local' },
+        detail: { directory: `/work/b3-${i % 10}`, windowMs: 10_000, created: 0, modified: 1, deleted: 0 },
+      });
+    }
+
+    // Delayed patch on early non-aggregated event after 4200 file.activity events
+    mgr1.patchEvent(earlyId, { at: wall, level: 'context', feedback: 'useful', reason: 'delayed-feedback' });
+
+    // Nonexistent UUID id must never emit an orphan patch on disk
+    mgr1.patchEvent('99999999-9999-4999-8999-999999999999:999', { at: wall, feedback: 'noise' });
+
+    wall += 120_000;
+    mono += 120_000;
+    await mgr1.stop();
+
+    const raw = (await port.readEvents('2026-11-22')) ?? '';
+    expect(raw).not.toContain(targetUuid);
+    expect(raw).not.toContain('99999999-9999-4999-8999-999999999999');
+
+    // Every patch line on disk must correspond to an existing persisted event ID (zero orphans)
+    const eventIds = new Set<string>();
+    const patchIds: string[] = [];
+    for (const line of raw.split('\n')) {
+      if (!line.trim()) continue;
+      const obj = JSON.parse(line) as { record?: string; id?: string };
+      if ((obj.record === 'event' || obj.record === undefined) && typeof obj.id === 'string') {
+        eventIds.add(obj.id);
+      } else if (obj.record === 'patch' && typeof obj.id === 'string') {
+        patchIds.push(obj.id);
+      }
+    }
+    expect(patchIds).toHaveLength(1);
+    for (const pid of patchIds) {
+      expect(eventIds.has(pid)).toBe(true);
+    }
+
+    // Restart on real FileHistoryStoragePort and verify early non-aggregated patch took effect
+    const mgr2 = mkMgr();
+    await mgr2.start(false);
+    const parsed = parseHistoryLines((await port.readEvents('2026-11-22')) ?? '');
+    const earlyEv = parsed.events.find((e) => e.subject === 'EarlyApp');
+    expect(earlyEv?.level).toBe('context');
+    expect(earlyEv?.feedback).toBe('useful');
+    expect(earlyEv?.reason).toBe('delayed-feedback');
+    await mgr2.stop();
+
+    // Also overflow non-aggregated eventMetaById (4096) via fast port and verify evicted UUID patch reconstructs cleanly
+    const evEventsByDate = new Map<string, string>();
+    const evPort: HistoryStoragePort = {
+      eventFileSize: async (date) => Buffer.byteLength(evEventsByDate.get(date) ?? '', 'utf8'),
+      appendEvent: async (date, chunk) => {
+        evEventsByDate.set(date, (evEventsByDate.get(date) ?? '') + chunk);
+      },
+      readEvents: async (date) => evEventsByDate.get(date),
+      listEventDates: async () => [...evEventsByDate.keys()],
+      deleteEventDate: async (date) => {
+        evEventsByDate.delete(date);
+      },
+      readDaily: async () => undefined,
+      writeDaily: async () => {},
+      listDailyDates: async () => [],
+      deleteDailyDate: async () => {},
+      readMonthly: async () => undefined,
+      writeMonthly: async () => {},
+      listMonthlyMonths: async () => [],
+      clearAll: async () => {
+        evEventsByDate.clear();
+      },
+    };
+    const evWall = Date.UTC(2026, 10, 22, 14, 0, 0);
+    const mkEvMgr = () =>
+      new HistoryManager({
+        port: evPort,
+        clock: { wall: () => evWall, mono: () => 5_000 },
+        isPaused: () => false,
+        titlesAllowed: () => true,
+        restoreEntries: () => {},
+        clearMemoryEntries: () => {},
+        emitSourceError: () => {},
+        emitSourceOk: () => {},
+        timeZone: 'UTC',
+      });
+    const evMgr1 = mkEvMgr();
+    await evMgr1.start(false);
+    const bulkUuid = '660e8400-e29b-41d4-a716-446655440003';
+    for (let i = 0; i < 4_150; i++) {
+      evMgr1.recordEvent({
+        id: `${bulkUuid}:${i}`,
+        kind: 'file.changed',
+        subject: `/work/evict-${i}.ts`,
+        level: 'record',
+        at: evWall + i,
+        source: { id: 'files-global', api: 'watch', host: 'local' },
+      });
+    }
+    evMgr1.patchEvent(`${bulkUuid}:0`, { at: evWall, feedback: 'noise', reason: 'after-eviction' });
+    await evMgr1.stop();
+
+    const evRaw = evEventsByDate.get('2026-11-22') ?? '';
+    expect(evRaw).not.toContain(bulkUuid);
+    const evMgr2 = mkEvMgr();
+    await evMgr2.start(false);
+    const evParsed = parseHistoryLines(evEventsByDate.get('2026-11-22') ?? '');
+    const evictedEv = evParsed.events.find((e) => e.subject === '/work/evict-0.ts');
+    expect(evictedEv?.feedback).toBe('noise');
+    expect(evictedEv?.reason).toBe('after-eviction');
+    await evMgr2.stop();
+  });
+
+  it('S3: time-slices flushPendingActivity when 4096 buckets expire simultaneously and persists all buckets', async () => {
+    const buildRefBatch = (n: number, tag: string) =>
+      Array.from({ length: n }, (_, i) => ({
+        id: `ref:${tag}:${i}`,
+        kind: 'file.activity',
+        subject: `/work/${tag}/d-${i}`,
+        level: 'record',
+        at: 1_700_000_000_000 + i,
+        source: 'files-global',
+        detail: { windowMs: 60_000, created: 1, modified: 2, deleted: 0 },
+      }));
+
+    // Warmup JIT and compute in-process normalized reference work (median of 3 fixed batches, no hardcoded ms).
+    let sink = JSON.stringify(structuredClone(buildRefBatch(500, 'warm'))).length;
+    const refSamples: number[] = [];
+    for (let iter = 0; iter < 3; iter++) {
+      const t0 = performance.now();
+      sink += JSON.stringify(structuredClone(buildRefBatch(5_000, `b${iter}`))).length;
+      refSamples.push(performance.now() - t0);
+    }
+    refSamples.sort((a, b) => a - b);
+    const refBatchMs = Math.max(1, refSamples[1] ?? refSamples[0] ?? 1);
+    expect(sink).toBeGreaterThan(0);
+
+    const runS3Burst = async (tag: string, bucketCount: number, measure: boolean) => {
+      const eventsByDate = new Map<string, string>();
+      const fastPort: HistoryStoragePort = {
+        eventFileSize: async (date) => Buffer.byteLength(eventsByDate.get(date) ?? '', 'utf8'),
+        appendEvent: async (date, chunk) => {
+          eventsByDate.set(date, (eventsByDate.get(date) ?? '') + chunk);
+        },
+        readEvents: async (date) => eventsByDate.get(date),
+        listEventDates: async () => [...eventsByDate.keys()],
+        deleteEventDate: async (date) => {
+          eventsByDate.delete(date);
+        },
+        readDaily: async () => undefined,
+        writeDaily: async () => {},
+        listDailyDates: async () => [],
+        deleteDailyDate: async () => {},
+        readMonthly: async () => undefined,
+        writeMonthly: async () => {},
+        listMonthlyMonths: async () => [],
+        clearAll: async () => {
+          eventsByDate.clear();
+        },
+      };
+
+      let wall = Date.UTC(2026, 10, 23, 12, 0, 0);
+      let mono = 1_000;
+      const mgr = new HistoryManager({
+        port: fastPort,
+        clock: { wall: () => wall, mono: () => mono },
+        isPaused: () => false,
+        titlesAllowed: () => true,
+        restoreEntries: () => {},
+        clearMemoryEntries: () => {},
+        emitSourceError: () => {},
+        emitSourceOk: () => {},
+        timeZone: 'UTC',
+      });
+      await mgr.start(false);
+
+      for (let i = 0; i < bucketCount; i++) {
+        mgr.recordEvent({
+          id: `${tag}-${i}`,
+          kind: 'file.activity',
+          subject: `/work/${tag}-${i}`,
+          level: 'record',
+          cause: 'unknown',
+          at: wall,
+          source: { id: 'files-global', api: 'watch', host: 'local' },
+          detail: { directory: `/work/${tag}-${i}`, windowMs: 10_000, created: 1, modified: 1, deleted: 0 },
+        });
+      }
+
+      wall += 61_000;
+      mono += 61_000;
+      await new Promise((r) => setImmediate(r));
+
+      const gaps: number[] = [];
+      let lastBeat = performance.now();
+      let probing = measure;
+      const beat = () => {
+        const now = performance.now();
+        gaps.push(now - lastBeat);
+        lastBeat = now;
+        if (probing) setImmediate(beat);
+      };
+      if (measure) setImmediate(beat);
+
+      await mgr.tick();
+      probing = false;
+
+      const sorted = [...gaps].sort((a, b) => a - b);
+      const p95GapMs = sorted.length > 0 ? sorted[Math.floor((sorted.length - 1) * 0.95)] : 0;
+      const maxGapMs = sorted.length > 0 ? sorted[sorted.length - 1] : 0;
+      const parsed = parseHistoryLines(eventsByDate.get('2026-11-23') ?? '');
+      const persisted = parsed.events.filter((e) => e.kind === 'file.activity').length;
+      const summaryDirs = Object.keys(mgr.timelineSnapshots().today?.fileActivity ?? {}).length;
+      await mgr.stop();
+      return { yields: gaps.length, p95GapMs, maxGapMs, persisted, summaryDirs };
+    };
+
+    await runS3Burst('warm', 256, false);
+
+    const runs: Array<{ yields: number; p95GapMs: number; maxGapMs: number }> = [];
+    for (let r = 0; r < 3; r++) {
+      const res = await runS3Burst(`r${r}`, 4_096, true);
+      expect(res.persisted).toBe(4_096);
+      expect(res.summaryDirs).toBe(4_096);
+      expect(res.yields).toBeGreaterThanOrEqual(40);
+      expect(res.p95GapMs).toBeLessThanOrEqual(refBatchMs);
+      runs.push(res);
+    }
+    expect(Math.min(...runs.map((r) => r.maxGapMs))).toBeLessThanOrEqual(refBatchMs);
+
+    // Also verify full persistence through real FileHistoryStoragePort when stopping with 4096 pending buckets
+    const dirDisk = await makeTempDir();
+    const diskPort = new FileHistoryStoragePort(dirDisk);
+    const wallDisk = Date.UTC(2026, 10, 23, 14, 0, 0);
+    const monoDisk = 2_000;
+    const mgrDisk = new HistoryManager({
+      port: diskPort,
+      clock: { wall: () => wallDisk, mono: () => monoDisk },
+      isPaused: () => false,
+      titlesAllowed: () => true,
+      restoreEntries: () => {},
+      clearMemoryEntries: () => {},
+      emitSourceError: () => {},
+      emitSourceOk: () => {},
+      timeZone: 'UTC',
+    });
+    await mgrDisk.start(false);
+    for (let i = 0; i < 4_096; i++) {
+      mgrDisk.recordEvent({
+        id: `s3d-${i}`,
+        kind: 'file.activity',
+        subject: `/work/disk-${i}`,
+        level: 'record',
+        cause: 'unknown',
+        at: wallDisk,
+        source: { id: 'files-global', api: 'watch', host: 'local' },
+        detail: { directory: `/work/disk-${i}`, windowMs: 10_000, created: 0, modified: 1, deleted: 0 },
+      });
+    }
+    await mgrDisk.stop();
+    const diskParsed = parseHistoryLines((await diskPort.readEvents('2026-11-23')) ?? '');
+    expect(diskParsed.events.filter((e) => e.kind === 'file.activity')).toHaveLength(4_096);
+  });
+
+  it('S1: enforces absolute fallback daily cap for non-file context/wake exceptions, keeps summaries, and prompts sidebar via ok+capped without model delivery', async () => {
+    expect(MAX_DAILY_CRITICAL_EVENT_BYTES).toBe(32 * 1024 * 1024);
+    const dir = await makeTempDir();
+    const port = new FileHistoryStoragePort(dir);
+    const wall = Date.UTC(2026, 10, 24, 10, 0, 0);
+    const errors: Array<{ error: string; extra?: Record<string, unknown> }> = [];
+    const okEvents: Array<Record<string, unknown> | undefined> = [];
+    const mgr = new HistoryManager({
+      port,
+      clock: { wall: () => wall, mono: () => 1_000 },
+      isPaused: () => false,
+      titlesAllowed: () => true,
+      restoreEntries: () => {},
+      clearMemoryEntries: () => {},
+      emitSourceError: (error, extra) => errors.push({ error, extra }),
+      emitSourceOk: (extra) => okEvents.push(extra),
+      timeZone: 'UTC',
+      maxNonFileDailyBytes: 240,
+      maxCriticalDailyBytes: 900,
+    });
+    await mgr.start(false);
+
+    // Non-critical record events hit 240B soft non-file tier cap first
+    for (let i = 0; i < 4; i++) {
+      mgr.recordEvent({
+        id: `s1-rec-${i}`,
+        kind: 'app.activated',
+        subject: `Rec-${i}-${'r'.repeat(50)}`,
+        level: 'record',
+        at: wall + (i + 1) * 100,
+        source: { id: 'helper', api: 'ndjson', host: 'local' },
+      });
+    }
+    await mgr.query({});
+    expect(errors.filter((e) => e.error === 'daily-limit-exceeded')).toHaveLength(1);
+
+    // Critical (non-file wake/context) events bypass 240B tier cap, then stop at 900B fallback ceiling
+    for (let i = 0; i < 12; i++) {
+      mgr.recordEvent({
+        id: `s1-crit-${i}`,
+        kind: 'job.exited',
+        subject: `crit-${i}-${'k'.repeat(70)}`,
+        level: 'wake',
+        at: wall + 2_000 + i * 100,
+        source: { id: 'dsh', api: 'events', host: 'local' },
+      });
+    }
+    await mgr.query({});
+
+    const diskSize = await port.eventFileSize('2026-11-24');
+    expect(diskSize).toBeLessThanOrEqual(900);
+    const parsedDisk = parseHistoryLines((await port.readEvents('2026-11-24')) ?? '');
+    const critOnDisk = parsedDisk.events.filter((e) => e.id.startsWith('s1-crit-'));
+    expect(critOnDisk.length).toBeGreaterThan(0);
+    expect(critOnDisk.length).toBeLessThan(12);
+
+    // Summary still counts all 4 + 12 = 16 events ("只记汇总") and marks truncatedAtLimit
+    const todaySnap = mgr.timelineSnapshots().today;
+    expect(todaySnap?.totalEvents).toBe(16);
+    expect(todaySnap?.deliveries.wake).toBe(12);
+    expect(todaySnap?.truncatedAtLimit).toBe(true);
+    await mgr.stop();
+
+    // Restart same day with cap-state.json: critical writes remain capped and cap error is not duplicated
+    const mgr2 = new HistoryManager({
+      port,
+      clock: { wall: () => wall + 60_000, mono: () => 2_000 },
+      isPaused: () => false,
+      titlesAllowed: () => true,
+      restoreEntries: () => {},
+      clearMemoryEntries: () => {},
+      emitSourceError: (error, extra) => errors.push({ error, extra }),
+      emitSourceOk: (extra) => okEvents.push(extra),
+      timeZone: 'UTC',
+      maxNonFileDailyBytes: 240,
+      maxCriticalDailyBytes: 900,
+    });
+    await mgr2.start(false);
+    mgr2.recordEvent({
+      id: 's1-crit-after-restart',
+      kind: 'body.anomaly',
+      subject: `crit-restart-${'k'.repeat(70)}`,
+      level: 'context',
+      at: wall + 61_000,
+      source: { id: 'body', api: 'probe', host: 'local' },
+    });
+    await mgr2.stop();
+    const afterRestartRaw = (await port.readEvents('2026-11-24')) ?? '';
+    expect(afterRestartRaw).not.toContain('s1-crit-after-restart');
+
+    // After soft cap was already hit, critical cap triggers at 900B cleanly.
+    // Also verify pure critical stream bypassing soft cap (240B) and hitting critical cap (900B) emits tier='critical'
+    const dirCritOnly = await makeTempDir();
+    const portCritOnly = new FileHistoryStoragePort(dirCritOnly);
+    const critErrors: Array<{ error: string; extra?: Record<string, unknown> }> = [];
+    const mgrCritOnly = new HistoryManager({
+      port: portCritOnly,
+      clock: { wall: () => wall, mono: () => 1_000 },
+      isPaused: () => false,
+      titlesAllowed: () => true,
+      restoreEntries: () => {},
+      clearMemoryEntries: () => {},
+      emitSourceError: (error, extra) => critErrors.push({ error, extra }),
+      emitSourceOk: () => {},
+      timeZone: 'UTC',
+      maxNonFileDailyBytes: 240,
+      maxCriticalDailyBytes: 700,
+    });
+    await mgrCritOnly.start(false);
+    for (let i = 0; i < 10; i++) {
+      mgrCritOnly.recordEvent({
+        id: `s1-pure-${i}`,
+        kind: 'body.anomaly',
+        subject: `cpu-${i}-${'m'.repeat(60)}`,
+        level: 'context',
+        at: wall + (i + 1) * 100,
+        source: { id: 'body', api: 'probe', host: 'local' },
+      });
+    }
+    await mgrCritOnly.query({});
+    expect(await portCritOnly.eventFileSize('2026-11-24')).toBeLessThanOrEqual(700);
+    expect(critErrors).toEqual([
+      {
+        error: 'daily-limit-exceeded',
+        extra: { date: '2026-11-24', tier: 'critical', maxBytes: 700 },
+      },
+    ]);
+    expect(mgrCritOnly.timelineSnapshots().today?.totalEvents).toBe(10);
+    expect(mgrCritOnly.timelineSnapshots().today?.truncatedAtLimit).toBe(true);
+    await mgrCritOnly.stop();
+
+    // End-to-end runtime check: default 32 MiB critical ceiling notifies sidebar via ok+capped without model push
+    const delivered: string[] = [];
+    let simBytes = MAX_DAILY_CRITICAL_EVENT_BYTES - 120;
+    const rtDir = await makeTempDir();
+    const baseRtPort = new FileHistoryStoragePort(rtDir);
+    let rtCapJson: string | undefined;
+    const rtPort: HistoryStoragePort = {
+      eventFileSize: async (d) => (d === '2026-11-24' ? simBytes : baseRtPort.eventFileSize(d)),
+      appendEvent: async (d, line) => {
+        if (d === '2026-11-24') simBytes += Buffer.byteLength(line, 'utf8');
+        return baseRtPort.appendEvent(d, line);
+      },
+      readEvents: (d) => baseRtPort.readEvents(d),
+      readEventLines: (d) => baseRtPort.readEventLines(d),
+      readEventLinesDesc: (d) => baseRtPort.readEventLinesDesc(d),
+      listEventDates: () => baseRtPort.listEventDates(),
+      deleteEventDate: (d) => baseRtPort.deleteEventDate(d),
+      readDaily: (d) => baseRtPort.readDaily(d),
+      writeDaily: (d, j) => baseRtPort.writeDaily(d, j),
+      listDailyDates: () => baseRtPort.listDailyDates(),
+      deleteDailyDate: (d) => baseRtPort.deleteDailyDate(d),
+      readMonthly: (m) => baseRtPort.readMonthly(m),
+      writeMonthly: (m, j) => baseRtPort.writeMonthly(m, j),
+      listMonthlyMonths: () => baseRtPort.listMonthlyMonths(),
+      readCapState: async () => rtCapJson,
+      writeCapState: async (j) => {
+        rtCapJson = j || undefined;
+      },
+      clearAll: async () => {
+        rtCapJson = undefined;
+        await baseRtPort.clearAll();
+      },
+    };
+    const dayBeforeRoll = Date.UTC(2026, 10, 23, 23, 59, 50);
+    const rt = createRuntimeHarness({
+      nowMs: dayBeforeRoll,
+      history: rtPort,
+      timeZone: 'UTC',
+      deliver: async (_sid, intent) => {
+        for (const c of intent.update.changes) {
+          delivered.push(`${c.signal.kind}:${c.signal.subject}:${String(c.signal.data.error ?? '')}`);
+        }
+      },
+    });
+    await rt.runtime.start();
+    // Start active session job on day before so usageByDate for 2026-11-24 stays untouched at 32MiB - 120
+    await rt.emitJob({
+      type: 'started',
+      id: 'rt-s1-seed',
+      sessionId: 's1',
+      command: `echo ${'x'.repeat(80)}`,
+      at: dayBeforeRoll + 1_000,
+    });
+    await rt.runtime.tools.envHistory({});
+    const nextDayWall = Date.UTC(2026, 10, 24, 0, 0, 10);
+    rt.setTime(nextDayWall, 20_000);
+    for (let i = 0; i < 4; i++) {
+      await rt.emitJob({
+        type: 'exited',
+        id: `rt-s1-${i}`,
+        sessionId: 's1',
+        command: `fail-${i}-${'x'.repeat(80)}`,
+        exitCode: 1,
+        at: nextDayWall + i + 1,
+      });
+    }
+    await vi.waitFor(
+      () =>
+        expect(
+          rt.runtime.events().filter((e) => e.kind === 'source.error' && e.reason === 'daily-limit-exceeded'),
+        ).toHaveLength(1),
+      { timeout: 2_000, interval: 5 },
+    );
+    await rt.runtime.tools.envHistory({});
+    await new Promise((r) => setTimeout(r, 40));
+    expect(simBytes).toBeLessThanOrEqual(32 * 1024 * 1024);
+    expect(delivered.some((d) => d.includes('daily-limit-exceeded'))).toBe(false);
+    expect(projectState(rt.runtime.state()).observation.sources.history).toMatchObject({
+      status: 'ok',
+      capped: true,
+    });
+    await rt.runtime.stop();
+  });
+
+  it('S2: infers capped state from file bytes when cap-state.json is missing/corrupt and matches real-time truncatedAtLimit in backfill', async () => {
+    const dir = await makeTempDir();
+    const port = new FileHistoryStoragePort(dir);
+    let wall = Date.UTC(2026, 10, 25, 10, 0, 0);
+
+    const mgr1 = new HistoryManager({
+      port,
+      clock: { wall: () => wall, mono: () => 1_000 },
+      isPaused: () => false,
+      titlesAllowed: () => true,
+      restoreEntries: () => {},
+      clearMemoryEntries: () => {},
+      emitSourceError: () => {},
+      emitSourceOk: () => {},
+      timeZone: 'UTC',
+      maxFileDailyBytes: 380,
+      maxNonFileDailyBytes: 500_000,
+    });
+    await mgr1.start(false);
+
+    // Exhaust 380B file tier cap (stops strictly below 380B), then write >200 non-file events
+    for (let i = 0; i < 4; i++) {
+      mgr1.recordEvent({
+        id: `s2-fb-${i}`,
+        kind: 'file.burst',
+        subject: `/work/burst-${i}-${'a'.repeat(50)}`,
+        level: 'wake',
+        at: wall + i * 100,
+        source: { id: 'files-global', api: 'watch', host: 'local' },
+      });
+    }
+    for (let i = 0; i < 210; i++) {
+      mgr1.recordEvent({
+        id: `s2-app-${i}`,
+        kind: 'app.activated',
+        subject: `App-${i}`,
+        level: 'record',
+        at: wall + 1_000 + i * 100,
+        source: { id: 'helper', api: 'ndjson', host: 'local' },
+      });
+    }
+    await mgr1.stop();
+
+    // Corrupt cap-state.json and restart on the same day
+    await port.writeCapState('{corrupt-cap-state');
+    const errsCorrupt: string[] = [];
+    const restoredCorrupt: string[] = [];
+    const mgr2 = new HistoryManager({
+      port,
+      clock: { wall: () => wall + 30_000, mono: () => 2_000 },
+      isPaused: () => false,
+      titlesAllowed: () => true,
+      restoreEntries: () => {},
+      clearMemoryEntries: () => {},
+      emitSourceError: (e) => errsCorrupt.push(e),
+      restoreSourceError: (e) => restoredCorrupt.push(e),
+      emitSourceOk: () => {},
+      timeZone: 'UTC',
+      maxFileDailyBytes: 380,
+      maxNonFileDailyBytes: 500_000,
+    });
+    await mgr2.start(false);
+    expect(restoredCorrupt).toContain('daily-limit-exceeded');
+    expect(mgr2.timelineSnapshots().today?.truncatedAtLimit).toBe(true);
+
+    // Next file.burst must stay blocked without re-emitting daily-limit-exceeded; non-file record still writes
+    mgr2.recordEvent({
+      id: 's2-fb-blocked',
+      kind: 'file.burst',
+      subject: `/work/burst-blocked-${'a'.repeat(50)}`,
+      level: 'wake',
+      at: wall + 31_000,
+      source: { id: 'files-global', api: 'watch', host: 'local' },
+    });
+    mgr2.recordEvent({
+      id: 's2-app-allowed',
+      kind: 'app.activated',
+      subject: 'AppAllowedAfterRestart',
+      level: 'record',
+      at: wall + 32_000,
+      source: { id: 'helper', api: 'ndjson', host: 'local' },
+    });
+    await mgr2.stop();
+    expect(errsCorrupt.filter((e) => e === 'daily-limit-exceeded')).toHaveLength(0);
+    const sameDayRaw = (await port.readEvents('2026-11-25')) ?? '';
+    expect(sameDayRaw).not.toContain('s2-fb-blocked');
+    expect(sameDayRaw).toContain('s2-app-allowed');
+
+    // Missing cap-state.json on a crash day (no daily summary written) + next-day backfill parity
+    await port.writeCapState('');
+    const restoredMissing: string[] = [];
+    const mgr3 = new HistoryManager({
+      port,
+      clock: { wall: () => wall + 60_000, mono: () => 3_000 },
+      isPaused: () => false,
+      titlesAllowed: () => true,
+      restoreEntries: () => {},
+      clearMemoryEntries: () => {},
+      emitSourceError: () => {},
+      restoreSourceError: (e) => restoredMissing.push(e),
+      emitSourceOk: () => {},
+      timeZone: 'UTC',
+      maxFileDailyBytes: 380,
+      maxNonFileDailyBytes: 500_000,
+    });
+    await mgr3.start(false);
+    expect(restoredMissing).toContain('daily-limit-exceeded');
+    expect(mgr3.timelineSnapshots().today?.truncatedAtLimit).toBe(true);
+    await mgr3.stop();
+
+    // Remove daily/monthly to simulate crash before rollover; verify runBackfillStep sets truncatedAtLimit=true
+    const dirCrash = await makeTempDir();
+    await mkdir(join(dirCrash, 'history', 'events'), { recursive: true, mode: 0o700 });
+    await writeFile(join(dirCrash, 'history', 'events', '2026-11-25.jsonl'), sameDayRaw, { mode: 0o600 });
+    const crashPort = new FileHistoryStoragePort(dirCrash);
+    wall = Date.UTC(2026, 10, 26, 9, 0, 0);
+    const mgrBackfill = new HistoryManager({
+      port: crashPort,
+      clock: { wall: () => wall, mono: () => 4_000 },
+      isPaused: () => false,
+      titlesAllowed: () => true,
+      restoreEntries: () => {},
+      clearMemoryEntries: () => {},
+      emitSourceError: () => {},
+      emitSourceOk: () => {},
+      timeZone: 'UTC',
+      maxFileDailyBytes: 380,
+      maxNonFileDailyBytes: 500_000,
+    });
+    await mgrBackfill.start(false);
+    await vi.waitFor(async () => expect(await crashPort.readDaily('2026-11-25')).toBeDefined(), {
+      timeout: 3_000,
+      interval: 20,
+    });
+    const backfilled25 = JSON.parse((await crashPort.readDaily('2026-11-25')) ?? '{}') as DailySummary;
+    expect(backfilled25.truncatedAtLimit).toBe(true);
+    await mgrBackfill.stop();
+  });
+
+  it('S4: excludes 600MiB-pruned dates from startup backfill list and updates yesterday daily/monthly summaries on file-global 10s midnight late arrival', async () => {
+    // 1) startupMaintenance backfill list must use post-prune retainedDates rather than pre-prune keptDates
+    const dirPrune = await makeTempDir();
+    await mkdir(join(dirPrune, 'history', 'events'), { recursive: true, mode: 0o700 });
+    const makeDayLines = (at: number, tag: string) =>
+      `${Array.from({ length: 2 }, (_, i) =>
+        JSON.stringify({
+          record: 'event',
+          id: `${tag}-${i}`,
+          kind: 'app.activated',
+          subject: `App-${tag}-${'x'.repeat(60)}`,
+          level: 'record',
+          at: at + i * 1_000,
+          source: 'helper',
+        }),
+      ).join('\n')}\n`;
+    const dayOldRaw = makeDayLines(Date.UTC(2026, 9, 25, 12, 0, 0), 'd25');
+    const dayKeepRaw = makeDayLines(Date.UTC(2026, 9, 26, 12, 0, 0), 'd26');
+    await writeFile(join(dirPrune, 'history', 'events', '2026-10-25.jsonl'), dayOldRaw, { mode: 0o600 });
+    await writeFile(join(dirPrune, 'history', 'events', '2026-10-26.jsonl'), dayKeepRaw, { mode: 0o600 });
+
+    const portPrune = new FileHistoryStoragePort(dirPrune);
+    // Write a valid daily summary for 2026-10-26 so 2026-10 has existing summary data while 2026-10-25 lacks one and is pruned.
+    const parsed26 = parseHistoryLines(dayKeepRaw);
+    const cal = new LocalCalendar('UTC');
+    await portPrune.writeDaily(
+      '2026-10-26',
+      JSON.stringify(summarizeDay('2026-10-26', parsed26, cal.dayBounds('2026-10-26'))),
+    );
+    const pruneWall = Date.UTC(2026, 10, 15, 10, 0, 0);
+    const mgrPrune = new HistoryManager({
+      port: portPrune,
+      clock: { wall: () => pruneWall, mono: () => 1_000 },
+      isPaused: () => false,
+      titlesAllowed: () => true,
+      restoreEntries: () => {},
+      clearMemoryEntries: () => {},
+      emitSourceError: () => {},
+      emitSourceOk: () => {},
+      timeZone: 'UTC',
+      maxTotalBytes: Buffer.byteLength(dayKeepRaw, 'utf8') + 20,
+    });
+    await mgrPrune.start(false);
+    try {
+      // Pruned 2026-10-25 must never enter pendingBackfill; completed month 2026-10 must be non-partial immediately
+      expect(await portPrune.listEventDates()).toEqual(['2026-10-26', '2026-11-15']);
+      const monthOct = await mgrPrune.summary({ month: '2026-10' });
+      expect(monthOct.available).toBe(true);
+      if (monthOct.available) {
+        expect(monthOct.pendingDays ?? []).not.toContain('2026-10-25');
+        expect(monthOct.partial).toBeUndefined();
+      }
+    } finally {
+      await mgrPrune.stop();
+    }
+
+    // 2) FileGlobalSource 10s buffered event from 23:59:58 arriving after 00:00:01 rollover updates yesterday & monthly
+    const rtDir = await makeTempDir();
+    const rtPort = new FileHistoryStoragePort(rtDir);
+    let rtWall = Date.UTC(2026, 10, 30, 23, 59, 55);
+    let rtMono = 1_000;
+    let watchCb: ((event: { path: string; change: 'add' | 'modify' | 'delete'; at: number }) => void) | undefined;
+    let jobCb!: (ev: JobEvent) => Promise<void>;
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'Date'] });
+    try {
+      const rt = createSenseRuntime(
+        {
+          clock: { wall: () => rtWall, mono: () => rtMono },
+          history: rtPort,
+          storage: { load: async () => undefined, save: async () => {} },
+          dsh: {
+            onAgentEvent: () => () => {},
+            onTool: () => () => {},
+            onJob: (cb) => {
+              jobCb = cb;
+              return () => {};
+            },
+            deliver: async () => {},
+            tokenSnapshot: async () => undefined,
+          },
+          helper: { spawn: () => undefined },
+          probe: { create: () => ({ onSample: () => () => {}, start: () => {}, stop: async () => {} }) },
+          files: {
+            watch: (_root, cb) => {
+              watchCb = cb as typeof watchCb;
+              return { close: () => {} };
+            },
+          },
+        },
+        {
+          platform: 'linux',
+          timeZone: 'UTC',
+          intervalMs: 600_000,
+          globalFileWatch: { root: '/work', windowMs: 10_000, homedir: '/home/tester', dataDirs: [rtDir] },
+        },
+      );
+      await rt.start();
+
+      // At 23:59:58 on 2026-11-30, edit file inside FileGlobalSource 10s buffer
+      rtWall = Date.UTC(2026, 10, 30, 23, 59, 58);
+      rtMono = 4_000;
+      watchCb?.({ path: '/work/late-proj/index.ts', change: 'modify', at: rtWall });
+
+      // At 00:00:01 on 2026-12-01, non-file event forces midnight + month rollover before 10s window flushes
+      rtWall = Date.UTC(2026, 11, 1, 0, 0, 1);
+      rtMono = 7_000;
+      await jobCb({ type: 'started', id: 'dec-1-job', command: 'echo dec', at: rtWall });
+      await rt.tools.envHistory({});
+
+      // Advance past FileGlobalSource 10s window (00:00:08) so buffered 23:59:58 activity emits and flushes
+      rtWall = Date.UTC(2026, 11, 1, 0, 0, 9);
+      rtMono = 15_000;
+      await vi.advanceTimersByTimeAsync(8_000);
+      await rt.tools.envHistory({});
+      await rt.stop();
+
+      const novRaw = (await rtPort.readEvents('2026-11-30')) ?? '';
+      const decRaw = (await rtPort.readEvents('2026-12-01')) ?? '';
+      expect(novRaw).toContain('/work/late-proj');
+      expect(decRaw).not.toContain('/work/late-proj');
+
+      const novDaily = JSON.parse((await rtPort.readDaily('2026-11-30')) ?? '{}') as DailySummary;
+      expect(novDaily.fileActivity['late-proj']).toMatchObject({ events: 1, modified: 1 });
+      const novMonthly = JSON.parse((await rtPort.readMonthly('2026-11')) ?? '{}') as MonthlySummary;
+      expect(novMonthly.fileActivity['late-proj']).toMatchObject({ events: 1, modified: 1 });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('N1: only abbreviates source in serializeEventLine when local api matches defaultApiForSourceId', async () => {
+    const dir = await makeTempDir();
+    const port = new FileHistoryStoragePort(dir);
+    const wall = Date.UTC(2026, 10, 27, 10, 0, 0);
+    const mgr = new HistoryManager({
+      port,
+      clock: { wall: () => wall, mono: () => 1_000 },
+      isPaused: () => false,
+      titlesAllowed: () => true,
+      restoreEntries: () => {},
+      clearMemoryEntries: () => {},
+      emitSourceError: () => {},
+      emitSourceOk: () => {},
+      timeZone: 'UTC',
+    });
+    await mgr.start(false);
+    try {
+      mgr.recordEvent({
+        id: 'n1-default',
+        kind: 'app.activated',
+        subject: 'DefaultSrc',
+        level: 'record',
+        at: wall,
+        source: { id: 'helper', api: 'ndjson', host: 'local' },
+      });
+      mgr.recordEvent({
+        id: 'n1-custom-api',
+        kind: 'app.activated',
+        subject: 'CustomApiSrc',
+        level: 'record',
+        at: wall + 1_000,
+        source: { id: 'helper', api: 'nsworkspace', host: 'local' },
+      });
+      mgr.recordEvent({
+        id: 'n1-unknown-id',
+        kind: 'app.activated',
+        subject: 'CustomHostId',
+        level: 'record',
+        at: wall + 2_000,
+        source: { id: 'custom-probe', api: 'ipc', host: 'local' },
+      });
+    } finally {
+      await mgr.stop();
+    }
+
+    const raw = (await port.readEvents('2026-11-27')) ?? '';
+    expect(raw).toContain('"source":"helper"');
+    expect(raw).not.toContain('"source":"custom-probe"');
+
+    const parsed = parseHistoryLines(raw);
+    expect(parsed.events.find((e) => e.id === 'n1-default')?.source).toEqual({
+      id: 'helper',
+      api: 'ndjson',
+      host: 'local',
+    });
+    expect(parsed.events.find((e) => e.id === 'n1-custom-api')?.source).toEqual({
+      id: 'helper',
+      api: 'nsworkspace',
+      host: 'local',
+    });
+    expect(parsed.events.find((e) => e.id === 'n1-unknown-id')?.source).toEqual({
+      id: 'custom-probe',
+      api: 'ipc',
+      host: 'local',
+    });
   });
 });

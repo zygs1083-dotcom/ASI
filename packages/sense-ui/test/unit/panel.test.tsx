@@ -1028,4 +1028,26 @@ describe('全盘文件监视与活动视图', () => {
     renderPanel({ ...base, now: T0, state });
     expect(screen.getByText('今日已达上限，后续只记汇总')).toBeTruthy();
   });
+
+  it('shows capped notice with ok status and alongside real errors without hiding real write failure', () => {
+    const base = makeScenario('healthy');
+    const stateOkCapped = makeState();
+    stateOkCapped.observation.sources.history = {
+      status: 'ok',
+      capped: true,
+      lastSignalAt: T0,
+    };
+    const { props, view } = renderPanel({ ...base, now: T0, state: stateOkCapped });
+    expect(screen.getByText('今日已达上限，后续只记汇总')).toBeTruthy();
+
+    const stateErrCapped = makeState();
+    stateErrCapped.observation.sources.history = {
+      status: 'unavailable',
+      error: 'history-write-failed',
+      capped: true,
+      lastSignalAt: T0,
+    };
+    view.rerender(<SensePanel {...props} model={{ ...base, now: T0, state: stateErrCapped }} />);
+    expect(screen.getByText('不可用（history-write-failed） · 今日已达上限，后续只记汇总')).toBeTruthy();
+  });
 });

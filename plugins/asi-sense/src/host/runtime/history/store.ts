@@ -5,6 +5,7 @@ import {
   createDailySummaryAccumulator,
   parseDailySummary,
   parseMonthlySummary,
+  type SummarizeDayOptions,
   synthesizeMonth,
   toPersistedEvent,
 } from './summarize.ts';
@@ -13,6 +14,7 @@ import {
   DAILY_SUMMARY_RETENTION_DAYS,
   type DailySummary,
   DEFAULT_HISTORY_LIMIT,
+  defaultApiForSourceId,
   HISTORY_HEARTBEAT_MS,
   HISTORY_RETENTION_DAYS,
   type HistoryEventLine,
@@ -21,6 +23,7 @@ import {
   type HistoryQueryResult,
   type HistoryStoragePort,
   isNonEmptyString,
+  MAX_DAILY_CRITICAL_EVENT_BYTES,
   MAX_DAILY_EVENT_BYTES,
   MAX_DAILY_FILE_EVENT_BYTES,
   MAX_DAILY_NON_FILE_EVENT_BYTES,
@@ -72,11 +75,13 @@ export interface HistoryManagerOptions {
   restoreMemoryEntries?: (entries: readonly PersistedEventEntry[]) => void;
   emitSourceError: (error: string, extra?: Record<string, unknown>) => void;
   restoreSourceError?: (error: string, extra?: Record<string, unknown>) => void;
-  emitSourceOk: () => void;
+  emitSourceOk: (extra?: Record<string, unknown>) => void;
+  clearSourceCap?: () => void;
   timeZone?: string;
   maxDailyBytes?: number;
   maxFileDailyBytes?: number;
   maxNonFileDailyBytes?: number;
+  maxCriticalDailyBytes?: number;
   maxTotalBytes?: number;
   heartbeatIntervalMs?: number;
   /** Extra `extensions` entries (e.g. metric buckets) for a day being summarized. */
@@ -110,6 +115,9 @@ const UUID_SEQ_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{1
 const BOOT_ID_RE = /^([a-z][0-9a-z]{3})-[0-9a-z]+$/;
 const FILE_ACTIVITY_AGG_MS = 60_000;
 const MAX_PENDING_ACTIVITY_BUCKETS = 4096;
+const FLUSH_ACTIVITY_SLICE_MAX_BUCKETS = 16;
+const FLUSH_ACTIVITY_SLICE_BUDGET_MS = 5;
+const LATE_ROLLOVER_GRACE_MS = 120_000;
 const LEVEL_RANK: Record<DeliveryLevel, number> = { record: 0, context: 1, wake: 2 };
 
 interface PendingActivityBucket {
@@ -136,6 +144,52 @@ interface PendingActivityBucket {
   count: number;
   epoch: number;
   entryIds: string[];
+}
+
+function cloneActivityBucket(bucket: PendingActivityBucket, epoch = bucket.epoch): PendingActivityBucket {
+  return {
+    ...bucket,
+    epoch,
+    source: { ...bucket.source },
+    entryIds: [...bucket.entryIds],
+  };
+}
+
+function mergeActivityBuckets(
+  base: PendingActivityBucket,
+  extra: PendingActivityBucket,
+  epoch: number,
+): PendingActivityBucket {
+  const preferExtraMeta = LEVEL_RANK[extra.level] > LEVEL_RANK[base.level];
+  const mergedLevel = preferExtraMeta ? extra.level : base.level;
+  const mergedReason = preferExtraMeta ? extra.reason : base.reason;
+  const mergedRuleId = preferExtraMeta ? extra.ruleId : base.ruleId;
+  const mergedFeedback = base.feedback ?? extra.feedback;
+  return {
+    key: base.key,
+    date: base.date,
+    diskId: base.diskId,
+    dir: base.dir,
+    cause: base.cause,
+    source: { ...base.source },
+    level: mergedLevel,
+    ...(mergedReason !== undefined ? { reason: mergedReason } : {}),
+    ...(mergedRuleId !== undefined ? { ruleId: mergedRuleId } : {}),
+    ...(mergedFeedback !== undefined ? { feedback: mergedFeedback } : {}),
+    firstAt: Math.min(base.firstAt, extra.firstAt),
+    latestAt: Math.max(base.latestAt, extra.latestAt),
+    windowEndWall: Math.max(base.windowEndWall, extra.windowEndWall),
+    flushMono: Math.max(base.flushMono, extra.flushMono),
+    windowMsSum: base.windowMsSum + extra.windowMsSum,
+    created: base.created + extra.created,
+    modified: base.modified + extra.modified,
+    deleted: base.deleted + extra.deleted,
+    rolledUp: base.rolledUp + extra.rolledUp,
+    degraded: base.degraded || extra.degraded,
+    count: base.count + extra.count,
+    epoch,
+    entryIds: [...base.entryIds, ...extra.entryIds],
+  };
 }
 
 function finiteNonNeg(value: unknown): number {
@@ -223,6 +277,7 @@ interface PendingPatch {
 }
 
 type BudgetTier = 'file' | 'nonFile';
+type CapTier = BudgetTier | 'critical';
 
 interface AppendOptions {
   tier?: BudgetTier;
@@ -234,6 +289,28 @@ interface DateByteUsage {
   file: number;
   nonFile: number;
   breakdownLoaded: boolean;
+}
+
+interface DayTierStats {
+  fileBytes: number;
+  nonFileBytes: number;
+  fileLines: number;
+  nonFileLines: number;
+  maxFileLineBytes: number;
+  maxNonFileLineBytes: number;
+  sawCapError: boolean;
+}
+
+function createDayTierStats(): DayTierStats {
+  return {
+    fileBytes: 0,
+    nonFileBytes: 0,
+    fileLines: 0,
+    nonFileLines: 0,
+    maxFileLineBytes: 0,
+    maxNonFileLineBytes: 0,
+    sawCapError: false,
+  };
 }
 
 function createReverseEventScanner() {
@@ -289,11 +366,13 @@ export class HistoryManager {
   private readonly restoreMemoryEntries?: (entries: readonly PersistedEventEntry[]) => void;
   private readonly emitSourceError: (error: string, extra?: Record<string, unknown>) => void;
   private readonly restoreSourceError?: (error: string, extra?: Record<string, unknown>) => void;
-  private readonly emitSourceOk: () => void;
+  private readonly emitSourceOk: (extra?: Record<string, unknown>) => void;
+  private readonly clearSourceCap?: () => void;
   private readonly calendar: LocalCalendar;
   private readonly maxDailyBytes: number;
   private readonly maxFileDailyBytes: number;
   private readonly maxNonFileDailyBytes: number;
+  private readonly maxCriticalDailyBytes: number;
   private readonly enforceTotalDailyCap: boolean;
   private readonly maxTotalBytes: number;
   private readonly heartbeatIntervalMs: number;
@@ -303,6 +382,8 @@ export class HistoryManager {
   private tail: Promise<void> = Promise.resolve();
   private started = false;
   private stopped = false;
+  private stopPromise?: Promise<void>;
+  private activeActivityFlush?: Promise<void>;
   private clearEpoch = 0;
   private clearFeedBuffer?: Array<{ date: string; raw: string }>;
   private currentDate?: string;
@@ -314,13 +395,21 @@ export class HistoryManager {
   private readonly cappedDates = new Set<string>();
   private readonly fileCappedDates = new Set<string>();
   private readonly nonFileCappedDates = new Set<string>();
+  private readonly criticalCappedDates = new Set<string>();
   private readonly capErrorsEmitted = new Set<string>();
   private readonly reportedFileErrors = new Set<string>();
   private appendDegraded = false;
   private summaryDegraded = false;
   private bootTag = makeBootTag();
   private shortSeq = 0;
+  private readonly usedBootTags = new Set<string>([this.bootTag]);
+  private readonly uuidPrefixTag = new Map<string, string>();
+  private readonly uuidLastDate = new Map<string, string>();
   private readonly eventMetaById = new Map<
+    string,
+    { date: string; diskId: string; isFile?: boolean; critical?: boolean }
+  >();
+  private readonly activityMetaById = new Map<
     string,
     { date: string; diskId: string; isFile?: boolean; critical?: boolean }
   >();
@@ -340,6 +429,15 @@ export class HistoryManager {
   private cachedToday?: { revision: number; date: string; summary?: DailySummary };
   private yesterdayDate?: string;
   private yesterdaySummary?: DailySummary;
+  private yesterdayLateState?: {
+    date: string;
+    acc: ReturnType<typeof createDailySummaryAccumulator>;
+    rolloverOpts: SummarizeDayOptions;
+    expiresMono: number;
+    prevMonthKey: string;
+    nextMonthKey: string;
+    dirty: boolean;
+  };
   private pendingTodayHydration?: { date: string; epoch: number; liveLines: string[] };
   private todayHydrationTimer?: ReturnType<typeof setTimeout>;
   private activeTodayHydration?: Promise<unknown>;
@@ -356,6 +454,7 @@ export class HistoryManager {
     this.emitSourceError = options.emitSourceError;
     this.restoreSourceError = options.restoreSourceError;
     this.emitSourceOk = options.emitSourceOk;
+    this.clearSourceCap = options.clearSourceCap;
     this.calendar = new LocalCalendar(options.timeZone);
     if (options.maxFileDailyBytes !== undefined || options.maxNonFileDailyBytes !== undefined) {
       this.maxFileDailyBytes = options.maxFileDailyBytes ?? MAX_DAILY_FILE_EVENT_BYTES;
@@ -373,6 +472,8 @@ export class HistoryManager {
       this.maxDailyBytes = MAX_DAILY_EVENT_BYTES;
       this.enforceTotalDailyCap = false;
     }
+    this.maxCriticalDailyBytes =
+      options.maxCriticalDailyBytes ?? Math.max(MAX_DAILY_CRITICAL_EVENT_BYTES, this.maxDailyBytes);
     this.maxTotalBytes = options.maxTotalBytes ?? MAX_HISTORY_TOTAL_BYTES;
     this.heartbeatIntervalMs = options.heartbeatIntervalMs ?? HISTORY_HEARTBEAT_MS;
     this.dayExtensions = options.dayExtensions;
@@ -441,7 +542,7 @@ export class HistoryManager {
 
     const isFile = entry.kind.startsWith('file.');
     const critical = this.isCriticalEvent(entry.kind, entry.level);
-    const diskId = UUID_SEQ_RE.test(entry.id) ? this.nextShortId() : entry.id;
+    const diskId = this.shortDiskIdForNonAggregated(entry.id, date);
     this.rememberEventMeta(entry.id, date, diskId, isFile, critical);
 
     const raw = this.serializeEventLine(entry, diskId, meta);
@@ -487,7 +588,7 @@ export class HistoryManager {
           existing.feedback = entry.feedback;
         }
         existing.entryIds.push(entry.id);
-        this.rememberEventMeta(entry.id, date, existing.diskId, true, false);
+        this.rememberActivityMeta(entry.id, date, existing.diskId, true, false);
         this.pendingBucketByEntryId.set(entry.id, existing);
         this.cachedToday = undefined;
         this.summaryRevision += 1;
@@ -530,7 +631,7 @@ export class HistoryManager {
       entryIds: [entry.id],
     };
     this.pendingActivity.set(key, bucket);
-    this.rememberEventMeta(entry.id, date, diskId, true, false);
+    this.rememberActivityMeta(entry.id, date, diskId, true, false);
     this.pendingBucketByEntryId.set(entry.id, bucket);
     this.cachedToday = undefined;
     this.summaryRevision += 1;
@@ -568,15 +669,8 @@ export class HistoryManager {
     };
   }
 
-  private flushActivityBucket(bucket: PendingActivityBucket): void {
-    this.pendingActivity.delete(bucket.key);
-    for (const eid of bucket.entryIds) {
-      if (this.pendingBucketByEntryId.get(eid) === bucket) {
-        this.pendingBucketByEntryId.delete(eid);
-      }
-    }
-    if (bucket.epoch !== this.clearEpoch) return;
-    const raw = this.serializeEventLine(
+  private serializeActivityBucket(bucket: PendingActivityBucket): string {
+    return this.serializeEventLine(
       {
         id: bucket.diskId,
         kind: 'file.activity',
@@ -592,15 +686,126 @@ export class HistoryManager {
       },
       bucket.diskId,
     );
-    this.feedTodayRaw(bucket.date, raw);
-    const epoch = bucket.epoch;
-    this.enqueue(() => this.appendRawLine(bucket.date, `${raw}\n`, epoch, { tier: 'file', critical: false }));
   }
 
-  private flushPendingActivity(predicate: (bucket: PendingActivityBucket) => boolean): void {
-    if (this.pendingActivity.size === 0) return;
+  private detachActivityBucket(bucket: PendingActivityBucket): void {
+    if (this.pendingActivity.get(bucket.key) === bucket) {
+      this.pendingActivity.delete(bucket.key);
+    }
+    for (const eid of bucket.entryIds) {
+      if (this.pendingBucketByEntryId.get(eid) === bucket) {
+        this.pendingBucketByEntryId.delete(eid);
+      }
+    }
+  }
+
+  private detachMatchingActivityBuckets(
+    predicate: (bucket: PendingActivityBucket) => boolean,
+  ): PendingActivityBucket[] {
+    if (this.pendingActivity.size === 0) return [];
+    const epoch = this.clearEpoch;
+    const out: PendingActivityBucket[] = [];
     for (const bucket of [...this.pendingActivity.values()]) {
-      if (predicate(bucket)) this.flushActivityBucket(bucket);
+      if (bucket.epoch !== epoch || !predicate(bucket)) continue;
+      this.detachActivityBucket(bucket);
+      out.push(bucket);
+    }
+    return out;
+  }
+
+  private consumeActivityBucket(
+    bucket: PendingActivityBucket,
+    expectedEpoch = this.clearEpoch,
+  ): { date: string; raw: string; epoch: number } | undefined {
+    this.detachActivityBucket(bucket);
+    if (bucket.epoch !== expectedEpoch) return undefined;
+    const raw = this.serializeActivityBucket(bucket);
+    this.feedTodayRaw(bucket.date, raw);
+    return { date: bucket.date, raw, epoch: bucket.epoch };
+  }
+
+  private flushActivityBucket(bucket: PendingActivityBucket): void {
+    const item = this.consumeActivityBucket(bucket);
+    if (!item) return;
+    this.enqueue(() => this.appendRawLine(item.date, `${item.raw}\n`, item.epoch, { tier: 'file', critical: false }));
+  }
+
+  private async runActivityFlush(predicate: (bucket: PendingActivityBucket) => boolean): Promise<void> {
+    while (this.activeActivityFlush) {
+      await this.activeActivityFlush;
+    }
+    if (this.pendingActivity.size === 0) return;
+    const run = this.flushPendingActivitySliced(predicate);
+    this.activeActivityFlush = run;
+    try {
+      await run;
+    } finally {
+      if (this.activeActivityFlush === run) this.activeActivityFlush = undefined;
+    }
+  }
+
+  private async flushPendingActivitySliced(predicate: (bucket: PendingActivityBucket) => boolean): Promise<void> {
+    if (this.pendingActivity.size === 0) return;
+    const epoch = this.clearEpoch;
+    const candidates = [...this.pendingActivity.values()];
+    let idx = 0;
+    while (idx < candidates.length && epoch === this.clearEpoch) {
+      const sliceStart = performance.now();
+      const sliceLines: Array<{ date: string; raw: string; epoch: number }> = [];
+      let scannedInSlice = 0;
+      while (idx < candidates.length) {
+        const bucket = candidates[idx++];
+        scannedInSlice += 1;
+        if (bucket.epoch !== this.clearEpoch) continue;
+        if (this.pendingActivity.get(bucket.key) !== bucket) continue;
+        if (!predicate(bucket)) continue;
+        const item = this.consumeActivityBucket(bucket, epoch);
+        if (item) sliceLines.push(item);
+        if (
+          sliceLines.length >= FLUSH_ACTIVITY_SLICE_MAX_BUCKETS ||
+          performance.now() - sliceStart >= FLUSH_ACTIVITY_SLICE_BUDGET_MS
+        ) {
+          break;
+        }
+      }
+      if (sliceLines.length > 0 && epoch === this.clearEpoch) {
+        this.enqueue(() => this.appendBatchedActivityLines(sliceLines));
+      }
+      if (idx >= candidates.length || epoch !== this.clearEpoch) break;
+      if (scannedInSlice > 0) {
+        await new Promise<void>((resolve) => setImmediate(resolve));
+      }
+    }
+  }
+
+  private async flushDetachedBucketsSliced(
+    buckets: readonly PendingActivityBucket[],
+    epoch: number,
+    onRaw?: (raw: string) => void,
+  ): Promise<void> {
+    let idx = 0;
+    while (idx < buckets.length && epoch === this.clearEpoch) {
+      const sliceStart = performance.now();
+      const sliceLines: Array<{ date: string; raw: string; epoch: number }> = [];
+      while (idx < buckets.length) {
+        const bucket = buckets[idx++];
+        if (bucket.epoch !== epoch) continue;
+        const raw = this.serializeActivityBucket(bucket);
+        onRaw?.(raw);
+        sliceLines.push({ date: bucket.date, raw, epoch });
+        if (
+          sliceLines.length >= FLUSH_ACTIVITY_SLICE_MAX_BUCKETS ||
+          performance.now() - sliceStart >= FLUSH_ACTIVITY_SLICE_BUDGET_MS
+        ) {
+          break;
+        }
+      }
+      if (sliceLines.length > 0 && epoch === this.clearEpoch) {
+        await this.appendBatchedActivityLines(sliceLines);
+      }
+      if (idx < buckets.length && epoch === this.clearEpoch) {
+        await new Promise<void>((resolve) => setImmediate(resolve));
+      }
     }
   }
 
@@ -621,7 +826,10 @@ export class HistoryManager {
       subject: entry.subject,
       level: entry.level,
       at: entry.at,
-      source: entry.source.host === 'local' ? entry.source.id : { ...entry.source },
+      source:
+        entry.source.host === 'local' && entry.source.api === defaultApiForSourceId(entry.source.id)
+          ? entry.source.id
+          : { ...entry.source },
       ...(entry.reason !== undefined ? { reason: entry.reason } : {}),
       ...(entry.ruleId !== undefined ? { ruleId: entry.ruleId } : {}),
       ...(entry.cause !== undefined && entry.cause !== 'unknown' ? { cause: entry.cause } : {}),
@@ -650,23 +858,31 @@ export class HistoryManager {
       this.summaryRevision += 1;
       return;
     }
-    const mapped = this.eventMetaById.get(id);
-    const date = patch.at !== undefined ? this.calendar.dateKey(patch.at) : mapped?.date;
-    if (!date) return;
-    const diskId = mapped?.diskId ?? id;
-    const isFile = mapped?.isFile ?? false;
-    const critical = !isFile && (patch.level === 'context' || patch.level === 'wake' || mapped?.critical === true);
-    const record = {
-      record: 'patch' as const,
-      id: diskId,
-      ...(patch.level !== undefined ? { level: patch.level } : {}),
-      ...(patch.reason !== undefined ? { reason: patch.reason } : {}),
-      ...(patch.feedback !== undefined ? { feedback: patch.feedback } : {}),
-    };
-    const raw = JSON.stringify(record);
-    this.feedTodayRaw(date, raw);
+    const mapped = this.lookupMetaForPatch(id);
+    if (mapped) {
+      const date = patch.at !== undefined ? this.calendar.dateKey(patch.at) : mapped.date;
+      if (!date) return;
+      const diskId = mapped.diskId;
+      const isFile = mapped.isFile ?? false;
+      const critical = !isFile && (patch.level === 'context' || patch.level === 'wake' || mapped.critical === true);
+      const record = {
+        record: 'patch' as const,
+        id: diskId,
+        ...(patch.level !== undefined ? { level: patch.level } : {}),
+        ...(patch.reason !== undefined ? { reason: patch.reason } : {}),
+        ...(patch.feedback !== undefined ? { feedback: patch.feedback } : {}),
+      };
+      const raw = JSON.stringify(record);
+      this.feedTodayRaw(date, raw);
+      const epoch = this.clearEpoch;
+      this.enqueue(() => this.appendRawLine(date, `${raw}\n`, epoch, { tier: isFile ? 'file' : 'nonFile', critical }));
+      return;
+    }
+
+    const fallback = this.resolveEvictedPatchCandidates(id, patch.at);
+    if (!fallback) return;
     const epoch = this.clearEpoch;
-    this.enqueue(() => this.appendRawLine(date, `${raw}\n`, epoch, { tier: isFile ? 'file' : 'nonFile', critical }));
+    this.enqueue(() => this.appendVerifiedPatch(fallback.date, fallback.candidates, patch, epoch));
   }
 
   nextDeadline(): number | undefined {
@@ -688,7 +904,8 @@ export class HistoryManager {
     const wall = this.clock.wall();
     const mono = this.clock.mono();
     const nowDate = this.syncClockDate(wall);
-    this.flushPendingActivity((b) => mono >= b.flushMono || wall >= b.windowEndWall);
+    await this.runActivityFlush((b) => mono >= b.flushMono || wall >= b.windowEndWall);
+    if (this.stopped) return;
     if (mono >= this.nextHeartbeatMono) {
       this.nextHeartbeatMono = mono + this.heartbeatIntervalMs;
       this.lastAliveAt = Math.max(this.lastAliveAt, wall);
@@ -711,11 +928,16 @@ export class HistoryManager {
   }
 
   async stop(): Promise<void> {
-    if (this.stopped) return this.tail;
-    this.flushPendingActivity(() => true);
+    if (this.stopPromise) return this.stopPromise;
     this.stopped = true;
     this.nextHeartbeatMono = Number.POSITIVE_INFINITY;
     this.cancelBackfill();
+    this.stopPromise = this.runStop();
+    return this.stopPromise;
+  }
+
+  private async runStop(): Promise<void> {
+    await this.runActivityFlush(() => true);
     if (this.port && this.started && this.activeLifecycleOpen) {
       const now = this.clock.wall();
       const date = this.calendar.dateKey(now);
@@ -747,27 +969,40 @@ export class HistoryManager {
       todayAcc: this.todayAcc,
       yesterdayDate: this.yesterdayDate,
       yesterdaySummary: this.yesterdaySummary,
+      yesterdayLateState: this.yesterdayLateState,
       eventMetaById: new Map(this.eventMetaById),
+      activityMetaById: new Map(this.activityMetaById),
+      usageByDate: new Map([...this.usageByDate].map(([date, usage]) => [date, { ...usage }])),
+      cappedDates: new Set(this.cappedDates),
+      fileCappedDates: new Set(this.fileCappedDates),
+      nonFileCappedDates: new Set(this.nonFileCappedDates),
+      criticalCappedDates: new Set(this.criticalCappedDates),
+      capErrorsEmitted: new Set(this.capErrorsEmitted),
+      reportedFileErrors: new Set(this.reportedFileErrors),
+      pendingActivity: [...this.pendingActivity.values()].map((bucket) => cloneActivityBucket(bucket, epoch)),
       activeApp: this.activeApp,
       activeLifecycleOpen: this.activeLifecycleOpen,
       appendDegraded: this.appendDegraded,
       summaryDegraded: this.summaryDegraded,
-      wasCapped: this.capErrorsEmitted.size > 0,
+      wasCapped: this.capErrorsEmitted.size > 0 || this.cappedDates.size > 0,
       memoryEntries: this.snapshotMemoryEntries?.() ?? [],
     };
     this.todayAcc = undefined;
     this.cachedToday = undefined;
     this.yesterdayDate = undefined;
     this.yesterdaySummary = undefined;
+    this.yesterdayLateState = undefined;
     this.summaryRevision += 1;
     this.clearMemoryEntries();
     this.usageByDate.clear();
     this.cappedDates.clear();
     this.fileCappedDates.clear();
     this.nonFileCappedDates.clear();
+    this.criticalCappedDates.clear();
     this.capErrorsEmitted.clear();
     this.reportedFileErrors.clear();
     this.eventMetaById.clear();
+    this.activityMetaById.clear();
     this.pendingActivity.clear();
     this.pendingBucketByEntryId.clear();
     this.activeApp = undefined;
@@ -799,8 +1034,66 @@ export class HistoryManager {
             this.currentMonth = this.calendar.monthKey(now);
             this.yesterdayDate = previous.yesterdayDate;
             this.yesterdaySummary = previous.yesterdaySummary;
+            this.yesterdayLateState = previous.yesterdayLateState;
+            this.usageByDate.clear();
+            for (const [date, usage] of previous.usageByDate) {
+              this.usageByDate.set(date, { ...usage });
+            }
+            this.cappedDates.clear();
+            for (const date of previous.cappedDates) this.cappedDates.add(date);
+            this.fileCappedDates.clear();
+            for (const date of previous.fileCappedDates) this.fileCappedDates.add(date);
+            this.nonFileCappedDates.clear();
+            for (const date of previous.nonFileCappedDates) this.nonFileCappedDates.add(date);
+            this.criticalCappedDates.clear();
+            for (const date of previous.criticalCappedDates) this.criticalCappedDates.add(date);
+            this.capErrorsEmitted.clear();
+            for (const date of previous.capErrorsEmitted) this.capErrorsEmitted.add(date);
+            this.reportedFileErrors.clear();
+            for (const key of previous.reportedFileErrors) this.reportedFileErrors.add(key);
+
+            const liveMeta = new Map(this.eventMetaById);
             this.eventMetaById.clear();
             for (const [id, info] of previous.eventMetaById) this.eventMetaById.set(id, info);
+            for (const [id, info] of liveMeta) this.eventMetaById.set(id, info);
+
+            const liveActivityMeta = new Map(this.activityMetaById);
+            this.activityMetaById.clear();
+            for (const [id, info] of previous.activityMetaById) this.activityMetaById.set(id, info);
+            for (const [id, info] of liveActivityMeta) this.activityMetaById.set(id, info);
+
+            const livePending = new Map(this.pendingActivity);
+            this.pendingActivity.clear();
+            this.pendingBucketByEntryId.clear();
+            for (const restoredBucket of previous.pendingActivity) {
+              const liveBucket = livePending.get(restoredBucket.key);
+              if (liveBucket) {
+                livePending.delete(restoredBucket.key);
+                const merged = mergeActivityBuckets(restoredBucket, liveBucket, epoch);
+                this.pendingActivity.set(merged.key, merged);
+                for (const eid of merged.entryIds) {
+                  this.pendingBucketByEntryId.set(eid, merged);
+                }
+                for (const eid of liveBucket.entryIds) {
+                  const meta = this.activityMetaById.get(eid);
+                  if (meta) this.activityMetaById.set(eid, { ...meta, diskId: merged.diskId });
+                }
+              } else {
+                const cloned = cloneActivityBucket(restoredBucket, epoch);
+                this.pendingActivity.set(cloned.key, cloned);
+                for (const eid of cloned.entryIds) {
+                  this.pendingBucketByEntryId.set(eid, cloned);
+                }
+              }
+            }
+            for (const liveBucket of livePending.values()) {
+              const bucket = liveBucket.epoch === epoch ? liveBucket : cloneActivityBucket(liveBucket, epoch);
+              this.pendingActivity.set(bucket.key, bucket);
+              for (const eid of bucket.entryIds) {
+                this.pendingBucketByEntryId.set(eid, bucket);
+              }
+            }
+
             this.activeApp = previous.activeApp;
             this.activeLifecycleOpen = previous.activeLifecycleOpen;
             this.appendDegraded = previous.appendDegraded;
@@ -812,7 +1105,7 @@ export class HistoryManager {
               liveLines: buffered.filter((item) => item.date === today).map((item) => item.raw),
             };
             this.pendingTodayHydration = hydration;
-            const hydrated = await this.hydrateTodayFromDisk(today, epoch, false);
+            const { hydrated } = await this.hydrateTodayFromDisk(today, epoch, false);
             if (this.pendingTodayHydration === hydration) this.pendingTodayHydration = undefined;
             if (this.clearFeedBuffer === buffered) this.clearFeedBuffer = undefined;
             if (!hydrated) {
@@ -824,6 +1117,8 @@ export class HistoryManager {
               }
               for (const raw of hydration.liveLines) this.feedTodayRaw(today, raw);
             }
+            this.cachedToday = undefined;
+            this.summaryRevision += 1;
             this.restoreMemoryEntries?.(previous.memoryEntries);
             this.onSummaryChanged?.();
           } else if (this.clearFeedBuffer === buffered) {
@@ -854,8 +1149,8 @@ export class HistoryManager {
         this.feedTodayRaw(today, raw);
         for (const item of buffered) if (item.date === today) this.feedTodayRaw(item.date, item.raw);
         await this.appendRawLine(today, `${raw}\n`, epoch);
-        if (previous.wasCapped && epoch === this.clearEpoch) {
-          this.safeEmitSourceOk();
+        if ((previous.wasCapped || previous.appendDegraded || previous.summaryDegraded) && epoch === this.clearEpoch) {
+          this.safeEmitSourceOk({ capped: false });
         }
       } else if (this.clearFeedBuffer === buffered) {
         this.clearFeedBuffer = undefined;
@@ -1187,50 +1482,70 @@ export class HistoryManager {
         this.cachedToday = { revision: this.summaryRevision, date: this.currentDate, summary: today };
       }
     }
+    let yesterday = this.yesterdaySummary;
+    if (yesterday && this.yesterdayDate) {
+      let hasPendingYesterday = false;
+      for (const bucket of this.pendingActivity.values()) {
+        if (bucket.epoch === this.clearEpoch && bucket.date === this.yesterdayDate) {
+          hasPendingYesterday = true;
+          break;
+        }
+      }
+      if (hasPendingYesterday) {
+        const copy = structuredClone(yesterday);
+        this.foldPendingIntoDailySummary(copy, this.yesterdayDate);
+        this.applyDayExtensions(copy, this.yesterdayDate);
+        yesterday = isEmptyDailySummary(copy) ? undefined : copy;
+      }
+    }
     return {
       version: this.summaryRevision,
       ...(today ? { today } : {}),
-      ...(this.yesterdaySummary ? { yesterday: this.yesterdaySummary } : {}),
+      ...(yesterday ? { yesterday } : {}),
     };
+  }
+
+  private applyActivityBucketToSummary(summary: DailySummary, bucket: PendingActivityBucket): void {
+    summary.totalEvents += 1;
+    const suppressed =
+      bucket.reason === 'no-session' || bucket.reason === 'wake-budget' || bucket.reason === 'self-caused';
+    const isWake = bucket.level === 'wake' && bucket.reason !== 'no-session';
+    const isContext = bucket.level === 'context';
+    if (isWake || isContext || suppressed) {
+      if (isWake) summary.deliveries.wake += 1;
+      if (isContext) summary.deliveries.context += 1;
+      if (suppressed) summary.deliveries.suppressed += 1;
+      const ruleKey = bucket.ruleId && bucket.ruleId.length > 0 ? bucket.ruleId : '_none';
+      let rc = summary.deliveries.byRule[ruleKey];
+      if (!rc) {
+        rc = { wake: 0, context: 0, suppressed: 0 };
+        summary.deliveries.byRule[ruleKey] = rc;
+      }
+      if (isWake) rc.wake += 1;
+      if (isContext) rc.context += 1;
+      if (suppressed) rc.suppressed += 1;
+    }
+    const dir = sanitizeDirPath(bucket.dir);
+    const existing = summary.fileActivity[dir];
+    if (existing) {
+      existing.events += 1;
+      existing.created += bucket.created;
+      existing.modified += bucket.modified;
+      existing.deleted += bucket.deleted;
+    } else {
+      summary.fileActivity[dir] = {
+        events: 1,
+        created: bucket.created,
+        modified: bucket.modified,
+        deleted: bucket.deleted,
+      };
+    }
   }
 
   private foldPendingIntoDailySummary(summary: DailySummary, date: string): void {
     for (const bucket of this.pendingActivity.values()) {
       if (bucket.epoch !== this.clearEpoch || bucket.date !== date) continue;
-      summary.totalEvents += 1;
-      const suppressed =
-        bucket.reason === 'no-session' || bucket.reason === 'wake-budget' || bucket.reason === 'self-caused';
-      const isWake = bucket.level === 'wake' && bucket.reason !== 'no-session';
-      const isContext = bucket.level === 'context';
-      if (isWake || isContext || suppressed) {
-        if (isWake) summary.deliveries.wake += 1;
-        if (isContext) summary.deliveries.context += 1;
-        if (suppressed) summary.deliveries.suppressed += 1;
-        const ruleKey = bucket.ruleId && bucket.ruleId.length > 0 ? bucket.ruleId : '_none';
-        let rc = summary.deliveries.byRule[ruleKey];
-        if (!rc) {
-          rc = { wake: 0, context: 0, suppressed: 0 };
-          summary.deliveries.byRule[ruleKey] = rc;
-        }
-        if (isWake) rc.wake += 1;
-        if (isContext) rc.context += 1;
-        if (suppressed) rc.suppressed += 1;
-      }
-      const dir = sanitizeDirPath(bucket.dir);
-      const existing = summary.fileActivity[dir];
-      if (existing) {
-        existing.events += 1;
-        existing.created += bucket.created;
-        existing.modified += bucket.modified;
-        existing.deleted += bucket.deleted;
-      } else {
-        summary.fileActivity[dir] = {
-          events: 1,
-          created: bucket.created,
-          modified: bucket.modified,
-          deleted: bucket.deleted,
-        };
-      }
+      this.applyActivityBucketToSummary(summary, bucket);
     }
   }
 
@@ -1246,13 +1561,72 @@ export class HistoryManager {
       this.clearFeedBuffer.push({ date, raw: rawLine });
       return;
     }
-    if (date !== this.currentDate || !this.todayAcc) return;
-    if (this.pendingTodayHydration && this.pendingTodayHydration.date === date) {
-      this.pendingTodayHydration.liveLines.push(rawLine);
+    if (date === this.currentDate && this.todayAcc) {
+      if (this.pendingTodayHydration && this.pendingTodayHydration.date === date) {
+        this.pendingTodayHydration.liveLines.push(rawLine);
+      }
+      this.todayAcc.feed(rawLine);
+      this.cachedToday = undefined;
+      this.summaryRevision += 1;
+      return;
     }
-    this.todayAcc.feed(rawLine);
-    this.cachedToday = undefined;
-    this.summaryRevision += 1;
+    if (this.yesterdayLateState && date === this.yesterdayLateState.date) {
+      if (this.clock.mono() > this.yesterdayLateState.expiresMono) {
+        this.yesterdayLateState = undefined;
+        return;
+      }
+      this.yesterdayLateState.acc.feed(rawLine);
+      this.yesterdayLateState.dirty = true;
+      const updated = this.yesterdayLateState.acc.snapshot({
+        ...this.yesterdayLateState.rolloverOpts,
+        truncatedAtLimit: this.yesterdayLateState.rolloverOpts.truncatedAtLimit || this.cappedDates.has(date),
+      });
+      this.applyDayExtensions(updated, date);
+      this.yesterdaySummary = isEmptyDailySummary(updated) ? undefined : updated;
+      this.summaryRevision += 1;
+      this.onSummaryChanged?.();
+    }
+  }
+
+  private async syncYesterdayLateDailyIfNeeded(date: string, epoch: number): Promise<void> {
+    const state = this.yesterdayLateState;
+    if (!state || state.date !== date || !state.dirty || !this.port || this.isEpochStale(epoch)) return;
+    if (this.clock.mono() > state.expiresMono) {
+      this.yesterdayLateState = undefined;
+      return;
+    }
+    state.dirty = false;
+    const daily = state.acc.snapshot({
+      ...state.rolloverOpts,
+      truncatedAtLimit: state.rolloverOpts.truncatedAtLimit || this.cappedDates.has(state.date),
+    });
+    if (isEmptyDailySummary(daily)) return;
+    this.applyDayExtensions(daily, state.date);
+    try {
+      await this.port.writeDaily(state.date, JSON.stringify(daily));
+      if (this.isEpochStale(epoch)) return;
+      if (this.yesterdayLateState === state) {
+        this.yesterdaySummary = daily;
+        this.summaryRevision += 1;
+        this.onSummaryChanged?.();
+      }
+      this.clearSummaryDegraded();
+      if (state.nextMonthKey !== state.prevMonthKey) {
+        await this.synthesizeMonthFromDaily(state.prevMonthKey, undefined, true, false, epoch);
+      }
+    } catch (error) {
+      if (this.isEpochStale(epoch)) return;
+      const code = unsafeFsCode(error);
+      if (code) {
+        this.reportFileErrorOnce(`unsafe:daily:${state.date}:${code}`, 'history-unsafe-entry', {
+          kind: 'daily',
+          date: state.date,
+          code,
+        });
+      } else {
+        this.reportSummaryWriteFailure(state.date, 'history-write-failed');
+      }
+    }
   }
 
   private scheduleTodayHydration(today: string, epoch: number): void {
@@ -1269,19 +1643,25 @@ export class HistoryManager {
     this.todayHydrationTimer.unref?.();
   }
 
-  private async hydrateTodayFromDisk(today: string, epoch: number, yieldSlices: boolean): Promise<boolean> {
-    if (!this.port || this.isEpochStale(epoch) || this.currentDate !== today) return false;
+  private async hydrateTodayFromDisk(
+    today: string,
+    epoch: number,
+    yieldSlices: boolean,
+  ): Promise<{ hydrated: boolean; diskStats?: DayTierStats }> {
+    if (!this.port || this.isEpochStale(epoch) || this.currentDate !== today) return { hydrated: false };
     try {
       const acc = createDailySummaryAccumulator(today, this.calendar.dayBounds(today));
+      const diskStats = createDayTierStats();
       let sawLine = false;
       let sliceStart = performance.now();
       for await (const line of this.streamLinesForward(today)) {
-        if (this.isEpochStale(epoch) || this.currentDate !== today) return false;
+        if (this.isEpochStale(epoch) || this.currentDate !== today) return { hydrated: false };
+        this.observeTierLine(diskStats, line);
         acc.feed(line);
         sawLine = true;
         if (yieldSlices && performance.now() - sliceStart >= 10) {
           await this.waitBackfillTurn(epoch, 0);
-          if (this.isEpochStale(epoch) || this.currentDate !== today) return false;
+          if (this.isEpochStale(epoch) || this.currentDate !== today) return { hydrated: false };
           sliceStart = performance.now();
         }
       }
@@ -1298,14 +1678,14 @@ export class HistoryManager {
         this.cachedToday = undefined;
         this.summaryRevision += 1;
         if (yieldSlices) this.onSummaryChanged?.();
-        return true;
+        return { hydrated: true, ...(sawLine ? { diskStats } : {}) };
       }
-      return false;
+      return { hydrated: false, ...(sawLine ? { diskStats } : {}) };
     } catch {
       if (this.pendingTodayHydration?.date === today && this.pendingTodayHydration.epoch === epoch) {
         this.pendingTodayHydration = undefined;
       }
-      return false;
+      return { hydrated: false };
     }
   }
 
@@ -1369,6 +1749,29 @@ export class HistoryManager {
     return !kind.startsWith('file.') && (level === 'context' || level === 'wake');
   }
 
+  private allocateBootTag(): string {
+    let tag = makeBootTag();
+    while (this.usedBootTags.has(tag)) tag = makeBootTag();
+    this.usedBootTags.add(tag);
+    return tag;
+  }
+
+  private shortDiskIdForNonAggregated(entryId: string, date: string): string {
+    if (!UUID_SEQ_RE.test(entryId)) return entryId;
+    const colon = entryId.lastIndexOf(':');
+    const uuid = entryId.slice(0, colon);
+    const seqStr = entryId.slice(colon + 1);
+    let tag = this.uuidPrefixTag.get(uuid);
+    if (!tag) {
+      tag = this.allocateBootTag();
+      this.uuidPrefixTag.set(uuid, tag);
+    }
+    this.uuidLastDate.set(uuid, date);
+    const seqPart =
+      !/^0\d+$/.test(seqStr) && Number.isSafeInteger(Number(seqStr)) ? Number(seqStr).toString(36) : seqStr;
+    return `${tag}-${seqPart}`;
+  }
+
   private rememberEventMeta(id: string, date: string, diskId: string, isFile = false, critical = false): void {
     if (this.eventMetaById.has(id)) this.eventMetaById.delete(id);
     this.eventMetaById.set(id, { date, diskId, isFile, critical });
@@ -1376,6 +1779,110 @@ export class HistoryManager {
       const oldest = this.eventMetaById.keys().next().value;
       if (oldest !== undefined) this.eventMetaById.delete(oldest);
     }
+  }
+
+  private rememberActivityMeta(id: string, date: string, diskId: string, isFile = true, critical = false): void {
+    if (this.activityMetaById.has(id)) this.activityMetaById.delete(id);
+    this.activityMetaById.set(id, { date, diskId, isFile, critical });
+    if (this.activityMetaById.size > 4096) {
+      const oldest = this.activityMetaById.keys().next().value;
+      if (oldest !== undefined) this.activityMetaById.delete(oldest);
+    }
+  }
+
+  private lookupMetaForPatch(
+    id: string,
+  ): { date: string; diskId: string; isFile?: boolean; critical?: boolean } | undefined {
+    const ev = this.eventMetaById.get(id);
+    if (ev) {
+      this.eventMetaById.delete(id);
+      this.eventMetaById.set(id, ev);
+      return ev;
+    }
+    const act = this.activityMetaById.get(id);
+    if (act) {
+      this.activityMetaById.delete(id);
+      this.activityMetaById.set(id, act);
+      return act;
+    }
+    return undefined;
+  }
+
+  private resolveEvictedPatchCandidates(
+    id: string,
+    patchAt: number | undefined,
+  ): { date: string; candidates: string[] } | undefined {
+    if (UUID_SEQ_RE.test(id)) {
+      const colon = id.lastIndexOf(':');
+      const uuid = id.slice(0, colon);
+      const seqStr = id.slice(colon + 1);
+      const date = patchAt !== undefined ? this.calendar.dateKey(patchAt) : this.uuidLastDate.get(uuid);
+      if (!date) return undefined;
+      const tag = this.uuidPrefixTag.get(uuid);
+      if (tag) {
+        const seqPart =
+          !/^0\d+$/.test(seqStr) && Number.isSafeInteger(Number(seqStr)) ? Number(seqStr).toString(36) : seqStr;
+        return { date, candidates: [`${tag}-${seqPart}`, id] };
+      }
+      return { date, candidates: [id] };
+    }
+    if (patchAt === undefined) return undefined;
+    return { date: this.calendar.dateKey(patchAt), candidates: [id] };
+  }
+
+  private async appendVerifiedPatch(
+    date: string,
+    candidateIds: readonly string[],
+    patch: { at?: number; level?: DeliveryLevel; reason?: string; feedback?: 'useful' | 'noise' },
+    epoch: number,
+  ): Promise<void> {
+    if (!this.port || epoch !== this.clearEpoch || candidateIds.length === 0) return;
+    const candidateSet = new Set(candidateIds);
+    let foundId: string | undefined;
+    let foundIsFile = false;
+    let foundLevel: DeliveryLevel = 'record';
+    try {
+      for await (const line of this.streamLinesDesc(date)) {
+        if (epoch !== this.clearEpoch) return;
+        let mayMatch = false;
+        for (let i = 0; i < candidateIds.length; i++) {
+          if (line.includes(candidateIds[i])) {
+            mayMatch = true;
+            break;
+          }
+        }
+        if (!mayMatch) continue;
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(line);
+        } catch {
+          continue;
+        }
+        if (!isRecordObject(parsed)) continue;
+        if (parsed.record !== 'event' && parsed.record !== undefined) continue;
+        if (typeof parsed.id !== 'string' || !candidateSet.has(parsed.id)) continue;
+        foundId = parsed.id;
+        foundIsFile = typeof parsed.kind === 'string' && parsed.kind.startsWith('file.');
+        foundLevel = VALID_LEVELS.has(parsed.level as DeliveryLevel) ? (parsed.level as DeliveryLevel) : 'record';
+        break;
+      }
+    } catch {
+      return;
+    }
+    if (!foundId || epoch !== this.clearEpoch) return;
+    const critical =
+      !foundIsFile &&
+      (patch.level === 'context' || patch.level === 'wake' || foundLevel === 'context' || foundLevel === 'wake');
+    const record = {
+      record: 'patch' as const,
+      id: foundId,
+      ...(patch.level !== undefined ? { level: patch.level } : {}),
+      ...(patch.reason !== undefined ? { reason: patch.reason } : {}),
+      ...(patch.feedback !== undefined ? { feedback: patch.feedback } : {}),
+    };
+    const raw = JSON.stringify(record);
+    this.feedTodayRaw(date, raw);
+    await this.appendRawLine(date, `${raw}\n`, epoch, { tier: foundIsFile ? 'file' : 'nonFile', critical });
   }
 
   private enqueue(work: () => Promise<void>): Promise<void> {
@@ -1390,12 +1897,27 @@ export class HistoryManager {
     if (nowDate > this.currentDate) {
       this.enqueueRollover(wall);
     } else if (nowDate < this.currentDate) {
-      this.flushPendingActivity(() => true);
+      const detached = this.detachMatchingActivityBuckets(() => true);
+      if (detached.length > 0) {
+        const prevEpoch = this.clearEpoch;
+        if (detached.length <= FLUSH_ACTIVITY_SLICE_MAX_BUCKETS) {
+          const items: Array<{ date: string; raw: string; epoch: number }> = [];
+          for (const b of detached) {
+            const raw = this.serializeActivityBucket(b);
+            this.feedTodayRaw(b.date, raw);
+            items.push({ date: b.date, raw, epoch: prevEpoch });
+          }
+          if (items.length > 0) this.enqueue(() => this.appendBatchedActivityLines(items));
+        } else {
+          this.enqueue(() => this.flushDetachedBucketsSliced(detached, prevEpoch));
+        }
+      }
       this.currentDate = nowDate;
       this.currentMonth = this.calendar.monthKey(wall);
       this.lastAliveAt = wall;
       this.resetTodayAcc(nowDate);
       this.yesterdaySummary = undefined;
+      this.yesterdayLateState = undefined;
       const paused = this.isPaused();
       const epoch = this.clearEpoch;
       const marker: HistoryLifecycleRecord = {
@@ -1430,7 +1952,21 @@ export class HistoryManager {
     const nextMonthKey = this.calendar.monthKey(wall);
     if (!prevDate || nextDate <= prevDate) return;
 
-    this.flushPendingActivity((b) => b.date < nextDate);
+    const dueBuckets = this.detachMatchingActivityBuckets((b) => b.date < nextDate);
+    let deferredRolloverBuckets: PendingActivityBucket[] = [];
+    if (dueBuckets.length <= FLUSH_ACTIVITY_SLICE_MAX_BUCKETS) {
+      const items: Array<{ date: string; raw: string; epoch: number }> = [];
+      for (const b of dueBuckets) {
+        const raw = this.serializeActivityBucket(b);
+        this.feedTodayRaw(b.date, raw);
+        items.push({ date: b.date, raw, epoch: b.epoch });
+      }
+      if (items.length > 0) {
+        this.enqueue(() => this.appendBatchedActivityLines(items));
+      }
+    } else {
+      deferredRolloverBuckets = dueBuckets;
+    }
 
     const prevWasCapped = this.cappedDates.has(prevDate);
     let prevPendingHydration: { date: string; epoch: number; liveLines: string[] } | undefined;
@@ -1448,9 +1984,18 @@ export class HistoryManager {
       prevAcc && diffDays(nextDate, prevDate) === 1
         ? prevAcc.snapshot(prevWasCapped ? { truncatedAtLimit: true } : undefined)
         : undefined;
-    if (prevProvisional) this.applyDayExtensions(prevProvisional, prevDate);
+    if (prevProvisional) {
+      if (deferredRolloverBuckets.length > 0) {
+        for (const b of deferredRolloverBuckets) {
+          if (b.date === prevDate) this.applyActivityBucketToSummary(prevProvisional, b);
+        }
+      }
+      this.applyDayExtensions(prevProvisional, prevDate);
+    }
 
     const prevAliveAt = this.lastAliveAt;
+    const prevBoundsSync = this.calendar.dayBounds(prevDate);
+    const continuousSync = diffDays(nextDate, prevDate) === 1 && prevBoundsSync.endMs - prevAliveAt <= 10 * 60_000;
     const carryApp = this.activeApp;
     const paused = this.isPaused();
     this.currentDate = nextDate;
@@ -1459,10 +2004,33 @@ export class HistoryManager {
     this.lastAliveAt = wall;
     this.resetTodayAcc(nextDate);
     this.yesterdaySummary = prevProvisional && !isEmptyDailySummary(prevProvisional) ? prevProvisional : undefined;
+    if (prevAcc && diffDays(nextDate, prevDate) === 1) {
+      this.yesterdayLateState = {
+        date: prevDate,
+        acc: prevAcc,
+        rolloverOpts: {
+          isRunningAtEnd: continuousSync,
+          liveEndMs: continuousSync ? prevBoundsSync.endMs : undefined,
+          truncatedAtLimit: prevWasCapped,
+        },
+        expiresMono: this.clock.mono() + LATE_ROLLOVER_GRACE_MS,
+        prevMonthKey: prevMonthKey ?? prevDate.slice(0, 7),
+        nextMonthKey,
+        dirty: false,
+      };
+    } else {
+      this.yesterdayLateState = undefined;
+    }
     const epoch = this.clearEpoch;
 
     this.enqueue(async () => {
       if (!this.port || this.isEpochStale(epoch)) return;
+      if (deferredRolloverBuckets.length > 0) {
+        await this.flushDetachedBucketsSliced(deferredRolloverBuckets, epoch, (raw) => {
+          prevAcc?.feed(raw);
+        });
+        if (this.isEpochStale(epoch)) return;
+      }
       const prevBounds = this.calendar.dayBounds(prevDate);
       const continuous = diffDays(nextDate, prevDate) === 1 && prevBounds.endMs - prevAliveAt <= 10 * 60_000;
       try {
@@ -1475,15 +2043,22 @@ export class HistoryManager {
           truncatedAtLimit,
         };
         let daily: DailySummary | undefined;
+        let finalAcc = prevAcc;
         if (prevAcc) {
+          if (this.yesterdayLateState?.acc === prevAcc && this.yesterdayLateState.date === prevDate) {
+            this.yesterdayLateState.rolloverOpts = rolloverOpts;
+            this.yesterdayLateState.dirty = false;
+          }
           if (prevAcc.hasRecords() || size > 0) {
-            daily = prevAcc.finish(rolloverOpts);
+            daily = diffDays(nextDate, prevDate) === 1 ? prevAcc.snapshot(rolloverOpts) : prevAcc.finish(rolloverOpts);
           }
         } else {
           const acc = createDailySummaryAccumulator(prevDate, prevBounds, rolloverOpts);
+          const rolloverStats = createDayTierStats();
           let sawLine = false;
           for await (const line of this.streamLinesForward(prevDate)) {
             if (this.isEpochStale(epoch)) return;
+            this.observeTierLine(rolloverStats, line);
             acc.feed(line);
             sawLine = true;
           }
@@ -1494,7 +2069,24 @@ export class HistoryManager {
             sawLine = true;
           }
           if (sawLine || size > 0) {
-            daily = acc.finish();
+            const inferred = this.evaluateCappedFromStats(rolloverStats, size);
+            const finalOpts = {
+              ...rolloverOpts,
+              truncatedAtLimit: rolloverOpts.truncatedAtLimit || inferred.anyCapped,
+            };
+            daily = diffDays(nextDate, prevDate) === 1 ? acc.snapshot(finalOpts) : acc.finish(finalOpts);
+            if (diffDays(nextDate, prevDate) === 1) {
+              finalAcc = acc;
+              this.yesterdayLateState = {
+                date: prevDate,
+                acc: finalAcc,
+                rolloverOpts: finalOpts,
+                expiresMono: this.clock.mono() + LATE_ROLLOVER_GRACE_MS,
+                prevMonthKey: prevMonthKey ?? prevDate.slice(0, 7),
+                nextMonthKey,
+                dirty: false,
+              };
+            }
           }
         }
         if (daily) {
@@ -1531,9 +2123,13 @@ export class HistoryManager {
         }
       }
       if (this.isEpochStale(epoch)) return;
-      if (this.cappedDates.has(prevDate) && !this.appendDegraded && !this.summaryDegraded) {
-        this.safeEmitSourceOk();
+      if (this.cappedDates.has(prevDate)) {
         await this.port.writeCapState?.('').catch(() => {});
+        if (!this.appendDegraded && !this.summaryDegraded) {
+          this.safeEmitSourceOk({ capped: false });
+        } else {
+          this.safeClearSourceCap();
+        }
       }
       const startAt = continuous ? prevBounds.endMs : wall;
       const boundary: HistoryLifecycleRecord = {
@@ -1739,7 +2335,29 @@ export class HistoryManager {
         this.clearPendingForEpoch(epoch);
         return;
       }
-      await this.restoreTodayCapState(today, seenTodayCapError, epoch);
+      const todayHasEvents = retainedDates.includes(today) && !knownUnsafeEvents.has(today);
+      const todayBytes = todayHasEvents ? await this.safeEventFileSize(today) : 0;
+      if (this.isEpochStale(epoch)) {
+        this.clearPendingForEpoch(epoch);
+        return;
+      }
+      let hydratedTodayDiskStats: DayTierStats | undefined;
+      if (todayHasEvents && todayBytes <= 512 * 1024) {
+        const res = await this.hydrateTodayFromDisk(today, epoch, false);
+        if (this.isEpochStale(epoch)) {
+          this.clearPendingForEpoch(epoch);
+          return;
+        }
+        hydratedTodayDiskStats = res.diskStats;
+      }
+      await this.restoreTodayCapState(
+        today,
+        seenTodayCapError,
+        todayHasEvents,
+        todayBytes,
+        hydratedTodayDiskStats,
+        epoch,
+      );
       if (this.isEpochStale(epoch)) {
         this.clearPendingForEpoch(epoch);
         return;
@@ -1748,35 +2366,28 @@ export class HistoryManager {
         this.bootTag = makeBootTag();
         this.shortSeq = 0;
       }
+      this.usedBootTags.add(this.bootTag);
+      for (const tag of seenTodayBootTags) this.usedBootTags.add(tag);
       if (collected.length > 0) {
         collected.reverse();
         for (const item of collected) {
-          this.rememberEventMeta(
-            item.ev.id,
-            item.date,
-            item.ev.id,
-            item.ev.kind.startsWith('file.'),
-            this.isCriticalEvent(item.ev.kind, item.ev.level),
-          );
+          if (item.ev.kind === 'file.activity') {
+            this.rememberActivityMeta(item.ev.id, item.date, item.ev.id, true, false);
+          } else {
+            this.rememberEventMeta(
+              item.ev.id,
+              item.date,
+              item.ev.id,
+              item.ev.kind.startsWith('file.'),
+              this.isCriticalEvent(item.ev.kind, item.ev.level),
+            );
+          }
         }
         this.restoreEntries(collected.map((item) => item.ev));
       }
 
-      if (retainedDates.includes(today) && !knownUnsafeEvents.has(today)) {
-        const todayBytes = await this.safeEventFileSize(today);
-        if (this.isEpochStale(epoch)) {
-          this.clearPendingForEpoch(epoch);
-          return;
-        }
-        if (todayBytes <= 512 * 1024) {
-          await this.hydrateTodayFromDisk(today, epoch, false);
-          if (this.isEpochStale(epoch)) {
-            this.clearPendingForEpoch(epoch);
-            return;
-          }
-        } else {
-          this.scheduleTodayHydration(today, epoch);
-        }
+      if (todayHasEvents && todayBytes > 512 * 1024) {
+        this.scheduleTodayHydration(today, epoch);
       }
 
       // Prune daily summaries older than 400 days.
@@ -1836,9 +2447,9 @@ export class HistoryManager {
         return;
       }
 
-      // Determine missing daily summaries for past days with raw logs.
+      // Determine missing daily summaries for past days with retained raw logs.
       const missingDailyDates: string[] = [];
-      for (const date of keptDates) {
+      for (const date of retainedDates) {
         if (this.isEpochStale(epoch)) {
           this.clearPendingForEpoch(epoch);
           return;
@@ -2004,18 +2615,15 @@ export class HistoryManager {
         isRunningAtEnd: false,
         truncatedAtLimit: this.cappedDates.has(nextDate) || size >= this.maxDailyBytes,
       });
+      const backfillStats = createDayTierStats();
       let sawLine = false;
-      let fileBytes = 0;
-      let nonFileBytes = 0;
       let sliceStart = performance.now();
       for await (const line of this.streamLinesForward(nextDate)) {
         if (this.isEpochStale(epoch)) {
           this.clearPendingForEpoch(epoch);
           return;
         }
-        const lineBytes = Buffer.byteLength(line, 'utf8') + 1;
-        if (this.classifyLineTier(line) === 'file') fileBytes += lineBytes;
-        else nonFileBytes += lineBytes;
+        this.observeTierLine(backfillStats, line);
         acc.feed(line);
         sawLine = true;
         if (this.activeQueries > 0 || performance.now() - sliceStart >= 16) {
@@ -2032,13 +2640,10 @@ export class HistoryManager {
         return;
       }
       if (sawLine || size > 0) {
-        const tierCapped =
-          fileBytes >= this.maxFileDailyBytes ||
-          nonFileBytes >= this.maxNonFileDailyBytes ||
-          size >= this.maxDailyBytes;
+        const inferred = this.evaluateCappedFromStats(backfillStats, size);
         const daily = acc.finish({
           isRunningAtEnd: false,
-          truncatedAtLimit: this.cappedDates.has(nextDate) || tierCapped,
+          truncatedAtLimit: this.cappedDates.has(nextDate) || inferred.anyCapped,
         });
         this.applyDayExtensions(daily, nextDate);
         const dailyJson = JSON.stringify(daily);
@@ -2302,6 +2907,7 @@ export class HistoryManager {
             this.cappedDates.delete(date);
             this.fileCappedDates.delete(date);
             this.nonFileCappedDates.delete(date);
+            this.criticalCappedDates.delete(date);
             this.capErrorsEmitted.delete(date);
           } catch (error) {
             const code = unsafeFsCode(error);
@@ -2425,6 +3031,7 @@ export class HistoryManager {
         this.cappedDates.delete(entry.date);
         this.fileCappedDates.delete(entry.date);
         this.nonFileCappedDates.delete(entry.date);
+        this.criticalCappedDates.delete(entry.date);
         this.capErrorsEmitted.delete(entry.date);
         deleted.add(entry.date);
         totalBytes -= entry.size;
@@ -2475,11 +3082,49 @@ export class HistoryManager {
     };
   }
 
+  private minCapThresholdBytes(): number {
+    return Math.min(this.maxFileDailyBytes, this.maxNonFileDailyBytes, this.maxDailyBytes, this.maxCriticalDailyBytes);
+  }
+
+  private async triggerDailyCap(
+    date: string,
+    capKind: CapTier | 'total',
+    tier: CapTier,
+    maxBytes: number,
+    epoch: number,
+  ): Promise<void> {
+    if (epoch !== this.clearEpoch) return;
+    this.cappedDates.add(date);
+    if (capKind === 'total') {
+      this.fileCappedDates.add(date);
+      this.nonFileCappedDates.add(date);
+    } else if (capKind === 'critical') {
+      this.nonFileCappedDates.add(date);
+      this.criticalCappedDates.add(date);
+    } else if (capKind === 'file') {
+      this.fileCappedDates.add(date);
+    } else {
+      this.nonFileCappedDates.add(date);
+    }
+    await this.persistCapStateForDate(date, epoch);
+    if (epoch !== this.clearEpoch) return;
+    if (!this.capErrorsEmitted.has(date)) {
+      this.capErrorsEmitted.add(date);
+      this.safeEmitSourceError('daily-limit-exceeded', {
+        date,
+        tier,
+        maxBytes,
+      });
+    }
+  }
+
   private async appendRawLine(date: string, line: string, epoch: number, options: AppendOptions = {}): Promise<void> {
     if (!this.port || epoch !== this.clearEpoch) return;
     const tier: BudgetTier = options.tier ?? 'nonFile';
     const critical = options.critical === true;
-    if (!critical) {
+    if (critical) {
+      if (this.criticalCappedDates.has(date)) return;
+    } else {
       if (tier === 'file' && this.fileCappedDates.has(date)) return;
       if (tier === 'nonFile' && this.nonFileCappedDates.has(date)) return;
     }
@@ -2492,7 +3137,7 @@ export class HistoryManager {
         this.usageByDate.set(date, usage);
       }
       const lineBytes = Buffer.byteLength(line, 'utf8');
-      const minTierLimit = Math.min(this.maxFileDailyBytes, this.maxNonFileDailyBytes, this.maxDailyBytes);
+      const minTierLimit = this.minCapThresholdBytes();
       if (!usage.breakdownLoaded && usage.total + lineBytes > minTierLimit) {
         const loaded = await this.loadDateTierBreakdown(date, usage.total);
         if (epoch !== this.clearEpoch) return;
@@ -2505,26 +3150,19 @@ export class HistoryManager {
         const overTier = tierUsed + lineBytes > tierLimit;
         const overTotal = this.enforceTotalDailyCap && usage.total + lineBytes > this.maxDailyBytes;
         if (overTier || overTotal) {
-          if (epoch !== this.clearEpoch) return;
-          this.cappedDates.add(date);
-          if (overTotal) {
-            this.fileCappedDates.add(date);
-            this.nonFileCappedDates.add(date);
-          } else if (tier === 'file') {
-            this.fileCappedDates.add(date);
-          } else {
-            this.nonFileCappedDates.add(date);
-          }
-          await this.persistCapStateForDate(date, epoch);
-          if (epoch !== this.clearEpoch) return;
-          if (!this.capErrorsEmitted.has(date)) {
-            this.capErrorsEmitted.add(date);
-            this.safeEmitSourceError('daily-limit-exceeded', {
-              date,
-              tier,
-              maxBytes: overTotal ? this.maxDailyBytes : tierLimit,
-            });
-          }
+          await this.triggerDailyCap(
+            date,
+            overTotal ? 'total' : tier,
+            tier,
+            overTotal ? this.maxDailyBytes : tierLimit,
+            epoch,
+          );
+          return;
+        }
+      } else {
+        const nonFileUsed = usage.breakdownLoaded ? usage.nonFile : usage.total;
+        if (nonFileUsed + lineBytes > this.maxCriticalDailyBytes) {
+          await this.triggerDailyCap(date, 'critical', 'critical', this.maxCriticalDailyBytes, epoch);
           return;
         }
       }
@@ -2536,10 +3174,7 @@ export class HistoryManager {
         if (tier === 'file') usage.file += lineBytes;
         else usage.nonFile += lineBytes;
       }
-      if (this.appendDegraded) {
-        this.appendDegraded = false;
-        if (!this.summaryDegraded) this.safeEmitSourceOk();
-      }
+      this.clearAppendDegradedIfNeeded();
     } catch (error) {
       if (epoch !== this.clearEpoch) return;
       // Drop cached usage after write failure so a partial write (e.g. ENOSPC) is re-stat'd.
@@ -2554,6 +3189,113 @@ export class HistoryManager {
         return;
       }
       this.reportAppendWriteFailure(date, 'history-write-failed');
+    } finally {
+      await this.syncYesterdayLateDailyIfNeeded(date, epoch);
+    }
+  }
+
+  private async appendBatchedActivityLines(
+    items: ReadonlyArray<{ date: string; raw: string; epoch: number }>,
+  ): Promise<void> {
+    const dirtyDates = new Map<string, number>();
+    let i = 0;
+    while (i < items.length) {
+      const { date, epoch } = items[i];
+      if (!this.port || epoch !== this.clearEpoch) return;
+      dirtyDates.set(date, epoch);
+      let end = i + 1;
+      while (end < items.length && items[end].date === date && items[end].epoch === epoch) {
+        end++;
+      }
+      if (this.fileCappedDates.has(date)) {
+        i = end;
+        continue;
+      }
+      let usage = this.usageByDate.get(date);
+      if (!usage) {
+        try {
+          const total = await this.port.eventFileSize(date);
+          if (epoch !== this.clearEpoch) return;
+          usage = { total, file: 0, nonFile: 0, breakdownLoaded: total === 0 };
+          this.usageByDate.set(date, usage);
+        } catch {
+          for (let k = i; k < end; k++) {
+            await this.appendRawLine(date, `${items[k].raw}\n`, epoch, { tier: 'file', critical: false });
+          }
+          i = end;
+          continue;
+        }
+      }
+      const firstBytes = Buffer.byteLength(items[i].raw, 'utf8') + 1;
+      const minTierLimit = this.minCapThresholdBytes();
+      if (!usage.breakdownLoaded && usage.total + firstBytes > minTierLimit) {
+        try {
+          usage = await this.loadDateTierBreakdown(date, usage.total);
+          if (epoch !== this.clearEpoch) return;
+          this.usageByDate.set(date, usage);
+        } catch {
+          for (let k = i; k < end; k++) {
+            await this.appendRawLine(date, `${items[k].raw}\n`, epoch, { tier: 'file', critical: false });
+          }
+          i = end;
+          continue;
+        }
+      }
+
+      const fileUsed = usage.breakdownLoaded ? usage.file : usage.total;
+      const fileRoom = this.maxFileDailyBytes - fileUsed;
+      const totalRoom = this.enforceTotalDailyCap ? this.maxDailyBytes - usage.total : Number.POSITIVE_INFINITY;
+      const room = Math.min(fileRoom, totalRoom);
+
+      let batchCount = 0;
+      let batchBytes = 0;
+      const lines: string[] = [];
+      while (i + batchCount < end) {
+        const line = `${items[i + batchCount].raw}\n`;
+        const lineBytes = Buffer.byteLength(line, 'utf8');
+        if (!usage.breakdownLoaded && usage.total + batchBytes + lineBytes > minTierLimit) {
+          break;
+        }
+        if (batchBytes + lineBytes > room) {
+          break;
+        }
+        lines.push(line);
+        batchBytes += lineBytes;
+        batchCount += 1;
+      }
+
+      if (batchCount > 0) {
+        const payload = lines.join('');
+        try {
+          await this.port.appendEvent(date, payload);
+          if (epoch !== this.clearEpoch) return;
+          usage.total += batchBytes;
+          if (usage.breakdownLoaded) usage.file += batchBytes;
+          this.clearAppendDegradedIfNeeded();
+          i += batchCount;
+          continue;
+        } catch {
+          this.usageByDate.delete(date);
+          await this.appendRawLine(date, `${items[i].raw}\n`, epoch, { tier: 'file', critical: false });
+          i += 1;
+          continue;
+        }
+      }
+
+      await this.appendRawLine(date, `${items[i].raw}\n`, epoch, { tier: 'file', critical: false });
+      i += 1;
+    }
+    for (const [date, epoch] of dirtyDates) {
+      await this.syncYesterdayLateDailyIfNeeded(date, epoch);
+    }
+  }
+
+  private clearAppendDegradedIfNeeded(): void {
+    if (!this.appendDegraded) return;
+    this.appendDegraded = false;
+    if (!this.summaryDegraded) {
+      const capped = this.currentDate !== undefined && this.cappedDates.has(this.currentDate);
+      this.safeEmitSourceOk({ capped });
     }
   }
 
@@ -2584,7 +3326,10 @@ export class HistoryManager {
   private clearSummaryDegraded(): void {
     if (!this.summaryDegraded) return;
     this.summaryDegraded = false;
-    if (!this.appendDegraded) this.safeEmitSourceOk();
+    if (!this.appendDegraded) {
+      const capped = this.currentDate !== undefined && this.cappedDates.has(this.currentDate);
+      this.safeEmitSourceOk({ capped });
+    }
     if (
       this.pendingBackfill.size > 0 &&
       this.pendingBackfillEpoch === this.clearEpoch &&
@@ -2603,38 +3348,197 @@ export class HistoryManager {
     this.safeEmitSourceError(errorCode, extra);
   }
 
-  private async restoreTodayCapState(today: string, seenInLog: boolean, epoch: number): Promise<void> {
+  private observeTierLine(stats: DayTierStats, rawLine: string): void {
+    const bytes = Buffer.byteLength(rawLine, 'utf8') + 1;
+    if (this.classifyLineTier(rawLine) === 'file') {
+      stats.fileBytes += bytes;
+      stats.fileLines += 1;
+      if (bytes > stats.maxFileLineBytes) stats.maxFileLineBytes = bytes;
+    } else {
+      stats.nonFileBytes += bytes;
+      stats.nonFileLines += 1;
+      if (bytes > stats.maxNonFileLineBytes) stats.maxNonFileLineBytes = bytes;
+    }
+    if (!stats.sawCapError && rawLine.includes('"daily-limit-exceeded"')) {
+      try {
+        const parsed = JSON.parse(rawLine);
+        if (
+          isRecordObject(parsed) &&
+          parsed.kind === 'source.error' &&
+          parsed.subject === 'history' &&
+          parsed.reason === 'daily-limit-exceeded'
+        ) {
+          stats.sawCapError = true;
+        }
+      } catch {}
+    }
+  }
+
+  private isTierUsageCapped(used: number, lineCount: number, maxLineBytes: number, limit: number): boolean {
+    if (used >= limit) return true;
+    if (lineCount === 0 || limit <= 0) return false;
+    const slack = limit >= 4096 ? Math.max(maxLineBytes, 1024) : Math.max(maxLineBytes, Math.floor(limit * 0.25));
+    return used + slack > limit;
+  }
+
+  private evaluateCappedFromStats(
+    stats: DayTierStats,
+    reportedSize: number,
+  ): {
+    fileCapped: boolean;
+    nonFileCapped: boolean;
+    criticalCapped: boolean;
+    totalCapped: boolean;
+    sawCapError: boolean;
+    anyCapped: boolean;
+  } {
+    const totalSize = Math.max(reportedSize, stats.fileBytes + stats.nonFileBytes);
+    const syntheticOnly = stats.fileBytes + stats.nonFileBytes === 0 && reportedSize > 0;
+    const fileCapped = syntheticOnly
+      ? reportedSize >= this.maxFileDailyBytes
+      : this.isTierUsageCapped(stats.fileBytes, stats.fileLines, stats.maxFileLineBytes, this.maxFileDailyBytes);
+    const nonFileCapped = syntheticOnly
+      ? reportedSize >= this.maxNonFileDailyBytes
+      : this.isTierUsageCapped(
+          stats.nonFileBytes,
+          stats.nonFileLines,
+          stats.maxNonFileLineBytes,
+          this.maxNonFileDailyBytes,
+        );
+    const criticalCapped = syntheticOnly
+      ? reportedSize >= this.maxCriticalDailyBytes
+      : this.isTierUsageCapped(
+          stats.nonFileBytes,
+          stats.nonFileLines,
+          stats.maxNonFileLineBytes,
+          this.maxCriticalDailyBytes,
+        );
+    const maxLineOverall = Math.max(stats.maxFileLineBytes, stats.maxNonFileLineBytes);
+    const totalLinesOverall = stats.fileLines + stats.nonFileLines;
+    const totalCapped = syntheticOnly
+      ? reportedSize >= this.maxDailyBytes
+      : totalSize >= this.maxDailyBytes ||
+        (this.enforceTotalDailyCap &&
+          this.isTierUsageCapped(totalSize, totalLinesOverall, maxLineOverall, this.maxDailyBytes));
+    const sawCapError = stats.sawCapError;
+    const anyCapped = fileCapped || nonFileCapped || criticalCapped || totalCapped || sawCapError;
+    return { fileCapped, nonFileCapped, criticalCapped, totalCapped, sawCapError, anyCapped };
+  }
+
+  private async inferTierStatsFromDisk(date: string, epoch: number): Promise<DayTierStats | undefined> {
+    if (!this.port || this.isEpochStale(epoch)) return undefined;
+    const stats = createDayTierStats();
+    try {
+      for await (const rawLine of this.streamLinesForward(date)) {
+        if (this.isEpochStale(epoch)) return undefined;
+        this.observeTierLine(stats, rawLine);
+      }
+      return stats;
+    } catch {
+      return undefined;
+    }
+  }
+
+  private async restoreTodayCapState(
+    today: string,
+    seenInLog: boolean,
+    todayHasEvents: boolean,
+    todayBytes: number,
+    hydratedDiskStats: DayTierStats | undefined,
+    epoch: number,
+  ): Promise<void> {
     if (!this.port || this.isEpochStale(epoch)) return;
     let restored = seenInLog;
+    let hasValidCapState = false;
     if (this.port.readCapState) {
       try {
         const raw = await this.port.readCapState();
         if (this.isEpochStale(epoch)) return;
         if (raw) {
           const parsed = JSON.parse(raw);
-          if (isRecordObject(parsed) && parsed.date === today) {
+          if (isRecordObject(parsed) && parsed.date === today && Array.isArray(parsed.tiers)) {
+            hasValidCapState = true;
             restored = true;
-            if (Array.isArray(parsed.tiers)) {
-              for (const t of parsed.tiers) {
-                if (t === 'file') this.fileCappedDates.add(today);
-                else if (t === 'nonFile') this.nonFileCappedDates.add(today);
+            for (const t of parsed.tiers) {
+              if (t === 'file') this.fileCappedDates.add(today);
+              else if (t === 'nonFile') this.nonFileCappedDates.add(today);
+              else if (t === 'critical') {
+                this.criticalCappedDates.add(today);
+                this.nonFileCappedDates.add(today);
               }
             }
           }
         }
       } catch {}
     }
+
+    if (hydratedDiskStats) {
+      this.usageByDate.set(today, {
+        total: Math.max(todayBytes, hydratedDiskStats.fileBytes + hydratedDiskStats.nonFileBytes),
+        file: hydratedDiskStats.fileBytes,
+        nonFile: hydratedDiskStats.nonFileBytes,
+        breakdownLoaded: true,
+      });
+    }
+
+    if (!hasValidCapState && todayHasEvents && !this.isEpochStale(epoch)) {
+      let stats = hydratedDiskStats;
+      const minLimit = this.minCapThresholdBytes();
+      const combinedLimit = this.enforceTotalDailyCap
+        ? Math.min(this.maxDailyBytes, this.maxFileDailyBytes + this.maxNonFileDailyBytes)
+        : this.maxFileDailyBytes + this.maxNonFileDailyBytes;
+      if (!stats && todayBytes > 0) {
+        if (todayBytes >= combinedLimit) {
+          restored = true;
+        } else if (todayBytes + 16_384 > minLimit) {
+          stats = await this.inferTierStatsFromDisk(today, epoch);
+          if (this.isEpochStale(epoch)) return;
+          if (stats) {
+            this.usageByDate.set(today, {
+              total: Math.max(todayBytes, stats.fileBytes + stats.nonFileBytes),
+              file: stats.fileBytes,
+              nonFile: stats.nonFileBytes,
+              breakdownLoaded: true,
+            });
+          }
+        }
+      }
+      if (stats && (stats.fileLines > 0 || stats.nonFileLines > 0 || stats.sawCapError)) {
+        const inferred = this.evaluateCappedFromStats(stats, todayBytes);
+        if (inferred.fileCapped) this.fileCappedDates.add(today);
+        if (inferred.nonFileCapped) this.nonFileCappedDates.add(today);
+        if (inferred.criticalCapped) {
+          this.criticalCappedDates.add(today);
+          this.nonFileCappedDates.add(today);
+        }
+        if (inferred.totalCapped) {
+          this.fileCappedDates.add(today);
+          this.nonFileCappedDates.add(today);
+        }
+        if (inferred.anyCapped) restored = true;
+      }
+    }
+
     if (!restored || this.isEpochStale(epoch)) return;
     this.cappedDates.add(today);
     this.capErrorsEmitted.add(today);
+    this.cachedToday = undefined;
+    this.summaryRevision += 1;
     this.safeRestoreSourceError('daily-limit-exceeded', { date: today });
+    if (
+      !hasValidCapState &&
+      (this.fileCappedDates.has(today) || this.nonFileCappedDates.has(today) || this.criticalCappedDates.has(today))
+    ) {
+      await this.persistCapStateForDate(today, epoch);
+    }
   }
 
   private async persistCapStateForDate(date: string, epoch: number): Promise<void> {
     if (!this.port?.writeCapState || epoch !== this.clearEpoch || date !== this.currentDate) return;
-    const tiers: BudgetTier[] = [];
+    const tiers: CapTier[] = [];
     if (this.fileCappedDates.has(date)) tiers.push('file');
     if (this.nonFileCappedDates.has(date)) tiers.push('nonFile');
+    if (this.criticalCappedDates.has(date)) tiers.push('critical');
     try {
       await this.port.writeCapState(JSON.stringify({ date, tiers }));
     } catch {}
@@ -2653,9 +3557,16 @@ export class HistoryManager {
     } catch {}
   }
 
-  private safeEmitSourceOk(): void {
+  private safeEmitSourceOk(extra?: Record<string, unknown>): void {
     try {
-      this.emitSourceOk();
+      this.emitSourceOk(extra);
+    } catch {}
+  }
+
+  private safeClearSourceCap(): void {
+    if (!this.clearSourceCap) return;
+    try {
+      this.clearSourceCap();
     } catch {}
   }
 }
