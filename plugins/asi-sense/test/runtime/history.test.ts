@@ -4618,4 +4618,134 @@ describe('runtime history persistence, rollups, retention, and recovery', () => 
     expect(backfilled25.truncatedAtLimit).toBe(true);
     await mgrBackfill.stop();
   });
+
+  it('S4: excludes 600MiB-pruned dates from startup backfill list and updates yesterday daily/monthly summaries on file-global 10s midnight late arrival', async () => {
+    // 1) startupMaintenance backfill list must use post-prune retainedDates rather than pre-prune keptDates
+    const dirPrune = await makeTempDir();
+    await mkdir(join(dirPrune, 'history', 'events'), { recursive: true, mode: 0o700 });
+    const makeDayLines = (at: number, tag: string) =>
+      `${Array.from({ length: 2 }, (_, i) =>
+        JSON.stringify({
+          record: 'event',
+          id: `${tag}-${i}`,
+          kind: 'app.activated',
+          subject: `App-${tag}-${'x'.repeat(60)}`,
+          level: 'record',
+          at: at + i * 1_000,
+          source: 'helper',
+        }),
+      ).join('\n')}\n`;
+    const dayOldRaw = makeDayLines(Date.UTC(2026, 9, 25, 12, 0, 0), 'd25');
+    const dayKeepRaw = makeDayLines(Date.UTC(2026, 9, 26, 12, 0, 0), 'd26');
+    await writeFile(join(dirPrune, 'history', 'events', '2026-10-25.jsonl'), dayOldRaw, { mode: 0o600 });
+    await writeFile(join(dirPrune, 'history', 'events', '2026-10-26.jsonl'), dayKeepRaw, { mode: 0o600 });
+
+    const portPrune = new FileHistoryStoragePort(dirPrune);
+    // Write a valid daily summary for 2026-10-26 so 2026-10 has existing summary data while 2026-10-25 lacks one and is pruned.
+    const parsed26 = parseHistoryLines(dayKeepRaw);
+    const cal = new LocalCalendar('UTC');
+    await portPrune.writeDaily(
+      '2026-10-26',
+      JSON.stringify(summarizeDay('2026-10-26', parsed26, cal.dayBounds('2026-10-26'))),
+    );
+    const pruneWall = Date.UTC(2026, 10, 15, 10, 0, 0);
+    const mgrPrune = new HistoryManager({
+      port: portPrune,
+      clock: { wall: () => pruneWall, mono: () => 1_000 },
+      isPaused: () => false,
+      titlesAllowed: () => true,
+      restoreEntries: () => {},
+      clearMemoryEntries: () => {},
+      emitSourceError: () => {},
+      emitSourceOk: () => {},
+      timeZone: 'UTC',
+      maxTotalBytes: Buffer.byteLength(dayKeepRaw, 'utf8') + 20,
+    });
+    await mgrPrune.start(false);
+    try {
+      // Pruned 2026-10-25 must never enter pendingBackfill; completed month 2026-10 must be non-partial immediately
+      expect(await portPrune.listEventDates()).toEqual(['2026-10-26', '2026-11-15']);
+      const monthOct = await mgrPrune.summary({ month: '2026-10' });
+      expect(monthOct.available).toBe(true);
+      if (monthOct.available) {
+        expect(monthOct.pendingDays ?? []).not.toContain('2026-10-25');
+        expect(monthOct.partial).toBeUndefined();
+      }
+    } finally {
+      await mgrPrune.stop();
+    }
+
+    // 2) FileGlobalSource 10s buffered event from 23:59:58 arriving after 00:00:01 rollover updates yesterday & monthly
+    const rtDir = await makeTempDir();
+    const rtPort = new FileHistoryStoragePort(rtDir);
+    let rtWall = Date.UTC(2026, 10, 30, 23, 59, 55);
+    let rtMono = 1_000;
+    let watchCb: ((event: { path: string; change: 'add' | 'modify' | 'delete'; at: number }) => void) | undefined;
+    let jobCb!: (ev: JobEvent) => Promise<void>;
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'Date'] });
+    try {
+      const rt = createSenseRuntime(
+        {
+          clock: { wall: () => rtWall, mono: () => rtMono },
+          history: rtPort,
+          storage: { load: async () => undefined, save: async () => {} },
+          dsh: {
+            onAgentEvent: () => () => {},
+            onTool: () => () => {},
+            onJob: (cb) => {
+              jobCb = cb;
+              return () => {};
+            },
+            deliver: async () => {},
+            tokenSnapshot: async () => undefined,
+          },
+          helper: { spawn: () => undefined },
+          probe: { create: () => ({ onSample: () => () => {}, start: () => {}, stop: async () => {} }) },
+          files: {
+            watch: (_root, cb) => {
+              watchCb = cb as typeof watchCb;
+              return { close: () => {} };
+            },
+          },
+        },
+        {
+          platform: 'linux',
+          timeZone: 'UTC',
+          intervalMs: 600_000,
+          globalFileWatch: { root: '/work', windowMs: 10_000, homedir: '/home/tester', dataDirs: [rtDir] },
+        },
+      );
+      await rt.start();
+
+      // At 23:59:58 on 2026-11-30, edit file inside FileGlobalSource 10s buffer
+      rtWall = Date.UTC(2026, 10, 30, 23, 59, 58);
+      rtMono = 4_000;
+      watchCb?.({ path: '/work/late-proj/index.ts', change: 'modify', at: rtWall });
+
+      // At 00:00:01 on 2026-12-01, non-file event forces midnight + month rollover before 10s window flushes
+      rtWall = Date.UTC(2026, 11, 1, 0, 0, 1);
+      rtMono = 7_000;
+      await jobCb({ type: 'started', id: 'dec-1-job', command: 'echo dec', at: rtWall });
+      await rt.tools.envHistory({});
+
+      // Advance past FileGlobalSource 10s window (00:00:08) so buffered 23:59:58 activity emits and flushes
+      rtWall = Date.UTC(2026, 11, 1, 0, 0, 9);
+      rtMono = 15_000;
+      await vi.advanceTimersByTimeAsync(8_000);
+      await rt.tools.envHistory({});
+      await rt.stop();
+
+      const novRaw = (await rtPort.readEvents('2026-11-30')) ?? '';
+      const decRaw = (await rtPort.readEvents('2026-12-01')) ?? '';
+      expect(novRaw).toContain('/work/late-proj');
+      expect(decRaw).not.toContain('/work/late-proj');
+
+      const novDaily = JSON.parse((await rtPort.readDaily('2026-11-30')) ?? '{}') as DailySummary;
+      expect(novDaily.fileActivity['late-proj']).toMatchObject({ events: 1, modified: 1 });
+      const novMonthly = JSON.parse((await rtPort.readMonthly('2026-11')) ?? '{}') as MonthlySummary;
+      expect(novMonthly.fileActivity['late-proj']).toMatchObject({ events: 1, modified: 1 });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
