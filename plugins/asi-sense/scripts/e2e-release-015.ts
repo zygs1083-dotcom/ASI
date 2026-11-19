@@ -305,8 +305,8 @@ async function prepare(
 }
 
 /** Append one synthetic helper-protocol event (v:1 ndjson) for the wrapper to emit. */
-async function inject(rig: Rig, type: string, at: number): Promise<void> {
-  await appendFile(rig.injectFile, `${JSON.stringify({ v: 1, type, at })}\n`);
+async function inject(rig: Rig, type: string, at: number, extra?: Record<string, unknown>): Promise<void> {
+  await appendFile(rig.injectFile, `${JSON.stringify({ v: 1, type, at, ...extra })}\n`);
 }
 
 /** Many injects at once — used to push today's non-file budget past the cap quickly. */
@@ -371,12 +371,14 @@ async function openPanel(panelPage: Page, url: string): Promise<Locator> {
 
 /** The 历史 <details> element inside the sidebar panel. */
 function historySection(panel: Locator): Locator {
-  return panel.locator('details:has(summary:text("历史"))');
+  return panel.locator('details:has(> summary:text("历史"))');
 }
 
 /** The 信号源 <details> element inside the sidebar panel (source health, incl. capped). */
 function sourcesSection(panel: Locator): Locator {
-  return panel.locator('details:has(summary:text("信号源"))');
+  // Direct-child summary: an unscoped :has() also matches the enclosing 现在
+  // section details, and multi-match breaks textContent()/toggles.
+  return panel.locator('details:has(> summary:text("信号源"))');
 }
 
 /** Text of the 信号源 details block; opens it first if needed. */
@@ -604,7 +606,7 @@ async function phaseBody(): Promise<void> {
     expect(awayEvents1).toBeLessThanOrEqual(1);
 
     st.phase = 'exclusion round-trip';
-    const exclusionsDetails = panel.locator('details:has(summary:text("排除项"))').last();
+    const exclusionsDetails = panel.locator('details:has(> summary:text("排除项"))');
     await exclusionsDetails.locator('summary').first().dispatchEvent('click');
     const exInput = panel.getByLabel('新增排除路径或模式');
     await expect(exInput).toBeVisible({ timeout: 10_000 });
@@ -645,7 +647,7 @@ async function phaseBody(): Promise<void> {
     st.phase = 'clear history';
     // The metric sampler ticks every 2s, so the post-clear empty chart state
     // is unobservable unless sampling is paused first.
-    const rulesDetails = panel.locator('details:has(summary:text("规则"))');
+    const rulesDetails = panel.locator('details:has(> summary:text("规则"))');
     await rulesDetails.locator('summary').first().dispatchEvent('click');
     const pauseBox = rulesDetails.getByLabel('暂停感知');
     await pauseBox.dispatchEvent('click');
@@ -758,6 +760,11 @@ async function phaseModel(): Promise<void> {
   const secretA = `ghp_${'x'.repeat(36)}`;
   const secretB = `password=${'Fake9xyz'}${'2026abc'}`;
   const secretValueB = `${'Fake9xyz'}${'2026abc'}`;
+  // file.burst env lines print data.directory (the basename) through
+  // sanitizeForModel: bursting dirs whose names are the fabricated secrets
+  // must ship as `file.burst: [redacted]`, never the raw shape.
+  const secretDirA = `/Users/Shared/${secretA}`;
+  const secretDirB = `/Users/Shared/${secretB}`;
   // See phaseBody: /tmp is under the built-in /private exclusion.
   const rig = await prepare(profile, {
     limit: MODEL_BUDGET,
@@ -770,6 +777,16 @@ async function phaseModel(): Promise<void> {
         createdBy: 'user',
         approved: true,
       },
+      {
+        // app.activated env lines render `front-app: <name>` through
+        // sanitizeForModel as free text — the only model-bound channel a
+        // synthetic secret shape reaches as [redacted] rather than [path].
+        id: 'e2e-secret-app',
+        match: { kind: 'app.activated', subject: 'e2e.fake.*' },
+        level: 'context',
+        createdBy: 'user',
+        approved: true,
+      },
     ],
     // Just under the 8 MiB non-file budget: hydration will not infer a cap
     // (needs total+16KiB > minLimit), so the first ~24 KiB of new records
@@ -778,6 +795,8 @@ async function phaseModel(): Promise<void> {
   });
   await mkdir(rig.burstDir, { recursive: true, mode: 0o700 });
   await mkdir(secDir, { recursive: true, mode: 0o700 });
+  await mkdir(secretDirA, { recursive: true, mode: 0o700 });
+  await mkdir(secretDirB, { recursive: true, mode: 0o700 });
   const st: RunState = { phase: 'profile setup' };
   try {
     if (ownedPids(rig).length) throw new Error(`Owned processes already running: ${ownedPids(rig).join(',')}`);
@@ -862,10 +881,19 @@ async function phaseModel(): Promise<void> {
     );
     await chat.getByRole('button', { name: 'Send message', exact: true }).first().click();
     await burstOps(rig.burstDir, 80);
-    // Secret-shaped filenames on the e2e-sec-watch scope: file.changed carries
-    // the full path through sanitizeForModel, so only [redacted] may ship.
+    // Fired while turn 1 is still open so the wake splices next-step instead
+    // of spending extra budgeted requests.
+    await burstOps(secretDirA, 80);
+    await burstOps(secretDirB, 80);
+    // Secret-shaped filenames on the e2e-sec-watch scope: file.changed subjects
+    // project to [path], and the credential-shaped source ids must only ever
+    // reach the model as [redacted].
     await writeFile(join(secDir, `${secretA}.txt`), 'e2e synthetic fixture');
     await writeFile(join(secDir, `${secretB}.txt`), 'e2e synthetic fixture');
+    // Synthetic app activations whose names are the fabricated secrets:
+    // front-app env lines must ship them only as [redacted].
+    await inject(rig, 'app.activated', Date.now(), { name: secretA, bundleId: 'e2e.fake.app', pid: 424241 });
+    await inject(rig, 'app.activated', Date.now(), { name: secretB, bundleId: 'e2e.fake.app2', pid: 424242 });
     const found = await waitFor(
       async () => {
         const log = await events(rig.sessionRoot);
@@ -888,14 +916,6 @@ async function phaseModel(): Promise<void> {
     expect(burst).toMatch(/deleted=[1-9]\d*/);
     expect(job).toMatch(/exit code: [1-9]/);
 
-    st.phase = 'env_state capped projection';
-    const log0 = await events(rig.sessionRoot);
-    const stateCall = log0.find((e) => e.type === 'tool/call' && record(e.data).name === 'env_state');
-    expect(stateCall, 'agent must call env_state').toBeTruthy();
-    const cappedFlag = findCappedFlag(log0);
-    console.log(`env_state observation.sources.history.capped: ${cappedFlag}`);
-    expect(cappedFlag).toBe(true);
-
     st.phase = 'away.summary push (anomaly)';
     // The burst's wake was charged moments ago; a wake attempted within the
     // 60s WAKE_MIN_GAP is downgraded to a context update that only ships with
@@ -913,7 +933,7 @@ async function phaseModel(): Promise<void> {
           return away.length >= 1 && redacted ? { texts, away } : undefined;
         },
         90_000,
-        'away.summary + redacted file.changed environment messages',
+        'away.summary + redacted environment messages',
       );
     } catch {
       // A wake-budget downgrade still delivers the summary as context on the
@@ -929,7 +949,7 @@ async function phaseModel(): Promise<void> {
           return away.length >= 1 && redacted ? { texts, away } : undefined;
         },
         120_000,
-        'away.summary + redacted file.changed environment messages (after nudge)',
+        'away.summary + redacted environment messages (after nudge)',
       );
       console.log('away.summary arrived via wake-budget context path (after nudge)');
     }
@@ -958,6 +978,14 @@ async function phaseModel(): Promise<void> {
       'env content assertions passed (counts, sanitized dirs, redacted secrets, no titles/email/daily-limit)',
     );
 
+    st.phase = 'env_state capped projection';
+    const log1 = await events(rig.sessionRoot);
+    const stateCall = log1.find((e) => e.type === 'tool/call' && record(e.data).name === 'env_state');
+    expect(stateCall, 'agent must call env_state').toBeTruthy();
+    const cappedFlag = findCappedFlag(log1);
+    console.log(`env_state observation.sources.history.capped: ${cappedFlag}`);
+    expect(cappedFlag).toBe(true);
+
     st.phase = 'budget accounting';
     const used = await count(rig);
     console.log(`model requests: ${used}/${MODEL_BUDGET}`);
@@ -984,6 +1012,8 @@ async function phaseModel(): Promise<void> {
     }
     await rm(rig.burstDir, { recursive: true, force: true });
     await rm(secDir, { recursive: true, force: true });
+    await rm(secretDirA, { recursive: true, force: true });
+    await rm(secretDirB, { recursive: true, force: true });
   }
 }
 
@@ -1006,12 +1036,17 @@ function findCappedFlag(log: Record<string, unknown>[]): boolean {
   const visit = (value: unknown, depth: number): boolean => {
     if (depth > 10 || value === null || typeof value !== 'object' || seen.has(value)) return false;
     seen.add(value);
-    const obj = record(value);
-    const sources = record(obj.sources);
-    const hist = record(sources.history);
-    if (hist.capped === true) return true;
-    if (obj.capped === true && Object.hasOwn(obj, 'lastSignalAt')) return true;
-    for (const v of Object.values(obj)) {
+    // record() rejects arrays, so iterate either kind of container explicitly —
+    // tool results nest the env_state JSON inside message.content[] parts.
+    const children = Array.isArray(value) ? value : Object.values(value as Record<string, unknown>);
+    if (!Array.isArray(value)) {
+      const obj = record(value);
+      const sources = record(obj.sources);
+      const hist = record(sources.history);
+      if (hist.capped === true) return true;
+      if (obj.capped === true && Object.hasOwn(obj, 'lastSignalAt')) return true;
+    }
+    for (const v of children) {
       if (typeof v === 'string' && v.length > 2 && v.trimStart().startsWith('{')) {
         try {
           if (visit(JSON.parse(v), depth + 1)) return true;
