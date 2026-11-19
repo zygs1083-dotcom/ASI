@@ -183,7 +183,7 @@ describe('DSH environment delivery', () => {
     };
     await deliver('session-a', { ...intent('followup'), update: { ...update, changes: [change] } });
     const text = JSON.stringify(agent.followup.mock.calls);
-    expect(text).toContain('front-app: \\n');
+    expect(text).toContain('front-app:  \\n');
     expect(text).not.toContain('front-app: observation');
   });
 
@@ -450,8 +450,33 @@ describe('DSH environment delivery', () => {
     expect(text).toContain('file.burst: project');
     expect(text).toContain('created=2');
     expect(text).toContain('modified=3');
-    expect(text).toContain('deleted=55');
+    expect(text).toContain('externalDeleted=51');
+    expect(text).toContain('agentDeleted=4');
+    expect(text).not.toContain('deleted=55');
     expect(text).not.toContain('/private/');
+  });
+
+  it('ignores non-finite job.*/process.* numbers and omits empty data.id without [redacted]', () => {
+    const mk = (id: string, kind: string, subject: string, data: Record<string, unknown>) => ({
+      count: 1,
+      level: 'context' as const,
+      signal: { id, kind, at: update.at, subject, data, source: { id: 'dsh', api: 'jobs', host: 'local' } },
+    });
+    const changes = [
+      mk('j', 'job.exited', 'build', {
+        id: '  ',
+        exitCode: Number.NaN,
+        durationMs: Number.POSITIVE_INFINITY,
+        startedAt: Number.NaN,
+      }),
+      mk('p', 'process.started', 'worker', { id: '', startedAt: Number.NEGATIVE_INFINITY }),
+    ];
+    const projected = modelUpdate({ since: update.since, at: update.at, suppressed: 0, changes });
+    expect(projected.changes.map((c) => c.signal.data)).toEqual([{ status: 'exited' }, { status: 'running' }]);
+    const text = formatEnvUpdate(projected, { includeJobCommands: false });
+    expect(text).not.toMatch(/\[redacted]|NaN|Infinity/);
+    expect(text).toContain('job: `job` exited');
+    expect(text).toContain('process: `worker` started');
   });
 
   it('delivers rebaseline suggestions as an explicit model-visible line with redacted metric paths', async () => {
@@ -926,8 +951,8 @@ describe('DSH environment delivery', () => {
     });
     expect(byId.get('al-1')).toMatchObject({
       kind: 'app.launched',
-      subject: 'SyntaxEditor',
-      data: { name: 'SyntaxEditor' },
+      subject: 'Syntax Editor',
+      data: { name: 'Syntax Editor' },
     });
     expect(byId.get('at-1')).toMatchObject({
       kind: 'app.terminated',
@@ -1066,6 +1091,12 @@ describe('DSH environment delivery', () => {
       const formatted = formatEnvUpdate(projected);
       expect(formatted.length).toBeGreaterThan(0);
       expect(formatted).not.toContain('observation');
+    }
+    expect([...MODEL_RULE_KINDS].filter((k) => !DELIVERABLE_KINDS.has(k))).toEqual(['fact.updated']);
+    expect([...KNOWN_EVENT_KINDS].filter((k) => !MODEL_RULE_KINDS.has(k))).toEqual(['delivery-unknown']);
+    for (const kind of DELIVERABLE_KINDS) {
+      expect(MODEL_RULE_KINDS.has(kind)).toBe(true);
+      expect(KNOWN_EVENT_KINDS.has(kind)).toBe(true);
     }
   });
 
@@ -1379,14 +1410,42 @@ describe('DSH environment delivery', () => {
         data: { status: 'error', reason: "EACCES: permission denied, open '/Users/alice/.ssh/config'" },
       },
     }));
-    modelUpdate({ since: T, at: T + 10_000, suppressed: 0, changes: changes.slice(0, 500) });
-    const t0 = performance.now();
-    const out = modelUpdate({ since: T, at: T + 10_000, suppressed: 0, changes });
-    const elapsed = performance.now() - t0;
+    const distinctChanges = Array.from({ length: 2_000 }, (_, i) => ({
+      count: 1,
+      level: 'context' as const,
+      signal: {
+        id: `sd-${i}`,
+        kind: 'source.status',
+        at: T + i,
+        source: { id: 'files-global', api: 'watch', host: 'local' },
+        subject: 'files-global',
+        data: { status: 'error', reason: `EACCES: permission denied, open '/Users/alice/dir-${i}/.ssh/config'` },
+      },
+    }));
+    // Warm up both cached and uncached paths, then compare 10,000 cached signals against 2,000 uncached signals
+    // so the assertion scales with CPU load while still catching cache/fast-path regressions.
+    modelUpdate({ since: T, at: T + 10_000, suppressed: 0, changes });
+    modelUpdate({ since: T, at: T + 10_000, suppressed: 0, changes: distinctChanges.slice(0, 300) });
+
+    let out!: ReturnType<typeof modelUpdate>;
+    const cachedTimes: number[] = [];
+    for (let run = 0; run < 3; run++) {
+      const t0 = performance.now();
+      out = modelUpdate({ since: T, at: T + 10_000, suppressed: 0, changes });
+      cachedTimes.push(performance.now() - t0);
+    }
+    const uncachedTimes: number[] = [];
+    for (let run = 0; run < 3; run++) {
+      const t0 = performance.now();
+      modelUpdate({ since: T, at: T + 10_000, suppressed: 0, changes: distinctChanges });
+      uncachedTimes.push(performance.now() - t0);
+    }
+    const minCachedMs = Math.min(...cachedTimes);
+    const minUncached2kMs = Math.min(...uncachedTimes);
     expect(out.changes).toHaveLength(10_000);
     expect(out.changes[0]?.signal.data.status).toBe('error');
     expect(String(out.changes[0]?.signal.data.reason)).not.toContain('alice');
-    expect(elapsed).toBeLessThanOrEqual(300);
+    expect(minCachedMs).toBeLessThanOrEqual(minUncached2kMs);
   });
 
   it('sanitizes embedded paths and hostnames in away.summary text fields', () => {

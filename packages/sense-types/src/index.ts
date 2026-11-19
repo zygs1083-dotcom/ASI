@@ -209,6 +209,7 @@ export interface SourceObservation {
   status: FactStatus;
   lastSignalAt: number;
   error?: string;
+  capped?: boolean;
 }
 
 /** Observation pipeline status. */

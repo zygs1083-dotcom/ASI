@@ -95,17 +95,19 @@ class FakeChild extends EventEmitter {
   }
 }
 
+const activeRuntimes = new Set<ReturnType<typeof createSenseRuntime>>();
+
 function setup(autoAck = true, stubborn = false, holdWrites = false) {
   vi.useFakeTimers();
   vi.setSystemTime(1_700_000_000_000);
-  let mono = 0;
+  const monoStart = performance.now();
   let agent: (event: AgentEvent) => Promise<void> = async () => {};
   let sample: (body: Body) => void = () => {};
   let snapshotReply = true;
   const children: FakeChild[] = [];
   const delivered: Parameters<DshPort['deliver']>[1][] = [];
   const ports: SensePorts = {
-    clock: { wall: () => Date.now(), mono: () => mono },
+    clock: { wall: () => Date.now(), mono: () => Math.max(0, performance.now() - monoStart) },
     dsh: {
       onAgentEvent: (cb) => {
         agent = cb;
@@ -141,6 +143,7 @@ function setup(autoAck = true, stubborn = false, holdWrites = false) {
     files: { watch: () => ({ close: () => {} }) },
   };
   const runtime = createSenseRuntime(ports, { platform: 'darwin', helperPath: '/fixture/helper' });
+  activeRuntimes.add(runtime);
   return {
     ports,
     runtime,
@@ -148,7 +151,6 @@ function setup(autoAck = true, stubborn = false, holdWrites = false) {
     delivered,
     agent: (event: AgentEvent) => agent(event),
     advance: async (ms: number) => {
-      mono += ms;
       await vi.advanceTimersByTimeAsync(ms);
     },
     settle: () => vi.advanceTimersByTimeAsync(0),
@@ -165,7 +167,15 @@ function setup(autoAck = true, stubborn = false, holdWrites = false) {
   };
 }
 
-afterEach(() => vi.useRealTimers());
+afterEach(async () => {
+  try {
+    await Promise.allSettled([...activeRuntimes].map((rt) => rt.stop()));
+  } finally {
+    activeRuntimes.clear();
+    if (vi.isFakeTimers()) vi.clearAllTimers();
+    vi.useRealTimers();
+  }
+});
 
 describe('helper protocol integration', () => {
   it('refreshes metadata without another activation event or delivery', async () => {
@@ -439,23 +449,25 @@ describe('helper protocol integration', () => {
     await h.runtime.stop();
   });
 
-  it('resets per-process AX state without fabricating an activation for the same bundle', async () => {
+  it('emits a real activation for a new pid of the same bundle, but ax.* messages never fabricate one', async () => {
     const h = setup();
     await h.runtime.start();
     await h.settle();
     const child = h.children[0];
     child.snapshotReply = false;
+    const before = h.runtime.events().filter((event) => event.kind === 'app.activated').length;
     child.send({ type: 'ax.unsupported', bundleId: 'example.app', pid: 123 });
     await h.settle();
-    const before = h.runtime.events().filter((event) => event.kind === 'app.activated').length;
+    expect(h.runtime.events().filter((event) => event.kind === 'app.activated')).toHaveLength(before);
     child.send({ type: 'app.activated', name: 'ExampleApp', bundleId: 'example.app', pid: 456 });
     await h.settle();
     expect(h.runtime.state().observation.sources['helper.ax']?.status).toBe('unknown');
     expect(h.runtime.state().env.frontApp.value).toEqual({ name: 'ExampleApp', bundleId: 'example.app', pid: 456 });
-    expect(h.runtime.events().filter((event) => event.kind === 'app.activated')).toHaveLength(before);
+    expect(h.runtime.events().filter((event) => event.kind === 'app.activated')).toHaveLength(before + 1);
     child.send({ type: 'ax.unsupported', bundleId: 'example.app', pid: 123 });
     await h.settle();
     expect(h.runtime.state().observation.sources['helper.ax']?.status).toBe('unknown');
+    expect(h.runtime.events().filter((event) => event.kind === 'app.activated')).toHaveLength(before + 1);
     await h.runtime.stop();
   });
 
@@ -991,45 +1003,41 @@ describe('helper protocol integration', () => {
     await h.runtime.stop();
   });
 
-  it.each(['delta', 'cooldown'] as const)(
-    'starts another bounded recovery round after %s',
-    async (trigger) => {
-      const h = setup();
-      await h.runtime.start();
+  it.each(['delta', 'cooldown'] as const)('starts another bounded recovery round after %s', async (trigger) => {
+    const h = setup();
+    await h.runtime.start();
+    await h.settle();
+    const child = h.children[0];
+    child.snapshotReply = false;
+    let snapshots = 0;
+    child.stdin.on('data', (chunk: Buffer) => {
+      if (chunk.toString().includes('"snapshot"')) snapshots++;
+    });
+    child.send({ type: 'error', code: 'output_overflow', dropped: 1 });
+    await h.settle();
+    for (let i = 0; i < 11; i++) {
+      child.send({ type: 'snapshot', frontApp: { name: 'ExampleApp', bundleId: 'example.app' } });
       await h.settle();
-      const child = h.children[0];
-      child.snapshotReply = false;
-      let snapshots = 0;
-      child.stdin.on('data', (chunk: Buffer) => {
-        if (chunk.toString().includes('"snapshot"')) snapshots++;
-      });
-      child.send({ type: 'error', code: 'output_overflow', dropped: 1 });
+      if (i < 10) await h.advance(Math.min(60_000, 2_000 * 2 ** i));
+    }
+    expect(snapshots).toBe(11);
+    if (trigger === 'delta') {
+      child.send({ type: 'thermal', state: 'unknown' });
       await h.settle();
-      for (let i = 0; i < 11; i++) {
-        child.send({ type: 'snapshot', frontApp: { name: 'ExampleApp', bundleId: 'example.app' } });
-        await h.settle();
-        if (i < 10) await h.advance(Math.min(60_000, 2_000 * 2 ** i));
-      }
       expect(snapshots).toBe(11);
-      if (trigger === 'delta') {
-        child.send({ type: 'thermal', state: 'unknown' });
-        await h.settle();
-        expect(snapshots).toBe(11);
-        child.send({ type: 'thermal', state: 'nominal' });
-        await h.settle();
-      } else {
-        await h.advance(299_999);
-        expect(snapshots).toBe(11);
-        await h.advance(1);
-      }
-      expect(snapshots).toBe(12);
-      child.send({ type: 'snapshot', thermal: 'nominal' });
+      child.send({ type: 'thermal', state: 'nominal' });
       await h.settle();
-      expect(h.runtime.state().observation.sources.helper?.status).toBe('ok');
-      await h.runtime.stop();
-    },
-    30_000,
-  ); // cooldown advances a 5-minute fake clock (~3s alone, >5s under root pnpm check)
+    } else {
+      await h.advance(299_999);
+      expect(snapshots).toBe(11);
+      await h.advance(1);
+    }
+    expect(snapshots).toBe(12);
+    child.send({ type: 'snapshot', thermal: 'nominal' });
+    await h.settle();
+    expect(h.runtime.state().observation.sources.helper?.status).toBe('ok');
+    await h.runtime.stop();
+  });
 
   it('applies complete snapshot fields after an unusable incremental thermal event', async () => {
     const h = setup();

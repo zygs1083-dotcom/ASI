@@ -315,6 +315,22 @@ plugins/asi-sense/
 - 窗口标题默认**发给模型**（否则感知价值大减），侧栏可一键关闭；关闭后只发应用名。
 - 不读窗口内容、不截图；`env_detail` 走 computer-use 自己的授权。
 
+### 4.1 凭据扫描与脱敏契约
+
+所有发给模型的字符串字段（`env_state`、`env_detail`、`env_watch`、`body_tune`、`env_metrics`、`env_history`、`env_summary`、`deliver` 与独立公开导出 `formatEnvUpdate`）统一先经单一入口 `sanitizeForModel(s)`（NFKC 规范化、删除 `\p{Cc}`/`\p{Cf}`（保留连接 `\p{Extended_Pictographic}` 的 ZWJ `U+200D`）、换行/制表变空格 → 单遍线性 $O(N)$ 扫描打码为 `[redacted]`），再做各自的格式化或截断；ID 类字段（`ruleId`、`signal.id`、`alertId`、`events[].id` 等，除严格符合 `^(?:body\.rate|file\.burst):[0-9a-f]{64}$` 的内部哈希 ID）若被打码则整体替换为 `[redacted]`。
+
+- **必须打码（任何通道、任何位置）**：
+  1. **强前缀子串**（前后可为任意分隔符或文字）：`ghp_`、`gho_`、`ghu_`、`ghs_`、`ghr_`、`github_pat_`、`glpat-`、`npm_`、`hf_`、`xox[a-z]-`、`AIza`、`(?:AKIA|ASIA)[A-Z0-9]{16}`、`sk-proj-`、`sk-ant-`、`sk_live_`、`sk_test_`、`pk_(?:live|test)_`、`rk_(?:live|test)_`、`SG.`、`tskey-`、`pypi-`、`dop_v1_`、`lin_api_`、`gsk_`、`ya29.`、JWT（`eyJ….eyJ…`）、`-----BEGIN`。裸 `sk-` 仅匹配后面紧跟 ≥20 位 `[A-Za-z0-9_-]` 且含数字的串（`sk-design-system` 不算）。
+  2. **认证上下文**：`Bearer|Basic|Token|Authorization` 后跟任意空白（含换行、NBSP、零宽字符清洗后）或 `:` / `：` / `=`，再跟 ≥8 字符且含数字、符号或高熵的值；后接普通英文单词形态（纯字母且首字母大写+小写、PascalCase 或全小写 ≤12，如 `Bearer Token`、`Basic TypeScript`、`Basic settings`）不打码。
+  3. **键值**：键名（不区分大小写，支持驼峰/下划线/横杠/空格）属于 `{api key, apikey, access token, refresh token, secret, secret key, client secret, password, passwd, pwd, token, auth, private key}`：分隔符为 `=`、`:`、`：` 或 JSON `":"` 时值整体打码；分隔符为 `-` 或 `_`（键名含 `bearer`）且值 ≥12 字符并含数字（排除纯小写 ≥4 字符分段加 `-v\d{1,2}` 的版本号 slug 如 `secret-scanning-pipeline-v2`）时整体打码。
+  4. **URL userinfo**：`scheme://user:pass@host` 中的 `pass` 打码。
+  5. **高熵长串与纯 hex**：含 `-` 或 `_` 分隔的连续 `[A-Za-z0-9_+/=-]` 串按 `-`/`_` 分段判定——仅当某一段自身 ≥20 字符、含字母和数字且 Shannon 熵 ≥3.5，或包含 ≥40 位纯 hex 时打码；不含 `-`/`_` 分隔符的连续 `[A-Za-z0-9_+/=-]` 串按整串 ≥32 字符、含字母和数字且 Shannon 熵 ≥3.5，或纯 hex `[0-9A-Fa-f]` ≥40 字符打码。
+- **已知限制（明确不追）**：
+  - `<32` 字符（或含 `-`/`_` 分隔时单段 `<20` 字符）、无强前缀、无认证或键值上下文的随机串。
+  - `<40` 字符的低熵 hex，或无数字的高熵串（即使 ≥32 字符）。
+  - 跨字段拼接（例如前缀在 `subject`、后缀在 `title`）。
+  - 仅以零宽字符分隔的 `Bearer\u200b...`（清洗 `\p{Cf}` 后无空白分隔且不足 32 字符）。
+
 ## 5. 验证方法
 
 | 层 | 内容 |

@@ -2,9 +2,13 @@ import { createHash } from 'node:crypto';
 import os from 'node:os';
 import type { Fact, SenseState, WatchRule } from '@asi/sense-types';
 import { isRemoteJsonValue } from '@deepseek-ai/dsh-typert-protocol';
-import { isHomeRootShape, toHomeRelative } from '../attention/path.ts';
+import { isHomeRoot, isHomeRootShape, toHomeRelative } from '../attention/path.ts';
 import type { createSenseRuntime } from '../runtime/index.ts';
+import { sanitizeForModel, sanitizeModelId } from './credential-scan.ts';
+import { MODEL_RULE_KINDS } from './kinds.ts';
 import type { JsonValue } from './wire-types.ts';
+
+export { MODEL_RULE_KINDS };
 
 const MAX_BYTES = 32_768;
 const MAX_TITLE_LENGTH = 512;
@@ -1064,6 +1068,16 @@ function hasPathEndpointMetaNormalized(normToken: string): boolean {
       if (deferredColon && !hasDrivePrefix) return true;
       deferredColon = false;
     }
+    if (
+      code === 91 &&
+      normToken.startsWith('[redacted]', i) &&
+      (i === 0 || isSlashChar(normToken.charCodeAt(i - 1))) &&
+      (i + 10 === normToken.length || isSlashChar(normToken.charCodeAt(i + 10)))
+    ) {
+      detIndex += 10;
+      i += 10;
+      continue;
+    }
     if (code === 64 || code === 37 || code === 91 || code === 93) return true;
     if (code === 58) {
       if (detIndex === 1) deferredColon = true;
@@ -1197,6 +1211,8 @@ function isSafeNonPathCore(core: string, host: HostSpec | undefined): boolean {
 
   return isSafeSingleAtom(core);
 }
+
+const REVERSE_DOMAIN_SEG_RE = /^[A-Za-z][A-Za-z0-9-]{0,62}$/;
 
 function isSimpleAsciiAlnumWord(text: string): boolean {
   for (let i = 0; i < text.length; i++) {
@@ -1365,7 +1381,9 @@ function findBoundaryHostMatch(
   return undefined;
 }
 
-function projectModelString(value: string, hostname: string, limit: number, isTitle: boolean): string {
+function projectModelString(rawValue: string, hostname: string, limit: number, isTitle: boolean): string {
+  if (!rawValue) return '';
+  const value = sanitizeForModel(rawValue);
   if (!value) return '';
   const host = analyzeHost(hostname);
   const hostPlaceholder = isTitle ? '<host>' : '[host]';
@@ -1679,12 +1697,18 @@ function truncateName(value: string, limit = MAX_ACTIVITY_NAME): string {
 export function modelActivityName(raw: string, maskHomeRoot = false): string {
   // Stored summaries already contain the '~' placeholder; keep it instead of re-redacting it to [path].
   if (raw === '~') return '~';
-  // Paths at or below a home alias collapse to `~`/`~/…` before the basename projection, so a
-  // custom `globalFileWatch.homedir` is masked exactly like `os.homedir()`.
+  // Paths at or below a home alias collapse to `~`/`~/…` before credential scanning, so a
+  // custom `globalFileWatch.homedir` or test tmp home dir is masked exactly like `os.homedir()`.
   const relative = maskHomeRoot ? toHomeRelative(raw) : undefined;
   if (relative === '~' || (maskHomeRoot && isHomeRootShape(raw))) return '~';
+  if (maskHomeRoot && relative === undefined) {
+    const sanitized = sanitizeForModel(raw);
+    const postRel = toHomeRelative(sanitized);
+    if (postRel === '~' || isHomeRootShape(sanitized)) return '~';
+  }
   const base = modelPath(relative ?? raw);
-  const masked = modelTitle(truncateName(base));
+  if (base === '~') return '~';
+  const masked = projectModelString(truncateName(base), os.hostname(), MAX_TITLE_LENGTH, true);
   return masked.trim() ? masked : '[file]';
 }
 
@@ -1729,7 +1753,9 @@ function isRawSlashOrHomoglyph(raw: string, i: number): boolean {
   return mapped === '/' || mapped === '\\' || ch === '\uff0f' || ch === '\uff3c' || ch === '\ufe68';
 }
 
-export function modelPath(value: string): string {
+export function modelPath(rawValue: string): string {
+  if (!rawValue) return '[path]';
+  const value = sanitizeForModel(rawValue);
   if (!value) return '[path]';
   if (value.length <= MAX_RAW_NORMALIZE_CODEPOINTS * 4) {
     const norm = normalizeFullShort(value);
@@ -1755,7 +1781,7 @@ export function modelPath(value: string): string {
       ) {
         return '[path]';
       }
-      return modelText(rawBase);
+      return projectModelString(rawBase, os.hostname(), MAX_BYTES, false);
     }
     const parts = norm.split(' ').filter(Boolean);
     if (
@@ -1765,7 +1791,7 @@ export function modelPath(value: string): string {
     ) {
       return '[path]';
     }
-    return modelText(norm);
+    return projectModelString(norm, os.hostname(), MAX_BYTES, false);
   }
 
   // Long path fast-path: reject endpoint metadata anywhere, extract trailing segment if bounded.
@@ -1791,23 +1817,55 @@ export function modelPath(value: string): string {
   ) {
     return '[path]';
   }
-  return modelText(normBase);
+  return projectModelString(normBase, os.hostname(), MAX_BYTES, false);
 }
 
 export function modelLabel(value: string): string {
   if (!value || value.length > MAX_RAW_NORMALIZE_CODEPOINTS) return '[redacted]';
-  const norm = normalizeFullShort(value);
-  return /^[\p{L}\p{N}_ -]+$/u.test(norm) ? modelText(norm) : '[redacted]';
+  const norm = normalizeFullShort(sanitizeForModel(value));
+  return norm && /^[\p{L}\p{N}_ -]+$/u.test(norm) ? modelText(norm) : '[redacted]';
 }
 
 export function modelAppName(value: string): string {
-  return Array.from(value.replace(/\p{Cc}/gu, ''))
-    .slice(0, 256)
-    .join('');
+  return Array.from(sanitizeForModel(value)).slice(0, 256).join('');
+}
+
+function modelEventSubject(raw: string, hostname = os.hostname()): string {
+  if (!raw) return '';
+  if (raw === '~' || isHomeRoot(raw)) return '~';
+  const rel = toHomeRelative(raw);
+  if (rel === '~' || isHomeRootShape(raw)) return '~';
+  const target = rel ?? sanitizeForModel(raw);
+  if (target === '~' || isHomeRoot(target) || isHomeRootShape(target)) return '~';
+  if (rel === undefined) {
+    const postRel = toHomeRelative(target);
+    if (postRel === '~') return '~';
+    if (postRel !== undefined) {
+      return truncateRedacted(projectModelString(postRel, hostname, MAX_BYTES, false), 256);
+    }
+  }
+  if (!target) return '';
+  return truncateRedacted(projectModelString(target, hostname, MAX_BYTES, false), 256);
+}
+
+function modelBundleId(value: string, hostname = os.hostname()): string {
+  if (!value) return '';
+  const id = sanitizeModelId(value);
+  if (id.redacted) return '[redacted]';
+  const cleaned = id.value;
+  if (!cleaned) return '';
+  if (cleaned.length > 128 || (hostname && cleaned.toLowerCase().includes(hostname.toLowerCase()))) return '[redacted]';
+  const segments = cleaned.split('.');
+  if (segments.length < 2 || segments.length > 8 || !segments.every((seg) => REVERSE_DOMAIN_SEG_RE.test(seg))) {
+    return '[redacted]';
+  }
+  return cleaned;
 }
 
 function identifier(value: string): string {
-  return /^[\w-]+$/.test(value) ? modelText(value) : '[redacted]';
+  const id = sanitizeModelId(value);
+  if (id.redacted) return '[redacted]';
+  return /^[\w-]+$/.test(id.value) ? modelText(id.value) : '[redacted]';
 }
 
 function isSourceIdentifier(value: string): boolean {
@@ -1871,7 +1929,12 @@ function dictionary<T>(
 
 function observations(state: SenseState['observation']) {
   return {
-    sources: dictionary(state.sources, sourceIdentifier, (source) => pick(source, ['status', 'lastSignalAt']), true),
+    sources: dictionary(
+      state.sources,
+      sourceIdentifier,
+      (source) => pick(source, ['status', 'lastSignalAt', 'capped']),
+      true,
+    ),
   };
 }
 
@@ -1922,7 +1985,10 @@ export function modelState(state: SenseState, now: number, section?: 'self' | 'e
         observed: fact(env.where.observed, () => ({})),
         toolExec: fact(env.where.toolExec, (value) => ({ cwd: modelActivityName(value.cwd, true) })),
       },
-      frontApp: fact(env.frontApp, (value) => ({ name: modelAppName(value.name) })),
+      frontApp: fact(env.frontApp, (value) => ({
+        name: modelAppName(value.name),
+        ...(typeof value.bundleId === 'string' ? { bundleId: modelBundleId(value.bundleId) } : {}),
+      })),
       focusedWindow: fact(env.focusedWindow, (value) => ({ title: value.title })),
       activeJobs: fact(env.activeJobs, (value) =>
         value.map((job) => ({ ...pick(job, ['startedAt', 'status', 'exitCode']), id: identifier(job.id) })),
@@ -1967,40 +2033,10 @@ export function modelState(state: SenseState, now: number, section?: 'self' | 'e
   return projectModelOutput(
     section ? projected[section] : projected,
     now,
-    ['env.frontApp.value.name', 'frontApp.value.name'],
+    ['env.frontApp.value.name', 'frontApp.value.name', 'env.frontApp.value.bundleId', 'frontApp.value.bundleId'],
     ['watchedPaths.value', 'env.watchedPaths.value'],
   );
 }
-
-export const MODEL_RULE_KINDS: ReadonlySet<string> = new Set([
-  'app.activated',
-  'app.launched',
-  'app.terminated',
-  'window.focused',
-  'window.title-changed',
-  'file.changed',
-  'file.activity',
-  'job.started',
-  'job.exited',
-  'job.failed',
-  'process.started',
-  'process.exited',
-  'source.status',
-  'source.error',
-  'body.threshold',
-  'body.rate',
-  'body.anomaly',
-  'file.burst',
-  'fact.updated',
-  'delivery.target-unavailable',
-  'system.sleep',
-  'system.wake',
-  'screen.locked',
-  'screen.unlocked',
-  'session.active',
-  'session.inactive',
-  'away.summary',
-]);
 
 export function modelRules(rules: WatchRule[]): JsonValue {
   const kinds = MODEL_RULE_KINDS;
@@ -2195,8 +2231,11 @@ export function environmentDetail(
   const axStatus = observation.sources['helper.ax']?.status;
   const countDenied = axStatus === 'denied' || axStatus === 'unsupported';
   const title = env.focusedWindow.value?.title;
+  const safeBundle = typeof front?.bundleId === 'string' ? modelBundleId(front.bundleId) : undefined;
   const matchesApp =
-    front === null ? null : app === undefined || app === modelAppName(front.name) || app === front.bundleId;
+    front === null
+      ? null
+      : app === undefined || app === modelAppName(front.name) || (safeBundle !== '[redacted]' && app === safeBundle);
   const matchesWindow = window === undefined ? true : title === undefined ? null : modelTitle(title) === window;
   const available = matchesApp === true && matchesWindow === true;
   const mismatch = matchesApp === false || matchesWindow === false;
@@ -2219,7 +2258,13 @@ export function environmentDetail(
           ),
         )
         .slice(-20)
-        .map(({ kind, subject, at, level }) => ({ kind, subject: modelAppName(subject), at, level }))
+        .map(({ kind, subject, at, level, source }) => ({
+          kind,
+          subject: modelEventSubject(subject),
+          at,
+          level,
+          source: { id: sourceIdentifier(source.id), api: sourceIdentifier(source.api) },
+        }))
     : [];
   return modelOutput(
     {
@@ -2229,6 +2274,7 @@ export function environmentDetail(
         ? null
         : fact(env.frontApp, (value) => ({
             name: modelAppName(value.name),
+            ...(safeBundle !== undefined ? { bundleId: safeBundle } : {}),
             ...pick(value, ['pid', ...(countFresh && !countDenied ? ['windowCount'] : [])]),
           })),
       window: mismatch ? null : fact(env.focusedWindow, (value) => ({ title: value.title })),
@@ -2239,6 +2285,6 @@ export function environmentDetail(
       guidance: '如需查看窗口内容，请使用当前会话可用的 computer-use 工具（需经其授权流程）',
     },
     undefined,
-    ['app.value.name', 'recentEvents.kind', 'guidance'],
+    ['app.value.name', 'app.value.bundleId', 'recentEvents.kind', 'recentEvents.subject', 'guidance'],
   );
 }

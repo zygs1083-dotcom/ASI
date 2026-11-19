@@ -1,4 +1,5 @@
 import type { EnvChange, EnvUpdate, Signal } from '@asi/sense-types';
+import { sanitizeForModel, sanitizeModelId, sanitizeSignalId } from '../dsh/credential-scan.ts';
 import { isAnomalousAwayMetric } from '../runtime/away.ts';
 
 /** Options for {@link formatEnvUpdate}. */
@@ -30,7 +31,27 @@ function esc(s: string): string {
 }
 
 function str(v: unknown): string {
-  return typeof v === 'string' ? v : '';
+  return typeof v === 'string' ? sanitizeForModel(v) : '';
+}
+
+function safeEsc(v: unknown): string {
+  return esc(str(v));
+}
+
+function fin(v: unknown): v is number {
+  return typeof v === 'number' && Number.isFinite(v);
+}
+
+/** Splits `file.burst` deletions into external vs agent counts, suppressing total `deleted` when mixed. */
+export function resolveBurstDeletions(data: Record<string, unknown>) {
+  const agentDeleted = fin(data.agentDeleted) && data.agentDeleted >= 0 ? data.agentDeleted : undefined;
+  const externalDeleted =
+    fin(data.externalDeleted) && data.externalDeleted >= 0
+      ? data.externalDeleted
+      : fin(data.deleted) && agentDeleted !== undefined && data.deleted >= agentDeleted
+        ? data.deleted - agentDeleted
+        : undefined;
+  return { externalDeleted, agentDeleted, skipMixedDeleted: externalDeleted !== undefined && (agentDeleted ?? 0) > 0 };
 }
 
 function fileVerb(change: unknown): 'created' | 'saved' | 'deleted' | 'renamed' {
@@ -134,15 +155,15 @@ function changeLines(ch: EnvChange, includeTitles: boolean, includeJobCommands: 
   const summary = s.data.jobSummary;
   if (summary && typeof summary === 'object' && !Array.isArray(summary)) {
     const { total, omitted, recent } = summary as Record<string, unknown>;
-    if (typeof total === 'number' && typeof omitted === 'number' && Array.isArray(recent)) {
+    if (fin(total) && fin(omitted) && Array.isArray(recent)) {
       return [
         `jobs: ${total} events`,
         ...recent.flatMap((item: unknown) => {
           if (!item || typeof item !== 'object') return [];
           const { id, kind, count, exitCode } = item as Record<string, unknown>;
-          if (typeof id !== 'string' || !['job.exited', 'job.started'].includes(String(kind))) return [];
+          if (typeof id !== 'string' || !id.trim() || !['job.exited', 'job.started'].includes(String(kind))) return [];
           return [
-            `job: \`${esc(id)}\` ${kind === 'job.exited' ? 'exited' : 'started'}${typeof exitCode === 'number' ? ` ${exitCode}` : ''}${typeof count === 'number' && count > 1 ? ` ×${count}` : ''}`,
+            `job: \`${safeEsc(id)}\` ${kind === 'job.exited' ? 'exited' : 'started'}${fin(exitCode) ? ` ${exitCode}` : ''}${fin(count) && count > 1 ? ` ×${count}` : ''}`,
           ];
         }),
         ...(omitted > 0 ? [`另有 ${omitted} 个未列出`] : []),
@@ -150,58 +171,61 @@ function changeLines(ch: EnvChange, includeTitles: boolean, includeJobCommands: 
     }
   }
   if (s.kind === 'app.activated') {
-    main = `front-app: ${esc(typeof s.data.name === 'string' ? s.data.name : s.subject)}`;
+    main = `front-app: ${safeEsc(typeof s.data.name === 'string' ? s.data.name : s.subject)}`;
     const prev = str(s.data.previousName);
     if (prev) main += ` (was: ${esc(prev)})`;
   } else if (s.kind === 'app.launched' || s.kind === 'app.terminated') {
     const verb = s.kind === 'app.launched' ? 'launched' : 'terminated';
-    main = `app: ${esc(str(s.data.name) || s.subject)} ${verb}`;
+    main = `app: ${esc(str(s.data.name) || str(s.subject))} ${verb}`;
   } else if (WINDOW_KINDS.has(s.kind)) {
     if (!includeTitles) return [];
-    main = `window: ${esc(str(s.data.title))}`;
+    main = `window: ${safeEsc(s.data.title)}`;
   } else if (s.kind === 'file.changed') {
-    const path = str(s.data.path) || s.subject;
+    const path = str(s.data.path) || str(s.subject);
     main = `file: ${esc(path)} ${fileVerb(s.data.change)}${ch.count > 1 ? ` ×${ch.count}` : ''}`;
   } else if (s.kind === 'job.started' || s.kind === 'process.started') {
     const label = s.kind === 'job.started' ? 'job' : 'process';
-    main = `${label}: \`${esc(str(s.data.id) || s.subject)}\` started`;
+    const idText = str(s.data.id).trim() ? str(s.data.id) : str(s.subject) || label;
+    main = `${label}: \`${esc(idText)}\` started`;
   } else if (s.kind === 'job.failed') {
-    const cmd = includeJobCommands ? str(s.data.command) || s.subject : str(s.data.id) || s.subject;
+    const idText = str(s.data.id).trim() ? str(s.data.id) : str(s.subject) || 'job';
+    const cmd = includeJobCommands ? str(s.data.command) || idText : idText;
     main = `job.failed: \`${esc(cmd)}\``;
-    if (typeof s.data.exitCode === 'number') main += ` ${s.data.exitCode}`;
+    if (typeof s.data.exitCode === 'number' && Number.isFinite(s.data.exitCode)) main += ` ${s.data.exitCode}`;
     const dur = durationMs(s);
     if (dur !== undefined) main += ` after ${Math.round(dur / 1000)}s`;
   } else if (s.kind === 'job.exited' || s.kind === 'process.exited') {
     const label = s.kind === 'job.exited' ? 'job' : 'process';
-    const cmd = includeJobCommands ? str(s.data.command) || s.subject : str(s.data.id) || label;
+    const idText = str(s.data.id).trim() ? str(s.data.id) : label;
+    const cmd = includeJobCommands ? str(s.data.command) || str(s.subject) || idText : idText;
     main = `${label}: \`${esc(cmd)}\` exited`;
-    if (typeof s.data.exitCode === 'number') main += ` ${s.data.exitCode}`;
+    if (typeof s.data.exitCode === 'number' && Number.isFinite(s.data.exitCode)) main += ` ${s.data.exitCode}`;
     const dur = durationMs(s);
     if (dur !== undefined) main += ` after ${Math.round(dur / 1000)}s`;
   } else if (s.kind === 'body.threshold') {
-    main = `body: ${esc(s.subject)} ${esc(str(s.data.severity) || '?')}`;
+    main = `body: ${safeEsc(s.subject)} ${esc(str(s.data.severity) || '?')}`;
     const v = s.data.value;
     if (typeof v === 'number' && Number.isFinite(v)) main += ` ${v}`;
-    else if (typeof v === 'string') main += ` ${esc(v)}`;
+    else if (typeof v === 'string') main += ` ${safeEsc(v)}`;
   } else if (s.kind === 'body.anomaly' && s.data.type === 'rebaseline-suggestion') {
-    const target = str(s.data.metric) || s.subject.replace(/^(?:rebaseline|baseline):/, '') || s.subject;
+    const target = str(s.data.metric) || str(s.subject).replace(/^(?:rebaseline|baseline):/, '') || str(s.subject);
     main = `建议重新基线：${esc(target)}`;
   } else if (s.kind === 'body.rate' || s.kind === 'body.anomaly' || s.kind === 'file.burst') {
-    const directory =
-      s.kind === 'file.burst' && typeof s.data?.directory === 'string' && s.data.directory.trim()
-        ? s.data.directory
-        : '';
+    const directory = typeof s.data?.directory === 'string' && s.data.directory.trim() ? str(s.data.directory) : '';
     const head = s.kind === 'file.burst' ? directory || str(s.subject) || '[path]' : str(s.subject);
     main = `${esc(s.kind)}: ${esc(head)}`;
-    if (s.kind !== 'file.burst' && typeof s.data.metric === 'string' && s.data.metric && s.data.metric !== s.subject) {
-      main += ` metric=${esc(s.data.metric)}`;
+    const safeMetric = str(s.data.metric);
+    if (s.kind !== 'file.burst' && safeMetric && safeMetric !== str(s.subject)) {
+      main += ` metric=${esc(safeMetric)}`;
     }
-    if (typeof s.data.ruleId === 'string') main += ` ruleId=${esc(s.data.ruleId)}`;
-    if (typeof s.data.severity === 'string') main += ` ${esc(s.data.severity)}`;
+    if (typeof s.data.ruleId === 'string') main += ` ruleId=${esc(sanitizeModelId(s.data.ruleId).value)}`;
+    if (typeof s.data.severity === 'string') main += ` ${safeEsc(s.data.severity)}`;
     const etaKey =
       typeof s.data.etaToFloorMs === 'number' && Number.isFinite(s.data.etaToFloorMs)
         ? 'etaToFloorMs'
         : 'timeToFloorMs';
+    const { externalDeleted: burstExt, skipMixedDeleted } =
+      s.kind === 'file.burst' ? resolveBurstDeletions(s.data) : { externalDeleted: undefined, skipMixedDeleted: false };
     for (const key of [
       'value',
       'baseline',
@@ -216,7 +240,8 @@ function changeLines(ch: EnvChange, includeTitles: boolean, includeJobCommands: 
       'externalDeleted',
       'agentDeleted',
     ]) {
-      const value = s.data[key];
+      if (key === 'deleted' && skipMixedDeleted) continue;
+      const value = key === 'externalDeleted' && burstExt !== undefined ? burstExt : s.data[key];
       if (typeof value === 'number' && Number.isFinite(value)) {
         main += key === 'deviation' ? ` ${key}=${value}σ` : ` ${key}=${value}`;
       }
@@ -224,7 +249,7 @@ function changeLines(ch: EnvChange, includeTitles: boolean, includeJobCommands: 
     if (s.data.externalDeletionExceeded === true) main += ' externalDeletionExceeded=true';
     if (s.kind === 'file.burst' && s.data.rolledUp === true) main += ' rolledUp=true';
   } else if (s.kind === 'file.activity') {
-    const directory = typeof s.data?.directory === 'string' && s.data.directory.trim() ? s.data.directory : '';
+    const directory = typeof s.data?.directory === 'string' && s.data.directory.trim() ? str(s.data.directory) : '';
     const head = directory || str(s.subject) || '[path]';
     main = `file.activity: ${esc(head)}`;
     for (const key of ['windowMs', 'created', 'modified', 'deleted']) {
@@ -240,12 +265,12 @@ function changeLines(ch: EnvChange, includeTitles: boolean, includeJobCommands: 
       const files = s.data.files
         .filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
         .slice(0, 5)
-        .map((item) => esc(item));
+        .map((item) => safeEsc(item));
       if (files.length > 0) main += ` files=[${files.join(', ')}]`;
     }
     if (s.data?.degraded === true) main += ' degraded=true';
   } else if (s.kind === 'source.status') {
-    const src = str(s.data.source) || s.subject;
+    const src = str(s.data.source) || str(s.subject);
     main = `source.status: ${esc(src)}`;
     const status = str(s.data.status);
     if (status) main += ` status=${esc(status)}`;
@@ -256,7 +281,7 @@ function changeLines(ch: EnvChange, includeTitles: boolean, includeJobCommands: 
     const error = str(s.data.error);
     if (error && error !== reason) main += ` error=${esc(error)}`;
   } else if (s.kind === 'source.error') {
-    const src = str(s.data.source) || s.subject;
+    const src = str(s.data.source) || str(s.subject);
     main = `source.error: ${esc(src)}`;
     const error = str(s.data.error) || str(s.data.category);
     if (error) main += ` error=${esc(error)}`;
@@ -359,7 +384,7 @@ function changeLines(ch: EnvChange, includeTitles: boolean, includeJobCommands: 
         ? Math.round(s.data.deletedCount)
         : deletedFromBursts;
     if (deleted > 0 || burstCount > 0) {
-      const safeDir = directory ? `@${truncateEscapedRaw(directory, 256)}` : '';
+      const safeDir = directory ? `@${truncateEscapedRaw(str(directory), 256)}` : '';
       main += ` deletes=${deleted}${safeDir}`;
     }
     if (typeof s.data.omitted === 'number' && Number.isFinite(s.data.omitted) && s.data.omitted > 0) {
@@ -372,16 +397,21 @@ function changeLines(ch: EnvChange, includeTitles: boolean, includeJobCommands: 
     // Internal seam: a focused-window fact update still carries a title —
     // hide it entirely when titles are disabled.
     if (!includeTitles && s.data.path === 'env.focusedWindow') return [];
-    main = `${esc(s.kind)}: ${esc(str(s.data.path) || s.subject)}`;
+    main = `${safeEsc(s.kind)}: ${esc(str(s.data.path) || str(s.subject))}`;
   } else {
     // Generic fallback: kind + subject only — never dumps arbitrary data.
-    main = `${esc(s.kind)}: ${esc(s.subject)}`;
+    main = `${safeEsc(s.kind)}: ${safeEsc(s.subject)}`;
   }
-  if (ch.ruleId) main += ` [rule: ${esc(ch.ruleId)} → ${ch.level}]`;
+  if (ch.ruleId) main += ` [rule: ${esc(sanitizeModelId(ch.ruleId).value)} → ${ch.level}]`;
   if (typeof s.data.feedbackAvailable === 'boolean' && s.data.type !== 'rebaseline-suggestion') {
-    const bytes = Buffer.from(s.id, 'utf8');
+    const safeId = sanitizeSignalId(s.id);
+    const bytes = Buffer.from(safeId.value, 'utf8');
     const available =
-      s.data.feedbackAvailable && bytes.length > 0 && bytes.length <= 256 && bytes.toString('utf8') === s.id;
+      s.data.feedbackAvailable &&
+      !safeId.redacted &&
+      bytes.length > 0 &&
+      bytes.length <= 256 &&
+      bytes.toString('utf8') === safeId.value;
     main += available
       ? ` alertId="${bytes.toString('base64url')}" feedbackAvailable="true"`
       : ' feedbackAvailable="false"';
@@ -392,12 +422,12 @@ function changeLines(ch: EnvChange, includeTitles: boolean, includeJobCommands: 
     const lines = [boundedMain];
     if (ch.note) {
       const remainingNoteBytes = Math.max(32, 1900 - Buffer.byteLength(boundedMain, 'utf8'));
-      lines.push(`note: ${truncateEscapedRaw(ch.note, remainingNoteBytes)}`);
+      lines.push(`note: ${truncateEscapedRaw(str(ch.note), remainingNoteBytes)}`);
     }
     return lines;
   }
   const lines = [main];
-  if (ch.note) lines.push(`note: ${esc(ch.note)}`);
+  if (ch.note) lines.push(`note: ${safeEsc(ch.note)}`);
   return lines;
 }
 

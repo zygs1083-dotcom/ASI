@@ -306,7 +306,8 @@ describe('home aliases (B1/B2/S1)', () => {
       };
       expect(history.events).toHaveLength(1);
       expect(history.events[0]?.subject).toBe('~');
-      expect(history.events[0]?.detail).toMatchObject({ directory: '~', files: ['note.md'] });
+      expect(history.events[0]?.detail).toMatchObject({ directory: '~', modified: 1 });
+      expect(history.events[0]?.detail?.files).toBeUndefined();
       expect(JSON.stringify(history)).not.toContain('demo_acct');
 
       const delivered = await deliverEvent(runtime, wall);

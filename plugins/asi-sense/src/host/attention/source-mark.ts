@@ -12,7 +12,7 @@ import type { SessionState } from './pipeline-types.ts';
 export function sourceMarkSeen(s: SessionState, ev: Signal): boolean {
   if (ev.data.preserveSourceStatus === true) return false;
   const prev = s.srcStatus.get(ev.source.id);
-  const next = sourceObservation(ev);
+  const next = sourceObservation(ev, prev);
   const sequence = ev.data.sequence;
   const previous = s.srcSequence.get(ev.source.id);
   if (

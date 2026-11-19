@@ -120,7 +120,7 @@ export interface SenseState {
     system?: Fact<SystemStateValue>;
   };
   observation: {
-    sources: Record<string, { status: FactStatus; lastSignalAt: number; error?: string }>;
+    sources: Record<string, { status: FactStatus; lastSignalAt: number; error?: string; capped?: boolean }>;
   };
 }
 

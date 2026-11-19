@@ -622,4 +622,26 @@ describe('formatEnvUpdate', () => {
     expect(out).not.toContain('file-0.ts');
     expect(out).toContain('file-13.ts');
   });
+
+  it('separates externalDeleted from agentDeleted in file.burst and ignores non-finite job numbers / empty id', () => {
+    const burst = sig({
+      id: 'fb',
+      kind: 'file.burst',
+      at: T0,
+      subject: 'proj',
+      data: { directory: 'proj', created: 1, modified: 2, deleted: 55, agentDeleted: 4 },
+    });
+    const job = sig({
+      id: 'je',
+      kind: 'job.exited',
+      at: T0 + 1,
+      subject: 'build',
+      data: { id: '  ', exitCode: Number.NaN, durationMs: Number.POSITIVE_INFINITY },
+    });
+    const out = formatEnvUpdate(update([change({ signal: burst }), change({ signal: job })]));
+    expect(out).toContain('file.burst: proj created=1 modified=2 externalDeleted=51 agentDeleted=4');
+    expect(out).not.toContain('deleted=55');
+    expect(out).toContain('job: `build` exited');
+    expect(out).not.toContain('NaN');
+  });
 });

@@ -271,6 +271,9 @@ export class RuntimeAttention {
   snapshotEntries(): EventEntry[] {
     return structuredClone(this.entries);
   }
+  restoreSourceObservation(signal: Signal): void {
+    this.store.apply(signal, () => this.changed());
+  }
   /** Merge pre-clear entries back in front of entries recorded during a failed clear. */
   restoreEntriesPreservingLive(entries: readonly EventEntry[]): void {
     const liveIds = new Set(this.entries.map((entry) => entry.id));
@@ -506,7 +509,7 @@ export class RuntimeAttention {
     if (this.stopped) return;
     const session = this.selected && this.sessions.get(this.selected);
     if (!session) {
-      const priorStatus = this.store.sourceStatus(signal.source.id);
+      const priorObs = this.store.sourceObs(signal.source.id);
       await new Promise<void>((resolve, reject) =>
         this.store.apply(signal, (result) => {
           try {
@@ -524,7 +527,7 @@ export class RuntimeAttention {
             }
             if (
               (signal.kind === 'source.status' || signal.kind === 'source.error') &&
-              priorStatus === sourceObservation(signal).status
+              priorObs?.status === sourceObservation(signal, priorObs).status
             ) {
               level = 'record';
             }
@@ -574,9 +577,9 @@ export class RuntimeAttention {
     const monoFor = (signal: Signal) => nowMono - Math.max(0, nowWall - signal.at);
     const session = this.selected && this.sessions.get(this.selected);
     if (!session) {
-      const priorStatuses = new Map<string, ReturnType<typeof this.store.sourceStatus>>();
+      const priorObsMap = new Map<string, ReturnType<typeof this.store.sourceObs>>();
       for (const s of signals) {
-        if (!priorStatuses.has(s.source.id)) priorStatuses.set(s.source.id, this.store.sourceStatus(s.source.id));
+        if (!priorObsMap.has(s.source.id)) priorObsMap.set(s.source.id, this.store.sourceObs(s.source.id));
       }
       await new Promise<void>((resolve, reject) =>
         this.store.applyBatch(signals, (results) => {
@@ -599,9 +602,10 @@ export class RuntimeAttention {
                 level = 'context';
                 reason = 'rule-pending-approval';
               }
+              const priorObs = priorObsMap.get(signal.source.id);
               if (
                 (signal.kind === 'source.status' || signal.kind === 'source.error') &&
-                priorStatuses.get(signal.source.id) === sourceObservation(signal).status
+                priorObs?.status === sourceObservation(signal, priorObs).status
               ) {
                 level = 'record';
               }

@@ -1,5 +1,13 @@
 import { performance } from 'node:perf_hooks';
-import type { Fact, FactStatus, JobSummary, SenseState, Signal, SystemStateValue } from '@asi/sense-types';
+import type {
+  Fact,
+  FactStatus,
+  JobSummary,
+  SenseState,
+  Signal,
+  SourceObservation,
+  SystemStateValue,
+} from '@asi/sense-types';
 import { FactExpiry } from './expiry.ts';
 import { FACT_PATHS, factAt, initialState, num, recomputeStatuses, str, ttlOf } from './facts.ts';
 import { type ApplyResult, SignalIntake } from './intake.ts';
@@ -98,6 +106,9 @@ export class StateStore {
   }
   sourceStatus(id: string): FactStatus | undefined {
     return this.state.observation.sources[id]?.status;
+  }
+  sourceObs(id: string): SourceObservation | undefined {
+    return this.state.observation.sources[id];
   }
   batch<T>(work: () => T, publish: () => void = () => {}): T {
     if (this.batchState) return work();
@@ -347,6 +358,6 @@ export class StateStore {
   private updateSource(signal: Signal): void {
     if (signal.data.preserveSourceStatus === true) return;
     const sources = this.state.observation.sources;
-    sources[signal.source.id] = sourceObservation(signal);
+    sources[signal.source.id] = sourceObservation(signal, sources[signal.source.id]);
   }
 }

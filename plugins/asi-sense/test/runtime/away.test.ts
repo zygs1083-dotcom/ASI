@@ -296,8 +296,8 @@ describe('away detection', () => {
             BASE + 10 * MINUTE,
             {
               directory: '/Users/alice/build',
-              deleted: 120,
-              externalDeleted: 120,
+              deleted: 124,
+              agentDeleted: 4,
               externalDeletionExceeded: true,
             },
             '/Users/alice/build',
@@ -314,6 +314,7 @@ describe('away detection', () => {
       const data = awaySummary(h);
       expect(data?.hasAnomaly, testCase.name).toBe(true);
       expect(data?.anomalies, testCase.name).toContain(testCase.expected);
+      if (testCase.expected === 'external-deletion') expect(data?.deletedCount).toBe(120);
       await h.flush();
       // A competing wake in the same window (a failed job) may spend the wake
       // budget, downgrading the summary to context; it is still delivered.

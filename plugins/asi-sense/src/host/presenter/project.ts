@@ -28,8 +28,20 @@ const displayValue = (value: number | string | boolean): number | string =>
   typeof value === 'boolean' ? String(value) : value;
 
 export function projectState(state: SenseState): SensePanelModel['state'] {
+  const histSource = state.observation.sources.history;
+  const sources =
+    histSource?.error === 'daily-limit-exceeded'
+      ? {
+          ...state.observation.sources,
+          history: { ...histSource, capped: true, error: '今日已达上限，后续只记汇总' },
+        }
+      : state.observation.sources;
   return {
     ...state,
+    observation: {
+      ...state.observation,
+      sources,
+    },
     env: {
       ...state.env,
       activeJobs: {
