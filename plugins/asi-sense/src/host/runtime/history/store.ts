@@ -1178,7 +1178,9 @@ export class HistoryManager {
       ) {
         today = this.cachedToday.summary;
       } else {
-        const finished = this.todayAcc.snapshot();
+        const finished = this.todayAcc.snapshot(
+          this.cappedDates.has(this.currentDate) ? { truncatedAtLimit: true } : undefined,
+        );
         this.foldPendingIntoDailySummary(finished, this.currentDate);
         this.applyDayExtensions(finished, this.currentDate);
         today = isEmptyDailySummary(finished) ? undefined : finished;
@@ -1430,7 +1432,22 @@ export class HistoryManager {
 
     this.flushPendingActivity((b) => b.date < nextDate);
 
-    const prevProvisional = this.todayAcc && diffDays(nextDate, prevDate) === 1 ? this.todayAcc.snapshot() : undefined;
+    const prevWasCapped = this.cappedDates.has(prevDate);
+    let prevPendingHydration: { date: string; epoch: number; liveLines: string[] } | undefined;
+    const prevEpoch = this.clearEpoch;
+    if (this.pendingTodayHydration?.date === prevDate && this.pendingTodayHydration.epoch === prevEpoch) {
+      prevPendingHydration = this.pendingTodayHydration;
+      this.pendingTodayHydration = undefined;
+      if (this.todayHydrationTimer) {
+        clearTimeout(this.todayHydrationTimer);
+        this.todayHydrationTimer = undefined;
+      }
+    }
+    const prevAcc = !prevPendingHydration ? this.todayAcc : undefined;
+    const prevProvisional =
+      prevAcc && diffDays(nextDate, prevDate) === 1
+        ? prevAcc.snapshot(prevWasCapped ? { truncatedAtLimit: true } : undefined)
+        : undefined;
     if (prevProvisional) this.applyDayExtensions(prevProvisional, prevDate);
 
     const prevAliveAt = this.lastAliveAt;
@@ -1451,20 +1468,36 @@ export class HistoryManager {
       try {
         const size = await this.safeEventFileSize(prevDate);
         if (this.isEpochStale(epoch)) return;
-        const acc = createDailySummaryAccumulator(prevDate, prevBounds, {
+        const truncatedAtLimit = prevWasCapped || this.cappedDates.has(prevDate) || size >= this.maxDailyBytes;
+        const rolloverOpts = {
           isRunningAtEnd: continuous,
           liveEndMs: continuous ? prevBounds.endMs : undefined,
-          truncatedAtLimit: this.cappedDates.has(prevDate) || size >= this.maxDailyBytes,
-        });
-        let sawLine = false;
-        for await (const line of this.streamLinesForward(prevDate)) {
+          truncatedAtLimit,
+        };
+        let daily: DailySummary | undefined;
+        if (prevAcc) {
+          if (prevAcc.hasRecords() || size > 0) {
+            daily = prevAcc.finish(rolloverOpts);
+          }
+        } else {
+          const acc = createDailySummaryAccumulator(prevDate, prevBounds, rolloverOpts);
+          let sawLine = false;
+          for await (const line of this.streamLinesForward(prevDate)) {
+            if (this.isEpochStale(epoch)) return;
+            acc.feed(line);
+            sawLine = true;
+          }
           if (this.isEpochStale(epoch)) return;
-          acc.feed(line);
-          sawLine = true;
+          const liveLines = prevPendingHydration?.liveLines ?? [];
+          for (const raw of liveLines) {
+            acc.feed(raw);
+            sawLine = true;
+          }
+          if (sawLine || size > 0) {
+            daily = acc.finish();
+          }
         }
-        if (this.isEpochStale(epoch)) return;
-        if (sawLine || size > 0) {
-          const daily = acc.finish();
+        if (daily) {
           this.applyDayExtensions(daily, prevDate);
           await this.port.writeDaily(prevDate, JSON.stringify(daily));
           if (this.isEpochStale(epoch)) return;
@@ -1972,12 +2005,17 @@ export class HistoryManager {
         truncatedAtLimit: this.cappedDates.has(nextDate) || size >= this.maxDailyBytes,
       });
       let sawLine = false;
+      let fileBytes = 0;
+      let nonFileBytes = 0;
       let sliceStart = performance.now();
       for await (const line of this.streamLinesForward(nextDate)) {
         if (this.isEpochStale(epoch)) {
           this.clearPendingForEpoch(epoch);
           return;
         }
+        const lineBytes = Buffer.byteLength(line, 'utf8') + 1;
+        if (this.classifyLineTier(line) === 'file') fileBytes += lineBytes;
+        else nonFileBytes += lineBytes;
         acc.feed(line);
         sawLine = true;
         if (this.activeQueries > 0 || performance.now() - sliceStart >= 16) {
@@ -1994,7 +2032,14 @@ export class HistoryManager {
         return;
       }
       if (sawLine || size > 0) {
-        const daily = acc.finish();
+        const tierCapped =
+          fileBytes >= this.maxFileDailyBytes ||
+          nonFileBytes >= this.maxNonFileDailyBytes ||
+          size >= this.maxDailyBytes;
+        const daily = acc.finish({
+          isRunningAtEnd: false,
+          truncatedAtLimit: this.cappedDates.has(nextDate) || tierCapped,
+        });
         this.applyDayExtensions(daily, nextDate);
         const dailyJson = JSON.stringify(daily);
         if (this.isEpochStale(epoch)) {

@@ -716,7 +716,8 @@ export function createDailySummaryAccumulator(date: string, bounds: DayBounds, o
     return out;
   }
 
-  function buildSummary(retainState: boolean): DailySummary {
+  function buildSummary(retainState: boolean, overrideOptions?: SummarizeDayOptions): DailySummary {
+    const summaryOptions = overrideOptions ?? options;
     const totalEvents = seenEvents.size;
     const apps: Record<string, DailyAppStats> = Object.create(null) as Record<string, DailyAppStats>;
     let appSwitches = 0;
@@ -767,7 +768,7 @@ export function createDailySummaryAccumulator(date: string, bounds: DayBounds, o
         otherSortedArr.sort();
       }
 
-      const machine = createLifecycleMachine(bounds, options, apps);
+      const machine = createLifecycleMachine(bounds, summaryOptions, apps);
       let lcPtr = 0;
       let actPtr = 0;
       let otherPtr = 0;
@@ -884,7 +885,7 @@ export function createDailySummaryAccumulator(date: string, bounds: DayBounds, o
       system,
       coverage: { observedMs, pausedMs, notRunningMs },
       totalEvents,
-      ...(options.truncatedAtLimit ? { truncatedAtLimit: true } : {}),
+      ...(summaryOptions.truncatedAtLimit ? { truncatedAtLimit: true } : {}),
     };
   }
 
@@ -1051,12 +1052,16 @@ export function createDailySummaryAccumulator(date: string, bounds: DayBounds, o
       seenEvents.set(id, packEventState(levelCode, reasonCode, kindTag, ruleIdx, slotIdx));
     },
 
-    snapshot(): DailySummary {
-      return buildSummary(true);
+    hasRecords(): boolean {
+      return seenEvents.size > 0 || lifecycle.length > 0;
     },
 
-    finish(): DailySummary {
-      return buildSummary(false);
+    snapshot(overrideOptions?: SummarizeDayOptions): DailySummary {
+      return buildSummary(true, overrideOptions);
+    },
+
+    finish(overrideOptions?: SummarizeDayOptions): DailySummary {
+      return buildSummary(false, overrideOptions);
     },
   };
 }

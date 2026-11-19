@@ -3392,4 +3392,107 @@ describe('runtime history persistence, rollups, retention, and recovery', () => 
     expect(deliveredNoSess.some((d) => d.includes('daily-limit-exceeded'))).toBe(false);
     await rtNoSess.stop();
   });
+
+  it('persists rollover daily summary from in-memory accumulator after cap and rebuilds mid-day restart cleanly', async () => {
+    const dir = await makeTempDir();
+    const port = new FileHistoryStoragePort(dir);
+    let wall = Date.UTC(2026, 10, 18, 23, 50, 0);
+    let mono = 1_000;
+    const mgr = new HistoryManager({
+      port,
+      clock: { wall: () => wall, mono: () => mono },
+      isPaused: () => false,
+      titlesAllowed: () => true,
+      restoreEntries: () => {},
+      clearMemoryEntries: () => {},
+      emitSourceError: () => {},
+      emitSourceOk: () => {},
+      timeZone: 'UTC',
+      maxNonFileDailyBytes: 250,
+    });
+    await mgr.start(false);
+
+    // First 1-2 events fill the 250B non-file budget on disk, remaining events still count in todayAcc
+    for (let i = 0; i < 10; i++) {
+      wall += 1_000;
+      mono += 1_000;
+      mgr.recordEvent({
+        id: `ev-roll-${i}`,
+        kind: 'app.activated',
+        subject: `App-${i}-${'x'.repeat(40)}`,
+        level: 'record',
+        at: wall,
+        source: { id: 'helper', api: 'ndjson', host: 'local' },
+      });
+    }
+    await mgr.query({});
+
+    const diskDay1 = parseHistoryLines((await port.readEvents('2026-11-18')) ?? '');
+    expect(diskDay1.events.length).toBeLessThan(10);
+    const todayBeforeRollover = mgr.timelineSnapshots().today;
+    expect(todayBeforeRollover?.totalEvents).toBe(10);
+    expect(todayBeforeRollover?.truncatedAtLimit).toBe(true);
+
+    // Cross midnight into 2026-11-19: persisted daily/2026-11-18.json and yesterday must match in-memory count 10
+    wall = Date.UTC(2026, 10, 19, 0, 1, 0);
+    mono += 660_000;
+    await mgr.tick();
+    await mgr.stop();
+
+    const daily1 = JSON.parse((await port.readDaily('2026-11-18')) ?? '{}') as DailySummary;
+    expect(daily1.totalEvents).toBe(10);
+    expect(daily1.truncatedAtLimit).toBe(true);
+    expect(mgr.timelineSnapshots().yesterday?.totalEvents).toBe(10);
+
+    // Mid-day restart after cap: rebuilds from disk (>= persisted rows) and keeps truncatedAtLimit=true
+    const dirMid = await makeTempDir();
+    const portMid = new FileHistoryStoragePort(dirMid);
+    const wallMid = Date.UTC(2026, 10, 20, 10, 0, 0);
+    const mgrMid1 = new HistoryManager({
+      port: portMid,
+      clock: { wall: () => wallMid, mono: () => 1_000 },
+      isPaused: () => false,
+      titlesAllowed: () => true,
+      restoreEntries: () => {},
+      clearMemoryEntries: () => {},
+      emitSourceError: () => {},
+      emitSourceOk: () => {},
+      timeZone: 'UTC',
+      maxNonFileDailyBytes: 250,
+    });
+    await mgrMid1.start(false);
+    for (let i = 0; i < 8; i++) {
+      mgrMid1.recordEvent({
+        id: `mid-${i}`,
+        kind: 'app.activated',
+        subject: `Mid-${i}-${'y'.repeat(40)}`,
+        level: 'record',
+        at: wallMid + (i + 1) * 1_000,
+        source: { id: 'helper', api: 'ndjson', host: 'local' },
+      });
+    }
+    await mgrMid1.stop();
+    const midDiskCount = parseHistoryLines((await portMid.readEvents('2026-11-20')) ?? '').events.length;
+    expect(midDiskCount).toBeGreaterThan(0);
+    expect(midDiskCount).toBeLessThan(8);
+
+    // Restart same day 2026-11-20
+    const mgrMid2 = new HistoryManager({
+      port: portMid,
+      clock: { wall: () => wallMid + 30_000, mono: () => 2_000 },
+      isPaused: () => false,
+      titlesAllowed: () => true,
+      restoreEntries: () => {},
+      clearMemoryEntries: () => {},
+      emitSourceError: () => {},
+      emitSourceOk: () => {},
+      timeZone: 'UTC',
+      maxNonFileDailyBytes: 250,
+    });
+    await mgrMid2.start(false);
+    const rebuiltToday = mgrMid2.timelineSnapshots().today;
+    expect(rebuiltToday?.totalEvents).toBeGreaterThanOrEqual(midDiskCount);
+    expect(rebuiltToday?.truncatedAtLimit).toBe(true);
+    await mgrMid2.stop();
+  });
 });
