@@ -173,7 +173,6 @@ export async function appObservation(
   at: number,
   recovering = false,
   valid: () => boolean = () => true,
-  dedupe = true,
 ): Promise<void> {
   if (!validApp(app) || attention.isStopped()) return;
   const previous = attention.state().env.frontApp.value;
@@ -184,7 +183,7 @@ export async function appObservation(
     await axStatus(attention, 'unknown', at);
     if (!valid() || attention.isStopped()) return;
   }
-  if (!dedupe || !sameProcess) {
+  if (!sameProcess) {
     await attention.accept({
       id: attention.id(),
       kind: 'app.activated',
@@ -248,9 +247,11 @@ export async function helperEvent(
     const app = object(event.frontApp);
     if (validApp(app) && !skip.has('frontApp')) await appObservation(attention, app, at, recovering, valid);
     if (!valid()) return;
+    const permission = !skip.has('permissions') ? object(event.permissions)?.accessibility : undefined;
     const window = object(event.focusedWindow);
     if (!skip.has('focusedWindow')) {
-      if (window?.status === 'denied' || window?.status === 'unsupported') await axStatus(attention, window.status, at);
+      if (permission === 'denied' || window?.status === 'denied') await axStatus(attention, 'denied', at);
+      else if (window?.status === 'unsupported') await axStatus(attention, 'unsupported', at);
       else if (window?.status === 'ok' && typeof window.title === 'string') await emit('window.focused', window);
       else if (window?.status === 'ok') {
         clearWindow(attention, at);
@@ -281,7 +282,7 @@ export async function helperEvent(
       !['denied', 'unsupported'].includes(attention.state().env.focusedWindow.status)
     )
       clearWindow(attention, at);
-    if (event.type === 'app.activated') await appObservation(attention, event, at, recovering, valid, false);
+    if (event.type === 'app.activated') await appObservation(attention, event, at, recovering, valid);
     else await emit(event.type, event);
   } else if ((event.type === 'window.focused' || event.type === 'window.title') && typeof event.title === 'string') {
     await emit(event.type === 'window.title' ? 'window.title-changed' : event.type, event);

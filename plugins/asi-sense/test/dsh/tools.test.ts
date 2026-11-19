@@ -915,7 +915,16 @@ describe('model-facing tools', () => {
     expect(inverted.isError).toBe(true);
     const badStep = await h.call('env_metrics', { metric: 'cpu', step: 299 });
     expect(badStep.isError).toBe(true);
-    for (const badDate of ['2026-02-30', '2026-02-30T12:00:00Z', '2026-02-29T00:00:00Z', '2026-04-31T00:00:00Z']) {
+    for (const badDate of [
+      '2026-02-30',
+      '2026-02-30T12:00:00Z',
+      '2026-02-29T00:00:00Z',
+      '2026-04-31T00:00:00Z',
+      '2026-02-30Z',
+      '2026-2-30',
+      '2026/02/30',
+      'Feb 30, 2026',
+    ]) {
       expect((await h.call('env_metrics', { metric: 'cpu', from: badDate })).isError).toBe(true);
     }
     const valid = await h.call('env_metrics', { metric: 'cpu', step: 300 });
@@ -955,5 +964,98 @@ describe('model-facing tools', () => {
       expect.objectContaining({ subject: 'Mail [host] [redacted] [redacted]' }),
     ]);
     expect(JSON.stringify(res)).not.toMatch(/alice@corp\.invalid|fixture-host\.invalid|sk-aaa|ghp_bbb/);
+  });
+
+  it('redacts credential shapes in env_detail/env_state without breaking normal bundleIds or word subjects', async () => {
+    const h = await fixture();
+    const jwt = 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c';
+    const sg = `SG.${'a'.repeat(16)}.${'b'.repeat(16)}`;
+    const hf = `hf_${'c'.repeat(16)}`;
+    const pkLive = `pk_live_${'d'.repeat(16)}`;
+    const rkTest = `rk_test_${'e'.repeat(16)}`;
+    const xoxc = `xoxc-${'1'.repeat(8)}-${'f'.repeat(16)}`;
+    const secrets = [
+      'token-abc_def_123456',
+      'secret_my-key-123456',
+      `com.example.sk-${'a'.repeat(16)}`,
+      jwt,
+      sg,
+      hf,
+      pkLive,
+      rkTest,
+      xoxc,
+      'com.example.token-abc-def-123456',
+    ];
+    const src = { id: 'helper.ax', api: 'accessibility', host: 'fixture-host.invalid' };
+    const safeWords = ['SyntaxEditor', 'app-activated', 'token-count', 'secret_note', 'README.md'];
+    const events = [
+      ...secrets.map((secret, i) => ({
+        id: `sec-${i}`,
+        kind: 'window.focused',
+        subject: secret,
+        level: 'record' as const,
+        at: 1000 + i,
+        source: src,
+      })),
+      ...safeWords.map((word, i) => ({
+        id: `ok-${i}`,
+        kind: 'app.activated',
+        subject: word,
+        level: 'record' as const,
+        at: 1100 + i,
+        source: src,
+      })),
+    ];
+    const rt = {
+      ...h.live,
+      tools: {
+        ...h.live.tools,
+        envState: (section?: 'self' | 'env' | 'observation') =>
+          section ? structuredClone(h.state[section]) : structuredClone(h.state),
+      },
+      events: () => events,
+    };
+
+    for (const secret of secrets) {
+      if (!h.state.env.frontApp.value) throw new Error('fixture missing');
+      h.state.env.frontApp.value.bundleId = secret;
+      const stateOut = modelState(h.state, 990, 'env') as { frontApp: { value: { bundleId: string } } };
+      expect(stateOut.frontApp.value.bundleId).toBe('[redacted]');
+      const detailOut = environmentDetail(rt) as {
+        app: { value: { bundleId: string } };
+        recentEvents: Array<{ subject: string }>;
+      };
+      expect(detailOut.app.value.bundleId).toBe('[redacted]');
+      for (const s of secrets) {
+        expect(JSON.stringify(stateOut.frontApp)).not.toContain(s);
+        expect(JSON.stringify(detailOut.app)).not.toContain(s);
+        expect(JSON.stringify(detailOut.recentEvents)).not.toContain(s);
+      }
+      expect(detailOut.recentEvents.slice(-safeWords.length).map((e) => e.subject)).toEqual(safeWords);
+    }
+
+    for (const badBundleId of [
+      'SingleSegment',
+      'com.123.app',
+      'com.example.my_app',
+      'a.b.c.d.e.f.g.h.i',
+      `com.${'a'.repeat(60)}.${'b'.repeat(60)}.app`,
+    ]) {
+      if (!h.state.env.frontApp.value) throw new Error('fixture missing');
+      h.state.env.frontApp.value.bundleId = badBundleId;
+      const stateOut = modelState(h.state, 990, 'env') as { frontApp: { value: { bundleId: string } } };
+      const detailOut = environmentDetail(rt) as { app: { value: { bundleId: string } } };
+      expect(stateOut.frontApp.value.bundleId).toBe('[redacted]');
+      expect(detailOut.app.value.bundleId).toBe('[redacted]');
+    }
+
+    for (const safeBundleId of ['com.example.App', 'org.mozilla.firefox']) {
+      if (!h.state.env.frontApp.value) throw new Error('fixture missing');
+      h.state.env.frontApp.value.bundleId = safeBundleId;
+      const stateOut = modelState(h.state, 990, 'env') as { frontApp: { value: { bundleId: string } } };
+      const detailOut = environmentDetail(rt) as { app: { value: { bundleId: string } } };
+      expect(stateOut.frontApp.value.bundleId).toBe(safeBundleId);
+      expect(detailOut.app.value.bundleId).toBe(safeBundleId);
+    }
   });
 });

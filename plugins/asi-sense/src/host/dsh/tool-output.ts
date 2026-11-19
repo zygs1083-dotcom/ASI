@@ -1202,7 +1202,16 @@ function isSafeNonPathCore(core: string, host: HostSpec | undefined): boolean {
 }
 
 const CREDENTIAL_TOKEN_RE =
-  /^(?:(?:npm_|ghp_|gho_|ghu_|ghs_|ghr_|github_pat_|glpat-|xox[abprs]-|AIza|sk[-_])[A-Za-z0-9_-]{8,}|(?:AKIA|ASIA)[A-Z0-9]{16}|-{5}BEGIN|(?:api[-_]?key|token|secret|password|bearer)[-_][A-Za-z0-9]{12,})$/i;
+  /^(?:(?:npm_|ghp_|gho_|ghu_|ghs_|ghr_|github_pat_|glpat-|hf_|xox[a-z]*[-_]|AIza|(?:pk|sk|rk)[-_](?:live|test)[-_]|sk[-_])[A-Za-z0-9_-]{8,}|(?:AKIA|ASIA)[A-Z0-9]{16}|-{5}BEGIN|(?:api[-_]?key|token|secret|password|bearer)[-_][A-Za-z0-9_-]{12,})$/i;
+const EMBEDDED_DOT_CREDENTIAL_RE =
+  /(?:^|\.)(?:eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+|SG\.[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]{8,})?)(?:\.|$)/;
+const REVERSE_DOMAIN_SEG_RE = /^[A-Za-z][A-Za-z0-9-]{0,62}$/;
+
+function isCredentialToken(token: string): boolean {
+  if (CREDENTIAL_TOKEN_RE.test(token) || EMBEDDED_DOT_CREDENTIAL_RE.test(token)) return true;
+  if (!token.includes('.')) return false;
+  return token.split('.').some((segment) => segment.length > 0 && CREDENTIAL_TOKEN_RE.test(segment));
+}
 
 function isSimpleAsciiAlnumWord(text: string): boolean {
   for (let i = 0; i < text.length; i++) {
@@ -1219,7 +1228,7 @@ function classifyNonPathToken(
   prevEndedWithColon: boolean,
   host: HostSpec | undefined,
 ): TokenClassification {
-  if (!prevEndedWithColon && isSimpleAsciiAlnumWord(normToken) && !CREDENTIAL_TOKEN_RE.test(normToken)) {
+  if (!prevEndedWithColon && isSimpleAsciiAlnumWord(normToken) && !isCredentialToken(normToken)) {
     return { kind: 'plain', text: normToken };
   }
   const hostPlaceholder = isTitle ? '<host>' : '[host]';
@@ -1229,7 +1238,7 @@ function classifyNonPathToken(
     return { kind: 'replaced', text: core + trail };
   }
 
-  if (CREDENTIAL_TOKEN_RE.test(core)) {
+  if (isCredentialToken(core)) {
     return { kind: 'replaced', text: `[redacted]${trail}` };
   }
 
@@ -1826,14 +1835,12 @@ function modelEventSubject(raw: string, hostname = os.hostname()): string {
 function modelBundleId(value: string, hostname = os.hostname()): string {
   const cleaned = modelAppName(value);
   if (!cleaned) return '';
-  if (cleaned === '~' || isHomeRoot(cleaned)) return '~';
-  if (
-    !/^[\w.-]+$/.test(cleaned) ||
-    CREDENTIAL_TOKEN_RE.test(cleaned) ||
-    (hostname && cleaned.toLowerCase().includes(hostname.toLowerCase()))
-  ) {
-    return modelText(toHomeRelative(cleaned) ?? cleaned, hostname);
-  }
+  if (cleaned.length > 128) return '[redacted]';
+  if (hostname && cleaned.toLowerCase().includes(hostname.toLowerCase())) return '[redacted]';
+  const segments = cleaned.split('.');
+  if (segments.length < 2 || segments.length > 8) return '[redacted]';
+  if (!segments.every((seg) => REVERSE_DOMAIN_SEG_RE.test(seg))) return '[redacted]';
+  if (isCredentialToken(cleaned)) return '[redacted]';
   return cleaned;
 }
 

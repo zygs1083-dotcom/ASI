@@ -278,9 +278,10 @@ function netstatTotals(): { physical: { rx: number; tx: number }; all: { rx: num
 }
 
 function parseRate(text: string, arrow: '↓' | '↑'): number | undefined {
-  const m = text.match(new RegExp(`${arrow}\\s+([\\d.]+)\\s*(MB/s|KB/s)`));
+  const m = text.match(new RegExp(`${arrow}\\s+(\\d[\\d,]*(?:\\.\\d+)?)\\s*(MB/s|KB/s)`));
   if (!m) return undefined;
-  const v = Number(m[1]);
+  const v = Number(m[1].replaceAll(',', ''));
+  if (!Number.isFinite(v)) return undefined;
   return m[2] === 'MB/s' ? v * 1024 * 1024 : v * 1024;
 }
 
@@ -372,8 +373,8 @@ async function phaseBody(): Promise<void> {
     const netTile = panel.locator('[data-tile="network"]');
     const netText = (await netTile.textContent()) ?? '';
     expect(netText).not.toMatch(/未知|不可用|无权限|待补全/);
-    expect(netText).toMatch(/↓\s+[\d.]+\s*(?:MB|KB)\/s/);
-    expect(netText).toMatch(/↑\s+[\d.]+\s*(?:MB|KB)\/s\s*·\s*已(?:连接|断开)/);
+    expect(netText).toMatch(/↓\s+\d[\d,]*(?:\.\d+)?\s*(?:MB|KB)\/s/);
+    expect(netText).toMatch(/↑\s+\d[\d,]*(?:\.\d+)?\s*(?:MB|KB)\/s\s*·\s*已(?:连接|断开)/);
 
     const snap0 = netstatTotals();
     // Poll the tile and the cumulative physical counters together so every
@@ -397,11 +398,13 @@ async function phaseBody(): Promise<void> {
       allTx: (snap1.all.tx - snap0.all.tx) / dt,
     };
     const ratios: { rx: number[]; tx: number[] } = { rx: [], tx: [] };
+    let parsedWindows = 0;
     const floor = 16 * 1024; // below this the 1 KB/s display rounding dominates
     for (let i = 0; i + WINDOW_POLLS < samples.length; i++) {
       const a = samples[i]!;
       const b = samples[i + WINDOW_POLLS]!;
       if (!b.tile) continue;
+      parsedWindows++;
       const sec = (b.at - a.at) / 1000;
       const physRx = (b.rx - a.rx) / sec;
       const physTx = (b.tx - a.tx) / sec;
@@ -419,11 +422,12 @@ async function phaseBody(): Promise<void> {
     const medRx = ratios.rx.length ? median(ratios.rx) : Number.NaN;
     const medTx = ratios.tx.length ? median(ratios.tx) : Number.NaN;
     console.log(
-      `network compare: median(tile/netstat per 5s) rx=${medRx.toFixed(2)} (${ratios.rx.length} windows) ` +
-        `tx=${medTx.toFixed(2)} (${ratios.tx.length} windows) | ` +
+      `network compare: median(tile/netstat per 5s) rx=${medRx.toFixed(2)} (${ratios.rx.length}/${parsedWindows} windows) ` +
+        `tx=${medTx.toFixed(2)} (${ratios.tx.length}/${parsedWindows} windows) | ` +
         `netstat phys rx=${est.physRx.toFixed(0)}B/s tx=${est.physTx.toFixed(0)}B/s | ` +
         `all-iface rx=${est.allRx.toFixed(0)}B/s tx=${est.allTx.toFixed(0)}B/s`,
     );
+    expect(parsedWindows).toBeGreaterThanOrEqual(5);
     // 0.67-1.5x of the same physical NIC. Too few comparable windows (idle
     // machine) makes the median meaningless, so only bound the window average
     // then; the additive slack covers 1 KB/s display rounding.
@@ -433,7 +437,9 @@ async function phaseBody(): Promise<void> {
         expect(medianRatio).toBeGreaterThanOrEqual(0.67);
         expect(medianRatio).toBeLessThanOrEqual(1.5);
       } else {
-        console.log(`network ${label}: only ${windows} comparable 5s windows; traffic too low for a ratio check`);
+        console.log(
+          `network ${label}: low-traffic: ratio check skipped (${windows}/${parsedWindows} comparable 5s windows)`,
+        );
         expect(avgTileRate).toBeLessThanOrEqual(phys * 1.5 + slack);
       }
     };
