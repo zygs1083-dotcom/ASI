@@ -34,6 +34,7 @@ export const SCENARIOS = [
   'history-empty',
   'history-away-anomaly',
   'history-monthly-error',
+  'history-capped',
 ] as const;
 
 export type ScenarioName = (typeof SCENARIOS)[number];
@@ -303,6 +304,11 @@ const BUILDERS: Record<ScenarioName, () => SensePanelModel> = {
   'history-empty': () => historyEmpty(healthy()),
   'history-away-anomaly': () => historyAwayAnomaly(healthy()),
   'history-monthly-error': () => historyReady(healthy()),
+  'history-capped': () => {
+    const model = historyReady(healthy());
+    model.state.observation.sources['history'] = { status: 'ok', lastSignalAt: T0 - 5_000, capped: true };
+    return model;
+  },
 };
 
 export function makeScenario(name: ScenarioName): SensePanelModel {

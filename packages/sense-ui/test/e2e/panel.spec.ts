@@ -143,6 +143,7 @@ test.describe('历史分区截图（320/420 × 明暗）', () => {
     'history-empty',
     'history-away-anomaly',
     'history-monthly-error',
+    'history-capped',
   ] as const;
   for (const scenario of HISTORY_SCENARIOS) {
     for (const theme of THEMES) {
@@ -172,6 +173,10 @@ test.describe('历史分区截图（320/420 × 明暗）', () => {
           if (scenario === 'history-away-anomaly') {
             await expect(page.getByText('已推送', { exact: true })).toBeVisible();
             await expect(page.getByText('外部删除 14 个文件（workspace-demo）')).toBeVisible();
+          }
+          if (scenario === 'history-capped') {
+            await openSection(page, '信号源');
+            await expect(page.getByText('今日已达上限，后续只记汇总').first()).toBeVisible();
           }
           await expectNoOverflow(page);
           await axeCheck(page);
