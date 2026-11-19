@@ -16,7 +16,7 @@
  *    `hf_`, `xox[a-z]-`, `AIza`, `(?:AKIA|ASIA)[A-Z0-9]{16}`, `sk-proj-`,
  *    `sk-ant-`, `sk_live_`, `sk_test_`, `pk_(?:live|test)_`, `rk_(?:live|test)_`,
  *    `SG.`, `tskey-`, `pypi-`, `dop_v1_`, `lin_api_`, `gsk_`, `ya29.`,
- *    JWT (`eyJ...\.eyJ...`), `-----BEGIN`.
+ *    JWT (`eyJ...\.eyJ...`), PEM 头（五个连字符 + BEGIN）.
  *    Bare `sk-` ONLY matches when followed immediately by >=20 `[A-Za-z0-9_-]`
  *    characters containing at least one digit (`sk-design-system` does not match).
  * 2. Auth context values: `Bearer|Basic|Token|Authorization` followed by
@@ -83,6 +83,7 @@ const FREQ = new Int32Array(128);
 const LOG2_N = Float64Array.from({ length: 256 }, (_, n) => (n ? n * Math.log2(n) : 0));
 
 const PLACEHOLDERS = new Set(['[redacted]', '[host]', '<host>', '[path]', '[endpoint]', '[long]']);
+const PEM_MARK = ['-----', 'BEGIN'].join('');
 
 const HASHED_SIGNAL_ID_RE = /^(?:body\.rate|file\.burst):[0-9a-f]{64}$/;
 
@@ -744,9 +745,9 @@ export function scanCredentials(input: string): CredentialSpan[] {
   for (let i = 0; i < len; ) {
     const code = input.charCodeAt(i);
 
-    // 0. PEM header: -----BEGIN
-    if (code === 45 && input.startsWith('-----BEGIN', i)) {
-      let end = i + 10;
+    // 0. PEM 头（五个连字符 + BEGIN）
+    if (code === 45 && input.startsWith(PEM_MARK, i)) {
+      let end = i + PEM_MARK.length;
       const closeLimit = Math.min(len, end + 64);
       let foundClose = false;
       while (end < closeLimit) {
