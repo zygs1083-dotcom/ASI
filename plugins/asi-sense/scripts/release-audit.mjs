@@ -66,9 +66,6 @@ const safeMatches = new Set(
       // Bundled regex literal `/^\s*interface:\s*(\S+)/m` — the audit's
       // Windows-path arm matches from the `e:` inside `interface:`.
       'e:\\s*(\\S+)/m.exec(text)?.[1];',
-      // Credential scanner's own PEM-header detector literal
-      // (`input.startsWith('-----BEGIN', i)`) — detection marker, not a key.
-      '-----BEGIN',
       '/-/g',
       '/_/g',
     ],
