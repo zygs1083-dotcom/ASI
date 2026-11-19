@@ -343,6 +343,30 @@ describe('DEFAULT_RULES', () => {
     expect(sel(sig({ id: '7', kind: 'process.exited', data: { exitCode: 2 } }))?.level).toBe('wake');
     expect(sel(sig({ id: '8', kind: 'source.status', data: { status: 'denied' } }))?.level).toBe('context');
     expect(sel(sig({ id: '9', kind: 'source.error' }))?.level).toBe('context');
+    expect(
+      sel(
+        sig({
+          id: '9b',
+          kind: 'source.error',
+          subject: 'history',
+          data: { status: 'error', error: 'daily-limit-exceeded' },
+        }),
+      )?.level,
+    ).toBe('record');
+    // Legacy saved rule sets lacking history-daily-limit must still keep daily-limit-exceeded out of context
+    const legacySourceError = DEFAULT_RULES.filter((r) => r.id === 'source-error');
+    expect(
+      selectRule(
+        legacySourceError,
+        sig({
+          id: '9c',
+          kind: 'source.error',
+          subject: 'history',
+          data: { status: 'error', error: 'daily-limit-exceeded' },
+        }),
+        at,
+      ),
+    ).toBeUndefined();
     expect(sel(sig({ id: '10', kind: 'body.threshold', data: { severity: 'warn' } }))?.level).toBe('context');
     expect(
       sel(

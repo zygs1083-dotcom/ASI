@@ -8,6 +8,7 @@ import { PassThrough } from 'node:stream';
 import type { Body, Signal, WatchRule } from '@asi/sense-types';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { FileHistoryStoragePort } from '../../src/host/dsh/history-storage.ts';
+import { projectState } from '../../src/host/presenter/project.ts';
 import { RuntimeAttention } from '../../src/host/runtime/attention.ts';
 import { FactExpiry } from '../../src/host/runtime/expiry.ts';
 import {
@@ -17,6 +18,9 @@ import {
   HistoryManager,
   LocalCalendar,
   MAX_DAILY_EVENT_BYTES,
+  MAX_DAILY_FILE_EVENT_BYTES,
+  MAX_DAILY_NON_FILE_EVENT_BYTES,
+  MAX_HISTORY_TOTAL_BYTES,
   type MonthlySummary,
   parseDailySummary,
   parseHistoryLines,
@@ -3085,5 +3089,307 @@ describe('runtime history persistence, rollups, retention, and recovery', () => 
     const day2FaIdx = day2Raw.indexOf('/work/day2');
     expect(day2FaIdx).toBeGreaterThan(-1);
     expect(day2FaIdx).toBeLessThan(lastStopIdx);
+  });
+
+  it('isolates file.* vs non-file daily budgets, always persists non-file context/wake exceptions, and enforces 30d total cap', async () => {
+    expect(MAX_DAILY_FILE_EVENT_BYTES).toBe(12 * 1024 * 1024);
+    expect(MAX_DAILY_NON_FILE_EVENT_BYTES).toBe(8 * 1024 * 1024);
+    expect(MAX_HISTORY_TOTAL_BYTES).toBeLessThanOrEqual(600 * 1024 * 1024);
+
+    const dir = await makeTempDir();
+    const port = new FileHistoryStoragePort(dir);
+    const wall = Date.UTC(2026, 10, 18, 12, 0, 0);
+    const capErrors: Array<{ error: string; extra?: Record<string, unknown> }> = [];
+    const mgr = new HistoryManager({
+      port,
+      clock: { wall: () => wall, mono: () => 1_000 },
+      isPaused: () => false,
+      titlesAllowed: () => true,
+      restoreEntries: () => {},
+      clearMemoryEntries: () => {},
+      emitSourceError: (error, extra) => capErrors.push({ error, extra }),
+      emitSourceOk: () => {},
+      timeZone: 'UTC',
+      maxFileDailyBytes: 380,
+      maxNonFileDailyBytes: 360,
+    });
+    await mgr.start(false);
+
+    // Push file.burst lines past the 380B file tier cap
+    for (let i = 0; i < 4; i++) {
+      mgr.recordEvent({
+        id: `fb-${i}`,
+        kind: 'file.burst',
+        subject: `/work/burst-${i}-${'a'.repeat(50)}`,
+        level: 'wake',
+        at: wall + i * 1_000,
+        source: { id: 'files-global', api: 'watch', host: 'local' },
+      });
+    }
+    await mgr.query({});
+
+    // file.* cap must NOT block non-file record events while non-file budget remains
+    mgr.recordEvent({
+      id: 'app-while-file-capped',
+      kind: 'app.activated',
+      subject: 'EditorApp',
+      level: 'record',
+      at: wall + 5_000,
+      source: { id: 'helper', api: 'ndjson', host: 'local' },
+    });
+    // Exhaust non-file 360B cap with another oversized record event
+    for (let i = 0; i < 4; i++) {
+      mgr.recordEvent({
+        id: `app-pad-${i}`,
+        kind: 'app.activated',
+        subject: `AppPad-${i}-${'b'.repeat(70)}`,
+        level: 'record',
+        at: wall + 6_000 + i * 1_000,
+        source: { id: 'helper', api: 'ndjson', host: 'local' },
+      });
+    }
+
+    // Non-file context and wake exceptions MUST still persist even when BOTH tiers are capped
+    mgr.recordEvent({
+      id: 'critical-ctx-1',
+      kind: 'body.anomaly',
+      subject: 'memory',
+      level: 'context',
+      at: wall + 12_000,
+      source: { id: 'body', api: 'probe', host: 'local' },
+    });
+    mgr.recordEvent({
+      id: 'critical-wake-1',
+      kind: 'job.exited',
+      subject: 'build-job',
+      level: 'wake',
+      at: wall + 13_000,
+      source: { id: 'dsh', api: 'events', host: 'local' },
+    });
+    mgr.patchEvent('critical-ctx-1', { feedback: 'useful' });
+    await mgr.stop();
+
+    const raw = (await port.readEvents('2026-11-18')) ?? '';
+    const parsed = parseHistoryLines(raw);
+    const ids = parsed.events.map((e) => e.id);
+    expect(ids).toContain('app-while-file-capped');
+    expect(ids).toContain('critical-ctx-1');
+    expect(ids).toContain('critical-wake-1');
+    expect(parsed.events.find((e) => e.id === 'critical-ctx-1')?.feedback).toBe('useful');
+    expect(ids).not.toContain('fb-3');
+    expect(ids).not.toContain('app-pad-3');
+    expect(capErrors.filter((c) => c.error === 'daily-limit-exceeded')).toHaveLength(1);
+
+    // 30d total disk ceiling prunes oldest past days while keeping recent days + today
+    const dirTotal = await makeTempDir();
+    const totalPort = new FileHistoryStoragePort(dirTotal);
+    await totalPort.appendEvent('2026-11-15', `${'x'.repeat(250)}\n`);
+    await totalPort.appendEvent('2026-11-16', `${'y'.repeat(250)}\n`);
+    await totalPort.appendEvent('2026-11-17', `${'z'.repeat(200)}\n`);
+    const mgrTotal = new HistoryManager({
+      port: totalPort,
+      clock: { wall: () => wall, mono: () => 2_000 },
+      isPaused: () => false,
+      titlesAllowed: () => true,
+      restoreEntries: () => {},
+      clearMemoryEntries: () => {},
+      emitSourceError: () => {},
+      emitSourceOk: () => {},
+      timeZone: 'UTC',
+      maxTotalBytes: 300,
+    });
+    await mgrTotal.start(false);
+    await mgrTotal.stop();
+
+    const kept = (await totalPort.listEventDates()).sort();
+    expect(kept).not.toContain('2026-11-15');
+    expect(kept).not.toContain('2026-11-16');
+    expect(kept).toContain('2026-11-17');
+    expect(kept).toContain('2026-11-18');
+  });
+
+  it('keeps history daily-limit-exceeded out of model deliveries with/without session, shows sidebar text, and deduplicates across restart', async () => {
+    // 1) With active session + across same-day restart
+    const dirWithSess = await makeTempDir();
+    const basePortWithSess = new FileHistoryStoragePort(dirWithSess);
+    let wall = Date.UTC(2026, 10, 18, 12, 0, 0);
+    let simulatedBytes = MAX_DAILY_EVENT_BYTES - 80;
+    let capJson: string | undefined;
+    const capPort: HistoryStoragePort = {
+      eventFileSize: async (date) => (date === '2026-11-18' ? simulatedBytes : 0),
+      appendEvent: async (date, line) => {
+        if (date === '2026-11-18') simulatedBytes += Buffer.byteLength(line, 'utf8');
+        await basePortWithSess.appendEvent(date, line);
+      },
+      readEvents: (d) => basePortWithSess.readEvents(d),
+      readEventLines: (d) => basePortWithSess.readEventLines(d),
+      readEventLinesDesc: (d) => basePortWithSess.readEventLinesDesc(d),
+      listEventDates: () => basePortWithSess.listEventDates(),
+      deleteEventDate: (d) => basePortWithSess.deleteEventDate(d),
+      readDaily: (d) => basePortWithSess.readDaily(d),
+      writeDaily: (d, j) => basePortWithSess.writeDaily(d, j),
+      listDailyDates: () => basePortWithSess.listDailyDates(),
+      deleteDailyDate: (d) => basePortWithSess.deleteDailyDate(d),
+      readMonthly: (m) => basePortWithSess.readMonthly(m),
+      writeMonthly: (m, j) => basePortWithSess.writeMonthly(m, j),
+      listMonthlyMonths: () => basePortWithSess.listMonthlyMonths(),
+      readCapState: async () => capJson,
+      writeCapState: async (j) => {
+        capJson = j || undefined;
+      },
+      clearAll: async () => {
+        capJson = undefined;
+        await basePortWithSess.clearAll();
+      },
+    };
+
+    const deliveredWithSess: string[] = [];
+    const h1 = createRuntimeHarness({
+      nowMs: wall,
+      history: capPort,
+      timeZone: 'UTC',
+      deliver: async (_sid, intent) => {
+        for (const c of intent.update.changes) {
+          deliveredWithSess.push(`${c.signal.kind}:${c.signal.subject}:${String(c.signal.data.error ?? '')}`);
+        }
+      },
+    });
+    await h1.runtime.start();
+    for (let i = 0; i < 3; i++) {
+      await h1.emitJob({
+        type: 'started',
+        id: `cap-sess-${i}-${'x'.repeat(60)}`,
+        sessionId: 's1',
+        command: 'echo test',
+        at: wall + (i + 1) * 1_000,
+      });
+    }
+    await vi.waitFor(
+      () =>
+        expect(
+          h1.runtime.events().filter((e) => e.kind === 'source.error' && e.reason === 'daily-limit-exceeded'),
+        ).toHaveLength(1),
+      { timeout: 2_000, interval: 5 },
+    );
+    await h1.runtime.tools.envHistory({});
+    // Give delivery pipeline a beat to drain any queued deliveries
+    await new Promise((r) => setTimeout(r, 50));
+    expect(deliveredWithSess.some((d) => d.includes('daily-limit-exceeded'))).toBe(false);
+    expect(h1.runtime.events().find((e) => e.reason === 'daily-limit-exceeded')?.level).toBe('record');
+    expect(projectState(h1.runtime.state()).observation.sources.history?.error).toBe('今日已达上限，后续只记汇总');
+    await h1.runtime.stop();
+
+    // Restart on the same date: must NOT emit a duplicate daily-limit-exceeded event or push to model
+    const deliveredRestart: string[] = [];
+    const h2 = createRuntimeHarness({
+      nowMs: wall + 60_000,
+      history: capPort,
+      timeZone: 'UTC',
+      deliver: async (_sid, intent) => {
+        for (const c of intent.update.changes) {
+          deliveredRestart.push(`${c.signal.kind}:${String(c.signal.data.error ?? '')}`);
+        }
+      },
+    });
+    await h2.runtime.start();
+    expect(projectState(h2.runtime.state()).observation.sources.history?.error).toBe('今日已达上限，后续只记汇总');
+    await h2.emitJob({
+      type: 'started',
+      id: `cap-sess-after-restart-${'x'.repeat(60)}`,
+      sessionId: 's1',
+      command: 'echo test2',
+      at: wall + 61_000,
+    });
+    await h2.runtime.tools.envHistory({});
+    await new Promise((r) => setTimeout(r, 50));
+    expect(h2.runtime.events().filter((e) => !e.restored && e.reason === 'daily-limit-exceeded')).toHaveLength(0);
+    expect(deliveredRestart.some((d) => d.includes('daily-limit-exceeded'))).toBe(false);
+    await h2.runtime.stop();
+
+    // 2) Without active session (pending path): must never buffer daily-limit-exceeded into pending or deliver later
+    const dirNoSess = await makeTempDir();
+    const baseNoSess = new FileHistoryStoragePort(dirNoSess);
+    let noSessBytes = MAX_DAILY_EVENT_BYTES - 80;
+    let sessionList: Array<{ id: string; title: string; updatedAt: number; running: boolean }> = [];
+    let jobCb: ((ev: JobEvent) => Promise<void>) | undefined;
+    const deliveredNoSess: string[] = [];
+    const noSessPort: HistoryStoragePort = {
+      eventFileSize: async (date) => (date === '2026-11-18' ? noSessBytes : 0),
+      appendEvent: async (date, line) => {
+        if (date === '2026-11-18') noSessBytes += Buffer.byteLength(line, 'utf8');
+        await baseNoSess.appendEvent(date, line);
+      },
+      readEvents: (d) => baseNoSess.readEvents(d),
+      readEventLines: (d) => baseNoSess.readEventLines(d),
+      readEventLinesDesc: (d) => baseNoSess.readEventLinesDesc(d),
+      listEventDates: () => baseNoSess.listEventDates(),
+      deleteEventDate: (d) => baseNoSess.deleteEventDate(d),
+      readDaily: (d) => baseNoSess.readDaily(d),
+      writeDaily: (d, j) => baseNoSess.writeDaily(d, j),
+      listDailyDates: () => baseNoSess.listDailyDates(),
+      deleteDailyDate: (d) => baseNoSess.deleteDailyDate(d),
+      readMonthly: (m) => baseNoSess.readMonthly(m),
+      writeMonthly: (m, j) => baseNoSess.writeMonthly(m, j),
+      listMonthlyMonths: () => baseNoSess.listMonthlyMonths(),
+      clearAll: () => baseNoSess.clearAll(),
+    };
+    const rtNoSess = createSenseRuntime(
+      {
+        clock: { wall: () => wall, mono: () => 1_000 },
+        history: noSessPort,
+        storage: { load: async () => undefined, save: async () => {} },
+        dsh: {
+          listSessions: async () => sessionList,
+          onAgentEvent: () => () => {},
+          onTool: () => () => {},
+          onJob: (cb) => {
+            jobCb = cb;
+            return () => {};
+          },
+          deliver: async (_sid, intent) => {
+            for (const c of intent.update.changes) {
+              deliveredNoSess.push(`${c.signal.kind}:${c.signal.subject}:${String(c.signal.data.error ?? '')}`);
+            }
+          },
+          tokenSnapshot: async () => undefined,
+        },
+        helper: { spawn: () => undefined },
+        probe: { create: () => ({ onSample: () => () => {}, start: () => {}, stop: async () => {} }) },
+        files: { watch: () => ({ close: () => {} }) },
+      },
+      { platform: 'linux', timeZone: 'UTC', intervalMs: 600_000, globalFileWatch: { disableInTests: true } },
+    );
+    await rtNoSess.start();
+    for (let i = 0; i < 3; i++) {
+      await jobCb?.({
+        type: 'started',
+        id: `no-sess-job-${i}-${'z'.repeat(60)}`,
+        sessionId: 'no-sess',
+        command: 'echo synthetic',
+        at: wall + (i + 1) * 100,
+      });
+    }
+    await vi.waitFor(
+      () =>
+        expect(
+          rtNoSess.events().filter((e) => e.kind === 'source.error' && e.reason === 'daily-limit-exceeded'),
+        ).toHaveLength(1),
+      { timeout: 2_000, interval: 5 },
+    );
+    expect(projectState(rtNoSess.state()).observation.sources.history?.error).toBe('今日已达上限，后续只记汇总');
+
+    // Now bring a session online and deliver an event on it: daily-limit-exceeded must NEVER be pending or delivered
+    sessionList = [{ id: 's-late', title: 'Late', updatedAt: wall + 1_000, running: true }];
+    await jobCb?.({
+      type: 'exited',
+      id: 'late-job-1',
+      sessionId: 's-late',
+      command: 'echo done',
+      exitCode: 0,
+      at: wall + 1_000,
+    });
+    await new Promise((r) => setTimeout(r, 80));
+    expect(deliveredNoSess.some((d) => d.includes('daily-limit-exceeded'))).toBe(false);
+    await rtNoSess.stop();
   });
 });

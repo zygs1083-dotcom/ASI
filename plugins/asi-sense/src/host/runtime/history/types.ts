@@ -3,7 +3,17 @@ import { isHomeRoot } from '../../attention/path.ts';
 
 export const HISTORY_RETENTION_DAYS = 30;
 export const DAILY_SUMMARY_RETENTION_DAYS = 400;
-export const MAX_DAILY_EVENT_BYTES = 20 * 1024 * 1024;
+/**
+ * Tiered daily raw-event budgets (per history-volume-measure benchmark):
+ * - Non-file events (~6/min steady -> ~1.5 MB/day slimmed; 5x burst -> ~7.5 MB/day) get 8 MiB/day.
+ * - `file.*` events (~112/min raw -> 60s aggregated <= 1 line/dir/cause/min) get 12 MiB/day.
+ * Separating tiers stops `file.activity` storms from crowding out app/window/body/lifecycle events.
+ */
+export const MAX_DAILY_FILE_EVENT_BYTES = 12 * 1024 * 1024;
+export const MAX_DAILY_NON_FILE_EVENT_BYTES = 8 * 1024 * 1024;
+export const MAX_DAILY_EVENT_BYTES = MAX_DAILY_FILE_EVENT_BYTES + MAX_DAILY_NON_FILE_EVENT_BYTES;
+/** 30-day total disk ceiling across retained raw event logs (<= 600 MiB). */
+export const MAX_HISTORY_TOTAL_BYTES = HISTORY_RETENTION_DAYS * MAX_DAILY_EVENT_BYTES;
 export const HISTORY_HEARTBEAT_MS = 300_000;
 export const MAX_HISTORY_LIMIT = 200;
 export const DEFAULT_HISTORY_LIMIT = 50;
@@ -167,6 +177,9 @@ export interface HistoryStoragePort {
   readMonthly(month: string): Promise<string | undefined>;
   writeMonthly(month: string, json: string): Promise<void>;
   listMonthlyMonths(): Promise<string[]>;
+
+  readCapState?(): Promise<string | undefined>;
+  writeCapState?(json: string): Promise<void>;
 
   harden?(): Promise<HistoryUnsafeEntry[]>;
   clearAll(): Promise<void>;

@@ -271,6 +271,9 @@ export class RuntimeAttention {
   snapshotEntries(): EventEntry[] {
     return structuredClone(this.entries);
   }
+  restoreSourceObservation(signal: Signal): void {
+    this.store.apply(signal, () => this.changed());
+  }
   /** Merge pre-clear entries back in front of entries recorded during a failed clear. */
   restoreEntriesPreservingLive(entries: readonly EventEntry[]): void {
     const liveIds = new Set(this.entries.map((entry) => entry.id));

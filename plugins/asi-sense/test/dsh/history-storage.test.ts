@@ -365,4 +365,20 @@ describe('FileHistoryStoragePort', () => {
       '{"record":"event","id":"ok-3"}',
     ]);
   });
+
+  it('persists and clears daily cap-state.json atomically with 0600 permissions', async () => {
+    const root = await makeTempDir();
+    const port = new FileHistoryStoragePort(root);
+    expect(await port.readCapState()).toBeUndefined();
+    const payload = JSON.stringify({ date: '2026-11-18', tiers: ['file'] });
+    await port.writeCapState(payload);
+    expect(await port.readCapState()).toBe(payload);
+    const st = await stat(join(root, 'history', 'cap-state.json'));
+    expect(st.mode & 0o777).toBe(0o600);
+    await port.writeCapState('');
+    expect(await port.readCapState()).toBeUndefined();
+    await port.writeCapState(payload);
+    await port.clearAll();
+    expect(await port.readCapState()).toBeUndefined();
+  });
 });

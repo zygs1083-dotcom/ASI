@@ -83,6 +83,17 @@ export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}
         })
         .catch(() => {});
     },
+    restoreSourceError: (error, extra) => {
+      if (!attentionRef || stopping) return;
+      attentionRef.restoreSourceObservation({
+        id: attentionRef.id(),
+        kind: 'source.error',
+        at: clock.wall(),
+        source: { id: 'history', api: 'storage', host: 'local' },
+        subject: 'history',
+        data: { status: 'error', error, reason: error, ...extra },
+      });
+    },
     emitSourceOk: () => {
       if (!attentionRef || stopping) return;
       void attentionRef

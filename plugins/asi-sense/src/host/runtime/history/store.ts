@@ -22,7 +22,10 @@ import {
   type HistoryStoragePort,
   isNonEmptyString,
   MAX_DAILY_EVENT_BYTES,
+  MAX_DAILY_FILE_EVENT_BYTES,
+  MAX_DAILY_NON_FILE_EVENT_BYTES,
   MAX_HISTORY_LIMIT,
+  MAX_HISTORY_TOTAL_BYTES,
   MAX_QUERY_RANGE_MS,
   type MonthlySummary,
   type PersistedEventEntry,
@@ -68,9 +71,13 @@ export interface HistoryManagerOptions {
   snapshotMemoryEntries?: () => readonly PersistedEventEntry[];
   restoreMemoryEntries?: (entries: readonly PersistedEventEntry[]) => void;
   emitSourceError: (error: string, extra?: Record<string, unknown>) => void;
+  restoreSourceError?: (error: string, extra?: Record<string, unknown>) => void;
   emitSourceOk: () => void;
   timeZone?: string;
   maxDailyBytes?: number;
+  maxFileDailyBytes?: number;
+  maxNonFileDailyBytes?: number;
+  maxTotalBytes?: number;
   heartbeatIntervalMs?: number;
   /** Extra `extensions` entries (e.g. metric buckets) for a day being summarized. */
   dayExtensions?: (date: string) => Record<string, unknown> | undefined;
@@ -215,6 +222,20 @@ interface PendingPatch {
   feedback?: 'useful' | 'noise';
 }
 
+type BudgetTier = 'file' | 'nonFile';
+
+interface AppendOptions {
+  tier?: BudgetTier;
+  critical?: boolean;
+}
+
+interface DateByteUsage {
+  total: number;
+  file: number;
+  nonFile: number;
+  breakdownLoaded: boolean;
+}
+
 function createReverseEventScanner() {
   const patches = new Map<string, PendingPatch>();
   const seenIds = new Set<string>();
@@ -267,9 +288,14 @@ export class HistoryManager {
   private readonly snapshotMemoryEntries?: () => readonly PersistedEventEntry[];
   private readonly restoreMemoryEntries?: (entries: readonly PersistedEventEntry[]) => void;
   private readonly emitSourceError: (error: string, extra?: Record<string, unknown>) => void;
+  private readonly restoreSourceError?: (error: string, extra?: Record<string, unknown>) => void;
   private readonly emitSourceOk: () => void;
   private readonly calendar: LocalCalendar;
   private readonly maxDailyBytes: number;
+  private readonly maxFileDailyBytes: number;
+  private readonly maxNonFileDailyBytes: number;
+  private readonly enforceTotalDailyCap: boolean;
+  private readonly maxTotalBytes: number;
   private readonly heartbeatIntervalMs: number;
   private readonly dayExtensions?: (date: string) => Record<string, unknown> | undefined;
   private readonly onSummaryChanged?: () => void;
@@ -284,15 +310,20 @@ export class HistoryManager {
   private lastAliveAt = Number.NEGATIVE_INFINITY;
   private nextHeartbeatMono = Number.POSITIVE_INFINITY;
   private activeApp?: string;
-  private readonly sizes = new Map<string, number>();
+  private readonly usageByDate = new Map<string, DateByteUsage>();
   private readonly cappedDates = new Set<string>();
+  private readonly fileCappedDates = new Set<string>();
+  private readonly nonFileCappedDates = new Set<string>();
   private readonly capErrorsEmitted = new Set<string>();
   private readonly reportedFileErrors = new Set<string>();
   private appendDegraded = false;
   private summaryDegraded = false;
   private bootTag = makeBootTag();
   private shortSeq = 0;
-  private readonly eventMetaById = new Map<string, { date: string; diskId: string }>();
+  private readonly eventMetaById = new Map<
+    string,
+    { date: string; diskId: string; isFile?: boolean; critical?: boolean }
+  >();
   private readonly pendingActivity = new Map<string, PendingActivityBucket>();
   private readonly pendingBucketByEntryId = new Map<string, PendingActivityBucket>();
   private activeLifecycleOpen = false;
@@ -323,9 +354,26 @@ export class HistoryManager {
     this.snapshotMemoryEntries = options.snapshotMemoryEntries;
     this.restoreMemoryEntries = options.restoreMemoryEntries;
     this.emitSourceError = options.emitSourceError;
+    this.restoreSourceError = options.restoreSourceError;
     this.emitSourceOk = options.emitSourceOk;
     this.calendar = new LocalCalendar(options.timeZone);
-    this.maxDailyBytes = options.maxDailyBytes ?? MAX_DAILY_EVENT_BYTES;
+    if (options.maxFileDailyBytes !== undefined || options.maxNonFileDailyBytes !== undefined) {
+      this.maxFileDailyBytes = options.maxFileDailyBytes ?? MAX_DAILY_FILE_EVENT_BYTES;
+      this.maxNonFileDailyBytes = options.maxNonFileDailyBytes ?? MAX_DAILY_NON_FILE_EVENT_BYTES;
+      this.maxDailyBytes = options.maxDailyBytes ?? this.maxFileDailyBytes + this.maxNonFileDailyBytes;
+      this.enforceTotalDailyCap = options.maxDailyBytes !== undefined;
+    } else if (options.maxDailyBytes !== undefined) {
+      this.maxDailyBytes = options.maxDailyBytes;
+      this.maxFileDailyBytes = options.maxDailyBytes;
+      this.maxNonFileDailyBytes = options.maxDailyBytes;
+      this.enforceTotalDailyCap = true;
+    } else {
+      this.maxFileDailyBytes = MAX_DAILY_FILE_EVENT_BYTES;
+      this.maxNonFileDailyBytes = MAX_DAILY_NON_FILE_EVENT_BYTES;
+      this.maxDailyBytes = MAX_DAILY_EVENT_BYTES;
+      this.enforceTotalDailyCap = false;
+    }
+    this.maxTotalBytes = options.maxTotalBytes ?? MAX_HISTORY_TOTAL_BYTES;
     this.heartbeatIntervalMs = options.heartbeatIntervalMs ?? HISTORY_HEARTBEAT_MS;
     this.dayExtensions = options.dayExtensions;
     this.onSummaryChanged = options.onSummaryChanged;
@@ -391,13 +439,15 @@ export class HistoryManager {
       return;
     }
 
+    const isFile = entry.kind.startsWith('file.');
+    const critical = this.isCriticalEvent(entry.kind, entry.level);
     const diskId = UUID_SEQ_RE.test(entry.id) ? this.nextShortId() : entry.id;
-    this.rememberEventMeta(entry.id, date, diskId);
+    this.rememberEventMeta(entry.id, date, diskId, isFile, critical);
 
     const raw = this.serializeEventLine(entry, diskId, meta);
     this.feedTodayRaw(date, raw);
     const epoch = this.clearEpoch;
-    this.enqueue(() => this.appendRawLine(date, `${raw}\n`, epoch));
+    this.enqueue(() => this.appendRawLine(date, `${raw}\n`, epoch, { tier: isFile ? 'file' : 'nonFile', critical }));
     if (deferRollover) {
       this.syncClockDate(now);
     }
@@ -437,7 +487,7 @@ export class HistoryManager {
           existing.feedback = entry.feedback;
         }
         existing.entryIds.push(entry.id);
-        this.rememberEventMeta(entry.id, date, existing.diskId);
+        this.rememberEventMeta(entry.id, date, existing.diskId, true, false);
         this.pendingBucketByEntryId.set(entry.id, existing);
         this.cachedToday = undefined;
         this.summaryRevision += 1;
@@ -480,7 +530,7 @@ export class HistoryManager {
       entryIds: [entry.id],
     };
     this.pendingActivity.set(key, bucket);
-    this.rememberEventMeta(entry.id, date, diskId);
+    this.rememberEventMeta(entry.id, date, diskId, true, false);
     this.pendingBucketByEntryId.set(entry.id, bucket);
     this.cachedToday = undefined;
     this.summaryRevision += 1;
@@ -544,7 +594,7 @@ export class HistoryManager {
     );
     this.feedTodayRaw(bucket.date, raw);
     const epoch = bucket.epoch;
-    this.enqueue(() => this.appendRawLine(bucket.date, `${raw}\n`, epoch));
+    this.enqueue(() => this.appendRawLine(bucket.date, `${raw}\n`, epoch, { tier: 'file', critical: false }));
   }
 
   private flushPendingActivity(predicate: (bucket: PendingActivityBucket) => boolean): void {
@@ -604,6 +654,8 @@ export class HistoryManager {
     const date = patch.at !== undefined ? this.calendar.dateKey(patch.at) : mapped?.date;
     if (!date) return;
     const diskId = mapped?.diskId ?? id;
+    const isFile = mapped?.isFile ?? false;
+    const critical = !isFile && (patch.level === 'context' || patch.level === 'wake' || mapped?.critical === true);
     const record = {
       record: 'patch' as const,
       id: diskId,
@@ -614,7 +666,7 @@ export class HistoryManager {
     const raw = JSON.stringify(record);
     this.feedTodayRaw(date, raw);
     const epoch = this.clearEpoch;
-    this.enqueue(() => this.appendRawLine(date, `${raw}\n`, epoch));
+    this.enqueue(() => this.appendRawLine(date, `${raw}\n`, epoch, { tier: isFile ? 'file' : 'nonFile', critical }));
   }
 
   nextDeadline(): number | undefined {
@@ -700,6 +752,7 @@ export class HistoryManager {
       activeLifecycleOpen: this.activeLifecycleOpen,
       appendDegraded: this.appendDegraded,
       summaryDegraded: this.summaryDegraded,
+      wasCapped: this.capErrorsEmitted.size > 0,
       memoryEntries: this.snapshotMemoryEntries?.() ?? [],
     };
     this.todayAcc = undefined;
@@ -708,8 +761,10 @@ export class HistoryManager {
     this.yesterdaySummary = undefined;
     this.summaryRevision += 1;
     this.clearMemoryEntries();
-    this.sizes.clear();
+    this.usageByDate.clear();
     this.cappedDates.clear();
+    this.fileCappedDates.clear();
+    this.nonFileCappedDates.clear();
     this.capErrorsEmitted.clear();
     this.reportedFileErrors.clear();
     this.eventMetaById.clear();
@@ -799,6 +854,9 @@ export class HistoryManager {
         this.feedTodayRaw(today, raw);
         for (const item of buffered) if (item.date === today) this.feedTodayRaw(item.date, item.raw);
         await this.appendRawLine(today, `${raw}\n`, epoch);
+        if (previous.wasCapped && epoch === this.clearEpoch) {
+          this.safeEmitSourceOk();
+        }
       } else if (this.clearFeedBuffer === buffered) {
         this.clearFeedBuffer = undefined;
       }
@@ -1305,9 +1363,13 @@ export class HistoryManager {
     return undefined;
   }
 
-  private rememberEventMeta(id: string, date: string, diskId: string): void {
+  private isCriticalEvent(kind: string, level: DeliveryLevel): boolean {
+    return !kind.startsWith('file.') && (level === 'context' || level === 'wake');
+  }
+
+  private rememberEventMeta(id: string, date: string, diskId: string, isFile = false, critical = false): void {
     if (this.eventMetaById.has(id)) this.eventMetaById.delete(id);
-    this.eventMetaById.set(id, { date, diskId });
+    this.eventMetaById.set(id, { date, diskId, isFile, critical });
     if (this.eventMetaById.size > 4096) {
       const oldest = this.eventMetaById.keys().next().value;
       if (oldest !== undefined) this.eventMetaById.delete(oldest);
@@ -1436,6 +1498,10 @@ export class HistoryManager {
         }
       }
       if (this.isEpochStale(epoch)) return;
+      if (this.cappedDates.has(prevDate) && !this.appendDegraded && !this.summaryDegraded) {
+        this.safeEmitSourceOk();
+        await this.port.writeCapState?.('').catch(() => {});
+      }
       const startAt = continuous ? prevBounds.endMs : wall;
       const boundary: HistoryLifecycleRecord = {
         record: 'lifecycle',
@@ -1587,12 +1653,18 @@ export class HistoryManager {
         this.clearPendingForEpoch(epoch);
         return;
       }
+      const retainedDates = await this.pruneEventDatesOverTotalCap(keptDates, today, epoch);
+      if (this.isEpochStale(epoch)) {
+        this.clearPendingForEpoch(epoch);
+        return;
+      }
 
       // Restore up to 200 most recent events starting from the latest day only.
       const collected: Array<{ date: string; ev: PersistedEventEntry }> = [];
       const seenTodayBootTags = new Set<string>();
-      for (let i = keptDates.length - 1; i >= 0 && collected.length < MAX_HISTORY_LIMIT; i--) {
-        const date = keptDates[i];
+      let seenTodayCapError = false;
+      for (let i = retainedDates.length - 1; i >= 0 && collected.length < MAX_HISTORY_LIMIT; i--) {
+        const date = retainedDates[i];
         try {
           const scanner = createReverseEventScanner();
           for await (const line of this.streamLinesDesc(date)) {
@@ -1605,6 +1677,9 @@ export class HistoryManager {
             if (date === today) {
               const tag = BOOT_ID_RE.exec(ev.id)?.[1];
               if (tag) seenTodayBootTags.add(tag);
+              if (ev.kind === 'source.error' && ev.subject === 'history' && ev.reason === 'daily-limit-exceeded') {
+                seenTodayCapError = true;
+              }
             }
             collected.push({ date, ev });
             if (collected.length >= MAX_HISTORY_LIMIT) break;
@@ -1631,6 +1706,11 @@ export class HistoryManager {
         this.clearPendingForEpoch(epoch);
         return;
       }
+      await this.restoreTodayCapState(today, seenTodayCapError, epoch);
+      if (this.isEpochStale(epoch)) {
+        this.clearPendingForEpoch(epoch);
+        return;
+      }
       while (seenTodayBootTags.has(this.bootTag)) {
         this.bootTag = makeBootTag();
         this.shortSeq = 0;
@@ -1638,12 +1718,18 @@ export class HistoryManager {
       if (collected.length > 0) {
         collected.reverse();
         for (const item of collected) {
-          this.rememberEventMeta(item.ev.id, item.date, item.ev.id);
+          this.rememberEventMeta(
+            item.ev.id,
+            item.date,
+            item.ev.id,
+            item.ev.kind.startsWith('file.'),
+            this.isCriticalEvent(item.ev.kind, item.ev.level),
+          );
         }
         this.restoreEntries(collected.map((item) => item.ev));
       }
 
-      if (keptDates.includes(today) && !knownUnsafeEvents.has(today)) {
+      if (retainedDates.includes(today) && !knownUnsafeEvents.has(today)) {
         const todayBytes = await this.safeEventFileSize(today);
         if (this.isEpochStale(epoch)) {
           this.clearPendingForEpoch(epoch);
@@ -2159,15 +2245,18 @@ export class HistoryManager {
   private async pruneExpired(today: string, epoch: number): Promise<void> {
     if (!this.port || this.isEpochStale(epoch)) return;
     try {
-      const eventDates = this.filterValidDates(await this.port.listEventDates(), 'events');
+      const eventDates = this.filterValidDates(await this.port.listEventDates(), 'events').sort();
       if (this.isEpochStale(epoch)) return;
+      const keptDates: string[] = [];
       for (const date of eventDates) {
         if (this.isEpochStale(epoch)) return;
         if (diffDays(today, date) > HISTORY_RETENTION_DAYS) {
           try {
             await this.port.deleteEventDate(date);
-            this.sizes.delete(date);
+            this.usageByDate.delete(date);
             this.cappedDates.delete(date);
+            this.fileCappedDates.delete(date);
+            this.nonFileCappedDates.delete(date);
             this.capErrorsEmitted.delete(date);
           } catch (error) {
             const code = unsafeFsCode(error);
@@ -2181,8 +2270,11 @@ export class HistoryManager {
               throw error;
             }
           }
+        } else {
+          keptDates.push(date);
         }
       }
+      await this.pruneEventDatesOverTotalCap(keptDates, today, epoch);
     } catch (error) {
       const code = unsafeFsCode(error);
       if (code) {
@@ -2260,38 +2352,153 @@ export class HistoryManager {
     }
   }
 
-  private async appendRawLine(date: string, line: string, epoch: number): Promise<void> {
-    if (!this.port || epoch !== this.clearEpoch) return;
-    if (this.cappedDates.has(date)) return;
+  private async pruneEventDatesOverTotalCap(
+    keptDates: readonly string[],
+    today: string,
+    epoch: number,
+  ): Promise<string[]> {
+    if (!this.port || this.maxTotalBytes <= 0 || keptDates.length <= 1) return [...keptDates];
+    const sorted = [...keptDates].sort();
+    const entries: Array<{ date: string; size: number }> = [];
+    let totalBytes = 0;
+    for (const date of sorted) {
+      if (this.isEpochStale(epoch)) return sorted;
+      const size = await this.safeEventFileSize(date);
+      totalBytes += size;
+      entries.push({ date, size });
+    }
+    if (totalBytes <= this.maxTotalBytes) return sorted;
+
+    const deleted = new Set<string>();
+    for (const entry of entries) {
+      if (totalBytes <= this.maxTotalBytes) break;
+      if (entry.date >= today) continue;
+      if (this.isEpochStale(epoch)) break;
+      try {
+        await this.port.deleteEventDate(entry.date);
+        this.usageByDate.delete(entry.date);
+        this.cappedDates.delete(entry.date);
+        this.fileCappedDates.delete(entry.date);
+        this.nonFileCappedDates.delete(entry.date);
+        this.capErrorsEmitted.delete(entry.date);
+        deleted.add(entry.date);
+        totalBytes -= entry.size;
+      } catch (error) {
+        const code = unsafeFsCode(error);
+        if (code) {
+          this.reportFileErrorOnce(`unsafe:events:${entry.date}:${code}`, 'history-unsafe-entry', {
+            kind: 'events',
+            date: entry.date,
+            code,
+          });
+        } else {
+          throw error;
+        }
+      }
+    }
+    return deleted.size === 0 ? sorted : sorted.filter((d) => !deleted.has(d));
+  }
+
+  private classifyLineTier(rawLine: string): BudgetTier {
+    if (!rawLine.includes('"file.')) return 'nonFile';
     try {
-      let size = this.sizes.get(date);
-      if (size === undefined) {
-        size = await this.port.eventFileSize(date);
+      const parsed = JSON.parse(rawLine);
+      if (isRecordObject(parsed) && typeof parsed.kind === 'string' && parsed.kind.startsWith('file.')) {
+        return 'file';
+      }
+    } catch {}
+    return 'nonFile';
+  }
+
+  private async loadDateTierBreakdown(date: string, reportedTotal: number): Promise<DateByteUsage> {
+    let file = 0;
+    let nonFile = 0;
+    for await (const rawLine of this.streamLinesForward(date)) {
+      const bytes = Buffer.byteLength(rawLine, 'utf8') + 1;
+      if (this.classifyLineTier(rawLine) === 'file') file += bytes;
+      else nonFile += bytes;
+    }
+    if (file + nonFile === 0 && reportedTotal > 0) {
+      // Mocked StoragePorts may return a synthetic byte size while readEvents returns undefined.
+      return { total: reportedTotal, file: reportedTotal, nonFile: reportedTotal, breakdownLoaded: true };
+    }
+    return {
+      total: Math.max(reportedTotal, file + nonFile),
+      file,
+      nonFile,
+      breakdownLoaded: true,
+    };
+  }
+
+  private async appendRawLine(date: string, line: string, epoch: number, options: AppendOptions = {}): Promise<void> {
+    if (!this.port || epoch !== this.clearEpoch) return;
+    const tier: BudgetTier = options.tier ?? 'nonFile';
+    const critical = options.critical === true;
+    if (!critical) {
+      if (tier === 'file' && this.fileCappedDates.has(date)) return;
+      if (tier === 'nonFile' && this.nonFileCappedDates.has(date)) return;
+    }
+    try {
+      let usage = this.usageByDate.get(date);
+      if (!usage) {
+        const total = await this.port.eventFileSize(date);
         if (epoch !== this.clearEpoch) return;
-        this.sizes.set(date, size);
+        usage = { total, file: 0, nonFile: 0, breakdownLoaded: total === 0 };
+        this.usageByDate.set(date, usage);
       }
       const lineBytes = Buffer.byteLength(line, 'utf8');
-      if (size + lineBytes > this.maxDailyBytes) {
+      const minTierLimit = Math.min(this.maxFileDailyBytes, this.maxNonFileDailyBytes, this.maxDailyBytes);
+      if (!usage.breakdownLoaded && usage.total + lineBytes > minTierLimit) {
+        const loaded = await this.loadDateTierBreakdown(date, usage.total);
         if (epoch !== this.clearEpoch) return;
-        this.cappedDates.add(date);
-        if (!this.capErrorsEmitted.has(date)) {
-          this.capErrorsEmitted.add(date);
-          this.safeEmitSourceError('daily-limit-exceeded', { date, maxBytes: this.maxDailyBytes });
+        usage = loaded;
+        this.usageByDate.set(date, usage);
+      }
+      if (!critical) {
+        const tierLimit = tier === 'file' ? this.maxFileDailyBytes : this.maxNonFileDailyBytes;
+        const tierUsed = usage.breakdownLoaded ? (tier === 'file' ? usage.file : usage.nonFile) : usage.total;
+        const overTier = tierUsed + lineBytes > tierLimit;
+        const overTotal = this.enforceTotalDailyCap && usage.total + lineBytes > this.maxDailyBytes;
+        if (overTier || overTotal) {
+          if (epoch !== this.clearEpoch) return;
+          this.cappedDates.add(date);
+          if (overTotal) {
+            this.fileCappedDates.add(date);
+            this.nonFileCappedDates.add(date);
+          } else if (tier === 'file') {
+            this.fileCappedDates.add(date);
+          } else {
+            this.nonFileCappedDates.add(date);
+          }
+          await this.persistCapStateForDate(date, epoch);
+          if (epoch !== this.clearEpoch) return;
+          if (!this.capErrorsEmitted.has(date)) {
+            this.capErrorsEmitted.add(date);
+            this.safeEmitSourceError('daily-limit-exceeded', {
+              date,
+              tier,
+              maxBytes: overTotal ? this.maxDailyBytes : tierLimit,
+            });
+          }
+          return;
         }
-        return;
       }
       if (epoch !== this.clearEpoch) return;
       await this.port.appendEvent(date, line);
       if (epoch !== this.clearEpoch) return;
-      this.sizes.set(date, size + lineBytes);
+      usage.total += lineBytes;
+      if (usage.breakdownLoaded) {
+        if (tier === 'file') usage.file += lineBytes;
+        else usage.nonFile += lineBytes;
+      }
       if (this.appendDegraded) {
         this.appendDegraded = false;
         if (!this.summaryDegraded) this.safeEmitSourceOk();
       }
     } catch (error) {
       if (epoch !== this.clearEpoch) return;
-      // Drop cached size after write failure so a partial write (e.g. ENOSPC) is re-stat'd.
-      this.sizes.delete(date);
+      // Drop cached usage after write failure so a partial write (e.g. ENOSPC) is re-stat'd.
+      this.usageByDate.delete(date);
       const code = unsafeFsCode(error);
       if (code) {
         this.reportFileErrorOnce(`unsafe:events:${date}:${code}`, 'history-unsafe-entry', {
@@ -2351,9 +2558,53 @@ export class HistoryManager {
     this.safeEmitSourceError(errorCode, extra);
   }
 
+  private async restoreTodayCapState(today: string, seenInLog: boolean, epoch: number): Promise<void> {
+    if (!this.port || this.isEpochStale(epoch)) return;
+    let restored = seenInLog;
+    if (this.port.readCapState) {
+      try {
+        const raw = await this.port.readCapState();
+        if (this.isEpochStale(epoch)) return;
+        if (raw) {
+          const parsed = JSON.parse(raw);
+          if (isRecordObject(parsed) && parsed.date === today) {
+            restored = true;
+            if (Array.isArray(parsed.tiers)) {
+              for (const t of parsed.tiers) {
+                if (t === 'file') this.fileCappedDates.add(today);
+                else if (t === 'nonFile') this.nonFileCappedDates.add(today);
+              }
+            }
+          }
+        }
+      } catch {}
+    }
+    if (!restored || this.isEpochStale(epoch)) return;
+    this.cappedDates.add(today);
+    this.capErrorsEmitted.add(today);
+    this.safeRestoreSourceError('daily-limit-exceeded', { date: today });
+  }
+
+  private async persistCapStateForDate(date: string, epoch: number): Promise<void> {
+    if (!this.port?.writeCapState || epoch !== this.clearEpoch || date !== this.currentDate) return;
+    const tiers: BudgetTier[] = [];
+    if (this.fileCappedDates.has(date)) tiers.push('file');
+    if (this.nonFileCappedDates.has(date)) tiers.push('nonFile');
+    try {
+      await this.port.writeCapState(JSON.stringify({ date, tiers }));
+    } catch {}
+  }
+
   private safeEmitSourceError(error: string, extra?: Record<string, unknown>): void {
     try {
       this.emitSourceError(error, extra);
+    } catch {}
+  }
+
+  private safeRestoreSourceError(error: string, extra?: Record<string, unknown>): void {
+    if (!this.restoreSourceError) return;
+    try {
+      this.restoreSourceError(error, extra);
     } catch {}
   }
 
