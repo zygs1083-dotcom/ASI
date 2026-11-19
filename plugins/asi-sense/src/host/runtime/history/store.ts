@@ -723,10 +723,7 @@ export class HistoryManager {
     this.clearOrphanedLines.push({ date, raw: raw.endsWith('\n') ? raw.slice(0, -1) : raw, options });
   }
 
-  private bufferClearOrphanedItems(
-    items: ReadonlyArray<{ date: string; raw: string }>,
-    start: number,
-  ): void {
+  private bufferClearOrphanedItems(items: ReadonlyArray<{ date: string; raw: string }>, start: number): void {
     if (!this.clearOrphanedLines) return;
     for (let i = start; i < items.length; i++) {
       this.clearOrphanedLines.push({ date: items[i].date, raw: items[i].raw, options: { tier: 'file' } });
