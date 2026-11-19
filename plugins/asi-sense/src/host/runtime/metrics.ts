@@ -47,7 +47,8 @@ const METRIC_INDEX: Readonly<Record<MetricKey, number>> = {
   battery: 7,
 };
 const DATE_ONLY_RE = /^\d{4}-\d{2}-\d{2}$/;
-const ISO_DATE_PREFIX_RE = /^(\d{4}-\d{2}-\d{2})(?:[Tt ]|$)/;
+const ISO_TIMESTAMP_RE =
+  /^(\d{4}-\d{2}-\d{2})[Tt](?:[01]\d|2[0-3]):[0-5]\d(?::[0-5]\d(?:\.\d+)?)?(?:[Zz]|[+-](?:[01]\d|2[0-3]):?[0-5]\d)?$/;
 
 export interface MetricStats {
   min: number;
@@ -830,8 +831,11 @@ export class MetricTimeline {
       }
       return edge === 'start' ? bounds.startMs : Math.max(bounds.startMs, bounds.endMs - 1);
     }
-    const prefixMatch = ISO_DATE_PREFIX_RE.exec(trimmed);
-    if (prefixMatch && !parseDateKey(prefixMatch[1])) {
+    const isoMatch = ISO_TIMESTAMP_RE.exec(trimmed);
+    if (!isoMatch?.[1]) {
+      throw new MetricsArgsError(`invalid ISO date/time string: ${value}`);
+    }
+    if (!parseDateKey(isoMatch[1])) {
       throw new MetricsArgsError(`invalid calendar date in ISO string: ${value}`);
     }
     const parsed = Date.parse(trimmed);
