@@ -3276,7 +3276,11 @@ describe('runtime history persistence, rollups, retention, and recovery', () => 
     await new Promise((r) => setTimeout(r, 50));
     expect(deliveredWithSess.some((d) => d.includes('daily-limit-exceeded'))).toBe(false);
     expect(h1.runtime.events().find((e) => e.reason === 'daily-limit-exceeded')?.level).toBe('record');
-    expect(projectState(h1.runtime.state()).observation.sources.history?.error).toBe('今日已达上限，后续只记汇总');
+    expect(projectState(h1.runtime.state()).observation.sources.history).toMatchObject({
+      status: 'ok',
+      capped: true,
+    });
+    expect(projectState(h1.runtime.state()).observation.sources.history?.error).toBeUndefined();
     await h1.runtime.stop();
 
     // Restart on the same date: must NOT emit a duplicate daily-limit-exceeded event or push to model
@@ -3292,7 +3296,11 @@ describe('runtime history persistence, rollups, retention, and recovery', () => 
       },
     });
     await h2.runtime.start();
-    expect(projectState(h2.runtime.state()).observation.sources.history?.error).toBe('今日已达上限，后续只记汇总');
+    expect(projectState(h2.runtime.state()).observation.sources.history).toMatchObject({
+      status: 'ok',
+      capped: true,
+    });
+    expect(projectState(h2.runtime.state()).observation.sources.history?.error).toBeUndefined();
     await h2.emitJob({
       type: 'started',
       id: `cap-sess-after-restart-${'x'.repeat(60)}`,
@@ -3376,7 +3384,11 @@ describe('runtime history persistence, rollups, retention, and recovery', () => 
         ).toHaveLength(1),
       { timeout: 2_000, interval: 5 },
     );
-    expect(projectState(rtNoSess.state()).observation.sources.history?.error).toBe('今日已达上限，后续只记汇总');
+    expect(projectState(rtNoSess.state()).observation.sources.history).toMatchObject({
+      status: 'ok',
+      capped: true,
+    });
+    expect(projectState(rtNoSess.state()).observation.sources.history?.error).toBeUndefined();
 
     // Now bring a session online and deliver an event on it: daily-limit-exceeded must NEVER be pending or delivered
     sessionList = [{ id: 's-late', title: 'Late', updatedAt: wall + 1_000, running: true }];
@@ -3390,6 +3402,292 @@ describe('runtime history persistence, rollups, retention, and recovery', () => 
     });
     await new Promise((r) => setTimeout(r, 80));
     expect(deliveredNoSess.some((d) => d.includes('daily-limit-exceeded'))).toBe(false);
+    await rtNoSess.stop();
+  });
+
+  it('B1: keeps history source ok+capped on daily-limit-exceeded so subsequent real write failures still deliver and transient emitSourceOk preserves cap notice', async () => {
+    // 1) Active session: daily-limit-exceeded keeps status='ok' + capped=true; subsequent ENOSPC delivers; recovery preserves capped=true
+    const dirSess = await makeTempDir();
+    const baseSess = new FileHistoryStoragePort(dirSess);
+    const wall = Date.UTC(2026, 10, 18, 12, 0, 0);
+    let failWrites = false;
+    let simulatedBytes = MAX_DAILY_EVENT_BYTES - 80;
+    let sessAgentCb: ((ev: AgentEvent) => Promise<void>) | undefined;
+    let sessJobCb: ((ev: JobEvent) => Promise<void>) | undefined;
+    const deliveredSess: string[] = [];
+    const rtSess = createSenseRuntime(
+      {
+        clock: { wall: () => wall, mono: () => 1_000 },
+        history: {
+          eventFileSize: async (d) => (d === '2026-11-18' ? simulatedBytes : 0),
+          appendEvent: async (d, line) => {
+            if (failWrites) throw Object.assign(new Error('ENOSPC'), { code: 'ENOSPC' });
+            if (d === '2026-11-18') simulatedBytes += Buffer.byteLength(line, 'utf8');
+            await baseSess.appendEvent(d, line);
+          },
+          readEvents: (d) => baseSess.readEvents(d),
+          readEventLines: (d) => baseSess.readEventLines(d),
+          readEventLinesDesc: (d) => baseSess.readEventLinesDesc(d),
+          listEventDates: () => baseSess.listEventDates(),
+          deleteEventDate: (d) => baseSess.deleteEventDate(d),
+          readDaily: (d) => baseSess.readDaily(d),
+          writeDaily: (d, j) => baseSess.writeDaily(d, j),
+          listDailyDates: () => baseSess.listDailyDates(),
+          deleteDailyDate: (d) => baseSess.deleteDailyDate(d),
+          readMonthly: (m) => baseSess.readMonthly(m),
+          writeMonthly: (m, j) => baseSess.writeMonthly(m, j),
+          listMonthlyMonths: () => baseSess.listMonthlyMonths(),
+          clearAll: () => baseSess.clearAll(),
+        },
+        storage: { load: async () => undefined, save: async () => {} },
+        dsh: {
+          listSessions: async () => [{ id: 's1', title: 'Active', updatedAt: wall, running: true }],
+          onAgentEvent: (cb) => {
+            sessAgentCb = cb;
+            return () => {};
+          },
+          onTool: () => () => {},
+          onJob: (cb) => {
+            sessJobCb = cb;
+            return () => {};
+          },
+          deliver: async (_sid, intent) => {
+            for (const c of intent.update.changes) {
+              deliveredSess.push(`${c.signal.kind}:${c.signal.subject}:${String(c.signal.data.error ?? '')}`);
+            }
+          },
+          tokenSnapshot: async () => undefined,
+        },
+        helper: { spawn: () => undefined },
+        probe: { create: () => ({ onSample: () => () => {}, start: () => {}, stop: async () => {} }) },
+        files: { watch: () => ({ close: () => {} }) },
+      },
+      { platform: 'linux', timeZone: 'UTC', intervalMs: 600_000, globalFileWatch: { disableInTests: true } },
+    );
+    await rtSess.start();
+    await sessAgentCb?.({ type: 'created', sessionId: 's1' });
+    await sessAgentCb?.({ type: 'pre-step', sessionId: 's1' });
+    await sessAgentCb?.({ type: 'post-step', sessionId: 's1' });
+    for (let i = 0; i < 3; i++) {
+      await sessJobCb?.({
+        type: 'started',
+        id: `b1-sess-${i}-${'a'.repeat(60)}`,
+        sessionId: 's1',
+        command: 'echo test',
+        at: wall + (i + 1) * 100,
+      });
+    }
+    await vi.waitFor(
+      () =>
+        expect(
+          rtSess.events().filter((e) => e.kind === 'source.error' && e.reason === 'daily-limit-exceeded'),
+        ).toHaveLength(1),
+      { timeout: 2_000, interval: 5 },
+    );
+    expect(rtSess.state().observation.sources.history).toMatchObject({
+      status: 'ok',
+      capped: true,
+    });
+    expect(rtSess.state().observation.sources.history?.error).toBeUndefined();
+
+    // Now inject real ENOSPC on critical write: MUST still be delivered to active session s1!
+    failWrites = true;
+    await sessJobCb?.({
+      type: 'started',
+      id: 'b1-fail-job',
+      sessionId: 's1',
+      command: 'pnpm test',
+      at: wall + 1_900,
+    });
+    await sessJobCb?.({
+      type: 'exited',
+      id: 'b1-fail-job',
+      sessionId: 's1',
+      command: 'pnpm test',
+      exitCode: 1,
+      at: wall + 2_000,
+    });
+    await vi.waitFor(() => expect(rtSess.state().observation.sources.history?.status).toBe('unavailable'), {
+      timeout: 2_000,
+      interval: 10,
+    });
+    await sessAgentCb?.({ type: 'pre-step', sessionId: 's1' });
+    await vi.waitFor(
+      () => expect(deliveredSess.some((d) => d === 'source.error:history:history-write-failed')).toBe(true),
+      { timeout: 3_000, interval: 10 },
+    );
+    expect(rtSess.state().observation.sources.history).toMatchObject({
+      status: 'unavailable',
+      error: 'history-write-failed',
+      capped: true,
+    });
+
+    // Transient write recovery (emitSourceOk) MUST restore status='ok' WITHOUT wiping capped=true
+    failWrites = false;
+    await sessJobCb?.({
+      type: 'started',
+      id: 'b1-recover-job',
+      sessionId: 's1',
+      command: 'pnpm test',
+      at: wall + 2_900,
+    });
+    await sessJobCb?.({
+      type: 'exited',
+      id: 'b1-recover-job',
+      sessionId: 's1',
+      command: 'pnpm test',
+      exitCode: 0,
+      at: wall + 3_000,
+    });
+    await vi.waitFor(() => expect(rtSess.state().observation.sources.history?.status).toBe('ok'), {
+      timeout: 2_000,
+      interval: 10,
+    });
+    expect(rtSess.state().observation.sources.history).toMatchObject({
+      status: 'ok',
+      capped: true,
+    });
+    expect(rtSess.state().observation.sources.history?.error).toBeUndefined();
+    expect(deliveredSess.some((d) => d.includes('daily-limit-exceeded'))).toBe(false);
+    await rtSess.stop();
+
+    // 2) No-session pending path: daily-limit-exceeded followed by ENOSPC still queues history-write-failed into pending
+    const dirNoSess = await makeTempDir();
+    const baseNoSess = new FileHistoryStoragePort(dirNoSess);
+    let noSessFail = false;
+    let noSessBytes = MAX_DAILY_EVENT_BYTES - 80;
+    let agentCb: ((ev: AgentEvent) => Promise<void>) | undefined;
+    let jobCb: ((ev: JobEvent) => Promise<void>) | undefined;
+    let probeCb: ((body: Body) => void) | undefined;
+    const sessions: Array<{ id: string; title: string; updatedAt: number; running: boolean }> = [];
+    const deliveredPending: string[] = [];
+    const diskBody = (free: number, at: number): Body => {
+      const src = { id: 'body', api: 'probe', host: 'local' };
+      const ok = <T>(value: T) => ({ value, status: 'ok' as const, source: src, observedAt: at, ttlMs: 10_000 });
+      return {
+        cpu: ok({ usage: 0.1, perCore: [0.1], load1: 0.1, load5: 0.1, load15: 0.1 }),
+        memory: ok({ total: 1000, used: 200, pressure: 'normal' as const, swapUsed: 0 }),
+        disks: {
+          kind: 'disks',
+          value: [{ mount: '/Volumes/Work', total: 1000, free, status: 'ok', observedAt: at, ttlMs: 10_000 }],
+          status: 'ok',
+          source: src,
+          observedAt: at,
+          ttlMs: 10_000,
+        },
+        battery: { value: null, status: 'unavailable', source: src, observedAt: at, ttlMs: 10_000 },
+        thermal: ok('nominal' as const),
+        network: ok({ online: true, rxBps: 0, txBps: 0 }),
+        harnessProcess: ok({ rss: 100, cpu: 0.1, uptimeSec: 10 }),
+        tokens: {
+          value: null,
+          status: 'unavailable',
+          source: { id: 'tokens', api: 'dsh', host: 'local' },
+          observedAt: at,
+          ttlMs: 10_000,
+        },
+      };
+    };
+    let noSessWall = wall;
+    let noSessMono = 1_000;
+    const rtNoSess = createSenseRuntime(
+      {
+        clock: { wall: () => noSessWall, mono: () => noSessMono },
+        history: {
+          eventFileSize: async (d) => (d === '2026-11-18' ? noSessBytes : 0),
+          appendEvent: async (d, line) => {
+            if (noSessFail) throw Object.assign(new Error('EACCES'), { code: 'EACCES' });
+            if (d === '2026-11-18') noSessBytes += Buffer.byteLength(line, 'utf8');
+            await baseNoSess.appendEvent(d, line);
+          },
+          readEvents: (d) => baseNoSess.readEvents(d),
+          readEventLines: (d) => baseNoSess.readEventLines(d),
+          readEventLinesDesc: (d) => baseNoSess.readEventLinesDesc(d),
+          listEventDates: () => baseNoSess.listEventDates(),
+          deleteEventDate: (d) => baseNoSess.deleteEventDate(d),
+          readDaily: (d) => baseNoSess.readDaily(d),
+          writeDaily: (d, j) => baseNoSess.writeDaily(d, j),
+          listDailyDates: () => baseNoSess.listDailyDates(),
+          deleteDailyDate: (d) => baseNoSess.deleteDailyDate(d),
+          readMonthly: (m) => baseNoSess.readMonthly(m),
+          writeMonthly: (m, j) => baseNoSess.writeMonthly(m, j),
+          listMonthlyMonths: () => baseNoSess.listMonthlyMonths(),
+          clearAll: () => baseNoSess.clearAll(),
+        },
+        storage: { load: async () => undefined, save: async () => {} },
+        dsh: {
+          listSessions: async () => sessions,
+          onAgentEvent: (cb) => {
+            agentCb = cb;
+            return () => {};
+          },
+          onTool: () => () => {},
+          onJob: (cb) => {
+            jobCb = cb;
+            return () => {};
+          },
+          deliver: async (_sid, intent) => {
+            for (const c of intent.update.changes) {
+              deliveredPending.push(`${c.signal.kind}:${c.signal.subject}:${String(c.signal.data.error ?? '')}`);
+            }
+          },
+          tokenSnapshot: async () => undefined,
+        },
+        helper: { spawn: () => undefined },
+        probe: {
+          create: () => ({
+            onSample: (cb) => {
+              probeCb = cb;
+              return () => {};
+            },
+            start: () => {},
+            stop: async () => {},
+          }),
+        },
+        files: { watch: () => ({ close: () => {} }) },
+      },
+      { platform: 'linux', timeZone: 'UTC', intervalMs: 600_000, globalFileWatch: { disableInTests: true } },
+    );
+    await rtNoSess.start();
+    probeCb?.(diskBody(800, noSessWall));
+    // Hit daily limit while no session exists
+    for (let i = 0; i < 2; i++) {
+      await jobCb?.({
+        type: 'started',
+        id: `b1-nosess-${i}-${'z'.repeat(60)}`,
+        sessionId: 'no-sess',
+        command: 'echo synthetic',
+        at: noSessWall + (i + 1) * 100,
+      });
+    }
+    await vi.waitFor(
+      () =>
+        expect(
+          rtNoSess.events().filter((e) => e.kind === 'source.error' && e.reason === 'daily-limit-exceeded'),
+        ).toHaveLength(1),
+      { timeout: 2_000, interval: 5 },
+    );
+    expect(rtNoSess.state().observation.sources.history).toMatchObject({ status: 'ok', capped: true });
+
+    // Real EACCES while still no session -> must queue history-write-failed into pending
+    noSessFail = true;
+    noSessWall += 2_000;
+    noSessMono += 2_000;
+    probeCb?.(diskBody(50, noSessWall));
+    await vi.waitFor(() => expect(rtNoSess.state().observation.sources.history?.status).toBe('unavailable'), {
+      timeout: 2_000,
+      interval: 10,
+    });
+
+    // Bring session online and preStep it -> pending history-write-failed MUST deliver!
+    sessions.push({ id: 's-late', title: 'Late', updatedAt: noSessWall + 2_000, running: true });
+    await agentCb?.({ type: 'created', sessionId: 's-late' });
+    await agentCb?.({ type: 'pre-step', sessionId: 's-late' });
+    await vi.waitFor(
+      () => expect(deliveredPending.some((d) => d === 'source.error:history:history-write-failed')).toBe(true),
+      { timeout: 3_000, interval: 10 },
+    );
+    expect(deliveredPending.some((d) => d.includes('daily-limit-exceeded'))).toBe(false);
     await rtNoSess.stop();
   });
 

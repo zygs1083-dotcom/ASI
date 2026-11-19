@@ -33,7 +33,7 @@ export function projectState(state: SenseState): SensePanelModel['state'] {
     histSource?.error === 'daily-limit-exceeded'
       ? {
           ...state.observation.sources,
-          history: { ...histSource, error: '今日已达上限，后续只记汇总' },
+          history: { ...histSource, capped: true, error: '今日已达上限，后续只记汇总' },
         }
       : state.observation.sources;
   return {

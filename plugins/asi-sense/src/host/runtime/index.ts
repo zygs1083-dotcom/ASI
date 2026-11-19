@@ -72,6 +72,7 @@ export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}
     restoreMemoryEntries: (entries) => attentionRef?.restoreEntriesPreservingLive(entries),
     emitSourceError: (error, extra) => {
       if (!attentionRef || stopping) return;
+      const isDailyLimit = error === 'daily-limit-exceeded';
       void attentionRef
         .accept({
           id: attentionRef.id(),
@@ -79,22 +80,27 @@ export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}
           at: clock.wall(),
           source: { id: 'history', api: 'storage', host: 'local' },
           subject: 'history',
-          data: { status: 'error', error, reason: error, ...extra },
+          data: isDailyLimit
+            ? { status: 'ok', capped: true, error, reason: error, ...extra }
+            : { status: 'error', error, reason: error, ...extra },
         })
         .catch(() => {});
     },
     restoreSourceError: (error, extra) => {
       if (!attentionRef || stopping) return;
+      const isDailyLimit = error === 'daily-limit-exceeded';
       attentionRef.restoreSourceObservation({
         id: attentionRef.id(),
         kind: 'source.error',
         at: clock.wall(),
         source: { id: 'history', api: 'storage', host: 'local' },
         subject: 'history',
-        data: { status: 'error', error, reason: error, ...extra },
+        data: isDailyLimit
+          ? { status: 'ok', capped: true, error, reason: error, ...extra }
+          : { status: 'error', error, reason: error, ...extra },
       });
     },
-    emitSourceOk: () => {
+    emitSourceOk: (extra) => {
       if (!attentionRef || stopping) return;
       void attentionRef
         .accept({
@@ -103,9 +109,20 @@ export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}
           at: clock.wall(),
           source: { id: 'history', api: 'storage', host: 'local' },
           subject: 'history',
-          data: { status: 'ok' },
+          data: { status: 'ok', ...extra },
         })
         .catch(() => {});
+    },
+    clearSourceCap: () => {
+      if (!attentionRef || stopping) return;
+      attentionRef.restoreSourceObservation({
+        id: attentionRef.id(),
+        kind: 'source.status',
+        at: clock.wall(),
+        source: { id: 'history', api: 'storage', host: 'local' },
+        subject: 'history',
+        data: { preserveStatus: true, capped: false },
+      });
     },
     timeZone: options.timeZone,
     dayExtensions: (date) => {

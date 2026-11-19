@@ -72,7 +72,8 @@ export interface HistoryManagerOptions {
   restoreMemoryEntries?: (entries: readonly PersistedEventEntry[]) => void;
   emitSourceError: (error: string, extra?: Record<string, unknown>) => void;
   restoreSourceError?: (error: string, extra?: Record<string, unknown>) => void;
-  emitSourceOk: () => void;
+  emitSourceOk: (extra?: Record<string, unknown>) => void;
+  clearSourceCap?: () => void;
   timeZone?: string;
   maxDailyBytes?: number;
   maxFileDailyBytes?: number;
@@ -289,7 +290,8 @@ export class HistoryManager {
   private readonly restoreMemoryEntries?: (entries: readonly PersistedEventEntry[]) => void;
   private readonly emitSourceError: (error: string, extra?: Record<string, unknown>) => void;
   private readonly restoreSourceError?: (error: string, extra?: Record<string, unknown>) => void;
-  private readonly emitSourceOk: () => void;
+  private readonly emitSourceOk: (extra?: Record<string, unknown>) => void;
+  private readonly clearSourceCap?: () => void;
   private readonly calendar: LocalCalendar;
   private readonly maxDailyBytes: number;
   private readonly maxFileDailyBytes: number;
@@ -356,6 +358,7 @@ export class HistoryManager {
     this.emitSourceError = options.emitSourceError;
     this.restoreSourceError = options.restoreSourceError;
     this.emitSourceOk = options.emitSourceOk;
+    this.clearSourceCap = options.clearSourceCap;
     this.calendar = new LocalCalendar(options.timeZone);
     if (options.maxFileDailyBytes !== undefined || options.maxNonFileDailyBytes !== undefined) {
       this.maxFileDailyBytes = options.maxFileDailyBytes ?? MAX_DAILY_FILE_EVENT_BYTES;
@@ -752,7 +755,7 @@ export class HistoryManager {
       activeLifecycleOpen: this.activeLifecycleOpen,
       appendDegraded: this.appendDegraded,
       summaryDegraded: this.summaryDegraded,
-      wasCapped: this.capErrorsEmitted.size > 0,
+      wasCapped: this.capErrorsEmitted.size > 0 || this.cappedDates.size > 0,
       memoryEntries: this.snapshotMemoryEntries?.() ?? [],
     };
     this.todayAcc = undefined;
@@ -854,8 +857,8 @@ export class HistoryManager {
         this.feedTodayRaw(today, raw);
         for (const item of buffered) if (item.date === today) this.feedTodayRaw(item.date, item.raw);
         await this.appendRawLine(today, `${raw}\n`, epoch);
-        if (previous.wasCapped && epoch === this.clearEpoch) {
-          this.safeEmitSourceOk();
+        if ((previous.wasCapped || previous.appendDegraded || previous.summaryDegraded) && epoch === this.clearEpoch) {
+          this.safeEmitSourceOk({ capped: false });
         }
       } else if (this.clearFeedBuffer === buffered) {
         this.clearFeedBuffer = undefined;
@@ -1531,9 +1534,13 @@ export class HistoryManager {
         }
       }
       if (this.isEpochStale(epoch)) return;
-      if (this.cappedDates.has(prevDate) && !this.appendDegraded && !this.summaryDegraded) {
-        this.safeEmitSourceOk();
+      if (this.cappedDates.has(prevDate)) {
         await this.port.writeCapState?.('').catch(() => {});
+        if (!this.appendDegraded && !this.summaryDegraded) {
+          this.safeEmitSourceOk({ capped: false });
+        } else {
+          this.safeClearSourceCap();
+        }
       }
       const startAt = continuous ? prevBounds.endMs : wall;
       const boundary: HistoryLifecycleRecord = {
@@ -2538,7 +2545,10 @@ export class HistoryManager {
       }
       if (this.appendDegraded) {
         this.appendDegraded = false;
-        if (!this.summaryDegraded) this.safeEmitSourceOk();
+        if (!this.summaryDegraded) {
+          const capped = this.currentDate !== undefined && this.cappedDates.has(this.currentDate);
+          this.safeEmitSourceOk({ capped });
+        }
       }
     } catch (error) {
       if (epoch !== this.clearEpoch) return;
@@ -2584,7 +2594,10 @@ export class HistoryManager {
   private clearSummaryDegraded(): void {
     if (!this.summaryDegraded) return;
     this.summaryDegraded = false;
-    if (!this.appendDegraded) this.safeEmitSourceOk();
+    if (!this.appendDegraded) {
+      const capped = this.currentDate !== undefined && this.cappedDates.has(this.currentDate);
+      this.safeEmitSourceOk({ capped });
+    }
     if (
       this.pendingBackfill.size > 0 &&
       this.pendingBackfillEpoch === this.clearEpoch &&
@@ -2653,9 +2666,16 @@ export class HistoryManager {
     } catch {}
   }
 
-  private safeEmitSourceOk(): void {
+  private safeEmitSourceOk(extra?: Record<string, unknown>): void {
     try {
-      this.emitSourceOk();
+      this.emitSourceOk(extra);
+    } catch {}
+  }
+
+  private safeClearSourceCap(): void {
+    if (!this.clearSourceCap) return;
+    try {
+      this.clearSourceCap();
     } catch {}
   }
 }
