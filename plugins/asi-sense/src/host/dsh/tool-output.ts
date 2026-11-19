@@ -4,6 +4,7 @@ import type { Fact, SenseState, WatchRule } from '@asi/sense-types';
 import { isRemoteJsonValue } from '@deepseek-ai/dsh-typert-protocol';
 import { isHomeRoot, isHomeRootShape, toHomeRelative } from '../attention/path.ts';
 import type { createSenseRuntime } from '../runtime/index.ts';
+import { containsCredential, isBasicCred, redactCredentials } from './credential-scan.ts';
 import { MODEL_RULE_KINDS } from './kinds.ts';
 import type { JsonValue } from './wire-types.ts';
 
@@ -1201,17 +1202,7 @@ function isSafeNonPathCore(core: string, host: HostSpec | undefined): boolean {
   return isSafeSingleAtom(core);
 }
 
-const CREDENTIAL_TOKEN_RE =
-  /^(?:(?:npm_|ghp_|gho_|ghu_|ghs_|ghr_|github_pat_|glpat-|hf_|xox[a-z]*[-_]|AIza|(?:pk|sk|rk)[-_](?:live|test)[-_]|sk[-_])[A-Za-z0-9_-]{8,}|(?:AKIA|ASIA)[A-Z0-9]{16}|-{5}BEGIN|(?:api[-_]?key|token|secret|password|bearer)[-_][A-Za-z0-9_-]{12,})$/i;
-const EMBEDDED_DOT_CREDENTIAL_RE =
-  /(?:^|\.)(?:eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+|SG\.[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]{8,})?)(?:\.|$)/;
 const REVERSE_DOMAIN_SEG_RE = /^[A-Za-z][A-Za-z0-9-]{0,62}$/;
-
-function isCredentialToken(token: string): boolean {
-  if (CREDENTIAL_TOKEN_RE.test(token) || EMBEDDED_DOT_CREDENTIAL_RE.test(token)) return true;
-  if (!token.includes('.')) return false;
-  return token.split('.').some((segment) => segment.length > 0 && CREDENTIAL_TOKEN_RE.test(segment));
-}
 
 function isSimpleAsciiAlnumWord(text: string): boolean {
   for (let i = 0; i < text.length; i++) {
@@ -1227,8 +1218,9 @@ function classifyNonPathToken(
   isTitle: boolean,
   prevEndedWithColon: boolean,
   host: HostSpec | undefined,
+  alreadyScanned = false,
 ): TokenClassification {
-  if (!prevEndedWithColon && isSimpleAsciiAlnumWord(normToken) && !isCredentialToken(normToken)) {
+  if (!prevEndedWithColon && isSimpleAsciiAlnumWord(normToken) && (alreadyScanned || !containsCredential(normToken))) {
     return { kind: 'plain', text: normToken };
   }
   const hostPlaceholder = isTitle ? '<host>' : '[host]';
@@ -1238,7 +1230,7 @@ function classifyNonPathToken(
     return { kind: 'replaced', text: core + trail };
   }
 
-  if (isCredentialToken(core)) {
+  if (!alreadyScanned && containsCredential(core)) {
     return { kind: 'replaced', text: `[redacted]${trail}` };
   }
 
@@ -1268,11 +1260,12 @@ function classifyNormalizedToken(
   isTitle: boolean,
   prevEndedWithColon: boolean,
   host: HostSpec | undefined,
+  alreadyScanned = false,
 ): TokenClassification {
   const hostPlaceholder = isTitle ? '<host>' : '[host]';
 
   if (!hasSlash(normToken)) {
-    return classifyNonPathToken(normToken, isTitle, prevEndedWithColon, host);
+    return classifyNonPathToken(normToken, isTitle, prevEndedWithColon, host, alreadyScanned);
   }
 
   const detNoMarks = stripCombiningMarksIfAny(normToken);
@@ -1289,7 +1282,7 @@ function classifyNormalizedToken(
   if (!rawBase || rawBase === '.' || rawBase === '..' || isDriveRootBaseNormalized(rawBase) || hasSlash(rawBase)) {
     return { kind: 'replaced', text: '[path]' };
   }
-  const baseClassified = classifyNonPathToken(rawBase, isTitle, false, host);
+  const baseClassified = classifyNonPathToken(rawBase, isTitle, false, host, alreadyScanned);
   if (baseClassified.kind === 'replaced') {
     if (hostMatchesText(rawBase, host)) {
       return { kind: 'replaced', text: hostPlaceholder };
@@ -1384,8 +1377,15 @@ function findBoundaryHostMatch(
   return undefined;
 }
 
-function projectModelString(value: string, hostname: string, limit: number, isTitle: boolean): string {
-  if (!value) return '';
+function projectModelString(
+  rawValue: string,
+  hostname: string,
+  limit: number,
+  isTitle: boolean,
+  skipCredScan = false,
+): string {
+  if (!rawValue) return '';
+  const value = skipCredScan ? rawValue : redactCredentials(rawValue);
   const host = analyzeHost(hostname);
   const hostPlaceholder = isTitle ? '<host>' : '[host]';
   const tailGuard = host ? host.tailGuardClusters : 0;
@@ -1397,6 +1397,7 @@ function projectModelString(value: string, hostname: string, limit: number, isTi
   let pendingLen = 0;
   let lastWasSpace = false;
   let prevEndedWithColon = false;
+  let prevAuthScheme: 'none' | 'bearer' | 'basic' | 'auth' = 'none';
   let prevReplacedTail = '';
 
   const drainPendingString = (): string => {
@@ -1514,14 +1515,30 @@ function projectModelString(value: string, hostname: string, limit: number, isTi
     }
   };
 
-  const processNormalizedSubToken = (sub: string) => {
+  const processNormalizedSubToken = (sub: string, alreadyScanned = false) => {
     if (!sub) return;
+    if (prevAuthScheme !== 'none') {
+      const scheme = prevAuthScheme;
+      if (scheme === 'auth' && /^(?:bearer|basic|token)$/i.test(sub)) {
+        prevAuthScheme = /^basic$/i.test(sub) ? 'basic' : 'bearer';
+      } else {
+        prevAuthScheme = 'none';
+        if (!PLACEHOLDERS_SET.has(sub) && (scheme !== 'basic' || isBasicCred(sub))) {
+          emitReplaced('[redacted]', sub);
+          prevEndedWithColon = endsWithDetectionColon(sub);
+          return;
+        }
+      }
+    } else if (/^(?:bearer|basic|authorization:)$/i.test(sub)) {
+      prevAuthScheme = sub.length > 7 ? 'auth' : /^basic$/i.test(sub) ? 'basic' : 'bearer';
+    }
+
     if (countCodePoints(sub) > MAX_TOKEN_CODEPOINTS) {
       emitReplaced('[long]', sub);
       prevEndedWithColon = endsWithDetectionColon(sub);
       return;
     }
-    const classified = classifyNormalizedToken(sub, isTitle, prevEndedWithColon, host);
+    const classified = classifyNormalizedToken(sub, isTitle, prevEndedWithColon, host, alreadyScanned);
     prevEndedWithColon = endsWithDetectionColon(sub);
     if (classified.kind === 'replaced') {
       emitReplaced(classified.text, sub);
@@ -1643,7 +1660,7 @@ function projectModelString(value: string, hostname: string, limit: number, isTi
         prevEndedWithColon = endsWithDetectionColon(rawToken);
         continue;
       }
-      processNormalizedSubToken(rawToken);
+      processNormalizedSubToken(rawToken, true);
       continue;
     }
 
@@ -1703,7 +1720,7 @@ export function modelActivityName(raw: string, maskHomeRoot = false): string {
   const relative = maskHomeRoot ? toHomeRelative(raw) : undefined;
   if (relative === '~' || (maskHomeRoot && isHomeRootShape(raw))) return '~';
   const base = modelPath(relative ?? raw);
-  const masked = modelTitle(truncateName(base));
+  const masked = projectModelString(truncateName(base), os.hostname(), MAX_TITLE_LENGTH, true, true);
   return masked.trim() ? masked : '[file]';
 }
 
@@ -1748,8 +1765,9 @@ function isRawSlashOrHomoglyph(raw: string, i: number): boolean {
   return mapped === '/' || mapped === '\\' || ch === '\uff0f' || ch === '\uff3c' || ch === '\ufe68';
 }
 
-export function modelPath(value: string): string {
-  if (!value) return '[path]';
+export function modelPath(rawValue: string): string {
+  if (!rawValue) return '[path]';
+  const value = redactCredentials(rawValue);
   if (value.length <= MAX_RAW_NORMALIZE_CODEPOINTS * 4) {
     const norm = normalizeFullShort(value);
     if (!norm) return '[path]';
@@ -1774,7 +1792,7 @@ export function modelPath(value: string): string {
       ) {
         return '[path]';
       }
-      return modelText(rawBase);
+      return projectModelString(rawBase, os.hostname(), MAX_BYTES, false, true);
     }
     const parts = norm.split(' ').filter(Boolean);
     if (
@@ -1784,7 +1802,7 @@ export function modelPath(value: string): string {
     ) {
       return '[path]';
     }
-    return modelText(norm);
+    return projectModelString(norm, os.hostname(), MAX_BYTES, false, true);
   }
 
   // Long path fast-path: reject endpoint metadata anywhere, extract trailing segment if bounded.
@@ -1810,7 +1828,7 @@ export function modelPath(value: string): string {
   ) {
     return '[path]';
   }
-  return modelText(normBase);
+  return projectModelString(normBase, os.hostname(), MAX_BYTES, false, true);
 }
 
 export function modelLabel(value: string): string {
@@ -1820,31 +1838,39 @@ export function modelLabel(value: string): string {
 }
 
 export function modelAppName(value: string): string {
-  return Array.from(value.replace(/\p{Cc}/gu, ''))
-    .slice(0, 256)
-    .join('');
+  const redacted = redactCredentials(value);
+  const stripped = redacted.replace(/\p{Cc}/gu, '');
+  const final = stripped.length === redacted.length ? stripped : redactCredentials(stripped);
+  return Array.from(final).slice(0, 256).join('');
 }
 
 function modelEventSubject(raw: string, hostname = os.hostname()): string {
-  const bounded = modelAppName(raw);
-  if (!bounded) return '';
-  if (bounded === '~' || isHomeRoot(bounded)) return '~';
-  return modelText(toHomeRelative(bounded) ?? bounded, hostname);
+  if (!raw) return '';
+  if (raw === '~' || isHomeRoot(raw)) return '~';
+  const scanned = redactCredentials(toHomeRelative(raw) ?? raw).replace(/\p{Cc}/gu, (ch) =>
+    ch === '\t' || ch === '\n' || ch === '\r' ? ch : '',
+  );
+  if (!scanned) return '';
+  return truncateRedacted(projectModelString(scanned, hostname, MAX_BYTES, false, true), 256);
 }
 
 function modelBundleId(value: string, hostname = os.hostname()): string {
-  const cleaned = modelAppName(value);
+  if (!value) return '';
+  if (containsCredential(value)) return '[redacted]';
+  const cleaned = value.replace(/\p{Cc}/gu, '');
   if (!cleaned) return '';
-  if (cleaned.length > 128) return '[redacted]';
-  if (hostname && cleaned.toLowerCase().includes(hostname.toLowerCase())) return '[redacted]';
+  if (cleaned.length > 128 || (hostname && cleaned.toLowerCase().includes(hostname.toLowerCase()))) return '[redacted]';
   const segments = cleaned.split('.');
-  if (segments.length < 2 || segments.length > 8) return '[redacted]';
-  if (!segments.every((seg) => REVERSE_DOMAIN_SEG_RE.test(seg))) return '[redacted]';
-  if (isCredentialToken(cleaned)) return '[redacted]';
-  return cleaned;
+  if (segments.length < 2 || segments.length > 8 || !segments.every((seg) => REVERSE_DOMAIN_SEG_RE.test(seg))) {
+    return '[redacted]';
+  }
+  return cleaned.length !== value.length && (containsCredential(cleaned) || segments.some(containsCredential))
+    ? '[redacted]'
+    : cleaned;
 }
 
 function identifier(value: string): string {
+  if (containsCredential(value)) return '[redacted]';
   return /^[\w-]+$/.test(value) ? modelText(value) : '[redacted]';
 }
 
@@ -2206,8 +2232,11 @@ export function environmentDetail(
   const axStatus = observation.sources['helper.ax']?.status;
   const countDenied = axStatus === 'denied' || axStatus === 'unsupported';
   const title = env.focusedWindow.value?.title;
+  const safeBundle = typeof front?.bundleId === 'string' ? modelBundleId(front.bundleId) : undefined;
   const matchesApp =
-    front === null ? null : app === undefined || app === modelAppName(front.name) || app === front.bundleId;
+    front === null
+      ? null
+      : app === undefined || app === modelAppName(front.name) || (safeBundle !== '[redacted]' && app === safeBundle);
   const matchesWindow = window === undefined ? true : title === undefined ? null : modelTitle(title) === window;
   const available = matchesApp === true && matchesWindow === true;
   const mismatch = matchesApp === false || matchesWindow === false;
@@ -2246,7 +2275,7 @@ export function environmentDetail(
         ? null
         : fact(env.frontApp, (value) => ({
             name: modelAppName(value.name),
-            ...(typeof value.bundleId === 'string' ? { bundleId: modelBundleId(value.bundleId) } : {}),
+            ...(safeBundle !== undefined ? { bundleId: safeBundle } : {}),
             ...pick(value, ['pid', ...(countFresh && !countDenied ? ['windowCount'] : [])]),
           })),
       window: mismatch ? null : fact(env.focusedWindow, (value) => ({ title: value.title })),

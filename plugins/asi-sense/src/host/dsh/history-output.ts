@@ -8,6 +8,7 @@ import type {
   PersistedEventEntry,
   SummaryQueryResult,
 } from '../runtime/ports.ts';
+import { containsCredential, redactCredentials } from './credential-scan.ts';
 import { modelActivityName, modelFileEntry } from './deliver.ts';
 import { KNOWN_EVENT_KINDS } from './kinds.ts';
 import { modelAppName, modelOutput, modelPath, modelProjectedOutput, modelText, modelTitle } from './tool-output.ts';
@@ -68,7 +69,7 @@ const CUSTOM_EVENT_KIND_RE = /^[a-z]+(?:\.[a-z-]+)+$/;
 
 function safeIdentifier(value: string): string {
   if (SAFE_IDENTIFIERS.has(value)) return value;
-  return STRICT_WORD_ID_RE.test(value) ? value : '[redacted]';
+  return !containsCredential(value) && STRICT_WORD_ID_RE.test(value) ? value : '[redacted]';
 }
 
 function safeEventKind(kind: string): string {
@@ -89,6 +90,7 @@ function safeFeedback(feedback: string): string {
 }
 
 function safeReason(reason: string): string {
+  if (containsCredential(reason)) return '[redacted]';
   return STRICT_COLON_ID_RE.test(reason) || HELPER_DROPPED_REASON_RE.test(reason) ? reason : '[redacted]';
 }
 
@@ -414,7 +416,7 @@ function extractExecutableToken(raw: string): string | undefined {
 }
 
 function isSafeCommandBasename(base: string): boolean {
-  if (!COMMAND_BASENAME_RE.test(base)) return false;
+  if (containsCredential(base) || !COMMAND_BASENAME_RE.test(base)) return false;
   if (!/[A-Za-z]/.test(base)) return false;
   if (!base.includes('.')) return true;
   if (SAFE_COMMAND_NAME_RE.test(base) || VERSIONED_COMMAND_RE.test(base)) return true;
@@ -511,7 +513,7 @@ function projectDetail(
 }
 
 function projectAppSubject(value: string): string {
-  const cleaned = modelAppName(value);
+  const cleaned = modelAppName(redactCredentials(value));
   if (
     /^(?:~?[/\\]|[A-Za-z]:[/\\])/.test(cleaned) ||
     /[/\\].*[/\\]/.test(cleaned) ||
