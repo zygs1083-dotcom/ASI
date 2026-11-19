@@ -82,13 +82,57 @@ describe('fix3 durable tuning', () => {
     const persistence = storage();
     const tuner = new Tuner({ x: { value: 10, max: 20 } }, { persistence });
     await tuner.restore();
-    for (let i = 0; i < 500; i++) expect((await tuner.propose({ param: 'x', to: 100 })).applied).toBe(false);
+    for (let i = 0; i < 25; i++) expect((await tuner.propose({ param: 'x', to: 100 })).applied).toBe(false);
     const applied = await tuner.propose({ param: 'x', to: 11 });
     expect(persistence.writes()).toBe(1);
     expect(applied.change.id.endsWith('-1')).toBe(true);
     const disk = JSON.parse(persistence.text() ?? '{}');
     expect(disk.log.every((entry: { status: string }) => entry.status === 'applied')).toBe(true);
     await tuner.close();
+
+    // Pre-seed 490 valid rejected entries in memory via restore, then push past LOG_CAP (500)
+    // without triggering writes or advancing durable IDs.
+    const snap = JSON.parse(persistence.text() ?? '{}') as {
+      idPrefix: string;
+      nextId: number;
+      log: {
+        id: string;
+        param: string;
+        from: number;
+        to: number;
+        by: string;
+        reason: string;
+        at: number;
+        operation: string;
+        status: string;
+        rejectionReason?: string;
+      }[];
+    };
+    snap.log = Array.from({ length: 490 }, (_, i) => ({
+      id: `${snap.idPrefix}-${i + 2}`,
+      param: 'x',
+      from: 11,
+      to: 100,
+      by: 'agent',
+      reason: '',
+      at: 1_000 + i,
+      operation: 'propose',
+      status: 'rejected',
+      rejectionReason: 'out of bounds',
+    }));
+    snap.nextId = 492;
+    const fullPersistence = storage(JSON.stringify(snap));
+    const capped = new Tuner({ x: { value: 10, max: 20 } }, { persistence: fullPersistence });
+    await capped.restore();
+    for (let i = 0; i < 15; i++) expect((await capped.propose({ param: 'x', to: 100 })).applied).toBe(false);
+    expect(fullPersistence.writes()).toBe(0);
+    expect(capped.logs).toHaveLength(500);
+    const nextApplied = await capped.propose({ param: 'x', to: 12 });
+    expect(fullPersistence.writes()).toBe(1);
+    expect(nextApplied.change.id).toBe(`${snap.idPrefix}-492`);
+    const cappedDisk = JSON.parse(fullPersistence.text() ?? '{}');
+    expect(cappedDisk.log.every((entry: { status: string }) => entry.status === 'applied')).toBe(true);
+    await capped.close();
   });
 
   it('N8 retains the larger of 30-day or 200 applied records and every undoable change', async () => {
@@ -98,13 +142,40 @@ describe('fix3 durable tuning', () => {
     const tuner = new Tuner(specs, { persistence, actor: () => 'user', wallClock: () => wall });
     await tuner.restore();
     const oldUndo = await tuner.propose({ param: 'y', to: 11 });
-    for (let i = 0; i < 202; i++) await tuner.propose({ param: 'x', to: i % 2 ? 10 : 11 });
-    expect(JSON.parse(persistence.text() ?? '{}').applied).toHaveLength(203);
-    wall += 31 * 86_400_000;
     await tuner.propose({ param: 'x', to: 11 });
-    expect(JSON.parse(persistence.text() ?? '{}').applied).toHaveLength(201);
+    await tuner.propose({ param: 'x', to: 10 });
     await tuner.close();
-    const restored = new Tuner(specs, { persistence, actor: () => 'user', wallClock: () => wall });
+
+    const snap = JSON.parse(persistence.text() ?? '{}') as {
+      idPrefix: string;
+      nextId: number;
+      log: { id: string; param: string; from: number; to: number }[];
+      applied: { id: string; param: string; from: number; to: number }[];
+    };
+    const oldUndoEntry = snap.applied[0];
+    const template = snap.applied[1];
+    const lastX = snap.applied[2];
+    if (!oldUndoEntry || !template || !lastX) throw new Error('missing seed applied entries');
+    const seeded = Array.from({ length: 197 }, (_, i) => ({
+      ...template,
+      id: `${snap.idPrefix}-${i + 2}`,
+      to: i % 2 ? 10 : 11,
+      from: i % 2 ? 11 : 10,
+    }));
+    snap.applied = [oldUndoEntry, ...seeded, { ...lastX, id: `${snap.idPrefix}-199` }];
+    snap.log = [...snap.applied];
+    snap.nextId = 200;
+    const seededPersistence = storage(JSON.stringify(snap));
+
+    const tuner2 = new Tuner(specs, { persistence: seededPersistence, actor: () => 'user', wallClock: () => wall });
+    await tuner2.restore();
+    for (let i = 0; i < 4; i++) await tuner2.propose({ param: 'x', to: i % 2 ? 10 : 11 });
+    expect(JSON.parse(seededPersistence.text() ?? '{}').applied).toHaveLength(203);
+    wall += 31 * 86_400_000;
+    await tuner2.propose({ param: 'x', to: 11 });
+    expect(JSON.parse(seededPersistence.text() ?? '{}').applied).toHaveLength(201);
+    await tuner2.close();
+    const restored = new Tuner(specs, { persistence: seededPersistence, actor: () => 'user', wallClock: () => wall });
     await restored.restore();
     expect((await restored.revert(oldUndo.change.id)).applied).toBe(true);
     await restored.close();

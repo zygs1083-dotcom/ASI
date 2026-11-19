@@ -331,12 +331,54 @@ describe('user-confirmed rebaselining', () => {
     await current.monitor.acceptRebaseline(current.monitor.rebaselineSuggestions[0].id);
     const change = current.tuner.undoableChanges.find((entry) => entry.kind === 'rebaseline');
     if (!change) throw new Error('missing rebaseline');
-    for (let i = 0; i < 501; i++) {
-      expect((await current.tuner.propose({ param: 'unknown', to: i })).applied).toBe(false);
-    }
-    expect(current.tuner.logs.some((entry) => entry.id === change.id)).toBe(true);
     await current.monitor.persist();
-    const restored = await reload(current.persistence);
+    await current.monitor.close();
+
+    // Seed 490 valid rejected entries in the restored snapshot so 15 live rejected proposals cross LOG_CAP (500)
+    // without O(500^2) structuredClone overhead.
+    const snap = JSON.parse(current.snapshot() ?? '{}') as { tuner: string };
+    const tunerSnap = JSON.parse(snap.tuner) as {
+      idPrefix: string;
+      nextId: number;
+      log: unknown[];
+    };
+    const seedStart = tunerSnap.nextId;
+    for (let i = 0; i < 490; i++) {
+      tunerSnap.log.push({
+        id: `${tunerSnap.idPrefix}-${seedStart + i}`,
+        param: 'unknown',
+        from: i,
+        to: i,
+        by: 'agent',
+        reason: '',
+        at: MON10 + 2 * WEEK + i,
+        operation: 'propose',
+        status: 'rejected',
+        rejectionReason: 'unknown param',
+      });
+    }
+    tunerSnap.nextId = seedStart + 490;
+    snap.tuner = JSON.stringify(tunerSnap);
+    let saved = JSON.stringify(snap);
+    const flooded = await reload({
+      load: async () => saved,
+      save: async (data) => {
+        saved = data;
+      },
+    });
+    for (let i = 0; i < 15; i++) {
+      expect((await flooded.tuner.propose({ param: 'unknown', to: i })).applied).toBe(false);
+    }
+    expect(flooded.tuner.logs.some((entry) => entry.id === change.id)).toBe(true);
+    await flooded.monitor.persist();
+    await flooded.monitor.close();
+
+    const restored = await reload({
+      load: async () => saved,
+      save: async (data) => {
+        saved = data;
+      },
+    });
     expect(restored.tuner.undoableChanges.map((entry) => entry.id)).toContain(change.id);
     expect(restored.tuner.logs.some((entry) => entry.id === change.id)).toBe(true);
     restored.asUser();
