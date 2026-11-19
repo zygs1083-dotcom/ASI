@@ -14,6 +14,7 @@ import {
   DAILY_SUMMARY_RETENTION_DAYS,
   type DailySummary,
   DEFAULT_HISTORY_LIMIT,
+  defaultApiForSourceId,
   HISTORY_HEARTBEAT_MS,
   HISTORY_RETENTION_DAYS,
   type HistoryEventLine,
@@ -825,7 +826,10 @@ export class HistoryManager {
       subject: entry.subject,
       level: entry.level,
       at: entry.at,
-      source: entry.source.host === 'local' ? entry.source.id : { ...entry.source },
+      source:
+        entry.source.host === 'local' && entry.source.api === defaultApiForSourceId(entry.source.id)
+          ? entry.source.id
+          : { ...entry.source },
       ...(entry.reason !== undefined ? { reason: entry.reason } : {}),
       ...(entry.ruleId !== undefined ? { ruleId: entry.ruleId } : {}),
       ...(entry.cause !== undefined && entry.cause !== 'unknown' ? { cause: entry.cause } : {}),

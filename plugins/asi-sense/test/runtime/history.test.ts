@@ -4748,4 +4748,71 @@ describe('runtime history persistence, rollups, retention, and recovery', () => 
       vi.useRealTimers();
     }
   });
+
+  it('N1: only abbreviates source in serializeEventLine when local api matches defaultApiForSourceId', async () => {
+    const dir = await makeTempDir();
+    const port = new FileHistoryStoragePort(dir);
+    const wall = Date.UTC(2026, 10, 27, 10, 0, 0);
+    const mgr = new HistoryManager({
+      port,
+      clock: { wall: () => wall, mono: () => 1_000 },
+      isPaused: () => false,
+      titlesAllowed: () => true,
+      restoreEntries: () => {},
+      clearMemoryEntries: () => {},
+      emitSourceError: () => {},
+      emitSourceOk: () => {},
+      timeZone: 'UTC',
+    });
+    await mgr.start(false);
+    try {
+      mgr.recordEvent({
+        id: 'n1-default',
+        kind: 'app.activated',
+        subject: 'DefaultSrc',
+        level: 'record',
+        at: wall,
+        source: { id: 'helper', api: 'ndjson', host: 'local' },
+      });
+      mgr.recordEvent({
+        id: 'n1-custom-api',
+        kind: 'app.activated',
+        subject: 'CustomApiSrc',
+        level: 'record',
+        at: wall + 1_000,
+        source: { id: 'helper', api: 'nsworkspace', host: 'local' },
+      });
+      mgr.recordEvent({
+        id: 'n1-unknown-id',
+        kind: 'app.activated',
+        subject: 'CustomHostId',
+        level: 'record',
+        at: wall + 2_000,
+        source: { id: 'custom-probe', api: 'ipc', host: 'local' },
+      });
+    } finally {
+      await mgr.stop();
+    }
+
+    const raw = (await port.readEvents('2026-11-27')) ?? '';
+    expect(raw).toContain('"source":"helper"');
+    expect(raw).not.toContain('"source":"custom-probe"');
+
+    const parsed = parseHistoryLines(raw);
+    expect(parsed.events.find((e) => e.id === 'n1-default')?.source).toEqual({
+      id: 'helper',
+      api: 'ndjson',
+      host: 'local',
+    });
+    expect(parsed.events.find((e) => e.id === 'n1-custom-api')?.source).toEqual({
+      id: 'helper',
+      api: 'nsworkspace',
+      host: 'local',
+    });
+    expect(parsed.events.find((e) => e.id === 'n1-unknown-id')?.source).toEqual({
+      id: 'custom-probe',
+      api: 'ipc',
+      host: 'local',
+    });
+  });
 });
