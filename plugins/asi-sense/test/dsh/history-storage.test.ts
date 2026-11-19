@@ -313,4 +313,56 @@ describe('FileHistoryStoragePort', () => {
       '{"record":"event","id":"unterm"\n{"record":"event","id":"second"}\n',
     );
   });
+
+  it('heals newline after a partial ENOSPC write even when verifiedNewlineDates was cached by a prior write (#47)', async () => {
+    const root = await makeTempDir();
+    const fsPromises = await import('node:fs/promises');
+    let injectPartialEnospc = false;
+    const partialFs: HistoryFileSystem = {
+      mkdir: (p, opts) => fsPromises.mkdir(p, opts),
+      readdir: (p) => fsPromises.readdir(p),
+      stat: (p) => fsPromises.stat(p),
+      lstat: (p) => fsPromises.lstat(p),
+      chmod: (p, m) => fsPromises.chmod(p, m),
+      readFile: (p, enc) => fsPromises.readFile(p, enc),
+      rename: (o, n) => fsPromises.rename(o, n),
+      unlink: (p) => fsPromises.unlink(p),
+      rm: (p, opts) => fsPromises.rm(p, opts),
+      open: async (p, flags, mode) => {
+        const h = await fsPromises.open(p, flags as number, mode);
+        return {
+          read: h.read.bind(h),
+          readFile: h.readFile.bind(h),
+          stat: h.stat.bind(h),
+          chmod: h.chmod.bind(h),
+          sync: h.sync.bind(h),
+          close: h.close.bind(h),
+          writeFile: async (data: string, enc: BufferEncoding) => {
+            if (injectPartialEnospc) {
+              injectPartialEnospc = false;
+              // Simulate a partial write without trailing newline before ENOSPC throws.
+              await h.writeFile(data.slice(0, Math.max(1, Math.floor(data.length / 2))), enc);
+              throw Object.assign(new Error('ENOSPC'), { code: 'ENOSPC' });
+            }
+            return h.writeFile(data, enc);
+          },
+        };
+      },
+    };
+    const port = new FileHistoryStoragePort(root, partialFs);
+    await port.appendEvent('2026-11-18', '{"record":"event","id":"ok-1"}\n');
+    injectPartialEnospc = true;
+    await expect(port.appendEvent('2026-11-18', '{"record":"event","id":"half-2"}\n')).rejects.toMatchObject({
+      code: 'ENOSPC',
+    });
+    await port.appendEvent('2026-11-18', '{"record":"event","id":"ok-3"}\n');
+
+    const lines: string[] = [];
+    for await (const line of port.readEventLines('2026-11-18')) lines.push(line);
+    expect(lines).toEqual([
+      '{"record":"event","id":"ok-1"}',
+      '{"record":"event","id":"half-2"'.slice(0, 16),
+      '{"record":"event","id":"ok-3"}',
+    ]);
+  });
 });

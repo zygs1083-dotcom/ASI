@@ -220,6 +220,9 @@ export class FileHistoryStoragePort implements HistoryStoragePort {
           }
         }
 
+        // Invalidate cached newline assurance before writing so a partial ENOSPC
+        // or failed write forces the next append to inspect the file's last byte.
+        this.verifiedNewlineDates.delete(date);
         await handle.writeFile(payload, 'utf8');
         if (payload.endsWith('\n')) {
           this.verifiedNewlineDates.add(date);

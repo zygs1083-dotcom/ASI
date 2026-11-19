@@ -6,6 +6,7 @@ import {
   type DailyDirectoryStats,
   type DailySummary,
   type DailySystemStats,
+  defaultApiForSourceId,
   type HistoryLifecycleRecord,
   type HistoryLifecycleState,
   isNonEmptyString,
@@ -106,6 +107,9 @@ function isRecordObject(value: unknown): value is Record<string, unknown> {
 }
 
 function validSource(value: unknown): SourceRef {
+  if (typeof value === 'string' && value.length > 0) {
+    return { id: value, api: defaultApiForSourceId(value), host: 'local' };
+  }
   if (!isRecordObject(value)) return { id: 'unknown', api: 'unknown', host: 'local' };
   return {
     id: typeof value.id === 'string' ? value.id : 'unknown',
@@ -174,10 +178,20 @@ export function toPersistedEvent(raw: Record<string, unknown>): PersistedEventEn
   };
   if (typeof raw.reason === 'string') entry.reason = raw.reason;
   if (typeof raw.ruleId === 'string') entry.ruleId = raw.ruleId;
-  if (VALID_CAUSES.has(raw.cause as SignalCause)) entry.cause = raw.cause as SignalCause;
+  entry.cause = VALID_CAUSES.has(raw.cause as SignalCause) ? (raw.cause as SignalCause) : 'unknown';
   if (typeof raw.restarts === 'number' && Number.isFinite(raw.restarts)) entry.restarts = raw.restarts;
   const detail = validDetail(raw.detail);
-  if (detail) entry.detail = detail;
+  if (detail) {
+    if (
+      (entry.kind === 'file.activity' || entry.kind === 'file.burst') &&
+      detail.directory === undefined &&
+      detail.dir === undefined &&
+      entry.subject
+    ) {
+      detail.directory = entry.subject;
+    }
+    entry.detail = detail;
+  }
   const eta = validEta(raw.currentEta);
   if (eta) entry.currentEta = eta;
   if (raw.feedback === 'useful' || raw.feedback === 'noise') entry.feedback = raw.feedback;

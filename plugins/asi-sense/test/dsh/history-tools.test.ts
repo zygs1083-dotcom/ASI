@@ -1296,11 +1296,12 @@ describe('env_detail, env_history, and env_summary tools', () => {
         }>;
       };
 
-      // Local event log keeps full local paths on disk (case-folded on darwin)
+      // Local event log keeps full local paths on disk (case-folded on darwin) while dropping detail.files
       const rawEvents = (await port.readEvents('2026-10-15')) ?? '';
-      expect(rawEvents).toContain('/users/alice/secret-workspace');
+      expect(rawEvents).toContain('"subject":"/users/alice/secret-workspace"');
       expect(rawEvents).toContain('"subject":"/users/alice"');
-      expect(rawEvents).toContain('.bashrc');
+      expect(rawEvents).not.toContain('.bashrc');
+      expect(rawEvents).not.toContain('"directory"');
       expect(rawEvents).toContain('/users/bob-dev/alice@corp.com-192.168.1.50:5432');
 
       // Model-facing env_history output masks home root, strips directory prefixes, and redacts email/IP
@@ -1311,24 +1312,23 @@ describe('env_detail, env_history, and env_summary tools', () => {
         created: 1,
         modified: 1,
         deleted: 0,
-        files: ['app.ts', 'notes.md'],
       });
+      expect(bySubject.get('secret-workspace')?.detail?.files).toBeUndefined();
       expect(bySubject.get('~')?.detail).toMatchObject({
         directory: '~',
         created: 0,
         modified: 1,
         deleted: 0,
-        // Dotfiles are hidden metadata under the whitelist projection, so the name becomes [path].
-        files: ['[path]'],
       });
+      expect(bySubject.get('~')?.detail?.files).toBeUndefined();
       // Endpoint-like directory (email + IP:port) is fully redacted to [path] now.
       expect(bySubject.get('[path]')?.detail).toMatchObject({
         directory: '[path]',
         created: 0,
         modified: 0,
         deleted: 1,
-        files: ['leak.log'],
       });
+      expect(bySubject.get('[path]')?.detail?.files).toBeUndefined();
       const histSerialized = JSON.stringify(histRes);
       for (const secret of ['/Users/alice', '/users/bob-dev', 'alice', 'bob-dev', '192.168.1.50', '5432']) {
         expect(histSerialized).not.toContain(secret);
@@ -1549,7 +1549,8 @@ describe('env_detail, env_history, and env_summary tools', () => {
         events: Array<{ kind: string; subject: string; detail?: { directory?: string; files?: string[] } }>;
       };
       expect(hist.events).toHaveLength(1);
-      expect(hist.events[0].detail).toMatchObject({ directory: 'users', files: ['~'] });
+      expect(hist.events[0].detail).toMatchObject({ directory: 'users', modified: 1 });
+      expect(hist.events[0].detail?.files).toBeUndefined();
       expect(JSON.stringify(hist)).not.toContain('alice');
 
       const send = vi.fn();

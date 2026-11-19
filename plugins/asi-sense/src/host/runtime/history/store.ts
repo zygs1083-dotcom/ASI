@@ -1,3 +1,4 @@
+import { randomBytes } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
 import type { DeliveryLevel, SignalCause, SourceRef } from '@asi/sense-types';
 import {
@@ -97,6 +98,32 @@ const PARTIAL_SUMMARY_NOTE =
   'Monthly summary is partial because daily backfill for some days is still pending or failed; retry later for complete data.';
 const UNSAFE_FS_CODES = new Set(['ELOOP', 'EISDIR', 'ENOTDIR', 'EINVAL', 'ENOTSUP', 'EOPNOTSUPP']);
 const VALID_LEVELS = new Set<DeliveryLevel>(['record', 'context', 'wake']);
+const UUID_SEQ_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}:\d+$/i;
+const BOOT_ID_RE = /^([a-z][0-9a-z]{3})-[0-9a-z]+$/;
+
+function makeBootTag(): string {
+  const bytes = randomBytes(4);
+  const first = String.fromCharCode(97 + (bytes.readUInt8(0) % 26));
+  const rest = (bytes.readUInt32BE(0) % (36 * 36 * 36)).toString(36).padStart(3, '0');
+  return `${first}${rest}`;
+}
+
+function slimDetailForDisk(
+  kind: string,
+  subject: string,
+  detail: Record<string, string | number | boolean | string[]> | undefined,
+): Record<string, string | number | boolean | string[]> | undefined {
+  if (!detail) return undefined;
+  const out: Record<string, string | number | boolean | string[]> = {};
+  let hasAny = false;
+  for (const [key, val] of Object.entries(detail)) {
+    if (kind === 'file.activity' && key === 'files') continue;
+    if ((key === 'directory' || key === 'dir') && val === subject) continue;
+    out[key] = Array.isArray(val) ? [...val] : val;
+    hasAny = true;
+  }
+  return hasAny ? out : undefined;
+}
 
 function utcDateKey(ms: number): string {
   const d = new Date(ms);
@@ -229,7 +256,9 @@ export class HistoryManager {
   private readonly reportedFileErrors = new Set<string>();
   private appendDegraded = false;
   private summaryDegraded = false;
-  private readonly eventDatesById = new Map<string, string>();
+  private bootTag = makeBootTag();
+  private shortSeq = 0;
+  private readonly eventMetaById = new Map<string, { date: string; diskId: string }>();
   private activeLifecycleOpen = false;
   private readonly pendingBackfill = new Set<string>();
   private pendingBackfillEpoch = 0;
@@ -313,38 +342,14 @@ export class HistoryManager {
     if (!deferRollover) {
       this.syncClockDate(now);
     }
-    this.rememberEventDate(entry.id, date);
+    const diskId = UUID_SEQ_RE.test(entry.id) ? this.nextShortId() : entry.id;
+    this.rememberEventMeta(entry.id, date, diskId);
     if (entry.kind === 'app.activated' && isNonEmptyString(entry.subject)) {
       this.activeApp = entry.subject;
     }
     if (entry.at > this.lastAliveAt) this.lastAliveAt = entry.at;
 
-    const line: HistoryEventLine = {
-      record: 'event',
-      id: entry.id,
-      kind: entry.kind,
-      subject: entry.subject,
-      level: entry.level,
-      at: entry.at,
-      source: { ...entry.source },
-      ...(entry.reason !== undefined ? { reason: entry.reason } : {}),
-      ...(entry.ruleId !== undefined ? { ruleId: entry.ruleId } : {}),
-      ...(entry.cause !== undefined ? { cause: entry.cause } : {}),
-      ...(entry.restarts !== undefined ? { restarts: entry.restarts } : {}),
-      ...(entry.detail !== undefined
-        ? {
-            detail: Object.fromEntries(
-              Object.entries(entry.detail).map(([key, val]) => [key, Array.isArray(val) ? [...val] : val]),
-            ),
-          }
-        : {}),
-      ...(entry.currentEta !== undefined ? { currentEta: { ...entry.currentEta } } : {}),
-      ...(entry.feedback !== undefined ? { feedback: entry.feedback } : {}),
-      ...(entry.feedbackAvailable !== undefined ? { feedbackAvailable: entry.feedbackAvailable } : {}),
-      ...(meta?.bundleId !== undefined ? { bundleId: meta.bundleId } : {}),
-      ...(meta?.title !== undefined ? { title: meta.title } : {}),
-    };
-    const raw = JSON.stringify(line);
+    const raw = this.serializeEventLine(entry, diskId, meta);
     this.feedTodayRaw(date, raw);
     const epoch = this.clearEpoch;
     this.enqueue(() => this.appendRawLine(date, `${raw}\n`, epoch));
@@ -353,16 +358,50 @@ export class HistoryManager {
     }
   }
 
+  private nextShortId(): string {
+    return `${this.bootTag}-${(++this.shortSeq).toString(36)}`;
+  }
+
+  private serializeEventLine(
+    entry: HistoryEventInput,
+    diskId: string,
+    meta?: { bundleId?: string; title?: string },
+  ): string {
+    const detail = slimDetailForDisk(entry.kind, entry.subject, entry.detail);
+    const line: HistoryEventLine = {
+      record: 'event',
+      id: diskId,
+      kind: entry.kind,
+      subject: entry.subject,
+      level: entry.level,
+      at: entry.at,
+      source: entry.source.host === 'local' ? entry.source.id : { ...entry.source },
+      ...(entry.reason !== undefined ? { reason: entry.reason } : {}),
+      ...(entry.ruleId !== undefined ? { ruleId: entry.ruleId } : {}),
+      ...(entry.cause !== undefined && entry.cause !== 'unknown' ? { cause: entry.cause } : {}),
+      ...(entry.restarts !== undefined ? { restarts: entry.restarts } : {}),
+      ...(detail !== undefined ? { detail } : {}),
+      ...(entry.currentEta !== undefined ? { currentEta: { ...entry.currentEta } } : {}),
+      ...(entry.feedback !== undefined ? { feedback: entry.feedback } : {}),
+      ...(entry.feedbackAvailable !== undefined ? { feedbackAvailable: entry.feedbackAvailable } : {}),
+      ...(meta?.bundleId !== undefined ? { bundleId: meta.bundleId } : {}),
+      ...(meta?.title !== undefined ? { title: meta.title } : {}),
+    };
+    return JSON.stringify(line);
+  }
+
   patchEvent(
     id: string,
     patch: { at?: number; level?: DeliveryLevel; reason?: string; feedback?: 'useful' | 'noise' },
   ): void {
     if (!this.port || !this.started || this.stopped) return;
-    const date = patch.at !== undefined ? this.calendar.dateKey(patch.at) : this.eventDatesById.get(id);
+    const mapped = this.eventMetaById.get(id);
+    const date = patch.at !== undefined ? this.calendar.dateKey(patch.at) : mapped?.date;
     if (!date) return;
+    const diskId = mapped?.diskId ?? id;
     const record = {
       record: 'patch' as const,
-      id,
+      id: diskId,
       ...(patch.level !== undefined ? { level: patch.level } : {}),
       ...(patch.reason !== undefined ? { reason: patch.reason } : {}),
       ...(patch.feedback !== undefined ? { feedback: patch.feedback } : {}),
@@ -443,7 +482,7 @@ export class HistoryManager {
       todayAcc: this.todayAcc,
       yesterdayDate: this.yesterdayDate,
       yesterdaySummary: this.yesterdaySummary,
-      eventDatesById: new Map(this.eventDatesById),
+      eventMetaById: new Map(this.eventMetaById),
       activeApp: this.activeApp,
       activeLifecycleOpen: this.activeLifecycleOpen,
       appendDegraded: this.appendDegraded,
@@ -460,7 +499,7 @@ export class HistoryManager {
     this.cappedDates.clear();
     this.capErrorsEmitted.clear();
     this.reportedFileErrors.clear();
-    this.eventDatesById.clear();
+    this.eventMetaById.clear();
     this.activeApp = undefined;
     this.activeLifecycleOpen = false;
     this.appendDegraded = false;
@@ -490,8 +529,8 @@ export class HistoryManager {
             this.currentMonth = this.calendar.monthKey(now);
             this.yesterdayDate = previous.yesterdayDate;
             this.yesterdaySummary = previous.yesterdaySummary;
-            this.eventDatesById.clear();
-            for (const [id, date] of previous.eventDatesById) this.eventDatesById.set(id, date);
+            this.eventMetaById.clear();
+            for (const [id, info] of previous.eventMetaById) this.eventMetaById.set(id, info);
             this.activeApp = previous.activeApp;
             this.activeLifecycleOpen = previous.activeLifecycleOpen;
             this.appendDegraded = previous.appendDegraded;
@@ -994,12 +1033,12 @@ export class HistoryManager {
     return undefined;
   }
 
-  private rememberEventDate(id: string, date: string): void {
-    if (this.eventDatesById.has(id)) this.eventDatesById.delete(id);
-    this.eventDatesById.set(id, date);
-    if (this.eventDatesById.size > 2048) {
-      const oldest = this.eventDatesById.keys().next().value;
-      if (oldest !== undefined) this.eventDatesById.delete(oldest);
+  private rememberEventMeta(id: string, date: string, diskId: string): void {
+    if (this.eventMetaById.has(id)) this.eventMetaById.delete(id);
+    this.eventMetaById.set(id, { date, diskId });
+    if (this.eventMetaById.size > 4096) {
+      const oldest = this.eventMetaById.keys().next().value;
+      if (oldest !== undefined) this.eventMetaById.delete(oldest);
     }
   }
 
@@ -1275,7 +1314,8 @@ export class HistoryManager {
       }
 
       // Restore up to 200 most recent events starting from the latest day only.
-      const collected: PersistedEventEntry[] = [];
+      const collected: Array<{ date: string; ev: PersistedEventEntry }> = [];
+      const seenTodayBootTags = new Set<string>();
       for (let i = keptDates.length - 1; i >= 0 && collected.length < MAX_HISTORY_LIMIT; i--) {
         const date = keptDates[i];
         try {
@@ -1287,7 +1327,11 @@ export class HistoryManager {
             }
             const ev = scanner.accept(line);
             if (!ev) continue;
-            collected.push(ev);
+            if (date === today) {
+              const tag = BOOT_ID_RE.exec(ev.id)?.[1];
+              if (tag) seenTodayBootTags.add(tag);
+            }
+            collected.push({ date, ev });
             if (collected.length >= MAX_HISTORY_LIMIT) break;
           }
         } catch (error) {
@@ -1312,9 +1356,16 @@ export class HistoryManager {
         this.clearPendingForEpoch(epoch);
         return;
       }
+      while (seenTodayBootTags.has(this.bootTag)) {
+        this.bootTag = makeBootTag();
+        this.shortSeq = 0;
+      }
       if (collected.length > 0) {
         collected.reverse();
-        this.restoreEntries(collected);
+        for (const item of collected) {
+          this.rememberEventMeta(item.ev.id, item.date, item.ev.id);
+        }
+        this.restoreEntries(collected.map((item) => item.ev));
       }
 
       if (keptDates.includes(today) && !knownUnsafeEvents.has(today)) {
@@ -1941,10 +1992,12 @@ export class HistoryManager {
       let size = this.sizes.get(date);
       if (size === undefined) {
         size = await this.port.eventFileSize(date);
+        if (epoch !== this.clearEpoch) return;
         this.sizes.set(date, size);
       }
       const lineBytes = Buffer.byteLength(line, 'utf8');
       if (size + lineBytes > this.maxDailyBytes) {
+        if (epoch !== this.clearEpoch) return;
         this.cappedDates.add(date);
         if (!this.capErrorsEmitted.has(date)) {
           this.capErrorsEmitted.add(date);
@@ -1952,13 +2005,18 @@ export class HistoryManager {
         }
         return;
       }
+      if (epoch !== this.clearEpoch) return;
       await this.port.appendEvent(date, line);
+      if (epoch !== this.clearEpoch) return;
       this.sizes.set(date, size + lineBytes);
       if (this.appendDegraded) {
         this.appendDegraded = false;
         if (!this.summaryDegraded) this.safeEmitSourceOk();
       }
     } catch (error) {
+      if (epoch !== this.clearEpoch) return;
+      // Drop cached size after write failure so a partial write (e.g. ENOSPC) is re-stat'd.
+      this.sizes.delete(date);
       const code = unsafeFsCode(error);
       if (code) {
         this.reportFileErrorOnce(`unsafe:events:${date}:${code}`, 'history-unsafe-entry', {

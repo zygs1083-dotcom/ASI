@@ -47,7 +47,10 @@ export interface HistoryPatchRecord {
   feedback?: 'useful' | 'noise';
 }
 
-export type HistoryEventLine = PersistedEventEntry & { record: 'event' };
+export type HistoryEventLine = Omit<PersistedEventEntry, 'source'> & {
+  record: 'event';
+  source: SourceRef | string;
+};
 
 export interface DailyAppStats {
   foregroundMs: number;
@@ -214,4 +217,19 @@ export function sanitizeDirPath(value: string): string {
 
 export function isNonEmptyString(value: unknown): value is string {
   return typeof value === 'string' && value.length > 0;
+}
+
+/** Reconstructs the canonical SourceRef.api from a persisted string source id. */
+export function defaultApiForSourceId(id: string): string {
+  if (id === 'files-global' || id === 'files-global-denied' || id === 'files' || id.startsWith('files:')) {
+    return 'watch';
+  }
+  if (id === 'helper.ax' || id === 'helper.window') return 'accessibility';
+  if (id === 'helper' || id.startsWith('helper.')) return 'ndjson';
+  if (id === 'dsh') return 'events';
+  if (id === 'tokens' || id === 'delivery') return 'dsh';
+  if (id === 'body') return 'probe';
+  if (id === 'history') return 'storage';
+  if (id === 'away') return 'detector';
+  return 'unknown';
 }

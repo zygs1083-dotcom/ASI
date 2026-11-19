@@ -39,6 +39,7 @@ export {
   type DailySummary,
   type DailySystemStats,
   DEFAULT_HISTORY_LIMIT,
+  defaultApiForSourceId,
   HISTORY_HEARTBEAT_MS,
   HISTORY_RETENTION_DAYS,
   type HistoryEventLine,
