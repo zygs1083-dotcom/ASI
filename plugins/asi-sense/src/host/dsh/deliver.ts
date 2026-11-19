@@ -10,6 +10,7 @@ import type { DeliveryIntent } from '../attention/pipeline.ts';
 import { BODY_THRESHOLDS } from '../attention/thresholds.ts';
 import { formatEnvUpdate, resolveBurstDeletions } from '../delivery/format.ts';
 import { isAnomalousAwayMetric } from '../runtime/away.ts';
+import { redactCredentials } from './credential-scan.ts';
 import { DELIVERABLE_KINDS } from './kinds.ts';
 import { modelActivityName, modelAppName, modelLabel, modelText, modelTitle, sourceIdentifier } from './tool-output.ts';
 
@@ -398,7 +399,8 @@ function sanitizeSourceStatus(value: unknown, getHostLower: () => string): strin
 const APP_PATH_LIKE_RE = /^(?:~?[/\\]|[A-Za-z]:[/\\])|[/\\].*[/\\]|[/\\][^/\\]+\.app$/i;
 const CTRL_CHARS_RE = /\p{Cc}/gu;
 
-function fallbackAppSubject(raw: string): string {
+function fallbackAppSubject(rawInput: string): string {
+  const raw = redactCredentials(rawInput);
   if (!raw.includes('/') && !raw.includes('\\')) return modelAppName(raw);
   const trimmed = raw.replace(CTRL_CHARS_RE, '').replace(/[/\\]+$/, '');
   if (!trimmed) return '';
@@ -409,7 +411,8 @@ function fallbackAppSubject(raw: string): string {
   return modelAppName(base);
 }
 
-function projectAppNameField(raw: string): string {
+function projectAppNameField(rawInput: string): string {
+  const raw = redactCredentials(rawInput);
   return APP_PATH_LIKE_RE.test(raw) ? fallbackAppSubject(raw) : modelAppName(raw);
 }
 
