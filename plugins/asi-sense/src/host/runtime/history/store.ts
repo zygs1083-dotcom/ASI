@@ -139,6 +139,52 @@ interface PendingActivityBucket {
   entryIds: string[];
 }
 
+function cloneActivityBucket(bucket: PendingActivityBucket, epoch = bucket.epoch): PendingActivityBucket {
+  return {
+    ...bucket,
+    epoch,
+    source: { ...bucket.source },
+    entryIds: [...bucket.entryIds],
+  };
+}
+
+function mergeActivityBuckets(
+  base: PendingActivityBucket,
+  extra: PendingActivityBucket,
+  epoch: number,
+): PendingActivityBucket {
+  const preferExtraMeta = LEVEL_RANK[extra.level] > LEVEL_RANK[base.level];
+  const mergedLevel = preferExtraMeta ? extra.level : base.level;
+  const mergedReason = preferExtraMeta ? extra.reason : base.reason;
+  const mergedRuleId = preferExtraMeta ? extra.ruleId : base.ruleId;
+  const mergedFeedback = base.feedback ?? extra.feedback;
+  return {
+    key: base.key,
+    date: base.date,
+    diskId: base.diskId,
+    dir: base.dir,
+    cause: base.cause,
+    source: { ...base.source },
+    level: mergedLevel,
+    ...(mergedReason !== undefined ? { reason: mergedReason } : {}),
+    ...(mergedRuleId !== undefined ? { ruleId: mergedRuleId } : {}),
+    ...(mergedFeedback !== undefined ? { feedback: mergedFeedback } : {}),
+    firstAt: Math.min(base.firstAt, extra.firstAt),
+    latestAt: Math.max(base.latestAt, extra.latestAt),
+    windowEndWall: Math.max(base.windowEndWall, extra.windowEndWall),
+    flushMono: Math.max(base.flushMono, extra.flushMono),
+    windowMsSum: base.windowMsSum + extra.windowMsSum,
+    created: base.created + extra.created,
+    modified: base.modified + extra.modified,
+    deleted: base.deleted + extra.deleted,
+    rolledUp: base.rolledUp + extra.rolledUp,
+    degraded: base.degraded || extra.degraded,
+    count: base.count + extra.count,
+    epoch,
+    entryIds: [...base.entryIds, ...extra.entryIds],
+  };
+}
+
 function finiteNonNeg(value: unknown): number {
   return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : 0;
 }
@@ -751,6 +797,13 @@ export class HistoryManager {
       yesterdayDate: this.yesterdayDate,
       yesterdaySummary: this.yesterdaySummary,
       eventMetaById: new Map(this.eventMetaById),
+      usageByDate: new Map([...this.usageByDate].map(([date, usage]) => [date, { ...usage }])),
+      cappedDates: new Set(this.cappedDates),
+      fileCappedDates: new Set(this.fileCappedDates),
+      nonFileCappedDates: new Set(this.nonFileCappedDates),
+      capErrorsEmitted: new Set(this.capErrorsEmitted),
+      reportedFileErrors: new Set(this.reportedFileErrors),
+      pendingActivity: [...this.pendingActivity.values()].map((bucket) => cloneActivityBucket(bucket, epoch)),
       activeApp: this.activeApp,
       activeLifecycleOpen: this.activeLifecycleOpen,
       appendDegraded: this.appendDegraded,
@@ -802,8 +855,58 @@ export class HistoryManager {
             this.currentMonth = this.calendar.monthKey(now);
             this.yesterdayDate = previous.yesterdayDate;
             this.yesterdaySummary = previous.yesterdaySummary;
+            this.usageByDate.clear();
+            for (const [date, usage] of previous.usageByDate) {
+              this.usageByDate.set(date, { ...usage });
+            }
+            this.cappedDates.clear();
+            for (const date of previous.cappedDates) this.cappedDates.add(date);
+            this.fileCappedDates.clear();
+            for (const date of previous.fileCappedDates) this.fileCappedDates.add(date);
+            this.nonFileCappedDates.clear();
+            for (const date of previous.nonFileCappedDates) this.nonFileCappedDates.add(date);
+            this.capErrorsEmitted.clear();
+            for (const date of previous.capErrorsEmitted) this.capErrorsEmitted.add(date);
+            this.reportedFileErrors.clear();
+            for (const key of previous.reportedFileErrors) this.reportedFileErrors.add(key);
+
+            const liveMeta = new Map(this.eventMetaById);
             this.eventMetaById.clear();
             for (const [id, info] of previous.eventMetaById) this.eventMetaById.set(id, info);
+            for (const [id, info] of liveMeta) this.eventMetaById.set(id, info);
+
+            const livePending = new Map(this.pendingActivity);
+            this.pendingActivity.clear();
+            this.pendingBucketByEntryId.clear();
+            for (const restoredBucket of previous.pendingActivity) {
+              const liveBucket = livePending.get(restoredBucket.key);
+              if (liveBucket) {
+                livePending.delete(restoredBucket.key);
+                const merged = mergeActivityBuckets(restoredBucket, liveBucket, epoch);
+                this.pendingActivity.set(merged.key, merged);
+                for (const eid of merged.entryIds) {
+                  this.pendingBucketByEntryId.set(eid, merged);
+                }
+                for (const eid of liveBucket.entryIds) {
+                  const meta = this.eventMetaById.get(eid);
+                  if (meta) this.eventMetaById.set(eid, { ...meta, diskId: merged.diskId });
+                }
+              } else {
+                const cloned = cloneActivityBucket(restoredBucket, epoch);
+                this.pendingActivity.set(cloned.key, cloned);
+                for (const eid of cloned.entryIds) {
+                  this.pendingBucketByEntryId.set(eid, cloned);
+                }
+              }
+            }
+            for (const liveBucket of livePending.values()) {
+              const bucket = liveBucket.epoch === epoch ? liveBucket : cloneActivityBucket(liveBucket, epoch);
+              this.pendingActivity.set(bucket.key, bucket);
+              for (const eid of bucket.entryIds) {
+                this.pendingBucketByEntryId.set(eid, bucket);
+              }
+            }
+
             this.activeApp = previous.activeApp;
             this.activeLifecycleOpen = previous.activeLifecycleOpen;
             this.appendDegraded = previous.appendDegraded;
@@ -827,6 +930,8 @@ export class HistoryManager {
               }
               for (const raw of hydration.liveLines) this.feedTodayRaw(today, raw);
             }
+            this.cachedToday = undefined;
+            this.summaryRevision += 1;
             this.restoreMemoryEntries?.(previous.memoryEntries);
             this.onSummaryChanged?.();
           } else if (this.clearFeedBuffer === buffered) {

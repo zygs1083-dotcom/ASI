@@ -3793,4 +3793,172 @@ describe('runtime history persistence, rollups, retention, and recovery', () => 
     expect(rebuiltToday?.truncatedAtLimit).toBe(true);
     await mgrMid2.stop();
   });
+
+  it('B2: clear() failure rollback restores pendingActivity buffers, concurrent live buffers, and same-day cap state', async () => {
+    const dirA = await makeTempDir();
+    const portA = new FileHistoryStoragePort(dirA);
+    let wallA = Date.UTC(2026, 10, 21, 12, 0, 0);
+    let monoA = 1_000;
+    const errorsA: Array<{ error: string; extra?: Record<string, unknown> }> = [];
+    let injectFailA = false;
+    const origClearAllA = portA.clearAll.bind(portA);
+    portA.clearAll = async () => {
+      if (injectFailA) {
+        await Promise.resolve();
+        throw Object.assign(new Error('EACCES: permission denied'), { code: 'EACCES' });
+      }
+      return origClearAllA();
+    };
+
+    const mgrA = new HistoryManager({
+      port: portA,
+      clock: { wall: () => wallA, mono: () => monoA },
+      isPaused: () => false,
+      titlesAllowed: () => true,
+      restoreEntries: () => {},
+      clearMemoryEntries: () => {},
+      emitSourceError: (error, extra) => errorsA.push({ error, extra }),
+      emitSourceOk: () => {},
+      timeZone: 'UTC',
+      maxFileDailyBytes: 240,
+    });
+    await mgrA.start(false);
+
+    for (let i = 0; i < 6; i++) {
+      mgrA.recordEvent({
+        id: `b2-cap-${i}`,
+        kind: 'file.changed',
+        subject: `/work/cap-${i}-${'z'.repeat(30)}.ts`,
+        level: 'record',
+        at: wallA + (i + 1) * 100,
+        source: { id: 'files-global', api: 'watch', host: 'local' },
+      });
+    }
+    await mgrA.tick();
+    expect(errorsA.filter((e) => e.error === 'daily-limit-exceeded')).toHaveLength(1);
+    expect(mgrA.timelineSnapshots().today?.truncatedAtLimit).toBe(true);
+
+    // Buffer an unflushed file.activity bucket before clear() fails.
+    wallA += 1_000;
+    monoA += 1_000;
+    mgrA.recordEvent({
+      id: 'b2-pend-cap',
+      kind: 'file.activity',
+      subject: '/work/pending-b2',
+      level: 'record',
+      cause: 'unknown',
+      at: wallA,
+      source: { id: 'files-global', api: 'watch', host: 'local' },
+      detail: { directory: '/work/pending-b2', windowMs: 10_000, created: 2, modified: 3, deleted: 1 },
+    });
+
+    injectFailA = true;
+    await expect(mgrA.clear()).rejects.toThrow('EACCES');
+
+    // Same-day cap state & pending summary must survive failed clear without re-emitting daily-limit-exceeded.
+    expect(mgrA.timelineSnapshots().today?.truncatedAtLimit).toBe(true);
+    expect(mgrA.timelineSnapshots().today?.fileActivity['pending-b2']).toEqual({
+      events: 1,
+      created: 2,
+      modified: 3,
+      deleted: 1,
+    });
+
+    const linesBeforeExtra = (await portA.readEvents('2026-11-21')) ?? '';
+    mgrA.recordEvent({
+      id: 'b2-cap-after',
+      kind: 'file.changed',
+      subject: `/work/cap-after-${'z'.repeat(30)}.ts`,
+      level: 'record',
+      at: wallA + 500,
+      source: { id: 'files-global', api: 'watch', host: 'local' },
+    });
+    await mgrA.tick();
+    expect(errorsA.filter((e) => e.error === 'daily-limit-exceeded')).toHaveLength(1);
+    expect((await portA.readEvents('2026-11-21')) ?? '').toBe(linesBeforeExtra);
+    await mgrA.stop();
+
+    // Case B: uncapped pendingActivity bucket + concurrent live bucket during failed clear() flush to disk on stop().
+    const dirB = await makeTempDir();
+    const portB = new FileHistoryStoragePort(dirB);
+    let wallB = Date.UTC(2026, 10, 21, 14, 0, 0);
+    let monoB = 5_000;
+    let injectFailB = false;
+    const origClearAllB = portB.clearAll.bind(portB);
+    let mgrB!: HistoryManager;
+    portB.clearAll = async () => {
+      if (injectFailB) {
+        await Promise.resolve();
+        mgrB.recordEvent({
+          id: 'b2-live-1',
+          kind: 'file.activity',
+          subject: '/work/live-b2',
+          level: 'record',
+          cause: 'unknown',
+          at: wallB + 200,
+          source: { id: 'files-global', api: 'watch', host: 'local' },
+          detail: { directory: '/work/live-b2', windowMs: 10_000, created: 1, modified: 0, deleted: 0 },
+        });
+        mgrB.recordEvent({
+          id: 'b2-live-merge',
+          kind: 'file.activity',
+          subject: '/work/pending-b2',
+          level: 'record',
+          cause: 'unknown',
+          at: wallB + 250,
+          source: { id: 'files-global', api: 'watch', host: 'local' },
+          detail: { directory: '/work/pending-b2', windowMs: 10_000, created: 0, modified: 1, deleted: 0 },
+        });
+        throw Object.assign(new Error('EACCES: denied'), { code: 'EACCES' });
+      }
+      return origClearAllB();
+    };
+    mgrB = new HistoryManager({
+      port: portB,
+      clock: { wall: () => wallB, mono: () => monoB },
+      isPaused: () => false,
+      titlesAllowed: () => true,
+      restoreEntries: () => {},
+      clearMemoryEntries: () => {},
+      emitSourceError: () => {},
+      emitSourceOk: () => {},
+      timeZone: 'UTC',
+    });
+    await mgrB.start(false);
+    mgrB.recordEvent({
+      id: 'b2-ok-1',
+      kind: 'file.activity',
+      subject: '/work/pending-b2',
+      level: 'record',
+      cause: 'unknown',
+      at: wallB,
+      source: { id: 'files-global', api: 'watch', host: 'local' },
+      detail: { directory: '/work/pending-b2', windowMs: 10_000, created: 2, modified: 3, deleted: 1 },
+    });
+
+    injectFailB = true;
+    await expect(mgrB.clear()).rejects.toThrow('EACCES');
+    expect(mgrB.timelineSnapshots().today?.fileActivity['pending-b2']).toEqual({
+      events: 1,
+      created: 2,
+      modified: 4,
+      deleted: 1,
+    });
+    expect(mgrB.timelineSnapshots().today?.fileActivity['live-b2']).toEqual({
+      events: 1,
+      created: 1,
+      modified: 0,
+      deleted: 0,
+    });
+    // Patch by pre-clear entryId must still target restored/merged pending bucket
+    mgrB.patchEvent('b2-ok-1', { feedback: 'useful' });
+    await mgrB.stop();
+
+    const parsedB = parseHistoryLines((await portB.readEvents('2026-11-21')) ?? '');
+    const activitiesB = parsedB.events.filter((e) => e.kind === 'file.activity');
+    expect(activitiesB).toHaveLength(2);
+    const mergedPend = activitiesB.find((e) => e.subject === '/work/pending-b2');
+    expect(mergedPend?.detail).toMatchObject({ created: 2, modified: 4, deleted: 1 });
+    expect(mergedPend?.feedback).toBe('useful');
+  });
 });
