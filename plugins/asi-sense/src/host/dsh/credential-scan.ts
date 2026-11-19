@@ -79,11 +79,6 @@ CHAR_FLAGS[43] = F_PLUS_EQ_SLASH; // +
 CHAR_FLAGS[47] = F_PLUS_EQ_SLASH; // /
 CHAR_FLAGS[61] = F_PLUS_EQ_SLASH; // =
 
-const HEX_BIT = new Int8Array(128).fill(-1);
-for (let c = 48; c <= 57; c++) HEX_BIT[c] = c - 48;
-for (let c = 65; c <= 70; c++) HEX_BIT[c] = 10 + (c - 65);
-for (let c = 97; c <= 102; c++) HEX_BIT[c] = 10 + (c - 97);
-
 const FREQ = new Int32Array(128);
 const LOG2_N = Float64Array.from({ length: 256 }, (_, n) => (n ? n * Math.log2(n) : 0));
 
@@ -352,16 +347,6 @@ export function normalizeForModel(input: string): string {
   return normalizeBoundedNfkc(stripped);
 }
 
-function popcount16(mask: number): number {
-  let n = mask;
-  let count = 0;
-  while (n !== 0) {
-    n &= n - 1;
-    count++;
-  }
-  return count;
-}
-
 function shannonEntropyAscii(freq: Int32Array, len: number): number {
   let sum = 0;
   for (let c = 43; c <= 122; c++) {
@@ -387,8 +372,6 @@ function evalContract5Segment(
   let hasLetter = false;
   let hasDigit = false;
   let hexStart = -1;
-  let hexMask = 0;
-  let hexHasDigit = false;
   const hexSpans: CredentialSpan[] = [];
 
   for (let k = start; k < end; k++) {
@@ -399,30 +382,13 @@ function evalContract5Segment(
     FREQ[code]++;
 
     if ((f & F_HEX) !== 0) {
-      if (hexStart < 0) {
-        hexStart = k;
-        hexMask = 0;
-        hexHasDigit = false;
-      }
-      const bit = HEX_BIT[code] ?? -1;
-      if (bit >= 0) hexMask |= 1 << bit;
-      if ((f & F_DIGIT) !== 0) hexHasDigit = true;
+      if (hexStart < 0) hexStart = k;
     } else if (hexStart >= 0) {
-      if (k - hexStart >= 40) {
-        const distinct = popcount16(hexMask);
-        if (distinct >= 2 && (hexHasDigit || distinct >= 6)) {
-          hexSpans.push({ start: hexStart, end: k });
-        }
-      }
+      if (k - hexStart >= 40) hexSpans.push({ start: hexStart, end: k });
       hexStart = -1;
     }
   }
-  if (hexStart >= 0 && end - hexStart >= 40) {
-    const distinct = popcount16(hexMask);
-    if (distinct >= 2 && (hexHasDigit || distinct >= 6)) {
-      hexSpans.push({ start: hexStart, end });
-    }
-  }
+  if (hexStart >= 0 && end - hexStart >= 40) hexSpans.push({ start: hexStart, end });
 
   const entropy = shannonEntropyAscii(FREQ, len);
   if (hasLetter && hasDigit && entropy >= 3.5) {
@@ -829,7 +795,7 @@ export function scanCredentials(input: string): CredentialSpan[] {
         }
         if (
           atPos > i + 3 &&
-          colonPos > i + 3 &&
+          colonPos >= i + 3 &&
           colonPos + 1 < atPos &&
           !input.startsWith('[redacted]', colonPos + 1)
         ) {
@@ -995,7 +961,7 @@ export function scanCredentials(input: string): CredentialSpan[] {
         const isMode3b = (km & KF_MODE3B) !== 0;
 
         // 3a. JSON quoted key: "key": "val" or 'key': 'val'
-        if (isKv && i > 0 && (input.charCodeAt(i - 1) === 34 || input.charCodeAt(i - 1) === 39)) {
+        if ((isKv || isAuth) && i > 0 && (input.charCodeAt(i - 1) === 34 || input.charCodeAt(i - 1) === 39)) {
           if (delim === input.charCodeAt(i - 1)) {
             let p = keyEnd + 1;
             let wsCount = 0;
@@ -1006,12 +972,10 @@ export function scanCredentials(input: string): CredentialSpan[] {
             if (p < len && (input.charCodeAt(p) === 58 || input.charCodeAt(p) === 61)) {
               p++;
               while (p < len && isHws(input.charCodeAt(p))) p++;
-              if (!isAuthSchemeFollowedByWs(p)) {
-                const kvSpan = scanKvVal(p);
-                if (kvSpan) {
-                  i = emit(kvSpan.start, kvSpan.end);
-                  continue;
-                }
+              const valSpan = isKv ? (isAuthSchemeFollowedByWs(p) ? null : scanKvVal(p)) : scanAuthVal(p);
+              if (valSpan) {
+                i = emit(valSpan.start, valSpan.end);
+                continue;
               }
             }
           }
@@ -1031,15 +995,11 @@ export function scanCredentials(input: string): CredentialSpan[] {
           }
         }
 
-        // 3c. Unquoted `=` or `:` (allowing up to 4 horizontal spaces before delimiter)
+        // 3c. Unquoted `=` or `:` (horizontal whitespace before delimiter is unbounded and stays linear)
         let sepPos = keyEnd;
         if (isHws(delim)) {
           let p = sepPos + 1;
-          let wsCount = 1;
-          while (p < len && wsCount < 4 && isHws(input.charCodeAt(p))) {
-            p++;
-            wsCount++;
-          }
+          while (p < len && isHws(input.charCodeAt(p))) p++;
           if (p < len && (input.charCodeAt(p) === 58 || input.charCodeAt(p) === 61)) sepPos = p;
         }
         const sep = sepPos < len ? input.charCodeAt(sepPos) : -1;

@@ -104,7 +104,7 @@ describe('T2 bounded redaction (hidden regression)', () => {
   });
 
   it('H6 never splits a surrogate pair', () => {
-    const out = modelTitle(`${'a'.repeat(511)}😀${'b'.repeat(50)}`, H);
+    const out = modelTitle(`${'x'.repeat(511)}😀${'y'.repeat(50)}`, H);
     expect(out).not.toMatch(loneSurrogate);
   });
 
@@ -156,9 +156,9 @@ describe('T2 bounded redaction (hidden regression)', () => {
 
 describe('blind bakeoff adversarial regressions', () => {
   it('A-1 does not leak tokens straddling pre-cap shrink points', () => {
-    const padComma = `${`${'u'.repeat(100)}@${'d'.repeat(100)},`.repeat(20)}${'x'.repeat(23)},`;
-    const padCommaShort = `${'u'.repeat(80)}@${'d'.repeat(80)},`;
-    const padSpace = `${`${'u'.repeat(100)}@${'d'.repeat(100)},`.repeat(20)}${'x'.repeat(23)} `;
+    const padComma = `${`${'u'.repeat(100)}@${'w'.repeat(100)},`.repeat(20)}${'x'.repeat(23)},`;
+    const padCommaShort = `${'u'.repeat(80)}@${'w'.repeat(80)},`;
+    const padSpace = `${`${'u'.repeat(100)}@${'w'.repeat(100)},`.repeat(20)}${'x'.repeat(23)} `;
 
     expect(modelTitle(`${padComma}secret-db-prod-01.corp.invalidxx:5432/app`, 'other')).toBe('[long]');
     expect(modelTitle(`${padCommaShort}secret-db-prod-01.corp.invalidxx:5432/app`, 'other')).toBe('<host>');
@@ -167,7 +167,7 @@ describe('blind bakeoff adversarial regressions', () => {
     expect(hostPortOut).not.toContain('corp.invalid');
     expect(hostPortOut).toBe('[long] <host>');
 
-    const spacePadPrefix = `${`${'u'.repeat(100)}@${'d'.repeat(100)} `.repeat(20)}${'x'.repeat(23)} `;
+    const spacePadPrefix = `${`${'u'.repeat(100)}@${'w'.repeat(100)} `.repeat(20)}${'x'.repeat(23)} `;
     const spaceHostOut = modelTitle(`${spacePadPrefix}secret-db-prod-01.corp.invalidxx:5432/app`, 'other');
     expect(spaceHostOut).not.toContain('secret-db-prod-01');
     expect(spaceHostOut).not.toContain('corp.invalid');
@@ -192,7 +192,7 @@ describe('blind bakeoff adversarial regressions', () => {
 
     const localHost = 'corp-macbook-pro.invalid';
     const textHostOut = modelText(
-      `https://${'a'.repeat(65_520)} ${`${localHost} `.repeat(2730)}${localHost}`,
+      `https://${'x'.repeat(65_520)} ${`${localHost} `.repeat(2730)}${localHost}`,
       localHost,
     );
     expect(textHostOut).not.toContain('corp-macbook-pro');
@@ -211,8 +211,8 @@ describe('blind bakeoff adversarial regressions', () => {
     expect(titleOut).not.toContain('secret-corp');
     expect(titleOut).toBe('x README.md');
 
-    expect(modelText(`https://${'a'.repeat(524_270)} /secret-corp-dir/README.md`, 'host')).toBe('[long] README.md');
-    const textOut = modelText(`https://${'a'.repeat(200)} /secret-corp-dir/README.md`, 'host');
+    expect(modelText(`https://${'x'.repeat(524_270)} /secret-corp-dir/README.md`, 'host')).toBe('[long] README.md');
+    const textOut = modelText(`https://${'x'.repeat(200)} /secret-corp-dir/README.md`, 'host');
     expect(textOut).not.toContain('secret-corp');
     expect(textOut).toBe('[endpoint] README.md');
   });
@@ -225,11 +225,11 @@ describe('blind bakeoff adversarial regressions', () => {
   });
 
   it('B-4 handles delimiter-prefixed unsafe inputs conservatively and never corrupts literal placeholders', () => {
-    expect(modelTitle(`<${'a'.repeat(600)}`, 'host')).toBe('[long]');
-    expect(modelTitle(`<${'a'.repeat(200)}`, 'host')).toBe('<host>');
-    expect(modelText(`<${'a'.repeat(40_000)}`, 'host')).toBe('[long]');
-    expect(modelText(`<${'a'.repeat(200)}`, 'host')).toBe('[host]');
-    expect(modelTitle(` ${'a'.repeat(600)}`, 'host')).toBe(' [long]');
+    expect(modelTitle(`<${'x'.repeat(600)}`, 'host')).toBe('[long]');
+    expect(modelTitle(`<${'x'.repeat(200)}`, 'host')).toBe('<host>');
+    expect(modelText(`<${'x'.repeat(40_000)}`, 'host')).toBe('[long]');
+    expect(modelText(`<${'x'.repeat(200)}`, 'host')).toBe('[host]');
+    expect(modelTitle(` ${'x'.repeat(600)}`, 'host')).toBe(' [long]');
     const safePrefix508 = `${'x'.repeat(254)} ${'y'.repeat(253)}`;
     expect(modelTitle(`${safePrefix508} a[pa rest`, 'host').slice(505)).toBe('yyy ');
     expect(modelTitle(`${safePrefix508} [path]`, 'host').slice(505)).toBe('yyy ');
@@ -302,7 +302,7 @@ describe('blind bakeoff adversarial regressions', () => {
       const padUrl = `https://a.example/${'x'.repeat(200)} `;
       const repeats = Math.floor((boundary - 3) / padUrl.length);
       const prefix = padUrl.repeat(repeats);
-      const spacer = 'a'.repeat(Math.max(0, boundary - 3 - prefix.length));
+      const spacer = 'x'.repeat(Math.max(0, boundary - 3 - prefix.length));
       const straddling = `${prefix}${spacer} My Host end`;
       const titleOut = modelTitle(straddling, 'My Host');
       expect(titleOut).not.toContain('My Host');
@@ -457,9 +457,9 @@ describe('review F1..F6 regressions', () => {
     expect(modelTitle('on hostß', 'hostSS')).toBe('on <host>');
     expect(modelTitle('on hostSS', 'hostß')).toBe('on <host>');
 
-    expect(modelTitle(`${'a'.repeat(508)}host\u0301`, 'host')).toBe('[long]');
-    const truncated = modelTitle(`${'a'.repeat(170)} ${'b'.repeat(170)} ${'c'.repeat(166)}host\u0301`, 'host');
-    expect(truncated.slice(505)).toBe('ccchos');
+    expect(modelTitle(`${'x'.repeat(508)}host\u0301`, 'host')).toBe('[long]');
+    const truncated = modelTitle(`${'x'.repeat(170)} ${'y'.repeat(170)} ${'z'.repeat(166)}host\u0301`, 'host');
+    expect(truncated.slice(505)).toBe('zzzhos');
     expect(truncated).not.toContain('host');
   });
 });
@@ -725,8 +725,8 @@ describe('rv3 blockers #1..#5 and round-4 canonical/whitelist regressions', () =
   });
 
   it('decision 4: bounds >256-cp tokens to [long] and runs <= 1 MB Hangul, CJK Ext-A, and emoji ZWJ under 1000 ms (design target < 200 ms)', () => {
-    expect(modelTitle('a'.repeat(256), 'fixture-host')).toBe('a'.repeat(256));
-    expect(modelTitle('a'.repeat(257), 'fixture-host')).toBe('[long]');
+    expect(modelTitle('x'.repeat(256), 'fixture-host')).toBe('x'.repeat(256));
+    expect(modelTitle('x'.repeat(257), 'fixture-host')).toBe('[long]');
     expect(modelTitle('secret-host:8080'.repeat(25), 'fixture-host')).toBe('[long]');
 
     let hangul4500 = '';

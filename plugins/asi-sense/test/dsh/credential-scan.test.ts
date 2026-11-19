@@ -223,6 +223,29 @@ describe('credential scanner contracts (契约 1–5) and single-entry normaliza
     expect(sanitizeForModel('token-bucket-rate-limiter')).toBe('token-bucket-rate-limiter');
   });
 
+  it('accepts unbounded horizontal whitespace before a KV delimiter (rrv-015a-3 contract-3 leak)', () => {
+    // Report input: `secret     =aligned9Val` (5 spaces) leaked verbatim; boundary 4/5/20 spaces
+    expect(sanitizeForModel('secret     =aligned9Val')).toBe('secret     =[redacted]');
+    for (const n of [4, 5, 20]) {
+      const input = `secret${' '.repeat(n)}=val${n}pad9`;
+      expect(sanitizeForModel(input), input).toBe(`secret${' '.repeat(n)}=[redacted]`);
+    }
+    expect(sanitizeForModel('password\t\t=mixedTab9')).toBe('password  =[redacted]');
+    // A whitespace run with no `=`/`:` after it still redacts nothing
+    expect(sanitizeForModel(`secret${' '.repeat(30)} notakey`)).toBe(`secret${' '.repeat(30)} notakey`);
+  });
+
+  it('redacts JSON-quoted auth-scheme keys via scanAuthVal (rrv-015a-3 contract-2/3 leak)', () => {
+    // Report input: {"Authorization":"myp4ssw0rds3cr3t"} emitted the value verbatim
+    expect(sanitizeForModel('{"Authorization":"myp4ssw0rds3cr3t"}')).toBe('{"Authorization":"[redacted]"}');
+    expect(sanitizeForModel('{"Bearer":"myp4ssw0rds3cr3t"}')).toBe('{"Bearer":"[redacted]"}');
+    expect(sanitizeForModel('{"basic":"dXNlcjpwYXNzMTIzNA=="}')).toBe('{"basic":"[redacted]"}');
+    expect(sanitizeForModel("{'authorization':'x1y2z3w4v5'}")).toBe("{'authorization':'[redacted]'}");
+    // The auth common-word exemption still applies inside JSON values
+    expect(sanitizeForModel('{"Authorization":"Settings"}')).toBe('{"Authorization":"Settings"}');
+    expect(sanitizeForModel('{"basic":"settings"}')).toBe('{"basic":"settings"}');
+  });
+
   it('detects Contract 4 URL userinfo passwords and Contract 5 high-entropy / >=40 hex strings', () => {
     expect(sanitizeForModel('https://alice:SuperSecretPass99@api.example.com/v1')).toBe(
       'https://alice:[redacted]@api.example.com/v1',
@@ -230,6 +253,11 @@ describe('credential scanner contracts (契约 1–5) and single-entry normaliza
     expect(sanitizeForModel('postgres://dbadmin:DbPassSecret123@db.internal:5432/prod')).toBe(
       'postgres://dbadmin:[redacted]@db.internal:5432/prod',
     );
+    // rrv-015a-3: empty username userinfo `scheme://:pass@host` redacts the password
+    expect(sanitizeForModel('redis://:R3d1sP4ss@cache:6379')).toBe('redis://:[redacted]@cache:6379');
+    expect(sanitizeForModel('https://:x9w8v7u6@host.invalid/')).toBe('https://:[redacted]@host.invalid/');
+    expect(sanitizeForModel('redis://:@cache:6379')).toBe('redis://:@cache:6379');
+    expect(sanitizeForModel('no scheme ://:pass@host.here')).toBe('no scheme ://:pass@host.here');
     // Contract 5 segment-scoped on `-`/`_` (>=20 high-entropy segment with letters+digits) and whole-run >=32 without `-`/`_`
     expect(sanitizeForModel('deploy-live-a9Z2xK8mP4qR7tW1yB5nC3vL6hJ0fD9sG2')).toBe('deploy-live-[redacted]');
     expect(sanitizeForModel('a9Z2xK8mP4qR7tW1yB5nC3vL6hJ0fD9sG2')).toBe('[redacted]');
@@ -241,6 +269,17 @@ describe('credential scanner contracts (契约 1–5) and single-entry normaliza
     expect(sanitizeForModel('000000000000000000000000a1b2c3d4e5f6a7b8')).toBe('[redacted]');
     expect(sanitizeForModel('deploy-live-000000000000000000000000a1b2c3d4e5f6a7b8')).toBe('deploy-live-[redacted]');
     expect(sanitizeForModel('token-prod-auth-39163dd30f703a79079e2d2446545cff3c453738')).toBe('[redacted]');
+  });
+
+  it('redacts any >=40 pure-hex run unconditionally (rrv-015a-3 contract-5 leak)', () => {
+    // Report inputs: 40-hex with 5 distinct chars / no digit, and 2-distinct 'abab...'
+    expect(sanitizeForModel('deadbeefdeadbeefdeadbeefdeadbeefdeadbeef')).toBe('[redacted]');
+    expect(sanitizeForModel('abababababababababababababababababababab')).toBe('[redacted]');
+    expect(sanitizeForModel('a'.repeat(40))).toBe('[redacted]');
+    expect(sanitizeForModel('deploy-live-deadbeefdeadbeefdeadbeefdeadbeefdeadbeef')).toBe('deploy-live-[redacted]');
+    // <40 hex runs stay governed by the entropy rules; non-hex runs unaffected
+    expect(sanitizeForModel('deadbeefdeadbeefdeadbeefdeadbeefdeadbee')).toBe('deadbeefdeadbeefdeadbeefdeadbeefdeadbee');
+    expect(sanitizeForModel('x'.repeat(64))).toBe('x'.repeat(64));
   });
 
   it('normalizes via single entry point, preserves emoji ZWJ, and is idempotent', () => {
@@ -410,6 +449,28 @@ const LEAK_CORPUS: LeakSample[] = [
     input: './deploy-live-39163dd30f703a79079e2d2446545cff3c453738',
     secret: '39163dd30f703a79079e2d2446545cff3c453738',
   },
+
+  // --- rrv-015a-3: >=40 pure-hex runs redact unconditionally ---
+  {
+    id: 'f4-hex40',
+    input: 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef',
+    secret: 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef',
+  },
+  {
+    id: 'f4-hexab40',
+    input: 'abababababababababababababababababababab',
+    secret: 'abababababababababababababababababababab',
+  },
+
+  // --- rrv-015a-3: unbounded horizontal whitespace before KV `=`/`:` ---
+  { id: 'f4-kv-ws5', input: 'secret     =aligned9Val', secret: 'aligned9Val' },
+  { id: 'f4-kv-ws20', input: `secret${' '.repeat(20)}=val20spaces9`, secret: 'val20spaces9' },
+
+  // --- rrv-015a-3: JSON-quoted authorization/bearer/basic keys ---
+  { id: 'f4-json-auth', input: '{"Authorization":"myp4ssw0rds3cr3t"}', secret: 'myp4ssw0rds3cr3t' },
+
+  // --- rrv-015a-3: empty-username URL userinfo ---
+  { id: 'f4-url-nouser', input: 'redis://:R3d1sP4ss@cache:6379', secret: 'R3d1sP4ss' },
 ];
 
 describe('leak corpus across all 4 real model exits (env_detail, env_state, deliver, env_history)', () => {
@@ -824,6 +885,7 @@ describe('linear O(N) performance on 4 worst-case patterns from rrv-015a-2', () 
     { name: "'-eyJ'.repeat(...)", build: (n) => '-eyJ'.repeat(Math.ceil(n / 4)).slice(0, n) },
     { name: "'api-key-'.repeat(...)", build: (n) => 'api-key-'.repeat(Math.ceil(n / 8)).slice(0, n) },
     { name: "'token-aaaa-bbbb-'.repeat(...) + '1'", build: (n) => `${'token-aaaa-bbbb-'.repeat(Math.floor(n / 16))}1` },
+    { name: "'secret' + n spaces + '='", build: (n) => `secret${' '.repeat(n - 8)}=v` },
   ];
 
   it('processes 10k < 5ms and 100k < 50ms normalized linearly without quadratic blowup', () => {
