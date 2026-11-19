@@ -243,6 +243,21 @@ describe('credential scanner contracts (契约 1–5) and single-entry normaliza
     expect(sanitizeForModel('token-prod-auth-39163dd30f703a79079e2d2446545cff3c453738')).toBe('[redacted]');
   });
 
+  it('redacts any >=40 pure-hex run unconditionally (rrv-015a-3 contract-5 leak)', () => {
+    // Report inputs: 40-hex with 5 distinct chars / no digit, and 2-distinct 'abab...'
+    expect(sanitizeForModel('deadbeefdeadbeefdeadbeefdeadbeefdeadbeef')).toBe('[redacted]');
+    expect(sanitizeForModel('abababababababababababababababababababab')).toBe('[redacted]');
+    expect(sanitizeForModel('a'.repeat(40))).toBe('[redacted]');
+    expect(sanitizeForModel('deploy-live-deadbeefdeadbeefdeadbeefdeadbeefdeadbeef')).toBe(
+      'deploy-live-[redacted]',
+    );
+    // <40 hex runs stay governed by the entropy rules; non-hex runs unaffected
+    expect(sanitizeForModel('deadbeefdeadbeefdeadbeefdeadbeefdeadbee')).toBe(
+      'deadbeefdeadbeefdeadbeefdeadbeefdeadbee',
+    );
+    expect(sanitizeForModel('x'.repeat(64))).toBe('x'.repeat(64));
+  });
+
   it('normalizes via single entry point, preserves emoji ZWJ, and is idempotent', () => {
     const emojiFamily = '👩\u200d👩\u200d👧';
     const raw = `\u200bＡＰＩ_ｋｅｙ： \x00g\u200bhp_1234567890abcdef\r\n${emojiFamily} `;
@@ -409,6 +424,18 @@ const LEAK_CORPUS: LeakSample[] = [
     id: 'R43',
     input: './deploy-live-39163dd30f703a79079e2d2446545cff3c453738',
     secret: '39163dd30f703a79079e2d2446545cff3c453738',
+  },
+
+  // --- rrv-015a-3: >=40 pure-hex runs redact unconditionally ---
+  {
+    id: 'f4-hex40',
+    input: 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef',
+    secret: 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef',
+  },
+  {
+    id: 'f4-hexab40',
+    input: 'abababababababababababababababababababab',
+    secret: 'abababababababababababababababababababab',
   },
 ];
 

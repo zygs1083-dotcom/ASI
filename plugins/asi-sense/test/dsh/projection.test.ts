@@ -105,18 +105,18 @@ describe('bounded model projections', () => {
     expect(Array.from(modelTitle(`${'汉 '.repeat(10_000)}`, 'fixture-host'))).toHaveLength(512);
     expect(Array.from(modelText(`${'汉 '.repeat(20_000)}`, 'fixture-host'))).toHaveLength(32_768);
 
-    expect(modelTitle(`${'a'.repeat(505)}secret-host.invalid`, 'secret-host.invalid')).toBe('[long]');
-    expect(modelTitle(`${'a'.repeat(200)}secret-host.invalid`, 'secret-host.invalid')).toBe('<host>');
-    expect(modelText(`${'a'.repeat(32_760)}https://secret-host.invalid/p`, 'secret-host.invalid')).toBe('[long]');
-    expect(modelText(`${'a'.repeat(200)}https://secret-host.invalid/p`, 'secret-host.invalid')).toBe('[endpoint]');
+    expect(modelTitle(`${'x'.repeat(505)}secret-host.invalid`, 'secret-host.invalid')).toBe('[long]');
+    expect(modelTitle(`${'x'.repeat(200)}secret-host.invalid`, 'secret-host.invalid')).toBe('<host>');
+    expect(modelText(`${'x'.repeat(32_760)}https://secret-host.invalid/p`, 'secret-host.invalid')).toBe('[long]');
+    expect(modelText(`${'x'.repeat(200)}https://secret-host.invalid/p`, 'secret-host.invalid')).toBe('[endpoint]');
 
-    const p504 = `${'a'.repeat(252)} ${'b'.repeat(251)}`;
-    const p508 = `${'a'.repeat(254)} ${'b'.repeat(253)}`;
+    const p504 = `${'x'.repeat(252)} ${'y'.repeat(251)}`;
+    const p508 = `${'x'.repeat(254)} ${'y'.repeat(253)}`;
     expect(modelTitle(`${p504} secret-host.invalid`, 'secret-host.invalid')).toBe(`${p504} <host>`);
     expect(modelTitle(`${p508} secret-host.invalid`, 'secret-host.invalid')).toBe(`${p508} `);
 
-    const p32757 = `${`${'a'.repeat(255)} `.repeat(127)}${'b'.repeat(245)}`;
-    const p32759 = `${`${'a'.repeat(255)} `.repeat(127)}${'b'.repeat(247)}`;
+    const p32757 = `${`${'x'.repeat(255)} `.repeat(127)}${'y'.repeat(245)}`;
+    const p32759 = `${`${'x'.repeat(255)} `.repeat(127)}${'y'.repeat(247)}`;
     expect(modelText(`${p32759} https://secret-host.invalid/p`, 'secret-host.invalid')).toBe(`${p32759} `);
     expect(modelText(`${p32757} https://secret-host.invalid/p`, 'secret-host.invalid')).toBe(`${p32757} [endpoint]`);
 
@@ -139,29 +139,29 @@ describe('bounded model projections', () => {
   it('truncates by code points without splitting surrogate pairs or redaction placeholders', () => {
     expect(modelTitle('😀'.repeat(600), 'fixture-host')).toBe('[long]');
     expect(Array.from(modelTitle(`${'😀 '.repeat(300)}`, 'fixture-host'))).toHaveLength(512);
-    expect(modelTitle(`${'a'.repeat(255)} ${'b'.repeat(255)}😀`, 'fixture-host')).toBe(
-      `${'a'.repeat(255)} ${'b'.repeat(255)}😀`,
+    expect(modelTitle(`${'x'.repeat(255)} ${'y'.repeat(255)}😀`, 'fixture-host')).toBe(
+      `${'x'.repeat(255)} ${'y'.repeat(255)}😀`,
     );
-    expect(modelTitle(`${'a'.repeat(255)} ${'b'.repeat(255)} 😀`, 'fixture-host')).toBe(
-      `${'a'.repeat(255)} ${'b'.repeat(255)} `,
+    expect(modelTitle(`${'x'.repeat(255)} ${'y'.repeat(255)} 😀`, 'fixture-host')).toBe(
+      `${'x'.repeat(255)} ${'y'.repeat(255)} `,
     );
     expect(modelTitle(`${'😀 '.repeat(252)}😀😀fixture-host`, 'fixture-host')).toBe(`${'😀 '.repeat(252)}😀😀<host>`);
     expect(modelTitle(`${'😀 '.repeat(252)}😀😀😀fixture-host`, 'fixture-host')).toBe(`${'😀 '.repeat(252)}😀😀😀`);
 
     expect(modelText('😀'.repeat(33_000), 'fixture-host')).toBe('[long]');
     expect(Array.from(modelText(`${'😀 '.repeat(20_000)}`, 'fixture-host'))).toHaveLength(32_768);
-    const t32761 = `${`${'a'.repeat(255)} `.repeat(127)}${'b'.repeat(249)}`;
-    const t32764 = `${`${'a'.repeat(255)} `.repeat(127)}${'b'.repeat(252)}`;
-    const t32765 = `${`${'a'.repeat(255)} `.repeat(127)}${'b'.repeat(253)}`;
-    const t32767 = `${`${'a'.repeat(255)} `.repeat(127)}${'b'.repeat(255)}`;
-    const t32768 = `${`${'a'.repeat(255)} `.repeat(128)}`;
+    const t32761 = `${`${'x'.repeat(255)} `.repeat(127)}${'y'.repeat(249)}`;
+    const t32764 = `${`${'x'.repeat(255)} `.repeat(127)}${'y'.repeat(252)}`;
+    const t32765 = `${`${'x'.repeat(255)} `.repeat(127)}${'y'.repeat(253)}`;
+    const t32767 = `${`${'x'.repeat(255)} `.repeat(127)}${'y'.repeat(255)}`;
+    const t32768 = `${`${'x'.repeat(255)} `.repeat(128)}`;
     expect(modelText(`${t32767}😀`, 'fixture-host')).toBe(`${t32767}😀`);
     expect(modelText(`${t32768}😀`, 'fixture-host')).toBe(t32768);
     expect(modelText(`${t32765} fixture-host`, 'fixture-host')).toBe(`${t32765} `);
     expect(modelText(`${t32764} /`, 'fixture-host')).toBe(`${t32764} `);
     expect(modelText(`${t32761} /`, 'fixture-host')).toBe(`${t32761} [path]`);
-    const p505 = `${'a'.repeat(255)} ${'b'.repeat(249)}`;
-    const p508 = `${'a'.repeat(255)} ${'b'.repeat(252)}`;
+    const p505 = `${'x'.repeat(255)} ${'y'.repeat(249)}`;
+    const p508 = `${'x'.repeat(255)} ${'y'.repeat(252)}`;
     expect(modelTitle(`${p508} /`, 'fixture-host')).toBe(`${p508} `);
     expect(modelTitle(`${p505} /`, 'fixture-host')).toBe(`${p505} [path]`);
   });
