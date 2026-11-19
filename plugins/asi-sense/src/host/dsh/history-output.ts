@@ -8,10 +8,10 @@ import type {
   PersistedEventEntry,
   SummaryQueryResult,
 } from '../runtime/ports.ts';
-import { containsCredential, redactCredentials } from './credential-scan.ts';
+import { sanitizeForModel, sanitizeModelId, sanitizeSignalId } from './credential-scan.ts';
 import { modelActivityName, modelFileEntry } from './deliver.ts';
 import { KNOWN_EVENT_KINDS } from './kinds.ts';
-import { modelAppName, modelOutput, modelPath, modelProjectedOutput, modelText, modelTitle } from './tool-output.ts';
+import { modelOutput, modelPath, modelProjectedOutput, modelText, modelTitle } from './tool-output.ts';
 import type { JsonValue } from './wire-types.ts';
 
 export { KNOWN_EVENT_KINDS };
@@ -64,12 +64,12 @@ const VALID_FEEDBACK = new Set(['useful', 'noise']);
 const STRICT_WORD_ID_RE = /^[A-Za-z0-9_][A-Za-z0-9_-]{0,127}$/;
 const STRICT_COLON_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_:-]{0,127}$/;
 const HELPER_DROPPED_REASON_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63} \(dropped=\d{1,12}\)$/;
-const HASHED_SIGNAL_ID_RE = /^(?:body\.rate|file\.burst):[A-Za-z0-9_-]{1,100}$/;
 const CUSTOM_EVENT_KIND_RE = /^[a-z]+(?:\.[a-z-]+)+$/;
 
 function safeIdentifier(value: string): string {
   if (SAFE_IDENTIFIERS.has(value)) return value;
-  return !containsCredential(value) && STRICT_WORD_ID_RE.test(value) ? value : '[redacted]';
+  const safe = sanitizeModelId(value);
+  return !safe.redacted && STRICT_WORD_ID_RE.test(safe.value) ? safe.value : '[redacted]';
 }
 
 function safeEventKind(kind: string): string {
@@ -90,8 +90,9 @@ function safeFeedback(feedback: string): string {
 }
 
 function safeReason(reason: string): string {
-  if (containsCredential(reason)) return '[redacted]';
-  return STRICT_COLON_ID_RE.test(reason) || HELPER_DROPPED_REASON_RE.test(reason) ? reason : '[redacted]';
+  const safe = sanitizeModelId(reason);
+  if (safe.redacted) return '[redacted]';
+  return STRICT_COLON_ID_RE.test(safe.value) || HELPER_DROPPED_REASON_RE.test(safe.value) ? safe.value : '[redacted]';
 }
 
 function projectPathBase(value: string): string {
@@ -416,18 +417,19 @@ function extractExecutableToken(raw: string): string | undefined {
 }
 
 function isSafeCommandBasename(base: string): boolean {
-  if (containsCredential(base) || !COMMAND_BASENAME_RE.test(base)) return false;
-  if (!/[A-Za-z]/.test(base)) return false;
-  if (!base.includes('.')) return true;
-  if (SAFE_COMMAND_NAME_RE.test(base) || VERSIONED_COMMAND_RE.test(base)) return true;
-  if (SAFE_APP_BUNDLE_COMMAND_RE.test(base)) return true;
-  const parts = base.split('.');
+  const safe = sanitizeModelId(base);
+  if (safe.redacted || !COMMAND_BASENAME_RE.test(safe.value)) return false;
+  if (!/[A-Za-z]/.test(safe.value)) return false;
+  if (!safe.value.includes('.')) return true;
+  if (SAFE_COMMAND_NAME_RE.test(safe.value) || VERSIONED_COMMAND_RE.test(safe.value)) return true;
+  if (SAFE_APP_BUNDLE_COMMAND_RE.test(safe.value)) return true;
+  const parts = safe.value.split('.');
   if (parts.length !== 2 || !parts[0] || !/[A-Za-z]/.test(parts[0])) return false;
   return EXECUTABLE_EXTENSIONS.has(parts[1].toLowerCase());
 }
 
 function projectCommandSubject(subject: string): string {
-  const trimmed = subject.trim();
+  const trimmed = sanitizeForModel(subject).trim();
   if (!trimmed) return '';
   const token = extractExecutableToken(trimmed);
   if (!token) return '[command]';
@@ -459,15 +461,17 @@ function projectBodySubject(subject: string): string {
 }
 
 function projectEventId(id: string): string {
-  if (HASHED_SIGNAL_ID_RE.test(id)) return id;
+  const safeId = sanitizeSignalId(id);
+  if (safeId.redacted) return '[redacted]';
+  if (/^(?:body\.rate|file\.burst):[0-9a-f]{64}$/.test(safeId.value)) return safeId.value;
   let diskError = false;
-  const replaced = id.replace(/disk:([^:]+)/g, (_match, mount: string) => {
+  const replaced = safeId.value.replace(/disk:([^:]+)/g, (_match, mount: string) => {
     const safeMount = projectDiskMount(mount);
     if (!safeMount || safeMount.includes(':')) diskError = true;
     return `disk:${safeMount}`;
   });
   if (diskError || replaced.length > 256) return '[redacted]';
-  const template = id.replace(/disk:([^:]+)/g, 'disk:mount');
+  const template = safeId.value.replace(/disk:([^:]+)/g, 'disk:mount');
   return STRICT_COLON_ID_RE.test(template) ? replaced : '[redacted]';
 }
 
@@ -513,7 +517,7 @@ function projectDetail(
 }
 
 function projectAppSubject(value: string): string {
-  const cleaned = modelAppName(redactCredentials(value));
+  const cleaned = sanitizeForModel(value);
   if (
     /^(?:~?[/\\]|[A-Za-z]:[/\\])/.test(cleaned) ||
     /[/\\].*[/\\]/.test(cleaned) ||
@@ -521,9 +525,9 @@ function projectAppSubject(value: string): string {
   ) {
     const normalized = cleaned.replaceAll('\\', '/').replace(/\/+$/, '');
     const base = path.posix.basename(normalized);
-    if (base) return modelAppName(base);
+    if (base) return Array.from(base).slice(0, 256).join('');
   }
-  return cleaned;
+  return Array.from(cleaned).slice(0, 256).join('');
 }
 
 function projectSubject(entry: PersistedEventEntry): string {
