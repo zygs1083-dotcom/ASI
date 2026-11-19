@@ -310,6 +310,17 @@ describe('model-facing tools', () => {
     }
   });
 
+  it('F3: projects capped in env_state observation.sources without affecting other fields', async () => {
+    const h = await fixture();
+    h.state.observation.sources['history'] = { status: 'ok', lastSignalAt: 990, capped: true };
+    h.state.observation.sources['helper.ax'] = { status: 'denied', lastSignalAt: 991, error: 'boom' };
+    const state = (await h.call('env_state', { section: 'observation' })).value;
+    const sources = (state as { sources: Record<string, Record<string, unknown>> }).sources;
+    expect(sources['history']).toEqual({ status: 'ok', lastSignalAt: 990, capped: true });
+    expect(sources['helper.ax']).toEqual({ status: 'denied', lastSignalAt: 991 });
+    expect(JSON.stringify(state)).not.toContain('boom');
+  });
+
   it('projects raw file source identifiers instead of exempting paths', () => {
     const value = modelOutput({
       observation: { sources: { 'files:/Users/example/private/work/project': { status: 'ok' } } },

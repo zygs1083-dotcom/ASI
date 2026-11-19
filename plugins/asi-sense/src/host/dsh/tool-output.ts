@@ -1871,7 +1871,12 @@ function dictionary<T>(
 
 function observations(state: SenseState['observation']) {
   return {
-    sources: dictionary(state.sources, sourceIdentifier, (source) => pick(source, ['status', 'lastSignalAt']), true),
+    sources: dictionary(
+      state.sources,
+      sourceIdentifier,
+      (source) => pick(source, ['status', 'lastSignalAt', 'capped']),
+      true,
+    ),
   };
 }
 
