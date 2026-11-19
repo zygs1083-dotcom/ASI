@@ -1003,5 +1003,5 @@ export function sanitizeModelId(input: string, allowHashedSignalId = false): { v
   return { value: norm, redacted: false };
 }
 
-/** Temporary compatibility export until `tool-output.ts` removes duplicate `prevAuthScheme`. */
-export const isBasicCred = (tok: string): boolean => isAuthSecretValue(tok);
+/** Sanitizes signal/event IDs while preserving strict `body.rate:<sha256>` / `file.burst:<sha256>` digests. */
+export const sanitizeSignalId = (input: string): { value: string; redacted: boolean } => sanitizeModelId(input, true);

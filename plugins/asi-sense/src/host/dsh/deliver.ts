@@ -10,9 +10,9 @@ import type { DeliveryIntent } from '../attention/pipeline.ts';
 import { BODY_THRESHOLDS } from '../attention/thresholds.ts';
 import { formatEnvUpdate, resolveBurstDeletions } from '../delivery/format.ts';
 import { isAnomalousAwayMetric } from '../runtime/away.ts';
-import { redactCredentials } from './credential-scan.ts';
+import { sanitizeForModel, sanitizeModelId, sanitizeSignalId } from './credential-scan.ts';
 import { DELIVERABLE_KINDS } from './kinds.ts';
-import { modelActivityName, modelAppName, modelLabel, modelText, modelTitle, sourceIdentifier } from './tool-output.ts';
+import { modelActivityName, modelLabel, modelText, modelTitle, sourceIdentifier } from './tool-output.ts';
 
 declare module '@deepseek-ai/dsh-llm' {
   interface MessageSourceMap {
@@ -397,23 +397,29 @@ function sanitizeSourceStatus(value: unknown, getHostLower: () => string): strin
 }
 
 const APP_PATH_LIKE_RE = /^(?:~?[/\\]|[A-Za-z]:[/\\])|[/\\].*[/\\]|[/\\][^/\\]+\.app$/i;
-const CTRL_CHARS_RE = /\p{Cc}/gu;
 
-function fallbackAppSubject(rawInput: string): string {
-  const raw = redactCredentials(rawInput);
-  if (!raw.includes('/') && !raw.includes('\\')) return modelAppName(raw);
-  const trimmed = raw.replace(CTRL_CHARS_RE, '').replace(/[/\\]+$/, '');
+function sliceAppName(sanitized: string): string {
+  return Array.from(sanitized).slice(0, 256).join('');
+}
+
+function fallbackAppBase(sanitized: string): string {
+  if (!sanitized.includes('/') && !sanitized.includes('\\')) return sliceAppName(sanitized);
+  const trimmed = sanitized.replace(/[/\\]+$/, '');
   if (!trimmed) return '';
   if (isHomeRoot(trimmed)) return '~';
   const lastSlash = Math.max(trimmed.lastIndexOf('/'), trimmed.lastIndexOf('\\'));
   const base = lastSlash >= 0 ? trimmed.slice(lastSlash + 1) : trimmed;
   if (!base || /^[A-Za-z]:$/.test(base) || !base.trim()) return '';
-  return modelAppName(base);
+  return sliceAppName(base);
+}
+
+function fallbackAppSubject(rawInput: string): string {
+  return fallbackAppBase(sanitizeForModel(rawInput));
 }
 
 function projectAppNameField(rawInput: string): string {
-  const raw = redactCredentials(rawInput);
-  return APP_PATH_LIKE_RE.test(raw) ? fallbackAppSubject(raw) : modelAppName(raw);
+  const sanitized = sanitizeForModel(rawInput);
+  return APP_PATH_LIKE_RE.test(sanitized) ? fallbackAppBase(sanitized) : sliceAppName(sanitized);
 }
 
 function pickSanitizedReasons(
@@ -755,10 +761,12 @@ export function modelUpdate(update: EnvUpdate): EnvUpdate {
       suppressed += count > 0 ? count : 1;
       continue;
     }
+    const safeSignalId = sanitizeSignalId(signal.id);
     const data: typeof signal.data = {};
     let subject = 'observation';
     if (typeof signal.data.feedbackAvailable === 'boolean') {
-      data.feedbackAvailable = signal.data.feedbackAvailable && /^[\w.:-]+$/.test(signal.id);
+      data.feedbackAvailable =
+        signal.data.feedbackAvailable && !safeSignalId.redacted && /^[\w.:-]+$/.test(safeSignalId.value);
     }
     if (signal.kind === 'app.activated' || signal.kind === 'app.launched' || signal.kind === 'app.terminated') {
       const fallbackName =
@@ -865,7 +873,7 @@ export function modelUpdate(update: EnvUpdate): EnvUpdate {
                   count,
                   level,
                   signal: {
-                    id: signal.id,
+                    id: safeSignalId.value,
                     kind: signal.kind,
                     at: signal.at,
                     source: { id: 'asi-sense', api: 'delivery', host: 'local' },
@@ -952,7 +960,13 @@ export function modelUpdate(update: EnvUpdate): EnvUpdate {
         data.type = 'rebaseline-suggestion';
       }
       const ruleId = signal.data.ruleId;
-      if (typeof ruleId === 'string' && (/^[\w-]+$/.test(ruleId) || ruleId === 'file.burst')) data.ruleId = ruleId;
+      if (typeof ruleId === 'string') {
+        const safeRuleId = sanitizeModelId(ruleId);
+        if (safeRuleId.redacted) data.ruleId = '[redacted]';
+        else if (/^[\w-]+$/.test(safeRuleId.value) || safeRuleId.value === 'file.burst') {
+          data.ruleId = safeRuleId.value;
+        }
+      }
       if (['normal', 'warn', 'critical'].includes(String(signal.data.severity))) data.severity = signal.data.severity;
       for (const key of [
         'value',
@@ -1035,17 +1049,22 @@ export function modelUpdate(update: EnvUpdate): EnvUpdate {
         };
       }
     }
+    let projectedRuleId: string | undefined;
+    if (
+      signal.kind === 'body.threshold' &&
+      (subject === 'disk' || subject.startsWith('disk:')) &&
+      typeof ruleId === 'string'
+    ) {
+      const safeRuleId = sanitizeModelId(ruleId);
+      if (safeRuleId.redacted) projectedRuleId = '[redacted]';
+      else if (/^[\w-]+$/.test(safeRuleId.value)) projectedRuleId = safeRuleId.value;
+    }
     changes.push({
       count,
       level,
-      ...(signal.kind === 'body.threshold' &&
-      (subject === 'disk' || subject.startsWith('disk:')) &&
-      typeof ruleId === 'string' &&
-      /^[\w-]+$/.test(ruleId)
-        ? { ruleId }
-        : {}),
+      ...(projectedRuleId !== undefined ? { ruleId: projectedRuleId } : {}),
       signal: {
-        id: signal.id,
+        id: safeSignalId.value,
         kind: signal.kind,
         at: signal.at,
         source: { id: 'asi-sense', api: 'delivery', host: 'local' },
