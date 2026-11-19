@@ -450,8 +450,33 @@ describe('DSH environment delivery', () => {
     expect(text).toContain('file.burst: project');
     expect(text).toContain('created=2');
     expect(text).toContain('modified=3');
-    expect(text).toContain('deleted=55');
+    expect(text).toContain('externalDeleted=51');
+    expect(text).toContain('agentDeleted=4');
+    expect(text).not.toContain('deleted=55');
     expect(text).not.toContain('/private/');
+  });
+
+  it('ignores non-finite job.*/process.* numbers and omits empty data.id without [redacted]', () => {
+    const mk = (id: string, kind: string, subject: string, data: Record<string, unknown>) => ({
+      count: 1,
+      level: 'context' as const,
+      signal: { id, kind, at: update.at, subject, data, source: { id: 'dsh', api: 'jobs', host: 'local' } },
+    });
+    const changes = [
+      mk('j', 'job.exited', 'build', {
+        id: '  ',
+        exitCode: Number.NaN,
+        durationMs: Number.POSITIVE_INFINITY,
+        startedAt: Number.NaN,
+      }),
+      mk('p', 'process.started', 'worker', { id: '', startedAt: Number.NEGATIVE_INFINITY }),
+    ];
+    const projected = modelUpdate({ since: update.since, at: update.at, suppressed: 0, changes });
+    expect(projected.changes.map((c) => c.signal.data)).toEqual([{ status: 'exited' }, { status: 'running' }]);
+    const text = formatEnvUpdate(projected, { includeJobCommands: false });
+    expect(text).not.toMatch(/\[redacted]|NaN|Infinity/);
+    expect(text).toContain('job: `job` exited');
+    expect(text).toContain('process: `worker` started');
   });
 
   it('delivers rebaseline suggestions as an explicit model-visible line with redacted metric paths', async () => {
@@ -1066,6 +1091,12 @@ describe('DSH environment delivery', () => {
       const formatted = formatEnvUpdate(projected);
       expect(formatted.length).toBeGreaterThan(0);
       expect(formatted).not.toContain('observation');
+    }
+    expect([...MODEL_RULE_KINDS].filter((k) => !DELIVERABLE_KINDS.has(k))).toEqual(['fact.updated']);
+    expect([...KNOWN_EVENT_KINDS].filter((k) => !MODEL_RULE_KINDS.has(k))).toEqual(['delivery-unknown']);
+    for (const kind of DELIVERABLE_KINDS) {
+      expect(MODEL_RULE_KINDS.has(kind)).toBe(true);
+      expect(KNOWN_EVENT_KINDS.has(kind)).toBe(true);
     }
   });
 

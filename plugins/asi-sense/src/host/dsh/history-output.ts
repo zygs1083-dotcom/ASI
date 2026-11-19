@@ -9,8 +9,11 @@ import type {
   SummaryQueryResult,
 } from '../runtime/ports.ts';
 import { modelActivityName, modelFileEntry } from './deliver.ts';
+import { KNOWN_EVENT_KINDS } from './kinds.ts';
 import { modelAppName, modelOutput, modelPath, modelProjectedOutput, modelText, modelTitle } from './tool-output.ts';
 import type { JsonValue } from './wire-types.ts';
+
+export { KNOWN_EVENT_KINDS };
 
 const SAFE_IDENTIFIERS = new Set([
   'accessibility',
@@ -52,36 +55,6 @@ const SAFE_IDENTIFIERS = new Set([
   'body.anomaly',
   'delivery.target-unavailable',
   'delivery-unknown',
-]);
-
-export const KNOWN_EVENT_KINDS = new Set([
-  'app.activated',
-  'app.launched',
-  'app.terminated',
-  'window.focused',
-  'window.title-changed',
-  'file.changed',
-  'file.burst',
-  'file.activity',
-  'job.started',
-  'job.exited',
-  'job.failed',
-  'process.exited',
-  'source.status',
-  'source.error',
-  'body.threshold',
-  'body.rate',
-  'body.anomaly',
-  'fact.updated',
-  'delivery.target-unavailable',
-  'delivery-unknown',
-  'system.sleep',
-  'system.wake',
-  'screen.locked',
-  'screen.unlocked',
-  'session.active',
-  'session.inactive',
-  'away.summary',
 ]);
 
 const VALID_LEVELS = new Set(['record', 'context', 'wake']);

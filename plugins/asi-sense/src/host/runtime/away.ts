@@ -224,19 +224,24 @@ export class AwayReporter {
       return;
     }
     if (signal.kind === 'file.burst') {
+      const extFromCounts =
+        finite(signal.data.deleted) &&
+        finite(signal.data.agentDeleted) &&
+        signal.data.agentDeleted >= 0 &&
+        signal.data.deleted >= signal.data.agentDeleted
+          ? signal.data.deleted - signal.data.agentDeleted
+          : undefined;
+      const resolvedExternal = finite(signal.data.externalDeleted)
+        ? Math.max(0, signal.data.externalDeleted)
+        : extFromCounts;
       const external =
-        signal.data.externalDeletionExceeded === true ||
-        (finite(signal.data.externalDeleted) && signal.data.externalDeleted > 0);
+        signal.data.externalDeletionExceeded === true || (resolvedExternal !== undefined && resolvedExternal > 0);
       if (!external) return;
       const directory =
         typeof signal.data.directory === 'string' && signal.data.directory.trim()
           ? signal.data.directory
           : signal.subject || '';
-      const deleted = finite(signal.data.externalDeleted)
-        ? Math.max(0, signal.data.externalDeleted)
-        : finite(signal.data.deleted)
-          ? Math.max(0, signal.data.deleted)
-          : 0;
+      const deleted = resolvedExternal ?? (finite(signal.data.deleted) ? Math.max(0, signal.data.deleted) : 0);
       this.totalDeletedCount += deleted;
       const existing = this.bursts.get(directory);
       if (existing) {

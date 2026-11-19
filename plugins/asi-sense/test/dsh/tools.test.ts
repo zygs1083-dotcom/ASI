@@ -12,7 +12,7 @@ import ToolsService from '@deepseek-ai/dsh-tools';
 import { describe, expect, it, onTestFinished, vi } from 'vitest';
 import { FileBurstDetector } from '../../src/host/body/burst.ts';
 import { createDelivery } from '../../src/host/dsh/deliver.ts';
-import { modelOutput, modelRules, modelState, modelTune } from '../../src/host/dsh/tool-output.ts';
+import { environmentDetail, modelOutput, modelRules, modelState, modelTune } from '../../src/host/dsh/tool-output.ts';
 import { registerSenseTools } from '../../src/host/dsh/tools.ts';
 import { createSenseRuntime } from '../../src/host/runtime/index.ts';
 import type { AgentEvent, JobEvent, SensePorts, ToolEvent } from '../../src/host/runtime/ports.ts';
@@ -210,11 +210,11 @@ describe('model-facing tools', () => {
       isError: false,
       value: {
         current: true,
-        app: { value: { name: 'Fixture App', pid: 123, windowCount: 2 } },
+        app: { value: { name: 'Fixture App', bundleId: 'org.fixture.app', pid: 123, windowCount: 2 } },
         window: { value: { title: 'Synthetic title' } },
         pid: { value: 123, status: 'ok' },
         windowCount: { value: 2, status: 'ok' },
-        recentEvents: [{ kind: 'window.focused' }],
+        recentEvents: [{ kind: 'window.focused', source: { id: 'helper', api: 'test' } }],
         sources: { helper: { status: 'ok' } },
         guidance: '如需查看窗口内容，请使用当前会话可用的 computer-use 工具（需经其授权流程）',
       },
@@ -461,16 +461,17 @@ describe('model-facing tools', () => {
     };
     const state = await h.call('env_state', { section: 'env' });
     expect(state.value).toMatchObject({
+      frontApp: { value: { name: 'Fixture App', bundleId: 'backup.example.invalid' } },
       focusedWindow: { value: { title: projected } },
       watchedPaths: { value: { project: { changes: 1 }, 'project (2)': { changes: 2 }, '[path]': { changes: 3 } } },
     });
     expect(Object.hasOwn((state.value as unknown as SenseState['env']).watchedPaths.value ?? {}, '__proto__')).toBe(
       true,
     );
-    expect(JSON.stringify((state.value as unknown as SenseState['env']).frontApp)).not.toContain(
-      'backup.example.invalid',
-    );
-    expect((await h.call('env_detail', {})).value).toMatchObject({ window: { value: { title: projected } } });
+    expect((await h.call('env_detail', {})).value).toMatchObject({
+      app: { value: { bundleId: 'backup.example.invalid' } },
+      window: { value: { title: projected } },
+    });
     expect((await h.call('env_detail', { window: projected })).value).toMatchObject({
       current: true,
       match: 'current',
@@ -914,10 +915,45 @@ describe('model-facing tools', () => {
     expect(inverted.isError).toBe(true);
     const badStep = await h.call('env_metrics', { metric: 'cpu', step: 299 });
     expect(badStep.isError).toBe(true);
+    for (const badDate of ['2026-02-30', '2026-02-30T12:00:00Z', '2026-02-29T00:00:00Z', '2026-04-31T00:00:00Z']) {
+      expect((await h.call('env_metrics', { metric: 'cpu', from: badDate })).isError).toBe(true);
+    }
     const valid = await h.call('env_metrics', { metric: 'cpu', step: 300 });
     expect(valid).toMatchObject({
       isError: false,
       value: { available: false, metric: 'cpu', unit: 'ratio', stepMs: 300_000, points: [] },
     });
+  });
+
+  it('filters email and secret shapes in env_detail event subjects and frontApp bundleId while keeping ~', async () => {
+    const h = await fixture();
+    const sk = `${'sk-'}${'a'.repeat(24)}`;
+    const ghp = `${'ghp_'}${'b'.repeat(24)}`;
+    if (!h.state.env.frontApp.value) throw new Error('fixture missing');
+    h.state.env.frontApp.value.bundleId = `user@corp.invalid ${sk}`;
+    const src = { id: 'helper.ax', api: 'accessibility', host: 'fixture-host.invalid' };
+    const events = [
+      { id: 'e1', kind: 'app.activated', subject: os.homedir(), level: 'record' as const, at: 991, source: src },
+      {
+        id: 'e2',
+        kind: 'window.focused',
+        subject: `Mail alice@corp.invalid ${sk} ${ghp}`,
+        level: 'context' as const,
+        at: 992,
+        source: src,
+      },
+    ];
+    const rt = {
+      ...h.live,
+      tools: { ...h.live.tools, envState: () => structuredClone(h.state) },
+      events: () => events,
+    };
+    const res = environmentDetail(rt) as { app: { value: { bundleId: string } }; recentEvents: unknown[] };
+    expect(res.app.value.bundleId).not.toMatch(/user@corp\.invalid|sk-aaa/);
+    expect(res.recentEvents).toEqual([
+      expect.objectContaining({ subject: '~', source: { id: 'helper.ax', api: 'accessibility' } }),
+      expect.objectContaining({ subject: 'Mail [host] [redacted] [redacted]' }),
+    ]);
+    expect(JSON.stringify(res)).not.toMatch(/alice@corp\.invalid|fixture-host\.invalid|sk-aaa|ghp_bbb/);
   });
 });
