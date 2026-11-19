@@ -173,16 +173,18 @@ export async function appObservation(
   at: number,
   recovering = false,
   valid: () => boolean = () => true,
+  dedupe = true,
 ): Promise<void> {
   if (!validApp(app) || attention.isStopped()) return;
   const previous = attention.state().env.frontApp.value;
+  const pid = Number.isSafeInteger(app.pid) && (app.pid as number) > 0 ? (app.pid as number) : undefined;
   const sameBundle = previous?.bundleId === app.bundleId;
-  const sameProcess = sameBundle && (previous?.pid === undefined || app.pid === undefined || previous.pid === app.pid);
+  const sameProcess = sameBundle && (previous?.pid === undefined || pid === undefined || previous.pid === pid);
   if (!sameProcess && attention.state().observation.sources['helper.ax']?.status !== 'denied') {
     await axStatus(attention, 'unknown', at);
     if (!valid() || attention.isStopped()) return;
   }
-  if (!sameBundle) {
+  if (!dedupe || !sameProcess) {
     await attention.accept({
       id: attention.id(),
       kind: 'app.activated',
@@ -196,7 +198,7 @@ export async function appObservation(
   const value = {
     name: app.name,
     bundleId: app.bundleId,
-    ...(Number.isSafeInteger(app.pid) && (app.pid as number) > 0 ? { pid: app.pid } : {}),
+    ...(pid !== undefined ? { pid } : {}),
     ...(Number.isSafeInteger(app.windowCount) && (app.windowCount as number) >= 0
       ? { windowCount: app.windowCount }
       : {}),
@@ -250,7 +252,10 @@ export async function helperEvent(
     if (!skip.has('focusedWindow')) {
       if (window?.status === 'denied' || window?.status === 'unsupported') await axStatus(attention, window.status, at);
       else if (window?.status === 'ok' && typeof window.title === 'string') await emit('window.focused', window);
-      else if (window) clearWindow(attention, at);
+      else if (window?.status === 'ok') {
+        clearWindow(attention, at);
+        await axStatus(attention, 'ok', at);
+      } else if (window) clearWindow(attention, at);
     }
     if (!valid()) return;
     if (!skip.has('thermal') && ['nominal', 'fair', 'serious', 'critical'].includes(String(event.thermal))) {
@@ -276,7 +281,7 @@ export async function helperEvent(
       !['denied', 'unsupported'].includes(attention.state().env.focusedWindow.status)
     )
       clearWindow(attention, at);
-    if (event.type === 'app.activated') await appObservation(attention, event, at, recovering, valid);
+    if (event.type === 'app.activated') await appObservation(attention, event, at, recovering, valid, false);
     else await emit(event.type, event);
   } else if ((event.type === 'window.focused' || event.type === 'window.title') && typeof event.title === 'string') {
     await emit(event.type === 'window.title' ? 'window.title-changed' : event.type, event);

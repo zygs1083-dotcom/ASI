@@ -439,23 +439,25 @@ describe('helper protocol integration', () => {
     await h.runtime.stop();
   });
 
-  it('resets per-process AX state without fabricating an activation for the same bundle', async () => {
+  it('emits a real activation for a new pid of the same bundle, but ax.* messages never fabricate one', async () => {
     const h = setup();
     await h.runtime.start();
     await h.settle();
     const child = h.children[0];
     child.snapshotReply = false;
+    const before = h.runtime.events().filter((event) => event.kind === 'app.activated').length;
     child.send({ type: 'ax.unsupported', bundleId: 'example.app', pid: 123 });
     await h.settle();
-    const before = h.runtime.events().filter((event) => event.kind === 'app.activated').length;
+    expect(h.runtime.events().filter((event) => event.kind === 'app.activated')).toHaveLength(before);
     child.send({ type: 'app.activated', name: 'ExampleApp', bundleId: 'example.app', pid: 456 });
     await h.settle();
     expect(h.runtime.state().observation.sources['helper.ax']?.status).toBe('unknown');
     expect(h.runtime.state().env.frontApp.value).toEqual({ name: 'ExampleApp', bundleId: 'example.app', pid: 456 });
-    expect(h.runtime.events().filter((event) => event.kind === 'app.activated')).toHaveLength(before);
+    expect(h.runtime.events().filter((event) => event.kind === 'app.activated')).toHaveLength(before + 1);
     child.send({ type: 'ax.unsupported', bundleId: 'example.app', pid: 123 });
     await h.settle();
     expect(h.runtime.state().observation.sources['helper.ax']?.status).toBe('unknown');
+    expect(h.runtime.events().filter((event) => event.kind === 'app.activated')).toHaveLength(before + 1);
     await h.runtime.stop();
   });
 
