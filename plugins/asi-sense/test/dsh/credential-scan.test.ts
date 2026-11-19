@@ -276,13 +276,9 @@ describe('credential scanner contracts (契约 1–5) and single-entry normaliza
     expect(sanitizeForModel('deadbeefdeadbeefdeadbeefdeadbeefdeadbeef')).toBe('[redacted]');
     expect(sanitizeForModel('abababababababababababababababababababab')).toBe('[redacted]');
     expect(sanitizeForModel('a'.repeat(40))).toBe('[redacted]');
-    expect(sanitizeForModel('deploy-live-deadbeefdeadbeefdeadbeefdeadbeefdeadbeef')).toBe(
-      'deploy-live-[redacted]',
-    );
+    expect(sanitizeForModel('deploy-live-deadbeefdeadbeefdeadbeefdeadbeefdeadbeef')).toBe('deploy-live-[redacted]');
     // <40 hex runs stay governed by the entropy rules; non-hex runs unaffected
-    expect(sanitizeForModel('deadbeefdeadbeefdeadbeefdeadbeefdeadbee')).toBe(
-      'deadbeefdeadbeefdeadbeefdeadbeefdeadbee',
-    );
+    expect(sanitizeForModel('deadbeefdeadbeefdeadbeefdeadbeefdeadbee')).toBe('deadbeefdeadbeefdeadbeefdeadbeefdeadbee');
     expect(sanitizeForModel('x'.repeat(64))).toBe('x'.repeat(64));
   });
 

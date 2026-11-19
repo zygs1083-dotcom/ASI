@@ -961,11 +961,7 @@ export function scanCredentials(input: string): CredentialSpan[] {
         const isMode3b = (km & KF_MODE3B) !== 0;
 
         // 3a. JSON quoted key: "key": "val" or 'key': 'val'
-        if (
-          (isKv || isAuth) &&
-          i > 0 &&
-          (input.charCodeAt(i - 1) === 34 || input.charCodeAt(i - 1) === 39)
-        ) {
+        if ((isKv || isAuth) && i > 0 && (input.charCodeAt(i - 1) === 34 || input.charCodeAt(i - 1) === 39)) {
           if (delim === input.charCodeAt(i - 1)) {
             let p = keyEnd + 1;
             let wsCount = 0;
@@ -976,11 +972,7 @@ export function scanCredentials(input: string): CredentialSpan[] {
             if (p < len && (input.charCodeAt(p) === 58 || input.charCodeAt(p) === 61)) {
               p++;
               while (p < len && isHws(input.charCodeAt(p))) p++;
-              const valSpan = isKv
-                ? isAuthSchemeFollowedByWs(p)
-                  ? null
-                  : scanKvVal(p)
-                : scanAuthVal(p);
+              const valSpan = isKv ? (isAuthSchemeFollowedByWs(p) ? null : scanKvVal(p)) : scanAuthVal(p);
               if (valSpan) {
                 i = emit(valSpan.start, valSpan.end);
                 continue;
