@@ -3963,6 +3963,64 @@ describe('runtime history persistence, rollups, retention, and recovery', () => 
     expect(mergedPend?.feedback).toBe('useful');
   });
 
+  it('F2: failed clear() rollback re-appends buckets consumed before the epoch bump but not yet persisted', async () => {
+    const { port, events } = mockPort({
+      clearAll: async () => {
+        throw Object.assign(new Error('EACCES: permission denied'), { code: 'EACCES' });
+      },
+    });
+    let wall = Date.UTC(2026, 10, 18, 9, 0, 0);
+    const mgr = managerFor(port, () => wall);
+    await mgr.start(false);
+
+    // 20 pending buckets: the tick flush consumes the first 16-bucket slice
+    // and enqueues its append, then yields before the 4-bucket remainder.
+    for (let i = 0; i < 20; i++) {
+      const dir = `/work/f2-d${String(i).padStart(2, '0')}`;
+      mgr.recordEvent({
+        id: `f2-${i}`,
+        kind: 'file.activity',
+        subject: dir,
+        level: 'record',
+        cause: 'unknown',
+        at: wall + 1_000,
+        source: { id: 'files-global', api: 'watch', host: 'local' },
+        detail: { directory: dir, windowMs: 10_000, created: 1, modified: 0, deleted: 0 },
+      });
+    }
+    wall += 70_000;
+
+    // tick() suspends mid-flush at the inter-slice yield; clear() bumps the
+    // epoch before the queued append runs, so the consumed slice lands in the
+    // orphan buffer while the 4 untouched buckets stay in the clear snapshot.
+    const tickP = mgr.tick();
+    const clearP = mgr.clear();
+    await expect(clearP).rejects.toThrow('EACCES');
+    await tickP;
+
+    // Re-appended orphans settle after the rollback; the restored remainder
+    // buckets need one more flush.
+    await mgr.query({});
+    await mgr.tick();
+    await mgr.query({});
+
+    const parsed = parseHistoryLines(events.get('2026-11-18') ?? '');
+    const activities = parsed.events.filter((e) => e.kind === 'file.activity');
+    expect(activities).toHaveLength(20);
+    expect(new Set(activities.map((e) => e.subject)).size).toBe(20);
+
+    const fileActivity = mgr.timelineSnapshots().today?.fileActivity ?? {};
+    for (let i = 0; i < 20; i++) {
+      expect(fileActivity[`f2-d${String(i).padStart(2, '0')}`]).toEqual({
+        events: 1,
+        created: 1,
+        modified: 0,
+        deleted: 0,
+      });
+    }
+    await mgr.stop();
+  });
+
   it('B3: preserves patchEvent short-id mapping across 4096+ file.activity events, reconstructs evicted UUID ids, and emits zero orphan patches', async () => {
     const dir = await makeTempDir();
     const port = new FileHistoryStoragePort(dir);
