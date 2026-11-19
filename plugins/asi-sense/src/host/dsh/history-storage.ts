@@ -220,6 +220,9 @@ export class FileHistoryStoragePort implements HistoryStoragePort {
           }
         }
 
+        // Invalidate cached newline assurance before writing so a partial ENOSPC
+        // or failed write forces the next append to inspect the file's last byte.
+        this.verifiedNewlineDates.delete(date);
         await handle.writeFile(payload, 'utf8');
         if (payload.endsWith('\n')) {
           this.verifiedNewlineDates.add(date);
@@ -410,6 +413,19 @@ export class FileHistoryStoragePort implements HistoryStoragePort {
     return this.listMatching(this.monthlyDir, MONTHLY_FILE_RE);
   }
 
+  readCapState(): Promise<string | undefined> {
+    return this.readOptional(this.historyDir, join(this.historyDir, 'cap-state.json'), 'cap-state.json');
+  }
+
+  writeCapState(json: string): Promise<void> {
+    if (!json) {
+      return this.unlinkOptional(this.historyDir, join(this.historyDir, 'cap-state.json'), 'cap-state.json');
+    }
+    return this.enqueue(() =>
+      this.writeAtomic(this.historyDir, join(this.historyDir, 'cap-state.json'), json, 'cap-state.json'),
+    );
+  }
+
   clearAll(): Promise<void> {
     return this.enqueue(async () => {
       this.verifiedNewlineDates.clear();
@@ -417,6 +433,7 @@ export class FileHistoryStoragePort implements HistoryStoragePort {
         this.fs.rm(this.eventsDir, { recursive: true, force: true }),
         this.fs.rm(this.dailyDir, { recursive: true, force: true }),
         this.fs.rm(this.monthlyDir, { recursive: true, force: true }),
+        this.fs.rm(join(this.historyDir, 'cap-state.json'), { recursive: true, force: true }),
       ]);
     });
   }

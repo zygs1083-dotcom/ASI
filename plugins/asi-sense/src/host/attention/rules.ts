@@ -210,6 +210,24 @@ export function validateRule(input: unknown): string[] {
  * `where` that is not a plain object — simply never matches, and no
  * malformed input can make it throw.
  */
+function isHistoryDailyLimitSignal(signal: Signal): boolean {
+  return (
+    signal.kind === 'source.error' &&
+    signal.subject === 'history' &&
+    isPlainObject(signal.data) &&
+    signal.data.error === 'daily-limit-exceeded'
+  );
+}
+
+function isGenericSourceErrorRule(rule: WatchRule): boolean {
+  return (
+    rule.id === 'source-error' &&
+    rule.match.kind === 'source.error' &&
+    rule.match.subject === undefined &&
+    rule.match.where === undefined
+  );
+}
+
 export function matchesRule(
   rule: WatchRule,
   signal: Signal,
@@ -219,6 +237,7 @@ export function matchesRule(
   if (validateRule(rule).length > 0 || !isPlainObject(signal)) return false;
   if (rule.expiresAt !== undefined && now >= rule.expiresAt) return false;
   if (rule.match.kind !== signal.kind) return false;
+  if (isGenericSourceErrorRule(rule) && isHistoryDailyLimitSignal(signal)) return false;
   if (rule.match.subject !== undefined) {
     const isFileSignal =
       signal.kind === 'file.changed' || signal.kind === 'file.burst' || signal.kind === 'file.activity';
@@ -319,6 +338,11 @@ export const DEFAULT_RULES: readonly WatchRule[] = [
   def('process-done', { kind: 'process.exited' }, 'context'),
   def('source-denied', { kind: 'source.status', where: { status: 'denied' } }, 'context'),
   def('source-errored', { kind: 'source.status', where: { status: 'error' } }, 'context'),
+  def(
+    'history-daily-limit',
+    { kind: 'source.error', subject: 'history', where: { error: 'daily-limit-exceeded' } },
+    'record',
+  ),
   def('source-error', { kind: 'source.error' }, 'context'),
   def('body-warn', { kind: 'body.threshold', where: { severity: 'warn' } }, 'context'),
   def('body-critical', { kind: 'body.threshold', where: { severity: 'critical' } }, 'wake'),

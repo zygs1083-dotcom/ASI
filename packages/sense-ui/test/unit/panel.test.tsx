@@ -1016,4 +1016,16 @@ describe('全盘文件监视与活动视图', () => {
     await waitFor(() => expect(screen.getByRole('alert').textContent).toBe('重试仍失败'));
     expect(screen.getByRole('button', { name: '重试' })).toBeTruthy();
   });
+
+  it('shows 今日已达上限，后续只记汇总 in sidebar when history hits daily limit', () => {
+    const base = makeScenario('healthy');
+    const state = makeState();
+    state.observation.sources.history = {
+      status: 'unavailable',
+      error: 'daily-limit-exceeded',
+      lastSignalAt: T0,
+    };
+    renderPanel({ ...base, now: T0, state });
+    expect(screen.getByText('今日已达上限，后续只记汇总')).toBeTruthy();
+  });
 });

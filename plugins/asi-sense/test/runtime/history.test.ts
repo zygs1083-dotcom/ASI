@@ -8,6 +8,7 @@ import { PassThrough } from 'node:stream';
 import type { Body, Signal, WatchRule } from '@asi/sense-types';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { FileHistoryStoragePort } from '../../src/host/dsh/history-storage.ts';
+import { projectState } from '../../src/host/presenter/project.ts';
 import { RuntimeAttention } from '../../src/host/runtime/attention.ts';
 import { FactExpiry } from '../../src/host/runtime/expiry.ts';
 import {
@@ -17,6 +18,9 @@ import {
   HistoryManager,
   LocalCalendar,
   MAX_DAILY_EVENT_BYTES,
+  MAX_DAILY_FILE_EVENT_BYTES,
+  MAX_DAILY_NON_FILE_EVENT_BYTES,
+  MAX_HISTORY_TOTAL_BYTES,
   type MonthlySummary,
   parseDailySummary,
   parseHistoryLines,
@@ -2603,5 +2607,915 @@ describe('runtime history persistence, rollups, retention, and recovery', () => 
     ) as MonthlySummary & { sliceB?: unknown };
     expect(monthlyExtended.extensions).toEqual({ custom: true });
     expect(monthlyExtended.sliceB).toBe(42);
+  });
+
+  it('reads mixed old and slimmed event lines with parity across env_history, today/monthly summary, event stream, and skips glued lines', async () => {
+    const dirOld = await makeTempDir();
+    const dirMixed = await makeTempDir();
+    const tDay = Date.UTC(2026, 9, 15, 10, 0, 0);
+    const tNext = Date.UTC(2026, 10, 2, 10, 0, 0);
+
+    const oldLines = [
+      JSON.stringify({ record: 'lifecycle', state: 'active', at: tDay, boot: true }),
+      JSON.stringify({
+        record: 'event',
+        id: 'ev-1',
+        kind: 'app.activated',
+        subject: 'EditorApp',
+        level: 'record',
+        cause: 'unknown',
+        at: tDay + 1_000,
+        source: { id: 'helper', api: 'ndjson', host: 'local' },
+      }),
+      JSON.stringify({
+        record: 'event',
+        id: 'ev-2',
+        kind: 'file.activity',
+        subject: '/work/proj',
+        level: 'record',
+        cause: 'unknown',
+        ruleId: 'file-activity',
+        at: tDay + 60_000,
+        source: { id: 'files-global', api: 'watch', host: 'local' },
+        detail: { directory: '/work/proj', windowMs: 10_000, created: 1, modified: 2, deleted: 0 },
+      }),
+      JSON.stringify({
+        record: 'event',
+        id: 'ev-3',
+        kind: 'file.burst',
+        subject: '/work/proj',
+        level: 'wake',
+        cause: 'unknown',
+        ruleId: 'file-burst',
+        at: tDay + 120_000,
+        source: { id: 'files-global', api: 'watch', host: 'local' },
+        detail: {
+          directory: '/work/proj',
+          windowMs: 60_000,
+          created: 0,
+          modified: 0,
+          deleted: 55,
+          externalDeletionExceeded: true,
+        },
+      }),
+      JSON.stringify({ record: 'lifecycle', state: 'stopped', at: tDay + 180_000 }),
+    ];
+
+    const mixedLines = [
+      oldLines[0],
+      // Old line
+      oldLines[1],
+      // Glued malformed line that must be skipped without aborting file parse
+      '{"record":"event","id":"g1","kind":"app.activated","at":1}{"record":"event","id":"g2"}',
+      // Slimmed file.activity line (no detail.directory, no cause:"unknown", string source)
+      JSON.stringify({
+        record: 'event',
+        id: 'ev-2',
+        kind: 'file.activity',
+        subject: '/work/proj',
+        level: 'record',
+        ruleId: 'file-activity',
+        at: tDay + 60_000,
+        source: 'files-global',
+        detail: { windowMs: 10_000, created: 1, modified: 2, deleted: 0 },
+      }),
+      // Slimmed file.burst line
+      JSON.stringify({
+        record: 'event',
+        id: 'ev-3',
+        kind: 'file.burst',
+        subject: '/work/proj',
+        level: 'wake',
+        ruleId: 'file-burst',
+        at: tDay + 120_000,
+        source: 'files-global',
+        detail: { windowMs: 60_000, created: 0, modified: 0, deleted: 55, externalDeletionExceeded: true },
+      }),
+      oldLines[4],
+    ];
+
+    await mkdir(join(dirOld, 'history', 'events'), { recursive: true, mode: 0o700 });
+    await mkdir(join(dirMixed, 'history', 'events'), { recursive: true, mode: 0o700 });
+    await writeFile(join(dirOld, 'history', 'events', '2026-10-15.jsonl'), `${oldLines.join('\n')}\n`, { mode: 0o600 });
+    await writeFile(join(dirMixed, 'history', 'events', '2026-10-15.jsonl'), `${mixedLines.join('\n')}\n`, {
+      mode: 0o600,
+    });
+
+    // Today summary + event stream parity (run on 2026-10-15)
+    const hOldToday = createRuntimeHarness({
+      nowMs: tDay + 200_000,
+      history: new FileHistoryStoragePort(dirOld),
+      timeZone: 'UTC',
+    });
+    const hMixedToday = createRuntimeHarness({
+      nowMs: tDay + 200_000,
+      history: new FileHistoryStoragePort(dirMixed),
+      timeZone: 'UTC',
+    });
+    await hOldToday.runtime.start();
+    await hMixedToday.runtime.start();
+
+    expect(hMixedToday.runtime.events().filter((e) => e.restored)).toEqual(
+      hOldToday.runtime.events().filter((e) => e.restored),
+    );
+    expect(hMixedToday.runtime.historySnapshot().today).toEqual(hOldToday.runtime.historySnapshot().today);
+    const qOld = await hOldToday.runtime.tools.envHistory({ from: tDay, to: tDay + 180_000 });
+    const qMixed = await hMixedToday.runtime.tools.envHistory({ from: tDay, to: tDay + 180_000 });
+    expect(qMixed.events).toEqual(qOld.events);
+    await hOldToday.runtime.stop();
+    await hMixedToday.runtime.stop();
+
+    // Monthly summary parity (run on 2026-11-02 so 2026-10 is backfilled and synthesized)
+    const portOldMonth = new FileHistoryStoragePort(dirOld);
+    const portMixedMonth = new FileHistoryStoragePort(dirMixed);
+    const hOldMonth = createRuntimeHarness({ nowMs: tNext, history: portOldMonth, timeZone: 'UTC' });
+    const hMixedMonth = createRuntimeHarness({ nowMs: tNext, history: portMixedMonth, timeZone: 'UTC' });
+    await hOldMonth.runtime.start();
+    await hMixedMonth.runtime.start();
+    await vi.waitFor(async () => expect(await portOldMonth.readMonthly('2026-10')).toBeDefined(), {
+      timeout: 5_000,
+      interval: 10,
+    });
+    await vi.waitFor(async () => expect(await portMixedMonth.readMonthly('2026-10')).toBeDefined(), {
+      timeout: 5_000,
+      interval: 10,
+    });
+    const mOld = await hOldMonth.runtime.tools.envSummary({ month: '2026-10' });
+    const mMixed = await hMixedMonth.runtime.tools.envSummary({ month: '2026-10' });
+    expect(mMixed).toEqual(mOld);
+    await hOldMonth.runtime.stop();
+    await hMixedMonth.runtime.stop();
+  });
+
+  it('drops queued pre-clear appendRawLine when clear() runs during async eventFileSize check (#44)', async () => {
+    const events = new Map<string, string>();
+    let releaseSize!: () => void;
+    const sizeGate = new Promise<void>((r) => {
+      releaseSize = r;
+    });
+    let sizeEntered!: () => void;
+    const onSizeEntered = new Promise<void>((r) => {
+      sizeEntered = r;
+    });
+    let gateFirstOnly = true;
+    const gatedPort: HistoryStoragePort = {
+      eventFileSize: async (date) => {
+        if (gateFirstOnly) {
+          gateFirstOnly = false;
+          sizeEntered();
+          await sizeGate;
+        }
+        return Buffer.byteLength(events.get(date) ?? '', 'utf8');
+      },
+      appendEvent: async (date, line) => {
+        events.set(date, (events.get(date) ?? '') + line);
+      },
+      readEvents: async (date) => events.get(date),
+      listEventDates: async () => [...events.keys()],
+      deleteEventDate: async (date) => {
+        events.delete(date);
+      },
+      readDaily: async () => undefined,
+      writeDaily: async () => {},
+      listDailyDates: async () => [],
+      deleteDailyDate: async () => {},
+      readMonthly: async () => undefined,
+      writeMonthly: async () => {},
+      listMonthlyMonths: async () => [],
+      clearAll: async () => {
+        events.clear();
+      },
+    };
+    const wall = Date.UTC(2026, 10, 18, 9, 0, 0);
+    const mgr = new HistoryManager({
+      port: gatedPort,
+      clock: { wall: () => wall, mono: () => 1_000 },
+      isPaused: () => false,
+      titlesAllowed: () => false,
+      restoreEntries: () => {},
+      clearMemoryEntries: () => {},
+      emitSourceError: () => {},
+      emitSourceOk: () => {},
+      timeZone: 'UTC',
+    });
+    const startP = mgr.start(false);
+    await onSizeEntered;
+    mgr.recordEvent({
+      id: 'pre-clear-queued',
+      kind: 'app.activated',
+      subject: 'StaleApp',
+      level: 'record',
+      at: wall + 100,
+      source: { id: 'helper', api: 'ndjson', host: 'local' },
+    });
+    const clearP = mgr.clear();
+    releaseSize();
+    await Promise.all([startP, clearP]);
+    expect(events.get('2026-11-18') ?? '').not.toContain('pre-clear-queued');
+    expect(events.get('2026-11-18') ?? '').not.toContain('StaleApp');
+    await mgr.stop();
+  });
+
+  it('shortens UUID-based IDs on disk, maps patchEvent/feedback consistently, and keeps IDs unique across same-day restarts', async () => {
+    const dir = await makeTempDir();
+    const port = new FileHistoryStoragePort(dir);
+    const wall = Date.UTC(2026, 10, 18, 12, 0, 0);
+    const mgr1 = new HistoryManager({
+      port,
+      clock: { wall: () => wall, mono: () => 1_000 },
+      isPaused: () => false,
+      titlesAllowed: () => true,
+      restoreEntries: () => {},
+      clearMemoryEntries: () => {},
+      emitSourceError: () => {},
+      emitSourceOk: () => {},
+      timeZone: 'UTC',
+    });
+    await mgr1.start(false);
+    const uuidId = '550e8400-e29b-41d4-a716-446655440000:7';
+    mgr1.recordEvent({
+      id: uuidId,
+      kind: 'app.activated',
+      subject: 'Editor',
+      level: 'record',
+      cause: 'unknown',
+      at: wall + 1_000,
+      source: { id: 'helper', api: 'ndjson', host: 'local' },
+    });
+    mgr1.patchEvent(uuidId, { at: wall + 1_000, level: 'context', feedback: 'useful' });
+    await mgr1.stop();
+
+    const raw = (await port.readEvents('2026-11-18')) ?? '';
+    expect(raw).not.toContain('550e8400-e29b-41d4-a716-446655440000');
+    expect(raw).not.toContain('"cause":"unknown"');
+    expect(raw).toContain('"source":"helper"');
+
+    const parsed1 = parseHistoryLines(raw);
+    expect(parsed1.events).toHaveLength(1);
+    const shortId1 = parsed1.events[0]?.id ?? '';
+    expect(shortId1.length).toBeLessThanOrEqual(12);
+    expect(parsed1.events[0]?.level).toBe('context');
+    expect(parsed1.events[0]?.feedback).toBe('useful');
+    expect(parsed1.events[0]?.source).toEqual({ id: 'helper', api: 'ndjson', host: 'local' });
+
+    // Second session on the same day emits a distinct short ID and can still patch the restored event.
+    const restored: Array<{ id: string }> = [];
+    const mgr2 = new HistoryManager({
+      port,
+      clock: { wall: () => wall + 60_000, mono: () => 2_000 },
+      isPaused: () => false,
+      titlesAllowed: () => true,
+      restoreEntries: (entries) => {
+        restored.push(...entries);
+      },
+      clearMemoryEntries: () => {},
+      emitSourceError: () => {},
+      emitSourceOk: () => {},
+      timeZone: 'UTC',
+    });
+    await mgr2.start(false);
+    expect(restored.map((e) => e.id)).toEqual([shortId1]);
+    mgr2.patchEvent(shortId1, { feedback: 'noise' });
+    mgr2.recordEvent({
+      id: '550e8400-e29b-41d4-a716-446655440000:1',
+      kind: 'app.activated',
+      subject: 'Terminal',
+      level: 'record',
+      cause: 'unknown',
+      at: wall + 61_000,
+      source: { id: 'helper', api: 'ndjson', host: 'local' },
+    });
+    await mgr2.stop();
+
+    const parsed2 = parseHistoryLines((await port.readEvents('2026-11-18')) ?? '');
+    expect(parsed2.events).toHaveLength(2);
+    expect(parsed2.events.find((e) => e.id === shortId1)?.feedback).toBe('noise');
+    expect(parsed2.events.filter((e) => e.id !== shortId1)).toHaveLength(1);
+  });
+
+  it('aggregates file.activity per (dir, cause) into 60s disk lines while keeping memory stream intact', async () => {
+    const dir = await makeTempDir();
+    const port = new FileHistoryStoragePort(dir);
+    let wall = Date.UTC(2026, 10, 18, 12, 0, 0);
+    let mono = 1_000;
+    const mgr = new HistoryManager({
+      port,
+      clock: { wall: () => wall, mono: () => mono },
+      isPaused: () => false,
+      titlesAllowed: () => true,
+      restoreEntries: () => {},
+      clearMemoryEntries: () => {},
+      emitSourceError: () => {},
+      emitSourceOk: () => {},
+      timeZone: 'UTC',
+    });
+    await mgr.start(false);
+
+    // Emit 6 x 10s external ('unknown') edits and 2 x 10s agent edits in the same dir within 60s
+    const startWall = wall;
+    const startMono = mono;
+    for (let i = 0; i < 6; i++) {
+      wall = startWall + i * 10_000;
+      mono = startMono + i * 10_000;
+      mgr.recordEvent({
+        id: `ext-${i}`,
+        kind: 'file.activity',
+        subject: '/work/proj',
+        level: 'record',
+        cause: 'unknown',
+        at: wall,
+        source: { id: 'files-global', api: 'watch', host: 'local' },
+        detail: {
+          directory: '/work/proj',
+          windowMs: 10_000,
+          created: 1,
+          modified: 2,
+          deleted: 0,
+          ...(i === 2 ? { rolledUp: 3 } : {}),
+          files: [`a${i}.ts`],
+        },
+      });
+      if (i < 2) {
+        mgr.recordEvent({
+          id: `agent-${i}`,
+          kind: 'file.activity',
+          subject: '/work/proj',
+          level: 'record',
+          cause: 'agent',
+          at: wall,
+          source: { id: 'files-global', api: 'watch', host: 'local' },
+          detail: {
+            directory: '/work/proj',
+            windowMs: 10_000,
+            created: 0,
+            modified: 1,
+            deleted: 1,
+            files: [`b${i}.ts`],
+          },
+        });
+      }
+    }
+
+    // Before 60s flush: summary and query() reflect pending buckets, while disk has not written file.activity yet
+    expect(mgr.timelineSnapshots().today?.fileActivity.proj).toEqual({
+      events: 2,
+      created: 6,
+      modified: 14,
+      deleted: 2,
+    });
+    const beforeFlushQuery = await mgr.query({ kinds: ['file.activity'] });
+    expect(beforeFlushQuery.events).toHaveLength(2);
+    mgr.patchEvent('ext-0', { feedback: 'useful' });
+    expect((await port.readEvents('2026-11-18')) ?? '').not.toContain('"file.activity"');
+
+    // Advance past 60s flush deadline and tick
+    wall = startWall + 61_000;
+    mono = startMono + 61_000;
+    await mgr.tick();
+
+    const parsed = parseHistoryLines((await port.readEvents('2026-11-18')) ?? '');
+    const fileLines = parsed.events.filter((e) => e.kind === 'file.activity');
+    expect(fileLines).toHaveLength(2);
+    const extDisk = fileLines.find((e) => e.cause === 'unknown');
+    const agentDisk = fileLines.find((e) => e.cause === 'agent');
+    expect(extDisk?.detail).toMatchObject({
+      directory: '/work/proj',
+      windowMs: 60_000,
+      created: 6,
+      modified: 12,
+      deleted: 0,
+      rolledUp: 3,
+    });
+    expect(extDisk?.feedback).toBe('useful');
+    expect(agentDisk?.detail).toMatchObject({
+      directory: '/work/proj',
+      windowMs: 60_000,
+      created: 0,
+      modified: 2,
+      deleted: 2,
+    });
+    await mgr.stop();
+
+    // End-to-end runtime check: 10s files-global cadence keeps all 10s events in runtime.events() while disk writes 1 aggregated line/min
+    const rtDir = await makeTempDir();
+    const rtPort = new FileHistoryStoragePort(rtDir);
+    let rtWall = Date.UTC(2026, 10, 18, 14, 0, 0);
+    let rtMono = 1_000;
+    let watchCb: ((event: { path: string; change: 'add' | 'modify' | 'delete'; at: number }) => void) | undefined;
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'Date'] });
+    try {
+      const rt = createSenseRuntime(
+        {
+          clock: { wall: () => rtWall, mono: () => rtMono },
+          history: rtPort,
+          storage: { load: async () => undefined, save: async () => {} },
+          dsh: {
+            onAgentEvent: () => () => {},
+            onTool: () => () => {},
+            onJob: () => () => {},
+            deliver: async () => {},
+            tokenSnapshot: async () => undefined,
+          },
+          helper: { spawn: () => undefined },
+          probe: { create: () => ({ onSample: () => () => {}, start: () => {}, stop: async () => {} }) },
+          files: {
+            watch: (_root, cb) => {
+              watchCb = cb as typeof watchCb;
+              return { close: () => {} };
+            },
+          },
+        },
+        {
+          platform: 'linux',
+          timeZone: 'UTC',
+          intervalMs: 600_000,
+          globalFileWatch: { root: '/work', windowMs: 10_000, homedir: '/home/tester', dataDirs: [rtDir] },
+        },
+      );
+      await rt.start();
+      for (let i = 0; i < 4; i++) {
+        watchCb?.({ path: `/work/repo/file-${i}.ts`, change: 'modify', at: rtWall + 100 });
+        rtWall += 10_000;
+        rtMono += 10_000;
+        await vi.advanceTimersByTimeAsync(10_000);
+        await rt.tools.envHistory({});
+      }
+      expect(rt.events().filter((e) => e.kind === 'file.activity')).toHaveLength(4);
+      rtWall += 60_000;
+      rtMono += 60_000;
+      await vi.advanceTimersByTimeAsync(60_000);
+      await rt.tools.envHistory({});
+      const rtDisk = parseHistoryLines((await rtPort.readEvents('2026-11-18')) ?? '');
+      const rtActivity = rtDisk.events.filter((e) => e.kind === 'file.activity');
+      expect(rtActivity).toHaveLength(1);
+      expect(rtActivity[0]?.detail).toMatchObject({ directory: '/work/repo', modified: 4 });
+      await rt.stop();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('flushes pending file.activity buckets on stop() and midnight rollover', async () => {
+    const dir = await makeTempDir();
+    const port = new FileHistoryStoragePort(dir);
+    let wall = Date.UTC(2026, 10, 18, 23, 59, 50);
+    let mono = 1_000;
+    const mgr = new HistoryManager({
+      port,
+      clock: { wall: () => wall, mono: () => mono },
+      isPaused: () => false,
+      titlesAllowed: () => true,
+      restoreEntries: () => {},
+      clearMemoryEntries: () => {},
+      emitSourceError: () => {},
+      emitSourceOk: () => {},
+      timeZone: 'UTC',
+    });
+    await mgr.start(false);
+    mgr.recordEvent({
+      id: 'fa-rollover-1',
+      kind: 'file.activity',
+      subject: '/work/day1',
+      level: 'record',
+      cause: 'unknown',
+      at: wall + 2_000,
+      source: { id: 'files-global', api: 'watch', host: 'local' },
+      detail: { directory: '/work/day1', windowMs: 10_000, created: 2, modified: 1, deleted: 0 },
+    });
+
+    // Cross midnight only 15s later (< 60s window): pending bucket must flush into 2026-11-18 before rollover
+    wall = Date.UTC(2026, 10, 19, 0, 0, 5);
+    mono += 15_000;
+    await mgr.tick();
+
+    const day1Raw = (await port.readEvents('2026-11-18')) ?? '';
+    expect(day1Raw).toContain('/work/day1');
+    const daily1 = JSON.parse((await port.readDaily('2026-11-18')) ?? '{}') as DailySummary;
+    expect(daily1.fileActivity.day1).toEqual({ events: 1, created: 2, modified: 1, deleted: 0 });
+
+    // Record another bucket on day 2 and call stop() immediately (< 60s): stop() must flush it before shutdown
+    mgr.recordEvent({
+      id: 'fa-stop-1',
+      kind: 'file.activity',
+      subject: '/work/day2',
+      level: 'record',
+      cause: 'agent',
+      at: wall + 1_000,
+      source: { id: 'files-global', api: 'watch', host: 'local' },
+      detail: { directory: '/work/day2', windowMs: 10_000, created: 1, modified: 0, deleted: 3 },
+    });
+    await mgr.stop();
+
+    const day2Raw = (await port.readEvents('2026-11-19')) ?? '';
+    expect(day2Raw).toContain('/work/day2');
+    const lastStopIdx = day2Raw.lastIndexOf('"stopped"');
+    const day2FaIdx = day2Raw.indexOf('/work/day2');
+    expect(day2FaIdx).toBeGreaterThan(-1);
+    expect(day2FaIdx).toBeLessThan(lastStopIdx);
+  });
+
+  it('isolates file.* vs non-file daily budgets, always persists non-file context/wake exceptions, and enforces 30d total cap', async () => {
+    expect(MAX_DAILY_FILE_EVENT_BYTES).toBe(12 * 1024 * 1024);
+    expect(MAX_DAILY_NON_FILE_EVENT_BYTES).toBe(8 * 1024 * 1024);
+    expect(MAX_HISTORY_TOTAL_BYTES).toBeLessThanOrEqual(600 * 1024 * 1024);
+
+    const dir = await makeTempDir();
+    const port = new FileHistoryStoragePort(dir);
+    const wall = Date.UTC(2026, 10, 18, 12, 0, 0);
+    const capErrors: Array<{ error: string; extra?: Record<string, unknown> }> = [];
+    const mgr = new HistoryManager({
+      port,
+      clock: { wall: () => wall, mono: () => 1_000 },
+      isPaused: () => false,
+      titlesAllowed: () => true,
+      restoreEntries: () => {},
+      clearMemoryEntries: () => {},
+      emitSourceError: (error, extra) => capErrors.push({ error, extra }),
+      emitSourceOk: () => {},
+      timeZone: 'UTC',
+      maxFileDailyBytes: 380,
+      maxNonFileDailyBytes: 360,
+    });
+    await mgr.start(false);
+
+    // Push file.burst lines past the 380B file tier cap
+    for (let i = 0; i < 4; i++) {
+      mgr.recordEvent({
+        id: `fb-${i}`,
+        kind: 'file.burst',
+        subject: `/work/burst-${i}-${'a'.repeat(50)}`,
+        level: 'wake',
+        at: wall + i * 1_000,
+        source: { id: 'files-global', api: 'watch', host: 'local' },
+      });
+    }
+    await mgr.query({});
+
+    // file.* cap must NOT block non-file record events while non-file budget remains
+    mgr.recordEvent({
+      id: 'app-while-file-capped',
+      kind: 'app.activated',
+      subject: 'EditorApp',
+      level: 'record',
+      at: wall + 5_000,
+      source: { id: 'helper', api: 'ndjson', host: 'local' },
+    });
+    // Exhaust non-file 360B cap with another oversized record event
+    for (let i = 0; i < 4; i++) {
+      mgr.recordEvent({
+        id: `app-pad-${i}`,
+        kind: 'app.activated',
+        subject: `AppPad-${i}-${'b'.repeat(70)}`,
+        level: 'record',
+        at: wall + 6_000 + i * 1_000,
+        source: { id: 'helper', api: 'ndjson', host: 'local' },
+      });
+    }
+
+    // Non-file context and wake exceptions MUST still persist even when BOTH tiers are capped
+    mgr.recordEvent({
+      id: 'critical-ctx-1',
+      kind: 'body.anomaly',
+      subject: 'memory',
+      level: 'context',
+      at: wall + 12_000,
+      source: { id: 'body', api: 'probe', host: 'local' },
+    });
+    mgr.recordEvent({
+      id: 'critical-wake-1',
+      kind: 'job.exited',
+      subject: 'build-job',
+      level: 'wake',
+      at: wall + 13_000,
+      source: { id: 'dsh', api: 'events', host: 'local' },
+    });
+    mgr.patchEvent('critical-ctx-1', { feedback: 'useful' });
+    await mgr.stop();
+
+    const raw = (await port.readEvents('2026-11-18')) ?? '';
+    const parsed = parseHistoryLines(raw);
+    const ids = parsed.events.map((e) => e.id);
+    expect(ids).toContain('app-while-file-capped');
+    expect(ids).toContain('critical-ctx-1');
+    expect(ids).toContain('critical-wake-1');
+    expect(parsed.events.find((e) => e.id === 'critical-ctx-1')?.feedback).toBe('useful');
+    expect(ids).not.toContain('fb-3');
+    expect(ids).not.toContain('app-pad-3');
+    expect(capErrors.filter((c) => c.error === 'daily-limit-exceeded')).toHaveLength(1);
+
+    // 30d total disk ceiling prunes oldest past days while keeping recent days + today
+    const dirTotal = await makeTempDir();
+    const totalPort = new FileHistoryStoragePort(dirTotal);
+    await totalPort.appendEvent('2026-11-15', `${'x'.repeat(250)}\n`);
+    await totalPort.appendEvent('2026-11-16', `${'y'.repeat(250)}\n`);
+    await totalPort.appendEvent('2026-11-17', `${'z'.repeat(200)}\n`);
+    const mgrTotal = new HistoryManager({
+      port: totalPort,
+      clock: { wall: () => wall, mono: () => 2_000 },
+      isPaused: () => false,
+      titlesAllowed: () => true,
+      restoreEntries: () => {},
+      clearMemoryEntries: () => {},
+      emitSourceError: () => {},
+      emitSourceOk: () => {},
+      timeZone: 'UTC',
+      maxTotalBytes: 300,
+    });
+    await mgrTotal.start(false);
+    await mgrTotal.stop();
+
+    const kept = (await totalPort.listEventDates()).sort();
+    expect(kept).not.toContain('2026-11-15');
+    expect(kept).not.toContain('2026-11-16');
+    expect(kept).toContain('2026-11-17');
+    expect(kept).toContain('2026-11-18');
+  });
+
+  it('keeps history daily-limit-exceeded out of model deliveries with/without session, shows sidebar text, and deduplicates across restart', async () => {
+    // 1) With active session + across same-day restart
+    const dirWithSess = await makeTempDir();
+    const basePortWithSess = new FileHistoryStoragePort(dirWithSess);
+    let wall = Date.UTC(2026, 10, 18, 12, 0, 0);
+    let simulatedBytes = MAX_DAILY_EVENT_BYTES - 80;
+    let capJson: string | undefined;
+    const capPort: HistoryStoragePort = {
+      eventFileSize: async (date) => (date === '2026-11-18' ? simulatedBytes : 0),
+      appendEvent: async (date, line) => {
+        if (date === '2026-11-18') simulatedBytes += Buffer.byteLength(line, 'utf8');
+        await basePortWithSess.appendEvent(date, line);
+      },
+      readEvents: (d) => basePortWithSess.readEvents(d),
+      readEventLines: (d) => basePortWithSess.readEventLines(d),
+      readEventLinesDesc: (d) => basePortWithSess.readEventLinesDesc(d),
+      listEventDates: () => basePortWithSess.listEventDates(),
+      deleteEventDate: (d) => basePortWithSess.deleteEventDate(d),
+      readDaily: (d) => basePortWithSess.readDaily(d),
+      writeDaily: (d, j) => basePortWithSess.writeDaily(d, j),
+      listDailyDates: () => basePortWithSess.listDailyDates(),
+      deleteDailyDate: (d) => basePortWithSess.deleteDailyDate(d),
+      readMonthly: (m) => basePortWithSess.readMonthly(m),
+      writeMonthly: (m, j) => basePortWithSess.writeMonthly(m, j),
+      listMonthlyMonths: () => basePortWithSess.listMonthlyMonths(),
+      readCapState: async () => capJson,
+      writeCapState: async (j) => {
+        capJson = j || undefined;
+      },
+      clearAll: async () => {
+        capJson = undefined;
+        await basePortWithSess.clearAll();
+      },
+    };
+
+    const deliveredWithSess: string[] = [];
+    const h1 = createRuntimeHarness({
+      nowMs: wall,
+      history: capPort,
+      timeZone: 'UTC',
+      deliver: async (_sid, intent) => {
+        for (const c of intent.update.changes) {
+          deliveredWithSess.push(`${c.signal.kind}:${c.signal.subject}:${String(c.signal.data.error ?? '')}`);
+        }
+      },
+    });
+    await h1.runtime.start();
+    for (let i = 0; i < 3; i++) {
+      await h1.emitJob({
+        type: 'started',
+        id: `cap-sess-${i}-${'x'.repeat(60)}`,
+        sessionId: 's1',
+        command: 'echo test',
+        at: wall + (i + 1) * 1_000,
+      });
+    }
+    await vi.waitFor(
+      () =>
+        expect(
+          h1.runtime.events().filter((e) => e.kind === 'source.error' && e.reason === 'daily-limit-exceeded'),
+        ).toHaveLength(1),
+      { timeout: 2_000, interval: 5 },
+    );
+    await h1.runtime.tools.envHistory({});
+    // Give delivery pipeline a beat to drain any queued deliveries
+    await new Promise((r) => setTimeout(r, 50));
+    expect(deliveredWithSess.some((d) => d.includes('daily-limit-exceeded'))).toBe(false);
+    expect(h1.runtime.events().find((e) => e.reason === 'daily-limit-exceeded')?.level).toBe('record');
+    expect(projectState(h1.runtime.state()).observation.sources.history?.error).toBe('今日已达上限，后续只记汇总');
+    await h1.runtime.stop();
+
+    // Restart on the same date: must NOT emit a duplicate daily-limit-exceeded event or push to model
+    const deliveredRestart: string[] = [];
+    const h2 = createRuntimeHarness({
+      nowMs: wall + 60_000,
+      history: capPort,
+      timeZone: 'UTC',
+      deliver: async (_sid, intent) => {
+        for (const c of intent.update.changes) {
+          deliveredRestart.push(`${c.signal.kind}:${String(c.signal.data.error ?? '')}`);
+        }
+      },
+    });
+    await h2.runtime.start();
+    expect(projectState(h2.runtime.state()).observation.sources.history?.error).toBe('今日已达上限，后续只记汇总');
+    await h2.emitJob({
+      type: 'started',
+      id: `cap-sess-after-restart-${'x'.repeat(60)}`,
+      sessionId: 's1',
+      command: 'echo test2',
+      at: wall + 61_000,
+    });
+    await h2.runtime.tools.envHistory({});
+    await new Promise((r) => setTimeout(r, 50));
+    expect(h2.runtime.events().filter((e) => !e.restored && e.reason === 'daily-limit-exceeded')).toHaveLength(0);
+    expect(deliveredRestart.some((d) => d.includes('daily-limit-exceeded'))).toBe(false);
+    await h2.runtime.stop();
+
+    // 2) Without active session (pending path): must never buffer daily-limit-exceeded into pending or deliver later
+    const dirNoSess = await makeTempDir();
+    const baseNoSess = new FileHistoryStoragePort(dirNoSess);
+    let noSessBytes = MAX_DAILY_EVENT_BYTES - 80;
+    let sessionList: Array<{ id: string; title: string; updatedAt: number; running: boolean }> = [];
+    let jobCb: ((ev: JobEvent) => Promise<void>) | undefined;
+    const deliveredNoSess: string[] = [];
+    const noSessPort: HistoryStoragePort = {
+      eventFileSize: async (date) => (date === '2026-11-18' ? noSessBytes : 0),
+      appendEvent: async (date, line) => {
+        if (date === '2026-11-18') noSessBytes += Buffer.byteLength(line, 'utf8');
+        await baseNoSess.appendEvent(date, line);
+      },
+      readEvents: (d) => baseNoSess.readEvents(d),
+      readEventLines: (d) => baseNoSess.readEventLines(d),
+      readEventLinesDesc: (d) => baseNoSess.readEventLinesDesc(d),
+      listEventDates: () => baseNoSess.listEventDates(),
+      deleteEventDate: (d) => baseNoSess.deleteEventDate(d),
+      readDaily: (d) => baseNoSess.readDaily(d),
+      writeDaily: (d, j) => baseNoSess.writeDaily(d, j),
+      listDailyDates: () => baseNoSess.listDailyDates(),
+      deleteDailyDate: (d) => baseNoSess.deleteDailyDate(d),
+      readMonthly: (m) => baseNoSess.readMonthly(m),
+      writeMonthly: (m, j) => baseNoSess.writeMonthly(m, j),
+      listMonthlyMonths: () => baseNoSess.listMonthlyMonths(),
+      clearAll: () => baseNoSess.clearAll(),
+    };
+    const rtNoSess = createSenseRuntime(
+      {
+        clock: { wall: () => wall, mono: () => 1_000 },
+        history: noSessPort,
+        storage: { load: async () => undefined, save: async () => {} },
+        dsh: {
+          listSessions: async () => sessionList,
+          onAgentEvent: () => () => {},
+          onTool: () => () => {},
+          onJob: (cb) => {
+            jobCb = cb;
+            return () => {};
+          },
+          deliver: async (_sid, intent) => {
+            for (const c of intent.update.changes) {
+              deliveredNoSess.push(`${c.signal.kind}:${c.signal.subject}:${String(c.signal.data.error ?? '')}`);
+            }
+          },
+          tokenSnapshot: async () => undefined,
+        },
+        helper: { spawn: () => undefined },
+        probe: { create: () => ({ onSample: () => () => {}, start: () => {}, stop: async () => {} }) },
+        files: { watch: () => ({ close: () => {} }) },
+      },
+      { platform: 'linux', timeZone: 'UTC', intervalMs: 600_000, globalFileWatch: { disableInTests: true } },
+    );
+    await rtNoSess.start();
+    for (let i = 0; i < 3; i++) {
+      await jobCb?.({
+        type: 'started',
+        id: `no-sess-job-${i}-${'z'.repeat(60)}`,
+        sessionId: 'no-sess',
+        command: 'echo synthetic',
+        at: wall + (i + 1) * 100,
+      });
+    }
+    await vi.waitFor(
+      () =>
+        expect(
+          rtNoSess.events().filter((e) => e.kind === 'source.error' && e.reason === 'daily-limit-exceeded'),
+        ).toHaveLength(1),
+      { timeout: 2_000, interval: 5 },
+    );
+    expect(projectState(rtNoSess.state()).observation.sources.history?.error).toBe('今日已达上限，后续只记汇总');
+
+    // Now bring a session online and deliver an event on it: daily-limit-exceeded must NEVER be pending or delivered
+    sessionList = [{ id: 's-late', title: 'Late', updatedAt: wall + 1_000, running: true }];
+    await jobCb?.({
+      type: 'exited',
+      id: 'late-job-1',
+      sessionId: 's-late',
+      command: 'echo done',
+      exitCode: 0,
+      at: wall + 1_000,
+    });
+    await new Promise((r) => setTimeout(r, 80));
+    expect(deliveredNoSess.some((d) => d.includes('daily-limit-exceeded'))).toBe(false);
+    await rtNoSess.stop();
+  });
+
+  it('persists rollover daily summary from in-memory accumulator after cap and rebuilds mid-day restart cleanly', async () => {
+    const dir = await makeTempDir();
+    const port = new FileHistoryStoragePort(dir);
+    let wall = Date.UTC(2026, 10, 18, 23, 50, 0);
+    let mono = 1_000;
+    const mgr = new HistoryManager({
+      port,
+      clock: { wall: () => wall, mono: () => mono },
+      isPaused: () => false,
+      titlesAllowed: () => true,
+      restoreEntries: () => {},
+      clearMemoryEntries: () => {},
+      emitSourceError: () => {},
+      emitSourceOk: () => {},
+      timeZone: 'UTC',
+      maxNonFileDailyBytes: 250,
+    });
+    await mgr.start(false);
+
+    // First 1-2 events fill the 250B non-file budget on disk, remaining events still count in todayAcc
+    for (let i = 0; i < 10; i++) {
+      wall += 1_000;
+      mono += 1_000;
+      mgr.recordEvent({
+        id: `ev-roll-${i}`,
+        kind: 'app.activated',
+        subject: `App-${i}-${'x'.repeat(40)}`,
+        level: 'record',
+        at: wall,
+        source: { id: 'helper', api: 'ndjson', host: 'local' },
+      });
+    }
+    await mgr.query({});
+
+    const diskDay1 = parseHistoryLines((await port.readEvents('2026-11-18')) ?? '');
+    expect(diskDay1.events.length).toBeLessThan(10);
+    const todayBeforeRollover = mgr.timelineSnapshots().today;
+    expect(todayBeforeRollover?.totalEvents).toBe(10);
+    expect(todayBeforeRollover?.truncatedAtLimit).toBe(true);
+
+    // Cross midnight into 2026-11-19: persisted daily/2026-11-18.json and yesterday must match in-memory count 10
+    wall = Date.UTC(2026, 10, 19, 0, 1, 0);
+    mono += 660_000;
+    await mgr.tick();
+    await mgr.stop();
+
+    const daily1 = JSON.parse((await port.readDaily('2026-11-18')) ?? '{}') as DailySummary;
+    expect(daily1.totalEvents).toBe(10);
+    expect(daily1.truncatedAtLimit).toBe(true);
+    expect(mgr.timelineSnapshots().yesterday?.totalEvents).toBe(10);
+
+    // Mid-day restart after cap: rebuilds from disk (>= persisted rows) and keeps truncatedAtLimit=true
+    const dirMid = await makeTempDir();
+    const portMid = new FileHistoryStoragePort(dirMid);
+    const wallMid = Date.UTC(2026, 10, 20, 10, 0, 0);
+    const mgrMid1 = new HistoryManager({
+      port: portMid,
+      clock: { wall: () => wallMid, mono: () => 1_000 },
+      isPaused: () => false,
+      titlesAllowed: () => true,
+      restoreEntries: () => {},
+      clearMemoryEntries: () => {},
+      emitSourceError: () => {},
+      emitSourceOk: () => {},
+      timeZone: 'UTC',
+      maxNonFileDailyBytes: 250,
+    });
+    await mgrMid1.start(false);
+    for (let i = 0; i < 8; i++) {
+      mgrMid1.recordEvent({
+        id: `mid-${i}`,
+        kind: 'app.activated',
+        subject: `Mid-${i}-${'y'.repeat(40)}`,
+        level: 'record',
+        at: wallMid + (i + 1) * 1_000,
+        source: { id: 'helper', api: 'ndjson', host: 'local' },
+      });
+    }
+    await mgrMid1.stop();
+    const midDiskCount = parseHistoryLines((await portMid.readEvents('2026-11-20')) ?? '').events.length;
+    expect(midDiskCount).toBeGreaterThan(0);
+    expect(midDiskCount).toBeLessThan(8);
+
+    // Restart same day 2026-11-20
+    const mgrMid2 = new HistoryManager({
+      port: portMid,
+      clock: { wall: () => wallMid + 30_000, mono: () => 2_000 },
+      isPaused: () => false,
+      titlesAllowed: () => true,
+      restoreEntries: () => {},
+      clearMemoryEntries: () => {},
+      emitSourceError: () => {},
+      emitSourceOk: () => {},
+      timeZone: 'UTC',
+      maxNonFileDailyBytes: 250,
+    });
+    await mgrMid2.start(false);
+    const rebuiltToday = mgrMid2.timelineSnapshots().today;
+    expect(rebuiltToday?.totalEvents).toBeGreaterThanOrEqual(midDiskCount);
+    expect(rebuiltToday?.truncatedAtLimit).toBe(true);
+    await mgrMid2.stop();
   });
 });

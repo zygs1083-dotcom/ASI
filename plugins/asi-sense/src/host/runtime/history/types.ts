@@ -3,7 +3,17 @@ import { isHomeRoot } from '../../attention/path.ts';
 
 export const HISTORY_RETENTION_DAYS = 30;
 export const DAILY_SUMMARY_RETENTION_DAYS = 400;
-export const MAX_DAILY_EVENT_BYTES = 20 * 1024 * 1024;
+/**
+ * Tiered daily raw-event budgets (per history-volume-measure benchmark):
+ * - Non-file events (~6/min steady -> ~1.5 MB/day slimmed; 5x burst -> ~7.5 MB/day) get 8 MiB/day.
+ * - `file.*` events (~112/min raw -> 60s aggregated <= 1 line/dir/cause/min) get 12 MiB/day.
+ * Separating tiers stops `file.activity` storms from crowding out app/window/body/lifecycle events.
+ */
+export const MAX_DAILY_FILE_EVENT_BYTES = 12 * 1024 * 1024;
+export const MAX_DAILY_NON_FILE_EVENT_BYTES = 8 * 1024 * 1024;
+export const MAX_DAILY_EVENT_BYTES = MAX_DAILY_FILE_EVENT_BYTES + MAX_DAILY_NON_FILE_EVENT_BYTES;
+/** 30-day total disk ceiling across retained raw event logs (<= 600 MiB). */
+export const MAX_HISTORY_TOTAL_BYTES = HISTORY_RETENTION_DAYS * MAX_DAILY_EVENT_BYTES;
 export const HISTORY_HEARTBEAT_MS = 300_000;
 export const MAX_HISTORY_LIMIT = 200;
 export const DEFAULT_HISTORY_LIMIT = 50;
@@ -47,7 +57,10 @@ export interface HistoryPatchRecord {
   feedback?: 'useful' | 'noise';
 }
 
-export type HistoryEventLine = PersistedEventEntry & { record: 'event' };
+export type HistoryEventLine = Omit<PersistedEventEntry, 'source'> & {
+  record: 'event';
+  source: SourceRef | string;
+};
 
 export interface DailyAppStats {
   foregroundMs: number;
@@ -165,6 +178,9 @@ export interface HistoryStoragePort {
   writeMonthly(month: string, json: string): Promise<void>;
   listMonthlyMonths(): Promise<string[]>;
 
+  readCapState?(): Promise<string | undefined>;
+  writeCapState?(json: string): Promise<void>;
+
   harden?(): Promise<HistoryUnsafeEntry[]>;
   clearAll(): Promise<void>;
 }
@@ -214,4 +230,19 @@ export function sanitizeDirPath(value: string): string {
 
 export function isNonEmptyString(value: unknown): value is string {
   return typeof value === 'string' && value.length > 0;
+}
+
+/** Reconstructs the canonical SourceRef.api from a persisted string source id. */
+export function defaultApiForSourceId(id: string): string {
+  if (id === 'files-global' || id === 'files-global-denied' || id === 'files' || id.startsWith('files:')) {
+    return 'watch';
+  }
+  if (id === 'helper.ax' || id === 'helper.window') return 'accessibility';
+  if (id === 'helper' || id.startsWith('helper.')) return 'ndjson';
+  if (id === 'dsh') return 'events';
+  if (id === 'tokens' || id === 'delivery') return 'dsh';
+  if (id === 'body') return 'probe';
+  if (id === 'history') return 'storage';
+  if (id === 'away') return 'detector';
+  return 'unknown';
 }
