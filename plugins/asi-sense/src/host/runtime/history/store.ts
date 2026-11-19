@@ -3473,11 +3473,14 @@ export class HistoryManager {
     }
 
     if (hydratedDiskStats) {
+      const seeded = hydratedDiskStats.fileBytes + hydratedDiskStats.nonFileBytes;
       this.usageByDate.set(today, {
-        total: Math.max(todayBytes, hydratedDiskStats.fileBytes + hydratedDiskStats.nonFileBytes),
+        total: Math.max(todayBytes, seeded),
         file: hydratedDiskStats.fileBytes,
         nonFile: hydratedDiskStats.nonFileBytes,
-        breakdownLoaded: true,
+        // Zero tier bytes on a non-empty file keeps the lazy synthetic
+        // fallback in loadDateTierBreakdown instead of seeding zero strata.
+        breakdownLoaded: seeded > 0 || todayBytes === 0,
       });
     }
 
@@ -3494,11 +3497,12 @@ export class HistoryManager {
           stats = await this.inferTierStatsFromDisk(today, epoch);
           if (this.isEpochStale(epoch)) return;
           if (stats) {
+            const seeded = stats.fileBytes + stats.nonFileBytes;
             this.usageByDate.set(today, {
-              total: Math.max(todayBytes, stats.fileBytes + stats.nonFileBytes),
+              total: Math.max(todayBytes, seeded),
               file: stats.fileBytes,
               nonFile: stats.nonFileBytes,
-              breakdownLoaded: true,
+              breakdownLoaded: seeded > 0 || todayBytes === 0,
             });
           }
         }
