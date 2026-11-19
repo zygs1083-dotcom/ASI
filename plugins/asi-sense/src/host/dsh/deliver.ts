@@ -8,8 +8,9 @@ import { DeliveryFailure } from '../attention/drain.ts';
 import { homeAliasRevision, isHomeRoot } from '../attention/path.ts';
 import type { DeliveryIntent } from '../attention/pipeline.ts';
 import { BODY_THRESHOLDS } from '../attention/thresholds.ts';
-import { formatEnvUpdate } from '../delivery/format.ts';
+import { formatEnvUpdate, resolveBurstDeletions } from '../delivery/format.ts';
 import { isAnomalousAwayMetric } from '../runtime/away.ts';
+import { DELIVERABLE_KINDS } from './kinds.ts';
 import { modelActivityName, modelAppName, modelLabel, modelText, modelTitle, sourceIdentifier } from './tool-output.ts';
 
 declare module '@deepseek-ai/dsh-llm' {
@@ -18,7 +19,7 @@ declare module '@deepseek-ai/dsh-llm' {
   }
 }
 
-export { modelActivityName };
+export { DELIVERABLE_KINDS, modelActivityName };
 
 /** Masks a `files` entry that resolves to the user's home root, keeping subdirectory names intact. */
 export function modelFileEntry(directory: string | undefined, item: string): string {
@@ -49,36 +50,6 @@ function metric(value: unknown): string {
     ? value
     : 'body';
 }
-
-/** Explicitly supported deliverable signal kinds; unknown kinds are dropped and counted as `suppressed`. */
-export const DELIVERABLE_KINDS: ReadonlySet<string> = new Set([
-  'app.activated',
-  'app.launched',
-  'app.terminated',
-  'window.focused',
-  'window.title-changed',
-  'file.changed',
-  'file.burst',
-  'file.activity',
-  'job.started',
-  'job.exited',
-  'job.failed',
-  'process.started',
-  'process.exited',
-  'source.status',
-  'source.error',
-  'body.threshold',
-  'body.rate',
-  'body.anomaly',
-  'system.sleep',
-  'system.wake',
-  'screen.locked',
-  'screen.unlocked',
-  'session.active',
-  'session.inactive',
-  'away.summary',
-  'delivery.target-unavailable',
-]);
 
 const AWAY_METRIC_NAMES: ReadonlySet<string> = new Set([
   'cpu',
@@ -936,10 +907,13 @@ export function modelUpdate(update: EnvUpdate): EnvUpdate {
         typeof signal.data.id === 'string' && signal.data.id.trim() ? signal.data.id : signal.subject || 'job';
       subject = modelLabel(rawJobId);
       if (subject === '[redacted]') subject = signal.kind.startsWith('process.') ? 'process' : 'job';
-      if (typeof signal.data.id === 'string') data.id = modelLabel(signal.data.id);
-      if (typeof signal.data.exitCode === 'number') data.exitCode = signal.data.exitCode;
-      if (typeof signal.data.durationMs === 'number') data.durationMs = signal.data.durationMs;
-      if (typeof signal.data.startedAt === 'number') data.startedAt = signal.data.startedAt;
+      if (typeof signal.data.id === 'string' && signal.data.id.trim()) data.id = modelLabel(signal.data.id);
+      if (typeof signal.data.exitCode === 'number' && Number.isFinite(signal.data.exitCode))
+        data.exitCode = signal.data.exitCode;
+      if (typeof signal.data.durationMs === 'number' && Number.isFinite(signal.data.durationMs))
+        data.durationMs = signal.data.durationMs;
+      if (typeof signal.data.startedAt === 'number' && Number.isFinite(signal.data.startedAt))
+        data.startedAt = signal.data.startedAt;
       if (Object.keys(data).length === 0) {
         data.status =
           signal.kind === 'job.started' || signal.kind === 'process.started'
@@ -988,22 +962,20 @@ export function modelUpdate(update: EnvUpdate): EnvUpdate {
         'windowMs',
         'created',
         'modified',
-        'deleted',
-        'agentDeleted',
       ]) {
         const value = signal.data[key];
         if (typeof value === 'number' && Number.isFinite(value)) data[key] = value;
       }
-      const { deleted, agentDeleted } = signal.data;
+      const { externalDeleted, agentDeleted, skipMixedDeleted } = resolveBurstDeletions(signal.data);
+      if (agentDeleted !== undefined) data.agentDeleted = agentDeleted;
+      if (externalDeleted !== undefined) data.externalDeleted = externalDeleted;
       if (
-        typeof deleted === 'number' &&
-        Number.isFinite(deleted) &&
-        typeof agentDeleted === 'number' &&
-        Number.isFinite(agentDeleted) &&
-        agentDeleted >= 0 &&
-        deleted >= agentDeleted
-      )
-        data.externalDeleted = deleted - agentDeleted;
+        typeof signal.data.deleted === 'number' &&
+        Number.isFinite(signal.data.deleted) &&
+        !(signal.kind === 'file.burst' && skipMixedDeleted)
+      ) {
+        data.deleted = signal.data.deleted;
+      }
       if (signal.data.externalDeletionExceeded === true) data.externalDeletionExceeded = true;
       if (signal.kind === 'file.burst' && signal.data.rolledUp === true) data.rolledUp = true;
       if ((signal.kind === 'body.rate' || signal.kind === 'body.anomaly') && Object.keys(data).length === 0) {
@@ -1033,20 +1005,27 @@ export function modelUpdate(update: EnvUpdate): EnvUpdate {
     const summary = signal.data.jobSummary;
     if (summary && typeof summary === 'object' && !Array.isArray(summary)) {
       const { total, omitted, recent } = summary as Record<string, unknown>;
-      if (typeof total === 'number' && typeof omitted === 'number' && Array.isArray(recent)) {
+      if (
+        typeof total === 'number' &&
+        Number.isFinite(total) &&
+        typeof omitted === 'number' &&
+        Number.isFinite(omitted) &&
+        Array.isArray(recent)
+      ) {
         data.jobSummary = {
           total,
           omitted,
           recent: recent.slice(-20).flatMap((item: unknown) => {
             if (!item || typeof item !== 'object') return [];
             const { id, kind, count, exitCode } = item as Record<string, unknown>;
-            if (typeof id !== 'string' || !['job.started', 'job.exited'].includes(String(kind))) return [];
+            if (typeof id !== 'string' || !id.trim() || !['job.started', 'job.exited'].includes(String(kind)))
+              return [];
             return [
               {
                 id: modelLabel(id),
                 kind,
-                count: typeof count === 'number' ? count : 1,
-                ...(typeof exitCode === 'number' ? { exitCode } : {}),
+                count: typeof count === 'number' && Number.isFinite(count) ? count : 1,
+                ...(typeof exitCode === 'number' && Number.isFinite(exitCode) ? { exitCode } : {}),
               },
             ];
           }),

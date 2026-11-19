@@ -125,6 +125,7 @@ describe('FileBurstDetector external vs agent counts', () => {
       data: {
         wake: true,
         deleted: 4,
+        externalDeleted: 3,
         agentDeleted: 1,
         externalDeletionExceeded: true,
       },

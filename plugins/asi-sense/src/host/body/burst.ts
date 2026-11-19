@@ -784,6 +784,7 @@ export class FileBurstDetector {
         scope: st.scope,
         windowMs: lim.windowMs,
         externalDeletionExceeded,
+        externalDeleted: Math.max(0, c.deleted - c.agentDeleted),
         ...(st.rolledUp ? { rolledUp: true } : {}),
         ...c,
       },

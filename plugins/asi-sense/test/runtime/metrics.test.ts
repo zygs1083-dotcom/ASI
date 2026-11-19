@@ -170,6 +170,12 @@ describe('metric timeline bucket aggregation', () => {
     expect(() => timeline.query({ metric: 'cpu', from: base + 10, to: base })).toThrow(MetricsArgsError);
     expect(() => timeline.query({ metric: 'cpu', step: 299 })).toThrow(MetricsArgsError);
     expect(() => timeline.query({ metric: 'cpu', step: 2.5 })).toThrow(MetricsArgsError);
+    for (const bad of ['2026-02-30', '2026-02-30T12:00:00Z', '2026-02-29T00:00:00Z', '2026-04-31T00:00:00Z']) {
+      expect(() => timeline.query({ metric: 'cpu', from: bad })).toThrow(MetricsArgsError);
+    }
+    expect(() =>
+      timeline.query({ metric: 'cpu', from: '2024-02-29T00:00:00Z', to: '2024-02-29T01:00:00Z' }),
+    ).not.toThrow();
 
     const full = timeline.query({ metric: 'cpu', from: base, to: base + 24 * 60 * 60_000 });
     expect(full.points.length).toBe(MAX_METRIC_POINTS);

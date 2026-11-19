@@ -2,9 +2,12 @@ import { createHash } from 'node:crypto';
 import os from 'node:os';
 import type { Fact, SenseState, WatchRule } from '@asi/sense-types';
 import { isRemoteJsonValue } from '@deepseek-ai/dsh-typert-protocol';
-import { isHomeRootShape, toHomeRelative } from '../attention/path.ts';
+import { isHomeRoot, isHomeRootShape, toHomeRelative } from '../attention/path.ts';
 import type { createSenseRuntime } from '../runtime/index.ts';
+import { MODEL_RULE_KINDS } from './kinds.ts';
 import type { JsonValue } from './wire-types.ts';
+
+export { MODEL_RULE_KINDS };
 
 const MAX_BYTES = 32_768;
 const MAX_TITLE_LENGTH = 512;
@@ -1198,6 +1201,9 @@ function isSafeNonPathCore(core: string, host: HostSpec | undefined): boolean {
   return isSafeSingleAtom(core);
 }
 
+const CREDENTIAL_TOKEN_RE =
+  /^(?:(?:npm_|ghp_|gho_|ghu_|ghs_|ghr_|github_pat_|glpat-|xox[abprs]-|AIza|sk[-_])[A-Za-z0-9_-]{8,}|(?:AKIA|ASIA)[A-Z0-9]{16}|-{5}BEGIN|(?:api[-_]?key|token|secret|password|bearer)[-_][A-Za-z0-9]{12,})$/i;
+
 function isSimpleAsciiAlnumWord(text: string): boolean {
   for (let i = 0; i < text.length; i++) {
     const c = text.charCodeAt(i);
@@ -1213,7 +1219,7 @@ function classifyNonPathToken(
   prevEndedWithColon: boolean,
   host: HostSpec | undefined,
 ): TokenClassification {
-  if (!prevEndedWithColon && isSimpleAsciiAlnumWord(normToken)) {
+  if (!prevEndedWithColon && isSimpleAsciiAlnumWord(normToken) && !CREDENTIAL_TOKEN_RE.test(normToken)) {
     return { kind: 'plain', text: normToken };
   }
   const hostPlaceholder = isTitle ? '<host>' : '[host]';
@@ -1221,6 +1227,10 @@ function classifyNonPathToken(
 
   if (PLACEHOLDERS_SET.has(core)) {
     return { kind: 'replaced', text: core + trail };
+  }
+
+  if (CREDENTIAL_TOKEN_RE.test(core)) {
+    return { kind: 'replaced', text: `[redacted]${trail}` };
   }
 
   if (prevEndedWithColon) {
@@ -1806,6 +1816,27 @@ export function modelAppName(value: string): string {
     .join('');
 }
 
+function modelEventSubject(raw: string, hostname = os.hostname()): string {
+  const bounded = modelAppName(raw);
+  if (!bounded) return '';
+  if (bounded === '~' || isHomeRoot(bounded)) return '~';
+  return modelText(toHomeRelative(bounded) ?? bounded, hostname);
+}
+
+function modelBundleId(value: string, hostname = os.hostname()): string {
+  const cleaned = modelAppName(value);
+  if (!cleaned) return '';
+  if (cleaned === '~' || isHomeRoot(cleaned)) return '~';
+  if (
+    !/^[\w.-]+$/.test(cleaned) ||
+    CREDENTIAL_TOKEN_RE.test(cleaned) ||
+    (hostname && cleaned.toLowerCase().includes(hostname.toLowerCase()))
+  ) {
+    return modelText(toHomeRelative(cleaned) ?? cleaned, hostname);
+  }
+  return cleaned;
+}
+
 function identifier(value: string): string {
   return /^[\w-]+$/.test(value) ? modelText(value) : '[redacted]';
 }
@@ -1922,7 +1953,10 @@ export function modelState(state: SenseState, now: number, section?: 'self' | 'e
         observed: fact(env.where.observed, () => ({})),
         toolExec: fact(env.where.toolExec, (value) => ({ cwd: modelActivityName(value.cwd, true) })),
       },
-      frontApp: fact(env.frontApp, (value) => ({ name: modelAppName(value.name) })),
+      frontApp: fact(env.frontApp, (value) => ({
+        name: modelAppName(value.name),
+        ...(typeof value.bundleId === 'string' ? { bundleId: modelBundleId(value.bundleId) } : {}),
+      })),
       focusedWindow: fact(env.focusedWindow, (value) => ({ title: value.title })),
       activeJobs: fact(env.activeJobs, (value) =>
         value.map((job) => ({ ...pick(job, ['startedAt', 'status', 'exitCode']), id: identifier(job.id) })),
@@ -1967,40 +2001,10 @@ export function modelState(state: SenseState, now: number, section?: 'self' | 'e
   return projectModelOutput(
     section ? projected[section] : projected,
     now,
-    ['env.frontApp.value.name', 'frontApp.value.name'],
+    ['env.frontApp.value.name', 'frontApp.value.name', 'env.frontApp.value.bundleId', 'frontApp.value.bundleId'],
     ['watchedPaths.value', 'env.watchedPaths.value'],
   );
 }
-
-export const MODEL_RULE_KINDS: ReadonlySet<string> = new Set([
-  'app.activated',
-  'app.launched',
-  'app.terminated',
-  'window.focused',
-  'window.title-changed',
-  'file.changed',
-  'file.activity',
-  'job.started',
-  'job.exited',
-  'job.failed',
-  'process.started',
-  'process.exited',
-  'source.status',
-  'source.error',
-  'body.threshold',
-  'body.rate',
-  'body.anomaly',
-  'file.burst',
-  'fact.updated',
-  'delivery.target-unavailable',
-  'system.sleep',
-  'system.wake',
-  'screen.locked',
-  'screen.unlocked',
-  'session.active',
-  'session.inactive',
-  'away.summary',
-]);
 
 export function modelRules(rules: WatchRule[]): JsonValue {
   const kinds = MODEL_RULE_KINDS;
@@ -2219,7 +2223,13 @@ export function environmentDetail(
           ),
         )
         .slice(-20)
-        .map(({ kind, subject, at, level }) => ({ kind, subject: modelAppName(subject), at, level }))
+        .map(({ kind, subject, at, level, source }) => ({
+          kind,
+          subject: modelEventSubject(subject),
+          at,
+          level,
+          source: { id: sourceIdentifier(source.id), api: sourceIdentifier(source.api) },
+        }))
     : [];
   return modelOutput(
     {
@@ -2229,6 +2239,7 @@ export function environmentDetail(
         ? null
         : fact(env.frontApp, (value) => ({
             name: modelAppName(value.name),
+            ...(typeof value.bundleId === 'string' ? { bundleId: modelBundleId(value.bundleId) } : {}),
             ...pick(value, ['pid', ...(countFresh && !countDenied ? ['windowCount'] : [])]),
           })),
       window: mismatch ? null : fact(env.focusedWindow, (value) => ({ title: value.title })),
@@ -2239,6 +2250,6 @@ export function environmentDetail(
       guidance: '如需查看窗口内容，请使用当前会话可用的 computer-use 工具（需经其授权流程）',
     },
     undefined,
-    ['app.value.name', 'recentEvents.kind', 'guidance'],
+    ['app.value.name', 'app.value.bundleId', 'recentEvents.kind', 'recentEvents.subject', 'guidance'],
   );
 }

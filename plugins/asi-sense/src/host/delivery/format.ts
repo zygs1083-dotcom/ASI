@@ -33,6 +33,22 @@ function str(v: unknown): string {
   return typeof v === 'string' ? v : '';
 }
 
+function fin(v: unknown): v is number {
+  return typeof v === 'number' && Number.isFinite(v);
+}
+
+/** Splits `file.burst` deletions into external vs agent counts, suppressing total `deleted` when mixed. */
+export function resolveBurstDeletions(data: Record<string, unknown>) {
+  const agentDeleted = fin(data.agentDeleted) && data.agentDeleted >= 0 ? data.agentDeleted : undefined;
+  const externalDeleted =
+    fin(data.externalDeleted) && data.externalDeleted >= 0
+      ? data.externalDeleted
+      : fin(data.deleted) && agentDeleted !== undefined && data.deleted >= agentDeleted
+        ? data.deleted - agentDeleted
+        : undefined;
+  return { externalDeleted, agentDeleted, skipMixedDeleted: externalDeleted !== undefined && (agentDeleted ?? 0) > 0 };
+}
+
 function fileVerb(change: unknown): 'created' | 'saved' | 'deleted' | 'renamed' {
   if (change === 'add' || change === 'create' || change === 'created') return 'created';
   if (change === 'delete' || change === 'deleted') return 'deleted';
@@ -134,15 +150,15 @@ function changeLines(ch: EnvChange, includeTitles: boolean, includeJobCommands: 
   const summary = s.data.jobSummary;
   if (summary && typeof summary === 'object' && !Array.isArray(summary)) {
     const { total, omitted, recent } = summary as Record<string, unknown>;
-    if (typeof total === 'number' && typeof omitted === 'number' && Array.isArray(recent)) {
+    if (fin(total) && fin(omitted) && Array.isArray(recent)) {
       return [
         `jobs: ${total} events`,
         ...recent.flatMap((item: unknown) => {
           if (!item || typeof item !== 'object') return [];
           const { id, kind, count, exitCode } = item as Record<string, unknown>;
-          if (typeof id !== 'string' || !['job.exited', 'job.started'].includes(String(kind))) return [];
+          if (typeof id !== 'string' || !id.trim() || !['job.exited', 'job.started'].includes(String(kind))) return [];
           return [
-            `job: \`${esc(id)}\` ${kind === 'job.exited' ? 'exited' : 'started'}${typeof exitCode === 'number' ? ` ${exitCode}` : ''}${typeof count === 'number' && count > 1 ? ` ×${count}` : ''}`,
+            `job: \`${esc(id)}\` ${kind === 'job.exited' ? 'exited' : 'started'}${fin(exitCode) ? ` ${exitCode}` : ''}${fin(count) && count > 1 ? ` ×${count}` : ''}`,
           ];
         }),
         ...(omitted > 0 ? [`另有 ${omitted} 个未列出`] : []),
@@ -164,18 +180,21 @@ function changeLines(ch: EnvChange, includeTitles: boolean, includeJobCommands: 
     main = `file: ${esc(path)} ${fileVerb(s.data.change)}${ch.count > 1 ? ` ×${ch.count}` : ''}`;
   } else if (s.kind === 'job.started' || s.kind === 'process.started') {
     const label = s.kind === 'job.started' ? 'job' : 'process';
-    main = `${label}: \`${esc(str(s.data.id) || s.subject)}\` started`;
+    const idText = str(s.data.id).trim() ? str(s.data.id) : s.subject || label;
+    main = `${label}: \`${esc(idText)}\` started`;
   } else if (s.kind === 'job.failed') {
-    const cmd = includeJobCommands ? str(s.data.command) || s.subject : str(s.data.id) || s.subject;
+    const idText = str(s.data.id).trim() ? str(s.data.id) : s.subject || 'job';
+    const cmd = includeJobCommands ? str(s.data.command) || idText : idText;
     main = `job.failed: \`${esc(cmd)}\``;
-    if (typeof s.data.exitCode === 'number') main += ` ${s.data.exitCode}`;
+    if (typeof s.data.exitCode === 'number' && Number.isFinite(s.data.exitCode)) main += ` ${s.data.exitCode}`;
     const dur = durationMs(s);
     if (dur !== undefined) main += ` after ${Math.round(dur / 1000)}s`;
   } else if (s.kind === 'job.exited' || s.kind === 'process.exited') {
     const label = s.kind === 'job.exited' ? 'job' : 'process';
-    const cmd = includeJobCommands ? str(s.data.command) || s.subject : str(s.data.id) || label;
+    const idText = str(s.data.id).trim() ? str(s.data.id) : label;
+    const cmd = includeJobCommands ? str(s.data.command) || s.subject || idText : idText;
     main = `${label}: \`${esc(cmd)}\` exited`;
-    if (typeof s.data.exitCode === 'number') main += ` ${s.data.exitCode}`;
+    if (typeof s.data.exitCode === 'number' && Number.isFinite(s.data.exitCode)) main += ` ${s.data.exitCode}`;
     const dur = durationMs(s);
     if (dur !== undefined) main += ` after ${Math.round(dur / 1000)}s`;
   } else if (s.kind === 'body.threshold') {
@@ -202,6 +221,8 @@ function changeLines(ch: EnvChange, includeTitles: boolean, includeJobCommands: 
       typeof s.data.etaToFloorMs === 'number' && Number.isFinite(s.data.etaToFloorMs)
         ? 'etaToFloorMs'
         : 'timeToFloorMs';
+    const { externalDeleted: burstExt, skipMixedDeleted } =
+      s.kind === 'file.burst' ? resolveBurstDeletions(s.data) : { externalDeleted: undefined, skipMixedDeleted: false };
     for (const key of [
       'value',
       'baseline',
@@ -216,7 +237,8 @@ function changeLines(ch: EnvChange, includeTitles: boolean, includeJobCommands: 
       'externalDeleted',
       'agentDeleted',
     ]) {
-      const value = s.data[key];
+      if (key === 'deleted' && skipMixedDeleted) continue;
+      const value = key === 'externalDeleted' && burstExt !== undefined ? burstExt : s.data[key];
       if (typeof value === 'number' && Number.isFinite(value)) {
         main += key === 'deviation' ? ` ${key}=${value}σ` : ` ${key}=${value}`;
       }

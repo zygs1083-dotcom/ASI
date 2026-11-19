@@ -1,5 +1,5 @@
 import type { Body, Fact } from '@asi/sense-types';
-import { type DayBounds, LocalCalendar } from './history/time.ts';
+import { type DayBounds, LocalCalendar, parseDateKey } from './history/time.ts';
 import type { Clock } from './ports.ts';
 
 /**
@@ -47,6 +47,7 @@ const METRIC_INDEX: Readonly<Record<MetricKey, number>> = {
   battery: 7,
 };
 const DATE_ONLY_RE = /^\d{4}-\d{2}-\d{2}$/;
+const ISO_DATE_PREFIX_RE = /^(\d{4}-\d{2}-\d{2})(?:[Tt ]|$)/;
 
 export interface MetricStats {
   min: number;
@@ -828,6 +829,10 @@ export class MetricTimeline {
         throw new MetricsArgsError(`invalid calendar date: ${value}`);
       }
       return edge === 'start' ? bounds.startMs : Math.max(bounds.startMs, bounds.endMs - 1);
+    }
+    const prefixMatch = ISO_DATE_PREFIX_RE.exec(trimmed);
+    if (prefixMatch && !parseDateKey(prefixMatch[1])) {
+      throw new MetricsArgsError(`invalid calendar date in ISO string: ${value}`);
     }
     const parsed = Date.parse(trimmed);
     if (!Number.isFinite(parsed)) throw new MetricsArgsError(`invalid ISO date/time string: ${value}`);
