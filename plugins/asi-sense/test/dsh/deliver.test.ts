@@ -1379,14 +1379,42 @@ describe('DSH environment delivery', () => {
         data: { status: 'error', reason: "EACCES: permission denied, open '/Users/alice/.ssh/config'" },
       },
     }));
-    modelUpdate({ since: T, at: T + 10_000, suppressed: 0, changes: changes.slice(0, 500) });
-    const t0 = performance.now();
-    const out = modelUpdate({ since: T, at: T + 10_000, suppressed: 0, changes });
-    const elapsed = performance.now() - t0;
+    const distinctChanges = Array.from({ length: 2_000 }, (_, i) => ({
+      count: 1,
+      level: 'context' as const,
+      signal: {
+        id: `sd-${i}`,
+        kind: 'source.status',
+        at: T + i,
+        source: { id: 'files-global', api: 'watch', host: 'local' },
+        subject: 'files-global',
+        data: { status: 'error', reason: `EACCES: permission denied, open '/Users/alice/dir-${i}/.ssh/config'` },
+      },
+    }));
+    // Warm up both cached and uncached paths, then compare 10,000 cached signals against 2,000 uncached signals
+    // so the assertion scales with CPU load while still catching cache/fast-path regressions.
+    modelUpdate({ since: T, at: T + 10_000, suppressed: 0, changes });
+    modelUpdate({ since: T, at: T + 10_000, suppressed: 0, changes: distinctChanges.slice(0, 300) });
+
+    let out!: ReturnType<typeof modelUpdate>;
+    const cachedTimes: number[] = [];
+    for (let run = 0; run < 3; run++) {
+      const t0 = performance.now();
+      out = modelUpdate({ since: T, at: T + 10_000, suppressed: 0, changes });
+      cachedTimes.push(performance.now() - t0);
+    }
+    const uncachedTimes: number[] = [];
+    for (let run = 0; run < 3; run++) {
+      const t0 = performance.now();
+      modelUpdate({ since: T, at: T + 10_000, suppressed: 0, changes: distinctChanges });
+      uncachedTimes.push(performance.now() - t0);
+    }
+    const minCachedMs = Math.min(...cachedTimes);
+    const minUncached2kMs = Math.min(...uncachedTimes);
     expect(out.changes).toHaveLength(10_000);
     expect(out.changes[0]?.signal.data.status).toBe('error');
     expect(String(out.changes[0]?.signal.data.reason)).not.toContain('alice');
-    expect(elapsed).toBeLessThanOrEqual(300);
+    expect(minCachedMs).toBeLessThanOrEqual(minUncached2kMs);
   });
 
   it('sanitizes embedded paths and hostnames in away.summary text fields', () => {
