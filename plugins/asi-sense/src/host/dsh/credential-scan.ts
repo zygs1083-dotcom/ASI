@@ -795,7 +795,7 @@ export function scanCredentials(input: string): CredentialSpan[] {
         }
         if (
           atPos > i + 3 &&
-          colonPos > i + 3 &&
+          colonPos >= i + 3 &&
           colonPos + 1 < atPos &&
           !input.startsWith('[redacted]', colonPos + 1)
         ) {

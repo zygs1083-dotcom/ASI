@@ -253,6 +253,11 @@ describe('credential scanner contracts (契约 1–5) and single-entry normaliza
     expect(sanitizeForModel('postgres://dbadmin:DbPassSecret123@db.internal:5432/prod')).toBe(
       'postgres://dbadmin:[redacted]@db.internal:5432/prod',
     );
+    // rrv-015a-3: empty username userinfo `scheme://:pass@host` redacts the password
+    expect(sanitizeForModel('redis://:R3d1sP4ss@cache:6379')).toBe('redis://:[redacted]@cache:6379');
+    expect(sanitizeForModel('https://:x9w8v7u6@host.invalid/')).toBe('https://:[redacted]@host.invalid/');
+    expect(sanitizeForModel('redis://:@cache:6379')).toBe('redis://:@cache:6379');
+    expect(sanitizeForModel('no scheme ://:pass@host.here')).toBe('no scheme ://:pass@host.here');
     // Contract 5 segment-scoped on `-`/`_` (>=20 high-entropy segment with letters+digits) and whole-run >=32 without `-`/`_`
     expect(sanitizeForModel('deploy-live-a9Z2xK8mP4qR7tW1yB5nC3vL6hJ0fD9sG2')).toBe('deploy-live-[redacted]');
     expect(sanitizeForModel('a9Z2xK8mP4qR7tW1yB5nC3vL6hJ0fD9sG2')).toBe('[redacted]');
@@ -467,6 +472,9 @@ const LEAK_CORPUS: LeakSample[] = [
 
   // --- rrv-015a-3: JSON-quoted authorization/bearer/basic keys ---
   { id: 'f4-json-auth', input: '{"Authorization":"myp4ssw0rds3cr3t"}', secret: 'myp4ssw0rds3cr3t' },
+
+  // --- rrv-015a-3: empty-username URL userinfo ---
+  { id: 'f4-url-nouser', input: 'redis://:R3d1sP4ss@cache:6379', secret: 'R3d1sP4ss' },
 ];
 
 describe('leak corpus across all 4 real model exits (env_detail, env_state, deliver, env_history)', () => {
