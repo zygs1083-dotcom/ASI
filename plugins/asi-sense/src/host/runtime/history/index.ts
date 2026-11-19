@@ -51,6 +51,7 @@ export {
   type HistoryStoragePort,
   type HistoryUnsafeEntry,
   isNonEmptyString,
+  MAX_DAILY_CRITICAL_EVENT_BYTES,
   MAX_DAILY_EVENT_BYTES,
   MAX_DAILY_FILE_EVENT_BYTES,
   MAX_DAILY_NON_FILE_EVENT_BYTES,

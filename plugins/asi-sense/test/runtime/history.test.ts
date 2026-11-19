@@ -17,6 +17,7 @@ import {
   type DailySummary,
   HistoryManager,
   LocalCalendar,
+  MAX_DAILY_CRITICAL_EVENT_BYTES,
   MAX_DAILY_EVENT_BYTES,
   MAX_DAILY_FILE_EVENT_BYTES,
   MAX_DAILY_NON_FILE_EVENT_BYTES,
@@ -4262,5 +4263,220 @@ describe('runtime history persistence, rollups, retention, and recovery', () => 
     await mgrDisk.stop();
     const diskParsed = parseHistoryLines((await diskPort.readEvents('2026-11-23')) ?? '');
     expect(diskParsed.events.filter((e) => e.kind === 'file.activity')).toHaveLength(4_096);
+  });
+
+  it('S1: enforces absolute fallback daily cap for non-file context/wake exceptions, keeps summaries, and prompts sidebar via ok+capped without model delivery', async () => {
+    expect(MAX_DAILY_CRITICAL_EVENT_BYTES).toBe(32 * 1024 * 1024);
+    const dir = await makeTempDir();
+    const port = new FileHistoryStoragePort(dir);
+    const wall = Date.UTC(2026, 10, 24, 10, 0, 0);
+    const errors: Array<{ error: string; extra?: Record<string, unknown> }> = [];
+    const okEvents: Array<Record<string, unknown> | undefined> = [];
+    const mgr = new HistoryManager({
+      port,
+      clock: { wall: () => wall, mono: () => 1_000 },
+      isPaused: () => false,
+      titlesAllowed: () => true,
+      restoreEntries: () => {},
+      clearMemoryEntries: () => {},
+      emitSourceError: (error, extra) => errors.push({ error, extra }),
+      emitSourceOk: (extra) => okEvents.push(extra),
+      timeZone: 'UTC',
+      maxNonFileDailyBytes: 240,
+      maxCriticalDailyBytes: 900,
+    });
+    await mgr.start(false);
+
+    // Non-critical record events hit 240B soft non-file tier cap first
+    for (let i = 0; i < 4; i++) {
+      mgr.recordEvent({
+        id: `s1-rec-${i}`,
+        kind: 'app.activated',
+        subject: `Rec-${i}-${'r'.repeat(50)}`,
+        level: 'record',
+        at: wall + (i + 1) * 100,
+        source: { id: 'helper', api: 'ndjson', host: 'local' },
+      });
+    }
+    await mgr.query({});
+    expect(errors.filter((e) => e.error === 'daily-limit-exceeded')).toHaveLength(1);
+
+    // Critical (non-file wake/context) events bypass 240B tier cap, then stop at 900B fallback ceiling
+    for (let i = 0; i < 12; i++) {
+      mgr.recordEvent({
+        id: `s1-crit-${i}`,
+        kind: 'job.exited',
+        subject: `crit-${i}-${'k'.repeat(70)}`,
+        level: 'wake',
+        at: wall + 2_000 + i * 100,
+        source: { id: 'dsh', api: 'events', host: 'local' },
+      });
+    }
+    await mgr.query({});
+
+    const diskSize = await port.eventFileSize('2026-11-24');
+    expect(diskSize).toBeLessThanOrEqual(900);
+    const parsedDisk = parseHistoryLines((await port.readEvents('2026-11-24')) ?? '');
+    const critOnDisk = parsedDisk.events.filter((e) => e.id.startsWith('s1-crit-'));
+    expect(critOnDisk.length).toBeGreaterThan(0);
+    expect(critOnDisk.length).toBeLessThan(12);
+
+    // Summary still counts all 4 + 12 = 16 events ("只记汇总") and marks truncatedAtLimit
+    const todaySnap = mgr.timelineSnapshots().today;
+    expect(todaySnap?.totalEvents).toBe(16);
+    expect(todaySnap?.deliveries.wake).toBe(12);
+    expect(todaySnap?.truncatedAtLimit).toBe(true);
+    await mgr.stop();
+
+    // Restart same day with cap-state.json: critical writes remain capped and cap error is not duplicated
+    const mgr2 = new HistoryManager({
+      port,
+      clock: { wall: () => wall + 60_000, mono: () => 2_000 },
+      isPaused: () => false,
+      titlesAllowed: () => true,
+      restoreEntries: () => {},
+      clearMemoryEntries: () => {},
+      emitSourceError: (error, extra) => errors.push({ error, extra }),
+      emitSourceOk: (extra) => okEvents.push(extra),
+      timeZone: 'UTC',
+      maxNonFileDailyBytes: 240,
+      maxCriticalDailyBytes: 900,
+    });
+    await mgr2.start(false);
+    mgr2.recordEvent({
+      id: 's1-crit-after-restart',
+      kind: 'body.anomaly',
+      subject: `crit-restart-${'k'.repeat(70)}`,
+      level: 'context',
+      at: wall + 61_000,
+      source: { id: 'body', api: 'probe', host: 'local' },
+    });
+    await mgr2.stop();
+    const afterRestartRaw = (await port.readEvents('2026-11-24')) ?? '';
+    expect(afterRestartRaw).not.toContain('s1-crit-after-restart');
+
+    // After soft cap was already hit, critical cap triggers at 900B cleanly.
+    // Also verify pure critical stream bypassing soft cap (240B) and hitting critical cap (900B) emits tier='critical'
+    const dirCritOnly = await makeTempDir();
+    const portCritOnly = new FileHistoryStoragePort(dirCritOnly);
+    const critErrors: Array<{ error: string; extra?: Record<string, unknown> }> = [];
+    const mgrCritOnly = new HistoryManager({
+      port: portCritOnly,
+      clock: { wall: () => wall, mono: () => 1_000 },
+      isPaused: () => false,
+      titlesAllowed: () => true,
+      restoreEntries: () => {},
+      clearMemoryEntries: () => {},
+      emitSourceError: (error, extra) => critErrors.push({ error, extra }),
+      emitSourceOk: () => {},
+      timeZone: 'UTC',
+      maxNonFileDailyBytes: 240,
+      maxCriticalDailyBytes: 700,
+    });
+    await mgrCritOnly.start(false);
+    for (let i = 0; i < 10; i++) {
+      mgrCritOnly.recordEvent({
+        id: `s1-pure-${i}`,
+        kind: 'body.anomaly',
+        subject: `cpu-${i}-${'m'.repeat(60)}`,
+        level: 'context',
+        at: wall + (i + 1) * 100,
+        source: { id: 'body', api: 'probe', host: 'local' },
+      });
+    }
+    await mgrCritOnly.query({});
+    expect(await portCritOnly.eventFileSize('2026-11-24')).toBeLessThanOrEqual(700);
+    expect(critErrors).toEqual([
+      {
+        error: 'daily-limit-exceeded',
+        extra: { date: '2026-11-24', tier: 'critical', maxBytes: 700 },
+      },
+    ]);
+    expect(mgrCritOnly.timelineSnapshots().today?.totalEvents).toBe(10);
+    expect(mgrCritOnly.timelineSnapshots().today?.truncatedAtLimit).toBe(true);
+    await mgrCritOnly.stop();
+
+    // End-to-end runtime check: default 32 MiB critical ceiling notifies sidebar via ok+capped without model push
+    const delivered: string[] = [];
+    let simBytes = MAX_DAILY_CRITICAL_EVENT_BYTES - 120;
+    const rtDir = await makeTempDir();
+    const baseRtPort = new FileHistoryStoragePort(rtDir);
+    let rtCapJson: string | undefined;
+    const rtPort: HistoryStoragePort = {
+      eventFileSize: async (d) => (d === '2026-11-24' ? simBytes : baseRtPort.eventFileSize(d)),
+      appendEvent: async (d, line) => {
+        if (d === '2026-11-24') simBytes += Buffer.byteLength(line, 'utf8');
+        return baseRtPort.appendEvent(d, line);
+      },
+      readEvents: (d) => baseRtPort.readEvents(d),
+      readEventLines: (d) => baseRtPort.readEventLines(d),
+      readEventLinesDesc: (d) => baseRtPort.readEventLinesDesc(d),
+      listEventDates: () => baseRtPort.listEventDates(),
+      deleteEventDate: (d) => baseRtPort.deleteEventDate(d),
+      readDaily: (d) => baseRtPort.readDaily(d),
+      writeDaily: (d, j) => baseRtPort.writeDaily(d, j),
+      listDailyDates: () => baseRtPort.listDailyDates(),
+      deleteDailyDate: (d) => baseRtPort.deleteDailyDate(d),
+      readMonthly: (m) => baseRtPort.readMonthly(m),
+      writeMonthly: (m, j) => baseRtPort.writeMonthly(m, j),
+      listMonthlyMonths: () => baseRtPort.listMonthlyMonths(),
+      readCapState: async () => rtCapJson,
+      writeCapState: async (j) => {
+        rtCapJson = j || undefined;
+      },
+      clearAll: async () => {
+        rtCapJson = undefined;
+        await baseRtPort.clearAll();
+      },
+    };
+    const dayBeforeRoll = Date.UTC(2026, 10, 23, 23, 59, 50);
+    const rt = createRuntimeHarness({
+      nowMs: dayBeforeRoll,
+      history: rtPort,
+      timeZone: 'UTC',
+      deliver: async (_sid, intent) => {
+        for (const c of intent.update.changes) {
+          delivered.push(`${c.signal.kind}:${c.signal.subject}:${String(c.signal.data.error ?? '')}`);
+        }
+      },
+    });
+    await rt.runtime.start();
+    // Start active session job on day before so usageByDate for 2026-11-24 stays untouched at 32MiB - 120
+    await rt.emitJob({
+      type: 'started',
+      id: 'rt-s1-seed',
+      sessionId: 's1',
+      command: `echo ${'x'.repeat(80)}`,
+      at: dayBeforeRoll + 1_000,
+    });
+    await rt.runtime.tools.envHistory({});
+    const nextDayWall = Date.UTC(2026, 10, 24, 0, 0, 10);
+    rt.setTime(nextDayWall, 20_000);
+    for (let i = 0; i < 4; i++) {
+      await rt.emitJob({
+        type: 'exited',
+        id: `rt-s1-${i}`,
+        sessionId: 's1',
+        command: `fail-${i}-${'x'.repeat(80)}`,
+        exitCode: 1,
+        at: nextDayWall + i + 1,
+      });
+    }
+    await vi.waitFor(
+      () =>
+        expect(
+          rt.runtime.events().filter((e) => e.kind === 'source.error' && e.reason === 'daily-limit-exceeded'),
+        ).toHaveLength(1),
+      { timeout: 2_000, interval: 5 },
+    );
+    await rt.runtime.tools.envHistory({});
+    await new Promise((r) => setTimeout(r, 40));
+    expect(simBytes).toBeLessThanOrEqual(32 * 1024 * 1024);
+    expect(delivered.some((d) => d.includes('daily-limit-exceeded'))).toBe(false);
+    expect(projectState(rt.runtime.state()).observation.sources.history).toMatchObject({
+      status: 'ok',
+      capped: true,
+    });
+    await rt.runtime.stop();
   });
 });

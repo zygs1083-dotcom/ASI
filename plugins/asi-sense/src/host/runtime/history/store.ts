@@ -21,6 +21,7 @@ import {
   type HistoryQueryResult,
   type HistoryStoragePort,
   isNonEmptyString,
+  MAX_DAILY_CRITICAL_EVENT_BYTES,
   MAX_DAILY_EVENT_BYTES,
   MAX_DAILY_FILE_EVENT_BYTES,
   MAX_DAILY_NON_FILE_EVENT_BYTES,
@@ -78,6 +79,7 @@ export interface HistoryManagerOptions {
   maxDailyBytes?: number;
   maxFileDailyBytes?: number;
   maxNonFileDailyBytes?: number;
+  maxCriticalDailyBytes?: number;
   maxTotalBytes?: number;
   heartbeatIntervalMs?: number;
   /** Extra `extensions` entries (e.g. metric buckets) for a day being summarized. */
@@ -272,6 +274,7 @@ interface PendingPatch {
 }
 
 type BudgetTier = 'file' | 'nonFile';
+type CapTier = BudgetTier | 'critical';
 
 interface AppendOptions {
   tier?: BudgetTier;
@@ -344,6 +347,7 @@ export class HistoryManager {
   private readonly maxDailyBytes: number;
   private readonly maxFileDailyBytes: number;
   private readonly maxNonFileDailyBytes: number;
+  private readonly maxCriticalDailyBytes: number;
   private readonly enforceTotalDailyCap: boolean;
   private readonly maxTotalBytes: number;
   private readonly heartbeatIntervalMs: number;
@@ -366,6 +370,7 @@ export class HistoryManager {
   private readonly cappedDates = new Set<string>();
   private readonly fileCappedDates = new Set<string>();
   private readonly nonFileCappedDates = new Set<string>();
+  private readonly criticalCappedDates = new Set<string>();
   private readonly capErrorsEmitted = new Set<string>();
   private readonly reportedFileErrors = new Set<string>();
   private appendDegraded = false;
@@ -433,6 +438,8 @@ export class HistoryManager {
       this.maxDailyBytes = MAX_DAILY_EVENT_BYTES;
       this.enforceTotalDailyCap = false;
     }
+    this.maxCriticalDailyBytes =
+      options.maxCriticalDailyBytes ?? Math.max(MAX_DAILY_CRITICAL_EVENT_BYTES, this.maxDailyBytes);
     this.maxTotalBytes = options.maxTotalBytes ?? MAX_HISTORY_TOTAL_BYTES;
     this.heartbeatIntervalMs = options.heartbeatIntervalMs ?? HISTORY_HEARTBEAT_MS;
     this.dayExtensions = options.dayExtensions;
@@ -931,6 +938,7 @@ export class HistoryManager {
       cappedDates: new Set(this.cappedDates),
       fileCappedDates: new Set(this.fileCappedDates),
       nonFileCappedDates: new Set(this.nonFileCappedDates),
+      criticalCappedDates: new Set(this.criticalCappedDates),
       capErrorsEmitted: new Set(this.capErrorsEmitted),
       reportedFileErrors: new Set(this.reportedFileErrors),
       pendingActivity: [...this.pendingActivity.values()].map((bucket) => cloneActivityBucket(bucket, epoch)),
@@ -951,6 +959,7 @@ export class HistoryManager {
     this.cappedDates.clear();
     this.fileCappedDates.clear();
     this.nonFileCappedDates.clear();
+    this.criticalCappedDates.clear();
     this.capErrorsEmitted.clear();
     this.reportedFileErrors.clear();
     this.eventMetaById.clear();
@@ -996,6 +1005,8 @@ export class HistoryManager {
             for (const date of previous.fileCappedDates) this.fileCappedDates.add(date);
             this.nonFileCappedDates.clear();
             for (const date of previous.nonFileCappedDates) this.nonFileCappedDates.add(date);
+            this.criticalCappedDates.clear();
+            for (const date of previous.criticalCappedDates) this.criticalCappedDates.add(date);
             this.capErrorsEmitted.clear();
             for (const date of previous.capErrorsEmitted) this.capErrorsEmitted.add(date);
             this.reportedFileErrors.clear();
@@ -2728,6 +2739,7 @@ export class HistoryManager {
             this.cappedDates.delete(date);
             this.fileCappedDates.delete(date);
             this.nonFileCappedDates.delete(date);
+            this.criticalCappedDates.delete(date);
             this.capErrorsEmitted.delete(date);
           } catch (error) {
             const code = unsafeFsCode(error);
@@ -2851,6 +2863,7 @@ export class HistoryManager {
         this.cappedDates.delete(entry.date);
         this.fileCappedDates.delete(entry.date);
         this.nonFileCappedDates.delete(entry.date);
+        this.criticalCappedDates.delete(entry.date);
         this.capErrorsEmitted.delete(entry.date);
         deleted.add(entry.date);
         totalBytes -= entry.size;
@@ -2901,11 +2914,49 @@ export class HistoryManager {
     };
   }
 
+  private minCapThresholdBytes(): number {
+    return Math.min(this.maxFileDailyBytes, this.maxNonFileDailyBytes, this.maxDailyBytes, this.maxCriticalDailyBytes);
+  }
+
+  private async triggerDailyCap(
+    date: string,
+    capKind: CapTier | 'total',
+    tier: CapTier,
+    maxBytes: number,
+    epoch: number,
+  ): Promise<void> {
+    if (epoch !== this.clearEpoch) return;
+    this.cappedDates.add(date);
+    if (capKind === 'total') {
+      this.fileCappedDates.add(date);
+      this.nonFileCappedDates.add(date);
+    } else if (capKind === 'critical') {
+      this.nonFileCappedDates.add(date);
+      this.criticalCappedDates.add(date);
+    } else if (capKind === 'file') {
+      this.fileCappedDates.add(date);
+    } else {
+      this.nonFileCappedDates.add(date);
+    }
+    await this.persistCapStateForDate(date, epoch);
+    if (epoch !== this.clearEpoch) return;
+    if (!this.capErrorsEmitted.has(date)) {
+      this.capErrorsEmitted.add(date);
+      this.safeEmitSourceError('daily-limit-exceeded', {
+        date,
+        tier,
+        maxBytes,
+      });
+    }
+  }
+
   private async appendRawLine(date: string, line: string, epoch: number, options: AppendOptions = {}): Promise<void> {
     if (!this.port || epoch !== this.clearEpoch) return;
     const tier: BudgetTier = options.tier ?? 'nonFile';
     const critical = options.critical === true;
-    if (!critical) {
+    if (critical) {
+      if (this.criticalCappedDates.has(date)) return;
+    } else {
       if (tier === 'file' && this.fileCappedDates.has(date)) return;
       if (tier === 'nonFile' && this.nonFileCappedDates.has(date)) return;
     }
@@ -2918,7 +2969,7 @@ export class HistoryManager {
         this.usageByDate.set(date, usage);
       }
       const lineBytes = Buffer.byteLength(line, 'utf8');
-      const minTierLimit = Math.min(this.maxFileDailyBytes, this.maxNonFileDailyBytes, this.maxDailyBytes);
+      const minTierLimit = this.minCapThresholdBytes();
       if (!usage.breakdownLoaded && usage.total + lineBytes > minTierLimit) {
         const loaded = await this.loadDateTierBreakdown(date, usage.total);
         if (epoch !== this.clearEpoch) return;
@@ -2931,26 +2982,19 @@ export class HistoryManager {
         const overTier = tierUsed + lineBytes > tierLimit;
         const overTotal = this.enforceTotalDailyCap && usage.total + lineBytes > this.maxDailyBytes;
         if (overTier || overTotal) {
-          if (epoch !== this.clearEpoch) return;
-          this.cappedDates.add(date);
-          if (overTotal) {
-            this.fileCappedDates.add(date);
-            this.nonFileCappedDates.add(date);
-          } else if (tier === 'file') {
-            this.fileCappedDates.add(date);
-          } else {
-            this.nonFileCappedDates.add(date);
-          }
-          await this.persistCapStateForDate(date, epoch);
-          if (epoch !== this.clearEpoch) return;
-          if (!this.capErrorsEmitted.has(date)) {
-            this.capErrorsEmitted.add(date);
-            this.safeEmitSourceError('daily-limit-exceeded', {
-              date,
-              tier,
-              maxBytes: overTotal ? this.maxDailyBytes : tierLimit,
-            });
-          }
+          await this.triggerDailyCap(
+            date,
+            overTotal ? 'total' : tier,
+            tier,
+            overTotal ? this.maxDailyBytes : tierLimit,
+            epoch,
+          );
+          return;
+        }
+      } else {
+        const nonFileUsed = usage.breakdownLoaded ? usage.nonFile : usage.total;
+        if (nonFileUsed + lineBytes > this.maxCriticalDailyBytes) {
+          await this.triggerDailyCap(date, 'critical', 'critical', this.maxCriticalDailyBytes, epoch);
           return;
         }
       }
@@ -3011,7 +3055,7 @@ export class HistoryManager {
         }
       }
       const firstBytes = Buffer.byteLength(items[i].raw, 'utf8') + 1;
-      const minTierLimit = Math.min(this.maxFileDailyBytes, this.maxNonFileDailyBytes, this.maxDailyBytes);
+      const minTierLimit = this.minCapThresholdBytes();
       if (!usage.breakdownLoaded && usage.total + firstBytes > minTierLimit) {
         try {
           usage = await this.loadDateTierBreakdown(date, usage.total);
@@ -3144,6 +3188,10 @@ export class HistoryManager {
               for (const t of parsed.tiers) {
                 if (t === 'file') this.fileCappedDates.add(today);
                 else if (t === 'nonFile') this.nonFileCappedDates.add(today);
+                else if (t === 'critical') {
+                  this.criticalCappedDates.add(today);
+                  this.nonFileCappedDates.add(today);
+                }
               }
             }
           }
@@ -3158,9 +3206,10 @@ export class HistoryManager {
 
   private async persistCapStateForDate(date: string, epoch: number): Promise<void> {
     if (!this.port?.writeCapState || epoch !== this.clearEpoch || date !== this.currentDate) return;
-    const tiers: BudgetTier[] = [];
+    const tiers: CapTier[] = [];
     if (this.fileCappedDates.has(date)) tiers.push('file');
     if (this.nonFileCappedDates.has(date)) tiers.push('nonFile');
+    if (this.criticalCappedDates.has(date)) tiers.push('critical');
     try {
       await this.port.writeCapState(JSON.stringify({ date, tiers }));
     } catch {}
