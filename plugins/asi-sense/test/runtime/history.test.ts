@@ -4479,4 +4479,143 @@ describe('runtime history persistence, rollups, retention, and recovery', () => 
     });
     await rt.runtime.stop();
   });
+
+  it('S2: infers capped state from file bytes when cap-state.json is missing/corrupt and matches real-time truncatedAtLimit in backfill', async () => {
+    const dir = await makeTempDir();
+    const port = new FileHistoryStoragePort(dir);
+    let wall = Date.UTC(2026, 10, 25, 10, 0, 0);
+
+    const mgr1 = new HistoryManager({
+      port,
+      clock: { wall: () => wall, mono: () => 1_000 },
+      isPaused: () => false,
+      titlesAllowed: () => true,
+      restoreEntries: () => {},
+      clearMemoryEntries: () => {},
+      emitSourceError: () => {},
+      emitSourceOk: () => {},
+      timeZone: 'UTC',
+      maxFileDailyBytes: 380,
+      maxNonFileDailyBytes: 500_000,
+    });
+    await mgr1.start(false);
+
+    // Exhaust 380B file tier cap (stops strictly below 380B), then write >200 non-file events
+    for (let i = 0; i < 4; i++) {
+      mgr1.recordEvent({
+        id: `s2-fb-${i}`,
+        kind: 'file.burst',
+        subject: `/work/burst-${i}-${'a'.repeat(50)}`,
+        level: 'wake',
+        at: wall + i * 100,
+        source: { id: 'files-global', api: 'watch', host: 'local' },
+      });
+    }
+    for (let i = 0; i < 210; i++) {
+      mgr1.recordEvent({
+        id: `s2-app-${i}`,
+        kind: 'app.activated',
+        subject: `App-${i}`,
+        level: 'record',
+        at: wall + 1_000 + i * 100,
+        source: { id: 'helper', api: 'ndjson', host: 'local' },
+      });
+    }
+    await mgr1.stop();
+
+    // Corrupt cap-state.json and restart on the same day
+    await port.writeCapState('{corrupt-cap-state');
+    const errsCorrupt: string[] = [];
+    const restoredCorrupt: string[] = [];
+    const mgr2 = new HistoryManager({
+      port,
+      clock: { wall: () => wall + 30_000, mono: () => 2_000 },
+      isPaused: () => false,
+      titlesAllowed: () => true,
+      restoreEntries: () => {},
+      clearMemoryEntries: () => {},
+      emitSourceError: (e) => errsCorrupt.push(e),
+      restoreSourceError: (e) => restoredCorrupt.push(e),
+      emitSourceOk: () => {},
+      timeZone: 'UTC',
+      maxFileDailyBytes: 380,
+      maxNonFileDailyBytes: 500_000,
+    });
+    await mgr2.start(false);
+    expect(restoredCorrupt).toContain('daily-limit-exceeded');
+    expect(mgr2.timelineSnapshots().today?.truncatedAtLimit).toBe(true);
+
+    // Next file.burst must stay blocked without re-emitting daily-limit-exceeded; non-file record still writes
+    mgr2.recordEvent({
+      id: 's2-fb-blocked',
+      kind: 'file.burst',
+      subject: `/work/burst-blocked-${'a'.repeat(50)}`,
+      level: 'wake',
+      at: wall + 31_000,
+      source: { id: 'files-global', api: 'watch', host: 'local' },
+    });
+    mgr2.recordEvent({
+      id: 's2-app-allowed',
+      kind: 'app.activated',
+      subject: 'AppAllowedAfterRestart',
+      level: 'record',
+      at: wall + 32_000,
+      source: { id: 'helper', api: 'ndjson', host: 'local' },
+    });
+    await mgr2.stop();
+    expect(errsCorrupt.filter((e) => e === 'daily-limit-exceeded')).toHaveLength(0);
+    const sameDayRaw = (await port.readEvents('2026-11-25')) ?? '';
+    expect(sameDayRaw).not.toContain('s2-fb-blocked');
+    expect(sameDayRaw).toContain('s2-app-allowed');
+
+    // Missing cap-state.json on a crash day (no daily summary written) + next-day backfill parity
+    await port.writeCapState('');
+    const restoredMissing: string[] = [];
+    const mgr3 = new HistoryManager({
+      port,
+      clock: { wall: () => wall + 60_000, mono: () => 3_000 },
+      isPaused: () => false,
+      titlesAllowed: () => true,
+      restoreEntries: () => {},
+      clearMemoryEntries: () => {},
+      emitSourceError: () => {},
+      restoreSourceError: (e) => restoredMissing.push(e),
+      emitSourceOk: () => {},
+      timeZone: 'UTC',
+      maxFileDailyBytes: 380,
+      maxNonFileDailyBytes: 500_000,
+    });
+    await mgr3.start(false);
+    expect(restoredMissing).toContain('daily-limit-exceeded');
+    expect(mgr3.timelineSnapshots().today?.truncatedAtLimit).toBe(true);
+    await mgr3.stop();
+
+    // Remove daily/monthly to simulate crash before rollover; verify runBackfillStep sets truncatedAtLimit=true
+    const dirCrash = await makeTempDir();
+    await mkdir(join(dirCrash, 'history', 'events'), { recursive: true, mode: 0o700 });
+    await writeFile(join(dirCrash, 'history', 'events', '2026-11-25.jsonl'), sameDayRaw, { mode: 0o600 });
+    const crashPort = new FileHistoryStoragePort(dirCrash);
+    wall = Date.UTC(2026, 10, 26, 9, 0, 0);
+    const mgrBackfill = new HistoryManager({
+      port: crashPort,
+      clock: { wall: () => wall, mono: () => 4_000 },
+      isPaused: () => false,
+      titlesAllowed: () => true,
+      restoreEntries: () => {},
+      clearMemoryEntries: () => {},
+      emitSourceError: () => {},
+      emitSourceOk: () => {},
+      timeZone: 'UTC',
+      maxFileDailyBytes: 380,
+      maxNonFileDailyBytes: 500_000,
+    });
+    await mgrBackfill.start(false);
+    await vi.waitFor(async () => expect(await crashPort.readDaily('2026-11-25')).toBeDefined(), {
+      timeout: 3_000,
+      interval: 20,
+    });
+    const backfilled25 = JSON.parse((await crashPort.readDaily('2026-11-25')) ?? '{}') as DailySummary;
+    expect(backfilled25.truncatedAtLimit).toBe(true);
+    await mgrBackfill.stop();
+  });
 });

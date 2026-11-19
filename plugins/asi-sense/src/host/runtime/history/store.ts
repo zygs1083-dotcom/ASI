@@ -288,6 +288,28 @@ interface DateByteUsage {
   breakdownLoaded: boolean;
 }
 
+interface DayTierStats {
+  fileBytes: number;
+  nonFileBytes: number;
+  fileLines: number;
+  nonFileLines: number;
+  maxFileLineBytes: number;
+  maxNonFileLineBytes: number;
+  sawCapError: boolean;
+}
+
+function createDayTierStats(): DayTierStats {
+  return {
+    fileBytes: 0,
+    nonFileBytes: 0,
+    fileLines: 0,
+    nonFileLines: 0,
+    maxFileLineBytes: 0,
+    maxNonFileLineBytes: 0,
+    sawCapError: false,
+  };
+}
+
 function createReverseEventScanner() {
   const patches = new Map<string, PendingPatch>();
   const seenIds = new Set<string>();
@@ -1065,7 +1087,7 @@ export class HistoryManager {
               liveLines: buffered.filter((item) => item.date === today).map((item) => item.raw),
             };
             this.pendingTodayHydration = hydration;
-            const hydrated = await this.hydrateTodayFromDisk(today, epoch, false);
+            const { hydrated } = await this.hydrateTodayFromDisk(today, epoch, false);
             if (this.pendingTodayHydration === hydration) this.pendingTodayHydration = undefined;
             if (this.clearFeedBuffer === buffered) this.clearFeedBuffer = undefined;
             if (!hydrated) {
@@ -1528,19 +1550,25 @@ export class HistoryManager {
     this.todayHydrationTimer.unref?.();
   }
 
-  private async hydrateTodayFromDisk(today: string, epoch: number, yieldSlices: boolean): Promise<boolean> {
-    if (!this.port || this.isEpochStale(epoch) || this.currentDate !== today) return false;
+  private async hydrateTodayFromDisk(
+    today: string,
+    epoch: number,
+    yieldSlices: boolean,
+  ): Promise<{ hydrated: boolean; diskStats?: DayTierStats }> {
+    if (!this.port || this.isEpochStale(epoch) || this.currentDate !== today) return { hydrated: false };
     try {
       const acc = createDailySummaryAccumulator(today, this.calendar.dayBounds(today));
+      const diskStats = createDayTierStats();
       let sawLine = false;
       let sliceStart = performance.now();
       for await (const line of this.streamLinesForward(today)) {
-        if (this.isEpochStale(epoch) || this.currentDate !== today) return false;
+        if (this.isEpochStale(epoch) || this.currentDate !== today) return { hydrated: false };
+        this.observeTierLine(diskStats, line);
         acc.feed(line);
         sawLine = true;
         if (yieldSlices && performance.now() - sliceStart >= 10) {
           await this.waitBackfillTurn(epoch, 0);
-          if (this.isEpochStale(epoch) || this.currentDate !== today) return false;
+          if (this.isEpochStale(epoch) || this.currentDate !== today) return { hydrated: false };
           sliceStart = performance.now();
         }
       }
@@ -1557,14 +1585,14 @@ export class HistoryManager {
         this.cachedToday = undefined;
         this.summaryRevision += 1;
         if (yieldSlices) this.onSummaryChanged?.();
-        return true;
+        return { hydrated: true, ...(sawLine ? { diskStats } : {}) };
       }
-      return false;
+      return { hydrated: false, ...(sawLine ? { diskStats } : {}) };
     } catch {
       if (this.pendingTodayHydration?.date === today && this.pendingTodayHydration.epoch === epoch) {
         this.pendingTodayHydration = undefined;
       }
-      return false;
+      return { hydrated: false };
     }
   }
 
@@ -1908,9 +1936,11 @@ export class HistoryManager {
           }
         } else {
           const acc = createDailySummaryAccumulator(prevDate, prevBounds, rolloverOpts);
+          const rolloverStats = createDayTierStats();
           let sawLine = false;
           for await (const line of this.streamLinesForward(prevDate)) {
             if (this.isEpochStale(epoch)) return;
+            this.observeTierLine(rolloverStats, line);
             acc.feed(line);
             sawLine = true;
           }
@@ -1921,7 +1951,11 @@ export class HistoryManager {
             sawLine = true;
           }
           if (sawLine || size > 0) {
-            daily = acc.finish();
+            const inferred = this.evaluateCappedFromStats(rolloverStats, size);
+            daily = acc.finish({
+              ...rolloverOpts,
+              truncatedAtLimit: rolloverOpts.truncatedAtLimit || inferred.anyCapped,
+            });
           }
         }
         if (daily) {
@@ -2170,7 +2204,29 @@ export class HistoryManager {
         this.clearPendingForEpoch(epoch);
         return;
       }
-      await this.restoreTodayCapState(today, seenTodayCapError, epoch);
+      const todayHasEvents = retainedDates.includes(today) && !knownUnsafeEvents.has(today);
+      const todayBytes = todayHasEvents ? await this.safeEventFileSize(today) : 0;
+      if (this.isEpochStale(epoch)) {
+        this.clearPendingForEpoch(epoch);
+        return;
+      }
+      let hydratedTodayDiskStats: DayTierStats | undefined;
+      if (todayHasEvents && todayBytes <= 512 * 1024) {
+        const res = await this.hydrateTodayFromDisk(today, epoch, false);
+        if (this.isEpochStale(epoch)) {
+          this.clearPendingForEpoch(epoch);
+          return;
+        }
+        hydratedTodayDiskStats = res.diskStats;
+      }
+      await this.restoreTodayCapState(
+        today,
+        seenTodayCapError,
+        todayHasEvents,
+        todayBytes,
+        hydratedTodayDiskStats,
+        epoch,
+      );
       if (this.isEpochStale(epoch)) {
         this.clearPendingForEpoch(epoch);
         return;
@@ -2199,21 +2255,8 @@ export class HistoryManager {
         this.restoreEntries(collected.map((item) => item.ev));
       }
 
-      if (retainedDates.includes(today) && !knownUnsafeEvents.has(today)) {
-        const todayBytes = await this.safeEventFileSize(today);
-        if (this.isEpochStale(epoch)) {
-          this.clearPendingForEpoch(epoch);
-          return;
-        }
-        if (todayBytes <= 512 * 1024) {
-          await this.hydrateTodayFromDisk(today, epoch, false);
-          if (this.isEpochStale(epoch)) {
-            this.clearPendingForEpoch(epoch);
-            return;
-          }
-        } else {
-          this.scheduleTodayHydration(today, epoch);
-        }
+      if (todayHasEvents && todayBytes > 512 * 1024) {
+        this.scheduleTodayHydration(today, epoch);
       }
 
       // Prune daily summaries older than 400 days.
@@ -2441,18 +2484,15 @@ export class HistoryManager {
         isRunningAtEnd: false,
         truncatedAtLimit: this.cappedDates.has(nextDate) || size >= this.maxDailyBytes,
       });
+      const backfillStats = createDayTierStats();
       let sawLine = false;
-      let fileBytes = 0;
-      let nonFileBytes = 0;
       let sliceStart = performance.now();
       for await (const line of this.streamLinesForward(nextDate)) {
         if (this.isEpochStale(epoch)) {
           this.clearPendingForEpoch(epoch);
           return;
         }
-        const lineBytes = Buffer.byteLength(line, 'utf8') + 1;
-        if (this.classifyLineTier(line) === 'file') fileBytes += lineBytes;
-        else nonFileBytes += lineBytes;
+        this.observeTierLine(backfillStats, line);
         acc.feed(line);
         sawLine = true;
         if (this.activeQueries > 0 || performance.now() - sliceStart >= 16) {
@@ -2469,13 +2509,10 @@ export class HistoryManager {
         return;
       }
       if (sawLine || size > 0) {
-        const tierCapped =
-          fileBytes >= this.maxFileDailyBytes ||
-          nonFileBytes >= this.maxNonFileDailyBytes ||
-          size >= this.maxDailyBytes;
+        const inferred = this.evaluateCappedFromStats(backfillStats, size);
         const daily = acc.finish({
           isRunningAtEnd: false,
-          truncatedAtLimit: this.cappedDates.has(nextDate) || tierCapped,
+          truncatedAtLimit: this.cappedDates.has(nextDate) || inferred.anyCapped,
         });
         this.applyDayExtensions(daily, nextDate);
         const dailyJson = JSON.stringify(daily);
@@ -3173,35 +3210,189 @@ export class HistoryManager {
     this.safeEmitSourceError(errorCode, extra);
   }
 
-  private async restoreTodayCapState(today: string, seenInLog: boolean, epoch: number): Promise<void> {
+  private observeTierLine(stats: DayTierStats, rawLine: string): void {
+    const bytes = Buffer.byteLength(rawLine, 'utf8') + 1;
+    if (this.classifyLineTier(rawLine) === 'file') {
+      stats.fileBytes += bytes;
+      stats.fileLines += 1;
+      if (bytes > stats.maxFileLineBytes) stats.maxFileLineBytes = bytes;
+    } else {
+      stats.nonFileBytes += bytes;
+      stats.nonFileLines += 1;
+      if (bytes > stats.maxNonFileLineBytes) stats.maxNonFileLineBytes = bytes;
+    }
+    if (!stats.sawCapError && rawLine.includes('"daily-limit-exceeded"')) {
+      try {
+        const parsed = JSON.parse(rawLine);
+        if (
+          isRecordObject(parsed) &&
+          parsed.kind === 'source.error' &&
+          parsed.subject === 'history' &&
+          parsed.reason === 'daily-limit-exceeded'
+        ) {
+          stats.sawCapError = true;
+        }
+      } catch {}
+    }
+  }
+
+  private isTierUsageCapped(used: number, lineCount: number, maxLineBytes: number, limit: number): boolean {
+    if (used >= limit) return true;
+    if (lineCount === 0 || limit <= 0) return false;
+    const slack = limit >= 4096 ? Math.max(maxLineBytes, 1024) : Math.max(maxLineBytes, Math.floor(limit * 0.25));
+    return used + slack > limit;
+  }
+
+  private evaluateCappedFromStats(
+    stats: DayTierStats,
+    reportedSize: number,
+  ): {
+    fileCapped: boolean;
+    nonFileCapped: boolean;
+    criticalCapped: boolean;
+    totalCapped: boolean;
+    sawCapError: boolean;
+    anyCapped: boolean;
+  } {
+    const totalSize = Math.max(reportedSize, stats.fileBytes + stats.nonFileBytes);
+    const syntheticOnly = stats.fileBytes + stats.nonFileBytes === 0 && reportedSize > 0;
+    const fileCapped = syntheticOnly
+      ? reportedSize >= this.maxFileDailyBytes
+      : this.isTierUsageCapped(stats.fileBytes, stats.fileLines, stats.maxFileLineBytes, this.maxFileDailyBytes);
+    const nonFileCapped = syntheticOnly
+      ? reportedSize >= this.maxNonFileDailyBytes
+      : this.isTierUsageCapped(
+          stats.nonFileBytes,
+          stats.nonFileLines,
+          stats.maxNonFileLineBytes,
+          this.maxNonFileDailyBytes,
+        );
+    const criticalCapped = syntheticOnly
+      ? reportedSize >= this.maxCriticalDailyBytes
+      : this.isTierUsageCapped(
+          stats.nonFileBytes,
+          stats.nonFileLines,
+          stats.maxNonFileLineBytes,
+          this.maxCriticalDailyBytes,
+        );
+    const maxLineOverall = Math.max(stats.maxFileLineBytes, stats.maxNonFileLineBytes);
+    const totalLinesOverall = stats.fileLines + stats.nonFileLines;
+    const totalCapped = syntheticOnly
+      ? reportedSize >= this.maxDailyBytes
+      : totalSize >= this.maxDailyBytes ||
+        (this.enforceTotalDailyCap &&
+          this.isTierUsageCapped(totalSize, totalLinesOverall, maxLineOverall, this.maxDailyBytes));
+    const sawCapError = stats.sawCapError;
+    const anyCapped = fileCapped || nonFileCapped || criticalCapped || totalCapped || sawCapError;
+    return { fileCapped, nonFileCapped, criticalCapped, totalCapped, sawCapError, anyCapped };
+  }
+
+  private async inferTierStatsFromDisk(date: string, epoch: number): Promise<DayTierStats | undefined> {
+    if (!this.port || this.isEpochStale(epoch)) return undefined;
+    const stats = createDayTierStats();
+    try {
+      for await (const rawLine of this.streamLinesForward(date)) {
+        if (this.isEpochStale(epoch)) return undefined;
+        this.observeTierLine(stats, rawLine);
+      }
+      return stats;
+    } catch {
+      return undefined;
+    }
+  }
+
+  private async restoreTodayCapState(
+    today: string,
+    seenInLog: boolean,
+    todayHasEvents: boolean,
+    todayBytes: number,
+    hydratedDiskStats: DayTierStats | undefined,
+    epoch: number,
+  ): Promise<void> {
     if (!this.port || this.isEpochStale(epoch)) return;
     let restored = seenInLog;
+    let hasValidCapState = false;
     if (this.port.readCapState) {
       try {
         const raw = await this.port.readCapState();
         if (this.isEpochStale(epoch)) return;
         if (raw) {
           const parsed = JSON.parse(raw);
-          if (isRecordObject(parsed) && parsed.date === today) {
+          if (isRecordObject(parsed) && parsed.date === today && Array.isArray(parsed.tiers)) {
+            hasValidCapState = true;
             restored = true;
-            if (Array.isArray(parsed.tiers)) {
-              for (const t of parsed.tiers) {
-                if (t === 'file') this.fileCappedDates.add(today);
-                else if (t === 'nonFile') this.nonFileCappedDates.add(today);
-                else if (t === 'critical') {
-                  this.criticalCappedDates.add(today);
-                  this.nonFileCappedDates.add(today);
-                }
+            for (const t of parsed.tiers) {
+              if (t === 'file') this.fileCappedDates.add(today);
+              else if (t === 'nonFile') this.nonFileCappedDates.add(today);
+              else if (t === 'critical') {
+                this.criticalCappedDates.add(today);
+                this.nonFileCappedDates.add(today);
               }
             }
           }
         }
       } catch {}
     }
+
+    if (hydratedDiskStats) {
+      this.usageByDate.set(today, {
+        total: Math.max(todayBytes, hydratedDiskStats.fileBytes + hydratedDiskStats.nonFileBytes),
+        file: hydratedDiskStats.fileBytes,
+        nonFile: hydratedDiskStats.nonFileBytes,
+        breakdownLoaded: true,
+      });
+    }
+
+    if (!hasValidCapState && todayHasEvents && !this.isEpochStale(epoch)) {
+      let stats = hydratedDiskStats;
+      const minLimit = this.minCapThresholdBytes();
+      const combinedLimit = this.enforceTotalDailyCap
+        ? Math.min(this.maxDailyBytes, this.maxFileDailyBytes + this.maxNonFileDailyBytes)
+        : this.maxFileDailyBytes + this.maxNonFileDailyBytes;
+      if (!stats && todayBytes > 0) {
+        if (todayBytes >= combinedLimit) {
+          restored = true;
+        } else if (todayBytes + 16_384 > minLimit) {
+          stats = await this.inferTierStatsFromDisk(today, epoch);
+          if (this.isEpochStale(epoch)) return;
+          if (stats) {
+            this.usageByDate.set(today, {
+              total: Math.max(todayBytes, stats.fileBytes + stats.nonFileBytes),
+              file: stats.fileBytes,
+              nonFile: stats.nonFileBytes,
+              breakdownLoaded: true,
+            });
+          }
+        }
+      }
+      if (stats && (stats.fileLines > 0 || stats.nonFileLines > 0 || stats.sawCapError)) {
+        const inferred = this.evaluateCappedFromStats(stats, todayBytes);
+        if (inferred.fileCapped) this.fileCappedDates.add(today);
+        if (inferred.nonFileCapped) this.nonFileCappedDates.add(today);
+        if (inferred.criticalCapped) {
+          this.criticalCappedDates.add(today);
+          this.nonFileCappedDates.add(today);
+        }
+        if (inferred.totalCapped) {
+          this.fileCappedDates.add(today);
+          this.nonFileCappedDates.add(today);
+        }
+        if (inferred.anyCapped) restored = true;
+      }
+    }
+
     if (!restored || this.isEpochStale(epoch)) return;
     this.cappedDates.add(today);
     this.capErrorsEmitted.add(today);
+    this.cachedToday = undefined;
+    this.summaryRevision += 1;
     this.safeRestoreSourceError('daily-limit-exceeded', { date: today });
+    if (
+      !hasValidCapState &&
+      (this.fileCappedDates.has(today) || this.nonFileCappedDates.has(today) || this.criticalCappedDates.has(today))
+    ) {
+      await this.persistCapStateForDate(today, epoch);
+    }
   }
 
   private async persistCapStateForDate(date: string, epoch: number): Promise<void> {
