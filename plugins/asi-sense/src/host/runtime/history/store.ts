@@ -368,7 +368,14 @@ export class HistoryManager {
   private summaryDegraded = false;
   private bootTag = makeBootTag();
   private shortSeq = 0;
+  private readonly usedBootTags = new Set<string>([this.bootTag]);
+  private readonly uuidPrefixTag = new Map<string, string>();
+  private readonly uuidLastDate = new Map<string, string>();
   private readonly eventMetaById = new Map<
+    string,
+    { date: string; diskId: string; isFile?: boolean; critical?: boolean }
+  >();
+  private readonly activityMetaById = new Map<
     string,
     { date: string; diskId: string; isFile?: boolean; critical?: boolean }
   >();
@@ -490,7 +497,7 @@ export class HistoryManager {
 
     const isFile = entry.kind.startsWith('file.');
     const critical = this.isCriticalEvent(entry.kind, entry.level);
-    const diskId = UUID_SEQ_RE.test(entry.id) ? this.nextShortId() : entry.id;
+    const diskId = this.shortDiskIdForNonAggregated(entry.id, date);
     this.rememberEventMeta(entry.id, date, diskId, isFile, critical);
 
     const raw = this.serializeEventLine(entry, diskId, meta);
@@ -536,7 +543,7 @@ export class HistoryManager {
           existing.feedback = entry.feedback;
         }
         existing.entryIds.push(entry.id);
-        this.rememberEventMeta(entry.id, date, existing.diskId, true, false);
+        this.rememberActivityMeta(entry.id, date, existing.diskId, true, false);
         this.pendingBucketByEntryId.set(entry.id, existing);
         this.cachedToday = undefined;
         this.summaryRevision += 1;
@@ -579,7 +586,7 @@ export class HistoryManager {
       entryIds: [entry.id],
     };
     this.pendingActivity.set(key, bucket);
-    this.rememberEventMeta(entry.id, date, diskId, true, false);
+    this.rememberActivityMeta(entry.id, date, diskId, true, false);
     this.pendingBucketByEntryId.set(entry.id, bucket);
     this.cachedToday = undefined;
     this.summaryRevision += 1;
@@ -699,23 +706,31 @@ export class HistoryManager {
       this.summaryRevision += 1;
       return;
     }
-    const mapped = this.eventMetaById.get(id);
-    const date = patch.at !== undefined ? this.calendar.dateKey(patch.at) : mapped?.date;
-    if (!date) return;
-    const diskId = mapped?.diskId ?? id;
-    const isFile = mapped?.isFile ?? false;
-    const critical = !isFile && (patch.level === 'context' || patch.level === 'wake' || mapped?.critical === true);
-    const record = {
-      record: 'patch' as const,
-      id: diskId,
-      ...(patch.level !== undefined ? { level: patch.level } : {}),
-      ...(patch.reason !== undefined ? { reason: patch.reason } : {}),
-      ...(patch.feedback !== undefined ? { feedback: patch.feedback } : {}),
-    };
-    const raw = JSON.stringify(record);
-    this.feedTodayRaw(date, raw);
+    const mapped = this.lookupMetaForPatch(id);
+    if (mapped) {
+      const date = patch.at !== undefined ? this.calendar.dateKey(patch.at) : mapped.date;
+      if (!date) return;
+      const diskId = mapped.diskId;
+      const isFile = mapped.isFile ?? false;
+      const critical = !isFile && (patch.level === 'context' || patch.level === 'wake' || mapped.critical === true);
+      const record = {
+        record: 'patch' as const,
+        id: diskId,
+        ...(patch.level !== undefined ? { level: patch.level } : {}),
+        ...(patch.reason !== undefined ? { reason: patch.reason } : {}),
+        ...(patch.feedback !== undefined ? { feedback: patch.feedback } : {}),
+      };
+      const raw = JSON.stringify(record);
+      this.feedTodayRaw(date, raw);
+      const epoch = this.clearEpoch;
+      this.enqueue(() => this.appendRawLine(date, `${raw}\n`, epoch, { tier: isFile ? 'file' : 'nonFile', critical }));
+      return;
+    }
+
+    const fallback = this.resolveEvictedPatchCandidates(id, patch.at);
+    if (!fallback) return;
     const epoch = this.clearEpoch;
-    this.enqueue(() => this.appendRawLine(date, `${raw}\n`, epoch, { tier: isFile ? 'file' : 'nonFile', critical }));
+    this.enqueue(() => this.appendVerifiedPatch(fallback.date, fallback.candidates, patch, epoch));
   }
 
   nextDeadline(): number | undefined {
@@ -797,6 +812,7 @@ export class HistoryManager {
       yesterdayDate: this.yesterdayDate,
       yesterdaySummary: this.yesterdaySummary,
       eventMetaById: new Map(this.eventMetaById),
+      activityMetaById: new Map(this.activityMetaById),
       usageByDate: new Map([...this.usageByDate].map(([date, usage]) => [date, { ...usage }])),
       cappedDates: new Set(this.cappedDates),
       fileCappedDates: new Set(this.fileCappedDates),
@@ -824,6 +840,7 @@ export class HistoryManager {
     this.capErrorsEmitted.clear();
     this.reportedFileErrors.clear();
     this.eventMetaById.clear();
+    this.activityMetaById.clear();
     this.pendingActivity.clear();
     this.pendingBucketByEntryId.clear();
     this.activeApp = undefined;
@@ -875,6 +892,11 @@ export class HistoryManager {
             for (const [id, info] of previous.eventMetaById) this.eventMetaById.set(id, info);
             for (const [id, info] of liveMeta) this.eventMetaById.set(id, info);
 
+            const liveActivityMeta = new Map(this.activityMetaById);
+            this.activityMetaById.clear();
+            for (const [id, info] of previous.activityMetaById) this.activityMetaById.set(id, info);
+            for (const [id, info] of liveActivityMeta) this.activityMetaById.set(id, info);
+
             const livePending = new Map(this.pendingActivity);
             this.pendingActivity.clear();
             this.pendingBucketByEntryId.clear();
@@ -888,8 +910,8 @@ export class HistoryManager {
                   this.pendingBucketByEntryId.set(eid, merged);
                 }
                 for (const eid of liveBucket.entryIds) {
-                  const meta = this.eventMetaById.get(eid);
-                  if (meta) this.eventMetaById.set(eid, { ...meta, diskId: merged.diskId });
+                  const meta = this.activityMetaById.get(eid);
+                  if (meta) this.activityMetaById.set(eid, { ...meta, diskId: merged.diskId });
                 }
               } else {
                 const cloned = cloneActivityBucket(restoredBucket, epoch);
@@ -1477,6 +1499,29 @@ export class HistoryManager {
     return !kind.startsWith('file.') && (level === 'context' || level === 'wake');
   }
 
+  private allocateBootTag(): string {
+    let tag = makeBootTag();
+    while (this.usedBootTags.has(tag)) tag = makeBootTag();
+    this.usedBootTags.add(tag);
+    return tag;
+  }
+
+  private shortDiskIdForNonAggregated(entryId: string, date: string): string {
+    if (!UUID_SEQ_RE.test(entryId)) return entryId;
+    const colon = entryId.lastIndexOf(':');
+    const uuid = entryId.slice(0, colon);
+    const seqStr = entryId.slice(colon + 1);
+    let tag = this.uuidPrefixTag.get(uuid);
+    if (!tag) {
+      tag = this.allocateBootTag();
+      this.uuidPrefixTag.set(uuid, tag);
+    }
+    this.uuidLastDate.set(uuid, date);
+    const seqPart =
+      !/^0\d+$/.test(seqStr) && Number.isSafeInteger(Number(seqStr)) ? Number(seqStr).toString(36) : seqStr;
+    return `${tag}-${seqPart}`;
+  }
+
   private rememberEventMeta(id: string, date: string, diskId: string, isFile = false, critical = false): void {
     if (this.eventMetaById.has(id)) this.eventMetaById.delete(id);
     this.eventMetaById.set(id, { date, diskId, isFile, critical });
@@ -1484,6 +1529,110 @@ export class HistoryManager {
       const oldest = this.eventMetaById.keys().next().value;
       if (oldest !== undefined) this.eventMetaById.delete(oldest);
     }
+  }
+
+  private rememberActivityMeta(id: string, date: string, diskId: string, isFile = true, critical = false): void {
+    if (this.activityMetaById.has(id)) this.activityMetaById.delete(id);
+    this.activityMetaById.set(id, { date, diskId, isFile, critical });
+    if (this.activityMetaById.size > 4096) {
+      const oldest = this.activityMetaById.keys().next().value;
+      if (oldest !== undefined) this.activityMetaById.delete(oldest);
+    }
+  }
+
+  private lookupMetaForPatch(
+    id: string,
+  ): { date: string; diskId: string; isFile?: boolean; critical?: boolean } | undefined {
+    const ev = this.eventMetaById.get(id);
+    if (ev) {
+      this.eventMetaById.delete(id);
+      this.eventMetaById.set(id, ev);
+      return ev;
+    }
+    const act = this.activityMetaById.get(id);
+    if (act) {
+      this.activityMetaById.delete(id);
+      this.activityMetaById.set(id, act);
+      return act;
+    }
+    return undefined;
+  }
+
+  private resolveEvictedPatchCandidates(
+    id: string,
+    patchAt: number | undefined,
+  ): { date: string; candidates: string[] } | undefined {
+    if (UUID_SEQ_RE.test(id)) {
+      const colon = id.lastIndexOf(':');
+      const uuid = id.slice(0, colon);
+      const seqStr = id.slice(colon + 1);
+      const date = patchAt !== undefined ? this.calendar.dateKey(patchAt) : this.uuidLastDate.get(uuid);
+      if (!date) return undefined;
+      const tag = this.uuidPrefixTag.get(uuid);
+      if (tag) {
+        const seqPart =
+          !/^0\d+$/.test(seqStr) && Number.isSafeInteger(Number(seqStr)) ? Number(seqStr).toString(36) : seqStr;
+        return { date, candidates: [`${tag}-${seqPart}`, id] };
+      }
+      return { date, candidates: [id] };
+    }
+    if (patchAt === undefined) return undefined;
+    return { date: this.calendar.dateKey(patchAt), candidates: [id] };
+  }
+
+  private async appendVerifiedPatch(
+    date: string,
+    candidateIds: readonly string[],
+    patch: { at?: number; level?: DeliveryLevel; reason?: string; feedback?: 'useful' | 'noise' },
+    epoch: number,
+  ): Promise<void> {
+    if (!this.port || epoch !== this.clearEpoch || candidateIds.length === 0) return;
+    const candidateSet = new Set(candidateIds);
+    let foundId: string | undefined;
+    let foundIsFile = false;
+    let foundLevel: DeliveryLevel = 'record';
+    try {
+      for await (const line of this.streamLinesDesc(date)) {
+        if (epoch !== this.clearEpoch) return;
+        let mayMatch = false;
+        for (let i = 0; i < candidateIds.length; i++) {
+          if (line.includes(candidateIds[i])) {
+            mayMatch = true;
+            break;
+          }
+        }
+        if (!mayMatch) continue;
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(line);
+        } catch {
+          continue;
+        }
+        if (!isRecordObject(parsed)) continue;
+        if (parsed.record !== 'event' && parsed.record !== undefined) continue;
+        if (typeof parsed.id !== 'string' || !candidateSet.has(parsed.id)) continue;
+        foundId = parsed.id;
+        foundIsFile = typeof parsed.kind === 'string' && parsed.kind.startsWith('file.');
+        foundLevel = VALID_LEVELS.has(parsed.level as DeliveryLevel) ? (parsed.level as DeliveryLevel) : 'record';
+        break;
+      }
+    } catch {
+      return;
+    }
+    if (!foundId || epoch !== this.clearEpoch) return;
+    const critical =
+      !foundIsFile &&
+      (patch.level === 'context' || patch.level === 'wake' || foundLevel === 'context' || foundLevel === 'wake');
+    const record = {
+      record: 'patch' as const,
+      id: foundId,
+      ...(patch.level !== undefined ? { level: patch.level } : {}),
+      ...(patch.reason !== undefined ? { reason: patch.reason } : {}),
+      ...(patch.feedback !== undefined ? { feedback: patch.feedback } : {}),
+    };
+    const raw = JSON.stringify(record);
+    this.feedTodayRaw(date, raw);
+    await this.appendRawLine(date, `${raw}\n`, epoch, { tier: foundIsFile ? 'file' : 'nonFile', critical });
   }
 
   private enqueue(work: () => Promise<void>): Promise<void> {
@@ -1860,16 +2009,22 @@ export class HistoryManager {
         this.bootTag = makeBootTag();
         this.shortSeq = 0;
       }
+      this.usedBootTags.add(this.bootTag);
+      for (const tag of seenTodayBootTags) this.usedBootTags.add(tag);
       if (collected.length > 0) {
         collected.reverse();
         for (const item of collected) {
-          this.rememberEventMeta(
-            item.ev.id,
-            item.date,
-            item.ev.id,
-            item.ev.kind.startsWith('file.'),
-            this.isCriticalEvent(item.ev.kind, item.ev.level),
-          );
+          if (item.ev.kind === 'file.activity') {
+            this.rememberActivityMeta(item.ev.id, item.date, item.ev.id, true, false);
+          } else {
+            this.rememberEventMeta(
+              item.ev.id,
+              item.date,
+              item.ev.id,
+              item.ev.kind.startsWith('file.'),
+              this.isCriticalEvent(item.ev.kind, item.ev.level),
+            );
+          }
         }
         this.restoreEntries(collected.map((item) => item.ev));
       }

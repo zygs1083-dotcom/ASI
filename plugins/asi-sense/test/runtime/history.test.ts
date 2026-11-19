@@ -3881,8 +3881,8 @@ describe('runtime history persistence, rollups, retention, and recovery', () => 
     // Case B: uncapped pendingActivity bucket + concurrent live bucket during failed clear() flush to disk on stop().
     const dirB = await makeTempDir();
     const portB = new FileHistoryStoragePort(dirB);
-    let wallB = Date.UTC(2026, 10, 21, 14, 0, 0);
-    let monoB = 5_000;
+    const wallB = Date.UTC(2026, 10, 21, 14, 0, 0);
+    const monoB = 5_000;
     let injectFailB = false;
     const origClearAllB = portB.clearAll.bind(portB);
     let mgrB!: HistoryManager;
@@ -3960,5 +3960,112 @@ describe('runtime history persistence, rollups, retention, and recovery', () => 
     const mergedPend = activitiesB.find((e) => e.subject === '/work/pending-b2');
     expect(mergedPend?.detail).toMatchObject({ created: 2, modified: 4, deleted: 1 });
     expect(mergedPend?.feedback).toBe('useful');
+  });
+
+  it('B3: preserves patchEvent short-id mapping across 4096+ file.activity events, reconstructs evicted UUID ids, and emits zero orphan patches', async () => {
+    const dir = await makeTempDir();
+    const port = new FileHistoryStoragePort(dir);
+    let wall = Date.UTC(2026, 10, 22, 9, 0, 0);
+    let mono = 1_000;
+    const mkMgr = () =>
+      new HistoryManager({
+        port,
+        clock: { wall: () => wall, mono: () => mono },
+        isPaused: () => false,
+        titlesAllowed: () => true,
+        restoreEntries: () => {},
+        clearMemoryEntries: () => {},
+        emitSourceError: () => {},
+        emitSourceOk: () => {},
+        timeZone: 'UTC',
+      });
+
+    const mgr1 = mkMgr();
+    await mgr1.start(false);
+
+    const targetUuid = '550e8400-e29b-41d4-a716-446655440001';
+    const earlyId = `${targetUuid}:1`;
+    mgr1.recordEvent({
+      id: earlyId,
+      kind: 'app.activated',
+      subject: 'EarlyApp',
+      level: 'record',
+      at: wall,
+      source: { id: 'helper', api: 'ndjson', host: 'local' },
+    });
+
+    // Overflow eventMetaById capacity (4096) with 4200 file.activity events
+    const actUuid = '550e8400-e29b-41d4-a716-446655440002';
+    for (let i = 0; i < 4_200; i++) {
+      mgr1.recordEvent({
+        id: `${actUuid}:${i + 1}`,
+        kind: 'file.activity',
+        subject: `/work/b3-${i % 10}`,
+        level: 'record',
+        cause: 'unknown',
+        at: wall + (i + 1) * 10,
+        source: { id: 'files-global', api: 'watch', host: 'local' },
+        detail: { directory: `/work/b3-${i % 10}`, windowMs: 10_000, created: 0, modified: 1, deleted: 0 },
+      });
+    }
+
+    // Delayed patch on early non-aggregated event after 4200 file.activity events
+    mgr1.patchEvent(earlyId, { at: wall, level: 'context', feedback: 'useful', reason: 'delayed-feedback' });
+
+    // Nonexistent UUID id must never emit an orphan patch on disk
+    mgr1.patchEvent('99999999-9999-4999-8999-999999999999:999', { at: wall, feedback: 'noise' });
+
+    // Also overflow non-aggregated eventMetaById (4096) and patch the evicted oldest one
+    const bulkUuid = '660e8400-e29b-41d4-a716-446655440003';
+    for (let i = 0; i < 4_150; i++) {
+      mgr1.recordEvent({
+        id: `${bulkUuid}:${i}`,
+        kind: 'file.changed',
+        subject: `/work/evict-${i}.ts`,
+        level: 'record',
+        at: wall + 50_000 + i,
+        source: { id: 'files-global', api: 'watch', host: 'local' },
+      });
+    }
+    mgr1.patchEvent(`${bulkUuid}:0`, { at: wall + 50_000, feedback: 'noise', reason: 'after-eviction' });
+
+    wall += 120_000;
+    mono += 120_000;
+    await mgr1.stop();
+
+    const raw = (await port.readEvents('2026-11-22')) ?? '';
+    expect(raw).not.toContain(targetUuid);
+    expect(raw).not.toContain(bulkUuid);
+    expect(raw).not.toContain('99999999-9999-4999-8999-999999999999');
+
+    // Every patch line on disk must correspond to an existing persisted event ID (zero orphans)
+    const eventIds = new Set<string>();
+    const patchIds: string[] = [];
+    for (const line of raw.split('\n')) {
+      if (!line.trim()) continue;
+      const obj = JSON.parse(line) as { record?: string; id?: string };
+      if ((obj.record === 'event' || obj.record === undefined) && typeof obj.id === 'string') {
+        eventIds.add(obj.id);
+      } else if (obj.record === 'patch' && typeof obj.id === 'string') {
+        patchIds.push(obj.id);
+      }
+    }
+    expect(patchIds.length).toBeGreaterThanOrEqual(2);
+    for (const pid of patchIds) {
+      expect(eventIds.has(pid)).toBe(true);
+    }
+
+    // Restart and verify both patches take effect on restored disk view
+    const mgr2 = mkMgr();
+    await mgr2.start(false);
+    const parsed = parseHistoryLines((await port.readEvents('2026-11-22')) ?? '');
+    const earlyEv = parsed.events.find((e) => e.subject === 'EarlyApp');
+    expect(earlyEv?.level).toBe('context');
+    expect(earlyEv?.feedback).toBe('useful');
+    expect(earlyEv?.reason).toBe('delayed-feedback');
+    const evictedEv = parsed.events.find((e) => e.subject === '/work/evict-0.ts');
+    expect(evictedEv?.feedback).toBe('noise');
+    expect(evictedEv?.reason).toBe('after-eviction');
+    await mgr2.stop();
   });
 });
