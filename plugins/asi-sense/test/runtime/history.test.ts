@@ -2865,4 +2865,225 @@ describe('runtime history persistence, rollups, retention, and recovery', () => 
     expect(parsed2.events.find((e) => e.id === shortId1)?.feedback).toBe('noise');
     expect(parsed2.events.filter((e) => e.id !== shortId1)).toHaveLength(1);
   });
+
+  it('aggregates file.activity per (dir, cause) into 60s disk lines while keeping memory stream intact', async () => {
+    const dir = await makeTempDir();
+    const port = new FileHistoryStoragePort(dir);
+    let wall = Date.UTC(2026, 10, 18, 12, 0, 0);
+    let mono = 1_000;
+    const mgr = new HistoryManager({
+      port,
+      clock: { wall: () => wall, mono: () => mono },
+      isPaused: () => false,
+      titlesAllowed: () => true,
+      restoreEntries: () => {},
+      clearMemoryEntries: () => {},
+      emitSourceError: () => {},
+      emitSourceOk: () => {},
+      timeZone: 'UTC',
+    });
+    await mgr.start(false);
+
+    // Emit 6 x 10s external ('unknown') edits and 2 x 10s agent edits in the same dir within 60s
+    const startWall = wall;
+    const startMono = mono;
+    for (let i = 0; i < 6; i++) {
+      wall = startWall + i * 10_000;
+      mono = startMono + i * 10_000;
+      mgr.recordEvent({
+        id: `ext-${i}`,
+        kind: 'file.activity',
+        subject: '/work/proj',
+        level: 'record',
+        cause: 'unknown',
+        at: wall,
+        source: { id: 'files-global', api: 'watch', host: 'local' },
+        detail: {
+          directory: '/work/proj',
+          windowMs: 10_000,
+          created: 1,
+          modified: 2,
+          deleted: 0,
+          ...(i === 2 ? { rolledUp: 3 } : {}),
+          files: [`a${i}.ts`],
+        },
+      });
+      if (i < 2) {
+        mgr.recordEvent({
+          id: `agent-${i}`,
+          kind: 'file.activity',
+          subject: '/work/proj',
+          level: 'record',
+          cause: 'agent',
+          at: wall,
+          source: { id: 'files-global', api: 'watch', host: 'local' },
+          detail: {
+            directory: '/work/proj',
+            windowMs: 10_000,
+            created: 0,
+            modified: 1,
+            deleted: 1,
+            files: [`b${i}.ts`],
+          },
+        });
+      }
+    }
+
+    // Before 60s flush: summary and query() reflect pending buckets, while disk has not written file.activity yet
+    expect(mgr.timelineSnapshots().today?.fileActivity.proj).toEqual({
+      events: 2,
+      created: 6,
+      modified: 14,
+      deleted: 2,
+    });
+    const beforeFlushQuery = await mgr.query({ kinds: ['file.activity'] });
+    expect(beforeFlushQuery.events).toHaveLength(2);
+    mgr.patchEvent('ext-0', { feedback: 'useful' });
+    expect((await port.readEvents('2026-11-18')) ?? '').not.toContain('"file.activity"');
+
+    // Advance past 60s flush deadline and tick
+    wall = startWall + 61_000;
+    mono = startMono + 61_000;
+    await mgr.tick();
+
+    const parsed = parseHistoryLines((await port.readEvents('2026-11-18')) ?? '');
+    const fileLines = parsed.events.filter((e) => e.kind === 'file.activity');
+    expect(fileLines).toHaveLength(2);
+    const extDisk = fileLines.find((e) => e.cause === 'unknown');
+    const agentDisk = fileLines.find((e) => e.cause === 'agent');
+    expect(extDisk?.detail).toMatchObject({
+      directory: '/work/proj',
+      windowMs: 60_000,
+      created: 6,
+      modified: 12,
+      deleted: 0,
+      rolledUp: 3,
+    });
+    expect(extDisk?.feedback).toBe('useful');
+    expect(agentDisk?.detail).toMatchObject({
+      directory: '/work/proj',
+      windowMs: 60_000,
+      created: 0,
+      modified: 2,
+      deleted: 2,
+    });
+    await mgr.stop();
+
+    // End-to-end runtime check: 10s files-global cadence keeps all 10s events in runtime.events() while disk writes 1 aggregated line/min
+    const rtDir = await makeTempDir();
+    const rtPort = new FileHistoryStoragePort(rtDir);
+    let rtWall = Date.UTC(2026, 10, 18, 14, 0, 0);
+    let rtMono = 1_000;
+    let watchCb: ((event: { path: string; change: 'add' | 'modify' | 'delete'; at: number }) => void) | undefined;
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'Date'] });
+    try {
+      const rt = createSenseRuntime(
+        {
+          clock: { wall: () => rtWall, mono: () => rtMono },
+          history: rtPort,
+          storage: { load: async () => undefined, save: async () => {} },
+          dsh: {
+            onAgentEvent: () => () => {},
+            onTool: () => () => {},
+            onJob: () => () => {},
+            deliver: async () => {},
+            tokenSnapshot: async () => undefined,
+          },
+          helper: { spawn: () => undefined },
+          probe: { create: () => ({ onSample: () => () => {}, start: () => {}, stop: async () => {} }) },
+          files: {
+            watch: (_root, cb) => {
+              watchCb = cb as typeof watchCb;
+              return { close: () => {} };
+            },
+          },
+        },
+        {
+          platform: 'linux',
+          timeZone: 'UTC',
+          intervalMs: 600_000,
+          globalFileWatch: { root: '/work', windowMs: 10_000, homedir: '/home/tester', dataDirs: [rtDir] },
+        },
+      );
+      await rt.start();
+      for (let i = 0; i < 4; i++) {
+        watchCb?.({ path: `/work/repo/file-${i}.ts`, change: 'modify', at: rtWall + 100 });
+        rtWall += 10_000;
+        rtMono += 10_000;
+        await vi.advanceTimersByTimeAsync(10_000);
+        await rt.tools.envHistory({});
+      }
+      expect(rt.events().filter((e) => e.kind === 'file.activity')).toHaveLength(4);
+      rtWall += 60_000;
+      rtMono += 60_000;
+      await vi.advanceTimersByTimeAsync(60_000);
+      await rt.tools.envHistory({});
+      const rtDisk = parseHistoryLines((await rtPort.readEvents('2026-11-18')) ?? '');
+      const rtActivity = rtDisk.events.filter((e) => e.kind === 'file.activity');
+      expect(rtActivity).toHaveLength(1);
+      expect(rtActivity[0]?.detail).toMatchObject({ directory: '/work/repo', modified: 4 });
+      await rt.stop();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('flushes pending file.activity buckets on stop() and midnight rollover', async () => {
+    const dir = await makeTempDir();
+    const port = new FileHistoryStoragePort(dir);
+    let wall = Date.UTC(2026, 10, 18, 23, 59, 50);
+    let mono = 1_000;
+    const mgr = new HistoryManager({
+      port,
+      clock: { wall: () => wall, mono: () => mono },
+      isPaused: () => false,
+      titlesAllowed: () => true,
+      restoreEntries: () => {},
+      clearMemoryEntries: () => {},
+      emitSourceError: () => {},
+      emitSourceOk: () => {},
+      timeZone: 'UTC',
+    });
+    await mgr.start(false);
+    mgr.recordEvent({
+      id: 'fa-rollover-1',
+      kind: 'file.activity',
+      subject: '/work/day1',
+      level: 'record',
+      cause: 'unknown',
+      at: wall + 2_000,
+      source: { id: 'files-global', api: 'watch', host: 'local' },
+      detail: { directory: '/work/day1', windowMs: 10_000, created: 2, modified: 1, deleted: 0 },
+    });
+
+    // Cross midnight only 15s later (< 60s window): pending bucket must flush into 2026-11-18 before rollover
+    wall = Date.UTC(2026, 10, 19, 0, 0, 5);
+    mono += 15_000;
+    await mgr.tick();
+
+    const day1Raw = (await port.readEvents('2026-11-18')) ?? '';
+    expect(day1Raw).toContain('/work/day1');
+    const daily1 = JSON.parse((await port.readDaily('2026-11-18')) ?? '{}') as DailySummary;
+    expect(daily1.fileActivity.day1).toEqual({ events: 1, created: 2, modified: 1, deleted: 0 });
+
+    // Record another bucket on day 2 and call stop() immediately (< 60s): stop() must flush it before shutdown
+    mgr.recordEvent({
+      id: 'fa-stop-1',
+      kind: 'file.activity',
+      subject: '/work/day2',
+      level: 'record',
+      cause: 'agent',
+      at: wall + 1_000,
+      source: { id: 'files-global', api: 'watch', host: 'local' },
+      detail: { directory: '/work/day2', windowMs: 10_000, created: 1, modified: 0, deleted: 3 },
+    });
+    await mgr.stop();
+
+    const day2Raw = (await port.readEvents('2026-11-19')) ?? '';
+    expect(day2Raw).toContain('/work/day2');
+    const lastStopIdx = day2Raw.lastIndexOf('"stopped"');
+    const day2FaIdx = day2Raw.indexOf('/work/day2');
+    expect(day2FaIdx).toBeGreaterThan(-1);
+    expect(day2FaIdx).toBeLessThan(lastStopIdx);
+  });
 });

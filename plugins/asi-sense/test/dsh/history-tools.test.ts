@@ -1214,7 +1214,7 @@ describe('env_detail, env_history, and env_summary tools', () => {
   it('persists file.activity locally, summarizes into daily/monthly fileActivity, and routes file.* paths through modelActivityName/modelPath', async () => {
     const dir = await makeTempDir();
     const port = new FileHistoryStoragePort(dir);
-    let wallMs = Date.UTC(2026, 9, 15, 23, 59, 0);
+    let wallMs = Date.UTC(2026, 9, 15, 23, 58, 0);
     let monoMs = 1_000;
     let watchCb: ((event: FileChange) => void) | undefined;
     const saved = new Map<string, string>();
@@ -1295,6 +1295,12 @@ describe('env_detail, env_history, and env_summary tools', () => {
           };
         }>;
       };
+
+      // Advance past the 60s file.activity disk aggregation window (still 2026-10-15) before inspecting disk JSONL.
+      wallMs += 60_000;
+      monoMs += 60_000;
+      await vi.advanceTimersByTimeAsync(60_000);
+      await rt.tools.envHistory({});
 
       // Local event log keeps full local paths on disk (case-folded on darwin) while dropping detail.files
       const rawEvents = (await port.readEvents('2026-10-15')) ?? '';

@@ -29,6 +29,7 @@ import {
   type SummaryQuery,
   type SummaryQueryResult,
   sanitizeAppName,
+  sanitizeDirPath,
 } from './types.ts';
 
 export class HistoryArgsError extends Error {
@@ -100,6 +101,39 @@ const UNSAFE_FS_CODES = new Set(['ELOOP', 'EISDIR', 'ENOTDIR', 'EINVAL', 'ENOTSU
 const VALID_LEVELS = new Set<DeliveryLevel>(['record', 'context', 'wake']);
 const UUID_SEQ_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}:\d+$/i;
 const BOOT_ID_RE = /^([a-z][0-9a-z]{3})-[0-9a-z]+$/;
+const FILE_ACTIVITY_AGG_MS = 60_000;
+const MAX_PENDING_ACTIVITY_BUCKETS = 4096;
+const LEVEL_RANK: Record<DeliveryLevel, number> = { record: 0, context: 1, wake: 2 };
+
+interface PendingActivityBucket {
+  key: string;
+  date: string;
+  diskId: string;
+  dir: string;
+  cause: SignalCause;
+  source: SourceRef;
+  level: DeliveryLevel;
+  reason?: string;
+  ruleId?: string;
+  feedback?: 'useful' | 'noise';
+  firstAt: number;
+  latestAt: number;
+  windowEndWall: number;
+  flushMono: number;
+  windowMsSum: number;
+  created: number;
+  modified: number;
+  deleted: number;
+  rolledUp: number;
+  degraded: boolean;
+  count: number;
+  epoch: number;
+  entryIds: string[];
+}
+
+function finiteNonNeg(value: unknown): number {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : 0;
+}
 
 function makeBootTag(): string {
   const bytes = randomBytes(4);
@@ -259,6 +293,8 @@ export class HistoryManager {
   private bootTag = makeBootTag();
   private shortSeq = 0;
   private readonly eventMetaById = new Map<string, { date: string; diskId: string }>();
+  private readonly pendingActivity = new Map<string, PendingActivityBucket>();
+  private readonly pendingBucketByEntryId = new Map<string, PendingActivityBucket>();
   private activeLifecycleOpen = false;
   private readonly pendingBackfill = new Set<string>();
   private pendingBackfillEpoch = 0;
@@ -342,12 +378,21 @@ export class HistoryManager {
     if (!deferRollover) {
       this.syncClockDate(now);
     }
-    const diskId = UUID_SEQ_RE.test(entry.id) ? this.nextShortId() : entry.id;
-    this.rememberEventMeta(entry.id, date, diskId);
     if (entry.kind === 'app.activated' && isNonEmptyString(entry.subject)) {
       this.activeApp = entry.subject;
     }
     if (entry.at > this.lastAliveAt) this.lastAliveAt = entry.at;
+
+    if (entry.kind === 'file.activity') {
+      this.bufferFileActivity(entry, date, now);
+      if (deferRollover) {
+        this.syncClockDate(now);
+      }
+      return;
+    }
+
+    const diskId = UUID_SEQ_RE.test(entry.id) ? this.nextShortId() : entry.id;
+    this.rememberEventMeta(entry.id, date, diskId);
 
     const raw = this.serializeEventLine(entry, diskId, meta);
     this.feedTodayRaw(date, raw);
@@ -355,6 +400,157 @@ export class HistoryManager {
     this.enqueue(() => this.appendRawLine(date, `${raw}\n`, epoch));
     if (deferRollover) {
       this.syncClockDate(now);
+    }
+  }
+
+  private bufferFileActivity(entry: HistoryEventInput, date: string, now: number): void {
+    const d = entry.detail;
+    const dir = typeof d?.directory === 'string' ? d.directory : typeof d?.dir === 'string' ? d.dir : entry.subject;
+    const cause: SignalCause = entry.cause ?? 'unknown';
+    const key = `${date}\0${cause}\0${dir}`;
+    const created = finiteNonNeg(d?.created);
+    const modified = finiteNonNeg(d?.modified);
+    const deleted = finiteNonNeg(d?.deleted);
+    const rolledUp = d?.rolledUp === true ? 1 : finiteNonNeg(d?.rolledUp);
+    const windowMs = finiteNonNeg(d?.windowMs);
+    const degraded = d?.degraded === true;
+
+    const existing = this.pendingActivity.get(key);
+    if (existing) {
+      if (entry.at >= existing.windowEndWall || entry.at < existing.firstAt || existing.epoch !== this.clearEpoch) {
+        this.flushActivityBucket(existing);
+      } else {
+        existing.latestAt = Math.max(existing.latestAt, entry.at);
+        existing.created += created;
+        existing.modified += modified;
+        existing.deleted += deleted;
+        existing.rolledUp += rolledUp;
+        existing.windowMsSum += windowMs;
+        existing.degraded = existing.degraded || degraded;
+        existing.count += 1;
+        if (LEVEL_RANK[entry.level] > LEVEL_RANK[existing.level]) {
+          existing.level = entry.level;
+          existing.ruleId = entry.ruleId;
+          existing.reason = entry.reason;
+        }
+        if (entry.feedback !== undefined && existing.feedback === undefined) {
+          existing.feedback = entry.feedback;
+        }
+        existing.entryIds.push(entry.id);
+        this.rememberEventMeta(entry.id, date, existing.diskId);
+        this.pendingBucketByEntryId.set(entry.id, existing);
+        this.cachedToday = undefined;
+        this.summaryRevision += 1;
+        return;
+      }
+    }
+
+    if (this.pendingActivity.size >= MAX_PENDING_ACTIVITY_BUCKETS) {
+      const oldest = this.pendingActivity.values().next().value;
+      if (oldest) this.flushActivityBucket(oldest);
+    }
+
+    const diskId = this.nextShortId();
+    const dayEnd = this.calendar.dayBounds(date).endMs;
+    const windowEndWall = Math.min(entry.at + FILE_ACTIVITY_AGG_MS, dayEnd);
+    const flushMono = this.clock.mono() + Math.min(FILE_ACTIVITY_AGG_MS, Math.max(0, dayEnd - now));
+    const bucket: PendingActivityBucket = {
+      key,
+      date,
+      diskId,
+      dir,
+      cause,
+      source: { ...entry.source },
+      level: entry.level,
+      ...(entry.reason !== undefined ? { reason: entry.reason } : {}),
+      ...(entry.ruleId !== undefined ? { ruleId: entry.ruleId } : {}),
+      ...(entry.feedback !== undefined ? { feedback: entry.feedback } : {}),
+      firstAt: entry.at,
+      latestAt: entry.at,
+      windowEndWall,
+      flushMono,
+      windowMsSum: windowMs,
+      created,
+      modified,
+      deleted,
+      rolledUp,
+      degraded,
+      count: 1,
+      epoch: this.clearEpoch,
+      entryIds: [entry.id],
+    };
+    this.pendingActivity.set(key, bucket);
+    this.rememberEventMeta(entry.id, date, diskId);
+    this.pendingBucketByEntryId.set(entry.id, bucket);
+    this.cachedToday = undefined;
+    this.summaryRevision += 1;
+  }
+
+  private bucketToDetail(
+    bucket: PendingActivityBucket,
+    includeDirectory: boolean,
+  ): Record<string, string | number | boolean | string[]> {
+    const windowMs = bucket.count === 1 ? bucket.windowMsSum : FILE_ACTIVITY_AGG_MS;
+    return {
+      ...(includeDirectory ? { directory: bucket.dir } : {}),
+      windowMs,
+      created: bucket.created,
+      modified: bucket.modified,
+      deleted: bucket.deleted,
+      ...(bucket.rolledUp > 0 ? { rolledUp: bucket.rolledUp } : {}),
+      ...(bucket.degraded ? { degraded: true } : {}),
+    };
+  }
+
+  private bucketToPersistedEntry(bucket: PendingActivityBucket): PersistedEventEntry {
+    return {
+      id: bucket.diskId,
+      kind: 'file.activity',
+      subject: bucket.dir,
+      level: bucket.level,
+      ...(bucket.reason !== undefined ? { reason: bucket.reason } : {}),
+      ...(bucket.ruleId !== undefined ? { ruleId: bucket.ruleId } : {}),
+      cause: bucket.cause,
+      at: bucket.latestAt,
+      source: { ...bucket.source },
+      detail: this.bucketToDetail(bucket, true),
+      ...(bucket.feedback !== undefined ? { feedback: bucket.feedback } : {}),
+    };
+  }
+
+  private flushActivityBucket(bucket: PendingActivityBucket): void {
+    this.pendingActivity.delete(bucket.key);
+    for (const eid of bucket.entryIds) {
+      if (this.pendingBucketByEntryId.get(eid) === bucket) {
+        this.pendingBucketByEntryId.delete(eid);
+      }
+    }
+    if (bucket.epoch !== this.clearEpoch) return;
+    const raw = this.serializeEventLine(
+      {
+        id: bucket.diskId,
+        kind: 'file.activity',
+        subject: bucket.dir,
+        level: bucket.level,
+        reason: bucket.reason,
+        ruleId: bucket.ruleId,
+        cause: bucket.cause,
+        at: bucket.latestAt,
+        source: bucket.source,
+        detail: this.bucketToDetail(bucket, false),
+        ...(bucket.feedback !== undefined ? { feedback: bucket.feedback } : {}),
+      },
+      bucket.diskId,
+    );
+    this.feedTodayRaw(bucket.date, raw);
+    const epoch = bucket.epoch;
+    this.enqueue(() => this.appendRawLine(bucket.date, `${raw}\n`, epoch));
+  }
+
+  private flushPendingActivity(predicate: (bucket: PendingActivityBucket) => boolean): void {
+    if (this.pendingActivity.size === 0) return;
+    for (const bucket of [...this.pendingActivity.values()]) {
+      if (predicate(bucket)) this.flushActivityBucket(bucket);
     }
   }
 
@@ -395,6 +591,15 @@ export class HistoryManager {
     patch: { at?: number; level?: DeliveryLevel; reason?: string; feedback?: 'useful' | 'noise' },
   ): void {
     if (!this.port || !this.started || this.stopped) return;
+    const pending = this.pendingBucketByEntryId.get(id);
+    if (pending && pending.epoch === this.clearEpoch) {
+      if (patch.level !== undefined) pending.level = patch.level;
+      if (patch.reason !== undefined) pending.reason = patch.reason;
+      if (patch.feedback !== undefined) pending.feedback = patch.feedback;
+      this.cachedToday = undefined;
+      this.summaryRevision += 1;
+      return;
+    }
     const mapped = this.eventMetaById.get(id);
     const date = patch.at !== undefined ? this.calendar.dateKey(patch.at) : mapped?.date;
     if (!date) return;
@@ -417,7 +622,13 @@ export class HistoryManager {
     const bounds = this.calendar.dayBounds(this.currentDate);
     const rolloverDelta = Math.max(0, bounds.endMs - this.clock.wall());
     const rolloverMono = this.clock.mono() + rolloverDelta;
-    return Math.min(this.nextHeartbeatMono, rolloverMono);
+    let deadline = Math.min(this.nextHeartbeatMono, rolloverMono);
+    for (const bucket of this.pendingActivity.values()) {
+      if (bucket.epoch === this.clearEpoch && bucket.flushMono < deadline) {
+        deadline = bucket.flushMono;
+      }
+    }
+    return deadline;
   }
 
   async tick(): Promise<void> {
@@ -425,6 +636,7 @@ export class HistoryManager {
     const wall = this.clock.wall();
     const mono = this.clock.mono();
     const nowDate = this.syncClockDate(wall);
+    this.flushPendingActivity((b) => mono >= b.flushMono || wall >= b.windowEndWall);
     if (mono >= this.nextHeartbeatMono) {
       this.nextHeartbeatMono = mono + this.heartbeatIntervalMs;
       this.lastAliveAt = Math.max(this.lastAliveAt, wall);
@@ -448,6 +660,7 @@ export class HistoryManager {
 
   async stop(): Promise<void> {
     if (this.stopped) return this.tail;
+    this.flushPendingActivity(() => true);
     this.stopped = true;
     this.nextHeartbeatMono = Number.POSITIVE_INFINITY;
     this.cancelBackfill();
@@ -500,6 +713,8 @@ export class HistoryManager {
     this.capErrorsEmitted.clear();
     this.reportedFileErrors.clear();
     this.eventMetaById.clear();
+    this.pendingActivity.clear();
+    this.pendingBucketByEntryId.clear();
     this.activeApp = undefined;
     this.activeLifecycleOpen = false;
     this.appendDegraded = false;
@@ -706,6 +921,14 @@ export class HistoryManager {
     const appLower = params.app !== undefined ? sanitizeAppName(params.app).toLowerCase() : undefined;
 
     const matched: PersistedEventEntry[] = [];
+    const pendingMatched: PersistedEventEntry[] = [];
+    if (appLower === undefined && (!kindsSet || kindsSet.has('file.activity'))) {
+      for (const bucket of this.pendingActivity.values()) {
+        if (bucket.epoch !== this.clearEpoch) continue;
+        if (bucket.latestAt < fromMs || bucket.latestAt > toMs) continue;
+        pendingMatched.push(this.bucketToPersistedEntry(bucket));
+      }
+    }
     let hasMore = false;
 
     for (const date of allDates) {
@@ -771,7 +994,15 @@ export class HistoryManager {
       return this.queryInternal(params, fromMs, toMs, limit, limitClamped, rangeClamped, true);
     }
 
+    if (pendingMatched.length > 0) {
+      matched.push(...pendingMatched);
+    }
+
     matched.sort((a, b) => b.at - a.at);
+    if (matched.length > limit) {
+      hasMore = true;
+      matched.length = limit;
+    }
     const events = titlesAllowed
       ? matched
       : matched.map((ev) => (ev.kind.startsWith('window') ? stripWindowEntry(ev) : ev));
@@ -890,6 +1121,7 @@ export class HistoryManager {
         today = this.cachedToday.summary;
       } else {
         const finished = this.todayAcc.snapshot();
+        this.foldPendingIntoDailySummary(finished, this.currentDate);
         this.applyDayExtensions(finished, this.currentDate);
         today = isEmptyDailySummary(finished) ? undefined : finished;
         this.cachedToday = { revision: this.summaryRevision, date: this.currentDate, summary: today };
@@ -900,6 +1132,46 @@ export class HistoryManager {
       ...(today ? { today } : {}),
       ...(this.yesterdaySummary ? { yesterday: this.yesterdaySummary } : {}),
     };
+  }
+
+  private foldPendingIntoDailySummary(summary: DailySummary, date: string): void {
+    for (const bucket of this.pendingActivity.values()) {
+      if (bucket.epoch !== this.clearEpoch || bucket.date !== date) continue;
+      summary.totalEvents += 1;
+      const suppressed =
+        bucket.reason === 'no-session' || bucket.reason === 'wake-budget' || bucket.reason === 'self-caused';
+      const isWake = bucket.level === 'wake' && bucket.reason !== 'no-session';
+      const isContext = bucket.level === 'context';
+      if (isWake || isContext || suppressed) {
+        if (isWake) summary.deliveries.wake += 1;
+        if (isContext) summary.deliveries.context += 1;
+        if (suppressed) summary.deliveries.suppressed += 1;
+        const ruleKey = bucket.ruleId && bucket.ruleId.length > 0 ? bucket.ruleId : '_none';
+        let rc = summary.deliveries.byRule[ruleKey];
+        if (!rc) {
+          rc = { wake: 0, context: 0, suppressed: 0 };
+          summary.deliveries.byRule[ruleKey] = rc;
+        }
+        if (isWake) rc.wake += 1;
+        if (isContext) rc.context += 1;
+        if (suppressed) rc.suppressed += 1;
+      }
+      const dir = sanitizeDirPath(bucket.dir);
+      const existing = summary.fileActivity[dir];
+      if (existing) {
+        existing.events += 1;
+        existing.created += bucket.created;
+        existing.modified += bucket.modified;
+        existing.deleted += bucket.deleted;
+      } else {
+        summary.fileActivity[dir] = {
+          events: 1,
+          created: bucket.created,
+          modified: bucket.modified,
+          deleted: bucket.deleted,
+        };
+      }
+    }
   }
 
   private resetTodayAcc(date: string): void {
@@ -1054,6 +1326,7 @@ export class HistoryManager {
     if (nowDate > this.currentDate) {
       this.enqueueRollover(wall);
     } else if (nowDate < this.currentDate) {
+      this.flushPendingActivity(() => true);
       this.currentDate = nowDate;
       this.currentMonth = this.calendar.monthKey(wall);
       this.lastAliveAt = wall;
@@ -1092,6 +1365,8 @@ export class HistoryManager {
     const nextDate = this.calendar.dateKey(wall);
     const nextMonthKey = this.calendar.monthKey(wall);
     if (!prevDate || nextDate <= prevDate) return;
+
+    this.flushPendingActivity((b) => b.date < nextDate);
 
     const prevProvisional = this.todayAcc && diffDays(nextDate, prevDate) === 1 ? this.todayAcc.snapshot() : undefined;
     if (prevProvisional) this.applyDayExtensions(prevProvisional, prevDate);
