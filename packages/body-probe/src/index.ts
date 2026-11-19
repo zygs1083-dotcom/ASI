@@ -13,6 +13,7 @@ export {
   type VmStat,
 } from './memory.js';
 export {
+  cumulativeTrafficBytes,
   type IfaceCounters,
   isOnline,
   type NetworkDeps,

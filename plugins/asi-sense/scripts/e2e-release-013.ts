@@ -22,6 +22,7 @@ import { access, mkdir, readFile, realpath, rm, writeFile } from 'node:fs/promis
 import { createRequire } from 'node:module';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { cumulativeTrafficBytes, parseNetstatIB } from '@asi/body-probe';
 import { type Browser, type BrowserContext, chromium, expect, type Locator, type Page } from '@playwright/test';
 import { DEFAULT_RULES } from '../src/host/attention/rules.ts';
 import { formatter, slotOf } from '../src/host/body/baseline-time.ts';
@@ -255,24 +256,23 @@ async function openPanel(panelPage: Page, url: string): Promise<Locator> {
   return panel;
 }
 
-/** Physical-interface byte totals, mirroring the probe's own selection. */
+/**
+ * Physical-interface byte totals, using the probe's own parser/selection.
+ *
+ * `netstat -ibn` prints one `<Link#N>` row per interface followed by one row
+ * per address, and every address row repeats the same Ibytes/Obytes values.
+ * Summing rows multiplied a dual-stack en0 by 3 and made the (correct)
+ * sidebar rate look 1/3 of "physical" in release-013.
+ */
 function netstatTotals(): { physical: { rx: number; tx: number }; all: { rx: number; tx: number } } {
-  const out = spawnSync('netstat', ['-ibn'], { encoding: 'utf8' });
+  const out = spawnSync('/usr/sbin/netstat', ['-ibn'], { encoding: 'utf8' });
   if (out.status !== 0) throw new Error('netstat -ibn failed');
-  const physical = { rx: 0, tx: 0 };
+  const counters = parseNetstatIB(out.stdout);
+  const physical = cumulativeTrafficBytes(counters);
   const all = { rx: 0, tx: 0 };
-  for (const line of out.stdout.split('\n')) {
-    const c = line.trim().split(/\s+/);
-    if (c.length < 10) continue;
-    const rx = Number(c[6]);
-    const tx = Number(c[9]);
-    if (!Number.isFinite(rx) || !Number.isFinite(tx)) continue;
-    all.rx += rx;
-    all.tx += tx;
-    if (/^(?:en|pdp_ip)\d+$/.test(c[0])) {
-      physical.rx += rx;
-      physical.tx += tx;
-    }
+  for (const c of counters.values()) {
+    all.rx += c.rx;
+    all.tx += c.tx;
   }
   return { physical, all };
 }
@@ -282,6 +282,12 @@ function parseRate(text: string, arrow: '↓' | '↑'): number | undefined {
   if (!m) return undefined;
   const v = Number(m[1]);
   return m[2] === 'MB/s' ? v * 1024 * 1024 : v * 1024;
+}
+
+function parseTileRates(text: string): { rx: number; tx: number } | undefined {
+  const rx = parseRate(text, '↓');
+  const tx = parseRate(text, '↑');
+  return rx === undefined || tx === undefined ? undefined : { rx, tx };
 }
 
 async function burstOps(dir: string, n: number): Promise<void> {
@@ -370,33 +376,81 @@ async function phaseBody(): Promise<void> {
     expect(netText).toMatch(/↑\s+[\d.]+\s*(?:MB|KB)\/s\s*·\s*已(?:连接|断开)/);
 
     const snap0 = netstatTotals();
-    await delay(12_000);
+    // Poll the tile and the cumulative physical counters together so every
+    // published 5s rate can be compared with netstat over its own 5s window;
+    // bursty traffic then cancels instead of skewing one end-to-end average.
+    const WINDOW_POLLS = 5; // five 1s polls ≈ the probe's 5s network rate window
+    const samples: { at: number; rx: number; tx: number; tile?: { rx: number; tx: number } }[] = [];
+    const startedAt = Date.now();
+    while (Date.now() - startedAt < 20_000) {
+      const total = netstatTotals().physical;
+      const tile = parseTileRates((await netTile.textContent()) ?? '');
+      samples.push({ at: Date.now(), ...total, ...(tile ? { tile } : {}) });
+      await delay(1_000);
+    }
     const snap1 = netstatTotals();
-    const dt = 12;
+    const dt = (Date.now() - startedAt) / 1000;
     const est = {
       physRx: (snap1.physical.rx - snap0.physical.rx) / dt,
       physTx: (snap1.physical.tx - snap0.physical.tx) / dt,
       allRx: (snap1.all.rx - snap0.all.rx) / dt,
       allTx: (snap1.all.tx - snap0.all.tx) / dt,
     };
-    const netText2 = (await netTile.textContent()) ?? '';
-    const tileRx = parseRate(netText2, '↓');
-    const tileTx = parseRate(netText2, '↑');
+    const ratios: { rx: number[]; tx: number[] } = { rx: [], tx: [] };
+    const floor = 16 * 1024; // below this the 1 KB/s display rounding dominates
+    for (let i = 0; i + WINDOW_POLLS < samples.length; i++) {
+      const a = samples[i]!;
+      const b = samples[i + WINDOW_POLLS]!;
+      if (!b.tile) continue;
+      const sec = (b.at - a.at) / 1000;
+      const physRx = (b.rx - a.rx) / sec;
+      const physTx = (b.tx - a.tx) / sec;
+      if (physRx >= floor) ratios.rx.push(b.tile.rx / physRx);
+      if (physTx >= floor) ratios.tx.push(b.tile.tx / physTx);
+    }
+    const median = (values: number[]) => {
+      const sorted = [...values].sort((a, b) => a - b);
+      const mid = sorted.length >> 1;
+      return sorted.length % 2 ? sorted[mid]! : (sorted[mid - 1]! + sorted[mid]!) / 2;
+    };
+    const tiles = samples.flatMap((s) => (s.tile ? [s.tile] : []));
+    const avgTile = (pick: (t: { rx: number; tx: number }) => number) =>
+      tiles.length ? tiles.reduce((sum, t) => sum + pick(t), 0) / tiles.length : 0;
+    const medRx = ratios.rx.length ? median(ratios.rx) : Number.NaN;
+    const medTx = ratios.tx.length ? median(ratios.tx) : Number.NaN;
     console.log(
-      `network compare: tile rx=${tileRx?.toFixed(0)}B/s tx=${tileTx?.toFixed(0)}B/s | ` +
+      `network compare: median(tile/netstat per 5s) rx=${medRx.toFixed(2)} (${ratios.rx.length} windows) ` +
+        `tx=${medTx.toFixed(2)} (${ratios.tx.length} windows) | ` +
         `netstat phys rx=${est.physRx.toFixed(0)}B/s tx=${est.physTx.toFixed(0)}B/s | ` +
         `all-iface rx=${est.allRx.toFixed(0)}B/s tx=${est.allTx.toFixed(0)}B/s`,
     );
-    expect(tileRx).toBeDefined();
-    expect(tileTx).toBeDefined();
-    const floor = 512 * 1024;
-    expect(tileRx as number).toBeLessThanOrEqual(Math.max(est.physRx * 5, floor));
-    expect(tileTx as number).toBeLessThanOrEqual(Math.max(est.physTx * 5, floor));
-    if (est.allRx > est.physRx * 2 + floor || est.allTx > est.physTx * 2 + floor) {
-      console.log('virtual-interface traffic detected; verifying tile tracks the physical sum');
-      expect(tileRx as number).toBeLessThanOrEqual(Math.max(est.physRx * 3, floor));
-      expect(tileTx as number).toBeLessThanOrEqual(Math.max(est.physTx * 3, floor));
-    }
+    // 0.67-1.5x of the same physical NIC. Too few comparable windows (idle
+    // machine) makes the median meaningless, so only bound the window average
+    // then; the additive slack covers 1 KB/s display rounding.
+    const slack = 16 * 1024;
+    const checkDirection = (label: string, medianRatio: number, windows: number, avgTileRate: number, phys: number) => {
+      if (windows >= 5) {
+        expect(medianRatio).toBeGreaterThanOrEqual(0.67);
+        expect(medianRatio).toBeLessThanOrEqual(1.5);
+      } else {
+        console.log(`network ${label}: only ${windows} comparable 5s windows; traffic too low for a ratio check`);
+        expect(avgTileRate).toBeLessThanOrEqual(phys * 1.5 + slack);
+      }
+    };
+    checkDirection(
+      'rx',
+      medRx,
+      ratios.rx.length,
+      avgTile((t) => t.rx),
+      est.physRx,
+    );
+    checkDirection(
+      'tx',
+      medTx,
+      ratios.tx.length,
+      avgTile((t) => t.tx),
+      est.physTx,
+    );
 
     st.phase = 'scoped file.burst';
     await burstOps(rig.burstDir, 80);
