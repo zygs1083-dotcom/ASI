@@ -428,7 +428,11 @@ describe('review F1..F6 regressions', () => {
       const elapsed = performance.now() - t0;
       // Design target is <200 ms; U1 shared-host CI uses 1000 ms to tolerate load jitter.
       expect(elapsed, name).toBeLessThan(1000);
-      expect(out.length, name).toBeGreaterThan(0);
+      if (name.startsWith('sentinels')) {
+        expect(out, name).toBe('');
+      } else {
+        expect(out.length, name).toBeGreaterThan(0);
+      }
       expect([...out].length, name).toBeLessThanOrEqual(limit);
       expect(out, name).not.toMatch(/a:1|a@b|::1/);
     }

@@ -34,12 +34,18 @@
  *      kebab versioned slugs like `secret-scanning-pipeline-v2`), the entire
  *      `key[-_]value` token is redacted.
  * 4. URL userinfo: `pass` in `scheme://user:pass@host` is redacted.
- * 5. High-entropy / long hex runs: >=32 contiguous `[A-Za-z0-9_+/=-]` chars
- *    (no kebab-segment exemption) containing letters and digits with Shannon
- *    entropy >=3.5 bits/char; or pure hex runs >=40 `[0-9A-Fa-f]` chars.
+ * 5. High-entropy / long hex runs:
+ *    - Runs of `[A-Za-z0-9_+/=-]` containing `-` or `_` are evaluated per
+ *      `-`/`_`-separated segment: a segment is redacted when its own length
+ *      is >=20 chars with letters, digits, and Shannon entropy >=3.5 bits/char,
+ *      or when it contains a pure hex run >=40 `[0-9A-Fa-f]` chars.
+ *    - Runs of `[A-Za-z0-9_+/=-]` without `-` or `_` are redacted as a whole
+ *      when length >=32 chars with letters, digits, and Shannon entropy >=3.5
+ *      bits/char, or on any pure hex run >=40 chars.
  *
  * ### Known limitations (explicitly not chased):
- * - Random strings <32 chars without strong prefix or auth/KV context.
+ * - Random strings <32 chars (or <20 chars per `-`/`_` segment) without strong
+ *   prefix or auth/KV context.
  * - Low-entropy hex <40 chars, or >=32 char high-entropy strings without digits.
  * - Cross-field splitting (e.g., half in `subject` and half in `title`).
  * - `Bearer\u200b...` where `\p{Cf}` deletion removes the zero-width char
@@ -86,7 +92,7 @@ const PLACEHOLDERS = new Set(['[redacted]', '[host]', '<host>', '[path]', '[endp
 const HASHED_SIGNAL_ID_RE = /^(?:body\.rate|file\.burst):[0-9a-f]{64}$/;
 
 const EP_SINGLE_RE = /^\p{Extended_Pictographic}$/u;
-const EP_MOD_OR_VS_RE = /^[\ufe0f\p{Emoji_Modifier}]$/u;
+const EP_CACHE = new Map<number, boolean>();
 const CF_TEST_RE = /\p{Cf}/u;
 const CF_CHAR_RE = /^\p{Cf}$/u;
 const MARK_TEST_RE = /\p{M}/u;
@@ -119,20 +125,51 @@ function prevCharStart(str: string, end: number): number {
   return start;
 }
 
-function endsWithEmojiForZwj(str: string): boolean {
-  if (!str) return false;
-  const prevStart = prevCharStart(str, str.length);
-  const prevCh = str.slice(prevStart);
-  if (EP_SINGLE_RE.test(prevCh)) return true;
-  if (!EP_MOD_OR_VS_RE.test(prevCh) || prevStart <= 0) return false;
-  return EP_SINGLE_RE.test(str.slice(prevCharStart(str, prevStart), prevStart));
+function isExtendedPictographicCp(cp: number): boolean {
+  if (cp < 0x80) return false;
+  let cached = EP_CACHE.get(cp);
+  if (cached === undefined) {
+    cached = EP_SINGLE_RE.test(String.fromCodePoint(cp));
+    if (EP_CACHE.size >= 4096) EP_CACHE.clear();
+    EP_CACHE.set(cp, cached);
+  }
+  return cached;
+}
+
+function readPrevLogical(
+  out: string,
+  input: string,
+  last: number,
+  inPos: number,
+  outPos: number,
+): { cp: number; valid: boolean; inPos: number; outPos: number } | null {
+  if (inPos > last) {
+    const start = Math.max(prevCharStart(input, inPos), last);
+    const { cp, valid } = readCodePointAt(input, start);
+    return { cp, valid, inPos: start, outPos };
+  }
+  if (outPos > 0) {
+    const start = prevCharStart(out, outPos);
+    const { cp, valid } = readCodePointAt(out, start);
+    return { cp, valid, inPos, outPos: start };
+  }
+  return null;
+}
+
+function endsWithEmojiForZwjLogical(out: string, input: string, last: number, inEnd: number): boolean {
+  const c1 = readPrevLogical(out, input, last, inEnd, out.length);
+  if (!c1?.valid) return false;
+  if (isExtendedPictographicCp(c1.cp)) return true;
+  if (c1.cp !== 0xfe0f && (c1.cp < 0x1f3fb || c1.cp > 0x1f3ff)) return false;
+  const c2 = readPrevLogical(out, input, last, c1.inPos, c1.outPos);
+  if (!c2?.valid) return false;
+  return isExtendedPictographicCp(c2.cp);
 }
 
 function startsWithEmojiSingle(str: string, offset: number): boolean {
   if (offset >= str.length) return false;
-  const { cp, len, valid } = readCodePointAt(str, offset);
-  if (!valid) return false;
-  return cp >= 0x80 && EP_SINGLE_RE.test(str.slice(offset, offset + len));
+  const { cp, valid } = readCodePointAt(str, offset);
+  return valid && isExtendedPictographicCp(cp);
 }
 
 function isQuickCf(cp: number): boolean {
@@ -142,6 +179,14 @@ function isQuickCf(cp: number): boolean {
   if (cp >= 0x2060 && cp <= 0x206f) return true;
   if (cp >= 0xfff9 && cp <= 0xfffb) return true;
   if (cp < 0x0600) return false;
+  if (
+    (cp >= 0x3400 && cp <= 0x4dbf) ||
+    (cp >= 0x4e00 && cp <= 0x9fff) ||
+    (cp >= 0xac00 && cp <= 0xd7a3) ||
+    (cp >= 0x1f300 && cp <= 0x1faff)
+  ) {
+    return false;
+  }
   return CF_CHAR_RE.test(String.fromCodePoint(cp));
 }
 
@@ -152,6 +197,14 @@ function isSafeNfkcCodeUnit(code: number): boolean {
     (code >= 0x4e00 && code <= 0x9fff) ||
     (code >= 0xac00 && code <= 0xd7a3)
   );
+}
+
+function isSafeNfkcEmojiSurrogateAt(text: string, i: number, code: number): boolean {
+  if (code < 0xd83c || code > 0xd83e || i + 1 >= text.length) return false;
+  const low = text.charCodeAt(i + 1);
+  if (low < 0xdc00 || low > 0xdfff) return false;
+  const cp = 0x10000 + ((code - 0xd800) << 10) + (low - 0xdc00);
+  return cp >= 0x1f300 && cp <= 0x1faff;
 }
 
 function stripControlsAndCf(input: string, mapNewlinesToSpace: boolean): string {
@@ -187,9 +240,8 @@ function stripControlsAndCf(input: string, mapNewlinesToSpace: boolean): string 
     }
     const { cp, len: cpLen, valid } = readCodePointAt(input, i);
     if (valid && cp === 0x200d) {
-      const prefix = out + input.slice(last, i);
-      if (!(endsWithEmojiForZwj(prefix) && startsWithEmojiSingle(input, i + cpLen))) {
-        out = prefix;
+      if (!(endsWithEmojiForZwjLogical(out, input, last, i) && startsWithEmojiSingle(input, i + cpLen))) {
+        out += input.slice(last, i);
         last = i + cpLen;
       }
       i += cpLen;
@@ -210,16 +262,24 @@ function isCombiningMarkAt(text: string, i: number, cp: number, len: number): bo
   if (cp < 0x0300) return false;
   if (cp <= 0x036f) return true;
   if ((cp >= 0x1160 && cp <= 0x11ff) || (cp >= 0xd7b0 && cp <= 0xd7ff)) return true;
+  if (cp >= 0x1f300 && cp <= 0x1faff) return false;
   return MARK_TEST_RE.test(text.slice(i, i + len));
 }
 
 function normalizeBoundedNfkc(text: string): string {
   let needsNorm = false;
-  for (let i = 0; i < text.length; i++) {
-    if (!isSafeNfkcCodeUnit(text.charCodeAt(i))) {
-      needsNorm = true;
-      break;
+  for (let i = 0; i < text.length; ) {
+    const code = text.charCodeAt(i);
+    if (isSafeNfkcCodeUnit(code) || code === 0x200d) {
+      i++;
+      continue;
     }
+    if (isSafeNfkcEmojiSurrogateAt(text, i, code)) {
+      i += 2;
+      continue;
+    }
+    needsNorm = true;
+    break;
   }
   if (!needsNorm) return text;
 
@@ -228,21 +288,26 @@ function normalizeBoundedNfkc(text: string): string {
   let chunkStart = 0;
   let markRun = 0;
   let overflowedMarkCluster = false;
+  let nfkcChanged = false;
 
   for (let i = 0; i < text.length; ) {
     const code = text.charCodeAt(i);
-    if (isSafeNfkcCodeUnit(code)) {
+    const safeUnit = isSafeNfkcCodeUnit(code) || code === 0x200d;
+    const safeEmoji = !safeUnit && isSafeNfkcEmojiSurrogateAt(text, i, code);
+    if (safeUnit || safeEmoji) {
       if (overflowedMarkCluster) {
-        // Keep the pre-overflow prefix normalized? Skip NFKC on the pathological mark-storm segment itself.
         out += text.slice(chunkStart, i);
         chunkStart = i;
         overflowedMarkCluster = false;
       } else if (i - chunkStart >= CHUNK_TARGET) {
-        out += text.slice(chunkStart, i).normalize('NFKC');
+        const rawChunk = text.slice(chunkStart, i);
+        const normChunk = rawChunk.normalize('NFKC');
+        if (normChunk !== rawChunk) nfkcChanged = true;
+        out += normChunk;
         chunkStart = i;
       }
       markRun = 0;
-      i++;
+      i += safeEmoji ? 2 : 1;
       continue;
     }
     const { cp, len, valid } = readCodePointAt(text, i);
@@ -255,9 +320,16 @@ function normalizeBoundedNfkc(text: string): string {
     i += len;
   }
   if (chunkStart < text.length) {
-    out += overflowedMarkCluster ? text.slice(chunkStart) : text.slice(chunkStart).normalize('NFKC');
+    if (overflowedMarkCluster) {
+      out += text.slice(chunkStart);
+    } else {
+      const rawTail = text.slice(chunkStart);
+      const normTail = rawTail.normalize('NFKC');
+      if (normTail !== rawTail) nfkcChanged = true;
+      out += normTail;
+    }
   }
-  return CF_TEST_RE.test(out) ? stripControlsAndCf(out, false) : out;
+  return nfkcChanged && CF_TEST_RE.test(out) ? stripControlsAndCf(out, false) : out;
 }
 
 /**
@@ -302,9 +374,15 @@ function shannonEntropyAscii(freq: Int32Array, len: number): number {
   return Math.log2(len) - sum / len;
 }
 
-function evalContract5(input: string, start: number, end: number, spans: CredentialSpan[]): void {
+function evalContract5Segment(
+  input: string,
+  start: number,
+  end: number,
+  minEntropyLen: number,
+  spans: CredentialSpan[],
+): void {
   const len = end - start;
-  if (len < 32) return;
+  if (len < minEntropyLen) return;
 
   let hasLetter = false;
   let hasDigit = false;
@@ -352,6 +430,24 @@ function evalContract5(input: string, start: number, end: number, spans: Credent
     return;
   }
   for (const hs of hexSpans) spans.push(hs);
+}
+
+function evalContract5(input: string, start: number, end: number, hasDelim: boolean, spans: CredentialSpan[]): void {
+  if (!hasDelim) {
+    evalContract5Segment(input, start, end, 32, spans);
+    return;
+  }
+  let segStart = start;
+  for (let k = start; k <= end; k++) {
+    const isEnd = k === end;
+    const code = isEnd ? 0 : input.charCodeAt(k);
+    if (isEnd || code === 45 || code === 95) {
+      if (k - segStart >= 20) {
+        evalContract5Segment(input, segStart, k, 20, spans);
+      }
+      segStart = k + 1;
+    }
+  }
 }
 
 function isSimpleWordValue(tok: string): boolean {
@@ -422,12 +518,11 @@ function isVersionedLowerKebab(input: string, start: number, end: number): boole
   return segments >= 2;
 }
 
-interface KeyMatch {
-  keyEnd: number;
-  isAuth: boolean;
-  isKv: boolean;
-  isMode3b: boolean;
-}
+const KF_AUTH = 1;
+const KF_KV = 2;
+const KF_MODE3B = 4;
+
+const packKey = (keyEnd: number, keyFlags: number): number => (keyEnd << 3) | keyFlags;
 
 function eqLowerAt(input: string, pos: number, lowerLit: string): boolean {
   if (pos + lowerLit.length > input.length) return false;
@@ -452,53 +547,58 @@ function matchTwoWord(input: string, i: number, first: string, second: string): 
   return eqLowerAt(input, p, second) ? p + second.length : -1;
 }
 
-function matchKeyAt(input: string, i: number): KeyMatch | null {
+function matchKeyAt(input: string, i: number): number {
   const low = input.charCodeAt(i) | 32;
+  if (i + 2 >= input.length) return -1;
+  const c1 = input.charCodeAt(i + 1) | 32;
   if (low === 97 /* a */) {
-    if (eqLowerAt(input, i, 'authorization')) {
-      return { keyEnd: i + 13, isAuth: true, isKv: false, isMode3b: false };
+    if (c1 === 112 /* p */) {
+      const apiKey = matchTwoWord(input, i, 'api', 'key');
+      return apiKey > 0 ? packKey(apiKey, KF_KV | KF_MODE3B) : -1;
     }
-    const accessToken = matchTwoWord(input, i, 'access', 'token');
-    if (accessToken > 0) return { keyEnd: accessToken, isAuth: false, isKv: true, isMode3b: true };
-    const apiKey = matchTwoWord(input, i, 'api', 'key');
-    if (apiKey > 0) return { keyEnd: apiKey, isAuth: false, isKv: true, isMode3b: true };
-    if (eqLowerAt(input, i, 'auth')) {
-      return { keyEnd: i + 4, isAuth: false, isKv: true, isMode3b: true };
+    if (c1 === 117 /* u */) {
+      if (eqLowerAt(input, i, 'authorization')) return packKey(i + 13, KF_AUTH);
+      if (eqLowerAt(input, i, 'auth')) return packKey(i + 4, KF_KV | KF_MODE3B);
+      return -1;
     }
-    return null;
+    if (c1 === 99 /* c */) {
+      const accessToken = matchTwoWord(input, i, 'access', 'token');
+      return accessToken > 0 ? packKey(accessToken, KF_KV | KF_MODE3B) : -1;
+    }
+    return -1;
   }
   if (low === 98 /* b */) {
-    if (eqLowerAt(input, i, 'bearer')) return { keyEnd: i + 6, isAuth: true, isKv: false, isMode3b: true };
-    if (eqLowerAt(input, i, 'basic')) return { keyEnd: i + 5, isAuth: true, isKv: false, isMode3b: false };
-    return null;
+    if (eqLowerAt(input, i, 'bearer')) return packKey(i + 6, KF_AUTH | KF_MODE3B);
+    if (eqLowerAt(input, i, 'basic')) return packKey(i + 5, KF_AUTH);
+    return -1;
   }
   if (low === 99 /* c */) {
     const clientSecret = matchTwoWord(input, i, 'client', 'secret');
-    return clientSecret > 0 ? { keyEnd: clientSecret, isAuth: false, isKv: true, isMode3b: true } : null;
+    return clientSecret > 0 ? packKey(clientSecret, KF_KV | KF_MODE3B) : -1;
   }
   if (low === 112 /* p */) {
     const privateKey = matchTwoWord(input, i, 'private', 'key');
-    if (privateKey > 0) return { keyEnd: privateKey, isAuth: false, isKv: true, isMode3b: true };
-    if (eqLowerAt(input, i, 'password')) return { keyEnd: i + 8, isAuth: false, isKv: true, isMode3b: true };
-    if (eqLowerAt(input, i, 'passwd')) return { keyEnd: i + 6, isAuth: false, isKv: true, isMode3b: true };
-    if (eqLowerAt(input, i, 'pwd')) return { keyEnd: i + 3, isAuth: false, isKv: true, isMode3b: true };
-    return null;
+    if (privateKey > 0) return packKey(privateKey, KF_KV | KF_MODE3B);
+    if (eqLowerAt(input, i, 'password')) return packKey(i + 8, KF_KV | KF_MODE3B);
+    if (eqLowerAt(input, i, 'passwd')) return packKey(i + 6, KF_KV | KF_MODE3B);
+    if (eqLowerAt(input, i, 'pwd')) return packKey(i + 3, KF_KV | KF_MODE3B);
+    return -1;
   }
   if (low === 114 /* r */) {
     const refreshToken = matchTwoWord(input, i, 'refresh', 'token');
-    return refreshToken > 0 ? { keyEnd: refreshToken, isAuth: false, isKv: true, isMode3b: true } : null;
+    return refreshToken > 0 ? packKey(refreshToken, KF_KV | KF_MODE3B) : -1;
   }
   if (low === 115 /* s */) {
     const secretKey = matchTwoWord(input, i, 'secret', 'key');
-    if (secretKey > 0) return { keyEnd: secretKey, isAuth: false, isKv: true, isMode3b: true };
-    if (eqLowerAt(input, i, 'secret')) return { keyEnd: i + 6, isAuth: false, isKv: true, isMode3b: true };
-    return null;
+    if (secretKey > 0) return packKey(secretKey, KF_KV | KF_MODE3B);
+    if (eqLowerAt(input, i, 'secret')) return packKey(i + 6, KF_KV | KF_MODE3B);
+    return -1;
   }
   if (low === 116 /* t */) {
-    if (eqLowerAt(input, i, 'token')) return { keyEnd: i + 5, isAuth: true, isKv: true, isMode3b: true };
-    return null;
+    if (eqLowerAt(input, i, 'token')) return packKey(i + 5, KF_AUTH | KF_KV | KF_MODE3B);
+    return -1;
   }
-  return null;
+  return -1;
 }
 
 const isWs = (c: number): boolean =>
@@ -562,6 +662,7 @@ export function scanCredentials(input: string): CredentialSpan[] {
 
   const spans: CredentialSpan[] = [];
   let entropyRunStart = 0;
+  let entropyRunHasDelim = false;
 
   let subRunStart = -1;
   let subRunEnd = -1;
@@ -601,9 +702,13 @@ export function scanCredentials(input: string): CredentialSpan[] {
   };
 
   const emit = (start: number, end: number): number => {
-    if (start - entropyRunStart >= 32) evalContract5(input, entropyRunStart, start, spans);
+    const runLen = start - entropyRunStart;
+    if (runLen >= 32 || (entropyRunHasDelim && runLen >= 20)) {
+      evalContract5(input, entropyRunStart, start, entropyRunHasDelim, spans);
+    }
     spans.push({ start, end });
     entropyRunStart = end;
+    entropyRunHasDelim = false;
     return end;
   };
 
@@ -728,7 +833,10 @@ export function scanCredentials(input: string): CredentialSpan[] {
           colonPos + 1 < atPos &&
           !input.startsWith('[redacted]', colonPos + 1)
         ) {
-          i = emit(colonPos + 1, atPos) + 1;
+          const nextI = emit(colonPos + 1, atPos) + 1;
+          entropyRunStart = nextI;
+          entropyRunHasDelim = false;
+          i = nextI;
           continue;
         }
         urlFailEnd = k;
@@ -737,17 +845,18 @@ export function scanCredentials(input: string): CredentialSpan[] {
 
     // 2. Strong prefix tokens (substring at any position)
     let strongEnd = -1;
-    if (code === 103 /* g */) {
-      if (input.startsWith('gh', i) && i + 3 < len && input.charCodeAt(i + 3) === 95) {
+    if (code === 103 /* g */ && i + 3 < len) {
+      const c1 = input.charCodeAt(i + 1);
+      if (c1 === 104 /* h */ && input.charCodeAt(i + 3) === 95) {
         const c2 = input.charCodeAt(i + 2);
         if (c2 === 112 || c2 === 111 || c2 === 117 || c2 === 115 || c2 === 114) {
           strongEnd = checkPrefixToken(i, 4, 8);
         }
-      } else if (input.startsWith('github_pat_', i)) {
+      } else if (c1 === 105 /* i */ && input.startsWith('github_pat_', i)) {
         strongEnd = checkPrefixToken(i, 11, 8);
-      } else if (input.startsWith('glpat-', i)) {
+      } else if (c1 === 108 /* l */ && input.startsWith('glpat-', i)) {
         strongEnd = checkPrefixToken(i, 6, 8);
-      } else if (input.startsWith('gsk_', i)) {
+      } else if (c1 === 115 /* s */ && input.startsWith('gsk_', i)) {
         strongEnd = checkPrefixToken(i, 4, 8);
       }
     } else if (code === 110 /* n */ && input.startsWith('npm_', i)) {
@@ -791,18 +900,20 @@ export function scanCredentials(input: string): CredentialSpan[] {
           strongEnd = checkPrefixToken(i, 8, 8);
         }
       }
-    } else if (code === 112 /* p */) {
+    } else if (code === 112 /* p */ && i + 5 < len) {
+      const c1 = input.charCodeAt(i + 1);
       if (
-        input.startsWith('pk_live_', i) ||
-        input.startsWith('pk_test_', i) ||
-        input.startsWith('pk-live-', i) ||
-        input.startsWith('pk-test-', i)
+        c1 === 107 /* k */ &&
+        (input.startsWith('pk_live_', i) ||
+          input.startsWith('pk_test_', i) ||
+          input.startsWith('pk-live-', i) ||
+          input.startsWith('pk-test-', i))
       ) {
         strongEnd = checkPrefixToken(i, 8, 8);
-      } else if (input.startsWith('pypi-', i)) {
+      } else if (c1 === 121 /* y */ && input.startsWith('pypi-', i)) {
         strongEnd = checkPrefixToken(i, 5, 8);
       }
-    } else if (code === 114 /* r */) {
+    } else if (code === 114 /* r */ && i + 8 < len && input.charCodeAt(i + 1) === 107 /* k */) {
       if (
         input.startsWith('rk_live_', i) ||
         input.startsWith('rk_test_', i) ||
@@ -876,13 +987,17 @@ export function scanCredentials(input: string): CredentialSpan[] {
       (isLowerAscii(input.charCodeAt(i - 1)) && isUpperAscii(code));
     if (atKeyBound && isAsciiLetter(code)) {
       const km = matchKeyAt(input, i);
-      if (km && km.keyEnd < len) {
-        const delim = input.charCodeAt(km.keyEnd);
+      const keyEnd = km >= 0 ? km >>> 3 : -1;
+      if (keyEnd >= 0 && keyEnd < len) {
+        const delim = input.charCodeAt(keyEnd);
+        const isKv = (km & KF_KV) !== 0;
+        const isAuth = (km & KF_AUTH) !== 0;
+        const isMode3b = (km & KF_MODE3B) !== 0;
 
         // 3a. JSON quoted key: "key": "val" or 'key': 'val'
-        if (km.isKv && i > 0 && (input.charCodeAt(i - 1) === 34 || input.charCodeAt(i - 1) === 39)) {
+        if (isKv && i > 0 && (input.charCodeAt(i - 1) === 34 || input.charCodeAt(i - 1) === 39)) {
           if (delim === input.charCodeAt(i - 1)) {
-            let p = km.keyEnd + 1;
+            let p = keyEnd + 1;
             let wsCount = 0;
             while (p < len && wsCount < 4 && isHws(input.charCodeAt(p))) {
               p++;
@@ -903,13 +1018,13 @@ export function scanCredentials(input: string): CredentialSpan[] {
         }
 
         // 3b. Mode 3b: key[-_]value (>=12 chars with digit)
-        if (km.isMode3b && (delim === 45 || delim === 95)) {
-          ensureSubRun(km.keyEnd + 1);
+        if (isMode3b && (delim === 45 || delim === 95)) {
+          ensureSubRun(keyEnd + 1);
           if (
-            subRunEnd - (km.keyEnd + 1) >= 12 &&
-            subLastDigit >= km.keyEnd + 1 &&
+            subRunEnd - (keyEnd + 1) >= 12 &&
+            subLastDigit >= keyEnd + 1 &&
             !subIsLowerKebabV &&
-            !input.startsWith('[redacted]', km.keyEnd + 1)
+            !input.startsWith('[redacted]', keyEnd + 1)
           ) {
             i = emit(i, subRunEnd);
             continue;
@@ -917,7 +1032,7 @@ export function scanCredentials(input: string): CredentialSpan[] {
         }
 
         // 3c. Unquoted `=` or `:` (allowing up to 4 horizontal spaces before delimiter)
-        let sepPos = km.keyEnd;
+        let sepPos = keyEnd;
         if (isHws(delim)) {
           let p = sepPos + 1;
           let wsCount = 1;
@@ -931,13 +1046,13 @@ export function scanCredentials(input: string): CredentialSpan[] {
         if (sep === 58 || sep === 61) {
           let p = sepPos + 1;
           while (p < len && isHws(input.charCodeAt(p))) p++;
-          if (km.isKv && !isAuthSchemeFollowedByWs(p)) {
+          if (isKv && !isAuthSchemeFollowedByWs(p)) {
             const kvSpan = scanKvVal(p);
             if (kvSpan) {
               i = emit(kvSpan.start, kvSpan.end);
               continue;
             }
-          } else if (km.isAuth) {
+          } else if (isAuth) {
             const authSpan = scanAuthVal(p);
             if (authSpan) {
               i = emit(authSpan.start, authSpan.end);
@@ -946,9 +1061,12 @@ export function scanCredentials(input: string): CredentialSpan[] {
           }
         }
 
-        // 3d. Auth context followed by whitespace
-        if (km.isAuth && isWs(delim)) {
-          let p = km.keyEnd + 1;
+        // 3d. Auth context followed by whitespace (require standalone word boundary, not snake/kebab suffix)
+        const prevAuth = i > 0 ? input.charCodeAt(i - 1) : 0;
+        const atAuthWsBound =
+          i === 0 || (!isAsciiLetter(prevAuth) && !isDigit(prevAuth) && prevAuth !== 95 && prevAuth !== 45);
+        if (atAuthWsBound && isAuth && isWs(delim)) {
+          let p = keyEnd + 1;
           while (p < len && isWs(input.charCodeAt(p))) p++;
           const authSpan = scanAuthVal(p);
           if (authSpan) {
@@ -959,15 +1077,24 @@ export function scanCredentials(input: string): CredentialSpan[] {
       }
     }
 
-    if ((flags(code) & F_ENTROPY) === 0) {
-      if (i - entropyRunStart >= 32) evalContract5(input, entropyRunStart, i, spans);
+    const cf = flags(code);
+    if ((cf & F_ENTROPY) === 0) {
+      const runLen = i - entropyRunStart;
+      if (runLen >= 32 || (entropyRunHasDelim && runLen >= 20)) {
+        evalContract5(input, entropyRunStart, i, entropyRunHasDelim, spans);
+      }
       entropyRunStart = ++i;
+      entropyRunHasDelim = false;
     } else {
+      if ((cf & F_DASH_UNDER) !== 0) entropyRunHasDelim = true;
       i++;
     }
   }
 
-  if (len - entropyRunStart >= 32) evalContract5(input, entropyRunStart, len, spans);
+  const tailLen = len - entropyRunStart;
+  if (tailLen >= 32 || (entropyRunHasDelim && tailLen >= 20)) {
+    evalContract5(input, entropyRunStart, len, entropyRunHasDelim, spans);
+  }
   return spans;
 }
 

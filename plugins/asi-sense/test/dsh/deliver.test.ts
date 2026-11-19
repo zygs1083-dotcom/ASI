@@ -183,7 +183,7 @@ describe('DSH environment delivery', () => {
     };
     await deliver('session-a', { ...intent('followup'), update: { ...update, changes: [change] } });
     const text = JSON.stringify(agent.followup.mock.calls);
-    expect(text).toContain('front-app: \\n');
+    expect(text).toContain('front-app:  \\n');
     expect(text).not.toContain('front-app: observation');
   });
 
@@ -951,8 +951,8 @@ describe('DSH environment delivery', () => {
     });
     expect(byId.get('al-1')).toMatchObject({
       kind: 'app.launched',
-      subject: 'SyntaxEditor',
-      data: { name: 'SyntaxEditor' },
+      subject: 'Syntax Editor',
+      data: { name: 'Syntax Editor' },
     });
     expect(byId.get('at-1')).toMatchObject({
       kind: 'app.terminated',

@@ -1068,6 +1068,16 @@ function hasPathEndpointMetaNormalized(normToken: string): boolean {
       if (deferredColon && !hasDrivePrefix) return true;
       deferredColon = false;
     }
+    if (
+      code === 91 &&
+      normToken.startsWith('[redacted]', i) &&
+      (i === 0 || isSlashChar(normToken.charCodeAt(i - 1))) &&
+      (i + 10 === normToken.length || isSlashChar(normToken.charCodeAt(i + 10)))
+    ) {
+      detIndex += 10;
+      i += 10;
+      continue;
+    }
     if (code === 64 || code === 37 || code === 91 || code === 93) return true;
     if (code === 58) {
       if (detIndex === 1) deferredColon = true;

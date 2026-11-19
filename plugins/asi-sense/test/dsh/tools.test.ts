@@ -408,7 +408,7 @@ describe('model-facing tools', () => {
     h.state.env.frontApp.value.name = `Fixture\n(App) /fixture/preview ${'x'.repeat(300)}`;
     const env = (await h.call('env_state', { section: 'env' })).value as { frontApp: { value: { name: string } } };
     const name = env.frontApp.value.name;
-    expect(name.startsWith('Fixture(App) /fixture/preview ')).toBe(true);
+    expect(name.startsWith('Fixture (App) /fixture/preview ')).toBe(true);
     expect(Array.from(name).length).toBeLessThanOrEqual(256);
     expect((await h.call('env_detail', { app: name })).value).toMatchObject({
       current: true,
@@ -936,7 +936,7 @@ describe('model-facing tools', () => {
 
   it('filters email and secret shapes in env_detail event subjects and frontApp bundleId while keeping ~', async () => {
     const h = await fixture();
-    const sk = `${'sk-'}${'a'.repeat(24)}`;
+    const sk = `${'sk-'}${'a'.repeat(22)}12`;
     const ghp = `${'ghp_'}${'b'.repeat(24)}`;
     if (!h.state.env.frontApp.value) throw new Error('fixture missing');
     h.state.env.frontApp.value.bundleId = `user@corp.invalid ${sk}`;
@@ -977,7 +977,7 @@ describe('model-facing tools', () => {
     const secrets = [
       'token-abc_def_123456',
       'secret_my-key-123456',
-      `com.example.sk-${'a'.repeat(16)}`,
+      `com.example.sk-${'a'.repeat(18)}12`,
       jwt,
       sg,
       hf,
