@@ -43,6 +43,31 @@ export function selectTrafficInterfaces(
   return [...counters.keys()];
 }
 
+/**
+ * Cumulative rx/tx bytes for the interfaces that carry real traffic.
+ *
+ * `netstat -ibn` prints one `<Link#N>` row per interface followed by one row
+ * per address, and every address row repeats the very same Ibytes/Obytes
+ * counters (see a real en0 capture: Link + IPv4 + IPv6 all show identical
+ * totals). Summing rows instead of interfaces therefore multiplies the rate
+ * by the number of address families — the 3x inflation that made the sidebar
+ * look like it undercounted. `parseNetstatIB` keeps only Link rows; this
+ * helper keeps one contribution per selected interface.
+ */
+export function cumulativeTrafficBytes(
+  counters: ReadonlyMap<string, IfaceCounters>,
+  routeIfaces: ReadonlySet<string> = new Set(),
+): { rx: number; tx: number } {
+  const totals = { rx: 0, tx: 0 };
+  for (const name of selectTrafficInterfaces(counters, routeIfaces)) {
+    const c = counters.get(name);
+    if (!c) continue;
+    totals.rx += c.rx;
+    totals.tx += c.tx;
+  }
+  return totals;
+}
+
 // Real `netstat -ibn` Link rows for interfaces without a MAC (utun*, awdl
 // tunnels, ...) omit the Address column entirely, leaving one fewer field
 // than the header. Rows are re-aligned by inserting an empty Address so the

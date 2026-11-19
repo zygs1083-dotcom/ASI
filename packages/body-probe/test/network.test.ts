@@ -3,7 +3,7 @@ import type { NetworkInterfaceInfo } from 'node:os';
 import { describe, expect, it, vi } from 'vitest';
 import type { RunFn } from '../src/command.js';
 import * as fact from '../src/fact.js';
-import { isOnline, NetworkSampler, parseNetstatIB } from '../src/network.js';
+import { cumulativeTrafficBytes, isOnline, NetworkSampler, parseNetstatIB } from '../src/network.js';
 
 const fx = (name: string) => readFileSync(new URL(`./fixtures/${name}`, import.meta.url), 'utf8');
 
@@ -52,6 +52,40 @@ describe('parseNetstatIB', () => {
 
   it('throws on a link row matching neither field-count variant', () => {
     expect(() => parseNetstatIB(fx('netstat_badlink.txt'))).toThrow();
+  });
+});
+
+describe('cumulativeTrafficBytes', () => {
+  // macOS prints one <Link#N> row per interface plus one row per address, and
+  // the address rows repeat the same Ibytes/Obytes. Summing rows instead of
+  // interfaces inflated the physical total 3x for a dual-stack en0, which is
+  // exactly how the sidebar rate looked like it undercounted by 1/3-1/2.
+  it('counts each interface once when address rows repeat its counters', () => {
+    const counters = parseNetstatIB(
+      [
+        HEADER,
+        'en0   1500  <Link#4>    aa:bb:cc:dd:ee:ff     5000     0       1000     4000     0       2000      0',
+        'en0   1500  192.168.1     192.168.1.50        5000     -       1000     4000     -       2000      -',
+        'en0   1500  fe80::abcd    fe80::1%en0         5000     -       1000     4000     -       2000      -',
+        'utun9 1500  <Link#20>                          100     0    9000000      200     0    8000000      0',
+      ].join('\n'),
+    );
+    expect(cumulativeTrafficBytes(counters)).toEqual({ rx: 1000, tx: 2000 });
+  });
+
+  it('sums every physical NIC once and ignores tunnels and peer links', () => {
+    const counters = parseNetstatIB(
+      [
+        HEADER,
+        'en0    1500  <Link#4>    aa:bb:cc:dd:ee:01     5000     0       1000     4000     0       2000      0',
+        'en0    1500  192.168.1     192.168.1.50        5000     -       1000     4000     -       2000      -',
+        'en7    1500  <Link#9>    aa:bb:cc:dd:ee:02      100     0        500      200     0        600      0',
+        'pdp_ip0 1500 <Link#21>   aa:bb:cc:dd:ee:03       10     0        100       20     0        200      0',
+        'awdl0  1500  <Link#16>   96:37:20:23:2f:28  701064     0  874223226  335298     0  117999478      0',
+        'utun9  1500  <Link#20>                          100     0    9000000      200     0    8000000      0',
+      ].join('\n'),
+    );
+    expect(cumulativeTrafficBytes(counters)).toEqual({ rx: 1600, tx: 2800 });
   });
 });
 
