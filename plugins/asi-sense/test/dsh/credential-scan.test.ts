@@ -235,6 +235,17 @@ describe('credential scanner contracts (契约 1–5) and single-entry normaliza
     expect(sanitizeForModel(`secret${' '.repeat(30)} notakey`)).toBe(`secret${' '.repeat(30)} notakey`);
   });
 
+  it('redacts JSON-quoted auth-scheme keys via scanAuthVal (rrv-015a-3 contract-2/3 leak)', () => {
+    // Report input: {"Authorization":"myp4ssw0rds3cr3t"} emitted the value verbatim
+    expect(sanitizeForModel('{"Authorization":"myp4ssw0rds3cr3t"}')).toBe('{"Authorization":"[redacted]"}');
+    expect(sanitizeForModel('{"Bearer":"myp4ssw0rds3cr3t"}')).toBe('{"Bearer":"[redacted]"}');
+    expect(sanitizeForModel('{"basic":"dXNlcjpwYXNzMTIzNA=="}')).toBe('{"basic":"[redacted]"}');
+    expect(sanitizeForModel("{'authorization':'x1y2z3w4v5'}")).toBe("{'authorization':'[redacted]'}");
+    // The auth common-word exemption still applies inside JSON values
+    expect(sanitizeForModel('{"Authorization":"Settings"}')).toBe('{"Authorization":"Settings"}');
+    expect(sanitizeForModel('{"basic":"settings"}')).toBe('{"basic":"settings"}');
+  });
+
   it('detects Contract 4 URL userinfo passwords and Contract 5 high-entropy / >=40 hex strings', () => {
     expect(sanitizeForModel('https://alice:SuperSecretPass99@api.example.com/v1')).toBe(
       'https://alice:[redacted]@api.example.com/v1',
@@ -453,6 +464,9 @@ const LEAK_CORPUS: LeakSample[] = [
   // --- rrv-015a-3: unbounded horizontal whitespace before KV `=`/`:` ---
   { id: 'f4-kv-ws5', input: 'secret     =aligned9Val', secret: 'aligned9Val' },
   { id: 'f4-kv-ws20', input: `secret${' '.repeat(20)}=val20spaces9`, secret: 'val20spaces9' },
+
+  // --- rrv-015a-3: JSON-quoted authorization/bearer/basic keys ---
+  { id: 'f4-json-auth', input: '{"Authorization":"myp4ssw0rds3cr3t"}', secret: 'myp4ssw0rds3cr3t' },
 ];
 
 describe('leak corpus across all 4 real model exits (env_detail, env_state, deliver, env_history)', () => {
