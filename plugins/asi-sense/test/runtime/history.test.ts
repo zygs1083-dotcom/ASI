@@ -4015,27 +4015,12 @@ describe('runtime history persistence, rollups, retention, and recovery', () => 
     // Nonexistent UUID id must never emit an orphan patch on disk
     mgr1.patchEvent('99999999-9999-4999-8999-999999999999:999', { at: wall, feedback: 'noise' });
 
-    // Also overflow non-aggregated eventMetaById (4096) and patch the evicted oldest one
-    const bulkUuid = '660e8400-e29b-41d4-a716-446655440003';
-    for (let i = 0; i < 4_150; i++) {
-      mgr1.recordEvent({
-        id: `${bulkUuid}:${i}`,
-        kind: 'file.changed',
-        subject: `/work/evict-${i}.ts`,
-        level: 'record',
-        at: wall + 50_000 + i,
-        source: { id: 'files-global', api: 'watch', host: 'local' },
-      });
-    }
-    mgr1.patchEvent(`${bulkUuid}:0`, { at: wall + 50_000, feedback: 'noise', reason: 'after-eviction' });
-
     wall += 120_000;
     mono += 120_000;
     await mgr1.stop();
 
     const raw = (await port.readEvents('2026-11-22')) ?? '';
     expect(raw).not.toContain(targetUuid);
-    expect(raw).not.toContain(bulkUuid);
     expect(raw).not.toContain('99999999-9999-4999-8999-999999999999');
 
     // Every patch line on disk must correspond to an existing persisted event ID (zero orphans)
@@ -4050,12 +4035,12 @@ describe('runtime history persistence, rollups, retention, and recovery', () => 
         patchIds.push(obj.id);
       }
     }
-    expect(patchIds.length).toBeGreaterThanOrEqual(2);
+    expect(patchIds).toHaveLength(1);
     for (const pid of patchIds) {
       expect(eventIds.has(pid)).toBe(true);
     }
 
-    // Restart and verify both patches take effect on restored disk view
+    // Restart on real FileHistoryStoragePort and verify early non-aggregated patch took effect
     const mgr2 = mkMgr();
     await mgr2.start(false);
     const parsed = parseHistoryLines((await port.readEvents('2026-11-22')) ?? '');
@@ -4063,9 +4048,219 @@ describe('runtime history persistence, rollups, retention, and recovery', () => 
     expect(earlyEv?.level).toBe('context');
     expect(earlyEv?.feedback).toBe('useful');
     expect(earlyEv?.reason).toBe('delayed-feedback');
-    const evictedEv = parsed.events.find((e) => e.subject === '/work/evict-0.ts');
+    await mgr2.stop();
+
+    // Also overflow non-aggregated eventMetaById (4096) via fast port and verify evicted UUID patch reconstructs cleanly
+    const evEventsByDate = new Map<string, string>();
+    const evPort: HistoryStoragePort = {
+      eventFileSize: async (date) => Buffer.byteLength(evEventsByDate.get(date) ?? '', 'utf8'),
+      appendEvent: async (date, chunk) => {
+        evEventsByDate.set(date, (evEventsByDate.get(date) ?? '') + chunk);
+      },
+      readEvents: async (date) => evEventsByDate.get(date),
+      listEventDates: async () => [...evEventsByDate.keys()],
+      deleteEventDate: async (date) => {
+        evEventsByDate.delete(date);
+      },
+      readDaily: async () => undefined,
+      writeDaily: async () => {},
+      listDailyDates: async () => [],
+      deleteDailyDate: async () => {},
+      readMonthly: async () => undefined,
+      writeMonthly: async () => {},
+      listMonthlyMonths: async () => [],
+      clearAll: async () => {
+        evEventsByDate.clear();
+      },
+    };
+    const evWall = Date.UTC(2026, 10, 22, 14, 0, 0);
+    const mkEvMgr = () =>
+      new HistoryManager({
+        port: evPort,
+        clock: { wall: () => evWall, mono: () => 5_000 },
+        isPaused: () => false,
+        titlesAllowed: () => true,
+        restoreEntries: () => {},
+        clearMemoryEntries: () => {},
+        emitSourceError: () => {},
+        emitSourceOk: () => {},
+        timeZone: 'UTC',
+      });
+    const evMgr1 = mkEvMgr();
+    await evMgr1.start(false);
+    const bulkUuid = '660e8400-e29b-41d4-a716-446655440003';
+    for (let i = 0; i < 4_150; i++) {
+      evMgr1.recordEvent({
+        id: `${bulkUuid}:${i}`,
+        kind: 'file.changed',
+        subject: `/work/evict-${i}.ts`,
+        level: 'record',
+        at: evWall + i,
+        source: { id: 'files-global', api: 'watch', host: 'local' },
+      });
+    }
+    evMgr1.patchEvent(`${bulkUuid}:0`, { at: evWall, feedback: 'noise', reason: 'after-eviction' });
+    await evMgr1.stop();
+
+    const evRaw = evEventsByDate.get('2026-11-22') ?? '';
+    expect(evRaw).not.toContain(bulkUuid);
+    const evMgr2 = mkEvMgr();
+    await evMgr2.start(false);
+    const evParsed = parseHistoryLines(evEventsByDate.get('2026-11-22') ?? '');
+    const evictedEv = evParsed.events.find((e) => e.subject === '/work/evict-0.ts');
     expect(evictedEv?.feedback).toBe('noise');
     expect(evictedEv?.reason).toBe('after-eviction');
-    await mgr2.stop();
+    await evMgr2.stop();
+  });
+
+  it('S3: time-slices flushPendingActivity when 4096 buckets expire simultaneously and persists all buckets', async () => {
+    const buildRefBatch = (n: number, tag: string) =>
+      Array.from({ length: n }, (_, i) => ({
+        id: `ref:${tag}:${i}`,
+        kind: 'file.activity',
+        subject: `/work/${tag}/d-${i}`,
+        level: 'record',
+        at: 1_700_000_000_000 + i,
+        source: 'files-global',
+        detail: { windowMs: 60_000, created: 1, modified: 2, deleted: 0 },
+      }));
+
+    // Warmup JIT and compute in-process normalized reference work (median of 3 fixed batches, no hardcoded ms).
+    let sink = JSON.stringify(structuredClone(buildRefBatch(500, 'warm'))).length;
+    const refSamples: number[] = [];
+    for (let iter = 0; iter < 3; iter++) {
+      const t0 = performance.now();
+      sink += JSON.stringify(structuredClone(buildRefBatch(5_000, `b${iter}`))).length;
+      refSamples.push(performance.now() - t0);
+    }
+    refSamples.sort((a, b) => a - b);
+    const refBatchMs = Math.max(1, refSamples[1] ?? refSamples[0] ?? 1);
+    expect(sink).toBeGreaterThan(0);
+
+    const runS3Burst = async (tag: string, bucketCount: number, measure: boolean) => {
+      const eventsByDate = new Map<string, string>();
+      const fastPort: HistoryStoragePort = {
+        eventFileSize: async (date) => Buffer.byteLength(eventsByDate.get(date) ?? '', 'utf8'),
+        appendEvent: async (date, chunk) => {
+          eventsByDate.set(date, (eventsByDate.get(date) ?? '') + chunk);
+        },
+        readEvents: async (date) => eventsByDate.get(date),
+        listEventDates: async () => [...eventsByDate.keys()],
+        deleteEventDate: async (date) => {
+          eventsByDate.delete(date);
+        },
+        readDaily: async () => undefined,
+        writeDaily: async () => {},
+        listDailyDates: async () => [],
+        deleteDailyDate: async () => {},
+        readMonthly: async () => undefined,
+        writeMonthly: async () => {},
+        listMonthlyMonths: async () => [],
+        clearAll: async () => {
+          eventsByDate.clear();
+        },
+      };
+
+      let wall = Date.UTC(2026, 10, 23, 12, 0, 0);
+      let mono = 1_000;
+      const mgr = new HistoryManager({
+        port: fastPort,
+        clock: { wall: () => wall, mono: () => mono },
+        isPaused: () => false,
+        titlesAllowed: () => true,
+        restoreEntries: () => {},
+        clearMemoryEntries: () => {},
+        emitSourceError: () => {},
+        emitSourceOk: () => {},
+        timeZone: 'UTC',
+      });
+      await mgr.start(false);
+
+      for (let i = 0; i < bucketCount; i++) {
+        mgr.recordEvent({
+          id: `${tag}-${i}`,
+          kind: 'file.activity',
+          subject: `/work/${tag}-${i}`,
+          level: 'record',
+          cause: 'unknown',
+          at: wall,
+          source: { id: 'files-global', api: 'watch', host: 'local' },
+          detail: { directory: `/work/${tag}-${i}`, windowMs: 10_000, created: 1, modified: 1, deleted: 0 },
+        });
+      }
+
+      wall += 61_000;
+      mono += 61_000;
+      await new Promise((r) => setImmediate(r));
+
+      const gaps: number[] = [];
+      let lastBeat = performance.now();
+      let probing = measure;
+      const beat = () => {
+        const now = performance.now();
+        gaps.push(now - lastBeat);
+        lastBeat = now;
+        if (probing) setImmediate(beat);
+      };
+      if (measure) setImmediate(beat);
+
+      await mgr.tick();
+      probing = false;
+
+      const sorted = [...gaps].sort((a, b) => a - b);
+      const p95GapMs = sorted.length > 0 ? sorted[Math.floor((sorted.length - 1) * 0.95)] : 0;
+      const maxGapMs = sorted.length > 0 ? sorted[sorted.length - 1] : 0;
+      const parsed = parseHistoryLines(eventsByDate.get('2026-11-23') ?? '');
+      const persisted = parsed.events.filter((e) => e.kind === 'file.activity').length;
+      const summaryDirs = Object.keys(mgr.timelineSnapshots().today?.fileActivity ?? {}).length;
+      await mgr.stop();
+      return { yields: gaps.length, p95GapMs, maxGapMs, persisted, summaryDirs };
+    };
+
+    await runS3Burst('warm', 256, false);
+
+    const runs: Array<{ yields: number; p95GapMs: number; maxGapMs: number }> = [];
+    for (let r = 0; r < 3; r++) {
+      const res = await runS3Burst(`r${r}`, 4_096, true);
+      expect(res.persisted).toBe(4_096);
+      expect(res.summaryDirs).toBe(4_096);
+      expect(res.yields).toBeGreaterThanOrEqual(40);
+      expect(res.p95GapMs).toBeLessThanOrEqual(refBatchMs);
+      runs.push(res);
+    }
+    expect(Math.min(...runs.map((r) => r.maxGapMs))).toBeLessThanOrEqual(refBatchMs);
+
+    // Also verify full persistence through real FileHistoryStoragePort when stopping with 4096 pending buckets
+    const dirDisk = await makeTempDir();
+    const diskPort = new FileHistoryStoragePort(dirDisk);
+    const wallDisk = Date.UTC(2026, 10, 23, 14, 0, 0);
+    const monoDisk = 2_000;
+    const mgrDisk = new HistoryManager({
+      port: diskPort,
+      clock: { wall: () => wallDisk, mono: () => monoDisk },
+      isPaused: () => false,
+      titlesAllowed: () => true,
+      restoreEntries: () => {},
+      clearMemoryEntries: () => {},
+      emitSourceError: () => {},
+      emitSourceOk: () => {},
+      timeZone: 'UTC',
+    });
+    await mgrDisk.start(false);
+    for (let i = 0; i < 4_096; i++) {
+      mgrDisk.recordEvent({
+        id: `s3d-${i}`,
+        kind: 'file.activity',
+        subject: `/work/disk-${i}`,
+        level: 'record',
+        cause: 'unknown',
+        at: wallDisk,
+        source: { id: 'files-global', api: 'watch', host: 'local' },
+        detail: { directory: `/work/disk-${i}`, windowMs: 10_000, created: 0, modified: 1, deleted: 0 },
+      });
+    }
+    await mgrDisk.stop();
+    const diskParsed = parseHistoryLines((await diskPort.readEvents('2026-11-23')) ?? '');
+    expect(diskParsed.events.filter((e) => e.kind === 'file.activity')).toHaveLength(4_096);
   });
 });

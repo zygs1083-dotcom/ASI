@@ -111,6 +111,8 @@ const UUID_SEQ_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{1
 const BOOT_ID_RE = /^([a-z][0-9a-z]{3})-[0-9a-z]+$/;
 const FILE_ACTIVITY_AGG_MS = 60_000;
 const MAX_PENDING_ACTIVITY_BUCKETS = 4096;
+const FLUSH_ACTIVITY_SLICE_MAX_BUCKETS = 16;
+const FLUSH_ACTIVITY_SLICE_BUDGET_MS = 5;
 const LEVEL_RANK: Record<DeliveryLevel, number> = { record: 0, context: 1, wake: 2 };
 
 interface PendingActivityBucket {
@@ -351,6 +353,8 @@ export class HistoryManager {
   private tail: Promise<void> = Promise.resolve();
   private started = false;
   private stopped = false;
+  private stopPromise?: Promise<void>;
+  private activeActivityFlush?: Promise<void>;
   private clearEpoch = 0;
   private clearFeedBuffer?: Array<{ date: string; raw: string }>;
   private currentDate?: string;
@@ -624,15 +628,8 @@ export class HistoryManager {
     };
   }
 
-  private flushActivityBucket(bucket: PendingActivityBucket): void {
-    this.pendingActivity.delete(bucket.key);
-    for (const eid of bucket.entryIds) {
-      if (this.pendingBucketByEntryId.get(eid) === bucket) {
-        this.pendingBucketByEntryId.delete(eid);
-      }
-    }
-    if (bucket.epoch !== this.clearEpoch) return;
-    const raw = this.serializeEventLine(
+  private serializeActivityBucket(bucket: PendingActivityBucket): string {
+    return this.serializeEventLine(
       {
         id: bucket.diskId,
         kind: 'file.activity',
@@ -648,15 +645,126 @@ export class HistoryManager {
       },
       bucket.diskId,
     );
-    this.feedTodayRaw(bucket.date, raw);
-    const epoch = bucket.epoch;
-    this.enqueue(() => this.appendRawLine(bucket.date, `${raw}\n`, epoch, { tier: 'file', critical: false }));
   }
 
-  private flushPendingActivity(predicate: (bucket: PendingActivityBucket) => boolean): void {
-    if (this.pendingActivity.size === 0) return;
+  private detachActivityBucket(bucket: PendingActivityBucket): void {
+    if (this.pendingActivity.get(bucket.key) === bucket) {
+      this.pendingActivity.delete(bucket.key);
+    }
+    for (const eid of bucket.entryIds) {
+      if (this.pendingBucketByEntryId.get(eid) === bucket) {
+        this.pendingBucketByEntryId.delete(eid);
+      }
+    }
+  }
+
+  private detachMatchingActivityBuckets(
+    predicate: (bucket: PendingActivityBucket) => boolean,
+  ): PendingActivityBucket[] {
+    if (this.pendingActivity.size === 0) return [];
+    const epoch = this.clearEpoch;
+    const out: PendingActivityBucket[] = [];
     for (const bucket of [...this.pendingActivity.values()]) {
-      if (predicate(bucket)) this.flushActivityBucket(bucket);
+      if (bucket.epoch !== epoch || !predicate(bucket)) continue;
+      this.detachActivityBucket(bucket);
+      out.push(bucket);
+    }
+    return out;
+  }
+
+  private consumeActivityBucket(
+    bucket: PendingActivityBucket,
+    expectedEpoch = this.clearEpoch,
+  ): { date: string; raw: string; epoch: number } | undefined {
+    this.detachActivityBucket(bucket);
+    if (bucket.epoch !== expectedEpoch) return undefined;
+    const raw = this.serializeActivityBucket(bucket);
+    this.feedTodayRaw(bucket.date, raw);
+    return { date: bucket.date, raw, epoch: bucket.epoch };
+  }
+
+  private flushActivityBucket(bucket: PendingActivityBucket): void {
+    const item = this.consumeActivityBucket(bucket);
+    if (!item) return;
+    this.enqueue(() => this.appendRawLine(item.date, `${item.raw}\n`, item.epoch, { tier: 'file', critical: false }));
+  }
+
+  private async runActivityFlush(predicate: (bucket: PendingActivityBucket) => boolean): Promise<void> {
+    while (this.activeActivityFlush) {
+      await this.activeActivityFlush;
+    }
+    if (this.pendingActivity.size === 0) return;
+    const run = this.flushPendingActivitySliced(predicate);
+    this.activeActivityFlush = run;
+    try {
+      await run;
+    } finally {
+      if (this.activeActivityFlush === run) this.activeActivityFlush = undefined;
+    }
+  }
+
+  private async flushPendingActivitySliced(predicate: (bucket: PendingActivityBucket) => boolean): Promise<void> {
+    if (this.pendingActivity.size === 0) return;
+    const epoch = this.clearEpoch;
+    const candidates = [...this.pendingActivity.values()];
+    let idx = 0;
+    while (idx < candidates.length && epoch === this.clearEpoch) {
+      const sliceStart = performance.now();
+      const sliceLines: Array<{ date: string; raw: string; epoch: number }> = [];
+      let scannedInSlice = 0;
+      while (idx < candidates.length) {
+        const bucket = candidates[idx++];
+        scannedInSlice += 1;
+        if (bucket.epoch !== this.clearEpoch) continue;
+        if (this.pendingActivity.get(bucket.key) !== bucket) continue;
+        if (!predicate(bucket)) continue;
+        const item = this.consumeActivityBucket(bucket, epoch);
+        if (item) sliceLines.push(item);
+        if (
+          sliceLines.length >= FLUSH_ACTIVITY_SLICE_MAX_BUCKETS ||
+          performance.now() - sliceStart >= FLUSH_ACTIVITY_SLICE_BUDGET_MS
+        ) {
+          break;
+        }
+      }
+      if (sliceLines.length > 0 && epoch === this.clearEpoch) {
+        this.enqueue(() => this.appendBatchedActivityLines(sliceLines));
+      }
+      if (idx >= candidates.length || epoch !== this.clearEpoch) break;
+      if (scannedInSlice > 0) {
+        await new Promise<void>((resolve) => setImmediate(resolve));
+      }
+    }
+  }
+
+  private async flushDetachedBucketsSliced(
+    buckets: readonly PendingActivityBucket[],
+    epoch: number,
+    onRaw?: (raw: string) => void,
+  ): Promise<void> {
+    let idx = 0;
+    while (idx < buckets.length && epoch === this.clearEpoch) {
+      const sliceStart = performance.now();
+      const sliceLines: Array<{ date: string; raw: string; epoch: number }> = [];
+      while (idx < buckets.length) {
+        const bucket = buckets[idx++];
+        if (bucket.epoch !== epoch) continue;
+        const raw = this.serializeActivityBucket(bucket);
+        onRaw?.(raw);
+        sliceLines.push({ date: bucket.date, raw, epoch });
+        if (
+          sliceLines.length >= FLUSH_ACTIVITY_SLICE_MAX_BUCKETS ||
+          performance.now() - sliceStart >= FLUSH_ACTIVITY_SLICE_BUDGET_MS
+        ) {
+          break;
+        }
+      }
+      if (sliceLines.length > 0 && epoch === this.clearEpoch) {
+        await this.appendBatchedActivityLines(sliceLines);
+      }
+      if (idx < buckets.length && epoch === this.clearEpoch) {
+        await new Promise<void>((resolve) => setImmediate(resolve));
+      }
     }
   }
 
@@ -752,7 +860,8 @@ export class HistoryManager {
     const wall = this.clock.wall();
     const mono = this.clock.mono();
     const nowDate = this.syncClockDate(wall);
-    this.flushPendingActivity((b) => mono >= b.flushMono || wall >= b.windowEndWall);
+    await this.runActivityFlush((b) => mono >= b.flushMono || wall >= b.windowEndWall);
+    if (this.stopped) return;
     if (mono >= this.nextHeartbeatMono) {
       this.nextHeartbeatMono = mono + this.heartbeatIntervalMs;
       this.lastAliveAt = Math.max(this.lastAliveAt, wall);
@@ -775,11 +884,16 @@ export class HistoryManager {
   }
 
   async stop(): Promise<void> {
-    if (this.stopped) return this.tail;
-    this.flushPendingActivity(() => true);
+    if (this.stopPromise) return this.stopPromise;
     this.stopped = true;
     this.nextHeartbeatMono = Number.POSITIVE_INFINITY;
     this.cancelBackfill();
+    this.stopPromise = this.runStop();
+    return this.stopPromise;
+  }
+
+  private async runStop(): Promise<void> {
+    await this.runActivityFlush(() => true);
     if (this.port && this.started && this.activeLifecycleOpen) {
       const now = this.clock.wall();
       const date = this.calendar.dateKey(now);
@@ -1324,43 +1438,47 @@ export class HistoryManager {
     };
   }
 
+  private applyActivityBucketToSummary(summary: DailySummary, bucket: PendingActivityBucket): void {
+    summary.totalEvents += 1;
+    const suppressed =
+      bucket.reason === 'no-session' || bucket.reason === 'wake-budget' || bucket.reason === 'self-caused';
+    const isWake = bucket.level === 'wake' && bucket.reason !== 'no-session';
+    const isContext = bucket.level === 'context';
+    if (isWake || isContext || suppressed) {
+      if (isWake) summary.deliveries.wake += 1;
+      if (isContext) summary.deliveries.context += 1;
+      if (suppressed) summary.deliveries.suppressed += 1;
+      const ruleKey = bucket.ruleId && bucket.ruleId.length > 0 ? bucket.ruleId : '_none';
+      let rc = summary.deliveries.byRule[ruleKey];
+      if (!rc) {
+        rc = { wake: 0, context: 0, suppressed: 0 };
+        summary.deliveries.byRule[ruleKey] = rc;
+      }
+      if (isWake) rc.wake += 1;
+      if (isContext) rc.context += 1;
+      if (suppressed) rc.suppressed += 1;
+    }
+    const dir = sanitizeDirPath(bucket.dir);
+    const existing = summary.fileActivity[dir];
+    if (existing) {
+      existing.events += 1;
+      existing.created += bucket.created;
+      existing.modified += bucket.modified;
+      existing.deleted += bucket.deleted;
+    } else {
+      summary.fileActivity[dir] = {
+        events: 1,
+        created: bucket.created,
+        modified: bucket.modified,
+        deleted: bucket.deleted,
+      };
+    }
+  }
+
   private foldPendingIntoDailySummary(summary: DailySummary, date: string): void {
     for (const bucket of this.pendingActivity.values()) {
       if (bucket.epoch !== this.clearEpoch || bucket.date !== date) continue;
-      summary.totalEvents += 1;
-      const suppressed =
-        bucket.reason === 'no-session' || bucket.reason === 'wake-budget' || bucket.reason === 'self-caused';
-      const isWake = bucket.level === 'wake' && bucket.reason !== 'no-session';
-      const isContext = bucket.level === 'context';
-      if (isWake || isContext || suppressed) {
-        if (isWake) summary.deliveries.wake += 1;
-        if (isContext) summary.deliveries.context += 1;
-        if (suppressed) summary.deliveries.suppressed += 1;
-        const ruleKey = bucket.ruleId && bucket.ruleId.length > 0 ? bucket.ruleId : '_none';
-        let rc = summary.deliveries.byRule[ruleKey];
-        if (!rc) {
-          rc = { wake: 0, context: 0, suppressed: 0 };
-          summary.deliveries.byRule[ruleKey] = rc;
-        }
-        if (isWake) rc.wake += 1;
-        if (isContext) rc.context += 1;
-        if (suppressed) rc.suppressed += 1;
-      }
-      const dir = sanitizeDirPath(bucket.dir);
-      const existing = summary.fileActivity[dir];
-      if (existing) {
-        existing.events += 1;
-        existing.created += bucket.created;
-        existing.modified += bucket.modified;
-        existing.deleted += bucket.deleted;
-      } else {
-        summary.fileActivity[dir] = {
-          events: 1,
-          created: bucket.created,
-          modified: bucket.modified,
-          deleted: bucket.deleted,
-        };
-      }
+      this.applyActivityBucketToSummary(summary, bucket);
     }
   }
 
@@ -1647,7 +1765,21 @@ export class HistoryManager {
     if (nowDate > this.currentDate) {
       this.enqueueRollover(wall);
     } else if (nowDate < this.currentDate) {
-      this.flushPendingActivity(() => true);
+      const detached = this.detachMatchingActivityBuckets(() => true);
+      if (detached.length > 0) {
+        const prevEpoch = this.clearEpoch;
+        if (detached.length <= FLUSH_ACTIVITY_SLICE_MAX_BUCKETS) {
+          const items: Array<{ date: string; raw: string; epoch: number }> = [];
+          for (const b of detached) {
+            const raw = this.serializeActivityBucket(b);
+            this.feedTodayRaw(b.date, raw);
+            items.push({ date: b.date, raw, epoch: prevEpoch });
+          }
+          if (items.length > 0) this.enqueue(() => this.appendBatchedActivityLines(items));
+        } else {
+          this.enqueue(() => this.flushDetachedBucketsSliced(detached, prevEpoch));
+        }
+      }
       this.currentDate = nowDate;
       this.currentMonth = this.calendar.monthKey(wall);
       this.lastAliveAt = wall;
@@ -1687,7 +1819,21 @@ export class HistoryManager {
     const nextMonthKey = this.calendar.monthKey(wall);
     if (!prevDate || nextDate <= prevDate) return;
 
-    this.flushPendingActivity((b) => b.date < nextDate);
+    const dueBuckets = this.detachMatchingActivityBuckets((b) => b.date < nextDate);
+    let deferredRolloverBuckets: PendingActivityBucket[] = [];
+    if (dueBuckets.length <= FLUSH_ACTIVITY_SLICE_MAX_BUCKETS) {
+      const items: Array<{ date: string; raw: string; epoch: number }> = [];
+      for (const b of dueBuckets) {
+        const raw = this.serializeActivityBucket(b);
+        this.feedTodayRaw(b.date, raw);
+        items.push({ date: b.date, raw, epoch: b.epoch });
+      }
+      if (items.length > 0) {
+        this.enqueue(() => this.appendBatchedActivityLines(items));
+      }
+    } else {
+      deferredRolloverBuckets = dueBuckets;
+    }
 
     const prevWasCapped = this.cappedDates.has(prevDate);
     let prevPendingHydration: { date: string; epoch: number; liveLines: string[] } | undefined;
@@ -1705,7 +1851,14 @@ export class HistoryManager {
       prevAcc && diffDays(nextDate, prevDate) === 1
         ? prevAcc.snapshot(prevWasCapped ? { truncatedAtLimit: true } : undefined)
         : undefined;
-    if (prevProvisional) this.applyDayExtensions(prevProvisional, prevDate);
+    if (prevProvisional) {
+      if (deferredRolloverBuckets.length > 0) {
+        for (const b of deferredRolloverBuckets) {
+          if (b.date === prevDate) this.applyActivityBucketToSummary(prevProvisional, b);
+        }
+      }
+      this.applyDayExtensions(prevProvisional, prevDate);
+    }
 
     const prevAliveAt = this.lastAliveAt;
     const carryApp = this.activeApp;
@@ -1720,6 +1873,12 @@ export class HistoryManager {
 
     this.enqueue(async () => {
       if (!this.port || this.isEpochStale(epoch)) return;
+      if (deferredRolloverBuckets.length > 0) {
+        await this.flushDetachedBucketsSliced(deferredRolloverBuckets, epoch, (raw) => {
+          prevAcc?.feed(raw);
+        });
+        if (this.isEpochStale(epoch)) return;
+      }
       const prevBounds = this.calendar.dayBounds(prevDate);
       const continuous = diffDays(nextDate, prevDate) === 1 && prevBounds.endMs - prevAliveAt <= 10 * 60_000;
       try {
@@ -2803,13 +2962,7 @@ export class HistoryManager {
         if (tier === 'file') usage.file += lineBytes;
         else usage.nonFile += lineBytes;
       }
-      if (this.appendDegraded) {
-        this.appendDegraded = false;
-        if (!this.summaryDegraded) {
-          const capped = this.currentDate !== undefined && this.cappedDates.has(this.currentDate);
-          this.safeEmitSourceOk({ capped });
-        }
-      }
+      this.clearAppendDegradedIfNeeded();
     } catch (error) {
       if (epoch !== this.clearEpoch) return;
       // Drop cached usage after write failure so a partial write (e.g. ENOSPC) is re-stat'd.
@@ -2824,6 +2977,106 @@ export class HistoryManager {
         return;
       }
       this.reportAppendWriteFailure(date, 'history-write-failed');
+    }
+  }
+
+  private async appendBatchedActivityLines(
+    items: ReadonlyArray<{ date: string; raw: string; epoch: number }>,
+  ): Promise<void> {
+    let i = 0;
+    while (i < items.length) {
+      const { date, epoch } = items[i];
+      if (!this.port || epoch !== this.clearEpoch) return;
+      let end = i + 1;
+      while (end < items.length && items[end].date === date && items[end].epoch === epoch) {
+        end++;
+      }
+      if (this.fileCappedDates.has(date)) {
+        i = end;
+        continue;
+      }
+      let usage = this.usageByDate.get(date);
+      if (!usage) {
+        try {
+          const total = await this.port.eventFileSize(date);
+          if (epoch !== this.clearEpoch) return;
+          usage = { total, file: 0, nonFile: 0, breakdownLoaded: total === 0 };
+          this.usageByDate.set(date, usage);
+        } catch {
+          for (let k = i; k < end; k++) {
+            await this.appendRawLine(date, `${items[k].raw}\n`, epoch, { tier: 'file', critical: false });
+          }
+          i = end;
+          continue;
+        }
+      }
+      const firstBytes = Buffer.byteLength(items[i].raw, 'utf8') + 1;
+      const minTierLimit = Math.min(this.maxFileDailyBytes, this.maxNonFileDailyBytes, this.maxDailyBytes);
+      if (!usage.breakdownLoaded && usage.total + firstBytes > minTierLimit) {
+        try {
+          usage = await this.loadDateTierBreakdown(date, usage.total);
+          if (epoch !== this.clearEpoch) return;
+          this.usageByDate.set(date, usage);
+        } catch {
+          for (let k = i; k < end; k++) {
+            await this.appendRawLine(date, `${items[k].raw}\n`, epoch, { tier: 'file', critical: false });
+          }
+          i = end;
+          continue;
+        }
+      }
+
+      const fileUsed = usage.breakdownLoaded ? usage.file : usage.total;
+      const fileRoom = this.maxFileDailyBytes - fileUsed;
+      const totalRoom = this.enforceTotalDailyCap ? this.maxDailyBytes - usage.total : Number.POSITIVE_INFINITY;
+      const room = Math.min(fileRoom, totalRoom);
+
+      let batchCount = 0;
+      let batchBytes = 0;
+      const lines: string[] = [];
+      while (i + batchCount < end) {
+        const line = `${items[i + batchCount].raw}\n`;
+        const lineBytes = Buffer.byteLength(line, 'utf8');
+        if (!usage.breakdownLoaded && usage.total + batchBytes + lineBytes > minTierLimit) {
+          break;
+        }
+        if (batchBytes + lineBytes > room) {
+          break;
+        }
+        lines.push(line);
+        batchBytes += lineBytes;
+        batchCount += 1;
+      }
+
+      if (batchCount > 0) {
+        const payload = lines.join('');
+        try {
+          await this.port.appendEvent(date, payload);
+          if (epoch !== this.clearEpoch) return;
+          usage.total += batchBytes;
+          if (usage.breakdownLoaded) usage.file += batchBytes;
+          this.clearAppendDegradedIfNeeded();
+          i += batchCount;
+          continue;
+        } catch {
+          this.usageByDate.delete(date);
+          await this.appendRawLine(date, `${items[i].raw}\n`, epoch, { tier: 'file', critical: false });
+          i += 1;
+          continue;
+        }
+      }
+
+      await this.appendRawLine(date, `${items[i].raw}\n`, epoch, { tier: 'file', critical: false });
+      i += 1;
+    }
+  }
+
+  private clearAppendDegradedIfNeeded(): void {
+    if (!this.appendDegraded) return;
+    this.appendDegraded = false;
+    if (!this.summaryDegraded) {
+      const capped = this.currentDate !== undefined && this.cappedDates.has(this.currentDate);
+      this.safeEmitSourceOk({ capped });
     }
   }
 
