@@ -57,3 +57,34 @@
 3. **类型与静态检查**（`task-648`）：
    - 命令：`pnpm typecheck && pnpm lint`
    - 结果：`exit 0`（4 个 workspace package `tsc` 全过，`biome check .` 354 文件 0 errors）。
+
+## 5. N5 复跑：`scripts/bench-history-volume.ts`（task/fix-history-volume-2）
+
+合成负载脚本落在 `plugins/asi-sense/scripts/bench-history-volume.ts`，**不进 `pnpm check`**（`tsconfig.json` 只包含 `src`/`test`/`vitest.config.ts`，脚本目录不参与 tsc 与 vitest；`biome check` 对该文件 0 error）。内存 `HistoryStoragePort` + 真实 `HistoryManager`，加速时钟（`wall`/`mono` 手动推进），夹具目录名全部编造。
+
+运行命令（仓库根目录或插件目录均可，前台）：
+
+```sh
+pnpm -C plugins/asi-sense exec tsx scripts/bench-history-volume.ts          # 全部场景
+pnpm -C plugins/asi-sense exec tsx scripts/bench-history-volume.ts steady   # 仅平稳日字节
+pnpm -C plugins/asi-sense exec tsx scripts/bench-history-volume.ts flush    # 仅 4096 桶 flush
+```
+
+**steady 场景**（对应 §2 平稳工作日 B：8h 活跃 ~112 条 `file.activity`/min 落 76 个 `(dir, min)` 桶 + 6 条非 `file.*`/min；16h 轻量 8 桶/min + 1 条/min，共 1,440 分钟 + 跨日 rollover）：
+
+```
+[steady] 8h mark:  9.34 MiB / 39457 lines
+[steady] 24h mark: 11.39 MiB / 48288 lines (48000 event records)
+[steady] day summary totalEvents=48000 fileActivityDirs=84 truncatedAtLimit=false wallMs=1131.2
+```
+
+与 §2 同分布实测 11.95 MiB 口径一致（本次 11.39 MiB；差异来自非 `file.*` 仅 3 类 kind 且 subject 更短）。均未触顶。
+
+**flush 场景**（4,096 个 `(dir, min)` 桶同一 60s 窗口到期，单次 `tick()` 分片 flush，片上限 `FLUSH_ACTIVITY_SLICE_MAX_BUCKETS=16` / `FLUSH_ACTIVITY_SLICE_BUDGET_MS=5`；用 `setImmediate` 泵测事件循环间隔近似单片耗时）：
+
+```
+[flush] buckets=4096 persisted=4096 summaryDirs=4096
+[flush] tickTotalMs=34.1 maxLoopGapMs=2.98 p95GapMs=0.17 fileBytes=1.00 MiB / 4097 lines
+```
+
+全部 4,096 桶落盘且日汇总目录数 4,096；**最大单片耗时 ≈2.98 ms（另一次跑 3.90 ms）**，远低于 200 ms 主线程阈值与旧实现 ~481.83 ms 的实测单片耗时；整次 tick 34.1 ms，p95 间隔 0.17 ms。

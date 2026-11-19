@@ -386,6 +386,7 @@ export class HistoryManager {
   private activeActivityFlush?: Promise<void>;
   private clearEpoch = 0;
   private clearFeedBuffer?: Array<{ date: string; raw: string }>;
+  private clearOrphanedLines?: Array<{ date: string; raw: string; options: AppendOptions }>;
   private currentDate?: string;
   private currentMonth?: string;
   private lastAliveAt = Number.NEGATIVE_INFINITY;
@@ -713,6 +714,22 @@ export class HistoryManager {
     return out;
   }
 
+  // While a clear() is in flight, lines already fed to a pre-clear
+  // accumulator whose appends were still queued behind the epoch bump are
+  // parked here so a failed clear can re-append them; a successful clear
+  // discards them like the rest of the pre-clear state.
+  private bufferClearOrphanedRaw(date: string, raw: string, options: AppendOptions = {}): void {
+    if (!this.clearOrphanedLines) return;
+    this.clearOrphanedLines.push({ date, raw: raw.endsWith('\n') ? raw.slice(0, -1) : raw, options });
+  }
+
+  private bufferClearOrphanedItems(items: ReadonlyArray<{ date: string; raw: string }>, start: number): void {
+    if (!this.clearOrphanedLines) return;
+    for (let i = start; i < items.length; i++) {
+      this.clearOrphanedLines.push({ date: items[i].date, raw: items[i].raw, options: { tier: 'file' } });
+    }
+  }
+
   private consumeActivityBucket(
     bucket: PendingActivityBucket,
     expectedEpoch = this.clearEpoch,
@@ -768,8 +785,12 @@ export class HistoryManager {
           break;
         }
       }
-      if (sliceLines.length > 0 && epoch === this.clearEpoch) {
-        this.enqueue(() => this.appendBatchedActivityLines(sliceLines));
+      if (sliceLines.length > 0) {
+        if (epoch === this.clearEpoch) {
+          this.enqueue(() => this.appendBatchedActivityLines(sliceLines));
+        } else {
+          this.bufferClearOrphanedItems(sliceLines, 0);
+        }
       }
       if (idx >= candidates.length || epoch !== this.clearEpoch) break;
       if (scannedInSlice > 0) {
@@ -800,11 +821,27 @@ export class HistoryManager {
           break;
         }
       }
-      if (sliceLines.length > 0 && epoch === this.clearEpoch) {
-        await this.appendBatchedActivityLines(sliceLines);
+      if (sliceLines.length > 0) {
+        if (epoch === this.clearEpoch) {
+          await this.appendBatchedActivityLines(sliceLines);
+        } else {
+          this.bufferClearOrphanedItems(sliceLines, 0);
+        }
       }
       if (idx < buckets.length && epoch === this.clearEpoch) {
         await new Promise<void>((resolve) => setImmediate(resolve));
+      }
+    }
+    if (this.clearOrphanedLines) {
+      // The clear() epoch bump cut the flush short: serialize the
+      // not-yet-consumed remainder into the orphan buffer so a failed clear
+      // can still land them on disk.
+      while (idx < buckets.length) {
+        const bucket = buckets[idx++];
+        if (bucket.epoch !== epoch) continue;
+        const raw = this.serializeActivityBucket(bucket);
+        onRaw?.(raw);
+        this.bufferClearOrphanedRaw(bucket.date, raw, { tier: 'file', critical: false });
       }
     }
   }
@@ -960,7 +997,9 @@ export class HistoryManager {
     // empty until the clear settles) and replay them afterwards; their disk
     // appends are queued behind this clear, so they outlive the deletion.
     const buffered: Array<{ date: string; raw: string }> = [];
+    const orphaned: Array<{ date: string; raw: string; options: AppendOptions }> = [];
     this.clearFeedBuffer = buffered;
+    this.clearOrphanedLines = orphaned;
     this.cancelBackfill();
     this.backfillCurrentMonth = undefined;
     // A failed clear must not lose pre-clear state: keep the in-memory values
@@ -1011,6 +1050,7 @@ export class HistoryManager {
     this.summaryDegraded = false;
     if (!this.port) {
       if (this.clearFeedBuffer === buffered) this.clearFeedBuffer = undefined;
+      if (this.clearOrphanedLines === orphaned) this.clearOrphanedLines = undefined;
       this.onSummaryChanged?.();
       return;
     }
@@ -1117,12 +1157,28 @@ export class HistoryManager {
               }
               for (const raw of hydration.liveLines) this.feedTodayRaw(today, raw);
             }
+            // Lines consumed into the pre-clear accumulator whose appends were
+            // still queued behind the failed clear are re-appended under the
+            // new epoch. The disk-rebuilt summary has not seen them so they are
+            // fed once here; the !hydrated fallback already counts them via
+            // previous.todayAcc / previous.yesterdayLateState.
+            if (hydrated) {
+              for (const item of orphaned) {
+                if (item.date === today) this.feedTodayRaw(today, item.raw);
+              }
+            }
+            if (this.clearOrphanedLines === orphaned) this.clearOrphanedLines = undefined;
+            for (const item of orphaned) {
+              const { date, raw, options } = item;
+              this.enqueue(() => this.appendRawLine(date, `${raw}\n`, epoch, options));
+            }
             this.cachedToday = undefined;
             this.summaryRevision += 1;
             this.restoreMemoryEntries?.(previous.memoryEntries);
             this.onSummaryChanged?.();
           } else if (this.clearFeedBuffer === buffered) {
             this.clearFeedBuffer = undefined;
+            if (this.clearOrphanedLines === orphaned) this.clearOrphanedLines = undefined;
           }
         }
         throw error;
@@ -1137,6 +1193,7 @@ export class HistoryManager {
         this.lastAliveAt = now;
         this.nextHeartbeatMono = this.clock.mono() + this.heartbeatIntervalMs;
         if (this.clearFeedBuffer === buffered) this.clearFeedBuffer = undefined;
+        if (this.clearOrphanedLines === orphaned) this.clearOrphanedLines = undefined;
         this.resetTodayAcc(today);
         const lifecycle: HistoryLifecycleRecord = {
           record: 'lifecycle',
@@ -1154,6 +1211,7 @@ export class HistoryManager {
         }
       } else if (this.clearFeedBuffer === buffered) {
         this.clearFeedBuffer = undefined;
+        if (this.clearOrphanedLines === orphaned) this.clearOrphanedLines = undefined;
       }
       this.onSummaryChanged?.();
     });
@@ -2024,7 +2082,17 @@ export class HistoryManager {
     const epoch = this.clearEpoch;
 
     this.enqueue(async () => {
-      if (!this.port || this.isEpochStale(epoch)) return;
+      if (!this.port || this.isEpochStale(epoch)) {
+        if (this.clearOrphanedLines) {
+          for (const b of deferredRolloverBuckets) {
+            if (b.epoch !== epoch) continue;
+            const raw = this.serializeActivityBucket(b);
+            prevAcc?.feed(raw);
+            this.bufferClearOrphanedRaw(b.date, raw, { tier: 'file', critical: false });
+          }
+        }
+        return;
+      }
       if (deferredRolloverBuckets.length > 0) {
         await this.flushDetachedBucketsSliced(deferredRolloverBuckets, epoch, (raw) => {
           prevAcc?.feed(raw);
@@ -3119,7 +3187,10 @@ export class HistoryManager {
   }
 
   private async appendRawLine(date: string, line: string, epoch: number, options: AppendOptions = {}): Promise<void> {
-    if (!this.port || epoch !== this.clearEpoch) return;
+    if (!this.port || epoch !== this.clearEpoch) {
+      this.bufferClearOrphanedRaw(date, line, options);
+      return;
+    }
     const tier: BudgetTier = options.tier ?? 'nonFile';
     const critical = options.critical === true;
     if (critical) {
@@ -3132,7 +3203,10 @@ export class HistoryManager {
       let usage = this.usageByDate.get(date);
       if (!usage) {
         const total = await this.port.eventFileSize(date);
-        if (epoch !== this.clearEpoch) return;
+        if (epoch !== this.clearEpoch) {
+          this.bufferClearOrphanedRaw(date, line, options);
+          return;
+        }
         usage = { total, file: 0, nonFile: 0, breakdownLoaded: total === 0 };
         this.usageByDate.set(date, usage);
       }
@@ -3140,7 +3214,10 @@ export class HistoryManager {
       const minTierLimit = this.minCapThresholdBytes();
       if (!usage.breakdownLoaded && usage.total + lineBytes > minTierLimit) {
         const loaded = await this.loadDateTierBreakdown(date, usage.total);
-        if (epoch !== this.clearEpoch) return;
+        if (epoch !== this.clearEpoch) {
+          this.bufferClearOrphanedRaw(date, line, options);
+          return;
+        }
         usage = loaded;
         this.usageByDate.set(date, usage);
       }
@@ -3166,7 +3243,10 @@ export class HistoryManager {
           return;
         }
       }
-      if (epoch !== this.clearEpoch) return;
+      if (epoch !== this.clearEpoch) {
+        this.bufferClearOrphanedRaw(date, line, options);
+        return;
+      }
       await this.port.appendEvent(date, line);
       if (epoch !== this.clearEpoch) return;
       usage.total += lineBytes;
@@ -3201,7 +3281,10 @@ export class HistoryManager {
     let i = 0;
     while (i < items.length) {
       const { date, epoch } = items[i];
-      if (!this.port || epoch !== this.clearEpoch) return;
+      if (!this.port || epoch !== this.clearEpoch) {
+        this.bufferClearOrphanedItems(items, i);
+        return;
+      }
       dirtyDates.set(date, epoch);
       let end = i + 1;
       while (end < items.length && items[end].date === date && items[end].epoch === epoch) {
@@ -3215,7 +3298,10 @@ export class HistoryManager {
       if (!usage) {
         try {
           const total = await this.port.eventFileSize(date);
-          if (epoch !== this.clearEpoch) return;
+          if (epoch !== this.clearEpoch) {
+            this.bufferClearOrphanedItems(items, i);
+            return;
+          }
           usage = { total, file: 0, nonFile: 0, breakdownLoaded: total === 0 };
           this.usageByDate.set(date, usage);
         } catch {
@@ -3231,7 +3317,10 @@ export class HistoryManager {
       if (!usage.breakdownLoaded && usage.total + firstBytes > minTierLimit) {
         try {
           usage = await this.loadDateTierBreakdown(date, usage.total);
-          if (epoch !== this.clearEpoch) return;
+          if (epoch !== this.clearEpoch) {
+            this.bufferClearOrphanedItems(items, i);
+            return;
+          }
           this.usageByDate.set(date, usage);
         } catch {
           for (let k = i; k < end; k++) {
@@ -3268,7 +3357,10 @@ export class HistoryManager {
         const payload = lines.join('');
         try {
           await this.port.appendEvent(date, payload);
-          if (epoch !== this.clearEpoch) return;
+          if (epoch !== this.clearEpoch) {
+            this.bufferClearOrphanedItems(items, i + batchCount);
+            return;
+          }
           usage.total += batchBytes;
           if (usage.breakdownLoaded) usage.file += batchBytes;
           this.clearAppendDegradedIfNeeded();
@@ -3473,11 +3565,14 @@ export class HistoryManager {
     }
 
     if (hydratedDiskStats) {
+      const seeded = hydratedDiskStats.fileBytes + hydratedDiskStats.nonFileBytes;
       this.usageByDate.set(today, {
-        total: Math.max(todayBytes, hydratedDiskStats.fileBytes + hydratedDiskStats.nonFileBytes),
+        total: Math.max(todayBytes, seeded),
         file: hydratedDiskStats.fileBytes,
         nonFile: hydratedDiskStats.nonFileBytes,
-        breakdownLoaded: true,
+        // Zero tier bytes on a non-empty file keeps the lazy synthetic
+        // fallback in loadDateTierBreakdown instead of seeding zero strata.
+        breakdownLoaded: seeded > 0 || todayBytes === 0,
       });
     }
 
@@ -3494,11 +3589,12 @@ export class HistoryManager {
           stats = await this.inferTierStatsFromDisk(today, epoch);
           if (this.isEpochStale(epoch)) return;
           if (stats) {
+            const seeded = stats.fileBytes + stats.nonFileBytes;
             this.usageByDate.set(today, {
-              total: Math.max(todayBytes, stats.fileBytes + stats.nonFileBytes),
+              total: Math.max(todayBytes, seeded),
               file: stats.fileBytes,
               nonFile: stats.nonFileBytes,
-              breakdownLoaded: true,
+              breakdownLoaded: seeded > 0 || todayBytes === 0,
             });
           }
         }
