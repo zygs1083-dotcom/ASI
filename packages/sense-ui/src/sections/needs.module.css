@@ -337,3 +337,84 @@
   font-size: var(--sense-fs-s);
   color: var(--dsw-alias-label-secondary, #61666b);
 }
+
+.higherBlock {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 0.5px solid var(--dsw-alias-border-l2, rgba(0, 0, 0, 0.1));
+}
+
+.higherHead {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sense-gap);
+  flex-wrap: wrap;
+  font-size: var(--sense-fs-s);
+}
+
+.higherTitle {
+  font-weight: 500;
+  color: var(--dsw-alias-label-primary, #0f1115);
+}
+
+.suppressedBadge,
+.suppressedInline {
+  font-size: var(--sense-fs-s);
+  color: var(--sev-warn-ink);
+}
+
+.tierTag {
+  font-size: var(--sense-fs-s);
+  font-weight: 600;
+  color: var(--sev-business-ink);
+}
+
+.ledgerBox {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 6px 8px;
+  border-radius: var(--dsw-radius-sm, 8px);
+  background: var(--dsw-alias-bg-layer-1, #fff);
+  border: 0.5px solid var(--dsw-alias-border-l2, rgba(0, 0, 0, 0.1));
+  font-size: var(--sense-fs-s);
+  min-width: 0;
+}
+
+.ledgerTitle {
+  font-weight: 500;
+  color: var(--dsw-alias-label-primary, #0f1115);
+}
+
+.ledgerList {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.ledgerItem {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.ledgerActionName {
+  font-weight: 500;
+  word-break: break-word;
+}
+
+.ledgerRate[data-effective="true"] {
+  color: var(--sev-good-ink);
+}
+
+.ledgerRate[data-effective="false"] {
+  color: var(--dsw-alias-label-secondary, #61666b);
+}

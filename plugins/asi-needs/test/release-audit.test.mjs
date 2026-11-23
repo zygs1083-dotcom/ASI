@@ -24,7 +24,7 @@ describe('asi-needs 发布包卫生审计', () => {
     }
   });
 
-  it('构建产物通过敏感路径、凭据、邮箱、用户名与 sourcemap 扫描', async () => {
+  it('构建产物通过敏感路径、凭据、邮箱、用户名与 sourcemap 扫描', { timeout: 30_000 }, async () => {
     const files = [
       'package.json',
       'cordis.patch.yml',

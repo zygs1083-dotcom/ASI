@@ -106,6 +106,10 @@ export function buildPanelModel(runtime: NeedsRuntime): NeedsPanelModel {
     maintenanceSession: needs.maintenanceSession,
     helpCards: needs.helpCards,
     recentMaintenance: needs.records,
+    ...(needs.actionLedger ? { actionLedger: needs.actionLedger } : {}),
+    ...(needs.higherOrderDrives ? { higherOrderDrives: needs.higherOrderDrives } : {}),
+    ...(needs.higherOrderSuppressed !== undefined ? { higherOrderSuppressed: needs.higherOrderSuppressed } : {}),
+    ...(needs.higherOrderSuppressionReason ? { higherOrderSuppressionReason: needs.higherOrderSuppressionReason } : {}),
   };
 }
 

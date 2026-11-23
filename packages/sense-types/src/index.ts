@@ -19,6 +19,19 @@ export {
 } from './credential-scan.js';
 export type { DisksFact, DiskVolume } from './disks.js';
 export { disksStatusAt, diskVolumeAt, effectiveDisks } from './disks.js';
+export type {
+  AsiDrivesServiceApi,
+  AsiDrivesSnapshot,
+  DriveAbortSignal,
+  DriveEvaluation,
+  DriveSandboxToolResult,
+  DriveSandboxToolSpec,
+  DriveSourceRegistration,
+  DriveTier,
+  DriveToolParameterSpec,
+  ExternalDriveReading,
+  HigherOrderDriveTier,
+} from './drives.js';
 export { ttlStatusAt } from './freshness.js';
 export {
   type BodyHistory,
@@ -28,6 +41,9 @@ export {
   type ThermalState,
 } from './history.js';
 export {
+  type ActionMeasurement,
+  type ActionOutcomeLedgerEntry,
+  type CacheRiskLevel,
   type HelpActionKind,
   type HelpCard,
   type HelpCardStatus,

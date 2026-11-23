@@ -26,8 +26,8 @@ pnpm --filter asi-needs pack:dist
 使用匹配的 DSH CLI（`0.2.2-rc.3` 或 `0.2.2-rc.5`）同时安装感官模块与生存需求模块：
 
 ```sh
-dsh plugin --profile desktop add ./plugins/asi-sense/dist/asi-sense-0.2.0.tgz
-dsh plugin --profile desktop add ./plugins/asi-needs/dist/asi-needs-0.2.0.tgz
+dsh plugin --profile desktop add ./plugins/asi-sense/dist/asi-sense-0.3.0.tgz
+dsh plugin --profile desktop add ./plugins/asi-needs/dist/asi-needs-0.3.0.tgz
 ```
 
 完整的隔离 Web profile 启动与升级说明见 [docs/install-and-update.md](../../docs/install-and-update.md)。

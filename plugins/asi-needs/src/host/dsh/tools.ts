@@ -1,17 +1,19 @@
 /**
- * Tool registration & scope isolation for `asi-needs`:
+ * Tool registration & scope isolation for `asi-needs` (`0.3.0`):
  * - Globally (ordinary conversations): registers ONLY read-only `needs_status`
- *   (sanitized via `sanitizeForModel`). Zero maintenance action tools and zero
- *   dynamic `<env-update>` injections touch ordinary conversations.
+ *   (sanitized via `sanitizeForModel`). Zero maintenance action tools, zero
+ *   sniffer tools, and zero dynamic `<env-update>` injections touch ordinary chats.
  * - Dedicated background self-maintenance session (`agent.ctx` scope):
  *   1. `agent.ctx.tools.restrict` strips non-whitelisted global tools (`shell`,
  *      `write_file`, `computer_use`, etc.), keeping only `env_state`, `env_detail`,
  *      and `needs_status`.
- *   2. Registers the 4 safe sandboxed maintenance tools (`needs_clean_cache`,
- *      `needs_stop_job`, `needs_compact_context`, `needs_request_help`) ONLY in
- *      `agent.ctx.tools`.
- *   3. Installs `agent.ctx.tools.guard` as defense-in-depth denying any tool
- *      outside the 7 whitelisted names.
+ *   2. Registers `needs_sniff_causes` (read-only panoramic cause sniffer) + the 4
+ *      safe sandboxed maintenance tools (`needs_clean_cache`, `needs_stop_job`,
+ *      `needs_compact_context`, `needs_request_help`) + any higher-order plugin
+ *      sandbox tools registered via `ctx.asiDrives` ONLY in `agent.ctx.tools`.
+ *   3. Installs `agent.ctx.tools.guard` as defense-in-depth denying any non-whitelisted
+ *      tool AND dynamically suspending L2–L4 drive tools whenever L1 physiological
+ *      distress or `'eco'` mode is active.
  */
 
 import { realpathSync } from 'node:fs';
@@ -19,13 +21,22 @@ import { type HelpActionKind, NEED_KEYS, type NeedKey, sanitizeForModel } from '
 import type { Context } from '@deepseek-ai/cordis';
 import type { Agent } from '@deepseek-ai/dsh-agent';
 import type {} from '@deepseek-ai/dsh-system-prompt';
-import { defineTool, ToolArgsError, ToolContextUnavailableError, type ToolRunContext } from '@deepseek-ai/dsh-tools';
+import {
+  defineTool,
+  type ParameterSchemaSpec,
+  ToolArgsError,
+  ToolContextUnavailableError,
+  type ToolRunContext,
+} from '@deepseek-ai/dsh-tools';
 import type { JsonValue } from '@deepseek-ai/dsh-util-values';
-import type { NeedsRuntime } from '../runtime.js';
+import { CLEANABLE_EXTERNAL_CACHE_IDS } from '../cache-catalog.js';
+import type { RegisteredSandboxTool } from '../drives.js';
+import { type NeedsRuntime, validateHelpActionTarget } from '../runtime.js';
 
 const READONLY_GLOBAL_ALLOW = ['env_state', 'env_detail', 'needs_status'] as const;
 
 export const MAINTENANCE_ACTION_TOOL_NAMES = [
+  'needs_sniff_causes',
   'needs_clean_cache',
   'needs_stop_job',
   'needs_compact_context',
@@ -37,6 +48,7 @@ const ALLOWED_MAINTAINER_TOOLS = new Set<string>([...READONLY_GLOBAL_ALLOW, ...M
 const ACTION_KINDS: readonly HelpActionKind[] = [
   'acknowledge',
   'clean-cache',
+  'clean-external-cache',
   'stop-stuck-jobs',
   'compact-context',
   'enable-eco',
@@ -91,7 +103,7 @@ export function createNeedsStatusTool(runtime: NeedsRuntime) {
   return defineTool({
     name: 'needs_status',
     description:
-      'Read the 5 homeostatic survival needs (energy, space, memory, mind, thermals), instinct reflex status, background self-maintenance status, and open help cards.',
+      'Read the 5 homeostatic survival needs (energy, space, memory, mind, thermals), arbitrated higher-order drives, action-outcome ledger, instinct reflex status, background self-maintenance status, and open help cards.',
     parameters: {
       need: {
         type: 'string',
@@ -115,6 +127,7 @@ export function createNeedsStatusTool(runtime: NeedsRuntime) {
           need: snap.needs[key],
           instinct: snap.instinct,
           helpCards: snap.helpCards.filter((c) => c.need === key && c.status === 'open'),
+          actionLedger: (snap.actionLedger ?? []).filter((e) => e.need === key),
         });
       }
       return sanitizeValueForModel(snap);
@@ -123,10 +136,23 @@ export function createNeedsStatusTool(runtime: NeedsRuntime) {
 }
 
 export function createMaintenanceActionTools(runtime: NeedsRuntime) {
+  const sniffCauses = defineTool({
+    name: 'needs_sniff_causes',
+    description:
+      'Read-only panoramic cause sniffer for the internal maintenance session: scans whitelisted developer cache sizes (Xcode DerivedData/Archives, Homebrew, pnpm, npm, pip, uv, Cargo, Go, Gradle, Playwright) distinguishing total vs >1h reclaimable bytes, read-only Trash size hint, and Top CPU/memory OS processes.',
+    parameters: {},
+    output,
+    async execute(args, exec) {
+      requireMaintainer(exec, runtime);
+      bounded(args);
+      return sanitizeValueForModel(await runtime.tools.sniffCauses());
+    },
+  });
+
   const cleanCache = defineTool({
     name: 'needs_clean_cache',
     description:
-      'Safely clean expired/temporary files strictly inside ASI plugin-owned cache/tmp sandbox directories. Never touches user files or follows symlinks.',
+      'Safely clean expired/temporary files strictly inside ASI plugin-owned cache/tmp sandbox directories. Never touches external developer caches, Trash, user files, or symlinks.',
     parameters: {},
     output,
     async execute(args, exec) {
@@ -170,7 +196,7 @@ export function createMaintenanceActionTools(runtime: NeedsRuntime) {
   const requestHelp = defineTool({
     name: 'needs_request_help',
     description:
-      'File a Help Card in the sidebar and send a concise one-time <asi-cry> notice to the user when safe self-rescue cannot relieve distress or hits a user-file/hardware/permission boundary.',
+      'File a Help Card in the sidebar and send a concise one-time <asi-cry> notice to the user when safe self-rescue cannot relieve distress, when external safe/caution developer caches require one-click user approval, or when hitting a user-file/hardware/permission boundary.',
     parameters: {
       need: {
         type: 'string',
@@ -202,6 +228,10 @@ export function createMaintenanceActionTools(runtime: NeedsRuntime) {
         enum: [...ACTION_KINDS],
         description: 'One-click approval action kind (default acknowledge).',
       },
+      actionTarget: {
+        type: 'string',
+        description: `Controlled whitelist target identifier (for clean-external-cache: one of ${CLEANABLE_EXTERNAL_CACHE_IDS.join(', ')}; arbitrary paths and macos-trash are strictly rejected).`,
+      },
     },
     output,
     async execute(args, exec) {
@@ -213,25 +243,79 @@ export function createMaintenanceActionTools(runtime: NeedsRuntime) {
       if (!args.title?.trim() || !args.summary?.trim()) {
         throw new ToolArgsError(['title and summary are required']);
       }
-      const actionKind =
-        args.actionKind && (ACTION_KINDS as readonly string[]).includes(args.actionKind)
-          ? (args.actionKind as HelpActionKind)
-          : 'acknowledge';
+      if (args.actionKind !== undefined && !(ACTION_KINDS as readonly string[]).includes(args.actionKind)) {
+        throw new ToolArgsError(['invalid actionKind']);
+      }
+      const actionKind = (args.actionKind as HelpActionKind | undefined) ?? 'acknowledge';
+      let validatedTarget: string | undefined;
+      try {
+        validatedTarget = validateHelpActionTarget(actionKind, args.actionTarget);
+      } catch (err) {
+        throw new ToolArgsError([err instanceof Error ? err.message : 'invalid actionTarget']);
+      }
       const severity = args.severity === 'critical' || args.severity === 'uncomfortable' ? args.severity : undefined;
-      return sanitizeValueForModel(
-        await runtime.tools.requestHelp({
-          need: args.need as NeedKey,
-          ...(severity ? { severity } : {}),
-          title: args.title,
-          summary: args.summary,
-          ...(args.proposedAction ? { proposedAction: args.proposedAction } : {}),
-          actionKind,
-        }),
-      );
+      try {
+        return sanitizeValueForModel(
+          await runtime.tools.requestHelp({
+            need: args.need as NeedKey,
+            ...(severity ? { severity } : {}),
+            title: args.title,
+            summary: args.summary,
+            ...(args.proposedAction ? { proposedAction: args.proposedAction } : {}),
+            actionKind,
+            ...(validatedTarget ? { actionTarget: validatedTarget } : {}),
+          }),
+        );
+      } catch (err) {
+        throw new ToolArgsError([err instanceof Error ? err.message : 'invalid help card request']);
+      }
     },
   });
 
-  return [cleanCache, stopJob, compactContext, requestHelp];
+  return [sniffCauses, cleanCache, stopJob, compactContext, requestHelp];
+}
+
+function createExternalDriveTool(registered: RegisteredSandboxTool, runtime: NeedsRuntime) {
+  const params: ParameterSchemaSpec = {};
+  for (const [k, p] of Object.entries(registered.spec.parameters ?? {})) {
+    const req = p.required ? ({ required: true as const } as const) : {};
+    const desc = p.description ? { description: p.description } : {};
+    if (p.type === 'string') {
+      params[k] = {
+        type: 'string',
+        ...desc,
+        ...req,
+        ...(p.enum ? { enum: [...p.enum] } : {}),
+      };
+    } else if (p.type === 'number') {
+      params[k] = { type: 'number', ...desc, ...req };
+    } else if (p.type === 'boolean') {
+      params[k] = { type: 'boolean', ...desc, ...req };
+    }
+  }
+  return defineTool({
+    name: registered.spec.name,
+    description: `[L${registered.tier} ${registered.sourceId}] ${registered.spec.description}`,
+    parameters: params,
+    output,
+    async execute(args, exec) {
+      requireMaintainer(exec, runtime);
+      bounded(args);
+      if (!runtime.drives) {
+        throw new ToolContextUnavailableError('asiDrives runtime is not available');
+      }
+      const guard = runtime.drives.checkSandboxToolGuard(registered.spec.name);
+      if (!guard.allowed) {
+        throw new ToolContextUnavailableError(guard.reason ?? 'Higher-order drive tool is currently suspended');
+      }
+      const result = await runtime.drives.executeSandboxTool(
+        registered,
+        (args ?? {}) as Record<string, unknown>,
+        exec.signal,
+      );
+      return sanitizeValueForModel(result);
+    },
+  });
 }
 
 function tryRealpath(p: string): string {
@@ -257,6 +341,8 @@ export function attachMaintainerScope(rootCtx: Context, agent: Agent, runtime: N
   if (!ensureMaintainerRegistered(agent, runtime)) return () => {};
 
   const disposers: (() => void)[] = [];
+  const extDisposers: (() => void)[] = [];
+
   try {
     const scopedTools = agent.ctx.get('tools');
     if (!scopedTools) {
@@ -274,10 +360,23 @@ export function attachMaintainerScope(rootCtx: Context, agent: Agent, runtime: N
       disposers.push(scopedTools.register(tool));
     }
 
+    const syncExternalTools = () => {
+      for (const off of extDisposers.splice(0).reverse()) off();
+      for (const reg of runtime.drives?.registeredSandboxTools() ?? []) {
+        extDisposers.push(scopedTools.register(createExternalDriveTool(reg, runtime)));
+      }
+    };
+    syncExternalTools();
+    if (runtime.drives) {
+      disposers.push(runtime.drives.onToolsStructureChanged(syncExternalTools));
+    }
+
     disposers.push(
-      scopedTools.guard((exec) =>
-        ALLOWED_MAINTAINER_TOOLS.has(exec.name) ? undefined : 'ASI maintenance sandbox forbids non-whitelisted tools',
-      ),
+      scopedTools.guard((exec) => {
+        if (ALLOWED_MAINTAINER_TOOLS.has(exec.name)) return undefined;
+        const ext = runtime.drives?.checkSandboxToolGuard(exec.name);
+        return ext?.allowed ? undefined : (ext?.reason ?? 'ASI maintenance sandbox forbids non-whitelisted tools');
+      }),
     );
 
     const scopedSystemPrompt = agent.ctx.get('systemPrompt');
@@ -288,18 +387,20 @@ export function attachMaintainerScope(rootCtx: Context, agent: Agent, runtime: N
           order: 2710,
           text: [
             'You are the dedicated background self-maintenance agent of ASI.',
-            'Operate strictly inside your read-only diagnostics (needs_status, env_state, env_detail) and safe sandbox tools (needs_clean_cache, needs_stop_job, needs_compact_context, needs_request_help).',
-            'Never attempt to delete user files, kill external applications, or alter system configuration; use needs_request_help when human intervention is required.',
+            'Operate strictly inside your read-only diagnostics (needs_status, needs_sniff_causes, env_state, env_detail) and safe sandbox tools (needs_clean_cache, needs_stop_job, needs_compact_context, needs_request_help, plus active non-suppressed higher-order drive tools).',
+            'Never attempt to empty Trash, delete user files, kill external applications, or alter system configuration; for external safe/caution developer caches use needs_request_help with actionKind="clean-external-cache" and a whitelisted targetId.',
           ].join(' '),
         }),
       );
     }
   } catch (err) {
+    for (const off of extDisposers.splice(0).reverse()) off();
     for (const d of disposers.reverse()) d();
     throw err;
   }
 
   return () => {
+    for (const off of extDisposers.splice(0).reverse()) off();
     for (const d of disposers.splice(0).reverse()) d();
   };
 }

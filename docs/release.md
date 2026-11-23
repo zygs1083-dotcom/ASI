@@ -53,14 +53,14 @@ npm view "asi-needs@$NEEDS_VERSION" version --registry=https://registry.npmjs.or
 
 ## 将用户安装源切到 registry
 
-仅在两个目标包均已发布并验证后，由用户完全退出 Desktop；确认 CLI 与 Desktop 使用同一 `DSH_HOME`，并确保 Desktop profile 已初始化。以下示例中的版本必须替换为已验证的 registry 版本（当前为 `0.2.0`），旧 tgz 必须继续保留以备回退。先备份 profile 文件并持久设置更新源：
+仅在两个目标包均已发布并验证后，由用户完全退出 Desktop；确认 CLI 与 Desktop 使用同一 `DSH_HOME`，并确保 Desktop profile 已初始化。以下示例中的版本必须替换为已验证的 registry 版本（当前为 `0.3.0`），旧 tgz 必须继续保留以备回退。先备份 profile 文件并持久设置更新源：
 
 ```sh
 DSH="/Applications/DeepSeek Harness.app/Contents/Resources/runtime/cli/bin/dsh"
 PROFILE="${DSH_HOME:-$HOME/.dsh}/profiles/desktop"
 REGISTRY=https://registry.npmjs.org/
-SENSE_VERSION=0.2.0
-NEEDS_VERSION=0.2.0
+SENSE_VERSION=0.3.0
+NEEDS_VERSION=0.3.0
 test -f "$PROFILE/package.json" || { echo "Desktop profile 未初始化" >&2; exit 1; }
 umask 077
 BACKUP=$(mktemp -d "${TMPDIR:-/tmp}/asi-profile-backup.XXXXXX")

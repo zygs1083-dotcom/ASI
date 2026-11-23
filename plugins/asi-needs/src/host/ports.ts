@@ -1,6 +1,7 @@
 import type { AsiSenseServiceApi } from '@asi/sense-types';
 import type { CryDeliveryMode } from './cry.js';
 import type { EndpointProbe } from './instinct.js';
+import type { ProcessExecFn } from './process-top.js';
 import type { CompactionPort, JobsPort } from './sandbox.js';
 
 export interface MaintenanceSessionsPort {
@@ -28,4 +29,8 @@ export interface NeedsHostPorts {
   sessions: MaintenanceSessionsPort;
   clock?: ClockPort;
   probeEndpoint?: EndpointProbe;
+  /** Optional home directory for read-only developer cache sniffing & user-approved cleanup. */
+  homeDir?: string;
+  /** Optional override for read-only `ps` top-process sampling. */
+  execProcessPs?: ProcessExecFn;
 }

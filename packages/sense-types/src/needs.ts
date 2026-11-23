@@ -4,6 +4,7 @@
  * and on-demand help requests ("啼哭求助").
  */
 
+import type { DriveEvaluation } from './drives.js';
 import type { PowerMode } from './service.js';
 
 export const NEED_KEYS = ['energy', 'space', 'memory', 'mind', 'thermals'] as const;
@@ -42,9 +43,12 @@ export interface InstinctState {
   lastProbeError?: string;
 }
 
+export type CacheRiskLevel = 'safe' | 'caution' | 'risky';
+
 export type HelpActionKind =
   | 'acknowledge'
   | 'clean-cache'
+  | 'clean-external-cache'
   | 'stop-stuck-jobs'
   | 'compact-context'
   | 'enable-eco'
@@ -70,14 +74,41 @@ export type MaintenanceActor = 'instinct' | 'maintainer' | 'user';
 
 export type MaintenanceOutcome = 'relieved' | 'partial' | 'escalated' | 'info' | 'failed';
 
+export interface ActionMeasurement {
+  freedBytes?: number;
+  stoppedJobs?: number;
+  tokensSaved?: number;
+  satisfactionBefore?: number;
+  satisfactionAfter?: number;
+  satisfactionDelta?: number;
+  effective: boolean;
+}
+
+export interface ActionOutcomeLedgerEntry {
+  need: string;
+  action: string;
+  attempts: number;
+  effectiveCount: number;
+  /** 0..1 ratio (`effectiveCount / attempts`). */
+  successRate: number;
+  totalFreedBytes: number;
+  totalStoppedJobs: number;
+  totalTokensSaved: number;
+  totalSatisfactionDelta: number;
+  lastAttemptAt: number;
+  lastEffective: boolean;
+}
+
 export interface MaintenanceRecord {
   id: string;
   at: number;
   actor: MaintenanceActor;
   need?: NeedKey;
+  driveKey?: string;
   action: string;
   summary: string;
   outcome: MaintenanceOutcome;
+  gain?: ActionMeasurement;
 }
 
 export interface MaintenanceSessionStatus {
@@ -86,6 +117,7 @@ export interface MaintenanceSessionStatus {
   status: 'not-created' | 'idle' | 'running' | 'unavailable';
   turnCount: number;
   lastRunAt?: number;
+  circuitBrokenNeeds?: string[];
 }
 
 export interface NeedsSnapshot {
@@ -101,4 +133,8 @@ export interface NeedsSnapshot {
   helpCards: HelpCard[];
   maintenanceSession: MaintenanceSessionStatus;
   records: MaintenanceRecord[];
+  actionLedger?: ActionOutcomeLedgerEntry[];
+  higherOrderDrives?: DriveEvaluation[];
+  higherOrderSuppressed?: boolean;
+  higherOrderSuppressionReason?: string;
 }

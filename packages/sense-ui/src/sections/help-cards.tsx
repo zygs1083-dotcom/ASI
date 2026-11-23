@@ -14,6 +14,7 @@ export const NEED_LABEL: Record<NeedKey, string> = {
 const APPROVE_LABEL: Record<HelpActionKind, string> = {
   acknowledge: '我已处理',
   'clean-cache': '批准清理缓存',
+  'clean-external-cache': '批准清理外部缓存',
   'stop-stuck-jobs': '批准结束任务',
   'compact-context': '批准整理上下文',
   'enable-eco': '启用节能模式',
@@ -78,6 +79,12 @@ export function HelpCardsSection({
                   </span>
                 </div>
                 <div className={css.helpSummary}>{card.summary}</div>
+                {card.actionTarget && (
+                  <div className={css.helpReason}>
+                    受控目标标识：{card.actionTarget}
+                    {card.actionKind === 'clean-external-cache' ? '（自动跳过 1 小时内活跃项）' : ''}
+                  </div>
+                )}
                 {card.proposedAction && <div className={css.helpReason}>建议处理：{card.proposedAction}</div>}
                 <div className={css.helpActions}>
                   <button

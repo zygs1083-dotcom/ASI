@@ -4,7 +4,14 @@ import { expect, type Page, test } from '@playwright/test';
 
 const axeSource = fs.readFileSync(createRequire(import.meta.url).resolve('axe-core/axe.min.js'), 'utf8');
 
-const SCENARIOS = ['healthy', 'memory-pressure', 'rapid-change', 'low-energy', 'permission-denied'] as const;
+const SCENARIOS = [
+  'healthy',
+  'memory-pressure',
+  'rapid-change',
+  'low-energy',
+  'permission-denied',
+  'external-cache-arbitration',
+] as const;
 const THEMES = ['light', 'dark'] as const;
 
 function watchErrors(page: Page) {

@@ -29,6 +29,7 @@ export const SCENARIOS = [
   'low-energy',
   'token-fallback',
   'disk-partial',
+  'external-cache-arbitration',
 ] as const;
 
 export type ScenarioName = (typeof SCENARIOS)[number];
@@ -184,6 +185,119 @@ function lowEnergy(): NeedsPanelModel {
   });
 }
 
+function externalCacheArbitration(): NeedsPanelModel {
+  const body = makeBody();
+  body.disks = disksFixture([
+    { mount: '/', total: 460e9, free: 38e9 },
+    { mount: '/demo/vol', total: 120e9, free: 72e9 },
+  ]);
+  return panelModel(makeState({ self: { ...makeState().self, body } }), {
+    needs: makeNeeds({
+      space: makeNeed('space', 44, '主卷剩余 35.4 GB（8.3%），检测到外部开发者缓存占用较高'),
+    }),
+    maintenanceSession: makeMaintenanceSession({
+      status: 'idle',
+      turnCount: 2,
+      lastRunAt: T0 - 30_000,
+      circuitBrokenNeeds: ['space'],
+    }),
+    helpCards: [
+      {
+        id: 'help-ext-cache-1',
+        need: 'space',
+        severity: 'uncomfortable',
+        title: '发现可清理外部缓存：Xcode DerivedData（可释放 14.20 GB）',
+        summary:
+          '扫描到 Xcode DerivedData 总计 15.80 GB，其中超过 1 小时的可清理项为 14.20 GB（风险分级：safe）；另只读统计到废纸篓占用 2.10 GB（仅提示不代清）。',
+        proposedAction: '点击「批准清理外部缓存」将直接清除超过 1 小时的陈旧项，自动跳过 1 小时内活跃子项。',
+        actionKind: 'clean-external-cache',
+        actionTarget: 'xcode-derived-data',
+        status: 'open',
+        createdAt: T0 - 30_000,
+        updatedAt: T0 - 20_000,
+      },
+    ],
+    actionLedger: [
+      {
+        need: 'space',
+        action: 'clean-external-cache:homebrew',
+        attempts: 2,
+        effectiveCount: 2,
+        successRate: 1,
+        totalFreedBytes: 5_200_000_000,
+        totalStoppedJobs: 0,
+        totalTokensSaved: 0,
+        totalSatisfactionDelta: 19,
+        lastAttemptAt: T0 - 120_000,
+        lastEffective: true,
+      },
+      {
+        need: 'space',
+        action: 'needs_clean_cache',
+        attempts: 1,
+        effectiveCount: 0,
+        successRate: 0,
+        totalFreedBytes: 0,
+        totalStoppedJobs: 0,
+        totalTokensSaved: 0,
+        totalSatisfactionDelta: 0,
+        lastAttemptAt: T0 - 30_000,
+        lastEffective: false,
+      },
+    ],
+    higherOrderSuppressed: true,
+    higherOrderSuppressionReason: 'L1 生理需求处于不适或恢复期，高阶需求已挂起',
+    higherOrderDrives: [
+      {
+        key: 'asi-sleep:consolidation',
+        sourceId: 'asi-sleep',
+        tier: 2,
+        label: '记忆离线巩固',
+        satisfaction: 48,
+        urgency: 52,
+        zone: 'uncomfortable',
+        driveActive: true,
+        suppressed: true,
+        suppressionReason: 'L1 生理需求处于不适或恢复期，高阶需求已挂起',
+        summary: '累计 9 条碎片记忆待空闲期离线整合',
+        evidence: { pendingFragments: 9 },
+        updatedAt: T0,
+      },
+      {
+        key: 'asi-care:digest',
+        sourceId: 'asi-care',
+        tier: 3,
+        label: '环境健康周报',
+        satisfaction: 85,
+        urgency: 15,
+        zone: 'comfortable',
+        driveActive: false,
+        suppressed: true,
+        summary: '本周摘要已是最新',
+        evidence: {},
+        updatedAt: T0,
+      },
+    ],
+    recentMaintenance: [
+      {
+        id: 'rec-ext-0',
+        at: T0 - 30_000,
+        actor: 'maintainer',
+        need: 'space',
+        action: 'needs_clean_cache',
+        summary: 'ASI 自有临时缓存目录已干净，无可清理项',
+        outcome: 'info',
+        gain: {
+          satisfactionBefore: 44,
+          satisfactionAfter: 44,
+          satisfactionDelta: 0,
+          effective: false,
+        },
+      },
+    ],
+  });
+}
+
 const BUILDERS: Record<ScenarioName, () => NeedsPanelModel> = {
   healthy,
   'memory-pressure': memoryPressure,
@@ -194,6 +308,7 @@ const BUILDERS: Record<ScenarioName, () => NeedsPanelModel> = {
   'low-energy': lowEnergy,
   'token-fallback': tokenFallback,
   'disk-partial': diskPartial,
+  'external-cache-arbitration': externalCacheArbitration,
 };
 
 export function makeScenario(name: ScenarioName): NeedsPanelModel {

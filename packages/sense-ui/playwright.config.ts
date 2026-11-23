@@ -1,6 +1,9 @@
-import { defineConfig } from '@playwright/test';
+import { existsSync } from 'node:fs';
+import { chromium, defineConfig } from '@playwright/test';
 
 const PORT = 4173;
+const useChromeChannelFallback =
+  !process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH && !existsSync(chromium.executablePath());
 
 export default defineConfig({
   testDir: './test/e2e',
@@ -22,7 +25,9 @@ export default defineConfig({
         browserName: 'chromium',
         ...(process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH
           ? { launchOptions: { executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH } }
-          : {}),
+          : useChromeChannelFallback
+            ? { channel: 'chrome' }
+            : {}),
       },
     },
   ],

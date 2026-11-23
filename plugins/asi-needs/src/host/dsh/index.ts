@@ -1,8 +1,9 @@
-import type { AsiSenseServiceApi } from '@asi/sense-types';
+import type { AsiDrivesServiceApi, AsiSenseServiceApi } from '@asi/sense-types';
 import type { Context } from '@deepseek-ai/cordis';
 import type {} from '@deepseek-ai/dsh-app-boot';
 import z from '@deepseek-ai/schemastery';
 import { createNeedsRuntime } from '../runtime.js';
+import { AsiDrivesService } from './drives-service.js';
 import { createDshNeedsPorts } from './dsh-ports.js';
 import { createFramesSource } from './frames.js';
 import { AsiNeedsRemote } from './remote.js';
@@ -11,9 +12,11 @@ import { registerNeedsTools } from './tools.js';
 declare module '@deepseek-ai/cordis' {
   interface Context {
     asiSense: AsiSenseServiceApi;
+    asiDrives: AsiDrivesServiceApi;
   }
 }
 
+export { AsiDrivesService } from './drives-service.js';
 export { AsiNeedsRemote } from './remote.js';
 export type { JsonObject, JsonValue, WireNeedsPanelModel } from './wire-types.js';
 
@@ -68,6 +71,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
 
     await runtime.start();
     if (disposed) return;
+    new AsiDrivesService(ctx, runtime);
     new AsiNeedsRemote(ctx, runtime.actions, createFramesSource(runtime));
   } catch (error) {
     await dispose();

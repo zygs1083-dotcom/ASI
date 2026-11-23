@@ -4,7 +4,11 @@
  */
 
 import type {
+  ActionMeasurement,
+  ActionOutcomeLedgerEntry,
   BodyHistory,
+  DriveEvaluation,
+  DriveTier,
   FactStatus,
   HelpActionKind,
   HelpCard,
@@ -31,7 +35,11 @@ import type {
 import { NEED_KEYS, THERMAL_ORDINAL } from '@asi/sense-types';
 
 export type {
+  ActionMeasurement,
+  ActionOutcomeLedgerEntry,
   BodyHistory,
+  DriveEvaluation,
+  DriveTier,
   FactStatus,
   HelpActionKind,
   HelpCard,
@@ -155,6 +163,10 @@ export interface NeedsPanelModel {
   maintenanceSession: MaintenanceSessionStatus;
   helpCards: HelpCard[];
   recentMaintenance: MaintenanceRecord[];
+  actionLedger?: ActionOutcomeLedgerEntry[];
+  higherOrderDrives?: DriveEvaluation[];
+  higherOrderSuppressed?: boolean;
+  higherOrderSuppressionReason?: string;
 }
 
 export interface NeedsPanelProps {

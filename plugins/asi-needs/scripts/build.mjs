@@ -1,3 +1,4 @@
+import { existsSync } from 'node:fs';
 import { mkdir, writeFile } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -6,6 +7,9 @@ import { build } from 'esbuild';
 const pkg = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const lib = join(pkg, 'lib');
 await mkdir(lib, { recursive: true });
+if (!existsSync(join(lib, 'typert.host.js'))) {
+  await import('./generate-typert.mjs');
+}
 
 await build({
   entryPoints: [join(pkg, 'src/host/dsh/index.ts')],
