@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
+  type ActionOutcomeLedgerEntry,
+  type AsiDrivesSnapshot,
   effectiveDisks,
   factStatusAt,
   NEED_KEYS,
@@ -62,5 +64,28 @@ describe('shared type exports', () => {
 
     const tokenPrefix = ['ghp', '_'].join('');
     expect(sanitizeForModel(`title ${tokenPrefix}${'a'.repeat(36)}`)).toBe('title [redacted]');
+
+    const ledgerEntry: ActionOutcomeLedgerEntry = {
+      need: 'space',
+      action: 'clean-external-cache:xcode-derived-data',
+      attempts: 2,
+      effectiveCount: 2,
+      successRate: 1,
+      totalFreedBytes: 4_000_000_000,
+      totalStoppedJobs: 0,
+      totalTokensSaved: 0,
+      totalSatisfactionDelta: 24,
+      lastAttemptAt: 200,
+      lastEffective: true,
+    };
+    const drivesSnap: AsiDrivesSnapshot = {
+      now: 200,
+      powerMode: 'normal',
+      higherOrderSuppressed: false,
+      activeTier: null,
+      drives: [],
+    };
+    expect(ledgerEntry.successRate).toBe(1);
+    expect(drivesSnap.higherOrderSuppressed).toBe(false);
   });
 });
