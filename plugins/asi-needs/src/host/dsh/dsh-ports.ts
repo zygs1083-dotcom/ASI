@@ -1,6 +1,8 @@
 import { randomUUID } from 'node:crypto';
+import { realpathSync } from 'node:fs';
 import { mkdir } from 'node:fs/promises';
 import { homedir } from 'node:os';
+import { join, resolve, sep } from 'node:path';
 import type { Context } from '@deepseek-ai/cordis';
 import type { Agent } from '@deepseek-ai/dsh-agent';
 import type {} from '@deepseek-ai/dsh-api-session-controller';
@@ -24,8 +26,37 @@ export function createDshNeedsPorts(ctx: Context, storageRoot: string, options?:
   const getWorkspaceRegistry = (): WorkspaceRegistry | undefined =>
     (ctx as Context & { get(name: 'workspaceRegistry'): WorkspaceRegistry | undefined }).get('workspaceRegistry');
 
+  const sandboxRoot = resolve(join(storageRoot, 'sandbox'));
+  const safeRealpath = (p: string): string => {
+    try {
+      return realpathSync(p);
+    } catch {
+      return resolve(p);
+    }
+  };
+  const INTERNAL_SESSION_ID_RE = /^asi-(?:maint|sleep|care|sense|internal)(?:[-_:]|$)/i;
+  const INTERNAL_SANDBOX_CWD_RE =
+    /(?:^|[\\/])(?:(?:asi[-_])?(?:needs|sleep|care|sense)[\\/]sandbox|data[\\/]asi-(?:needs|sleep|care|sense))(?:[\\/]|$)/i;
+
+  const isInsideDir = (candidate: string, parent: string): boolean => {
+    const normParent = parent.endsWith(sep) ? parent : `${parent}${sep}`;
+    return candidate === parent || candidate.startsWith(normParent);
+  };
+
   const isUserOrdinaryAgent = (agent: Agent): boolean => {
-    if (agent.session?.header?.origin === 'subagent') return false;
+    const id = String(agent.id ?? '');
+    if (!id || INTERNAL_SESSION_ID_RE.test(id)) return false;
+    const header = agent.session?.header;
+    if (header?.origin === 'subagent') return false;
+    if (typeof header?.delegationDepth === 'number' && header.delegationDepth > 0) return false;
+    const cwd = header?.cwd;
+    if (typeof cwd === 'string' && cwd.trim()) {
+      if (INTERNAL_SANDBOX_CWD_RE.test(cwd)) return false;
+      const normCwd = resolve(cwd);
+      if (isInsideDir(normCwd, sandboxRoot) || isInsideDir(safeRealpath(normCwd), safeRealpath(sandboxRoot))) {
+        return false;
+      }
+    }
     const wr = getWorkspaceRegistry();
     if (wr?.archivedSessionIds.includes(agent.id)) return false;
     return true;

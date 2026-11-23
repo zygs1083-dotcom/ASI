@@ -255,16 +255,25 @@ describe('工具作用域隔离：普通对话 vs 专用后台自维护会话', 
       },
     });
 
-    // 注册 subagent、已归档会话、正常用户会话
+    // 注册 subagent、已归档会话、正常用户会话，以及不在 excludeSessionIds 中的历史/冷恢复内部沙盒与委托会话（置后以攻击 candidates.at(-1)）
     for (const spec of [
-      { id: 'subagent-1', origin: 'subagent' as const },
-      { id: 'archived-user', origin: undefined },
-      { id: 'live-user-1', origin: undefined },
+      { id: 'subagent-1', origin: 'subagent' as const, cwd: undefined, delegationDepth: undefined },
+      { id: 'archived-user', origin: undefined, cwd: undefined, delegationDepth: undefined },
+      { id: 'live-user-1', origin: undefined, cwd: undefined, delegationDepth: undefined },
+      { id: 'asi-maint-stale-99', origin: undefined, cwd: undefined, delegationDepth: undefined },
+      { id: 'minted-sandbox-old', origin: undefined, cwd: join(storageRoot, 'sandbox'), delegationDepth: undefined },
+      { id: 'delegated-child-1', origin: undefined, cwd: undefined, delegationDepth: 1 },
     ]) {
       const a = {
         id: SessionId(spec.id),
         status: 'idle' as const,
-        session: { header: { ...(spec.origin ? { origin: spec.origin } : {}) } },
+        session: {
+          header: {
+            ...(spec.origin ? { origin: spec.origin } : {}),
+            ...(spec.cwd ? { cwd: spec.cwd } : {}),
+            ...(spec.delegationDepth !== undefined ? { delegationDepth: spec.delegationDepth } : {}),
+          },
+        },
         followup: (msg: { content: { text: string }[] }) =>
           cryInbox.push({ agentId: spec.id, text: msg.content[0]?.text ?? '' }),
         send: (msg: { content: { text: string }[] }) =>

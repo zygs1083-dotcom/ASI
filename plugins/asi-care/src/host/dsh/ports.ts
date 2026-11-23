@@ -1,5 +1,6 @@
+import { realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { basename, dirname, join } from 'node:path';
+import { dirname, join, resolve, sep } from 'node:path';
 import type { Context } from '@deepseek-ai/cordis';
 import type { Agent } from '@deepseek-ai/dsh-agent';
 import { JobId } from '@deepseek-ai/dsh-jobs';
@@ -42,11 +43,60 @@ export function createDshCarePorts(ctx: Context, storageRoot: string, options?: 
     }
   };
 
-  const ASI_INTERNAL_PATH_RE = /(?:^|[\\/])asi-(?:needs|sense|care|sleep)(?:[\\/]|$)/;
+  const ASI_INTERNAL_PATH_RE =
+    /(?:^|[\\/])(?:asi-(?:needs|sense|care|sleep)|(?:needs|sense|care|sleep)[\\/](?:sandbox|vault))(?:[\\/]|$)/i;
+  const INTERNAL_SESSION_ID_RE = /^asi-(?:maint|sleep|care|sense|internal)(?:[-_:]|$)/i;
 
-  const isInternalSession = (id: string, cwd?: string, origin?: string): boolean => {
-    if (origin === 'subagent' || id.startsWith('asi-maint-')) return true;
-    if (typeof cwd === 'string' && ASI_INTERNAL_PATH_RE.test(cwd)) return true;
+  const safeRealpath = (p: string): string => {
+    try {
+      return realpathSync(p);
+    } catch {
+      return resolve(p);
+    }
+  };
+
+  const isSameOrInsideSync = (parent: string, candidate: string): boolean => {
+    const prefix = parent.endsWith(sep) ? parent : `${parent}${sep}`;
+    return candidate === parent || candidate.startsWith(prefix);
+  };
+
+  const collectInternalRoots = (): string[] => {
+    const roots = new Set<string>([storageRoot]);
+    if (ctx.asiSense.storageRoot) {
+      roots.add(ctx.asiSense.storageRoot);
+    }
+    for (const anchor of [storageRoot, ctx.asiSense.storageRoot]) {
+      if (!anchor) continue;
+      const dataParent = dirname(anchor);
+      if (dataParent && dataParent !== '/' && dataParent !== '.') {
+        roots.add(join(dataParent, 'asi-needs'));
+        roots.add(join(dataParent, 'asi-sense'));
+        roots.add(join(dataParent, 'asi-sleep'));
+        roots.add(join(dataParent, 'asi-care'));
+        roots.add(join(dataParent, 'needs', 'sandbox'));
+        roots.add(join(dataParent, 'sleep', 'vault'));
+      }
+    }
+    return [...roots];
+  };
+
+  const isInternalPath = (candidate: string): boolean => {
+    if (ASI_INTERNAL_PATH_RE.test(candidate)) return true;
+    const normCandidate = resolve(candidate);
+    const realCandidate = safeRealpath(normCandidate);
+    for (const root of collectInternalRoots()) {
+      const normRoot = resolve(root);
+      if (isSameOrInsideSync(normRoot, normCandidate) || isSameOrInsideSync(safeRealpath(normRoot), realCandidate)) {
+        return true;
+      }
+    }
+    return false;
+  };
+
+  const isInternalSession = (id: string, cwd?: string, origin?: string, delegationDepth?: number): boolean => {
+    if (origin === 'subagent' || INTERNAL_SESSION_ID_RE.test(id)) return true;
+    if (typeof delegationDepth === 'number' && delegationDepth > 0) return true;
+    if (typeof cwd === 'string' && cwd.trim() && isInternalPath(cwd)) return true;
     return false;
   };
 
@@ -115,7 +165,7 @@ export function createDshCarePorts(ctx: Context, storageRoot: string, options?: 
         return wr
           .list()
           .map((ws) => ws.path)
-          .filter((p) => typeof p === 'string' && !ASI_INTERNAL_PATH_RE.test(p));
+          .filter((p) => typeof p === 'string' && p.trim().length > 0 && !isInternalPath(p));
       } catch {
         return [];
       }
@@ -138,20 +188,21 @@ export function createDshCarePorts(ctx: Context, storageRoot: string, options?: 
           id: s.id,
           ...(cwd ? { cwd } : {}),
           active: activeOwnerIds.has(s.id),
-          internal: isInternalSession(s.id, cwd, s.header?.origin),
+          internal: isInternalSession(s.id, cwd, s.header?.origin, s.header?.delegationDepth),
         });
       }
 
       for (const a of ctx.agents.list()) {
         if (archivedSet.has(a.id)) continue;
-        const header = (a as { session?: { header?: { cwd?: string; origin?: string } } }).session?.header;
+        const header = (a as { session?: { header?: { cwd?: string; origin?: string; delegationDepth?: number } } })
+          .session?.header;
         const cwd = header?.cwd ?? out.get(a.id)?.cwd;
         const isActive = a.status !== 'idle' || activeOwnerIds.has(a.id);
         out.set(a.id, {
           id: a.id,
           ...(cwd ? { cwd } : {}),
           active: isActive,
-          internal: isInternalSession(a.id, cwd, header?.origin),
+          internal: isInternalSession(a.id, cwd, header?.origin, header?.delegationDepth),
         });
       }
 
@@ -159,17 +210,7 @@ export function createDshCarePorts(ctx: Context, storageRoot: string, options?: 
     },
 
     listInternalRoots(): string[] {
-      const roots = new Set<string>([storageRoot]);
-      if (ctx.asiSense.storageRoot) {
-        roots.add(ctx.asiSense.storageRoot);
-      }
-      if (basename(storageRoot) === 'asi-care') {
-        const dataParent = dirname(storageRoot);
-        roots.add(join(dataParent, 'asi-needs'));
-        roots.add(join(dataParent, 'asi-sense'));
-        roots.add(join(dataParent, 'asi-sleep'));
-      }
-      return [...roots];
+      return collectInternalRoots();
     },
 
     jobs,

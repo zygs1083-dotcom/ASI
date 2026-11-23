@@ -1,9 +1,10 @@
-import { spawnSync } from 'node:child_process';
+import { execFile as execFileCb, spawnSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readdir, readFile, rm, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { promisify } from 'node:util';
 import { Context } from '@deepseek-ai/cordis';
 import { type Agent, emitAgentEvent } from '@deepseek-ai/dsh-agent';
 import { createAssistantMessage, createUserMessage } from '@deepseek-ai/dsh-llm';
@@ -11,11 +12,14 @@ import { createScope } from '@deepseek-ai/dsh-scope';
 import { Session, SessionId, SessionLogOffset, SessionSeq } from '@deepseek-ai/dsh-session';
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt';
 import { NativeToolExecutor } from '@deepseek-ai/dsh-tool-executor-native';
-import ToolsService from '@deepseek-ai/dsh-tools';
+import ToolsService, { defineTool } from '@deepseek-ai/dsh-tools';
 import * as AsiNeedsPlugin from 'asi-needs';
 import * as AsiSensePlugin from 'asi-sense';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import * as AsiCarePlugin from '../../asi-care/src/host/dsh/index.js';
 import * as AsiSleepPlugin from '../src/host/dsh/index.js';
+
+const execFile = promisify(execFileCb);
 
 const tempDirs: string[] = [];
 
@@ -912,6 +916,268 @@ describe('Cordis 全栈联合集成（asi-sense + asi-needs + asi-sleep）', () 
       expect(finalJsonl).toContain('流式窗口期手写新增踩坑');
       expect(finalJsonl).toContain('流式整合提炼');
     } finally {
+      sleepFork.dispose();
+      needsFork.dispose();
+      senseFork.dispose();
+      await new Promise((r) => setTimeout(r, 25));
+    }
+  });
+
+  it('四插件全栈 Cordis 同载（含逆序挂载 + dsh-context/dsh-superagent 共存）：L3 自动维护回合严禁越权强跑 L2 sleep_consolidate，且内部 needs/sandbox 对 asi-care 与 asi-sleep 双向隐身', {
+    timeout: 30_000,
+  }, async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'asi-4plugin-cordis-'));
+    tempDirs.push(dir);
+
+    const gitEnv = {
+      ...process.env,
+      GIT_AUTHOR_NAME: 'Test Bot',
+      GIT_AUTHOR_EMAIL: 'bot@test.local',
+      GIT_COMMITTER_NAME: 'Test Bot',
+      GIT_COMMITTER_EMAIL: 'bot@test.local',
+    };
+    const wtMain = join(dir, 'work', 'repo-main');
+    const wtIdle = join(dir, 'work', 'repo-wt-idle');
+    await mkdir(wtMain, { recursive: true });
+    await execFile('git', ['init', '-b', 'main'], { cwd: wtMain, env: gitEnv });
+    await writeFile(join(wtMain, 'index.ts'), 'export const v = 1;\n');
+    await execFile('git', ['add', '.'], { cwd: wtMain, env: gitEnv });
+    await execFile('git', ['commit', '-m', 'init'], { cwd: wtMain, env: gitEnv });
+    await execFile('git', ['worktree', 'add', '-b', 'feat/idle-lock', wtIdle, 'main'], { cwd: wtMain, env: gitEnv });
+
+    const wtIdleGitDir = (
+      await execFile('git', ['rev-parse', '--git-dir'], { cwd: wtIdle, env: gitEnv })
+    ).stdout.trim();
+    const deadLock = join(wtIdleGitDir, 'index.lock');
+    await writeFile(deadLock, '');
+    const fourHoursAgoSec = (Date.now() - 4 * 3_600_000) / 1000;
+    const setTreeMtimeSec = async (target: string): Promise<void> => {
+      const entries = await readdir(target, { withFileTypes: true }).catch(() => []);
+      for (const entry of entries) {
+        if (entry.isSymbolicLink()) continue;
+        const full = join(target, entry.name);
+        if (entry.isDirectory()) {
+          await setTreeMtimeSec(full);
+        } else {
+          await utimes(full, fourHoursAgoSec, fourHoursAgoSec);
+        }
+      }
+      await utimes(target, fourHoursAgoSec, fourHoursAgoSec);
+    };
+    await setTreeMtimeSec(wtIdle);
+    await setTreeMtimeSec(wtIdleGitDir);
+
+    const root = new Context();
+    await root.plugin(SystemPrompt);
+    await root.plugin(ToolsService);
+    root.tools.setExecutor(new NativeToolExecutor(root));
+
+    // 模拟宿主已安装的 dsh-context、dsh-superagent 与危险 shell 工具
+    for (const extName of ['dsh_context_inspect', 'dsh_superagent_dispatch', 'shell']) {
+      root.tools.register(
+        defineTool({
+          name: extName,
+          description: `external ${extName}`,
+          parameters: {},
+          output: { schema: { type: 'json' }, render: (_a, v) => [{ type: 'text', text: JSON.stringify(v) }] },
+          async execute() {
+            return { ok: true };
+          },
+        }),
+      );
+    }
+
+    const agentsList: Agent[] = [];
+    const sessionsList: Session[] = [];
+    const workspaces: Array<{ id: string; path: string; title?: string; sessionIds: SessionId[] }> = [
+      { id: 'ws-user-main', path: wtMain, title: 'Main Repo', sessionIds: [] },
+    ];
+    let autoTurnRan = false;
+    let sleepGuardDeniedInAutoTurn = false;
+    let sleepForcedRejectedInAutoTurn = false;
+    let careCleanedLocksInAutoTurn = false;
+
+    const userSession = Session.create(SessionId('user-live-4p'), [], {
+      version: 4,
+      id: SessionId('user-live-4p'),
+      createdAt: Date.now(),
+      cwd: wtMain,
+      isSeeded: false,
+    });
+    for (let i = 1; i <= 12; i += 1) {
+      appendTurn(userSession, i, `第 ${i} 轮讨论：坚持模块化四插件隔离`, `第 ${i} 轮确认`);
+    }
+    sessionsList.push(userSession);
+    workspaces[0]?.sessionIds.push(userSession.id);
+
+    const userAgent = {
+      id: userSession.id,
+      status: 'thinking' as const,
+      session: userSession,
+    } as unknown as Agent & { ctx: Context };
+    userAgent.ctx = createScope(root, userAgent).ctx;
+    agentsList.push(userAgent);
+
+    root.provide('agents', {
+      list: () => agentsList,
+      get: (id: string) => agentsList.find((a) => a.id === id),
+      withoutInitiator: <T>(fn: () => T) => fn(),
+    });
+    root.provide('jobs', { list: () => [], kill: () => 'already-finished', events: { subscribe: () => () => {} } });
+    root.provide('llm', { listConfigurableProviders: () => [], resolveModelInfo: async () => undefined });
+    root.provide('sessionProjections', { snapshot: () => ({ values: {} }) });
+    root.provide('sessions', {
+      list: () => sessionsList,
+      get: (id: SessionId) => sessionsList.find((s) => s.id === id),
+    });
+    root.provide('tokenMeter', { contextPressure: () => ({}) });
+    root.provide('workspaceRegistry', {
+      archivedSessionIds: [],
+      create: async (path: string, title?: string) => {
+        const ws = { id: `ws-${workspaces.length + 1}`, path, title, sessionIds: [] as SessionId[] };
+        workspaces.push(ws);
+        return ws;
+      },
+      list: () => workspaces,
+    });
+    root.provide('profileContext', {
+      name: 'desktop',
+      dir,
+      patchPath: '',
+      installAnchor: '',
+      cwd: '',
+      home: dir,
+      startedBundles: ['dsh-context', 'dsh-superagent', 'asi-care', 'asi-sleep', 'asi-needs', 'asi-sense'],
+      overlays: [],
+      telemetryDisabledEnv: undefined,
+    });
+    root.provide('sessionController', {
+      create: async (req: { workspaceId?: string; cwd?: string }) => {
+        // DSH 分配普通样式 ID（非 asi-maint-*），并将 needs/sandbox 写入 workspaceRegistry
+        const mintedId = SessionId('session-minted-maint-1');
+        const ws = workspaces.find((w) => w.id === req.workspaceId);
+        const maintSession = Session.create(mintedId, [], {
+          version: 4,
+          id: mintedId,
+          createdAt: Date.now(),
+          cwd: ws?.path ?? req.cwd ?? join(dir, 'needs', 'sandbox'),
+          isSeeded: false,
+        });
+        sessionsList.push(maintSession);
+        ws?.sessionIds.push(mintedId);
+
+        let turnPromise: Promise<void> = Promise.resolve();
+        const maintAgent = {
+          id: mintedId,
+          status: 'idle' as const,
+          session: maintSession,
+          send: () => {},
+          cancel: () => {},
+          whenIdle: () => turnPromise,
+          followup: () => {
+            turnPromise = (async () => {
+              const guardCheck = root.tools.checkGuards({ name: 'sleep_consolidate', agent: maintAgent } as never);
+              sleepGuardDeniedInAutoTurn = Boolean(guardCheck?.reason?.includes('autoMaintain=false'));
+
+              const sleepExec = root.tools.executable('sleep_consolidate', maintAgent);
+              try {
+                await sleepExec?.execute({ force: true }, {
+                  agent: maintAgent,
+                  signal: new AbortController().signal,
+                  callId: 'auto-sleep-1' as never,
+                } as never);
+              } catch (err) {
+                sleepForcedRejectedInAutoTurn = String(err).includes('autoMaintain=false');
+              }
+
+              const cleanLocksExec = root.tools.executable('care_clean_git_locks', maintAgent);
+              const lockRes = (await cleanLocksExec?.execute({}, {
+                agent: maintAgent,
+                signal: new AbortController().signal,
+                callId: 'auto-care-1' as never,
+              } as never)) as { stoppedJobs?: number };
+              careCleanedLocksInAutoTurn = (lockRes?.stoppedJobs ?? 0) === 1;
+              autoTurnRan = true;
+            })();
+          },
+        } as unknown as Agent & { ctx: Context };
+        maintAgent.ctx = createScope(root, maintAgent).ctx;
+        agentsList.push(maintAgent);
+        emitAgentEvent(root, maintAgent, 'agent/created', { source: 'startup' });
+        return { sessionId: mintedId };
+      },
+      rename: async () => ({ title: 'ASI 自维护', seq: 1 }),
+      resolveAgent: async (sid: string) => {
+        const found = agentsList.find((a) => a.id === sid);
+        return found ? { agent: found } : { error: new Error('not found') };
+      },
+    });
+
+    // 故意按逆序挂载 4 个真实插件（asi-care -> asi-sleep -> asi-needs -> asi-sense），验证 Cordis inject 依赖拓扑收敛
+    const careFork = await root.plugin(AsiCarePlugin, { storageRoot: join(dir, 'care') });
+    const sleepFork = await root.plugin(AsiSleepPlugin, { storageRoot: join(dir, 'sleep') });
+    const needsFork = await root.plugin(AsiNeedsPlugin, { storageRoot: join(dir, 'needs') });
+    const senseFork = await root.plugin(AsiSensePlugin, {
+      storageRoot: join(dir, 'sense'),
+      helperPath: join(dir, 'nonexistent-helper'),
+      intervalMs: 10_000,
+    });
+
+    try {
+      emitAgentEvent(root, userAgent, 'agent/created', { source: 'startup' });
+
+      await vi.waitFor(
+        () => {
+          expect(autoTurnRan).toBe(true);
+        },
+        { timeout: 15_000 },
+      );
+
+      expect(sleepGuardDeniedInAutoTurn).toBe(true);
+      expect(sleepForcedRejectedInAutoTurn).toBe(true);
+      expect(careCleanedLocksInAutoTurn).toBe(true);
+      expect(existsSync(deadLock)).toBe(false);
+
+      // 普通用户会话完整保留 dsh-context / dsh-superagent / shell 与全部 6 个 ASI 只读工具，且零沙盒写工具泄露
+      const ordinaryTools = root.tools.definitions(userAgent).map((d) => d.name);
+      for (const expectedTool of [
+        'dsh_context_inspect',
+        'dsh_superagent_dispatch',
+        'shell',
+        'env_state',
+        'env_detail',
+        'needs_status',
+        'memory_recall',
+        'memory_profile',
+        'care_status',
+      ]) {
+        expect(ordinaryTools).toContain(expectedTool);
+      }
+      for (const forbidden of ['needs_clean_cache', 'care_clean_git_locks', 'sleep_consolidate']) {
+        expect(ordinaryTools).not.toContain(forbidden);
+      }
+
+      // 自维护会话严格剥离 shell / dsh_superagent_dispatch / memory_recall，仅见白名单只读与维护工具
+      const maintAgent = agentsList.find((a) => String(a.id) === 'session-minted-maint-1');
+      expect(maintAgent).toBeDefined();
+      const maintTools = root.tools.definitions(maintAgent).map((d) => d.name);
+      expect(maintTools).toContain('care_status');
+      expect(maintTools).toContain('care_clean_git_locks');
+      expect(maintTools).not.toContain('shell');
+      expect(maintTools).not.toContain('dsh_superagent_dispatch');
+      expect(maintTools).not.toContain('memory_recall');
+
+      // care_status 仅发现真实 Git 主仓与兄弟工作树（共 2 个），严格排除已注册进 workspaceRegistry 的 <dir>/needs/sandbox
+      const careStatusExec = root.tools.executable('care_status', userAgent);
+      const careSnap = (await careStatusExec?.execute({ refresh: true }, {
+        agent: userAgent,
+        signal: new AbortController().signal,
+        callId: 'cs-4p' as never,
+      } as never)) as { discovery: { worktreeCount: number; worktrees: Array<{ displayPath: string }> } };
+      expect(careSnap.discovery.worktreeCount).toBe(2);
+      expect(JSON.stringify(careSnap.discovery.worktrees)).not.toContain('sandbox');
+    } finally {
+      careFork.dispose();
       sleepFork.dispose();
       needsFork.dispose();
       senseFork.dispose();

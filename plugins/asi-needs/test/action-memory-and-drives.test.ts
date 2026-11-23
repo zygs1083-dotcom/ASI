@@ -1885,6 +1885,11 @@ describe('0.3.0 全景嗅探、一键外部缓存批准清理、行动效果记�
     const maintPrompts: string[] = [];
     const cries: string[] = [];
     let careBloatSat = 100;
+    let sleepSat = 42;
+    let sleepConsolidateRuns = 0;
+    let careSniffRuns = 0;
+    let autoTurnSleepGuardAllowed: boolean | undefined;
+    let autoTurnSleepExecError: string | undefined;
 
     const rt = createNeedsRuntime({
       storageRoot: dir,
@@ -1896,16 +1901,35 @@ describe('0.3.0 全景嗅探、一键外部缓存批准清理、行动效果记�
       sessions: {
         createMaintenanceSession: async (id) => id,
         hasSession: () => true,
-        runMaintenanceTurn: async (_sid, prompt) => {
+        runMaintenanceTurn: async (_sid, prompt, signal) => {
           maintPrompts.push(prompt);
-          await rt.drives.proposeHelpCard('asi-care', {
-            driveKey: 'workspace_bloat',
-            title: '发现闲置工作树构建产物',
-            summary: '~/work/wt-old/node_modules 闲置 9 天（1.5 GiB）',
-            actionKind: 'run-drive-action',
-            actionTarget: 'art_demo01',
-            approveLabel: '批准清理构建产物',
-          });
+          const sleepTool = rt.drives.registeredSandboxTools().find((t) => t.spec.name === 'sleep_consolidate');
+          const careTool = rt.drives.registeredSandboxTools().find((t) => t.spec.name === 'care_sniff_workspaces');
+          if (maintPrompts.length === 1) {
+            // 自动唤醒回合（!manual）：autoMaintain=false 的 sleep_consolidate 必须被护栏拦截，严禁趁聊天中强跑！
+            autoTurnSleepGuardAllowed = rt.drives.checkSandboxToolGuard('sleep_consolidate').allowed;
+            if (sleepTool) {
+              try {
+                await rt.drives.executeSandboxTool(sleepTool, { force: true }, signal);
+              } catch (err) {
+                autoTurnSleepExecError = err instanceof Error ? err.message : String(err);
+              }
+            }
+            if (careTool) {
+              await rt.drives.executeSandboxTool(careTool, {}, signal);
+            }
+            await rt.drives.proposeHelpCard('asi-care', {
+              driveKey: 'workspace_bloat',
+              title: '发现闲置工作树构建产物',
+              summary: '~/work/wt-old/node_modules 闲置 9 天（1.5 GiB）',
+              actionKind: 'run-drive-action',
+              actionTarget: 'art_demo01',
+              approveLabel: '批准清理构建产物',
+            });
+          } else if (sleepTool) {
+            // 用户手动触发自检（manual=true）：允许显式调用 sleep_consolidate
+            await rt.drives.executeSandboxTool(sleepTool, { force: true }, signal);
+          }
         },
         deliverCryToUserSession: async (_target, _exclude, text) => {
           cries.push(text);
@@ -1935,10 +1959,23 @@ describe('0.3.0 全景嗅探、一键外部缓存批准清理、行动效果记�
           {
             key: 'consolidation',
             label: '睡眠记忆整合',
-            satisfaction: 42,
+            satisfaction: sleepSat,
             autoMaintain: false,
-            summary: '累计 14 轮待睡眠整合（等待 10 分钟静默期）',
-            evidence: { unconsolidatedTurns: 14, quietWindow: false },
+            summary: sleepSat < 70 ? '累计 14 轮待睡眠整合（等待 10 分钟静默期）' : '记忆已巩固',
+            evidence: { unconsolidatedTurns: sleepSat < 70 ? 14 : 0, quietWindow: false },
+          },
+        ],
+        sandboxTools: [
+          {
+            name: 'sleep_consolidate',
+            driveKey: 'consolidation',
+            description: 'Consolidate memories',
+            parameters: { force: { type: 'boolean' } },
+            execute: async () => {
+              sleepConsolidateRuns += 1;
+              sleepSat = 100;
+              return { summary: '已完成睡眠记忆巩固' };
+            },
           },
         ],
       });
@@ -1954,6 +1991,17 @@ describe('0.3.0 全景嗅探、一键外部缓存批准清理、行动效果记�
             satisfaction: careBloatSat,
             summary: careBloatSat < 60 ? '闲置产物 1.5 GiB' : '无膨胀',
             evidence: { bloatBytes: careBloatSat < 60 ? 1_600_000_000 : 0 },
+          },
+        ],
+        sandboxTools: [
+          {
+            name: 'care_sniff_workspaces',
+            driveKey: 'workspace_bloat',
+            description: 'Sniff workspaces',
+            execute: async () => {
+              careSniffRuns += 1;
+              return { summary: '已嗅探工作区产物膨胀' };
+            },
           },
         ],
         executeHelpAction: async (input) => {
@@ -1984,6 +2032,10 @@ describe('0.3.0 全景嗅探、一键外部缓存批准清理、行动效果记�
       });
       expect(maintPrompts[0]).toContain('asi-care:workspace_bloat');
       expect(maintPrompts[0]).not.toContain('asi-sleep:consolidation');
+      expect(autoTurnSleepGuardAllowed).toBe(false);
+      expect(autoTurnSleepExecError).toMatch(/autoMaintain=false/);
+      expect(sleepConsolidateRuns).toBe(0);
+      expect(careSniffRuns).toBe(1);
       expect(cries).toHaveLength(0);
 
       // 阶段 3：用户在侧栏一键批准静默求助卡 -> 执行回调恢复舒适并记入 ActionOutcomeLedger
@@ -2000,6 +2052,11 @@ describe('0.3.0 全景嗅探、一键外部缓存批准清理、行动效果记�
           (e) => e.need === 'asi-care:workspace_bloat' && e.action === 'clean-workspace-artifact:node_modules',
         );
       expect(ledgerEntry?.effectiveCount).toBe(1);
+
+      // 阶段 4：用户显式点击「立即自检」（manual=true）时，允许在沙盒手动调用 sleep_consolidate
+      await rt.actions.triggerCheck();
+      expect(sleepConsolidateRuns).toBe(1);
+      expect(rt.snapshot().higherOrderDrives?.find((d) => d.key === 'asi-sleep:consolidation')?.satisfaction).toBe(100);
       expect(cries).toHaveLength(0);
     } finally {
       await rt.stop();

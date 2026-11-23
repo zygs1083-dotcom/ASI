@@ -188,17 +188,32 @@ describe('NeedsPanel SSR 契约验证', () => {
     m.higherOrderSuppressed = false;
     m.higherOrderDrives = [
       {
+        key: 'asi-sleep:consolidation',
+        sourceId: 'asi-sleep',
+        tier: 2,
+        label: '睡眠记忆整合',
+        satisfaction: 48,
+        urgency: 52,
+        zone: 'uncomfortable',
+        driveActive: true,
+        autoMaintain: false,
+        suppressed: false,
+        summary: '累计 14 轮待睡眠整合（等待 10 分钟静默窗口）',
+        evidence: { unconsolidatedTurns: 14 },
+        updatedAt: T0,
+      },
+      {
         key: 'asi-care:repo_hygiene',
         sourceId: 'asi-care',
         tier: 3,
         label: '仓库与工作树卫生',
-        satisfaction: 52,
-        urgency: 48,
-        zone: 'uncomfortable',
+        satisfaction: 65,
+        urgency: 35,
+        zone: 'comfortable',
         driveActive: true,
         suppressed: false,
-        summary: '1 个工作树未提交改动静置 >24h',
-        evidence: { staleDirty: 1 },
+        summary: '工作树卫生恢复至 65%（回滞保持观察中）',
+        evidence: { staleDirty: 0 },
         updatedAt: T0,
       },
       {
@@ -236,6 +251,9 @@ describe('NeedsPanel SSR 契约验证', () => {
     expect(html).toContain('受控目标标识：art_123456abcdef（执行前二次复核活跃豁免与安全护栏）');
     expect(html).toContain('静默熔断省流中（L3 仓库与工作树卫生）');
     expect(html).toContain('L3 闲置工作树产物膨胀 · clean-workspace-artifact:node_modules');
+    expect(html).toContain('等待静默窗口');
+    expect(html).toContain('恢复至 70% 前保持驱动');
+    expect(html).toContain('自维护驱动中');
   });
 });
 

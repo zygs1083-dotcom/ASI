@@ -91,6 +91,7 @@ export function NeedsSection({
             {extraDrives.map((drv) => {
               const sat = Math.max(0, Math.min(100, Math.round(drv.satisfaction)));
               const urg = Math.max(0, Math.min(100, Math.round(drv.urgency)));
+              const visualZone: NeedZone = drv.zone === 'comfortable' && drv.driveActive ? 'uncomfortable' : drv.zone;
               return (
                 <div
                   key={drv.key}
@@ -109,7 +110,13 @@ export function NeedsSection({
                       {drv.suppressed ? (
                         <span className={css.suppressedInline}>已压制挂起</span>
                       ) : drv.driveActive ? (
-                        <span className={css.driveBadge}>自维护驱动中</span>
+                        <span className={css.driveBadge}>
+                          {drv.zone === 'comfortable'
+                            ? '恢复至 70% 前保持驱动'
+                            : drv.autoMaintain === false
+                              ? '等待静默窗口'
+                              : '自维护驱动中'}
+                        </span>
                       ) : null}
                     </span>
                     <span className={css.needScore}>
@@ -117,7 +124,7 @@ export function NeedsSection({
                     </span>
                   </div>
                   <div className={css.meterTrack} aria-hidden="true">
-                    <i className={css.meterFill} data-zone={drv.zone} style={{ width: `${sat}%` }} />
+                    <i className={css.meterFill} data-zone={visualZone} style={{ width: `${sat}%` }} />
                   </div>
                   <div className={css.needSummary}>{drv.summary}</div>
                 </div>

@@ -2106,7 +2106,10 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime & { read
     notifySourceChanged: (sourceId) => arbiter.notifySourceChanged(sourceId),
     onToolsStructureChanged: (listener) => arbiter.onToolsStructureChanged(listener),
     registeredSandboxTools: () => arbiter.registeredSandboxTools(),
-    checkSandboxToolGuard: (toolName) => arbiter.checkSandboxToolGuard(toolName),
+    checkSandboxToolGuard: (toolName) =>
+      arbiter.checkSandboxToolGuard(toolName, {
+        autonomousTurn: maintStatus === 'running' && !activeCheckManual,
+      }),
 
     async proposeHelpCard(sourceId, proposal) {
       const src = arbiter.getSource(sourceId);
@@ -2193,7 +2196,9 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime & { read
     },
 
     async executeSandboxTool(tool, args, signal) {
-      const guard = arbiter.checkSandboxToolGuard(tool.spec.name);
+      const guard = arbiter.checkSandboxToolGuard(tool.spec.name, {
+        autonomousTurn: maintStatus === 'running' && !activeCheckManual,
+      });
       if (!guard.allowed) {
         throw new Error(guard.reason ?? 'Sandbox tool is currently suspended');
       }

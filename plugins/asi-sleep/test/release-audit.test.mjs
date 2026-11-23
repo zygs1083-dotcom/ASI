@@ -1,5 +1,4 @@
 import { spawnSync } from 'node:child_process';
-import { existsSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { userInfo } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -21,14 +20,8 @@ describe('asi-sleep release-audit 安全门禁测试', () => {
       'lib/client.js',
       'lib/typert.host.js',
     ];
-    if (
-      !existsSync(join(pkgDir, 'lib/index.js')) ||
-      !existsSync(join(pkgDir, 'lib/client.js')) ||
-      !existsSync(join(pkgDir, 'lib/typert.host.js'))
-    ) {
-      const built = spawnSync(process.execPath, ['scripts/build.mjs'], { cwd: pkgDir, encoding: 'utf8' });
-      expect(built.status, built.stderr || built.stdout).toBe(0);
-    }
+    const built = spawnSync(process.execPath, ['scripts/build.mjs'], { cwd: pkgDir, encoding: 'utf8' });
+    expect(built.status, built.stderr || built.stdout).toBe(0);
     const buffers = new Map();
     for (const f of files) {
       buffers.set(f, await readFile(join(pkgDir, f)));

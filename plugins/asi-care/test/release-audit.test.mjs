@@ -1,5 +1,4 @@
 import { spawnSync } from 'node:child_process';
-import { existsSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { userInfo } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -29,10 +28,8 @@ describe('asi-care 发布包卫生审计', () => {
 
   it('构建产物通过敏感路径、凭据、邮箱、本机用户名与 sourcemap 扫描', { timeout: 30_000 }, async () => {
     const files = ['package.json', 'cordis.patch.yml', 'scripts/dsh.sh', 'lib/index.js'];
-    if (!existsSync(join(pkgDir, 'lib/index.js'))) {
-      const built = spawnSync(process.execPath, ['scripts/build.mjs'], { cwd: pkgDir, encoding: 'utf8' });
-      expect(built.status, built.stderr || built.stdout).toBe(0);
-    }
+    const built = spawnSync(process.execPath, ['scripts/build.mjs'], { cwd: pkgDir, encoding: 'utf8' });
+    expect(built.status, built.stderr || built.stdout).toBe(0);
     const buffers = new Map();
     for (const f of files) {
       buffers.set(f, await readFile(join(pkgDir, f)));

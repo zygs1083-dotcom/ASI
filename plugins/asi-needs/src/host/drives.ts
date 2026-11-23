@@ -241,9 +241,13 @@ export class MaslowDriveArbiter {
     return out;
   }
 
-  checkSandboxToolGuard(toolName: string): { allowed: boolean; reason?: string } {
+  checkSandboxToolGuard(
+    toolName: string,
+    options?: { autonomousTurn?: boolean },
+  ): { allowed: boolean; reason?: string } {
     const ownerId = this.toolOwners.get(toolName);
-    if (!ownerId || !this.sources.has(ownerId)) {
+    const src = ownerId ? this.sources.get(ownerId) : undefined;
+    if (!ownerId || !src) {
       return { allowed: false, reason: 'ASI maintenance sandbox forbids non-whitelisted tools' };
     }
     if (this.latestSnapshot.higherOrderSuppressed) {
@@ -253,6 +257,29 @@ export class MaslowDriveArbiter {
           this.latestSnapshot.suppressionReason ??
           'Higher-order drive sandbox tool is suspended while L1 physiological needs or eco mode are active',
       };
+    }
+    if (options?.autonomousTurn) {
+      const spec = src.sandboxTools?.find((t) => t.name === toolName);
+      if (spec) {
+        const regTool: RegisteredSandboxTool = {
+          sourceId: src.id,
+          tier: src.tier,
+          spec,
+          ...(spec.driveKey ? { qualifiedDriveKey: this.qualifyKey(src.id, spec.driveKey) } : {}),
+        };
+        const targetKey = this.resolveTargetDriveKey(regTool);
+        const targetDrive = targetKey ? this.latestSnapshot.drives.find((d) => d.key === targetKey) : undefined;
+        const sourceDrives = this.latestSnapshot.drives.filter((d) => d.sourceId === src.id);
+        const autoMaintainDisabled =
+          targetDrive?.autoMaintain === false ||
+          (!targetDrive && sourceDrives.length > 0 && sourceDrives.every((d) => d.autoMaintain === false));
+        if (autoMaintainDisabled) {
+          return {
+            allowed: false,
+            reason: `Higher-order drive "${targetDrive?.key ?? src.id}" has autoMaintain=false and is deferred during autonomous maintenance turns`,
+          };
+        }
+      }
     }
     return { allowed: true };
   }
