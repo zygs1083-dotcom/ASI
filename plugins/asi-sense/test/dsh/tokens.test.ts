@@ -82,7 +82,7 @@ describe('DSH token projections', () => {
     };
     const unregister = await ctx.agents.register(agent);
     onTestFinished(unregister);
-    const port = createDshPort(ctx, () => false);
+    const port = createDshPort(ctx);
     expect(await port.tokenSnapshot(id)).toEqual({
       contextWindow: 256_000,
       contextWindowSource: 'fallback',

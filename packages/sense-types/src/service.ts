@@ -33,6 +33,8 @@ export interface SenseSnapshot {
 }
 
 export interface AsiSenseServiceApi {
+  /** Optional storage root owned by `asi-sense` (for safe `tmp/` cleanup). */
+  readonly storageRoot?: string;
   /** Read an isolated sensory snapshot (optionally projecting session-specific facts for `sessionId`). */
   snapshot(sessionId?: string): SenseSnapshot;
   /** Subscribe to sensory snapshot updates; returns an unsubscribe callback. */

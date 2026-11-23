@@ -1,16 +1,10 @@
-import type { Signal, SourceRef, WatchRule } from '@asi/sense-types';
-import { AttentionPipeline, type DeliveryIntent, type SessionContext } from '../src/host/attention/pipeline.ts';
-import { StateStore } from '../src/host/state/store.ts';
+import type { Body, DisksFact, DiskVolume, Fact, Signal, SourceRef } from '@asi/sense-types';
 
 export const SRC: SourceRef = { id: 'fs', api: 'test', host: 'local' };
 export const SRC2: SourceRef = { id: 'ax', api: 'test', host: 'local' };
 
 export function sig(partial: Partial<Signal> & Pick<Signal, 'id' | 'kind'>): Signal {
   return { at: 0, source: SRC, subject: 'sub', data: {}, ...partial };
-}
-
-export function sess(partial: Partial<SessionContext> = {}): SessionContext {
-  return { id: 's1', busy: false, userInitiated: false, ...partial };
 }
 
 export function jobExit(id: string, at: number, exitCode: number, subject = 'j1', extra: Partial<Signal> = {}): Signal {
@@ -24,39 +18,51 @@ export function jobExit(id: string, at: number, exitCode: number, subject = 'j1'
   });
 }
 
-/** Feeds a failing job.exited signal, then advances past the merge window and flushes. */
-export async function wake(
-  pipeline: AttentionPipeline,
-  clock: FakeClock,
-  id: string,
-  session: SessionContext = sess(),
-): Promise<void> {
-  await pipeline.accept(jobExit(id, clock.now, 1, id), session);
-  clock.advance(2001);
-  await pipeline.flush();
+export function f<T>(value: T | null, status: Fact<T>['status'] = 'ok', observedAt = 0, ttlMs = 30_000): Fact<T> {
+  return {
+    value,
+    status,
+    source: { id: 'probe', api: 'test', host: 'local' },
+    observedAt,
+    ttlMs,
+  };
 }
 
-export function pipe(clock: FakeClock, rules?: WatchRule[]) {
-  const store = new StateStore(clock.time);
-  const intents: DeliveryIntent[] = [];
-  const pipeline = new AttentionPipeline({
-    store,
-    deliverer: {
-      deliver: (i) => {
-        intents.push(i);
-        return Promise.resolve();
-      },
-    },
-    clock: clock.time,
-    wallClock: clock.wallTime,
-    rules,
-  });
-  return { store, intents, pipeline };
+export function diskFact(
+  volumes: DiskVolume[] | null,
+  status: DisksFact['status'] = 'ok',
+  observedAt = 0,
+  ttlMs = 30_000,
+  unavailableMounts?: string[],
+): DisksFact {
+  return {
+    kind: 'disks',
+    value: volumes,
+    status,
+    source: { id: 'probe', api: 'test', host: 'local' },
+    observedAt,
+    ttlMs,
+    ...(unavailableMounts ? { unavailableMounts } : {}),
+  };
+}
+
+export function mkBody(overrides: Partial<Body> = {}, observedAt = 0): Body {
+  return {
+    cpu: f({ usage: 0.2, perCore: [0.2], load1: 1, load5: 1, load15: 1 }, 'ok', observedAt),
+    memory: f({ total: 16 * 1024 ** 3, used: 8 * 1024 ** 3, pressure: 'normal', swapUsed: 0 }, 'ok', observedAt),
+    disks: diskFact([{ mount: '/', total: 100 * 1024 ** 3, free: 50 * 1024 ** 3 }], 'ok', observedAt),
+    battery: f({ percent: 80, charging: true }, 'ok', observedAt),
+    thermal: f('nominal', 'ok', observedAt),
+    network: f({ online: true, rxBps: 100, txBps: 50 }, 'ok', observedAt),
+    harnessProcess: f({ rss: 120 * 1024 ** 2, cpu: 0.01, uptimeSec: 60 }, 'ok', observedAt),
+    tokens: f<NonNullable<Body['tokens']['value']>>(null, 'unknown', observedAt),
+    ...overrides,
+  };
 }
 
 /**
  * Two independent clocks: `now` is monotonic (deadlines, budgets) and `wall`
- * is the wall clock (rule expiry, update display). `advance` moves both so
+ * is the wall clock (display, timestamps). `advance` moves both so
  * existing tests stay deterministic; `jumpWall` moves only the wall clock.
  */
 export class FakeClock {

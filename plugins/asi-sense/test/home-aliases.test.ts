@@ -2,15 +2,12 @@ import { mkdir, mkdtemp, rm, symlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { ToolRunContext } from '@deepseek-ai/dsh-tools';
-import { afterEach, describe, expect, it, vi } from 'vitest';
-import { DEFAULT_RULES } from '../src/host/attention/rules.ts';
-import { defaultBodyRules } from '../src/host/body/index.ts';
-import { createDelivery } from '../src/host/dsh/deliver.ts';
-import { FileHistoryStoragePort } from '../src/host/dsh/history-storage.ts';
+import { afterEach, describe, expect, it } from 'vitest';
+import { isHomeRoot, isHomeRootShape, toHomeRelative } from '../src/host/dsh/path.ts';
+import { environmentDetail, modelState } from '../src/host/dsh/tool-output.ts';
 import { createSenseTools } from '../src/host/dsh/tools.ts';
 import { createSenseRuntime } from '../src/host/runtime/index.ts';
-import type { FileChange } from '../src/host/runtime/ports.ts';
-import { DEFAULT_FILE_EXCLUSIONS } from '../src/host/sources/file-exclusions.ts';
+import { StateStore } from '../src/host/state/store.ts';
 
 const tempDirs: string[] = [];
 
@@ -21,8 +18,6 @@ async function makeTempDir(): Promise<string> {
 }
 
 afterEach(async () => {
-  vi.useRealTimers();
-  vi.restoreAllMocks();
   await Promise.all(tempDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
 });
 
@@ -40,309 +35,136 @@ function makeExec(tool: string): ToolRunContext {
   } as unknown as ToolRunContext;
 }
 
-function settingsWith(extraRules: unknown[] = []): Map<string, string> {
-  return new Map([
-    [
-      'settings',
-      JSON.stringify({
-        version: 1,
-        paused: false,
-        sendTitles: true,
-        globalFileWatch: true,
-        fileExclusions: [...DEFAULT_FILE_EXCLUSIONS],
-        disabled: [],
-        rules: [...DEFAULT_RULES, ...defaultBodyRules(), ...extraRules],
-      }),
-    ],
-  ]);
-}
-
-function basePorts(
-  clock: { wall: () => number; mono: () => number },
-  saved: Map<string, string>,
-  onWatch: (cb: (event: FileChange) => void) => void,
-  history?: FileHistoryStoragePort,
-) {
-  return {
-    clock,
-    ...(history ? { history } : {}),
-    storage: {
-      load: async (key: string) => saved.get(key),
-      save: async (key: string, value: string) => {
-        saved.set(key, value);
-      },
-    },
-    dsh: {
-      onAgentEvent: () => () => {},
-      onTool: () => () => {},
-      onJob: () => () => {},
-      deliver: async () => {},
-      tokenSnapshot: async () => undefined,
-    },
-    helper: { spawn: () => undefined },
-    probe: { create: () => ({ onSample: () => () => {}, start: () => {}, stop: async () => {} }) },
-    files: {
-      watch: (_root: string, cb: (event: FileChange) => void) => {
-        onWatch(cb);
-        return { close: () => {} };
-      },
-    },
-  };
-}
-
-async function deliverEvent(runtime: ReturnType<typeof createSenseRuntime>, at: number): Promise<string> {
-  const event = runtime.events().find((entry) => entry.kind === 'file.activity');
-  if (!event) throw new Error('missing file.activity event');
-  const sent: string[] = [];
-  const agent = { send: (message: { content: Array<{ text: string }> }) => sent.push(message.content[0]!.text) };
-  const deliver = createDelivery(
-    () => agent as never,
-    () => true,
-    async () => false,
-  );
-  await deliver('s1', {
-    kind: 'send',
-    target: 'user',
-    wakeup: false,
-    sessionId: 's1',
-    deliveryId: 'home-alias',
-    update: {
-      since: at,
-      suppressed: 0,
-      summary: 'synthetic',
-      changes: [
-        {
-          level: 'context',
-          signal: {
-            id: event.id,
-            kind: event.kind,
-            at: event.at,
-            source: event.source,
-            subject: event.subject,
-            cause: 'unknown',
-            data: event.detail ?? {},
-          },
-        },
-      ],
-    },
-  } as never);
-  return sent[0] ?? '';
-}
-
-describe('home aliases (B1/B2/S1)', () => {
-  it('B1: masks a symlinked home root, its realpath, and the home-root entry itself', async () => {
-    // Keep the fixture outside /private (default exclusion) so the global watcher accepts events.
-    const base = await mkdtemp(join(process.cwd(), '.tmp-home-alias-b1-'));
-    tempDirs.push(base);
+describe('home aliases in pure sensory projection', () => {
+  it('masks a symlinked home root, its realpath, and the home-root entry itself in env_state and env_detail', async () => {
+    const base = await makeTempDir();
     const realHome = join(base, 'ext_vol', 'alice_real');
     const linkHome = join(base, 'links', 'alice_link');
-    const dataDir = join(base, 'data');
     await mkdir(realHome, { recursive: true });
     await mkdir(join(base, 'links'), { recursive: true });
-    await mkdir(dataDir, { recursive: true });
     await symlink(realHome, linkHome);
 
     const previousHome = process.env.HOME;
     process.env.HOME = linkHome;
-    let wall = Date.UTC(2026, 10, 18, 12, 0, 0);
-    let mono = 1_000;
-    let watchCb: ((event: FileChange) => void) | undefined;
-    const saved = settingsWith([
-      {
-        id: 'watch-home',
-        approved: true,
-        level: 'context',
-        createdBy: 'user',
-        match: { kind: 'file.changed', subject: realHome },
-      },
-    ]);
-    const runtime = createSenseRuntime(
-      basePorts(
-        { wall: () => wall, mono: () => mono },
-        saved,
-        (cb) => {
-          watchCb = cb;
-        },
-        new FileHistoryStoragePort(dataDir),
-      ),
-      {
-        platform: 'linux',
-        timeZone: 'UTC',
-        intervalMs: 600_000,
-        globalFileWatch: { root: '/', allowNonDarwinRoot: true, windowMs: 30, dataDirs: [dataDir] },
-      },
-    );
     try {
-      await runtime.start();
-      expect(watchCb).toBeDefined();
-      watchCb?.({ path: linkHome, change: 'modify', at: wall });
-      watchCb?.({ path: join(realHome, 'doc.txt'), change: 'modify', at: wall });
-      wall += 100;
-      mono += 100;
-      await new Promise((resolve) => setTimeout(resolve, 80));
+      expect(isHomeRoot(linkHome)).toBe(true);
+      expect(isHomeRoot(realHome)).toBe(true);
+      expect(toHomeRelative(linkHome)).toBe('~');
+      expect(toHomeRelative(realHome)).toBe('~');
+      expect(toHomeRelative(join(realHome, 'workspace', 'proj'))).toBe('~/workspace/proj');
+      expect(isHomeRootShape('/Users/alice_shape')).toBe(true);
 
-      const tools = createSenseTools(runtime, () => wall);
-      const watch = (await tools
-        .find((tool) => tool.name === 'env_watch')!
-        .execute({ action: 'list' }, makeExec('env_watch'))) as Array<{
-        id: string;
-        match: { subject?: string };
-      }>;
-      expect(watch.find((rule) => rule.id === 'watch-home')?.match.subject).toBe('~');
-
-      const state = (await tools
-        .find((tool) => tool.name === 'env_state')!
-        .execute({ section: 'env' }, makeExec('env_state'))) as {
-        watchedPaths: { value: Record<string, unknown> };
+      const state = new StateStore(() => 1_000).snapshot();
+      state.env.where.toolExec = {
+        value: { host: 'local', cwd: realHome },
+        status: 'ok',
+        source: { id: 'dsh', api: 'registry', host: 'local' },
+        observedAt: 1_000,
+        ttlMs: 30_000,
       };
-      const watchedKeys = Object.keys(state.watchedPaths.value);
-      expect(watchedKeys).toContain('~');
-      expect(JSON.stringify(watchedKeys)).not.toContain('alice');
-
-      const history = (await tools
-        .find((tool) => tool.name === 'env_history')!
-        .execute({ kinds: ['file.activity'] }, makeExec('env_history'))) as {
-        events: Array<{ subject: string; detail?: { directory?: string; files?: string[] } }>;
+      state.env.frontApp = {
+        value: { name: 'Editor', bundleId: 'com.example.Editor', pid: 42 },
+        status: 'ok',
+        source: { id: 'helper', api: 'ndjson', host: 'local' },
+        observedAt: 1_000,
+        ttlMs: 60_000,
       };
-      expect(history.events.length).toBeGreaterThan(0);
-      expect(JSON.stringify(history)).not.toContain('alice_real');
-      expect(JSON.stringify(history)).not.toContain('alice_link');
+      const projected = modelState(state, 1_000, 'env') as {
+        where: { toolExec: { value: { cwd: string } } };
+      };
+      expect(projected.where.toolExec.value.cwd).toBe('~');
+      expect(JSON.stringify(projected)).not.toContain('alice_real');
+      expect(JSON.stringify(projected)).not.toContain('alice_link');
 
-      const delivered = await deliverEvent(runtime, wall);
-      expect(delivered).toContain('~');
-      expect(delivered).not.toContain('alice_real');
-      expect(delivered).not.toContain('alice_link');
+      const detail = environmentDetail({
+        tools: {
+          envState: () => structuredClone(state),
+          refreshDetail: async () => true,
+        },
+        recentSignals: () => [
+          {
+            id: 's1',
+            kind: 'app.activated',
+            subject: realHome,
+            at: 1_000,
+            source: { id: 'helper', api: 'ndjson', host: 'local' },
+            data: {},
+          },
+          {
+            id: 's2',
+            kind: 'window.focused',
+            subject: linkHome,
+            at: 1_001,
+            source: { id: 'helper.ax', api: 'accessibility', host: 'local' },
+            data: {},
+          },
+        ],
+      });
+      const detailJson = JSON.stringify(detail);
+      expect(detailJson).toContain('"~"');
+      expect(detailJson).not.toContain('alice_real');
+      expect(detailJson).not.toContain('alice_link');
     } finally {
       process.env.HOME = previousHome;
-      await runtime.stop().catch(() => {});
     }
   });
 
-  it('B2: masks env_state.watchedPaths keys that are the home root', async () => {
+  it('masks toolExec cwd when it matches the live HOME root via createSenseTools', async () => {
     const base = await makeTempDir();
     const fakeHome = join(base, 'home', 'alice_acct');
     await mkdir(fakeHome, { recursive: true });
     const previousHome = process.env.HOME;
     process.env.HOME = fakeHome;
-    const saved = settingsWith([
-      {
-        id: 'watch-home',
-        approved: true,
-        level: 'context',
-        createdBy: 'user',
-        match: { kind: 'file.changed', subject: fakeHome },
-      },
-    ]);
     const runtime = createSenseRuntime(
-      basePorts({ wall: () => 1_700_000_000_000, mono: () => 1_000 }, saved, () => {}),
       {
-        platform: 'darwin',
-        globalFileWatch: { disableInTests: true },
+        clock: { wall: () => 1_700_000_000_000, mono: () => 1_000 },
+        storage: { load: async () => undefined, save: async () => {} },
+        dsh: {
+          onAgentEvent: () => () => {},
+          onTool: () => () => {},
+          onJob: () => () => {},
+          tokenSnapshot: async () => undefined,
+          nowReadings: () => ({
+            'env.where.toolExec': { value: { host: 'local', cwd: fakeHome } },
+          }),
+        } as never,
+        helper: { spawn: () => undefined },
+        probe: { create: () => ({ onSample: () => () => {}, start: () => {}, stop: async () => {} }) },
       },
+      { platform: 'linux' },
     );
     try {
       await runtime.start();
       const tools = createSenseTools(runtime, () => 1_700_000_000_000);
-      const watch = (await tools
-        .find((tool) => tool.name === 'env_watch')!
-        .execute({ action: 'list' }, makeExec('env_watch'))) as Array<{
-        id: string;
-        match: { subject?: string };
-      }>;
-      expect(watch.find((rule) => rule.id === 'watch-home')?.match.subject).toBe('~');
-
-      const state = (await tools
-        .find((tool) => tool.name === 'env_state')!
-        .execute({ section: 'env' }, makeExec('env_state'))) as {
-        watchedPaths: { value: Record<string, unknown> };
-      };
-      const keys = Object.keys(state.watchedPaths.value);
-      expect(keys).toContain('~');
-      expect(keys.some((key) => key.includes('alice_acct'))).toBe(false);
+      expect(tools.map((t) => t.name)).toEqual(['env_state', 'env_detail']);
+      // Simulate active session so toolExec reading applies
+      const state = modelState(
+        {
+          ...runtime.state(),
+          env: {
+            ...runtime.state().env,
+            where: {
+              ...runtime.state().env.where,
+              toolExec: {
+                value: { host: 'local', cwd: fakeHome },
+                status: 'ok',
+                source: { id: 'dsh', api: 'registry', host: 'local' },
+                observedAt: 1_700_000_000_000,
+                ttlMs: 30_000,
+              },
+            },
+          },
+        },
+        1_700_000_000_000,
+        'env',
+      );
       expect(JSON.stringify(state)).not.toContain('alice_acct');
+      const liveRes = await tools
+        .find((t) => t.name === 'env_state')
+        ?.execute({ section: 'env' }, makeExec('env_state'));
+      expect(JSON.stringify(liveRes)).not.toContain('alice_acct');
     } finally {
       process.env.HOME = previousHome;
-      await runtime.stop().catch(() => {});
-    }
-  });
-
-  it('S1: masks a custom globalFileWatch.homedir in env_history, <env-update>, and env_summary', async () => {
-    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'Date'] });
-    const dir = await makeTempDir();
-    const port = new FileHistoryStoragePort(dir);
-    let wall = Date.UTC(2026, 9, 15, 23, 59, 0);
-    let mono = 1_000;
-    let watchCb: ((event: FileChange) => void) | undefined;
-    const saved = settingsWith();
-    const runtime = createSenseRuntime(
-      basePorts(
-        { wall: () => wall, mono: () => mono },
-        saved,
-        (cb) => {
-          watchCb = cb;
-        },
-        port,
-      ),
-      {
-        platform: 'darwin',
-        timeZone: 'UTC',
-        intervalMs: 600_000,
-        globalFileWatch: { root: '/', windowMs: 30, homedir: '/srv/home/demo_acct', dataDirs: [dir] },
-      },
-    );
-    try {
-      await runtime.start();
-      expect(watchCb).toBeDefined();
-      watchCb?.({ path: '/srv/home/demo_acct/note.md', change: 'modify', at: wall });
-      wall += 100;
-      mono += 100;
-      await vi.advanceTimersByTimeAsync(100);
-
-      const tools = createSenseTools(runtime, () => wall);
-      const history = (await tools
-        .find((tool) => tool.name === 'env_history')!
-        .execute({ kinds: ['file.activity'] }, makeExec('env_history'))) as {
-        events: Array<{ subject: string; detail?: { directory?: string; files?: string[] } }>;
-      };
-      expect(history.events).toHaveLength(1);
-      expect(history.events[0]?.subject).toBe('~');
-      expect(history.events[0]?.detail).toMatchObject({ directory: '~', modified: 1 });
-      expect(history.events[0]?.detail?.files).toBeUndefined();
-      expect(JSON.stringify(history)).not.toContain('demo_acct');
-
-      const delivered = await deliverEvent(runtime, wall);
-      expect(delivered).toContain('~');
-      expect(delivered).not.toContain('demo_acct');
-
-      // Cross midnight so the daily summary (and later the monthly synthesis) is written.
-      wall = Date.UTC(2026, 9, 16, 0, 1, 0);
-      mono += 120_000;
-      await vi.advanceTimersByTimeAsync(120_000);
-      await runtime.tools.envHistory({});
-      await runtime.stop();
-
-      const novWall = Date.UTC(2026, 10, 2, 10, 0, 0);
-      const savedNov = new Map<string, string>();
-      const summaryRuntime = createSenseRuntime(
-        basePorts({ wall: () => novWall, mono: () => 1_000 }, savedNov, () => {}, port),
-        { platform: 'linux', timeZone: 'UTC', intervalMs: 600_000 },
-      );
-      try {
-        await summaryRuntime.start();
-        const summaryTools = createSenseTools(summaryRuntime, () => novWall);
-        const summary = (await summaryTools
-          .find((tool) => tool.name === 'env_summary')!
-          .execute({ month: '2026-10' }, makeExec('env_summary'))) as {
-          available: boolean;
-          summary?: { fileActivity: Record<string, { events: number }> };
-        };
-        expect(summary.available).toBe(true);
-        expect(summary.summary?.fileActivity['~']).toMatchObject({ events: 1 });
-        expect(JSON.stringify(summary)).not.toContain('demo_acct');
-      } finally {
-        await summaryRuntime.stop().catch(() => {});
-      }
-    } finally {
       await runtime.stop().catch(() => {});
     }
   });

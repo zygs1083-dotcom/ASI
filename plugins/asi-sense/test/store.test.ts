@@ -1,8 +1,6 @@
 import { type Fact, factStatusAt } from '@asi/sense-types';
 import { describe, expect, it } from 'vitest';
-import { initialState } from '../src/host/state/facts.ts';
 import { StateStore } from '../src/host/state/store.ts';
-import { noteFile } from '../src/host/state/updates.ts';
 import { FakeClock, SRC, sig } from './helpers.ts';
 
 function storeAt(clock: FakeClock) {
@@ -200,16 +198,6 @@ describe('StateStore', () => {
     clock.now += 1_000;
     expect(store.snapshot().env.frontApp.status).toBe('stale');
   });
-  it('bounds watched paths at 5000 and evicts the least recently used path', () => {
-    const state = initialState(0, 60_000);
-    for (let i = 0; i < 5000; i++)
-      noteFile(state, sig({ id: String(i), kind: 'file.changed', subject: `/f/${i}`, at: i }), 60_000);
-    noteFile(state, sig({ id: 'touch', kind: 'file.changed', subject: '/f/0', at: 5000 }), 60_000);
-    noteFile(state, sig({ id: 'new', kind: 'file.changed', subject: '/f/new', at: 5001 }), 60_000);
-    expect(Object.keys(state.env.watchedPaths.value ?? {})).toHaveLength(5000);
-    expect(state.env.watchedPaths.value?.['/f/0']).toBeDefined();
-    expect(state.env.watchedPaths.value?.['/f/1']).toBeUndefined();
-  });
   it('initializes every fact unknown/null with the internal source', () => {
     const clock = new FakeClock();
     const s = storeAt(clock).snapshot();
@@ -270,10 +258,6 @@ describe('StateStore', () => {
       bundleId: 'com.apple.Safari',
     });
     expect(s.env.focusedWindow.value).toEqual({ title: 'Doc' });
-    expect(s.env.watchedPaths.value?.['/r/a.ts']).toEqual({
-      lastChange: 13,
-      changes: 2,
-    });
     expect(s.env.activeJobs.value).toEqual([
       {
         id: 'j1',
@@ -389,9 +373,7 @@ describe('StateStore', () => {
     const b = st.snapshot();
     expect(a).not.toBe(b);
     if (a.env.frontApp.value) a.env.frontApp.value.name = 'HACK';
-    a.env.watchedPaths.value = { '/evil': { lastChange: 0, changes: 9 } };
     expect(st.snapshot().env.frontApp.value?.name).toBe('A');
-    expect(st.snapshot().env.watchedPaths.value).toBeNull();
   });
 
   it('notifies subscribers with fresh snapshots and supports unsubscribe', () => {
@@ -404,17 +386,13 @@ describe('StateStore', () => {
     expect(seen).toEqual(['A']);
   });
 
-  it('ignores earlier explicit sequences per fact but allows independent file paths', () => {
+  it('ignores earlier explicit sequences per fact while keeping independent fact keys isolated', () => {
     const st = storeAt(new FakeClock());
     st.apply(sig({ id: '1', kind: 'app.activated', at: 10, data: { name: 'New', sequence: 10 } }));
     st.apply(sig({ id: '2', kind: 'app.activated', at: 5, data: { name: 'Old', sequence: 5 } }));
     expect(st.snapshot().env.frontApp.value?.name).toBe('New');
-    st.apply(sig({ id: '3', kind: 'file.changed', at: 10, subject: '/r/a', data: { sequence: 10 } }));
-    st.apply(sig({ id: '4', kind: 'file.changed', at: 8, subject: '/r/b', data: { sequence: 8 } }));
-    st.apply(sig({ id: '5', kind: 'file.changed', at: 9, subject: '/r/a', data: { sequence: 9 } }));
-    const w = st.snapshot().env.watchedPaths.value ?? {};
-    expect(w['/r/a']).toEqual({ lastChange: 10, changes: 1 });
-    expect(w['/r/b']).toEqual({ lastChange: 8, changes: 1 });
+    st.apply(sig({ id: '3', kind: 'window.title-changed', at: 8, data: { title: 'Win', sequence: 8 } }));
+    expect(st.snapshot().env.focusedWindow.value?.title).toBe('Win');
   });
 
   it('tracks source.status and source.error transitions in observation', () => {

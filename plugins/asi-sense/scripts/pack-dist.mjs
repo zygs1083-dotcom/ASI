@@ -17,7 +17,7 @@ const stage = join(temp, 'package');
 try {
   await mkdir(join(stage, 'lib'), { recursive: true });
   await mkdir(join(stage, 'scripts'));
-  for (const file of ['index.js', 'client.js', 'typert.host.js', 'asi-sense-helper']) {
+  for (const file of ['index.js', 'asi-sense-helper']) {
     await copyFile(join(pkg, 'lib', file), join(stage, 'lib', file));
   }
   const helper = join(stage, 'lib/asi-sense-helper');
@@ -50,18 +50,9 @@ try {
           engines: manifest.engines,
           exports: {
             '.': './lib/index.js',
-            './client': './lib/client.js',
-            './typert': './lib/typert.host.js',
             './package.json': './package.json',
           },
-          files: [
-            'lib/index.js',
-            'lib/client.js',
-            'lib/typert.host.js',
-            'lib/asi-sense-helper',
-            'cordis.patch.yml',
-            'scripts/dsh.sh',
-          ],
+          files: ['lib/index.js', 'lib/asi-sense-helper', 'cordis.patch.yml', 'scripts/dsh.sh'],
           dsh: manifest.dsh,
           peerDependencies: manifest.peerDependencies,
         },

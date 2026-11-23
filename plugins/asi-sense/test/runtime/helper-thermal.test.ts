@@ -5,7 +5,7 @@ import type { Body } from '@asi/sense-types';
 import { afterEach, expect, it, vi } from 'vitest';
 import { createSenseRuntime } from '../../src/host/runtime/index.ts';
 import type { SensePorts } from '../../src/host/runtime/ports.ts';
-import { mkBody } from '../body/helpers.ts';
+import { mkBody } from '../helpers.ts';
 
 class FakeChild extends EventEmitter {
   readonly stdin = new PassThrough();
@@ -55,7 +55,7 @@ class FakeChild extends EventEmitter {
 
 afterEach(() => vi.useRealTimers());
 
-it('keeps repeated thermal readings fresh without extra events and expires after a helper crash', async () => {
+it('keeps repeated thermal readings fresh without extra signals and expires after a helper crash', async () => {
   vi.useFakeTimers();
   vi.setSystemTime(1_700_000_000_000);
   let mono = 0;
@@ -69,7 +69,6 @@ it('keeps repeated thermal readings fresh without extra events and expires after
       onTool: () => () => {},
       onJob: () => () => {},
       tokenSnapshot: async () => undefined,
-      deliver: async () => {},
     },
     storage: { load: async () => undefined, save: async () => {} },
     helper: {
@@ -92,7 +91,6 @@ it('keeps repeated thermal readings fresh without extra events and expires after
         stop: async () => {},
       }),
     },
-    files: { watch: () => ({ close: () => {} }) },
   };
   const runtime = createSenseRuntime(ports, { platform: 'darwin', helperPath: '/fixture/helper' });
   const settle = () => vi.advanceTimersByTimeAsync(0);
@@ -116,10 +114,9 @@ it('keeps repeated thermal readings fresh without extra events and expires after
     child.send({ type: 'thermal', state: 'critical' });
     await settle();
     await sampleBody();
-    const thermalEvents = () => runtime.events().filter((event) => event.subject === 'thermal');
-    const helperEvents = () => runtime.events().filter((event) => event.source.id === 'helper');
-    expect(thermalEvents()).toHaveLength(1);
-    const helperEventCount = helperEvents().length;
+    expect(runtime.state().self.body.thermal).toMatchObject({ status: 'ok', value: 'critical' });
+    const helperSignals = () => runtime.recentSignals().filter((sig) => sig.source.id === 'helper');
+    const helperSignalCount = helperSignals().length;
     for (let i = 0; i < 7; i++) {
       await advance(30_000);
       expect(runtime.state().self.body.thermal).toMatchObject({ status: 'ok', value: 'critical' });
@@ -127,8 +124,7 @@ it('keeps repeated thermal readings fresh without extra events and expires after
       await settle();
       await sampleBody();
       expect(runtime.state().self.body.thermal.observedAt).toBe(Date.now());
-      expect(thermalEvents()).toHaveLength(1);
-      expect(helperEvents()).toHaveLength(helperEventCount);
+      expect(helperSignals()).toHaveLength(helperSignalCount);
     }
     allowSpawn = false;
     child.crash();

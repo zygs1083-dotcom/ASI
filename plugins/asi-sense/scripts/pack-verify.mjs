@@ -63,6 +63,12 @@ else {
   console.log('Launcher: source tsx, isolated home, environment and argv');
   assertForwarded(run(['plugin', 'two words'], { PATH: `${installed}:${env.PATH}` }), 'installed');
   console.log('Launcher: matching PATH dsh takes priority');
+  await writeFile(cli, program('0.2.2-rc.5', 'source'));
+  assertForwarded(run(['plugin', 'two words']), 'source');
+  console.log('Launcher: source tsx on the second supported version');
+  await writeFile(executable, `#!/usr/bin/env node\n${program('0.2.2-rc.5', 'installed')}`);
+  assertForwarded(run(['plugin', 'two words'], { PATH: `${installed}:${env.PATH}` }), 'installed');
+  console.log('Launcher: PATH dsh on the second supported version');
   assert.equal(run(['fail']).status, 17);
   const installedOnly = run(['plugin', 'two words'], {
     PATH: `${installed}:${env.PATH}`,
@@ -82,7 +88,7 @@ else {
   assert.notEqual(sourceMismatch.status, 0);
   assert.match(sourceMismatch.stderr, /0\.2\.2-rc\.3/);
   console.log('Launcher: source version mismatch rejected');
-  await writeFile(cli, program('0.2.2-rc.3', 'source'));
+  await writeFile(cli, program('0.2.2-rc.5', 'source'));
   await writeFile(executable, `#!/usr/bin/env node\n${program('0.2.2-rc.4', 'installed')}`);
   const installedMismatch = run(['plugin'], { PATH: `${installed}:${env.PATH}` });
   assert.notEqual(installedMismatch.status, 0);
@@ -99,16 +105,11 @@ try {
   assert.equal(extracted.status, 0, 'Could not extract the distribution');
   const root = join(temp, 'package');
   assert.deepEqual((await readdir(root)).sort(), ['LICENSE', 'cordis.patch.yml', 'lib', 'package.json', 'scripts']);
-  assert.deepEqual((await readdir(join(root, 'lib'))).sort(), [
-    'asi-sense-helper',
-    'client.js',
-    'index.js',
-    'typert.host.js',
-  ]);
+  assert.deepEqual((await readdir(join(root, 'lib'))).sort(), ['asi-sense-helper', 'index.js']);
   const manifest = JSON.parse(await readFile(join(root, 'package.json'), 'utf8'));
   assert.equal(source.private, true);
   assert.notEqual(manifest.private, true);
-  assert.equal(manifest.engines.dsh, '0.2.2-rc.3');
+  assert.equal(manifest.engines.dsh, '0.2.2-rc.3 || 0.2.2-rc.5');
   assert.equal(JSON.stringify(manifest).includes('workspace:'), false);
   assert.deepEqual(manifest.dependencies ?? {}, {});
   for (const path of Object.values(manifest.exports)) await stat(join(root, path));

@@ -1,9 +1,10 @@
 import type { ChildProcessWithoutNullStreams } from 'node:child_process';
-import type { RuntimeAttention } from '../runtime/attention.ts';
+import type { SenseBus } from '../runtime/bus.ts';
 import type { Clock, HelperSpawner } from '../runtime/ports.ts';
 import type { BodySource } from './body.ts';
 import { SnapshotBackoff } from './helper-backoff.ts';
 import {
+  axRetryableTarget,
   axStatus,
   clearWindow,
   helperError,
@@ -49,7 +50,7 @@ export class HelperSource {
     private readonly path: string | undefined,
     private readonly platform: string,
     private readonly clock: Clock,
-    private readonly attention: RuntimeAttention,
+    private readonly bus: SenseBus,
     private readonly body: BodySource,
     private readonly reschedule: () => void,
     private readonly paused: () => boolean,
@@ -98,7 +99,7 @@ export class HelperSource {
   setTitles(enabled: boolean): void {
     this.desired = enabled;
     this.titles = false;
-    clearWindow(this.attention, this.clock.wall());
+    clearWindow(this.bus, this.clock.wall());
     if (this.child && this.session) this.sendIntent();
   }
   refreshDetail(): Promise<boolean> {
@@ -144,7 +145,7 @@ export class HelperSource {
     this.snapshots.reset();
     this.deadline = undefined;
     this.permissionDeadline = undefined;
-    permissionUnknown(this.attention, this.clock.wall());
+    permissionUnknown(this.bus, this.clock.wall());
     this.child = undefined;
     this.finishSnapshot(false);
     this.writer.stop();
@@ -205,7 +206,7 @@ export class HelperSource {
       if (this.child === child) {
         this.child = undefined;
         this.finishSnapshot(false);
-        clearWindow(this.attention, this.clock.wall());
+        clearWindow(this.bus, this.clock.wall());
         this.restart('process-exited');
       }
       this.reschedule();
@@ -260,15 +261,15 @@ export class HelperSource {
       this.recovery.delta(raw);
       const permissions = object(raw.permissions);
       if (permissions?.accessibility === 'granted' || permissions?.accessibility === 'denied') {
-        const previous = this.attention.state().self.permissions.value?.辅助功能;
-        permissionStatus(this.attention, permissions.accessibility, raw.at as number);
+        const previous = this.bus.state().self.permissions.value?.辅助功能;
+        permissionStatus(this.bus, permissions.accessibility, raw.at as number);
         if (
           first ||
           (previous !== permissions.accessibility &&
             (permissions.accessibility === 'denied' ||
-              this.attention.state().observation.sources['helper.ax']?.status !== 'unsupported'))
+              this.bus.state().observation.sources['helper.ax']?.status !== 'unsupported'))
         )
-          await axStatus(this.attention, permissions.accessibility === 'granted' ? 'ok' : 'denied', raw.at as number);
+          await axStatus(this.bus, permissions.accessibility === 'granted' ? 'ok' : 'denied', raw.at as number);
         if (
           previous !== undefined &&
           previous !== permissions.accessibility &&
@@ -304,11 +305,29 @@ export class HelperSource {
       return;
     }
     if (raw.type === 'error') {
+      if (raw.code === 'ax-retryable') {
+        if (this.paused()) return;
+        const state = this.bus.state();
+        const axNow = state.observation.sources['helper.ax']?.status;
+        const windowNow = state.env.focusedWindow.status;
+        if (
+          axNow !== 'denied' &&
+          axNow !== 'unsupported' &&
+          windowNow !== 'denied' &&
+          windowNow !== 'unsupported' &&
+          state.self.permissions.value?.辅助功能 !== 'denied' &&
+          axRetryableTarget(raw, state.env.frontApp.value)
+        ) {
+          if (recovery.waiting) recovery.dirty.add('focusedWindow');
+          await axStatus(this.bus, 'unknown', raw.at as number, 'ax-retryable');
+        }
+        return;
+      }
       if (!this.recovery.degraded) this.snapshots.reset();
       this.recovery.degraded = true;
-      permissionUnknown(this.attention, raw.at as number);
-      markHelperFacts(this.attention, this.body, raw.at as number, ['frontApp', 'focusedWindow', 'thermal'], 'stale');
-      const code = await helperError(this.attention, raw);
+      permissionUnknown(this.bus, raw.at as number);
+      markHelperFacts(this.bus, this.body, raw.at as number, ['frontApp', 'focusedWindow', 'thermal'], 'stale');
+      const code = await helperError(this.bus, raw);
       if (!valid()) return;
       if (code === 'privacy-generation-exhausted') throw new Error('privacy generation exhausted');
       if (this.recovery.waiting) this.recovery.obsolete = true;
@@ -331,7 +350,7 @@ export class HelperSource {
         !recovery.dirty.has('permissions') &&
         (permissions?.accessibility === 'granted' || permissions?.accessibility === 'denied')
       ) {
-        permissionStatus(this.attention, permissions.accessibility, raw.at as number);
+        permissionStatus(this.bus, permissions.accessibility, raw.at as number);
       }
       if (this.metadataSnapshot && !this.recovery.degraded) {
         metadataOnly = true;
@@ -340,7 +359,7 @@ export class HelperSource {
       this.metadataSnapshot = false;
     }
     const safe = (this.titles ? raw : strip(raw)) as Message;
-    const recovered = await applyHelperEvent(recovery, raw, safe, this.attention, this.body, valid, skip, metadataOnly);
+    const recovered = await applyHelperEvent(recovery, raw, safe, this.bus, this.body, valid, skip, metadataOnly);
     if (!valid()) return;
     if (recovered) {
       this.snapshots.reset();
@@ -349,7 +368,7 @@ export class HelperSource {
     else if (this.recovery.degraded && !this.recovery.waiting && this.snapshots.delta(raw)) this.requestSnapshot();
     if (raw.type === 'snapshot') {
       const app = object(raw.frontApp);
-      const current = this.attention.state().env.frontApp.value;
+      const current = this.bus.state().env.frontApp.value;
       this.finishSnapshot(
         !!current &&
           validApp(app) &&
@@ -371,7 +390,7 @@ export class HelperSource {
     this.reschedule();
   }
   private async status(status: 'ok' | 'unavailable' | 'error', reason: string): Promise<void> {
-    await helperStatus(this.attention, this.clock.wall(), status, reason, this.crashes.length, this.lastFailure);
+    await helperStatus(this.bus, this.clock.wall(), status, reason, this.crashes.length, this.lastFailure);
   }
   private sendIntent(): void {
     const child = this.child;
@@ -395,7 +414,7 @@ export class HelperSource {
     this.finishSnapshot(false);
     this.writer.stop();
     this.titles = false;
-    clearWindow(this.attention, this.clock.wall());
+    clearWindow(this.bus, this.clock.wall());
     const state = this.children.get(child);
     if (state) state.killAt = this.clock.mono() + 300;
     child.stdin.end();
@@ -405,7 +424,7 @@ export class HelperSource {
   private restart(reason: string): void {
     this.deadline = undefined;
     this.permissionDeadline = undefined;
-    permissionUnknown(this.attention, this.clock.wall());
+    permissionUnknown(this.bus, this.clock.wall());
     this.snapshots.reset();
     this.titles = false;
     this.lastFailure = reason;

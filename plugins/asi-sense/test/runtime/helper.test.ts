@@ -6,8 +6,8 @@ import type { Body } from '@asi/sense-types';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { environmentDetail } from '../../src/host/dsh/tool-output.ts';
 import { createSenseRuntime } from '../../src/host/runtime/index.ts';
-import type { AgentEvent, DshPort, SensePorts } from '../../src/host/runtime/ports.ts';
-import { mkBody } from '../body/helpers.ts';
+import type { AgentEvent, SensePorts } from '../../src/host/runtime/ports.ts';
+import { mkBody } from '../helpers.ts';
 
 const fixture = readFileSync(new URL('./fixtures/helper.ndjson', import.meta.url), 'utf8');
 
@@ -105,7 +105,6 @@ function setup(autoAck = true, stubborn = false, holdWrites = false) {
   let sample: (body: Body) => void = () => {};
   let snapshotReply = true;
   const children: FakeChild[] = [];
-  const delivered: Parameters<DshPort['deliver']>[1][] = [];
   const ports: SensePorts = {
     clock: { wall: () => Date.now(), mono: () => Math.max(0, performance.now() - monoStart) },
     dsh: {
@@ -116,9 +115,6 @@ function setup(autoAck = true, stubborn = false, holdWrites = false) {
       onTool: () => () => {},
       onJob: () => () => {},
       tokenSnapshot: async () => undefined,
-      deliver: async (_, intent) => {
-        delivered.push(intent);
-      },
     },
     storage: { load: async () => undefined, save: async () => {} },
     helper: {
@@ -140,7 +136,6 @@ function setup(autoAck = true, stubborn = false, holdWrites = false) {
         stop: async () => {},
       }),
     },
-    files: { watch: () => ({ close: () => {} }) },
   };
   const runtime = createSenseRuntime(ports, { platform: 'darwin', helperPath: '/fixture/helper' });
   activeRuntimes.add(runtime);
@@ -148,7 +143,6 @@ function setup(autoAck = true, stubborn = false, holdWrites = false) {
     ports,
     runtime,
     children,
-    delivered,
     agent: (event: AgentEvent) => agent(event),
     advance: async (ms: number) => {
       await vi.advanceTimersByTimeAsync(ms);
@@ -177,21 +171,26 @@ afterEach(async () => {
   }
 });
 
+function axRetryableError(extra: object = {}): object {
+  return {
+    type: 'error',
+    code: 'ax-retryable',
+    message: 'AX operation failed; will retry on next activation or recheck',
+    ...extra,
+  };
+}
+
 describe('helper protocol integration', () => {
-  it('refreshes metadata without another activation event or delivery', async () => {
+  it('refreshes metadata without another activation signal', async () => {
     const h = setup();
     await h.runtime.start();
     await h.settle();
-    await h.runtime.tools.envWatch({
-      action: 'add',
-      rule: { id: 'activation-context', match: { kind: 'app.activated' }, level: 'context' },
-    });
     await h.agent({ type: 'created', sessionId: 's' });
     await h.agent({ type: 'pre-step', sessionId: 's' });
     await h.agent({ type: 'post-step', sessionId: 's' });
     const child = h.children[0];
     child.snapshotReply = false;
-    const activationCount = h.runtime.events().filter((event) => event.kind === 'app.activated').length;
+    const activationCount = h.runtime.recentSignals().filter((event) => event.kind === 'app.activated').length;
     child.send({ type: 'window.focused', bundleId: 'example.app', pid: 123, title: 'Synthetic new window' });
     await h.settle();
     child.send({
@@ -203,11 +202,7 @@ describe('helper protocol integration', () => {
     });
     await h.settle();
     expect(h.runtime.state().env.frontApp.value?.windowCount).toBe(4);
-    expect(h.runtime.events().filter((event) => event.kind === 'app.activated')).toHaveLength(activationCount);
-    await h.agent({ type: 'pre-step', sessionId: 's' });
-    expect(
-      h.delivered.flatMap((intent) => intent.update.changes).filter((change) => change.signal.kind === 'app.activated'),
-    ).toHaveLength(0);
+    expect(h.runtime.recentSignals().filter((event) => event.kind === 'app.activated')).toHaveLength(activationCount);
     await h.runtime.stop();
   });
 
@@ -275,8 +270,8 @@ describe('helper protocol integration', () => {
     expect(h.runtime.state().observation.sources['helper.ax']?.status).toBe('denied');
     expect(h.runtime.state().env.focusedWindow).toMatchObject({ status: 'denied', value: null });
     expect(h.runtime.state().env.frontApp.value?.windowCount).toBeUndefined();
-    expect(h.runtime.events()).toContainEqual(
-      expect.objectContaining({ kind: 'source.status', subject: 'helper.ax', level: 'context' }),
+    expect(h.runtime.recentSignals()).toContainEqual(
+      expect.objectContaining({ kind: 'source.status', subject: 'helper.ax', data: { status: 'denied' } }),
     );
     await h.runtime.stop();
   });
@@ -455,19 +450,19 @@ describe('helper protocol integration', () => {
     await h.settle();
     const child = h.children[0];
     child.snapshotReply = false;
-    const before = h.runtime.events().filter((event) => event.kind === 'app.activated').length;
+    const before = h.runtime.recentSignals().filter((event) => event.kind === 'app.activated').length;
     child.send({ type: 'ax.unsupported', bundleId: 'example.app', pid: 123 });
     await h.settle();
-    expect(h.runtime.events().filter((event) => event.kind === 'app.activated')).toHaveLength(before);
+    expect(h.runtime.recentSignals().filter((event) => event.kind === 'app.activated')).toHaveLength(before);
     child.send({ type: 'app.activated', name: 'ExampleApp', bundleId: 'example.app', pid: 456 });
     await h.settle();
     expect(h.runtime.state().observation.sources['helper.ax']?.status).toBe('unknown');
     expect(h.runtime.state().env.frontApp.value).toEqual({ name: 'ExampleApp', bundleId: 'example.app', pid: 456 });
-    expect(h.runtime.events().filter((event) => event.kind === 'app.activated')).toHaveLength(before + 1);
+    expect(h.runtime.recentSignals().filter((event) => event.kind === 'app.activated')).toHaveLength(before + 1);
     child.send({ type: 'ax.unsupported', bundleId: 'example.app', pid: 123 });
     await h.settle();
     expect(h.runtime.state().observation.sources['helper.ax']?.status).toBe('unknown');
-    expect(h.runtime.events().filter((event) => event.kind === 'app.activated')).toHaveLength(before + 1);
+    expect(h.runtime.recentSignals().filter((event) => event.kind === 'app.activated')).toHaveLength(before + 1);
     await h.runtime.stop();
   });
 
@@ -594,19 +589,13 @@ describe('helper protocol integration', () => {
       status: 'unavailable',
       error: 'restart-limit',
     });
-    expect(h.runtime.events()).toContainEqual(
+    expect(h.runtime.recentSignals()).toContainEqual(
       expect.objectContaining({
         kind: 'source.status',
         subject: 'helper',
-        reason: 'restart-limit',
-        restarts: 5,
+        data: expect.objectContaining({ reason: 'restart-limit', restarts: 5 }),
       }),
     );
-    await h.agent({ type: 'pre-step', sessionId: 's' });
-    const changes = h.delivered.flatMap((intent) => intent.update.changes);
-    expect(
-      changes.filter((change) => change.signal.kind === 'source.status' && change.signal.data.status === 'error'),
-    ).toHaveLength(1);
     await h.runtime.stop();
     expect(h.children.filter((child) => !child.closed)).toHaveLength(0);
     expect(vi.getTimerCount()).toBe(0);
@@ -763,8 +752,11 @@ describe('helper protocol integration', () => {
     });
     child.send({ type: 'error', code: 'output_overflow', dropped: 7, droppedTypes: { 'window.focused': 7 } });
     await h.settle();
-    expect(h.runtime.events()).toContainEqual(
-      expect.objectContaining({ kind: 'source.error', reason: 'output_overflow (dropped=7)' }),
+    expect(h.runtime.recentSignals()).toContainEqual(
+      expect.objectContaining({
+        kind: 'source.error',
+        data: expect.objectContaining({ error: 'output_overflow', dropped: 7 }),
+      }),
     );
     expect(h.runtime.state().observation.sources.helper).toMatchObject({
       status: 'unavailable',
@@ -1136,13 +1128,6 @@ describe('helper protocol integration', () => {
     await h.advance(1);
     await h.sample();
     expect(h.runtime.state().self.body.thermal).toMatchObject({ status: 'ok', value: 'critical' });
-    expect(h.runtime.events()).toContainEqual(
-      expect.objectContaining({
-        kind: 'body.threshold',
-        subject: 'thermal',
-        level: 'wake',
-      }),
-    );
     await h.runtime.stop();
   });
 
@@ -1159,7 +1144,7 @@ describe('helper protocol integration', () => {
     await h.runtime.stop();
   });
 
-  it('evaluates fresh thermal evidence after a wall-clock jump', async () => {
+  it('retains fresh thermal fact after a wall-clock jump', async () => {
     const h = setup();
     await h.runtime.start();
     await h.settle();
@@ -1169,13 +1154,7 @@ describe('helper protocol integration', () => {
     h.jumpWall(120_000);
     await h.advance(1);
     await h.sample();
-    expect(h.runtime.events()).toContainEqual(
-      expect.objectContaining({
-        kind: 'body.threshold',
-        subject: 'thermal',
-        level: 'wake',
-      }),
-    );
+    expect(h.runtime.state().self.body.thermal).toMatchObject({ status: 'ok', value: 'critical' });
     await h.runtime.stop();
   });
 
@@ -1235,7 +1214,7 @@ describe('helper protocol integration', () => {
     await Promise.all([enabling, disabling]);
     await h.settle();
     expect(child.commands.slice(marker).every((command) => !command.enabled)).toBe(true);
-    expect(h.runtime.rules.settings().sendTitles).toBe(false);
+    expect(h.runtime.getSettings().sendTitles).toBe(false);
     await h.runtime.stop();
   });
 
@@ -1272,26 +1251,26 @@ describe('helper protocol integration', () => {
     await h.settle();
 
     const sysEvents = h.runtime
-      .events()
+      .recentSignals()
       .filter(
         (entry) =>
           entry.kind.startsWith('system.') || entry.kind.startsWith('screen.') || entry.kind.startsWith('session.'),
       );
-    expect(sysEvents.map((e) => [e.kind, e.subject, e.level, e.detail])).toEqual([
-      ['system.wake', 'system', 'record', { at: baseAt + 100 }],
-      ['screen.unlocked', 'screen', 'record', { at: baseAt + 200 }],
-      ['session.active', 'session', 'record', { at: baseAt + 300 }],
-      ['screen.locked', 'screen', 'record', { at: baseAt + 1_000 }],
-      ['system.sleep', 'system', 'record', { at: baseAt + 2_000 }],
-      ['session.inactive', 'session', 'record', { at: baseAt + 3_000 }],
-      ['system.sleep', 'system', 'record', { at: baseAt + 5_000 }],
-      ['system.wake', 'system', 'record', { at: baseAt + 9_000, durationMs: 4_000 }],
-      ['screen.unlocked', 'screen', 'record', { at: baseAt + 10_000, durationMs: 9_000 }],
-      ['session.active', 'session', 'record', { at: baseAt + 11_000, durationMs: 8_000 }],
-      ['system.sleep', 'system', 'record', { at: baseAt + 50_000 }],
-      ['system.wake', 'system', 'record', { at: baseAt + 40_000 }],
-      ['system.sleep', 'system', 'record', { at: baseAt + 42_000 }],
-      ['system.wake', 'system', 'record', { at: baseAt + 45_500, durationMs: 3_500 }],
+    expect(sysEvents.map((e) => [e.kind, e.subject, e.data])).toEqual([
+      ['system.wake', 'system', { at: baseAt + 100 }],
+      ['screen.unlocked', 'screen', { at: baseAt + 200 }],
+      ['session.active', 'session', { at: baseAt + 300 }],
+      ['screen.locked', 'screen', { at: baseAt + 1_000 }],
+      ['system.sleep', 'system', { at: baseAt + 2_000 }],
+      ['session.inactive', 'session', { at: baseAt + 3_000 }],
+      ['system.sleep', 'system', { at: baseAt + 5_000 }],
+      ['system.wake', 'system', { at: baseAt + 9_000, durationMs: 4_000 }],
+      ['screen.unlocked', 'screen', { at: baseAt + 10_000, durationMs: 9_000 }],
+      ['session.active', 'session', { at: baseAt + 11_000, durationMs: 8_000 }],
+      ['system.sleep', 'system', { at: baseAt + 50_000 }],
+      ['system.wake', 'system', { at: baseAt + 40_000 }],
+      ['system.sleep', 'system', { at: baseAt + 42_000 }],
+      ['system.wake', 'system', { at: baseAt + 45_500, durationMs: 3_500 }],
     ]);
 
     expect(h.runtime.state().env.system).toMatchObject({
@@ -1302,6 +1281,190 @@ describe('helper protocol integration', () => {
         lastWakeAt: baseAt + 45_500,
       },
     });
+    await h.runtime.stop();
+  });
+
+  it('marks only the focused window unknown on a matching ax-retryable, without recovery', async () => {
+    const h = setup();
+    await h.runtime.start();
+    await h.settle();
+    const child = h.children[0];
+    if (!child) throw new Error('missing helper');
+    child.snapshotReply = false;
+    expect(h.runtime.state().env.frontApp.value).toMatchObject({ bundleId: 'example.app', pid: 123 });
+    child.send({ type: 'window.focused', bundleId: 'example.app', pid: 123, title: 'Synthetic' });
+    await h.settle();
+    expect(h.runtime.state().env.focusedWindow).toMatchObject({ status: 'ok', value: { title: 'Synthetic' } });
+    const snapshots: string[] = [];
+    child.stdin.on('data', (chunk: Buffer) => {
+      if (chunk.toString().includes('"snapshot"')) snapshots.push('snapshot');
+    });
+    child.send(axRetryableError({ pid: 123, bundleId: 'example.app' }));
+    await h.settle();
+    expect(h.runtime.state().env.focusedWindow).toMatchObject({ status: 'unknown', value: null });
+    expect(h.runtime.state().observation.sources['helper.ax']?.status).toBe('unknown');
+    expect(h.runtime.state().env.frontApp.value).toMatchObject({ bundleId: 'example.app', pid: 123 });
+    expect(h.runtime.state().self.body.thermal).toMatchObject({ status: 'ok' });
+    expect(h.runtime.state().self.permissions.value?.辅助功能).toBe('granted');
+    expect(h.runtime.state().observation.sources.helper?.status).toBe('ok');
+    expect(h.runtime.recentSignals().filter((event) => event.kind === 'source.error')).toHaveLength(0);
+    expect(h.runtime.recentSignals()).toContainEqual(
+      expect.objectContaining({
+        kind: 'source.status',
+        subject: 'helper.ax',
+        data: { status: 'unknown', reason: 'ax-retryable' },
+      }),
+    );
+    expect(snapshots).toHaveLength(0);
+    child.send({ type: 'window.focused', bundleId: 'example.app', pid: 123, title: 'Synthetic again' });
+    await h.settle();
+    expect(h.runtime.state().env.focusedWindow).toMatchObject({
+      status: 'ok',
+      value: { title: 'Synthetic again' },
+    });
+    await h.runtime.stop();
+  });
+
+  it('keeps an in-flight snapshot from resurrecting a stale window after ax-retryable', async () => {
+    const h = setup();
+    await h.runtime.start();
+    await h.settle();
+    const child = h.children[0];
+    if (!child) throw new Error('missing helper');
+    child.snapshotReply = false;
+    child.send({ type: 'window.focused', bundleId: 'example.app', pid: 123, title: 'Synthetic' });
+    await h.settle();
+    await h.runtime.actions.setSendTitles(true);
+    await h.settle();
+    child.send(axRetryableError({ pid: 123, bundleId: 'example.app' }));
+    await h.settle();
+    expect(h.runtime.state().env.focusedWindow.status).toBe('unknown');
+    child.send({
+      type: 'snapshot',
+      frontApp: { name: 'ExampleApp', bundleId: 'example.app', pid: 123 },
+      focusedWindow: { status: 'ok', pid: 123, title: 'Stale title' },
+      permissions: { accessibility: 'granted' },
+      thermal: 'nominal',
+    });
+    await h.settle();
+    expect(h.runtime.state().env.focusedWindow).toMatchObject({ status: 'unknown', value: null });
+    expect(h.runtime.state().observation.sources.helper?.status).toBe('ok');
+    await h.runtime.stop();
+  });
+
+  it('keeps a true denial inside a dirty snapshot authoritative after ax-retryable', async () => {
+    const h = setup();
+    await h.runtime.start();
+    await h.settle();
+    const child = h.children[0];
+    if (!child) throw new Error('missing helper');
+    child.send({ type: 'window.focused', bundleId: 'example.app', pid: 123, title: 'Synthetic' });
+    await h.settle();
+    const snapshots: string[] = [];
+    child.stdin.on('data', (chunk: Buffer) => {
+      if (chunk.toString().includes('"snapshot"')) snapshots.push('snapshot');
+    });
+    child.snapshotReply = false;
+    await h.runtime.actions.setSendTitles(true);
+    await h.settle();
+    expect(snapshots).toHaveLength(1);
+    child.send(axRetryableError({ pid: 123, bundleId: 'example.app' }));
+    await h.settle();
+    child.send({
+      type: 'snapshot',
+      frontApp: { name: 'ExampleApp', bundleId: 'example.app', pid: 123 },
+      focusedWindow: { status: 'ok', pid: 123, title: 'Stale title' },
+      permissions: { accessibility: 'denied' },
+      thermal: 'nominal',
+    });
+    await h.settle();
+    expect(h.runtime.state().self.permissions.value?.辅助功能).toBe('denied');
+    expect(h.runtime.state().observation.sources['helper.ax']?.status).toBe('denied');
+    expect(h.runtime.state().env.focusedWindow).toMatchObject({ status: 'denied', value: null });
+    await h.runtime.stop();
+  });
+
+  it('ignores ax-retryable for other apps, invalid identity, known denials, and missing current pid', async () => {
+    const h = setup();
+    await h.runtime.start();
+    await h.settle();
+    const child = h.children[0];
+    if (!child) throw new Error('missing helper');
+    child.snapshotReply = false;
+    child.send({ type: 'window.focused', bundleId: 'example.app', pid: 123, title: 'Synthetic' });
+    await h.settle();
+    const unchanged = () => {
+      expect(h.runtime.state().env.focusedWindow).toMatchObject({
+        status: 'ok',
+        value: { title: 'Synthetic' },
+      });
+      expect(h.runtime.state().observation.sources['helper.ax']?.status).toBe('ok');
+    };
+    child.send(axRetryableError({ pid: 123, bundleId: 'other.app' }));
+    child.send(axRetryableError({ pid: 123, bundleId: '' }));
+    child.send(axRetryableError({ pid: 999, bundleId: 'example.app' }));
+    child.send(axRetryableError());
+    child.send(axRetryableError({ pid: 123, bundleId: 123 }));
+    await h.settle();
+    unchanged();
+    expect(h.runtime.recentSignals().filter((event) => event.kind === 'source.error')).toHaveLength(0);
+    expect(h.runtime.state().observation.sources.helper?.status).toBe('ok');
+
+    // rv-017-prod #6.1: when current.pid is undefined, even a valid wire pid from another instance of same bundleId must NOT clear focusedWindow
+    child.send({ type: 'app.activated', name: 'MultiInstance', bundleId: 'multi.app' });
+    await h.settle();
+    expect(h.runtime.state().env.frontApp.value?.pid).toBeUndefined();
+    child.send({ type: 'window.focused', bundleId: 'multi.app', title: 'Multi Window' });
+    await h.settle();
+    expect(h.runtime.state().env.focusedWindow.status).toBe('ok');
+    child.send(axRetryableError({ bundleId: 'multi.app', pid: 999 }));
+    child.send(axRetryableError({ bundleId: 'multi.app' }));
+    child.send(axRetryableError({ bundleId: 'multi.app', pid: 0 }));
+    await h.settle();
+    expect(h.runtime.state().env.focusedWindow.status).toBe('ok');
+    expect(h.runtime.state().observation.sources['helper.ax']?.status).toBe('ok');
+
+    // Known denial is not downgraded by retryable error
+    child.send({ type: 'hello', session: 'fixture-session', permissions: { accessibility: 'denied' } });
+    await h.settle();
+    expect(h.runtime.state().observation.sources['helper.ax']?.status).toBe('denied');
+    child.send({ type: 'error', code: 'ax-retryable', pid: 123, bundleId: 'multi.app' });
+    await h.settle();
+    expect(h.runtime.state().observation.sources['helper.ax']?.status).toBe('denied');
+    expect(h.runtime.state().env.focusedWindow.status).toBe('denied');
+    await h.runtime.stop();
+  });
+
+  it('matches ax-retryable on pid when foreground bundle id is empty, and metadataOnly snapshot does not restore ax=ok from windowCount while window is unknown', async () => {
+    const h = setup();
+    await h.runtime.start();
+    await h.settle();
+    const child = h.children[0];
+    if (!child) throw new Error('missing helper');
+    child.snapshotReply = false;
+    child.send({ type: 'app.activated', name: 'NoBundle', bundleId: '', pid: 42 });
+    await h.settle();
+    child.send({
+      type: 'snapshot',
+      frontApp: { name: 'NoBundle', bundleId: '', pid: 42, windowCount: 2 },
+      focusedWindow: { status: 'unknown', pid: 42 },
+      permissions: { accessibility: 'granted' },
+      thermal: 'nominal',
+    });
+    await h.settle();
+    // rv-017-prod #6.2: windowCount >= 0 must NOT flip helper.ax to 'ok' when focusedWindow is still 'unknown'
+    expect(h.runtime.state().observation.sources['helper.ax']?.status).toBe('unknown');
+
+    child.send({ type: 'window.focused', bundleId: '', pid: 42, title: 'NoBundle window' });
+    await h.settle();
+    expect(h.runtime.state().env.focusedWindow.status).toBe('ok');
+    child.send({ type: 'error', code: 'ax-retryable', pid: 43, bundleId: '' });
+    await h.settle();
+    expect(h.runtime.state().env.focusedWindow.status).toBe('ok');
+    child.send({ type: 'error', code: 'ax-retryable', pid: 42, bundleId: '' });
+    await h.settle();
+    expect(h.runtime.state().env.focusedWindow.status).toBe('unknown');
+    expect(h.runtime.state().observation.sources['helper.ax']?.status).toBe('unknown');
     await h.runtime.stop();
   });
 });

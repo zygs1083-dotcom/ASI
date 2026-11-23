@@ -33,8 +33,6 @@ export const FACT_PATHS: ReadonlySet<string> = new Set([
   'env.frontApp',
   'env.focusedWindow',
   'env.activeJobs',
-  'env.watchedPaths',
-  'env.globalFileWatch',
   'env.system',
 ]);
 
@@ -86,8 +84,6 @@ export function initialState(at: number, ttlMs: number): SenseState {
       frontApp: f(),
       focusedWindow: f(),
       activeJobs: f(),
-      watchedPaths: f(),
-      globalFileWatch: f(),
       system: f(),
     },
     // Null-prototype dictionary: '__proto__'/'constructor' source ids are safe.

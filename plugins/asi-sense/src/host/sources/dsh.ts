@@ -1,7 +1,6 @@
 import os from 'node:os';
-import type { SenseState, Signal } from '@asi/sense-types';
-import { classifyCause, isUnderDir, type ToolWindow } from '../attention/selfcause.ts';
-import type { RuntimeAttention } from '../runtime/attention.ts';
+import type { SenseState } from '@asi/sense-types';
+import type { SenseBus } from '../runtime/bus.ts';
 import type { AgentEvent, Clock, DshPort, JobEvent, ToolEvent, Unsubscribe } from '../runtime/ports.ts';
 import { initialState } from '../state/facts.ts';
 import { StateStore } from '../state/store.ts';
@@ -18,8 +17,7 @@ export type NowReadings = Record<
 const source = { id: 'dsh', api: 'events', host: 'local' };
 
 export class DshSource {
-  private readonly windows = new Map<string, ToolWindow & { sessionToken?: string }>();
-  private readonly jobs = new Map<string, { sessionId?: string; sessionToken?: string }>();
+  private readonly jobs = new Map<string, { sessionId?: string }>();
   private readonly off: Unsubscribe[] = [];
   private active = false;
   private readonly inflight = new Set<Promise<void>>();
@@ -28,10 +26,11 @@ export class DshSource {
   private selection = 0;
   private timer?: ReturnType<typeof setInterval>;
   private refreshQueued = false;
+
   constructor(
     private readonly port: DshPort,
     private readonly clock: Clock,
-    private readonly attention: RuntimeAttention,
+    private readonly bus: SenseBus,
     private readonly body: {
       tokens(session: string, valid?: () => boolean): Promise<void>;
       sessionsChanged(present: boolean): void;
@@ -40,11 +39,9 @@ export class DshSource {
       sessionToken(session: string): SenseState['self']['body']['tokens'];
     },
     private readonly paused: () => boolean,
-    private readonly selfCauseGraceMs = 2_000,
-    private readonly onAgentDisposed?: (sessionId: string) => void,
-    private readonly platform: string = process.platform,
   ) {}
-  start(): void {
+
+  start(refreshIntervalMs: number | undefined = 5_000): void {
     this.active = true;
     this.body.sessionsChanged(false);
     const host = os.hostname();
@@ -62,48 +59,66 @@ export class DshSource {
     this.off.push(this.port.onAgentEvent((event) => this.track(() => this.agent(event))));
     this.off.push(this.port.onTool((event) => this.track(() => this.tool(event))));
     this.off.push(this.port.onJob((event) => this.track(() => this.job(event))));
-    if ('nowReadings' in this.port) {
-      this.timer = setInterval(() => this.refresh(), 5_000);
+    this.setRefreshInterval(refreshIntervalMs);
+  }
+
+  setRefreshInterval(intervalMs: number | undefined): void {
+    if (this.timer) {
+      clearInterval(this.timer);
+      this.timer = undefined;
+    }
+    if (this.active && intervalMs !== undefined && 'nowReadings' in this.port) {
+      this.timer = setInterval(() => this.refresh(), intervalMs);
       this.timer.unref?.();
     }
   }
+
   stop(): Promise<void> {
     this.active = false;
     if (this.timer) clearInterval(this.timer);
     this.timer = undefined;
     for (const off of this.off.splice(0)) off();
-    this.windows.clear();
     this.jobs.clear();
     this.instances.clear();
     this.sessions.clear();
     return Promise.allSettled([...this.inflight]).then(() => {});
   }
-  private publish(readings: NowReadings, source = { id: 'dsh', api: 'registry', host: os.hostname() }): void {
-    if (!this.active || this.attention.isStopped()) return;
-    this.attention.store.batch(
+
+  private userInstanceCount(): number {
+    let count = 0;
+    for (const id of this.instances.keys()) {
+      if (!this.bus.isInternalSession(id)) count++;
+    }
+    return count;
+  }
+
+  private publish(readings: NowReadings, src = { id: 'dsh', api: 'registry', host: os.hostname() }): void {
+    if (!this.active || this.bus.isStopped()) return;
+    this.bus.store.batch(
       () => {
         for (const [path, reading] of Object.entries(readings)) {
-          this.attention.store.apply({
-            id: this.attention.id(),
+          this.bus.store.apply({
+            id: this.bus.id(),
             kind: 'fact.updated',
             at: this.clock.wall(),
-            source,
+            source: src,
             subject: path,
-            data: { path, ...reading, ttlMs: source.id === 'local' ? 86_400_000 : 30_000 },
+            data: { path, ...reading, ttlMs: src.id === 'local' ? 86_400_000 : 30_000 },
           });
         }
       },
-      () => this.attention.changed(),
+      () => this.bus.changed(),
     );
   }
+
   private refresh(force = false): void {
     if (!this.active || (this.paused() && !force)) return;
     const extended = this.port as DshPort & { nowReadings?: (sessionId?: string) => NowReadings };
-    const reason = this.instances.size ? 'DSH 未提供事实来源' : '没有活动会话';
+    const reason = this.userInstanceCount() ? 'DSH 未提供事实来源' : '没有活动会话';
     let readings: NowReadings;
     try {
       readings =
-        extended.nowReadings?.(this.attention.currentSessionId()) ??
+        extended.nowReadings?.(this.bus.currentSessionId()) ??
         Object.fromEntries(
           [
             'env.where.model',
@@ -123,6 +138,7 @@ export class DshSource {
     }
     this.publish(readings);
   }
+
   private requestRefresh(): void {
     if (this.refreshQueued || !this.active || !('nowReadings' in this.port)) return;
     this.refreshQueued = true;
@@ -131,17 +147,21 @@ export class DshSource {
       this.refresh();
     });
   }
+
   hasSession(session: string): boolean {
     return this.sessions.has(session);
   }
+
   targetChanged(): void {
-    const session = this.attention.currentSessionId();
+    const session = this.bus.currentSessionId();
+    this.body.sessionsChanged(this.userInstanceCount() > 0);
     this.body.selectSession(session);
     this.refresh(true);
     if (session && !this.paused()) {
-      void this.body.tokens(session, () => this.active && this.attention.currentSessionId() === session);
+      void this.body.tokens(session, () => this.active && this.bus.currentSessionId() === session);
     }
   }
+
   stateFor(session: string | undefined, state: SenseState): SenseState {
     const store = session === undefined ? undefined : this.sessions.get(session);
     const extended = this.port as DshPort & { nowReadings?: (sessionId?: string) => NowReadings };
@@ -167,7 +187,7 @@ export class DshSource {
         const reading = readings[path];
         if (!reading) continue;
         view.apply({
-          id: this.attention.id(),
+          id: this.bus.id(),
           kind: 'fact.updated',
           at: this.clock.wall(),
           source,
@@ -206,6 +226,7 @@ export class DshSource {
     state.env.activeJobs = own.env.activeJobs;
     return state;
   }
+
   private track(work: () => Promise<void>): Promise<void> {
     if (!this.active) return Promise.resolve();
     const result = work();
@@ -216,28 +237,13 @@ export class DshSource {
     );
     return result;
   }
-  classify(signal: Signal): Signal {
-    return {
-      ...signal,
-      cause: classifyCause(signal, [...this.windows.values()], this.selfCauseGraceMs, this.clock.mono(), this.platform),
-    };
-  }
-  /** Allocation-light self-cause check for high-rate file events. */
-  classifyFilePath(absPath: string): 'agent' | 'unknown' {
-    if (this.windows.size === 0) return 'unknown';
-    const mono = this.clock.mono();
-    for (const w of this.windows.values()) {
-      if (w.startedMono === undefined || mono < w.startedMono) continue;
-      if (w.endedMono !== undefined && mono >= w.endedMono + this.selfCauseGraceMs) continue;
-      if (w.cwd !== undefined && isUnderDir(w.cwd, absPath, this.platform)) return 'agent';
-    }
-    return 'unknown';
-  }
+
   private async agent(event: AgentEvent): Promise<void> {
+    const isInternal = this.bus.isInternalSession(event.sessionId);
     if (event.type === 'created') {
       if (this.instances.has(event.sessionId)) {
         this.body.disposeSession(event.sessionId);
-        if (this.attention.currentSessionId() === event.sessionId) this.body.selectSession(undefined);
+        if (this.bus.currentSessionId() === event.sessionId) this.body.selectSession(undefined);
       }
       this.instances.set(event.sessionId, {});
       this.sessions.set(
@@ -248,23 +254,22 @@ export class DshSource {
           () => this.clock.mono(),
         ),
       );
-      this.attention.create(event.sessionId);
-      this.body.sessionsChanged(true);
-      if (this.attention.currentSessionId() === event.sessionId) this.body.selectSession(event.sessionId);
+      this.bus.create(event.sessionId);
+      this.body.sessionsChanged(this.userInstanceCount() > 0);
+      if (this.bus.currentSessionId() === event.sessionId) this.body.selectSession(event.sessionId);
     }
     if (event.type === 'disposed') {
-      this.attention.store.batch(
+      this.bus.store.batch(
         () => {
           this.instances.delete(event.sessionId);
           this.sessions.delete(event.sessionId);
           this.body.disposeSession(event.sessionId);
-          this.attention.dispose(event.sessionId);
-          this.onAgentDisposed?.(event.sessionId);
-          this.body.sessionsChanged(this.instances.size > 0);
-          this.body.selectSession(this.attention.currentSessionId());
+          this.bus.dispose(event.sessionId);
+          this.body.sessionsChanged(this.userInstanceCount() > 0);
+          this.body.selectSession(this.bus.currentSessionId());
           this.refresh(true);
         },
-        () => this.attention.changed(),
+        () => this.bus.changed(),
       );
     }
     this.requestRefresh();
@@ -275,97 +280,43 @@ export class DshSource {
         this.active && !!instance && this.instances.get(event.sessionId) === instance && this.selection === sequence;
       if (!instance) return;
       try {
-        if (!this.paused()) await this.body.tokens(event.sessionId, valid);
-        if (valid()) {
-          let step: Promise<void> | undefined;
-          this.attention.store.batch(
+        if (!this.paused() && !isInternal) await this.body.tokens(event.sessionId, valid);
+        if (valid() && !isInternal) {
+          this.bus.store.batch(
             () => {
-              step = this.attention.preStep(event.sessionId, event.userInitiated, !this.paused());
-              this.body.selectSession(this.attention.currentSessionId());
+              this.bus.activateSession(event.sessionId);
+              this.body.selectSession(this.bus.currentSessionId());
               this.refresh(true);
             },
-            () => this.attention.changed(),
+            () => this.bus.changed(),
           );
-          await step;
         }
       } finally {
         this.requestRefresh();
       }
     }
-    if (event.type === 'post-step') {
-      this.attention.postStep(event.sessionId);
+    if (event.type === 'post-step' && !isInternal) {
       const instance = this.instances.get(event.sessionId);
       if (instance && !this.paused()) {
         await this.body.tokens(event.sessionId, () => this.active && this.instances.get(event.sessionId) === instance);
       }
     }
   }
+
   private async tool(event: ToolEvent): Promise<void> {
     this.requestRefresh();
-    const key = `${event.sessionId}:${event.toolCallId}`;
-    const at = event.at ?? this.clock.wall();
-    if (event.type === 'pre-execute') {
-      this.windows.set(key, {
-        startedAt: at,
-        startedMono: this.clock.mono(),
-        cwd: event.cwd,
-        pid: event.pid,
-        sessionToken: this.attention.sessionToken(event.sessionId),
-      });
-      if (this.windows.size > 1024) this.windows.delete(this.windows.keys().next().value as string);
-      return;
-    }
-    const window = this.windows.get(key);
-    if (window) {
-      window.endedAt = at;
-      window.endedMono = this.clock.mono();
-      window.pid ??= event.pid;
-    }
-    if (!this.paused() && event.exitCode !== undefined && event.exitCode !== 0) {
-      await this.attention.accept(
-        this.classify({
-          id: this.attention.id(),
-          kind: 'job.exited',
-          at,
-          source,
-          subject: event.command ?? event.toolCallId,
-          cause: 'agent',
-          data: {
-            id: event.toolCallId,
-            sessionId: event.sessionId,
-            sessionToken: window?.sessionToken,
-            command: event.command,
-            pid: event.pid ?? window?.pid,
-            ppid: event.ppid,
-            ancestors: event.ancestors,
-            path: event.cwd ?? window?.cwd,
-            exitCode: event.exitCode,
-          },
-        }),
-      );
-    }
-  }
-  private async job(event: JobEvent): Promise<void> {
-    if (event.type === 'started') {
-      this.jobs.set(event.id, {
-        sessionId: event.sessionId,
-        sessionToken: this.attention.sessionToken(event.sessionId),
-      });
-    }
-    const owner = this.jobs.get(event.id);
-    if (event.type === 'exited') this.jobs.delete(event.id);
-    if (this.paused()) return;
-    await this.attention.accept(
-      this.classify({
-        id: this.attention.id(),
-        kind: `job.${event.type}`,
-        at: event.at ?? this.clock.wall(),
+    if (!this.paused() && event.type === 'post-execute' && event.exitCode !== undefined && event.exitCode !== 0) {
+      const at = event.at ?? this.clock.wall();
+      await this.bus.accept({
+        id: this.bus.id(),
+        kind: 'job.exited',
+        at,
         source,
-        subject: event.command ?? event.id,
+        subject: event.command ?? event.toolCallId,
+        cause: 'agent',
         data: {
-          id: event.id,
-          sessionId: owner ? owner.sessionId : event.sessionId,
-          sessionToken: owner?.sessionToken,
+          id: event.toolCallId,
+          sessionId: event.sessionId,
           command: event.command,
           pid: event.pid,
           ppid: event.ppid,
@@ -373,7 +324,34 @@ export class DshSource {
           path: event.cwd,
           exitCode: event.exitCode,
         },
-      }),
-    );
+      });
+    }
+  }
+
+  private async job(event: JobEvent): Promise<void> {
+    if (event.type === 'started') {
+      this.jobs.set(event.id, { sessionId: event.sessionId });
+    }
+    const owner = this.jobs.get(event.id);
+    if (event.type === 'exited') this.jobs.delete(event.id);
+    if (this.paused()) return;
+    await this.bus.accept({
+      id: this.bus.id(),
+      kind: `job.${event.type}`,
+      at: event.at ?? this.clock.wall(),
+      source,
+      subject: event.command ?? event.id,
+      cause: 'agent',
+      data: {
+        id: event.id,
+        sessionId: owner ? owner.sessionId : event.sessionId,
+        command: event.command,
+        pid: event.pid,
+        ppid: event.ppid,
+        ancestors: event.ancestors,
+        path: event.cwd,
+        exitCode: event.exitCode,
+      },
+    });
   }
 }

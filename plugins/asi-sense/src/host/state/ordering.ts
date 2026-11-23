@@ -71,15 +71,13 @@ export class FactOrdering {
             ? 'env.frontApp'
             : signal.kind === 'window.focused' || signal.kind === 'window.title-changed'
               ? 'env.focusedWindow'
-              : signal.kind === 'file.changed'
-                ? `file:${typeof signal.data.path === 'string' ? signal.data.path : signal.subject}`
-                : signal.kind === 'agent.status'
-                  ? 'self.activity'
-                  : signal.kind === 'system.sleep' || signal.kind === 'system.wake'
-                    ? 'env.system.power'
-                    : signal.kind === 'screen.locked' || signal.kind === 'screen.unlocked'
-                      ? 'env.system.lock'
-                      : [signal.kind, signal.subject];
+              : signal.kind === 'agent.status'
+                ? 'self.activity'
+                : signal.kind === 'system.sleep' || signal.kind === 'system.wake'
+                  ? 'env.system.power'
+                  : signal.kind === 'screen.locked' || signal.kind === 'screen.unlocked'
+                    ? 'env.system.lock'
+                    : [signal.kind, signal.subject];
     const key = JSON.stringify([signal.source.id, path]);
     const sequence = signal.data.sequence;
     const previous = this.sequences.get(key);

@@ -1,5 +1,5 @@
 import type { FactStatus } from '@asi/sense-types';
-import type { RuntimeAttention } from '../runtime/attention.ts';
+import type { SenseBus } from '../runtime/bus.ts';
 import type { BodySource } from './body.ts';
 import { appObservation, axStatus, helperEvent, type Message, object, validApp } from './helper-events.ts';
 
@@ -48,13 +48,13 @@ export function missingSnapshot(event: Message): string[] {
 }
 
 export function markHelperFacts(
-  attention: RuntimeAttention,
+  bus: SenseBus,
   body: BodySource,
   at: number,
   fields: readonly string[],
   status: Extract<FactStatus, 'stale' | 'unknown'>,
 ): void {
-  const state = attention.state();
+  const state = bus.state();
   for (const [field, path, fact] of [
     ['frontApp', 'env.frontApp', state.env.frontApp],
     ['focusedWindow', 'env.focusedWindow', state.env.focusedWindow],
@@ -65,8 +65,8 @@ export function markHelperFacts(
       (status === 'stale' && fact.status === 'unknown')
     )
       continue;
-    attention.store.apply({
-      id: attention.id(),
+    bus.store.apply({
+      id: bus.id(),
       kind: 'fact.updated',
       at,
       source: fact.source,
@@ -78,14 +78,14 @@ export function markHelperFacts(
   if (fields.includes('thermal') && (fact.source.id === 'helper' || fact.source.id.startsWith('helper.'))) {
     body.setThermal({ ...fact, status: status === 'stale' && fact.status === 'unknown' ? 'unknown' : status }, true);
   }
-  attention.changed();
+  bus.changed();
 }
 
 export async function applyHelperEvent(
   recovery: HelperRecovery,
   raw: Message,
   safe: Message,
-  attention: RuntimeAttention,
+  bus: SenseBus,
   body: BodySource,
   valid: () => boolean = () => true,
   skip: ReadonlySet<string> = new Set(),
@@ -94,7 +94,7 @@ export async function applyHelperEvent(
   if (raw.type !== 'snapshot') recovery.delta(raw);
   if (raw.type === 'snapshot' && metadataOnly) {
     const app = object(safe.frontApp);
-    const state = attention.state();
+    const state = bus.state();
     const current = state.env.frontApp.value;
     const window = object(raw.focusedWindow);
     const permission = object(raw.permissions)?.accessibility;
@@ -112,11 +112,11 @@ export async function applyHelperEvent(
         (state.observation.sources['helper.ax']?.status === 'denied' && permission !== 'granted')
       )
         delete observed.windowCount;
-      await appObservation(attention, observed, raw.at as number, false, valid);
+      await appObservation(bus, observed, raw.at as number, false, valid);
     }
     if (!valid()) return false;
     if (!recovery.dirty.has('permissions')) {
-      const state = attention.state();
+      const state = bus.state();
       const currentStatus = state.observation.sources['helper.ax']?.status;
       const status =
         permission === 'denied'
@@ -130,11 +130,13 @@ export async function applyHelperEvent(
                 : sameApp &&
                     (currentStatus !== 'denied' || permission === 'granted') &&
                     (window?.status === 'ok' ||
-                      (Number.isSafeInteger(app.windowCount) && (app.windowCount as number) >= 0))
+                      (state.env.focusedWindow.status !== 'unknown' &&
+                        Number.isSafeInteger(app.windowCount) &&
+                        (app.windowCount as number) >= 0))
                   ? 'ok'
                   : undefined;
       if (status && (status !== currentStatus || (status === 'denied' && state.env.focusedWindow.status !== 'denied')))
-        await axStatus(attention, status, raw.at as number);
+        await axStatus(bus, status, raw.at as number);
     }
     if (!valid()) return false;
   }
@@ -144,8 +146,8 @@ export async function applyHelperEvent(
       ['focusedWindow', 'env.focusedWindow'],
     ] as const) {
       if (recovery.dirty.has(field) || skip.has(field)) continue;
-      attention.store.apply({
-        id: attention.id(),
+      bus.store.apply({
+        id: bus.id(),
         kind: 'fact.updated',
         at: raw.at as number,
         source: { id: `helper.${field}`, api: 'ndjson', host: 'local' },
@@ -153,11 +155,22 @@ export async function applyHelperEvent(
         data: { path, value: null, status: 'ok', ttlMs: 60_000, preserveSourceStatus: recovery.degraded },
       });
     }
-    attention.changed();
+    bus.changed();
+  }
+  if (
+    raw.type === 'snapshot' &&
+    !metadataOnly &&
+    (recovery.dirty.has('focusedWindow') || skip.has('focusedWindow')) &&
+    !recovery.dirty.has('permissions') &&
+    !skip.has('permissions') &&
+    object(raw.permissions)?.accessibility === 'denied'
+  ) {
+    await axStatus(bus, 'denied', raw.at as number);
+    if (!valid()) return false;
   }
   await helperEvent(
     safe,
-    attention,
+    bus,
     body,
     recovery.degraded,
     raw.type === 'snapshot' ? new Set([...recovery.dirty, ...skip]) : undefined,
@@ -167,7 +180,7 @@ export async function applyHelperEvent(
   if (!recovery.degraded || raw.type !== 'snapshot') return false;
   const missing = missingSnapshot(raw);
   if (missing.length) {
-    markHelperFacts(attention, body, raw.at as number, missing, 'unknown');
+    markHelperFacts(bus, body, raw.at as number, missing, 'unknown');
     return false;
   }
   recovery.degraded = false;

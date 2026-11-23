@@ -196,7 +196,7 @@ describe('DSH now facts', () => {
     );
     const ctx = f.ctx as unknown as Record<string, unknown>;
     ctx.sessionProjections = { register: async () => ({}) };
-    const port = createDshPort(f.ctx, () => false);
+    const port = createDshPort(f.ctx);
     expect(port.modelJobs?.(f.agent.id)).toEqual([{ id: 'job-1', startedAt: 10, status: 'running' }]);
     expect(port.modelJobs?.(other.id)).toEqual([{ id: 'other-job', startedAt: 30, status: 'running' }]);
     expect(port.modelJobs?.('missing')).toEqual([]);
@@ -213,7 +213,7 @@ describe('DSH now facts', () => {
     };
     ctx.jobs = { ...(ctx.jobs as object), events: { subscribe: () => () => {} } };
     ctx.sessionProjections = { register: async () => ({}) };
-    const port = createDshPort(f.ctx, () => false);
+    const port = createDshPort(f.ctx);
     let notifications = 0;
     const off = port.onNowChanged(() => notifications++);
     const execute = listeners.get('tools/execute') as (
@@ -252,11 +252,7 @@ describe('DSH now facts', () => {
       ctx.jobs = { ...(ctx.jobs as object), events: { subscribe: () => () => {} } };
       ctx.sessionProjections = { register: async () => ({}) };
       let mono = 0;
-      const port = createDshPort(
-        f.ctx,
-        () => false,
-        () => mono,
-      );
+      const port = createDshPort(f.ctx, () => mono);
       const off = port.onNowChanged(() => {});
       const stream = listeners.get('agent/assistant-stream') as unknown as (event: unknown) => void;
       const status = listeners.get('agent/status') as unknown as (event: unknown) => void;
@@ -294,7 +290,7 @@ describe('DSH now facts', () => {
       };
       ctx.jobs = { ...(ctx.jobs as object), events: { subscribe: () => () => {} } };
       ctx.sessionProjections = { register: async () => ({}) };
-      const port = createDshPort(f.ctx, () => false);
+      const port = createDshPort(f.ctx);
       const off = port.onNowChanged(() => {});
       const execute = listeners.get('tools/execute') as (
         event: unknown,
@@ -347,7 +343,7 @@ describe('DSH now facts', () => {
     ctx.on = bus.on.bind(bus);
     ctx.jobs = { ...(ctx.jobs as object), events: { subscribe: () => () => {} } };
     ctx.sessionProjections = { register: async () => ({}) };
-    const port = createDshPort(f.ctx, () => false);
+    const port = createDshPort(f.ctx);
     const off = port.onNowChanged(() => {});
     try {
       const request = events.waterfall('approval/request', { agent: f.agent }, async () => undefined);
@@ -374,7 +370,7 @@ describe('DSH now facts', () => {
     ctx.on = bus.on.bind(bus);
     ctx.jobs = { ...(ctx.jobs as object), events: { subscribe: () => () => {} } };
     ctx.sessionProjections = { register: async () => ({}) };
-    const off = createDshPort(f.ctx, () => false).onNowChanged(() => {});
+    const off = createDshPort(f.ctx).onNowChanged(() => {});
     try {
       await expect(events.waterfall('user-questions/request', { questions: [] }, async () => 'fallback')).resolves.toBe(
         'answered',

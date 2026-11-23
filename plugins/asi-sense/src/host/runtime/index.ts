@@ -1,34 +1,30 @@
-import type { WatchRule } from '@asi/sense-types';
+import type { MetricKey, PowerMode, SenseSettingsSnapshot, SenseSnapshot } from '@asi/sense-types';
 import { BodySource } from '../sources/body.ts';
 import { DshSource } from '../sources/dsh.ts';
-import { exclusionKey, MAX_FILE_EXCLUSIONS, normalizeFileExclusion } from '../sources/file-exclusions.ts';
-import { FileSource } from '../sources/files.ts';
-import { FileGlobalSource } from '../sources/files-global.ts';
 import { HelperSource } from '../sources/helper.ts';
 import { boundedShutdown, guardActions } from './action-guard.ts';
-import { RuntimeAttention } from './attention.ts';
-import { AwayReporter } from './away.ts';
-import { createChanges, createStateListeners, observableActions, settleShutdown } from './changes.ts';
-import { deliveryRetry } from './delivery-retry.ts';
+import { SenseBus } from './bus.ts';
+import {
+  createChanges,
+  createSnapshotListeners,
+  createStateListeners,
+  observableActions,
+  settleShutdown,
+} from './changes.ts';
 import { FactExpiry } from './expiry.ts';
-import { HistoryManager, toMonthlySummaryResult } from './history/index.ts';
-import { MetricTimeline } from './metrics.ts';
 import type { SenseActions, SenseOptions, SensePorts } from './ports.ts';
-import { createSessionTarget } from './session-target.ts';
+import { createRingHistory } from './ring.ts';
 import { Settings } from './settings.ts';
 import { pauseAction, runtimeTools } from './tools.ts';
 
-export type { EventEntry, EventLog } from './attention.ts';
 export type * from './ports.ts';
+
 export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}) {
-  if (
-    options.selfCauseGraceMs !== undefined &&
-    (!Number.isFinite(options.selfCauseGraceMs) || options.selfCauseGraceMs < 0)
-  )
-    throw new TypeError('selfCauseGraceMs must be a non-negative finite number');
   const { clock } = ports;
   const platform = options.platform ?? process.platform;
-  const settings = new Settings(ports.storage, options.rules, platform);
+  const normalIntervalMs = options.intervalMs ?? 2_000;
+  const ecoIntervalMs = options.ecoIntervalMs ?? Math.max(10_000, normalIntervalMs * 5);
+  const settings = new Settings(ports.storage);
   let running = false;
   let started = false;
   let generation = 0;
@@ -36,215 +32,109 @@ export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}
   let allowTitles = true;
   let titleIntent = 0;
   let paused = false;
+  let powerMode: PowerMode = 'normal';
+  let powerModeReason: string | undefined;
   const isPaused = () => paused;
   let timer: ReturnType<typeof setTimeout> | undefined;
   let nextToken = Number.POSITIVE_INFINITY;
-  let retryAfter = 0;
-  let installed = settings.enabled().map((rule) => rule.id);
-  const changes = createChanges();
-  const changed = () => {
-    if (generation === 0) changes.changed();
+
+  const sampleIntervals = (): Partial<Record<MetricKey, number>> => {
+    const base = powerMode === 'eco' ? ecoIntervalMs : normalIntervalMs;
+    return {
+      cpu: base,
+      memory: Math.max(base, powerMode === 'eco' ? 15_000 : 4_000),
+      battery: Math.max(base, powerMode === 'eco' ? 60_000 : 30_000),
+      thermal: 30_000,
+      networkRx: Math.max(base, powerMode === 'eco' ? 15_000 : 4_000),
+      networkTx: Math.max(base, powerMode === 'eco' ? 15_000 : 4_000),
+      processCpu: base,
+      processRss: base,
+      tokens: powerMode === 'eco' ? 15_000 : 5_000,
+    };
   };
+
+  const ring = createRingHistory({ thermal: 30_000 });
+  const changes = createChanges();
+  const snapshotListeners = createSnapshotListeners();
+  const listeners = createStateListeners();
+  const expiry = new FactExpiry(clock);
+
+  const publishSnapshot = () => {
+    if (generation !== 0 || !running) return;
+    if (snapshotListeners.size > 0) {
+      snapshotListeners.notify(buildSnapshot());
+    }
+  };
+
+  const changed = () => {
+    if (generation === 0) {
+      changes.changed();
+      publishSnapshot();
+    }
+  };
+
   const onChange = (listener: () => void) => (generation === 0 ? changes.subscribe(listener) : () => {});
   const check = (epoch = generation) => {
     if (stopping || epoch !== generation) throw new Error('stopped');
   };
-  const expiry = new FactExpiry(clock);
-  const deliveryPort = deliveryRetry(ports.dsh, clock, () => attention);
-  let attentionRef: RuntimeAttention | undefined;
-  const metrics = new MetricTimeline(clock, options.timeZone);
-  const away = new AwayReporter(metrics, clock, (signal) => {
-    // The observer runs inside the store's synchronous apply callback; defer
-    // the synthetic wake/record so it cannot re-enter that apply.
-    queueMicrotask(() => {
-      if (stopping || !attentionRef) return;
-      void attentionRef.accept(signal).catch(() => {});
-    });
+
+  let helperRef: HelperSource | undefined;
+  const bus = new SenseBus(clock, () => allowTitles && Boolean(helperRef?.titlesEnabled()), changed, expiry);
+
+  const body = new BodySource(ports.probe, ports.dsh, clock, bus, expiry, isPaused, changed, (sample, at, mono) => {
+    ring.record(sample, at, mono);
   });
-  const history = new HistoryManager({
-    port: ports.history,
-    clock,
-    isPaused,
-    titlesAllowed: () => allowTitles,
-    restoreEntries: (entries) => attentionRef?.restoreEntries(entries),
-    clearMemoryEntries: () => attentionRef?.clearEvents(),
-    snapshotMemoryEntries: () => attentionRef?.snapshotEntries() ?? [],
-    restoreMemoryEntries: (entries) => attentionRef?.restoreEntriesPreservingLive(entries),
-    emitSourceError: (error, extra) => {
-      if (!attentionRef || stopping) return;
-      const isDailyLimit = error === 'daily-limit-exceeded';
-      void attentionRef
-        .accept({
-          id: attentionRef.id(),
-          kind: 'source.error',
-          at: clock.wall(),
-          source: { id: 'history', api: 'storage', host: 'local' },
-          subject: 'history',
-          data: isDailyLimit
-            ? { status: 'ok', capped: true, error, reason: error, ...extra }
-            : { status: 'error', error, reason: error, ...extra },
-        })
-        .catch(() => {});
-    },
-    restoreSourceError: (error, extra) => {
-      if (!attentionRef || stopping) return;
-      const isDailyLimit = error === 'daily-limit-exceeded';
-      attentionRef.restoreSourceObservation({
-        id: attentionRef.id(),
-        kind: 'source.error',
-        at: clock.wall(),
-        source: { id: 'history', api: 'storage', host: 'local' },
-        subject: 'history',
-        data: isDailyLimit
-          ? { status: 'ok', capped: true, error, reason: error, ...extra }
-          : { status: 'error', error, reason: error, ...extra },
-      });
-    },
-    emitSourceOk: (extra) => {
-      if (!attentionRef || stopping) return;
-      void attentionRef
-        .accept({
-          id: attentionRef.id(),
-          kind: 'source.status',
-          at: clock.wall(),
-          source: { id: 'history', api: 'storage', host: 'local' },
-          subject: 'history',
-          data: { status: 'ok', ...extra },
-        })
-        .catch(() => {});
-    },
-    clearSourceCap: () => {
-      if (!attentionRef || stopping) return;
-      attentionRef.restoreSourceObservation({
-        id: attentionRef.id(),
-        kind: 'source.status',
-        at: clock.wall(),
-        source: { id: 'history', api: 'storage', host: 'local' },
-        subject: 'history',
-        data: { preserveStatus: true, capped: false },
-      });
-    },
-    timeZone: options.timeZone,
-    dayExtensions: (date) => {
-      const extension = metrics.dailyExtension(date);
-      return extension ? { metrics: extension } : undefined;
-    },
-    onSummaryChanged: changed,
-  });
-  const attention = new RuntimeAttention(
-    clock,
-    deliveryPort,
-    () => settings.enabled(),
-    schedule,
-    () => allowTitles && helper.titlesEnabled(),
-    changed,
-    expiry,
-    () => target.ensure(),
-    () => target.canEnsure(),
-    history,
-    platform,
-    (signal) => away.observe(signal),
-  );
-  attentionRef = attention;
-  const listeners = createStateListeners();
-  const body = new BodySource(
-    ports.probe,
-    ports.dsh,
-    ports.storage,
-    clock,
-    attention,
-    expiry,
-    isPaused,
-    changed,
-    metrics,
-  );
-  const dsh = new DshSource(
-    deliveryPort,
-    clock,
-    attention,
-    body,
-    isPaused,
-    options.selfCauseGraceMs,
-    (id) => {
-      target.unload(id);
-      attention.rescheduleDelivery();
-    },
-    platform,
-  );
-  const target = createSessionTarget(
-    ports.dsh,
-    ports.storage,
-    options.targetStorageKey ?? 'session-target',
-    async (id) => {
-      const transfer = attention.setTarget(id);
-      ports.dsh.selectDeliveryTarget?.(attention.currentSessionId());
-      await transfer;
-      dsh.targetChanged();
-    },
-    () => attention.recordTargetReset(),
-    changed,
-    {
-      closed: async (id) => {
-        await attention.closeSession(id);
-        ports.dsh.selectDeliveryTarget?.(attention.currentSessionId());
-        dsh.targetChanged();
-      },
-      refreshed: (rows) => attention.availableSessions(rows.map((row) => row.id)),
-    },
-  );
-  const offStore = attention.store.subscribe((state) => {
-    listeners.notify(dsh.stateFor(attention.currentSessionId(), state));
+
+  const dsh = new DshSource(ports.dsh, clock, bus, body, isPaused);
+
+  const helper = new HelperSource(ports.helper, options.helperPath, platform, clock, bus, body, schedule, isPaused);
+  helperRef = helper;
+
+  const offStore = bus.store.subscribe((state) => {
+    const projected = dsh.stateFor(bus.currentSessionId(), state);
+    ring.record(projected.self.body, clock.wall(), clock.mono());
+    listeners.notify(projected);
     schedule();
   });
-  const files = new FileSource(
-    ports.files,
-    clock,
-    attention,
-    dsh,
-    () => settings.enabled(),
-    isPaused,
-    (signal, dirs) => body.burst(signal, dirs),
-    (scopes) => body.setScopes(scopes),
-    platform,
-  );
-  const filesGlobal = new FileGlobalSource(
-    ports.files,
-    clock,
-    attention,
-    dsh,
-    settings,
-    isPaused,
-    (signal, dirs, receivedMono) => body.burst(signal, dirs, receivedMono),
-    (enabled) => body.setGlobalScope(enabled),
-    (absPath) => files.hasDirScope(absPath),
-    () => schedule(),
-    options.globalFileWatch,
-    platform,
-  );
-  const helper = new HelperSource(
-    ports.helper,
-    options.helperPath,
-    options.platform ?? process.platform,
-    clock,
-    attention,
-    body,
-    schedule,
-    isPaused,
-  );
+
+  function getSettings(): SenseSettingsSnapshot {
+    return {
+      paused,
+      sendTitles: allowTitles,
+      powerMode,
+      ...(powerModeReason !== undefined ? { powerModeReason } : {}),
+    };
+  }
+
+  function buildSnapshot(sessionId?: string): SenseSnapshot {
+    const now = clock.wall();
+    const mono = clock.mono();
+    const target = sessionId !== undefined && !bus.isInternalSession(sessionId) ? sessionId : bus.currentSessionId();
+    const state = dsh.stateFor(target, bus.state());
+    if (!(allowTitles && helper.titlesEnabled())) {
+      state.env.focusedWindow.value = null;
+    }
+    ring.record(state.self.body, now, mono);
+    return {
+      now,
+      mono,
+      ...(bus.currentSessionId() !== undefined ? { activeSessionId: bus.currentSessionId() } : {}),
+      state,
+      history: ring.snapshot(mono),
+      settings: getSettings(),
+      sampleIntervalsMs: sampleIntervals(),
+    };
+  }
+
+  function tokenPollMs(): number {
+    return powerMode === 'eco' ? 15_000 : 5_000;
+  }
+
   function schedule(): void {
     if (timer) clearTimeout(timer);
     timer = undefined;
     if (!running) return;
-    const due = paused ? undefined : attention.pipeline.nextDeadline();
-    const deadline = Math.min(
-      due === undefined ? Infinity : Math.max(due, retryAfter),
-      filesGlobal.nextDeadline() ?? Infinity,
-      helper.nextDeadline() ?? Infinity,
-      nextToken,
-      expiry.next() ?? Infinity,
-      attention.pipeline.retentionDeadline() ?? Infinity,
-      history.nextDeadline() ?? Infinity,
-    );
+    const deadline = Math.min(helper.nextDeadline() ?? Infinity, nextToken, expiry.next() ?? Infinity);
     if (!Number.isFinite(deadline)) return;
     timer = setTimeout(
       () => {
@@ -255,61 +145,22 @@ export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}
     );
     timer.unref?.();
   }
+
   async function tick(): Promise<void> {
     if (!running) return;
     if (expiry.expire()) {
-      listeners.notify(dsh.stateFor(attention.currentSessionId(), attention.state()));
+      listeners.notify(dsh.stateFor(bus.currentSessionId(), bus.state()));
       changed();
     }
     if (clock.mono() >= nextToken) {
-      nextToken = clock.mono() + 5_000;
-      const session = attention.current();
-      if (session && !paused) void body.tokens(session, () => attention.currentSessionId() === session);
+      nextToken = clock.mono() + tokenPollMs();
+      const session = bus.currentSessionId();
+      if (session && !paused) void body.tokens(session, () => bus.currentSessionId() === session);
     }
     helper.tick();
-    await filesGlobal.tick();
-    attention.pipeline.pruneSessions();
-    const due = attention.pipeline.nextDeadline();
-    if (!paused && due !== undefined && due <= clock.mono() && clock.mono() >= retryAfter) {
-      retryAfter = clock.mono() + 250;
-      await attention.flush().catch(() => {});
-    }
-    await history.tick();
     schedule();
   }
-  async function syncRules(): Promise<void> {
-    for (const id of installed) attention.pipeline.removeRule(id);
-    const rules = settings.enabled();
-    for (const rule of rules) attention.pipeline.addRule(rule);
-    installed = rules.map((rule) => rule.id);
-    if (running) {
-      await files.refresh();
-      await filesGlobal.refresh();
-    }
-  }
-  async function updateGlobalWatch(change: Parameters<Settings['update']>[0]): Promise<void> {
-    const epoch = generation;
-    check(epoch);
-    await settings.update(change);
-    check(epoch);
-    if (running) await filesGlobal.refresh();
-    changed();
-  }
-  async function update(change: Parameters<Settings['update']>[0]): Promise<void> {
-    const epoch = generation;
-    check(epoch);
-    await settings.update(change);
-    check(epoch);
-    await syncRules();
-    changed();
-  }
-  function ruleChange(id: string, change: (rule: WatchRule) => void): Promise<void> {
-    return update((draft) => {
-      const rule = draft.rules.find((item) => item.id === id);
-      if (!rule) throw new Error('unknown rule');
-      change(rule);
-    });
-  }
+
   const applyPause = pauseAction(
     settings,
     isPaused,
@@ -317,51 +168,22 @@ export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}
       paused = value;
       if (value) {
         schedule();
-        await settleShutdown([body.setPaused(true), files.refresh(), filesGlobal.refresh(), helper.stop()]);
+        dsh.setRefreshInterval(undefined);
+        await settleShutdown([body.setPaused(true), helper.stop()]);
       } else {
         await body.setPaused(false);
         check();
-        await files.refresh();
-        check();
-        await filesGlobal.refresh();
-        check();
+        dsh.setRefreshInterval(powerMode === 'eco' ? 15_000 : 5_000);
         helper.start(settings.sendTitles);
         schedule();
       }
     },
     check,
   );
-  const clearAllHistory = async () => {
-    // Clear persisted history first: a storage failure must leave the
-    // in-memory metrics/away state untouched and surface to the UI.
-    await history.clear();
-    metrics.clear();
-    away.clear();
-    changed();
-  };
 
   const unguarded: SenseActions = {
-    selectTarget: (id) => target.select(id),
-    dismissTargetNotice: async () => target.dismiss(),
-    toggleRule: (id, enabled) =>
-      update((draft) => {
-        if (!draft.rules.some((rule) => rule.id === id)) throw new Error('unknown rule');
-        draft.disabled = draft.disabled.filter((item) => item !== id);
-        if (!enabled) draft.disabled.push(id);
-      }),
-    confirmRule: (id) =>
-      ruleChange(id, (rule) => {
-        rule.approved = true;
-      }),
-    deleteRule: (id) =>
-      update((draft) => {
-        if (!draft.rules.some((rule) => rule.id === id)) throw new Error('unknown rule');
-        draft.rules = draft.rules.filter((rule) => rule.id !== id);
-        draft.disabled = draft.disabled.filter((item) => item !== id);
-      }),
     pause: async (value) => {
       await applyPause(value);
-      history.setPaused(value);
     },
     setSendTitles: async (enabled) => {
       const epoch = generation;
@@ -378,108 +200,33 @@ export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}
       if (intent !== titleIntent) return;
       allowTitles = enabled;
       if (enabled) helper.setTitles(true);
+      changed();
+    },
+    setPowerMode: async (mode, reason) => {
+      const epoch = generation;
+      check(epoch);
+      const nextReason = mode === 'eco' ? reason : undefined;
+      if (powerMode === mode && powerModeReason === nextReason) return;
+      powerMode = mode;
+      powerModeReason = nextReason;
+      const targetInterval = mode === 'eco' ? ecoIntervalMs : normalIntervalMs;
+      await body.setIntervalMs(targetInterval, mode === 'eco');
+      check(epoch);
+      if (!paused) {
+        dsh.setRefreshInterval(mode === 'eco' ? 15_000 : 5_000);
+      }
+      schedule();
+      changed();
     },
     openPermissionSettings: async () => {
       await ports.dsh.openPermissionSettings?.();
     },
-    revertTuning: (id) =>
-      body.asUser(async () => {
-        const result = await body.tuner.revert(id);
-        body.sync();
-        return result;
-      }),
-    lockParam: (param, locked) => body.asUser(() => (locked ? body.tuner.lock(param) : body.tuner.unlock(param))),
-    feedback: (id, verdict) =>
-      body.asUser(async () => {
-        const result = await body.tuner.feedback(id, verdict);
-        if (result.applied) attention.feedback(id, verdict);
-        return result;
-      }),
-    acceptRebaseline: (id) =>
-      body.asUser(async () => {
-        const result = await body.monitor.acceptRebaseline(id);
-        body.sync();
-        return result;
-      }),
-    resumeTuning: () => body.asUser(() => body.tuner.resumeTuning()),
-    resetTuning: () => body.asUser(() => body.tuner.resetTuning()),
-    retryTuningBackup: () =>
-      body.asUser(async () => {
-        await body.monitor.retryBackup();
-        body.sync();
-      }),
-    dismissTuningBackup: () => body.asUser(() => body.monitor.dismissBackup()),
-    setGlobalFileWatch: async (enabled) => {
-      filesGlobal.resetWatchAvailability();
-      await updateGlobalWatch((draft) => {
-        draft.globalFileWatch = enabled;
-      });
-    },
-    retryGlobalFileWatch: async () => {
-      const epoch = generation;
-      check(epoch);
-      if (running) await filesGlobal.retry();
-      check(epoch);
-      changed();
-    },
-    addFileExclusion: (pattern) => {
-      check();
-      const norm = normalizeFileExclusion(pattern);
-      const key = exclusionKey(norm, platform);
-      return updateGlobalWatch((draft) => {
-        const list = draft.fileExclusions ?? [];
-        if (list.some((item) => exclusionKey(item, platform) === key)) {
-          throw new TypeError('Exclusion pattern already exists');
-        }
-        if (list.length >= MAX_FILE_EXCLUSIONS) {
-          throw new RangeError(`Maximum of ${MAX_FILE_EXCLUSIONS} exclusion patterns reached`);
-        }
-        list.push(norm);
-        draft.fileExclusions = list;
-      });
-    },
-    removeFileExclusion: (pattern) => {
-      check();
-      const norm = normalizeFileExclusion(pattern);
-      const key = exclusionKey(norm, platform);
-      return updateGlobalWatch((draft) => {
-        draft.fileExclusions = (draft.fileExclusions ?? []).filter((item) => exclusionKey(item, platform) !== key);
-      });
-    },
-    listMonths: async () => {
-      check();
-      return history.listCompletedMonths();
-    },
-    loadMonthly: async (month) => {
-      check();
-      return toMonthlySummaryResult(await history.summary({ month }));
-    },
-    clearHistory: () => {
-      check();
-      return clearAllHistory();
-    },
   };
+
   const guarded = guardActions(unguarded, () => generation, check);
-  const actions = guarded.actions;
-  const tools = {
-    ...runtimeTools(
-      attention,
-      body,
-      settings,
-      actions,
-      files,
-      helper,
-      syncRules,
-      check,
-      () => allowTitles,
-      changed,
-      deliveryPort,
-      dsh,
-      metrics,
-    ),
-    envHistory: (params?: Parameters<HistoryManager['query']>[0]) => history.query(params),
-    envSummary: (params?: Parameters<HistoryManager['summary']>[0]) => history.summary(params),
-  };
+  const actions = observableActions(guarded.actions, changed);
+  const tools = runtimeTools(bus, helper, () => allowTitles && helper.titlesEnabled(), ports.dsh, dsh);
+
   function stop(): Promise<void> {
     if (stopping) return stopping;
     generation++;
@@ -487,27 +234,17 @@ export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}
     running = false;
     if (timer) clearTimeout(timer);
     timer = undefined;
-    const deliveries = attention.stop();
-    const targeting = target.stop();
+    const busStop = bus.stop();
     const callbacks = dsh.stop();
     offStore();
     listeners.clear();
+    snapshotListeners.clear();
     changes.clear();
-    const work = settleShutdown([
-      deliveries,
-      targeting,
-      callbacks,
-      guarded.wait(),
-      files.stop(),
-      filesGlobal.stop(),
-      helper.stop(),
-      body.stop(),
-      history.stop(),
-      settings.close(),
-    ]);
+    const work = settleShutdown([busStop, callbacks, guarded.wait(), helper.stop(), body.stop(), settings.close()]);
     stopping = boundedShutdown(work);
     return stopping;
   }
+
   return {
     async start(): Promise<void> {
       if (started) throw new Error('runtime cannot be restarted');
@@ -518,52 +255,41 @@ export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}
         check(epoch);
         allowTitles = settings.sendTitles;
         paused = settings.paused;
-        await history.start(paused);
-        check(epoch);
-        await syncRules();
-        check(epoch);
-        await body.start(options.intervalMs ?? 2_000);
+        await body.start(normalIntervalMs);
         check(epoch);
         running = true;
-        dsh.start();
-        await target.start();
-        check(epoch);
-        await files.refresh();
-        check(epoch);
-        await filesGlobal.refresh();
-        check(epoch);
+        dsh.start(paused ? undefined : 5_000);
         if (!paused) helper.start(settings.sendTitles);
-        nextToken = clock.mono() + 5_000;
+        nextToken = clock.mono() + tokenPollMs();
         schedule();
         changed();
       } catch (error) {
-        const stopped = epoch !== generation;
+        const stoppedEarly = epoch !== generation;
         await stop().catch(() => {});
-        if (stopped) throw new Error('stopped');
+        if (stoppedEarly) throw new Error('stopped');
         throw error;
       }
     },
     stop,
-    currentSessionId: () => attention.currentSessionId(),
-    targetMode: () => attention.targetMode(),
-    target: () => target.snapshot(),
-    state: () => dsh.stateFor(attention.currentSessionId(), attention.state()),
+    currentSessionId: () => bus.currentSessionId(),
+    state: () => dsh.stateFor(bus.currentSessionId(), bus.state()),
+    snapshot: buildSnapshot,
+    subscribeSnapshot: snapshotListeners.subscribe,
     factMeta: (path: string) => expiry.factMeta(path),
     subscribe: listeners.subscribe,
     onChange,
-    events: () => attention.events(),
-    rules: {
-      list: () => settings.list(),
-      isEnabled: (id: string) => settings.isEnabled(id),
-      settings: () => ({ paused, sendTitles: allowTitles }),
+    recentSignals: () => bus.recentSignals(),
+    getSettings,
+    registerInternalSession: (id: string) => {
+      const prev = bus.currentSessionId();
+      const off = bus.registerInternalSession(id);
+      if (prev !== bus.currentSessionId()) dsh.targetChanged();
+      return () => {
+        off();
+        dsh.targetChanged();
+      };
     },
-    body: { monitor: body.monitor, tuner: body.tuner },
-    actions: observableActions(actions, changed),
-    historySnapshot: () => history.timelineSnapshots(),
-    metricsVersion: () => metrics.snapshotVersion(),
-    metrics24h: (to?: number) => metrics.series24h(to),
-    awayLast: () => away.lastSummary(),
-    clearHistory: clearAllHistory,
+    actions,
     tools,
   };
 }

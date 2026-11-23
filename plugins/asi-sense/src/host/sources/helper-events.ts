@@ -1,5 +1,5 @@
 import type { Body, SourceRef } from '@asi/sense-types';
-import type { RuntimeAttention } from '../runtime/attention.ts';
+import type { SenseBus } from '../runtime/bus.ts';
 import type { BodySource } from './body.ts';
 
 export const source: SourceRef = { id: 'helper', api: 'ndjson', host: 'local' };
@@ -28,13 +28,13 @@ const SYSTEM_EVENT_SPECS: Readonly<Record<string, SystemEventSpec>> = {
   'session.active': { kind: 'session.active', subject: 'session', slot: 'inactiveAt', phase: 'end' },
 };
 
-const systemTrackers = new WeakMap<RuntimeAttention, SystemTracker>();
+const systemTrackers = new WeakMap<SenseBus, SystemTracker>();
 
-function getSystemTracker(attention: RuntimeAttention): SystemTracker {
-  let tracker = systemTrackers.get(attention);
+function getSystemTracker(bus: SenseBus): SystemTracker {
+  let tracker = systemTrackers.get(bus);
   if (!tracker) {
     tracker = {};
-    systemTrackers.set(attention, tracker);
+    systemTrackers.set(bus, tracker);
   }
   return tracker;
 }
@@ -54,31 +54,31 @@ export function object(value: unknown): Message | undefined {
 export function validApp(value: Message | undefined): value is Message {
   return value !== undefined && typeof value.name === 'string' && typeof value.bundleId === 'string';
 }
-export function clearWindow(attention: RuntimeAttention, at: number): void {
-  if (attention.isStopped()) return;
-  attention.store.apply({
-    id: attention.id(),
+export function clearWindow(bus: SenseBus, at: number): void {
+  if (bus.isStopped()) return;
+  bus.store.apply({
+    id: bus.id(),
     kind: 'fact.updated',
     at,
     source: { ...ax, id: 'helper.window' },
     subject: 'env.focusedWindow',
     data: { path: 'env.focusedWindow', value: null, status: 'unknown' },
   });
-  attention.changed();
+  bus.changed();
 }
 export async function helperStatus(
-  attention: RuntimeAttention,
+  bus: SenseBus,
   at: number,
   status: 'ok' | 'unavailable' | 'error',
   reason: string,
   restarts: number,
   lastFailure?: string,
 ): Promise<void> {
-  if (status !== 'ok' && !attention.isStopped()) {
-    permissionUnknown(attention, at);
+  if (status !== 'ok' && !bus.isStopped()) {
+    permissionUnknown(bus, at);
   }
-  await attention.accept({
-    id: attention.id(),
+  await bus.accept({
+    id: bus.id(),
     kind: 'source.status',
     at,
     source,
@@ -92,10 +92,10 @@ export async function helperStatus(
     },
   });
 }
-export function permissionUnknown(attention: RuntimeAttention, at: number): void {
-  if (attention.isStopped()) return;
-  attention.store.apply({
-    id: attention.id(),
+export function permissionUnknown(bus: SenseBus, at: number): void {
+  if (bus.isStopped()) return;
+  bus.store.apply({
+    id: bus.id(),
     kind: 'fact.updated',
     at,
     source: ax,
@@ -109,12 +109,12 @@ export function permissionUnknown(attention: RuntimeAttention, at: number): void
       preserveSourceStatus: true,
     },
   });
-  attention.changed();
+  bus.changed();
 }
-export async function helperError(attention: RuntimeAttention, event: Message): Promise<string> {
+export async function helperError(bus: SenseBus, event: Message): Promise<string> {
   const code = typeof event.code === 'string' ? event.code : 'protocol-error';
-  await attention.accept({
-    id: attention.id(),
+  await bus.accept({
+    id: bus.id(),
     kind: 'source.error',
     at: event.at as number,
     source,
@@ -123,10 +123,10 @@ export async function helperError(attention: RuntimeAttention, event: Message): 
   });
   return code;
 }
-export function permissionStatus(attention: RuntimeAttention, status: 'granted' | 'denied', at: number): void {
-  if (attention.isStopped()) return;
-  attention.store.apply({
-    id: attention.id(),
+export function permissionStatus(bus: SenseBus, status: 'granted' | 'denied', at: number): void {
+  if (bus.isStopped()) return;
+  bus.store.apply({
+    id: bus.id(),
     kind: 'fact.updated',
     at,
     source: ax,
@@ -139,18 +139,19 @@ export function permissionStatus(attention: RuntimeAttention, status: 'granted' 
       preserveSourceStatus: true,
     },
   });
-  attention.changed();
+  bus.changed();
 }
 export async function axStatus(
-  attention: RuntimeAttention,
+  bus: SenseBus,
   status: 'ok' | 'denied' | 'unsupported' | 'unknown',
   at: number,
+  reason?: string,
 ): Promise<void> {
-  if (attention.isStopped()) return;
-  const previous = attention.state().env.focusedWindow.status;
+  if (bus.isStopped()) return;
+  const previous = bus.state().env.focusedWindow.status;
   if (status !== 'ok' || previous === 'denied' || previous === 'unsupported') {
-    attention.store.apply({
-      id: attention.id(),
+    bus.store.apply({
+      id: bus.id(),
       kind: 'fact.updated',
       at,
       source: { ...ax, id: 'helper.window' },
@@ -158,34 +159,53 @@ export async function axStatus(
       data: { path: 'env.focusedWindow', value: null, status: status === 'ok' ? 'unknown' : status },
     });
   }
-  await attention.accept({
-    id: attention.id(),
+  await bus.accept({
+    id: bus.id(),
     kind: 'source.status',
     at,
     source: ax,
     subject: ax.id,
-    data: { status },
+    data: reason === undefined ? { status } : { status, reason },
   });
 }
+
+/**
+ * True when an `ax-retryable` error's wire identity names the exact current
+ * foreground app process. Both wire and current state must carry a positive
+ * integer pid so background multi-instance apps sharing a bundleId can never
+ * cross-clear the foreground window.
+ */
+export function axRetryableTarget(
+  event: Message,
+  current: { bundleId: string; pid?: number } | null | undefined,
+): boolean {
+  if (!current || current.pid === undefined) return false;
+  const bundleId = event.bundleId;
+  if (typeof bundleId !== 'string') return false;
+  const pid = Number.isSafeInteger(event.pid) && (event.pid as number) > 0 ? (event.pid as number) : undefined;
+  if (pid === undefined) return false;
+  return bundleId === current.bundleId && pid === current.pid;
+}
+
 export async function appObservation(
-  attention: RuntimeAttention,
+  bus: SenseBus,
   app: Message,
   at: number,
   recovering = false,
   valid: () => boolean = () => true,
 ): Promise<void> {
-  if (!validApp(app) || attention.isStopped()) return;
-  const previous = attention.state().env.frontApp.value;
+  if (!validApp(app) || bus.isStopped()) return;
+  const previous = bus.state().env.frontApp.value;
   const pid = Number.isSafeInteger(app.pid) && (app.pid as number) > 0 ? (app.pid as number) : undefined;
   const sameBundle = previous?.bundleId === app.bundleId;
   const sameProcess = sameBundle && (previous?.pid === undefined || pid === undefined || previous.pid === pid);
-  if (!sameProcess && attention.state().observation.sources['helper.ax']?.status !== 'denied') {
-    await axStatus(attention, 'unknown', at);
-    if (!valid() || attention.isStopped()) return;
+  if (!sameProcess && bus.state().observation.sources['helper.ax']?.status !== 'denied') {
+    await axStatus(bus, 'unknown', at);
+    if (!valid() || bus.isStopped()) return;
   }
   if (!sameProcess) {
-    await attention.accept({
-      id: attention.id(),
+    await bus.accept({
+      id: bus.id(),
       kind: 'app.activated',
       at,
       source,
@@ -202,29 +222,29 @@ export async function appObservation(
       ? { windowCount: app.windowCount }
       : {}),
   };
-  attention.store.apply({
-    id: attention.id(),
+  bus.store.apply({
+    id: bus.id(),
     kind: 'fact.updated',
     at,
     source,
     subject: 'env.frontApp',
     data: { path: 'env.frontApp', value, status: 'ok', preserveSourceStatus: recovering },
   });
-  attention.changed();
+  bus.changed();
 }
 export async function helperEvent(
   event: Message,
-  attention: RuntimeAttention,
+  bus: SenseBus,
   body: BodySource,
   recovering = false,
   skip: ReadonlySet<string> = new Set(),
   valid: () => boolean = () => true,
 ): Promise<void> {
-  if (attention.isStopped()) return;
+  if (bus.isStopped()) return;
   const at = event.at as number;
   const emit = async (kind: string, data: Message) => {
-    await attention.accept({
-      id: attention.id(),
+    await bus.accept({
+      id: bus.id(),
       kind,
       at,
       source: kind.startsWith('window') ? ax : source,
@@ -245,18 +265,18 @@ export async function helperEvent(
     );
   } else if (event.type === 'snapshot') {
     const app = object(event.frontApp);
-    if (validApp(app) && !skip.has('frontApp')) await appObservation(attention, app, at, recovering, valid);
+    if (validApp(app) && !skip.has('frontApp')) await appObservation(bus, app, at, recovering, valid);
     if (!valid()) return;
     const permission = !skip.has('permissions') ? object(event.permissions)?.accessibility : undefined;
     const window = object(event.focusedWindow);
     if (!skip.has('focusedWindow')) {
-      if (permission === 'denied' || window?.status === 'denied') await axStatus(attention, 'denied', at);
-      else if (window?.status === 'unsupported') await axStatus(attention, 'unsupported', at);
+      if (permission === 'denied' || window?.status === 'denied') await axStatus(bus, 'denied', at);
+      else if (window?.status === 'unsupported') await axStatus(bus, 'unsupported', at);
       else if (window?.status === 'ok' && typeof window.title === 'string') await emit('window.focused', window);
       else if (window?.status === 'ok') {
-        clearWindow(attention, at);
-        await axStatus(attention, 'ok', at);
-      } else if (window) clearWindow(attention, at);
+        clearWindow(bus, at);
+        await axStatus(bus, 'ok', at);
+      } else if (window) clearWindow(bus, at);
     }
     if (!valid()) return;
     if (!skip.has('thermal') && ['nominal', 'fair', 'serious', 'critical'].includes(String(event.thermal))) {
@@ -266,32 +286,32 @@ export async function helperEvent(
       );
     }
   } else if (event.type === 'ax.unsupported') {
-    const current = attention.state().env.frontApp.value;
+    const current = bus.state().env.frontApp.value;
     if (
       current &&
       ((typeof event.bundleId === 'string' && event.bundleId !== current.bundleId) ||
         (current.pid !== undefined && typeof event.pid === 'number' && event.pid !== current.pid))
     )
       return;
-    await axStatus(attention, 'unsupported', at);
+    await axStatus(bus, 'unsupported', at);
   } else if (event.type === 'app.activated' || event.type === 'app.launched' || event.type === 'app.terminated') {
     if (event.type === 'app.activated' && !validApp(event)) return;
     if (
       recovering &&
       event.type === 'app.activated' &&
-      !['denied', 'unsupported'].includes(attention.state().env.focusedWindow.status)
+      !['denied', 'unsupported'].includes(bus.state().env.focusedWindow.status)
     )
-      clearWindow(attention, at);
-    if (event.type === 'app.activated') await appObservation(attention, event, at, recovering, valid);
+      clearWindow(bus, at);
+    if (event.type === 'app.activated') await appObservation(bus, event, at, recovering, valid);
     else await emit(event.type, event);
   } else if ((event.type === 'window.focused' || event.type === 'window.title') && typeof event.title === 'string') {
     await emit(event.type === 'window.title' ? 'window.title-changed' : event.type, event);
   } else if (event.type === 'window.focused') {
-    clearWindow(attention, at);
+    clearWindow(bus, at);
   } else if (typeof event.type === 'string' && Object.hasOwn(SYSTEM_EVENT_SPECS, event.type)) {
     if (typeof at !== 'number' || !Number.isFinite(at)) return;
     const spec = SYSTEM_EVENT_SPECS[event.type] as SystemEventSpec;
-    const tracker = getSystemTracker(attention);
+    const tracker = getSystemTracker(bus);
     const data: Message = { at };
     if (spec.phase === 'start') {
       tracker[spec.slot] = at;
@@ -302,8 +322,8 @@ export async function helperEvent(
         data.durationMs = at - startAt;
       }
     }
-    await attention.accept({
-      id: attention.id(),
+    await bus.accept({
+      id: bus.id(),
       kind: spec.kind,
       at,
       source,

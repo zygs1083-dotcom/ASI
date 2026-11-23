@@ -1,7 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
-import { RuntimeAttention } from '../../src/host/runtime/attention.ts';
+import { SenseBus } from '../../src/host/runtime/bus.ts';
 import { FactExpiry } from '../../src/host/runtime/expiry.ts';
-import type { DshPort } from '../../src/host/runtime/ports.ts';
 import type { BodySource } from '../../src/host/sources/body.ts';
 import { HelperSource } from '../../src/host/sources/helper.ts';
 import { HelperRecovery, markHelperFacts } from '../../src/host/sources/helper-recovery.ts';
@@ -9,11 +8,8 @@ import { HelperRecovery, markHelperFacts } from '../../src/host/sources/helper-r
 describe('helper recovery source isolation', () => {
   it('does not apply later snapshot fields after stop interrupts an awaited field', async () => {
     const clock = { wall: () => 1_000, mono: () => 0 };
-    const attention = new RuntimeAttention(
+    const bus = new SenseBus(
       clock,
-      {} as DshPort,
-      () => [],
-      () => {},
       () => true,
       () => {},
       new FactExpiry(clock),
@@ -25,7 +21,7 @@ describe('helper recovery source isolation', () => {
       '/fixture',
       'darwin',
       clock,
-      attention,
+      bus,
       body,
       () => {},
       () => false,
@@ -56,11 +52,8 @@ describe('helper recovery source isolation', () => {
     'discards an in-flight snapshot continuation after stop or replacement (%s)',
     async (replace) => {
       const clock = { wall: () => 1_000, mono: () => 0 };
-      const attention = new RuntimeAttention(
+      const bus = new SenseBus(
         clock,
-        {} as DshPort,
-        () => [],
-        () => {},
         () => true,
         () => {},
         new FactExpiry(clock),
@@ -71,7 +64,7 @@ describe('helper recovery source isolation', () => {
         '/fixture',
         'darwin',
         clock,
-        attention,
+        bus,
         body,
         () => {},
         () => false,
@@ -100,11 +93,8 @@ describe('helper recovery source isolation', () => {
 
   it('stales helper facts without invalidating facts supplied by other sources', () => {
     const clock = { wall: () => 1_000, mono: () => 0 };
-    const attention = new RuntimeAttention(
+    const bus = new SenseBus(
       clock,
-      {} as DshPort,
-      () => [],
-      () => {},
       () => true,
       () => {},
       new FactExpiry(clock),
@@ -112,7 +102,7 @@ describe('helper recovery source isolation', () => {
     const setThermal = vi.fn();
     const body = { setThermal } as unknown as BodySource;
     const update = (id: string, path: string, value: unknown, source: string) =>
-      attention.store.apply({
+      bus.store.apply({
         id,
         kind: 'fact.updated',
         subject: path,
@@ -123,10 +113,10 @@ describe('helper recovery source isolation', () => {
     update('app', 'env.frontApp', { name: 'Other', bundleId: 'other.app' }, 'other');
     update('window', 'env.focusedWindow', { title: 'Synthetic' }, 'helper.ax');
     update('thermal', 'self.body.thermal', 'nominal', 'probe');
-    markHelperFacts(attention, body, 1_000, ['frontApp', 'focusedWindow', 'thermal'], 'stale');
-    expect(attention.state().env.frontApp.status).toBe('ok');
-    expect(attention.state().env.focusedWindow.status).toBe('stale');
-    expect(attention.state().self.body.thermal.status).toBe('ok');
+    markHelperFacts(bus, body, 1_000, ['frontApp', 'focusedWindow', 'thermal'], 'stale');
+    expect(bus.state().env.frontApp.status).toBe('ok');
+    expect(bus.state().env.focusedWindow.status).toBe('stale');
+    expect(bus.state().self.body.thermal.status).toBe('ok');
     expect(setThermal).not.toHaveBeenCalled();
   });
 });

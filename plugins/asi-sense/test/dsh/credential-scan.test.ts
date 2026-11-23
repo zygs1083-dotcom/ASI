@@ -1,8 +1,5 @@
-import type { DeliveryLevel, EnvChange, EnvUpdate, SenseState, Signal } from '@asi/sense-types';
-import type { Agent } from '@deepseek-ai/dsh-agent';
-import { SessionId } from '@deepseek-ai/dsh-session';
-import { describe, expect, it, vi } from 'vitest';
-import { formatEnvUpdate } from '../../src/host/delivery/format.ts';
+import type { SenseState } from '@asi/sense-types';
+import { describe, expect, it } from 'vitest';
 import {
   containsCredential,
   normalizeForModel,
@@ -12,8 +9,6 @@ import {
   sanitizeSignalId,
   scanCredentials,
 } from '../../src/host/dsh/credential-scan.ts';
-import { createDelivery, modelUpdate } from '../../src/host/dsh/deliver.ts';
-import { modelHistory } from '../../src/host/dsh/history-output.ts';
 import {
   environmentDetail,
   modelActivityName,
@@ -50,69 +45,24 @@ function makeFakeState(): SenseState {
 
 function makeFakeDetailRuntime(state: SenseState, recentSubjects: string[]): DetailRuntime {
   const src = { id: 'helper.ax', api: 'accessibility', host: 'fixture-host.invalid' };
-  const events = recentSubjects.map((subject, idx) => ({
+  const signals = recentSubjects.map((subject, idx) => ({
     id: `ev-${idx}`,
     kind: idx % 2 === 0 ? 'window.focused' : 'app.activated',
     subject,
-    level: 'context' as const,
     at: 990 + idx,
     source: src,
+    data: {},
   }));
   return {
-    state: { subscribe: () => () => {} },
-    events: () => events,
-    rules: { list: () => [], add: vi.fn(), remove: vi.fn(), toggle: vi.fn(), approve: vi.fn() },
-    actions: {},
+    recentSignals: () => signals,
     tools: {
       envState: (section?: 'self' | 'env' | 'observation') => {
         const copy = structuredClone(state);
         return section ? copy[section] : copy;
       },
-      envWatch: vi.fn(),
-      envMetrics: vi.fn(),
-      envHistory: vi.fn(),
-      envSummary: vi.fn(),
-      bodyTune: vi.fn(),
       refreshDetail: async () => true,
     },
-    start: async () => {},
-    stop: async () => {},
-  } as unknown as DetailRuntime;
-}
-
-function makeSignal(overrides: Partial<Signal> & { id?: string; kind?: string; subject?: string } = {}): Signal {
-  return {
-    id: overrides.id ?? 'sig-1',
-    kind: overrides.kind ?? 'window.focused',
-    at: overrides.at ?? 1_000,
-    source: overrides.source ?? { id: 'helper.ax', api: 'accessibility', host: 'fixture-host.invalid' },
-    subject: overrides.subject ?? 'notes.md',
-    data: overrides.data ?? {},
   };
-}
-
-function makeChange(signal: Signal, extra: Partial<EnvChange> = {}): EnvChange {
-  return {
-    signal,
-    count: extra.count ?? 1,
-    level: extra.level ?? 'context',
-    ...(extra.ruleId !== undefined ? { ruleId: extra.ruleId } : {}),
-    ...(extra.note !== undefined ? { note: extra.note } : {}),
-    ...(extra.reason !== undefined ? { reason: extra.reason } : {}),
-  };
-}
-
-function makeFakeAgent(): { agent: Agent; followup: ReturnType<typeof vi.fn> } {
-  const followup = vi.fn();
-  const agent = {
-    id: SessionId('session-cred-test'),
-    status: 'idle',
-    send: vi.fn(),
-    inject: vi.fn(),
-    followup,
-    steer: vi.fn(),
-  } as unknown as Agent;
-  return { agent, followup };
 }
 
 function makeRandomMixed(len: number): string {
@@ -473,257 +423,38 @@ const LEAK_CORPUS: LeakSample[] = [
   { id: 'f4-url-nouser', input: 'redis://:R3d1sP4ss@cache:6379', secret: 'R3d1sP4ss' },
 ];
 
-describe('leak corpus across all 4 real model exits (env_detail, env_state, deliver, env_history)', () => {
-  it.each(LEAK_CORPUS)(
-    '$id does not leak secret across env_detail, env_state, deliver, or env_history',
-    async (sample) => {
-      const state = makeFakeState();
-      state.env.frontApp.value = {
-        name: sample.checkAppName === false ? 'MailApp' : sample.input,
-        bundleId: sample.bundleIdInput ?? sample.input,
-        pid: 101,
-        windowCount: 1,
-      };
-      state.env.focusedWindow.value = { title: sample.input };
-      const rt = makeFakeDetailRuntime(state, [sample.input, sample.checkAppName === false ? 'MailApp' : sample.input]);
+describe('leak corpus across all model exits (sanitizeForModel, env_detail, env_state)', () => {
+  it.each(LEAK_CORPUS)('$id does not leak secret across sanitizeForModel, env_detail, or env_state', async (sample) => {
+    const state = makeFakeState();
+    state.env.frontApp.value = {
+      name: sample.checkAppName === false ? 'MailApp' : sample.input,
+      bundleId: sample.bundleIdInput ?? sample.input,
+      pid: 101,
+      windowCount: 1,
+    };
+    state.env.focusedWindow.value = { title: sample.input };
+    const rt = makeFakeDetailRuntime(state, [sample.input, sample.checkAppName === false ? 'MailApp' : sample.input]);
 
-      const detailJson = JSON.stringify(environmentDetail(rt));
-      const stateJson = JSON.stringify(modelState(state, 990));
-      assertNoSubstrings8(detailJson, sample.secret, `${sample.id}->env_detail`);
-      assertNoSubstrings8(stateJson, sample.secret, `${sample.id}->env_state`);
+    const detailJson = JSON.stringify(environmentDetail(rt));
+    const stateJson = JSON.stringify(modelState(state, 990));
+    assertNoSubstrings8(detailJson, sample.secret, `${sample.id}->env_detail`);
+    assertNoSubstrings8(stateJson, sample.secret, `${sample.id}->env_state`);
+    if (!sample.skipStandaloneFormat) {
+      assertNoSubstrings8(sanitizeForModel(sample.input), sample.secret, `${sample.id}->sanitizeForModel`);
+    }
+  });
 
-      const { agent, followup } = makeFakeAgent();
-      const deliver = createDelivery(
-        () => agent,
-        () => true,
-        async () => false,
-      );
-      const changes: EnvChange[] = [
-        makeChange(
-          makeSignal({
-            id: sample.input,
-            kind: 'window.focused',
-            subject: sample.input,
-            data: { title: sample.input },
-          }),
-          {
-            ruleId: sample.input,
-          },
-        ),
-        makeChange(makeSignal({ id: `${sample.id}-err`, kind: 'source.error', subject: sample.input })),
-      ];
-      if (sample.checkAppName !== false) {
-        changes.push(
-          makeChange(
-            makeSignal({
-              id: `${sample.id}-app`,
-              kind: 'app.activated',
-              subject: sample.input,
-              data: { name: sample.input },
-            }),
-          ),
-        );
-      }
-      const update: EnvUpdate = { since: 900, at: 1_000, changes, suppressed: 0 };
-      await deliver('session-cred-test', {
-        kind: 'followup' satisfies Extract<DeliveryLevel | 'followup', 'followup'>,
-        sessionId: 'session-cred-test',
-        update,
-      });
-      const deliverJson = JSON.stringify(followup.mock.calls);
-      assertNoSubstrings8(deliverJson, sample.secret, `${sample.id}->deliver`);
-
-      if (!sample.skipStandaloneFormat) {
-        const formattedStandalone = formatEnvUpdate({
-          since: 900,
-          at: 1_000,
-          suppressed: 0,
-          changes: [
-            makeChange(
-              makeSignal({
-                id: sample.input,
-                kind: 'window.focused',
-                subject: sample.input,
-                data: { title: sample.input, command: sample.input, feedbackAvailable: true },
-              }),
-              { ruleId: sample.input, note: sample.input },
-            ),
-          ],
-        });
-        assertNoSubstrings8(formattedStandalone, sample.secret, `${sample.id}->formatEnvUpdate`);
-      }
-
-      const histOut = JSON.stringify(
-        modelHistory({
-          available: true,
-          from: 900,
-          to: 2_000,
-          limit: 50,
-          total: 4,
-          truncated: false,
-          titlesAllowed: true,
-          events: [
-            {
-              id: sample.input,
-              kind: 'job.exited',
-              subject: sample.input,
-              level: 'context',
-              ruleId: sample.input,
-              at: 1_000,
-              source: { id: 'jobs', api: 'process', host: 'fixture-host.invalid' },
-            },
-            {
-              id: `${sample.id}-err`,
-              kind: 'source.error',
-              subject: sample.input,
-              level: 'context',
-              at: 1_002,
-              source: { id: 'helper', api: 'process', host: 'fixture-host.invalid' },
-            },
-            ...(sample.checkAppName === false
-              ? []
-              : [
-                  {
-                    id: `${sample.id}-win`,
-                    kind: 'window.focused',
-                    subject: sample.input,
-                    level: 'context' as const,
-                    ruleId: sample.input,
-                    at: 1_001,
-                    source: { id: 'helper.ax', api: 'accessibility', host: 'fixture-host.invalid' },
-                  },
-                  {
-                    id: `${sample.id}-app`,
-                    kind: 'app.activated',
-                    subject: sample.input,
-                    level: 'record' as const,
-                    at: 1_003,
-                    source: { id: 'helper.ax', api: 'accessibility', host: 'fixture-host.invalid' },
-                  },
-                ]),
-          ],
-        }),
-      );
-      assertNoSubstrings8(histOut, sample.secret, `${sample.id}->env_history`);
-    },
-  );
-
-  it('closes deliver ruleId/signal.id/alertId, env_history events[].id, and standalone formatEnvUpdate channels', async () => {
+  it('closes signal.id / identifier channels via sanitizeSignalId and sanitizeModelId', () => {
     const validHash = `body.rate:${'a'.repeat(64)}`;
-    const projectedUp = modelUpdate({
-      since: 900,
-      at: 1_000,
-      suppressed: 0,
-      changes: [
-        makeChange(
-          makeSignal({
-            id: 'ghp_1234567890abcdef',
-            kind: 'body.threshold',
-            subject: 'disk:/',
-            data: {
-              feedbackAvailable: true,
-              metric: 'disk',
-              severity: 'warn',
-              value: 0.9,
-            },
-          }),
-          { ruleId: 'ghp_1234567890abcdef', note: 'note https://u:PassWord99@h.invalid/x' },
-        ),
-        makeChange(
-          makeSignal({
-            id: validHash,
-            kind: 'body.rate',
-            subject: 'context',
-            data: {
-              metric: 'context',
-              windowMs: 60_000,
-              delta: 1,
-              slope: 0.1,
-              direction: 'up',
-              ruleId: 'token_secret_12345678',
-              feedbackAvailable: true,
-              command: 'curl -H "Authorization: Bearer tok_secret_123"',
-            },
-          }),
-        ),
-      ],
+    expect(sanitizeSignalId('ghp_1234567890abcdef')).toEqual({ value: '[redacted]', redacted: true });
+    expect(sanitizeSignalId(validHash)).toEqual({ value: validHash, redacted: false });
+    expect(sanitizeSignalId('11111111-2222-3333-4444-555555555555:7')).toEqual({
+      value: '11111111-2222-3333-4444-555555555555:7',
+      redacted: false,
     });
-    expect(projectedUp.changes[0]?.ruleId).toBe('[redacted]');
-    expect(projectedUp.changes[0]?.signal.id).toBe('[redacted]');
-    expect(projectedUp.changes[0]?.signal.data.feedbackAvailable).toBe(false);
-    expect((projectedUp.changes[1]?.signal.data as { ruleId?: string } | undefined)?.ruleId).toBe('[redacted]');
-    expect(projectedUp.changes[1]?.signal.id).toBe(validHash);
-    const renderedProjected = formatEnvUpdate(projectedUp);
-    expect(renderedProjected).not.toContain('ghp_1234567890abcdef');
-    expect(renderedProjected).not.toContain('token_secret_12345678');
-    expect(renderedProjected).not.toContain('PassWord99');
-    expect(renderedProjected).not.toContain('tok_secret_123');
-
-    const standalone = formatEnvUpdate(
-      {
-        since: 900,
-        at: 1_000,
-        suppressed: 0,
-        changes: [
-          makeChange(
-            makeSignal({
-              id: 'ghp_1234567890abcdef',
-              kind: 'window.focused',
-              subject: 'ok',
-              data: {
-                title: 'api_key: secret_val_99',
-                command: 'Bearer standalone_cmd_secret_99',
-                feedbackAvailable: true,
-              },
-            }),
-            { ruleId: 'token-abc_def_123456', note: 'https://u:StandalonePass9@example.com/a' },
-          ),
-        ],
-      },
-      { includeJobCommands: true },
-    );
-    expect(standalone).not.toContain('ghp_1234567890abcdef');
-    expect(standalone).not.toContain('secret_val_99');
-    expect(standalone).not.toContain('standalone_cmd_secret_99');
-    expect(standalone).not.toContain('token-abc_def_123456');
-    expect(standalone).not.toContain('StandalonePass9');
-
-    const hist = modelHistory({
-      available: true,
-      from: 900,
-      to: 2_000,
-      limit: 50,
-      total: 3,
-      truncated: false,
-      titlesAllowed: true,
-      events: [
-        {
-          id: 'ghp_1234567890abcdef',
-          kind: 'window.focused',
-          subject: 'ok',
-          level: 'context',
-          at: 1_000,
-          source: { id: 'helper.ax', api: 'accessibility', host: 'fixture-host.invalid' },
-        },
-        {
-          id: validHash,
-          kind: 'body.rate',
-          subject: 'context',
-          level: 'context',
-          at: 1_001,
-          source: { id: 'body', api: 'probe', host: 'fixture-host.invalid' },
-        },
-        {
-          id: '11111111-2222-3333-4444-555555555555:7',
-          kind: 'app.activated',
-          subject: 'Editor',
-          level: 'record',
-          at: 1_002,
-          source: { id: 'helper.ax', api: 'accessibility', host: 'fixture-host.invalid' },
-        },
-      ],
-    }) as { events: Array<{ id: string }> };
-    expect(hist.events.map((e) => e.id)).toEqual(['[redacted]', validHash, '11111111-2222-3333-4444-555555555555:7']);
+    expect(sanitizeModelId('token_secret_12345678').redacted).toBe(true);
+    expect(containsCredential('Bearer tok_secret_123')).toBe(true);
+    expect(redactCredentials('api_key: secret_val_99')).toContain('[redacted]');
   });
 });
 

@@ -1,14 +1,24 @@
 import { createHash } from 'node:crypto';
 import os from 'node:os';
-import type { Fact, SenseState, WatchRule } from '@asi/sense-types';
-import { isRemoteJsonValue } from '@deepseek-ai/dsh-typert-protocol';
-import { isHomeRoot, isHomeRootShape, toHomeRelative } from '../attention/path.ts';
+import type { Fact, SenseState } from '@asi/sense-types';
 import type { createSenseRuntime } from '../runtime/index.ts';
 import { sanitizeForModel, sanitizeModelId } from './credential-scan.ts';
-import { MODEL_RULE_KINDS } from './kinds.ts';
-import type { JsonValue } from './wire-types.ts';
+import { isHomeRoot, isHomeRootShape, toHomeRelative } from './path.ts';
 
-export { MODEL_RULE_KINDS };
+export type JsonObject = { [key: string]: JsonValue };
+export type JsonValue = null | boolean | number | string | JsonValue[] | JsonObject;
+
+function isLosslessJsonValue(value: unknown): value is JsonValue {
+  if (value === null || typeof value === 'boolean' || typeof value === 'string') return true;
+  if (typeof value === 'number') return Number.isFinite(value) && !Object.is(value, -0);
+  if (Array.isArray(value)) return value.every(isLosslessJsonValue);
+  if (typeof value === 'object') {
+    const proto = Object.getPrototypeOf(value);
+    if (proto !== Object.prototype && proto !== null) return false;
+    return Object.values(value).every(isLosslessJsonValue);
+  }
+  return false;
+}
 
 const MAX_BYTES = 32_768;
 const MAX_TITLE_LENGTH = 512;
@@ -1929,12 +1939,7 @@ function dictionary<T>(
 
 function observations(state: SenseState['observation']) {
   return {
-    sources: dictionary(
-      state.sources,
-      sourceIdentifier,
-      (source) => pick(source, ['status', 'lastSignalAt', 'capped']),
-      true,
-    ),
+    sources: dictionary(state.sources, sourceIdentifier, (source) => pick(source, ['status', 'lastSignalAt']), true),
   };
 }
 
@@ -1993,27 +1998,6 @@ export function modelState(state: SenseState, now: number, section?: 'self' | 'e
       activeJobs: fact(env.activeJobs, (value) =>
         value.map((job) => ({ ...pick(job, ['startedAt', 'status', 'exitCode']), id: identifier(job.id) })),
       ),
-      watchedPaths: fact(env.watchedPaths, (value) =>
-        dictionary(
-          value,
-          (key) => modelActivityName(key, true),
-          (item) => pick(item, ['lastChange', 'changes']),
-        ),
-      ),
-      ...(env.globalFileWatch
-        ? {
-            globalFileWatch: fact(env.globalFileWatch, (value) => ({
-              enabled: value.enabled,
-              status: value.status,
-              windowMs: value.windowMs,
-              eventsPerSec: value.eventsPerSec,
-              degraded: value.degraded,
-              countOnly: value.countOnly,
-              deniedCount: value.deniedPaths.length,
-              exclusionCount: value.exclusions.length,
-            })),
-          }
-        : {}),
       ...(env.system
         ? {
             system: fact(env.system, (value) => ({
@@ -2033,124 +2017,16 @@ export function modelState(state: SenseState, now: number, section?: 'self' | 'e
   return projectModelOutput(
     section ? projected[section] : projected,
     now,
-    ['env.frontApp.value.name', 'frontApp.value.name', 'env.frontApp.value.bundleId', 'frontApp.value.bundleId'],
-    ['watchedPaths.value', 'env.watchedPaths.value'],
+    [
+      'env.frontApp.value.name',
+      'frontApp.value.name',
+      'env.frontApp.value.bundleId',
+      'frontApp.value.bundleId',
+      'env.where.toolExec.value.cwd',
+      'where.toolExec.value.cwd',
+    ],
+    [],
   );
-}
-
-export function modelRules(rules: WatchRule[]): JsonValue {
-  const kinds = MODEL_RULE_KINDS;
-  return modelOutput(
-    rules.map((rule) => {
-      const where: Record<string, unknown> = {};
-      const exitCode = rule.match.where?.exitCode;
-      if (typeof exitCode === 'number') where.exitCode = exitCode;
-      else if (exitCode && typeof exitCode === 'object' && !Array.isArray(exitCode)) {
-        where.exitCode = Object.fromEntries(
-          Object.entries(exitCode).filter(
-            ([operator, value]) =>
-              ['==', '!=', '>', '>=', '<', '<='].includes(operator) &&
-              typeof value === 'number' &&
-              Number.isFinite(value),
-          ),
-        );
-      }
-      const severity = rule.match.where?.severity;
-      if (typeof severity === 'string' && ['normal', 'warn', 'critical'].includes(severity)) where.severity = severity;
-      const status = rule.match.where?.status;
-      if (typeof status === 'string' && ['ok', 'denied', 'error', 'unavailable', 'unknown'].includes(status))
-        where.status = status;
-      return {
-        ...pick(rule, ['level', 'createdBy', 'approved', 'expiresAt']),
-        id: identifier(rule.id),
-        match: {
-          kind: kinds.has(rule.match.kind) ? rule.match.kind : '[redacted]',
-          ...((rule.match.kind === 'file.changed' ||
-            rule.match.kind === 'file.activity' ||
-            rule.match.kind === 'file.burst') &&
-          rule.match.subject !== undefined
-            ? { subject: modelActivityName(rule.match.subject, true) }
-            : {}),
-          ...(Object.keys(where).length ? { where } : {}),
-        },
-      };
-    }),
-    undefined,
-    // `match.subject` is already masked by `modelActivityName`, so keep its `~` placeholder verbatim.
-    ['match.kind', 'match.subject'],
-  );
-}
-
-export function modelTune(value: unknown): JsonValue {
-  if (!value || typeof value !== 'object') return modelOutput({});
-  const result = pick(value, ['applied']);
-  const change = Reflect.get(value, 'change');
-  if (change && typeof change === 'object') {
-    const fields = pick(change, ['at', 'by', 'operation', 'status']);
-    const id = Reflect.get(change, 'id');
-    if (typeof id === 'string') fields.id = identifier(id);
-    const param = Reflect.get(change, 'param');
-    const params = [
-      'rate.disk.maxDelta',
-      'rate.rss.maxRatio',
-      'rate.context.maxEtaMs',
-      'anomaly.cpu.sigma',
-      'anomaly.memory.sigma',
-      'anomaly.network.sigma',
-      'file.burst.windowMs',
-      'file.burst.maxChanges',
-      'file.burst.maxDeleted',
-      'mergeWindowMs',
-      'fileMergeWindowMs',
-      'deliveryLevel.body.rate',
-      'deliveryLevel.body.anomaly',
-      'deliveryLevel.file.burst',
-      ...['disk', 'context', 'battery'].flatMap((metric) =>
-        ['warn', 'critical'].map((severity) => `floor.${metric}.${severity}`),
-      ),
-    ];
-    if (typeof param === 'string') fields.param = params.includes(param) ? param : '[redacted]';
-    const reason = Reflect.get(change, 'rejectionReason');
-    const reasons = [
-      'nonfinite clock',
-      'unknown param',
-      'type mismatch',
-      'nonfinite',
-      'no-op',
-      'not in choices',
-      'out of bounds',
-      'untrusted actor',
-      'param locked',
-      'restore pending',
-      'tuning disabled: restore-failed',
-      'tuning disabled: storage-failed',
-      'exceeds ±50%',
-      'exceeds 0.5–2 times',
-      'critical exceeds warn',
-      'wake requires user approval',
-      'safety: cannot loosen',
-      'frozen: wall clock behind saved highwater',
-      'hourly change limit',
-      'daily change limit',
-      'global daily change limit',
-      'unknown or consumed alert',
-    ];
-    if (typeof reason === 'string' && reasons.includes(reason)) {
-      fields.rejectionReason = reason;
-      result.reason = reason;
-    }
-    for (const key of ['from', 'to']) {
-      const item = Reflect.get(change, key);
-      if (
-        typeof item === 'number' ||
-        typeof item === 'boolean' ||
-        (typeof item === 'string' && ['record', 'context', 'wake'].includes(item))
-      )
-        fields[key] = item;
-    }
-    result.change = fields;
-  }
-  return modelOutput(result, undefined, ['change.param']);
 }
 
 function json(value: unknown): JsonValue {
@@ -2167,8 +2043,8 @@ function json(value: unknown): JsonValue {
   });
   if (text === undefined) throw new TypeError('tool result contains no JSON value');
   const parsed: unknown = JSON.parse(text);
-  if (!isRemoteJsonValue(parsed)) throw new TypeError('tool result is not lossless JSON');
-  return parsed as JsonValue;
+  if (!isLosslessJsonValue(parsed)) throw new TypeError('tool result is not lossless JSON');
+  return parsed;
 }
 
 function ages(value: JsonValue, now: number): JsonValue {
@@ -2215,7 +2091,7 @@ export function modelProjectedOutput(
   return projectModelOutput(value, undefined, appNamePaths, preSanitizedDictPaths);
 }
 
-type Runtime = Pick<ReturnType<typeof createSenseRuntime>, 'tools' | 'events' | 'rules'>;
+type Runtime = Pick<ReturnType<typeof createSenseRuntime>, 'tools' | 'recentSignals'>;
 
 export function environmentDetail(
   runtime: Runtime,
@@ -2251,18 +2127,17 @@ export function environmentDetail(
         : { value: null, status: 'unknown' };
   const events = available
     ? runtime
-        .events()
+        .recentSignals()
         .filter((event) =>
           ['app.activated', 'app.launched', 'app.terminated', 'window.focused', 'window.title-changed'].includes(
             event.kind,
           ),
         )
         .slice(-20)
-        .map(({ kind, subject, at, level, source }) => ({
+        .map(({ kind, subject, at, source }) => ({
           kind,
           subject: modelEventSubject(subject),
           at,
-          level,
           source: { id: sourceIdentifier(source.id), api: sourceIdentifier(source.api) },
         }))
     : [];
