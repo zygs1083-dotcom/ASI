@@ -447,6 +447,7 @@ describe('0.3.0 全景嗅探、一键外部缓存批准清理、行动效果记�
     });
     root.provide('sessionController', {
       create: async (req: { cwd?: string; sessionId?: string }) => {
+        await new Promise((r) => setTimeout(r, 15));
         const sid = req.sessionId ?? 'maint-1';
         const maintAgent = {
           id: SessionId(sid),
@@ -588,18 +589,21 @@ describe('0.3.0 全景嗅探、一键外部缓存批准清理、行动效果记�
       expect(suppressedSnap.drives.find((d) => d.key === 'asi-sleep:consolidation')?.suppressed).toBe(true);
       expect(maintWakeups).toBe(0);
 
-      // 阶段 2：恢复 normal 采样且 L1 生理需求全部舒适 -> 自动解除高阶压制，唤醒后台会话运行 sleep_consolidate_notes！
-      await root.asiSense.setPowerMode('normal');
+      // 阶段 2：恢复 normal 采样且连续刷新多个感官快照 -> 自动解除高阶压制，在首次建会话窗口内仅建 1 个会话并仅执行 1 轮维护！
+      await Promise.all([root.asiSense.setPowerMode('normal'), root.asiSense.refresh?.(), root.asiSense.refresh?.()]);
       await vi.waitFor(() => {
         expect(sleepToolRuns).toBe(1);
         expect(root.asiDrives.snapshot().drives.find((d) => d.key === 'asi-sleep:consolidation')?.zone).toBe(
           'comfortable',
         );
       });
+      expect(maintWakeups).toBe(1);
       expect(promptsSeen[0]).toContain('L2 · 记忆离线巩固 (asi-sleep:consolidation)');
 
       // 若此时再次切回 eco，即使在自维护会话中也立即由 guard 拦截高阶沙盒工具！
-      const maintAgent = agentsList.find((a) => a.id !== 'ordinary-user-chat');
+      const maintAgents = agentsList.filter((a) => a.id !== 'ordinary-user-chat');
+      expect(maintAgents).toHaveLength(1);
+      const maintAgent = maintAgents[0];
       expect(maintAgent).toBeDefined();
       if (!maintAgent) throw new Error('missing maintAgent');
       await root.asiSense.setPowerMode('eco', '高温节能');
@@ -784,6 +788,277 @@ describe('0.3.0 全景嗅探、一键外部缓存批准清理、行动效果记�
       expect(careLedger?.totalSatisfactionDelta).toBe(55);
     } finally {
       await rt.stop();
+    }
+  });
+
+  it('并发重入护栏：首次异步建会话及会话轮换期间连续到达多个感官快照或并发调用 openMaintenanceSession/triggerCheck 时，仅建 1 个会话且仅执行 1 轮维护；建会话中途被 L1 抢占或抛错时状态与预算精确收敛', async () => {
+    // 1. 首次创建自维护会话阻塞期间：并发涌入 5 帧感官快照 + 2 次 openMaintenanceSession，仅创建 1 个会话且仅执行 1 轮维护
+    const dir1 = await mkdtemp(join(tmpdir(), 'asi-030-maint-mutex-1-'));
+    tempDirs.push(dir1);
+
+    let nowWall = T0;
+    let nowMono = 1_000;
+    let sleepSat = 38;
+    const sense1 = createMockSenseService(makeSnapshot({ now: nowWall, mono: nowMono }), dir1);
+    const createdSessions1: string[] = [];
+    const turns1: { sid: string; prompt: string }[] = [];
+    let releaseCreate1: (() => void) | undefined;
+    let releaseRotate1: (() => void) | undefined;
+
+    const rt1 = createNeedsRuntime({
+      storageRoot: dir1,
+      sense: sense1,
+      clock: { wall: () => nowWall, mono: () => nowMono },
+      probeEndpoint: async () => true,
+      jobs: { listActiveJobs: () => [], hasLiveOwner: () => true, killJob: () => 'already-finished' },
+      compaction: { listIdleSessionIds: () => [], compactIdleSession: async () => ({ compacted: false }) },
+      sessions: {
+        createMaintenanceSession: async (id) => {
+          createdSessions1.push(id);
+          if (createdSessions1.length === 1) {
+            await new Promise<void>((resolve) => {
+              releaseCreate1 = resolve;
+            });
+          } else {
+            await new Promise<void>((resolve) => {
+              releaseRotate1 = resolve;
+            });
+          }
+          return id;
+        },
+        hasSession: (id) => createdSessions1.includes(id),
+        runMaintenanceTurn: async (sid, prompt) => {
+          turns1.push({ sid, prompt });
+          sleepSat = 95;
+        },
+        deliverCryToUserSession: async () => true,
+      },
+    });
+
+    await rt1.start();
+    try {
+      rt1.drives.registerSource({
+        id: 'asi-sleep',
+        tier: 2,
+        label: '离线睡眠整理',
+        evaluate: () => [
+          {
+            key: 'consolidation',
+            label: '记忆离线巩固',
+            satisfaction: sleepSat,
+            summary: sleepSat < 70 ? '待整理碎片' : '已巩固',
+            evidence: { count: sleepSat < 70 ? 8 : 0 },
+          },
+        ],
+      });
+
+      await vi.waitFor(() => expect(releaseCreate1).toBeTypeOf('function'));
+      expect(rt1.snapshot().maintenanceSession.status).toBe('running');
+
+      // 在首个 ensureMaintenanceSession 尚未返回时连续发射 5 次快照，并并发调用 2 次 openMaintenanceSession
+      for (let i = 0; i < 5; i += 1) {
+        nowWall += 200;
+        nowMono += 200;
+        sense1.emit((prev) => ({ ...prev, now: nowWall, mono: nowMono }));
+      }
+      const openP1 = rt1.actions.openMaintenanceSession();
+      const openP2 = rt1.actions.openMaintenanceSession();
+      await new Promise((r) => setTimeout(r, 15));
+
+      expect(createdSessions1).toHaveLength(1);
+      expect(turns1).toHaveLength(0);
+
+      releaseCreate1?.();
+      const [openedId1, openedId2] = await Promise.all([openP1, openP2]);
+
+      await vi.waitFor(() => {
+        expect(turns1).toHaveLength(1);
+        expect(rt1.snapshot().maintenanceSession.status).toBe('idle');
+      });
+      expect(createdSessions1).toHaveLength(1);
+      expect(openedId1).toBe(createdSessions1[0]);
+      expect(openedId2).toBe(createdSessions1[0]);
+      expect(turns1[0]?.sid).toBe(createdSessions1[0]);
+      expect(rt1.snapshot().maintenanceSession.turnCount).toBe(1);
+
+      // 手动 triggerCheck 在需求重新进入不适且未熔断时：不会因内部 scheduleProcess 先抢跑 auto-maintain 而漏跑或双跑
+      sleepSat = 42;
+      nowWall += 150_000;
+      nowMono += 150_000;
+      await rt1.actions.triggerCheck();
+      expect(turns1).toHaveLength(2);
+      expect(rt1.snapshot().records[0]?.action).toBe('manual-check');
+
+      // 跑满 12 轮触发会话轮换时，轮换异步窗口内并发到达多帧快照 + openMaintenanceSession 同样复用新会话且仅跑 1 轮
+      for (let i = 0; i < 10; i += 1) {
+        await rt1.actions.triggerCheck();
+      }
+      expect(rt1.snapshot().maintenanceSession.turnCount).toBe(12);
+
+      sleepSat = 35;
+      nowWall += 150_000;
+      nowMono += 150_000;
+      sense1.emit((prev) => ({ ...prev, now: nowWall, mono: nowMono }));
+      await vi.waitFor(() => expect(releaseRotate1).toBeTypeOf('function'));
+
+      for (let i = 0; i < 3; i += 1) {
+        nowWall += 100;
+        nowMono += 100;
+        sense1.emit((prev) => ({ ...prev, now: nowWall, mono: nowMono }));
+      }
+      const rotatedOpenPromise = rt1.actions.openMaintenanceSession();
+      await new Promise((r) => setTimeout(r, 10));
+      expect(createdSessions1).toHaveLength(2);
+
+      releaseRotate1?.();
+      const rotatedId = await rotatedOpenPromise;
+      await vi.waitFor(() => {
+        expect(turns1).toHaveLength(13);
+        expect(rt1.snapshot().maintenanceSession.status).toBe('idle');
+      });
+      expect(createdSessions1).toHaveLength(2);
+      expect(rotatedId).toBe(createdSessions1[1]);
+      expect(turns1[12]?.sid).toBe(createdSessions1[1]);
+    } finally {
+      await rt1.stop();
+    }
+
+    // 2. 高阶需求在首次建会话尚未返回时突遇 L1 不适抢占：跳过已中止的高阶回合（不浪费配额），复用刚建好的会话立即执行 1 轮 L1 自维护
+    const dir2 = await mkdtemp(join(tmpdir(), 'asi-030-maint-mutex-2-'));
+    tempDirs.push(dir2);
+
+    let wall2 = T0;
+    let mono2 = 1_000;
+    let diskFree2 = 80 * 1024 ** 3;
+    const makeSnap2 = () => {
+      const s = makeSnapshot({ now: wall2, mono: mono2 });
+      s.state.self.body.disks = {
+        kind: 'disks',
+        ...fact([{ mount: '/', total: 200 * 1024 ** 3, free: diskFree2 }]),
+      };
+      return s;
+    };
+    const sense2 = createMockSenseService(makeSnap2(), dir2);
+    const createdSessions2: string[] = [];
+    const prompts2: string[] = [];
+    let releaseCreate2: (() => void) | undefined;
+
+    const rt2 = createNeedsRuntime({
+      storageRoot: dir2,
+      sense: sense2,
+      clock: { wall: () => wall2, mono: () => mono2 },
+      probeEndpoint: async () => true,
+      jobs: { listActiveJobs: () => [], hasLiveOwner: () => true, killJob: () => 'already-finished' },
+      compaction: { listIdleSessionIds: () => [], compactIdleSession: async () => ({ compacted: false }) },
+      sessions: {
+        createMaintenanceSession: async (id) => {
+          createdSessions2.push(id);
+          await new Promise<void>((resolve) => {
+            releaseCreate2 = resolve;
+          });
+          return id;
+        },
+        hasSession: (id) => createdSessions2.includes(id),
+        runMaintenanceTurn: async (_sid, prompt) => {
+          prompts2.push(prompt);
+        },
+        deliverCryToUserSession: async () => true,
+      },
+    });
+
+    await rt2.start();
+    try {
+      rt2.drives.registerSource({
+        id: 'asi-care',
+        tier: 3,
+        label: '主动关怀',
+        evaluate: () => [{ key: 'digest', label: '摘要预热', satisfaction: 40, summary: '待预热' }],
+      });
+      await vi.waitFor(() => expect(releaseCreate2).toBeTypeOf('function'));
+
+      // 建会话尚未完成时 L1 磁盘跌入 uncomfortable -> 高阶回合在启动前即被抢占，放行建会话后直接跑 1 轮 L1
+      wall2 += 500;
+      mono2 += 500;
+      diskFree2 = 10 * 1024 ** 3;
+      sense2.emit(() => makeSnap2());
+      await new Promise((r) => setTimeout(r, 10));
+
+      releaseCreate2?.();
+      await vi.waitFor(() => {
+        expect(prompts2).toHaveLength(1);
+        expect(rt2.snapshot().maintenanceSession.status).toBe('idle');
+      });
+      expect(createdSessions2).toHaveLength(1);
+      expect(prompts2[0]).toContain('[L1 ·');
+      expect(prompts2[0]).not.toContain('asi-care:digest');
+    } finally {
+      await rt2.stop();
+    }
+
+    // 3. 首次建会话抛错且期间涌入多帧危急快照：仅尝试建会话 1 次（按冷却退避不紧接着重撞），状态收敛为 unavailable 且仅啼哭 1 次
+    const dir3 = await mkdtemp(join(tmpdir(), 'asi-030-maint-mutex-3-'));
+    tempDirs.push(dir3);
+
+    let wall3 = T0;
+    let mono3 = 1_000;
+    const critSnap3 = makeSnapshot({ now: wall3, mono: mono3 });
+    critSnap3.state.self.body.disks = {
+      kind: 'disks',
+      ...fact([{ mount: '/', total: 200 * 1024 ** 3, free: 512 * 1024 ** 2 }]),
+    };
+    const sense3 = createMockSenseService(critSnap3, dir3);
+    let createAttempts3 = 0;
+    const cries3: string[] = [];
+    let rejectCreate3: ((err: Error) => void) | undefined;
+
+    const rt3 = createNeedsRuntime({
+      storageRoot: dir3,
+      sense: sense3,
+      clock: { wall: () => wall3, mono: () => mono3 },
+      probeEndpoint: async () => true,
+      jobs: { listActiveJobs: () => [], hasLiveOwner: () => true, killJob: () => 'already-finished' },
+      compaction: { listIdleSessionIds: () => [], compactIdleSession: async () => ({ compacted: false }) },
+      sessions: {
+        createMaintenanceSession: async () => {
+          createAttempts3 += 1;
+          return await new Promise<string>((_resolve, reject) => {
+            rejectCreate3 = reject;
+          });
+        },
+        hasSession: () => false,
+        runMaintenanceTurn: async () => {},
+        deliverCryToUserSession: async (_t, _e, content) => {
+          cries3.push(content);
+          return true;
+        },
+      },
+    });
+
+    const startPromise3 = rt3.start();
+    try {
+      await vi.waitFor(() => expect(rejectCreate3).toBeTypeOf('function'));
+      await startPromise3;
+
+      for (let i = 0; i < 3; i += 1) {
+        wall3 += 300;
+        mono3 += 300;
+        sense3.emit((prev) => ({ ...prev, now: wall3, mono: mono3 }));
+      }
+      await new Promise((r) => setTimeout(r, 10));
+      expect(createAttempts3).toBe(1);
+
+      rejectCreate3?.(new Error('ENOSPC: no space left on device'));
+      await vi.waitFor(() => {
+        expect(rt3.snapshot().maintenanceSession.status).toBe('unavailable');
+        expect(cries3).toHaveLength(1);
+      });
+      await new Promise((r) => setTimeout(r, 20));
+      expect(createAttempts3).toBe(1);
+      expect(cries3).toHaveLength(1);
+      expect(cries3[0]).toContain('need="space"');
+      expect(cries3[0]).toContain('severity="critical"');
+    } finally {
+      await rt3.stop();
     }
   });
 });

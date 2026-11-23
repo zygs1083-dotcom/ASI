@@ -221,6 +221,9 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime & { read
   let higherOrderTurnAbort: AbortController | undefined;
   let rotateMaintainerNext = false;
   let pendingMaintenanceRecheck = false;
+  let sessionCreationInFlight: Promise<string> | undefined;
+  let maintCheckLocked = false;
+  let maintCheckPromise: Promise<void> | undefined;
 
   let started = false;
   let stopped = false;
@@ -353,15 +356,25 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime & { read
     });
   }
 
-  async function ensureMaintenanceSession(forceRotate = false): Promise<string> {
-    if (!forceRotate && maintSessionId && ports.sessions.hasSession(maintSessionId)) {
-      return maintSessionId;
+  async function createNewMaintenanceSession(): Promise<string> {
+    if (stopped) {
+      throw new Error('NeedsRuntime is stopped');
     }
-    await mkdir(sandboxDir, { recursive: true });
-    const requested = `asi-maint-${randomUUID()}`;
-    registerMaintSession(requested);
+    let requested: string | undefined;
     try {
+      await mkdir(sandboxDir, { recursive: true });
+      if (stopped) {
+        throw new Error('NeedsRuntime stopped before maintenance session creation');
+      }
+      requested = `asi-maint-${randomUUID()}`;
+      registerMaintSession(requested);
       const createdId = await ports.sessions.createMaintenanceSession(requested, sandboxDir, 'ASI 自维护');
+      if (stopped) {
+        const drop = internalSessions.get(requested);
+        drop?.();
+        internalSessions.delete(requested);
+        throw new Error('NeedsRuntime stopped during maintenance session creation');
+      }
       if (createdId !== requested) {
         const dropRequested = internalSessions.get(requested);
         dropRequested?.();
@@ -370,6 +383,7 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime & { read
       }
       maintSessionId = createdId;
       maintTurnCount = 0;
+      rotateMaintainerNext = false;
       if (maintStatus === 'not-created' || maintStatus === 'unavailable') {
         maintStatus = 'idle';
       }
@@ -377,12 +391,34 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime & { read
       notify();
       return createdId;
     } catch (err) {
-      const unregister = internalSessions.get(requested);
-      unregister?.();
-      internalSessions.delete(requested);
-      maintStatus = 'unavailable';
-      notify();
+      if (requested !== undefined) {
+        const unregister = internalSessions.get(requested);
+        unregister?.();
+        internalSessions.delete(requested);
+      }
+      if (!stopped) {
+        maintStatus = 'unavailable';
+        notify();
+      }
       throw err;
+    }
+  }
+
+  async function ensureMaintenanceSession(forceRotate = false): Promise<string> {
+    if (sessionCreationInFlight) {
+      return await sessionCreationInFlight;
+    }
+    if (!forceRotate && maintSessionId && ports.sessions.hasSession(maintSessionId)) {
+      return maintSessionId;
+    }
+    const pending = createNewMaintenanceSession();
+    sessionCreationInFlight = pending;
+    try {
+      return await pending;
+    } finally {
+      if (sessionCreationInFlight === pending) {
+        sessionCreationInFlight = undefined;
+      }
     }
   }
 
@@ -827,25 +863,13 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime & { read
     return true;
   }
 
-  async function runMaintenanceCheck(manual: boolean): Promise<void> {
-    if (stopped || latestSense.settings.paused) return;
-    if (maintStatus === 'running') {
-      if (!manual) {
-        pendingMaintenanceRecheck = true;
-        if (activeRunningTier === 'higher' && arbiter.snapshot().higherOrderSuppressed) {
-          higherOrderTurnAbort?.abort();
-        }
-      }
-      return;
-    }
-
-    const distressedL1 = manual
-      ? NEED_KEYS.filter((k) => latestEval.needs[k].driveActive)
-      : actionableL1SoftwareNeeds(false);
-    const distressedHigher = distressedL1.length === 0 ? actionableHigherOrderDrives(manual) : [];
-
-    if (!manual && distressedL1.length === 0 && distressedHigher.length === 0) return;
-
+  async function executeMaintenanceCheck(
+    manual: boolean,
+    distressedL1: NeedKey[],
+    distressedHigher: ReturnType<typeof actionableHigherOrderDrives>,
+    monoNow: number,
+    isHigherOrderOnlyTurn: boolean,
+  ): Promise<void> {
     if (effectiveConnectivity() === 'offline') {
       for (const key of distressedL1) {
         if (latestEval.needs[key].zone === 'critical') {
@@ -859,6 +883,270 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime & { read
       return;
     }
 
+    if (!manual && autonomousTurnMonoTimes.length >= MAX_AUTONOMOUS_TURNS_PER_HOUR) {
+      for (const key of distressedL1) {
+        const ev = latestEval.needs[key];
+        if (ev.zone === 'critical') {
+          await escalateNeedToCritical(
+            key,
+            `${NEED_LABELS[key]}持续危急，后台自救已达每小时上限`,
+            '后台安全维护未能解除压力，请人工介入检查。',
+          );
+        }
+      }
+      return;
+    }
+
+    const targetL1 =
+      distressedL1.length > 0
+        ? distressedL1
+        : distressedHigher.length > 0
+          ? []
+          : (['space', 'memory', 'mind'] as NeedKey[]);
+    const beforeSatL1 = Object.fromEntries(targetL1.map((k) => [k, latestEval.needs[k].satisfaction]));
+    const beforeSatHigher = Object.fromEntries(distressedHigher.map((d) => [d.key, d.satisfaction]));
+
+    const shouldRotate = rotateMaintainerNext || maintTurnCount >= MAX_MAINTAINER_TURNS_BEFORE_ROTATE;
+
+    const prevMaintStatus = maintStatus;
+    const prevLastL1Mono = lastL1AutoRunMono;
+    const prevLastHigherMono = lastHigherAutoRunMono;
+
+    activeTurnEffectiveNeeds.clear();
+    maintStatus = 'running';
+    activeRunningTier = isHigherOrderOnlyTurn ? 'higher' : 'l1';
+    const localHigherAbort = isHigherOrderOnlyTurn ? new AbortController() : undefined;
+    higherOrderTurnAbort = localHigherAbort;
+    if (!manual) {
+      if (isHigherOrderOnlyTurn) {
+        lastHigherAutoRunMono = monoNow;
+      } else {
+        lastL1AutoRunMono = monoNow;
+      }
+    }
+    notify();
+
+    try {
+      let sessionId: string;
+      try {
+        sessionId = await ensureMaintenanceSession(shouldRotate);
+      } catch {
+        if (maintStatus === 'running') {
+          maintStatus = 'unavailable';
+        }
+        if (!stopped && !turnAbort.signal.aborted) {
+          for (const critKey of distressedL1) {
+            if (latestEval.needs[critKey].zone === 'critical') {
+              escalatedCriticalInTurn.add(critKey);
+              await escalateNeedToCritical(
+                critKey,
+                `${NEED_LABELS[critKey]}危急且无法创建自维护沙盒会话，需人工协助`,
+                '后台自维护会话初始化失败（可能磁盘已满或会话服务受阻），请人工介入处理。',
+              );
+            }
+          }
+        }
+        return;
+      }
+
+      if (stopped || latestSense.settings.paused || localHigherAbort?.signal.aborted) {
+        if (!manual) {
+          lastL1AutoRunMono = prevLastL1Mono;
+          lastHigherAutoRunMono = prevLastHigherMono;
+        }
+        return;
+      }
+
+      for (const k of targetL1) {
+        if (latestEval.needs[k].zone === 'critical') escalatedCriticalInTurn.add(k);
+      }
+
+      const effectiveTurnSignal = localHigherAbort
+        ? AbortSignal.any([turnAbort.signal, localHigherAbort.signal])
+        : turnAbort.signal;
+      maintLastRunAt = clock.wall();
+      if (!manual) {
+        autonomousTurnMonoTimes.push(monoNow);
+      }
+      notify();
+
+      try {
+        const prompt =
+          manual && distressedL1.length === 0 && distressedHigher.length === 0
+            ? '用户触发了一次手动生存需求自检。请调用 needs_status 查看五大生存需求现状，必要时调用 needs_sniff_causes 嗅探本机缓存与负载，确认各项舒适或执行必要的安全整理后简要总结。'
+            : buildMaintenancePrompt(targetL1, distressedHigher);
+
+        await ports.sessions.runMaintenanceTurn(sessionId, prompt, effectiveTurnSignal);
+        maintTurnCount += 1;
+        maintTotalTurns += 1;
+
+        await ports.sense.refresh?.().catch(() => undefined);
+        recomputeEval(ports.sense.snapshot());
+
+        const primaryNeed = targetL1[0];
+        const primaryDriveKey = distressedHigher[0]?.key;
+        let outcome: MaintenanceOutcome = 'info';
+        const higherPreempted = Boolean(localHigherAbort?.signal.aborted);
+
+        if (distressedL1.length > 0) {
+          if (latestEval.needs.space.driveActive && distressedL1.includes('space')) {
+            const spaceSev: EpisodeSeverity = latestEval.needs.space.zone === 'critical' ? 'critical' : 'uncomfortable';
+            await maybeProposeExternalCacheHelpCard(spaceSev);
+          }
+
+          const allCleared = distressedL1.every((k) => !latestEval.needs[k].driveActive);
+          const anyImproved = distressedL1.some(
+            (k) => activeTurnEffectiveNeeds.has(k) || latestEval.needs[k].satisfaction > (beforeSatL1[k] ?? 0),
+          );
+          const stillCritical = distressedL1.filter((k) => latestEval.needs[k].zone === 'critical');
+
+          for (const critKey of stillCritical) {
+            await escalateNeedToCritical(
+              critKey,
+              `${NEED_LABELS[critKey]}自救后仍处危急，需人工协助`,
+              '白名单自维护动作未能彻底解除危急状态，请人工排查外部占用或扩容。',
+            );
+          }
+
+          if (!manual) {
+            for (const key of distressedL1) {
+              const ev = latestEval.needs[key];
+              const keyHadGain = activeTurnEffectiveNeeds.has(key) || ev.satisfaction > (beforeSatL1[key] ?? 0);
+              const curSev: EpisodeSeverity = ev.zone === 'critical' ? 'critical' : 'uncomfortable';
+              const hasOpenOrHandledCard =
+                helpCards.some((c) => c.need === key && c.status === 'open') || isAutoHelpSuppressed(key, curSev);
+              if (!keyHadGain && hasOpenOrHandledCard && ev.driveActive && ev.zone !== 'comfortable') {
+                const tripDiskFree = key === 'space' ? primaryDiskFreeBytes(latestSense) : undefined;
+                circuitBreaker.trip({
+                  need: key,
+                  trippedAt: clock.wall(),
+                  zoneAtTrip: ev.zone,
+                  satisfactionAtTrip: ev.satisfaction,
+                  envFingerprint: fingerprintForDrive(key, latestSense, ev),
+                  ...(tripDiskFree !== undefined ? { diskFreeAtTrip: tripDiskFree } : {}),
+                  reason: '安全自救零收益且求助卡已挂出或已处理，静默熔断避免重复唤醒模型',
+                });
+              }
+            }
+          }
+
+          outcome = allCleared ? 'relieved' : stillCritical.length > 0 ? 'escalated' : anyImproved ? 'partial' : 'info';
+        } else if (distressedHigher.length > 0 && !higherPreempted) {
+          const refreshedHigher = distressedHigher.map((d) => ({
+            key: d.key,
+            current: arbiter.findDrive(d.key),
+          }));
+          const allCleared = refreshedHigher.every((item) => !item.current?.driveActive);
+          const anyImproved = refreshedHigher.some(
+            (item) =>
+              activeTurnEffectiveNeeds.has(item.key) ||
+              (item.current?.satisfaction ?? 0) > (beforeSatHigher[item.key] ?? 0),
+          );
+          if (!manual && !arbiter.snapshot().higherOrderSuppressed) {
+            for (const item of refreshedHigher) {
+              const cur = item.current;
+              if (!cur?.driveActive || cur.suppressed || cur.zone === 'comfortable') continue;
+              const hadGain =
+                activeTurnEffectiveNeeds.has(item.key) || cur.satisfaction > (beforeSatHigher[item.key] ?? 0);
+              if (!hadGain) {
+                circuitBreaker.trip({
+                  need: item.key,
+                  trippedAt: clock.wall(),
+                  zoneAtTrip: cur.zone,
+                  satisfactionAtTrip: cur.satisfaction,
+                  envFingerprint: fingerprintForDrive(item.key, latestSense, cur),
+                  reason: '高阶需求自维护本轮无收益，静默熔断等待环境变化',
+                });
+              }
+            }
+          }
+          outcome = allCleared ? 'relieved' : anyImproved ? 'partial' : 'info';
+        }
+
+        if (!stopped) {
+          addRecord({
+            actor: 'maintainer',
+            ...(primaryNeed ? { need: primaryNeed } : {}),
+            ...(primaryDriveKey ? { driveKey: primaryDriveKey } : {}),
+            action: manual ? 'manual-check' : 'auto-maintain',
+            summary: higherPreempted
+              ? 'L1 生理需求或节能模式激活，已挂起并抢占当前高阶维护回合'
+              : outcome === 'relieved'
+                ? '后台自维护完成，相关需求已恢复舒适区'
+                : outcome === 'escalated'
+                  ? '后台自维护触及安全边界或仍处危急，已发出求助卡'
+                  : '后台自维护巡检已完成',
+            outcome,
+          });
+        }
+      } catch {
+        const preemptedCatch = Boolean(localHigherAbort?.signal.aborted);
+        if (!stopped && !turnAbort.signal.aborted && !preemptedCatch) {
+          recomputeEval(ports.sense.snapshot());
+          for (const critKey of distressedL1) {
+            if (latestEval.needs[critKey].zone === 'critical') {
+              await escalateNeedToCritical(
+                critKey,
+                `${NEED_LABELS[critKey]}危急且后台自维护执行中断，需人工协助`,
+                '后台自维护会话未能完成自救，请人工排查当前资源压力。',
+              );
+            }
+          }
+        }
+        if (!stopped) {
+          addRecord({
+            actor: 'maintainer',
+            ...(targetL1[0] ? { need: targetL1[0] } : {}),
+            ...(distressedHigher[0]?.key ? { driveKey: distressedHigher[0].key } : {}),
+            action: manual ? 'manual-check' : 'auto-maintain',
+            summary: preemptedCatch
+              ? 'L1 生理需求或节能模式激活，已抢占中断高阶维护回合'
+              : '后台自维护会话执行中断，稍后按退避策略重试',
+            outcome: preemptedCatch ? 'info' : 'failed',
+          });
+        }
+      }
+    } finally {
+      if (maintStatus === 'running') {
+        maintStatus = maintSessionId ? 'idle' : prevMaintStatus;
+      }
+      activeRunningTier = null;
+      if (higherOrderTurnAbort === localHigherAbort) {
+        higherOrderTurnAbort = undefined;
+      }
+      activeTurnEffectiveNeeds.clear();
+      notify();
+    }
+  }
+
+  async function runMaintenanceCheck(manual: boolean): Promise<void> {
+    if (stopped || latestSense.settings.paused) return;
+    if (maintCheckLocked || maintStatus === 'running') {
+      if (!manual) {
+        pendingMaintenanceRecheck = true;
+        if (activeRunningTier === 'higher' && arbiter.snapshot().higherOrderSuppressed) {
+          higherOrderTurnAbort?.abort();
+        }
+        return;
+      }
+      if (maintCheckPromise) {
+        await maintCheckPromise;
+      }
+      return;
+    }
+
+    const distressedL1 = manual
+      ? NEED_KEYS.filter((k) => latestEval.needs[k].driveActive)
+      : actionableL1SoftwareNeeds(false);
+    const distressedHigher = distressedL1.length === 0 ? actionableHigherOrderDrives(manual) : [];
+
+    if (!manual && distressedL1.length === 0 && distressedHigher.length === 0) return;
+
+    const connectivityOffline = effectiveConnectivity() === 'offline';
+    if (connectivityOffline && !distressedL1.some((k) => latestEval.needs[k].zone === 'critical')) {
+      return;
+    }
+
     const monoNow = clock.mono();
     while (autonomousTurnMonoTimes[0] !== undefined && monoNow - autonomousTurnMonoTimes[0] > 3_600_000) {
       autonomousTurnMonoTimes.shift();
@@ -866,7 +1154,7 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime & { read
 
     const isHigherOrderOnlyTurn = distressedL1.length === 0 && distressedHigher.length > 0;
 
-    if (!manual) {
+    if (!manual && !connectivityOffline) {
       const newlyCritical = distressedL1.some(
         (k) => latestEval.needs[k].zone === 'critical' && !escalatedCriticalInTurn.has(k),
       );
@@ -881,215 +1169,24 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime & { read
       ) {
         return;
       }
-      if (autonomousTurnMonoTimes.length >= MAX_AUTONOMOUS_TURNS_PER_HOUR) {
-        for (const key of distressedL1) {
-          const ev = latestEval.needs[key];
-          if (ev.zone === 'critical') {
-            await escalateNeedToCritical(
-              key,
-              `${NEED_LABELS[key]}持续危急，后台自救已达每小时上限`,
-              '后台安全维护未能解除压力，请人工介入检查。',
-            );
-          }
-        }
+      if (
+        autonomousTurnMonoTimes.length >= MAX_AUTONOMOUS_TURNS_PER_HOUR &&
+        !distressedL1.some((k) => latestEval.needs[k].zone === 'critical')
+      ) {
         return;
       }
     }
 
-    const targetL1 =
-      distressedL1.length > 0
-        ? distressedL1
-        : distressedHigher.length > 0
-          ? []
-          : (['space', 'memory', 'mind'] as NeedKey[]);
-    const beforeSatL1 = Object.fromEntries(targetL1.map((k) => [k, latestEval.needs[k].satisfaction]));
-    const beforeSatHigher = Object.fromEntries(distressedHigher.map((d) => [d.key, d.satisfaction]));
-
-    const shouldRotate = rotateMaintainerNext || maintTurnCount >= MAX_MAINTAINER_TURNS_BEFORE_ROTATE;
-    rotateMaintainerNext = false;
-
-    let sessionId: string;
+    maintCheckLocked = true;
+    const currentRun = executeMaintenanceCheck(manual, distressedL1, distressedHigher, monoNow, isHigherOrderOnlyTurn);
+    maintCheckPromise = currentRun;
     try {
-      sessionId = await ensureMaintenanceSession(shouldRotate);
-    } catch {
-      if (!stopped && !turnAbort.signal.aborted) {
-        for (const critKey of distressedL1) {
-          if (latestEval.needs[critKey].zone === 'critical') {
-            await escalateNeedToCritical(
-              critKey,
-              `${NEED_LABELS[critKey]}危急且无法创建自维护沙盒会话，需人工协助`,
-              '后台自维护会话初始化失败（可能磁盘已满或会话服务受阻），请人工介入处理。',
-            );
-          }
-        }
-      }
-      return;
-    }
-
-    for (const k of targetL1) {
-      if (latestEval.needs[k].zone === 'critical') escalatedCriticalInTurn.add(k);
-    }
-
-    activeTurnEffectiveNeeds.clear();
-    maintStatus = 'running';
-    activeRunningTier = isHigherOrderOnlyTurn ? 'higher' : 'l1';
-    const localHigherAbort = isHigherOrderOnlyTurn ? new AbortController() : undefined;
-    higherOrderTurnAbort = localHigherAbort;
-    const effectiveTurnSignal = localHigherAbort
-      ? AbortSignal.any([turnAbort.signal, localHigherAbort.signal])
-      : turnAbort.signal;
-    maintLastRunAt = clock.wall();
-    if (!manual) {
-      if (isHigherOrderOnlyTurn) {
-        lastHigherAutoRunMono = monoNow;
-      } else {
-        lastL1AutoRunMono = monoNow;
-      }
-      autonomousTurnMonoTimes.push(monoNow);
-    }
-    notify();
-
-    try {
-      const prompt =
-        manual && distressedL1.length === 0 && distressedHigher.length === 0
-          ? '用户触发了一次手动生存需求自检。请调用 needs_status 查看五大生存需求现状，必要时调用 needs_sniff_causes 嗅探本机缓存与负载，确认各项舒适或执行必要的安全整理后简要总结。'
-          : buildMaintenancePrompt(targetL1, distressedHigher);
-
-      await ports.sessions.runMaintenanceTurn(sessionId, prompt, effectiveTurnSignal);
-      maintTurnCount += 1;
-      maintTotalTurns += 1;
-
-      await ports.sense.refresh?.().catch(() => undefined);
-      recomputeEval(ports.sense.snapshot());
-
-      const primaryNeed = targetL1[0];
-      const primaryDriveKey = distressedHigher[0]?.key;
-      let outcome: MaintenanceOutcome = 'info';
-      const higherPreempted = Boolean(localHigherAbort?.signal.aborted);
-
-      if (distressedL1.length > 0) {
-        if (latestEval.needs.space.driveActive && distressedL1.includes('space')) {
-          const spaceSev: EpisodeSeverity = latestEval.needs.space.zone === 'critical' ? 'critical' : 'uncomfortable';
-          await maybeProposeExternalCacheHelpCard(spaceSev);
-        }
-
-        const allCleared = distressedL1.every((k) => !latestEval.needs[k].driveActive);
-        const anyImproved = distressedL1.some(
-          (k) => activeTurnEffectiveNeeds.has(k) || latestEval.needs[k].satisfaction > (beforeSatL1[k] ?? 0),
-        );
-        const stillCritical = distressedL1.filter((k) => latestEval.needs[k].zone === 'critical');
-
-        for (const critKey of stillCritical) {
-          await escalateNeedToCritical(
-            critKey,
-            `${NEED_LABELS[critKey]}自救后仍处危急，需人工协助`,
-            '白名单自维护动作未能彻底解除危急状态，请人工排查外部占用或扩容。',
-          );
-        }
-
-        if (!manual) {
-          for (const key of distressedL1) {
-            const ev = latestEval.needs[key];
-            const keyHadGain = activeTurnEffectiveNeeds.has(key) || ev.satisfaction > (beforeSatL1[key] ?? 0);
-            const curSev: EpisodeSeverity = ev.zone === 'critical' ? 'critical' : 'uncomfortable';
-            const hasOpenOrHandledCard =
-              helpCards.some((c) => c.need === key && c.status === 'open') || isAutoHelpSuppressed(key, curSev);
-            if (!keyHadGain && hasOpenOrHandledCard && ev.driveActive && ev.zone !== 'comfortable') {
-              const tripDiskFree = key === 'space' ? primaryDiskFreeBytes(latestSense) : undefined;
-              circuitBreaker.trip({
-                need: key,
-                trippedAt: clock.wall(),
-                zoneAtTrip: ev.zone,
-                satisfactionAtTrip: ev.satisfaction,
-                envFingerprint: fingerprintForDrive(key, latestSense, ev),
-                ...(tripDiskFree !== undefined ? { diskFreeAtTrip: tripDiskFree } : {}),
-                reason: '安全自救零收益且求助卡已挂出或已处理，静默熔断避免重复唤醒模型',
-              });
-            }
-          }
-        }
-
-        outcome = allCleared ? 'relieved' : stillCritical.length > 0 ? 'escalated' : anyImproved ? 'partial' : 'info';
-      } else if (distressedHigher.length > 0 && !higherPreempted) {
-        const refreshedHigher = distressedHigher.map((d) => ({
-          key: d.key,
-          current: arbiter.findDrive(d.key),
-        }));
-        const allCleared = refreshedHigher.every((item) => !item.current?.driveActive);
-        const anyImproved = refreshedHigher.some(
-          (item) =>
-            activeTurnEffectiveNeeds.has(item.key) ||
-            (item.current?.satisfaction ?? 0) > (beforeSatHigher[item.key] ?? 0),
-        );
-        if (!manual && !arbiter.snapshot().higherOrderSuppressed) {
-          for (const item of refreshedHigher) {
-            const cur = item.current;
-            if (!cur?.driveActive || cur.suppressed || cur.zone === 'comfortable') continue;
-            const hadGain =
-              activeTurnEffectiveNeeds.has(item.key) || cur.satisfaction > (beforeSatHigher[item.key] ?? 0);
-            if (!hadGain) {
-              circuitBreaker.trip({
-                need: item.key,
-                trippedAt: clock.wall(),
-                zoneAtTrip: cur.zone,
-                satisfactionAtTrip: cur.satisfaction,
-                envFingerprint: fingerprintForDrive(item.key, latestSense, cur),
-                reason: '高阶需求自维护本轮无收益，静默熔断等待环境变化',
-              });
-            }
-          }
-        }
-        outcome = allCleared ? 'relieved' : anyImproved ? 'partial' : 'info';
-      }
-
-      addRecord({
-        actor: 'maintainer',
-        ...(primaryNeed ? { need: primaryNeed } : {}),
-        ...(primaryDriveKey ? { driveKey: primaryDriveKey } : {}),
-        action: manual ? 'manual-check' : 'auto-maintain',
-        summary: higherPreempted
-          ? 'L1 生理需求或节能模式激活，已挂起并抢占当前高阶维护回合'
-          : outcome === 'relieved'
-            ? '后台自维护完成，相关需求已恢复舒适区'
-            : outcome === 'escalated'
-              ? '后台自维护触及安全边界或仍处危急，已发出求助卡'
-              : '后台自维护巡检已完成',
-        outcome,
-      });
-    } catch {
-      const preemptedCatch = Boolean(localHigherAbort?.signal.aborted);
-      if (!stopped && !turnAbort.signal.aborted && !preemptedCatch) {
-        recomputeEval(ports.sense.snapshot());
-        for (const critKey of distressedL1) {
-          if (latestEval.needs[critKey].zone === 'critical') {
-            await escalateNeedToCritical(
-              critKey,
-              `${NEED_LABELS[critKey]}危急且后台自维护执行中断，需人工协助`,
-              '后台自维护会话未能完成自救，请人工排查当前资源压力。',
-            );
-          }
-        }
-      }
-      addRecord({
-        actor: 'maintainer',
-        ...(targetL1[0] ? { need: targetL1[0] } : {}),
-        ...(distressedHigher[0]?.key ? { driveKey: distressedHigher[0].key } : {}),
-        action: 'auto-maintain',
-        summary: preemptedCatch
-          ? 'L1 生理需求或节能模式激活，已抢占中断高阶维护回合'
-          : '后台自维护会话执行中断，稍后按退避策略重试',
-        outcome: preemptedCatch ? 'info' : 'failed',
-      });
+      await currentRun;
     } finally {
-      if (maintStatus === 'running') {
-        maintStatus = 'idle';
+      maintCheckLocked = false;
+      if (maintCheckPromise === currentRun) {
+        maintCheckPromise = undefined;
       }
-      activeRunningTier = null;
-      if (higherOrderTurnAbort === localHigherAbort) {
-        higherOrderTurnAbort = undefined;
-      }
-      activeTurnEffectiveNeeds.clear();
-      notify();
       if (!stopped && !latestSense.settings.paused && pendingMaintenanceRecheck) {
         pendingMaintenanceRecheck = false;
         void runMaintenanceCheck(false);
@@ -1097,7 +1194,7 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime & { read
     }
   }
 
-  async function processSnapshot(snap: SenseSnapshot): Promise<void> {
+  async function processSnapshot(snap: SenseSnapshot, options?: { skipAutoMaint?: boolean }): Promise<void> {
     if (stopped) return;
     const connectivityChanged = await instinct.probeConnectivity(snap, snap.settings.paused);
     recomputeEval(snap);
@@ -1141,15 +1238,15 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime & { read
     }
     notify();
 
-    if (!latestSense.settings.paused) {
+    if (!options?.skipAutoMaint && !latestSense.settings.paused) {
       void runMaintenanceCheck(false);
     }
   }
 
-  function scheduleProcess(snap: SenseSnapshot): Promise<void> {
+  function scheduleProcess(snap: SenseSnapshot, options?: { skipAutoMaint?: boolean }): Promise<void> {
     const next = (reconcileInFlight ?? Promise.resolve()).then(
-      () => processSnapshot(snap),
-      () => processSnapshot(snap),
+      () => processSnapshot(snap, options),
+      () => processSnapshot(snap, options),
     );
     reconcileInFlight = next;
     return next;
@@ -1566,7 +1663,7 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime & { read
     },
 
     async triggerCheck() {
-      await scheduleProcess(ports.sense.snapshot());
+      await scheduleProcess(ports.sense.snapshot(), { skipAutoMaint: true });
       await runMaintenanceCheck(true);
     },
   };
