@@ -199,19 +199,14 @@ function splitMeaningfulSentences(text: string): string[] {
  * Deterministic NREM heuristic extractor: extracts explicit preferences, decisions,
  * pitfalls, and per-session episode summaries even when no LLM call is made.
  */
-export function extractDeterministicNremCandidates(
+function extractDeterministicTurnCandidates(
   turns: readonly ConversationTurnInput[],
   homeDir?: string,
 ): NremCandidate[] {
   const candidates: NremCandidate[] = [];
-  const bySession = new Map<string, ConversationTurnInput[]>();
 
   for (const turn of turns) {
     const safeSession = sanitizeSleepText(turn.sessionId, 64, homeDir);
-    const list = bySession.get(safeSession) ?? [];
-    list.push(turn);
-    bySession.set(safeSession, list);
-
     const safeUser = sanitizeSleepText(turn.userText, 900, homeDir);
     const safeAssistant = sanitizeSleepText(turn.assistantText, 900, homeDir);
     const sentences = [
@@ -250,6 +245,23 @@ export function extractDeterministicNremCandidates(
         evidenceCount: 1,
       });
     }
+  }
+
+  return candidates;
+}
+
+function extractDeterministicSessionEpisodes(
+  turns: readonly ConversationTurnInput[],
+  homeDir?: string,
+): NremCandidate[] {
+  const candidates: NremCandidate[] = [];
+  const bySession = new Map<string, ConversationTurnInput[]>();
+
+  for (const turn of turns) {
+    const safeSession = sanitizeSleepText(turn.sessionId, 64, homeDir);
+    const list = bySession.get(safeSession) ?? [];
+    list.push(turn);
+    bySession.set(safeSession, list);
   }
 
   // Generate 1 concise `episode` candidate per session that had meaningful work
@@ -291,6 +303,20 @@ export function extractDeterministicNremCandidates(
   return candidates;
 }
 
+/**
+ * Deterministic NREM heuristic extractor: extracts explicit preferences, decisions,
+ * pitfalls, and per-session episode summaries even when no LLM call is made.
+ */
+export function extractDeterministicNremCandidates(
+  turns: readonly ConversationTurnInput[],
+  homeDir?: string,
+): NremCandidate[] {
+  return [
+    ...extractDeterministicTurnCandidates(turns, homeDir),
+    ...extractDeterministicSessionEpisodes(turns, homeDir),
+  ];
+}
+
 export const LLM_CONSOLIDATION_BATCH_SIZE = 24;
 
 function buildLlmConsolidationPrompt(turns: readonly ConversationTurnInput[], homeDir?: string): string {
@@ -311,36 +337,75 @@ function buildLlmConsolidationPrompt(turns: readonly ConversationTurnInput[], ho
   ].join('\n\n');
 }
 
+function scanBalancedJsonArray(source: string): unknown[] | undefined {
+  let emptyFallback: unknown[] | undefined;
+  let searchFrom = 0;
+
+  while (searchFrom < source.length) {
+    const openIdx = source.indexOf('[', searchFrom);
+    if (openIdx < 0) break;
+
+    let depth = 0;
+    let inString = false;
+    let escaped = false;
+    let closeIdx = -1;
+
+    for (let i = openIdx; i < source.length; i += 1) {
+      const ch = source[i];
+      if (inString) {
+        if (escaped) {
+          escaped = false;
+        } else if (ch === '\\') {
+          escaped = true;
+        } else if (ch === '"') {
+          inString = false;
+        }
+        continue;
+      }
+      if (ch === '"') {
+        inString = true;
+        continue;
+      }
+      if (ch === '[') {
+        depth += 1;
+      } else if (ch === ']') {
+        depth -= 1;
+        if (depth === 0) {
+          closeIdx = i;
+          break;
+        }
+      }
+    }
+
+    if (closeIdx > openIdx) {
+      try {
+        const candidate = JSON.parse(source.slice(openIdx, closeIdx + 1)) as unknown;
+        if (Array.isArray(candidate)) {
+          if (candidate.some((el) => Boolean(el && typeof el === 'object' && !Array.isArray(el)))) {
+            return candidate;
+          }
+          if (candidate.length === 0 && emptyFallback === undefined) {
+            emptyFallback = candidate;
+          }
+        }
+      } catch {
+        // Non-JSON bracket sequence such as `[Turn 1]`; advance past `[`
+      }
+    }
+
+    searchFrom = openIdx + 1;
+  }
+
+  return emptyFallback;
+}
+
 function extractJsonArrayFromText(trimmed: string): unknown[] | undefined {
   for (const fenceMatch of trimmed.matchAll(/```(?:json)?\s*([\s\S]*?)```/gi)) {
     const body = (fenceMatch[1] ?? '').trim();
-    const fStart = body.indexOf('[');
-    const fEnd = body.lastIndexOf(']');
-    if (fStart >= 0 && fEnd > fStart) {
-      try {
-        const candidate = JSON.parse(body.slice(fStart, fEnd + 1)) as unknown;
-        if (Array.isArray(candidate)) return candidate;
-      } catch {
-        // Try next fenced block or bracket scan
-      }
-    }
+    const fromFence = scanBalancedJsonArray(body);
+    if (fromFence !== undefined) return fromFence;
   }
-
-  const lastClose = trimmed.lastIndexOf(']');
-  if (lastClose <= 0) return undefined;
-  let searchFrom = 0;
-  for (let attempts = 0; attempts < 16; attempts += 1) {
-    const openIdx = trimmed.indexOf('[', searchFrom);
-    if (openIdx < 0 || openIdx >= lastClose) break;
-    try {
-      const candidate = JSON.parse(trimmed.slice(openIdx, lastClose + 1)) as unknown;
-      if (Array.isArray(candidate)) return candidate;
-    } catch {
-      // Advance past non-JSON bracket (e.g. `[Turn 1]`)
-    }
-    searchFrom = openIdx + 1;
-  }
-  return undefined;
+  return scanBalancedJsonArray(trimmed);
 }
 
 export function parseLlmCandidatesJson(
@@ -433,6 +498,94 @@ export function parseLlmCandidatesJson(
   return out;
 }
 
+const PRECOMPILED_TOOL_CHOICES = [
+  'pnpm',
+  'npm',
+  'yarn',
+  'bun',
+  'biome',
+  'eslint',
+  'prettier',
+  'vitest',
+  'jest',
+  'esbuild',
+  'webpack',
+  'rollup',
+  'vite',
+].map((tool) => ({
+  tool,
+  wordRe: new RegExp(`\\b${tool}\\b`, 'i'),
+  negatedRe: new RegExp(
+    `(?:不要|禁止|严禁|不用|禁用|避免|替代|取代|替换|never|do\\s+not|don't|avoid|instead\\s+of|replaced\\s+with|switched\\s+from|migrated\\s+from|no\\s+longer\\s+use|stop\\s+using)[^，。,.;；]{0,18}\\b${tool}\\b|\\b${tool}\\b[^，。,.;；]{0,12}(?:太慢|废弃|不用了|已弃用)`,
+    'i',
+  ),
+}));
+
+function extractPositiveTools(txt: string): string[] {
+  const out: string[] = [];
+  for (const entry of PRECOMPILED_TOOL_CHOICES) {
+    if (entry.wordRe.test(txt) && !entry.negatedRe.test(txt)) {
+      out.push(entry.tool);
+    }
+  }
+  return out;
+}
+
+function isToolNegatedIn(txt: string, tool: string): boolean {
+  const entry = PRECOMPILED_TOOL_CHOICES.find((e) => e.tool === tool);
+  return entry ? entry.negatedRe.test(txt) : false;
+}
+
+function hasStanceConflict(
+  older: { kind: MemoryKind; title: string; content: string; topicKey?: string },
+  newer: { kind: MemoryKind; title: string; content: string; topicKey?: string; supersedes?: boolean },
+): boolean {
+  if (older.kind !== 'preference' && older.kind !== 'decision') return false;
+  if (newer.kind !== older.kind) return false;
+
+  const sameTopic = Boolean(older.topicKey && newer.topicKey && older.topicKey === newer.topicKey);
+  const existingText = `${older.title} ${older.content}`;
+  const candidateText = `${newer.title} ${newer.content}`;
+
+  if (sameTopic) {
+    const oldPosTools = extractPositiveTools(existingText);
+    const newPosTools = extractPositiveTools(candidateText);
+    if (oldPosTools.length === 1 && newPosTools.length === 1 && oldPosTools[0] === newPosTools[0]) {
+      // Both endorse the exact same positive tool without negating each other -> same stance
+      return false;
+    }
+    if (newer.supersedes || STANCE_REPLACEMENT_RE.test(candidateText)) return true;
+    if (oldPosTools.length === 1 && newPosTools.length === 1) {
+      return oldPosTools[0] !== newPosTools[0];
+    }
+    for (const tool of oldPosTools) {
+      if (isToolNegatedIn(candidateText, tool)) return true;
+    }
+    for (const tool of newPosTools) {
+      if (isToolNegatedIn(existingText, tool)) return true;
+    }
+
+    const oldPrimaryClause = older.title.split(/[，,；;。]/)[0] ?? older.title;
+    const newPrimaryClause = newer.title.split(/[，,；;。]/)[0] ?? newer.title;
+    if (oldPosTools.length === 0 && newPosTools.length === 0) {
+      const oldNeg = NEGATION_RE.test(oldPrimaryClause);
+      const newNeg = NEGATION_RE.test(newPrimaryClause);
+      if (oldNeg !== newNeg) return true;
+    }
+  }
+
+  const sim = jaccardSimilarity(significantTokenSet(existingText), significantTokenSet(candidateText));
+  if (sim >= 0.45 && (newer.supersedes || STANCE_REPLACEMENT_RE.test(candidateText))) {
+    const oldPosTools = extractPositiveTools(existingText);
+    const newPosTools = extractPositiveTools(candidateText);
+    if (oldPosTools.length === 1 && newPosTools.length === 1 && oldPosTools[0] === newPosTools[0]) {
+      return false;
+    }
+    return true;
+  }
+  return false;
+}
+
 /**
  * NREM Phase: Slow-wave intra-batch clustering to strip redundancy among extracted observations.
  */
@@ -444,9 +597,12 @@ export function clusterNremCandidates(candidates: readonly NremCandidate[]): Nre
     let merged = false;
     for (const cluster of clusters) {
       if (cluster.candidate.kind !== cand.kind) continue;
-      if (Boolean(cand.supersedes) !== Boolean(cluster.candidate.supersedes)) {
-        // Keep stance-reversing candidates distinct from prior non-superseding stances so
-        // Phase 2 REM conflict resolution replaces older stances in chronological order.
+      if (
+        Boolean(cand.supersedes) !== Boolean(cluster.candidate.supersedes) ||
+        hasStanceConflict(cluster.candidate, cand)
+      ) {
+        // Keep stance-reversing or conflicting candidates distinct in chronological order so
+        // Phase 2 REM conflict resolution replaces older stances accurately.
         continue;
       }
       const sameTopic =
@@ -483,66 +639,7 @@ export function clusterNremCandidates(candidates: readonly NremCandidate[]): Nre
 }
 
 function isConflictingStance(existing: MemoryEntry, candidate: NremCandidate): boolean {
-  if (existing.kind !== 'preference' && existing.kind !== 'decision') return false;
-  if (candidate.kind !== existing.kind) return false;
-
-  const sameTopic = Boolean(existing.topicKey && candidate.topicKey && existing.topicKey === candidate.topicKey);
-  const existingText = `${existing.title} ${existing.content}`;
-  const candidateText = `${candidate.title} ${candidate.content}`;
-
-  if (sameTopic) {
-    if (candidate.supersedes || STANCE_REPLACEMENT_RE.test(candidateText)) return true;
-
-    const toolChoices = [
-      'pnpm',
-      'npm',
-      'yarn',
-      'bun',
-      'biome',
-      'eslint',
-      'prettier',
-      'vitest',
-      'jest',
-      'esbuild',
-      'webpack',
-      'rollup',
-      'vite',
-    ];
-    const isNegatedTool = (txt: string, tool: string) =>
-      new RegExp(
-        `(?:不要|禁止|严禁|不用|禁用|避免|never|do\\s+not|don't|avoid)[^，。,.;；]{0,16}\\b${tool}\\b`,
-        'i',
-      ).test(txt);
-    const oldPosTools = toolChoices.filter(
-      (t) => new RegExp(`\\b${t}\\b`, 'i').test(existingText) && !isNegatedTool(existingText, t),
-    );
-    const newPosTools = toolChoices.filter(
-      (t) => new RegExp(`\\b${t}\\b`, 'i').test(candidateText) && !isNegatedTool(candidateText, t),
-    );
-    if (oldPosTools.length === 1 && newPosTools.length === 1) {
-      return oldPosTools[0] !== newPosTools[0];
-    }
-    for (const tool of oldPosTools) {
-      if (isNegatedTool(candidateText, tool)) return true;
-    }
-    for (const tool of newPosTools) {
-      if (isNegatedTool(existingText, tool)) return true;
-    }
-
-    const oldPrimaryClause = existing.title.split(/[，,；;。]/)[0] ?? existing.title;
-    const newPrimaryClause = candidate.title.split(/[，,；;。]/)[0] ?? candidate.title;
-    if (oldPosTools.length === 0 && newPosTools.length === 0) {
-      const oldNeg = NEGATION_RE.test(oldPrimaryClause);
-      const newNeg = NEGATION_RE.test(newPrimaryClause);
-      if (oldNeg !== newNeg) return true;
-    }
-  }
-
-  const sim = jaccardSimilarity(significantTokenSet(existingText), significantTokenSet(candidateText));
-  if (sim >= 0.45 && (candidate.supersedes || STANCE_REPLACEMENT_RE.test(candidateText))) {
-    return true;
-  }
-  return false;
+  return hasStanceConflict(existing, candidate);
 }
 
 /**
@@ -601,15 +698,13 @@ export async function runTwoPhaseSleepConsolidation(
     .sort((a, b) => a.turn.at - b.turn.at || (a.turn.seq ?? 0) - (b.turn.seq ?? 0) || a.index - b.index)
     .map((entry) => entry.turn);
 
-  // Phase 1: NREM extraction + intra-batch clustering
-  let rawCandidates: NremCandidate[] = [];
+  // Phase 1: NREM extraction + intra-batch clustering (strictly ordered per chronological batch)
+  const rawCandidates: NremCandidate[] = [];
   if (orderedTurns.length > 0) {
-    const deterministic = extractDeterministicNremCandidates(orderedTurns, homeDir);
-    const llmCandidates: NremCandidate[] = [];
-    if (llmExtract) {
-      for (let offset = 0; offset < orderedTurns.length; offset += LLM_CONSOLIDATION_BATCH_SIZE) {
-        throwIfAborted(signal);
-        const batchTurns = orderedTurns.slice(offset, offset + LLM_CONSOLIDATION_BATCH_SIZE);
+    for (let offset = 0; offset < orderedTurns.length; offset += LLM_CONSOLIDATION_BATCH_SIZE) {
+      throwIfAborted(signal);
+      const batchTurns = orderedTurns.slice(offset, offset + LLM_CONSOLIDATION_BATCH_SIZE);
+      if (llmExtract) {
         const batchSessionIds = [
           ...new Set(batchTurns.map((t) => sanitizeSleepText(t.sessionId, 64, homeDir)).filter(Boolean)),
         ];
@@ -618,7 +713,7 @@ export async function runTwoPhaseSleepConsolidation(
           const rawLlm = await llmExtract(prompt, signal);
           throwIfAborted(signal);
           if (rawLlm) {
-            llmCandidates.push(...parseLlmCandidatesJson(rawLlm, batchSessionIds, homeDir, batchTurns));
+            rawCandidates.push(...parseLlmCandidatesJson(rawLlm, batchSessionIds, homeDir, batchTurns));
           }
         } catch (err) {
           if (signal.aborted || (err instanceof Error && err.name === 'AbortError')) {
@@ -627,8 +722,9 @@ export async function runTwoPhaseSleepConsolidation(
           // Gracefully fall back to deterministic NREM extraction for failed batch if LLM is offline/unavailable
         }
       }
+      rawCandidates.push(...extractDeterministicTurnCandidates(batchTurns, homeDir));
     }
-    rawCandidates = [...llmCandidates, ...deterministic];
+    rawCandidates.push(...extractDeterministicSessionEpisodes(orderedTurns, homeDir));
   }
 
   const nremClustered = clusterNremCandidates(rawCandidates);

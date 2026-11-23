@@ -658,6 +658,75 @@ describe('NREM + REM 双阶段睡眠记忆巩固与 Markdown/JSONL 脱敏存储�
     const fencedParsed = parseLlmCandidatesJson(fencedWithPrefix, ['sess-early']);
     expect(fencedParsed).toHaveLength(1);
     expect(fencedParsed[0]?.title).toBe('避免 indexOf 首括号误判');
+
+    // 边界：无代码块包裹但尾部附带含 `]` 的溯源说明（如 `Source: [Turn 1]`）时，平衡括号扫描器不会因 lastIndexOf(']') 丢弃整批 JSON
+    const bareWithTrailingBracket = `[{"kind":"decision","title":"尾部括号耐受","content":"后缀含方括号说明仍可解析"}]\nSource: summarized from [Turn 1] and [Turn 2].`;
+    const bareParsed = parseLlmCandidatesJson(bareWithTrailingBracket, ['sess-early']);
+    expect(bareParsed).toHaveLength(1);
+    expect(bareParsed[0]?.title).toBe('尾部括号耐受');
+
+    // 回归防护：第 1 批 LLM 瞬时报错回退确定性提取（Turn 3 = npm），第 3 批 LLM 提取新立场（Turn 52 = pnpm），
+    // 以及跨批非 supersedes 同主题工具切换（eslint -> biome），均严格按真实时间序保留晚期新立场！
+    const mixedBatchTurns: ConversationTurnInput[] = [];
+    for (let i = 1; i <= 52; i += 1) {
+      mixedBatchTurns.push({
+        turnId: `mturn-${i}`,
+        sessionId: 'sess-chrono',
+        seq: i,
+        at: T0 + i * 1_000,
+        userText:
+          i === 3
+            ? '早期习惯：偏好使用 npm 安装依赖。'
+            : i === 52
+              ? '脚手架升级完成，现在切到 pnpm 了。'
+              : `第 ${i} 轮常规对话`,
+        assistantText: `第 ${i} 轮回复`,
+      });
+    }
+    let mixedCall = 0;
+    const mixedOut = await runTwoPhaseSleepConsolidation({
+      turns: mixedBatchTurns,
+      existingMemories: [],
+      now: T0 + 200_000,
+      trigger: 'manual',
+      signal: new AbortController().signal,
+      llmExtract: async (prompt) => {
+        mixedCall += 1;
+        if (mixedCall === 1) {
+          throw new Error('simulated transient gateway error on batch 1');
+        }
+        if (prompt.includes('切到 pnpm')) {
+          return JSON.stringify([
+            {
+              kind: 'preference',
+              title: '包管理器统一改用 pnpm',
+              content: '晚期批次将包管理器从 npm 切到 pnpm。',
+              tags: ['pnpm'],
+              topicKey: 'preference:package-manager',
+              supersedes: true,
+            },
+            {
+              kind: 'decision',
+              title: '代码检查统一使用 biome',
+              content: '代码格式化与检查工具采用 biome。',
+              tags: ['biome'],
+              topicKey: 'decision:formatter-linter',
+            },
+          ]);
+        }
+        return JSON.stringify([
+          {
+            kind: 'decision',
+            title: '代码检查统一使用 eslint',
+            content: '中期批次曾临时使用 eslint。',
+            tags: ['eslint'],
+            topicKey: 'decision:formatter-linter',
+          },
+        ]);
+      },
+    });
+    expect(mixedOut.memories.find((m) => m.topicKey === 'preference:package-manager')?.title).toContain('pnpm');
+    expect(mixedOut.memories.find((m) => m.topicKey === 'decision:formatter-linter')?.title).toContain('biome');
   });
 
   it('MEMORY.md 边界：支持代码块内 `#` 注释与后置 `- 标签:` 元数据，且清空全部条目时准确同步清空 memories.jsonl', async () => {
@@ -690,14 +759,172 @@ describe('NREM + REM 双阶段睡眠记忆巩固与 Markdown/JSONL 脱敏存储�
     expect(items[0]?.content).toContain('# 注意:代码块内的井号注释绝不能被误判为 H1 标题截断!');
     expect(items[0]?.content).toContain('rm -rf plugins/asi-sleep/lib');
 
-    // 当人类清空 MEMORY.md 中全部条目（仅保留标题与空章节）时，memories.jsonl 同步清空为 0 条
+    // 当人类清空 MEMORY.md 中全部条目（仅保留标题与空章节，含 Prettier `*暂无未置顶条目*` 变体）时，memories.jsonl 同步清空为 0 条
     await writeFile(
       vault.markdownPath,
-      '# ASI 记忆库 (Memory Vault)\n\n## 踩坑 (pitfall)\n\n_暂无未置顶条目_\n',
+      '# ASI 记忆库 (Memory Vault)\n\n## 踩坑 (pitfall)\n\n*暂无未置顶条目*\n',
       'utf8',
     );
     await vault.syncExternalChanges(T0 + 2_000);
     expect(vault.list(T0 + 2_000)).toHaveLength(0);
     expect(await readFile(vault.memoriesJsonlPath, 'utf8')).toBe('');
+  });
+
+  it('MEMORY.md 进阶回归：首行内联代码块不吞噬后序章节、保留 `[1]`/`[分类]` 标题前缀、消歧复制粘贴重复 ID，并支持与后台整合的三路快照合并', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'asi-sleep-md-3way-'));
+    tempDirs.push(dir);
+    const vault = new MemoryVault(dir, '/Users/tester');
+    await vault.load(T0);
+
+    const maturedFsrs = strengthenFsrsState(
+      strengthenFsrsState(createInitialFsrsState('preference', T0), T0 + 3_600_000, 'recall'),
+      T0 + 7_200_000,
+      'recall',
+    );
+
+    // 1. 首行即 ` ```sh ` 的代码块、带 `[1]` 的非置顶标题、带 `[决策]` 字面标题的进展记忆、带 `[偏好]` 字面标题的置顶记忆
+    vault.upsert({
+      id: 'mem_code_first',
+      kind: 'pitfall',
+      title: '首行代码块回归',
+      content: '```sh\n# 注释行\necho clean\n```',
+      tags: ['shell'],
+      pinned: false,
+      confidence: 0.9,
+      sourceSessionIds: ['s1'],
+      evidenceCount: 1,
+      recallCount: 0,
+      createdAt: T0,
+      updatedAt: T0,
+      fsrs: createInitialFsrsState('pitfall', T0),
+    });
+    vault.upsert({
+      id: 'mem_bracket_num',
+      kind: 'preference',
+      title: '[1] 阶段一命名规范',
+      content: '保持既有导出签名稳定。',
+      tags: ['naming'],
+      pinned: false,
+      confidence: 0.9,
+      sourceSessionIds: ['s1'],
+      evidenceCount: 1,
+      recallCount: 0,
+      createdAt: T0,
+      updatedAt: T0,
+      fsrs: createInitialFsrsState('preference', T0),
+    });
+    vault.upsert({
+      id: 'mem_episode_bracket',
+      kind: 'episode',
+      title: '[决策] 周五架构评审纪要',
+      content: '完成三插件联调评审，属于近期进展条目。',
+      tags: ['review'],
+      pinned: false,
+      confidence: 0.85,
+      sourceSessionIds: ['s1'],
+      evidenceCount: 1,
+      recallCount: 0,
+      createdAt: T0,
+      updatedAt: T0,
+      fsrs: createInitialFsrsState('episode', T0),
+    });
+    vault.upsert({
+      id: 'mem_dup_origin',
+      kind: 'preference',
+      title: '[偏好] 保持单引号风格',
+      content: 'Biome quoteStyle 固定为 single。',
+      tags: ['biome'],
+      pinned: true,
+      confidence: 1,
+      sourceSessionIds: ['manual'],
+      evidenceCount: 2,
+      recallCount: 4,
+      createdAt: T0,
+      updatedAt: T0,
+      fsrs: maturedFsrs,
+    });
+    await vault.flush(T0 + 5_000);
+
+    // 模拟用户在原置顶块上方复制粘贴了一段带相同 `mem_dup_origin` ID 的新块并修改标题/内容，
+    // 且将 `mem_code_first` 编辑为 `- 内容: ```sh` 首行直接开启多行代码块（验证闭合围栏绝不反向吞噬后续章节！）
+    const diskMd0 = await readFile(vault.markdownPath, 'utf8');
+    const pastedDupMd = diskMd0
+      .replace(
+        '- 内容: ```sh # 注释行 echo clean ```',
+        ['- 内容: ```sh', '  # 注释行', '  echo clean', '  ```'].join('\n'),
+      )
+      .replace(
+        '### [偏好] [偏好] 保持单引号风格',
+        [
+          '### [偏好] 复制粘贴新增的行宽约定',
+          '- ID: `mem_dup_origin` · 保留率: **100% (已置顶)** · 标签: `biome`',
+          '- 内容: Biome lineWidth 固定为 120。',
+          '',
+          '### [偏好] [偏好] 保持单引号风格',
+        ].join('\n'),
+      );
+    await writeFile(vault.markdownPath, pastedDupMd, 'utf8');
+    await vault.syncExternalChanges(T0 + 6_000);
+
+    // 首行代码块绝不吞噬后续章节；`[1]` 与 `[决策]` 字面标题及分类无损保留；重复 ID 原块保住原 ID 与 FSRS，粘贴块获新 ID
+    expect(vault.get('mem_code_first')?.content).toBe('```sh # 注释行 echo clean ```');
+    expect(vault.get('mem_bracket_num')?.pinned).toBe(false);
+    expect(vault.get('mem_bracket_num')?.title).toBe('[1] 阶段一命名规范');
+    expect(vault.get('mem_episode_bracket')?.kind).toBe('episode');
+    expect(vault.get('mem_episode_bracket')?.title).toBe('[决策] 周五架构评审纪要');
+    const keptOrigin = vault.get('mem_dup_origin');
+    expect(keptOrigin?.title).toBe('[偏好] 保持单引号风格');
+    expect(keptOrigin?.recallCount).toBe(4);
+    expect(keptOrigin?.fsrs).toEqual(maturedFsrs);
+    const pastedClone = vault.list(T0 + 6_000).find((m) => m.title === '复制粘贴新增的行宽约定');
+    expect(pastedClone).toBeDefined();
+    expect(pastedClone?.id).not.toBe('mem_dup_origin');
+    expect(pastedClone?.recallCount).toBe(0);
+
+    // 2. 三路快照合并：人类在外部编辑器打开旧版 H0 快照期间，后台完成了新记忆合并与旧记忆修剪并落盘 H1，
+    //    随后人类保存基于 H0 修改的 MEMORY.md（将 mem_bracket_num 置顶 + 新增手写条目），验证后台新增记忆不丢失且已修剪项不复活！
+    const editorSnapshotH0 = await readFile(vault.markdownPath, 'utf8');
+
+    // 模拟后台睡眠整合：删除 mem_episode_bracket（模拟遗忘修剪）、强化 mem_bracket_num 并新增 mem_bg_sleep
+    const strengthenedNumFsrs = strengthenFsrsState(
+      vault.get('mem_bracket_num')?.fsrs ?? createInitialFsrsState('preference', T0),
+      T0 + 10_000,
+      'consolidate',
+    );
+    const nextAfterSleep = vault
+      .list(T0 + 10_000)
+      .filter((m) => m.id !== 'mem_episode_bracket')
+      .map((m) => (m.id === 'mem_bracket_num' ? { ...m, evidenceCount: 3, fsrs: strengthenedNumFsrs } : m));
+    nextAfterSleep.push({
+      id: 'mem_bg_sleep',
+      kind: 'decision',
+      title: '后台睡眠期间新增的架构决策',
+      content: '在外部编辑器持旧快照期间由后台整合生成，绝不可被旧快照保存误删。',
+      tags: ['sleep-concurrent'],
+      pinned: false,
+      confidence: 0.92,
+      sourceSessionIds: ['s2'],
+      evidenceCount: 1,
+      recallCount: 0,
+      createdAt: T0 + 10_000,
+      updatedAt: T0 + 10_000,
+      fsrs: createInitialFsrsState('decision', T0 + 10_000),
+    });
+    vault.replaceAll(nextAfterSleep);
+    await vault.flush(T0 + 10_000);
+
+    // 人类基于旧 editorSnapshotH0 将 mem_bracket_num 标记置顶并新增一条手写笔记后保存覆盖 MEMORY.md
+    const humanSavedFromH0 = editorSnapshotH0
+      .replace('### [1] 阶段一命名规范', '### [置顶] [1] 阶段一命名规范')
+      .replace('## 决策 (decision)', '## 决策 (decision)\n\n### 人类并发手写决策\n- 内容: 外部编辑器并发新增。\n');
+    await writeFile(vault.markdownPath, humanSavedFromH0, 'utf8');
+    await vault.syncExternalChanges(T0 + 15_000);
+
+    expect(vault.get('mem_bg_sleep')?.title).toBe('后台睡眠期间新增的架构决策');
+    expect(vault.get('mem_episode_bracket')).toBeUndefined();
+    expect(vault.get('mem_bracket_num')?.pinned).toBe(true);
+    expect(vault.get('mem_bracket_num')?.evidenceCount).toBe(3);
+    expect(vault.get('mem_bracket_num')?.fsrs).toEqual(strengthenedNumFsrs);
+    expect(vault.list(T0 + 15_000).some((m) => m.title === '人类并发手写决策')).toBe(true);
   });
 });

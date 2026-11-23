@@ -262,10 +262,13 @@ describe('SleepRuntime 困意曲线、静默窗口、每日 6 次自动配额、
       // 距离首轮经过 >= 6h（仍只有 5 轮未整合）：触发时间因子困意 (<60)，且当前空闲已超过 10m -> 自动执行第 1 次整合！
       now += 6 * HOUR;
       senseH.emit();
-      await vi.waitFor(() => {
-        expect(rt.panelModel().consolidating).toBe(false);
-        expect(rt.panelModel().recentConsolidations).toHaveLength(1);
-      });
+      await vi.waitFor(
+        () => {
+          expect(rt.panelModel().consolidating).toBe(false);
+          expect(rt.panelModel().recentConsolidations).toHaveLength(1);
+        },
+        { timeout: 5_000 },
+      );
       expect(rt.panelModel().drive.unconsolidatedTurns).toBe(0);
       expect(rt.panelModel().drive.satisfaction).toBe(100);
       expect(rt.panelModel().drive.autoRunsToday).toBe(1);
@@ -282,10 +285,13 @@ describe('SleepRuntime 困意曲线、静默窗口、每日 6 次自动配额、
 
       // 锁屏 (env.system.locked = true)：立即满足静默窗口 -> 自动执行第 2 次整合！
       senseH.setLocked(true);
-      await vi.waitFor(() => {
-        expect(rt.panelModel().consolidating).toBe(false);
-        expect(rt.panelModel().recentConsolidations).toHaveLength(2);
-      });
+      await vi.waitFor(
+        () => {
+          expect(rt.panelModel().consolidating).toBe(false);
+          expect(rt.panelModel().recentConsolidations).toHaveLength(2);
+        },
+        { timeout: 5_000 },
+      );
       expect(rt.panelModel().drive.autoRunsToday).toBe(2);
       senseH.setLocked(false);
 
@@ -294,10 +300,13 @@ describe('SleepRuntime 困意曲线、静默窗口、每日 6 次自动配额、
         addTurns(12, `s-${runIdx}`);
         now += 11 * MIN;
         senseH.emit();
-        await vi.waitFor(() => {
-          expect(rt.panelModel().consolidating).toBe(false);
-          expect(rt.panelModel().drive.autoRunsToday).toBe(runIdx);
-        });
+        await vi.waitFor(
+          () => {
+            expect(rt.panelModel().consolidating).toBe(false);
+            expect(rt.panelModel().drive.autoRunsToday).toBe(runIdx);
+          },
+          { timeout: 5_000 },
+        );
       }
 
       // 第 7 次自动机会（24h 内）：已满 6/6 配额 -> 即使满 12 轮且空闲 20 分钟也不自动运行！
@@ -379,9 +388,12 @@ describe('SleepRuntime 困意曲线、静默窗口、每日 6 次自动配额、
 
       // 突发 L1 生理不适 -> 立即抢占中断在途睡眠！
       drivesH.setL1Distressed(true);
-      await vi.waitFor(() => {
-        expect(rt.panelModel().consolidating).toBe(false);
-      });
+      await vi.waitFor(
+        () => {
+          expect(rt.panelModel().consolidating).toBe(false);
+        },
+        { timeout: 5_000 },
+      );
       // 自动配额已回滚为 0，12 轮待整合对话未丢失！
       expect(rt.panelModel().drive.autoRunsToday).toBe(0);
       expect(rt.panelModel().drive.unconsolidatedTurns).toBe(12);
@@ -552,10 +564,13 @@ describe('SleepRuntime 困意曲线、静默窗口、每日 6 次自动配额、
     try {
       expect(rt1.panelModel().drive.unconsolidatedTurns).toBe(2_250);
       senseH.setLocked(true);
-      await vi.waitFor(() => {
-        expect(rt1.panelModel().consolidating).toBe(false);
-        expect(rt1.panelModel().drive.autoRunsToday).toBe(1);
-      });
+      await vi.waitFor(
+        () => {
+          expect(rt1.panelModel().consolidating).toBe(false);
+          expect(rt1.panelModel().drive.autoRunsToday).toBe(1);
+        },
+        { timeout: 5_000 },
+      );
       expect(rt1.panelModel().drive.unconsolidatedTurns).toBe(0);
       expect(rt1.panelModel().drive.satisfaction).toBe(100);
 

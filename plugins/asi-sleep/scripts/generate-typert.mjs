@@ -1,4 +1,4 @@
-import { cp, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
+import { cp, mkdir, mkdtemp, readFile, rename, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -86,7 +86,10 @@ try {
     'typert.remote-client.d.ts',
     'typert.remote-client.d.ts.map',
   ]) {
-    await cp(join(staged, 'lib', file), join(pkg, 'lib', file));
+    const dest = join(pkg, 'lib', file);
+    const tmp = `${dest}.${process.pid}.tmp`;
+    await cp(join(staged, 'lib', file), tmp);
+    await rename(tmp, dest);
   }
 } finally {
   await rm(root, { recursive: true, force: true });

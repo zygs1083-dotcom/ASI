@@ -731,4 +731,191 @@ describe('Cordis 全栈联合集成（asi-sense + asi-needs + asi-sleep）', () 
       await new Promise((r) => setTimeout(r, 25));
     }
   });
+
+  it('在途异步 llmExtract 窗口期内人类并发修改 MEMORY.md 零丢失，且坏路由/残缺冷会话缓存自动继续回退至可用推理路由', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'asi-sleep-race-fallback-'));
+    tempDirs.push(dir);
+
+    const staleCold = Session.create(SessionId('cold-stale-prov'), [], {
+      version: 4,
+      id: SessionId('cold-stale-prov'),
+      createdAt: Date.now() - 2 * 3_600_000,
+      cwd: join(dir, 'repo-a'),
+      isSeeded: false,
+    });
+    staleCold.append('request/header', {
+      header: { config: { provider: 'removed-legacy-provider', model: 'legacy-m1' } },
+      reason: 'initial',
+    });
+
+    const goodCold = Session.create(SessionId('cold-good-reasoner'), [], {
+      version: 4,
+      id: SessionId('cold-good-reasoner'),
+      createdAt: Date.now() - 4 * 3_600_000,
+      cwd: join(dir, 'repo-b'),
+      isSeeded: false,
+    });
+    goodCold.append('request/header', {
+      header: { config: { provider: 'deepseek', model: 'deepseek-reasoner' } },
+      reason: 'initial',
+    });
+
+    const liveSession = Session.create(SessionId('live-ordinary-race'), [], {
+      version: 4,
+      id: SessionId('live-ordinary-race'),
+      createdAt: Date.now() - 30_000,
+      cwd: join(dir, 'workspace'),
+      isSeeded: false,
+    });
+    appendTurn(liveSession, 1, '决定采用三路快照合并保护并发编辑。', '已验证三路合并方案。');
+
+    const sleepStorage = join(dir, 'sleep');
+    const mdPath = join(sleepStorage, 'vault', 'MEMORY.md');
+    const attemptedCalls: Array<Record<string, unknown>> = [];
+    let ColdReadCount = 0;
+
+    const root = new Context();
+    await root.plugin(SystemPrompt);
+    await root.plugin(ToolsService);
+    root.tools.setExecutor(new NativeToolExecutor(root));
+    root.provide('agents', { list: () => [], get: () => undefined, withoutInitiator: <T>(fn: () => T) => fn() });
+    root.provide('jobs', { list: () => [], kill: () => 'already-finished', events: { subscribe: () => () => {} } });
+    root.provide('llm', {
+      listConfigurableProviders: () => [],
+      listProviders: () => [
+        { id: 'broken-cred-provider', name: 'Broken Cred' },
+        { id: 'deepseek', name: 'DeepSeek' },
+      ],
+      listModels: async () => [],
+      resolveModelInfo: async () => undefined,
+      stream(opts: Record<string, unknown>) {
+        attemptedCalls.push(opts);
+        return (async function* () {
+          if (opts.provider === 'broken-cred-provider') {
+            yield {
+              type: 'finish' as const,
+              reason: {
+                kind: 'error' as const,
+                failure: { code: 'MISSING_CREDENTIAL', message: 'No credential configured' },
+              },
+            };
+            return;
+          }
+          // 在异步 llmExtract 流式等待窗口期内，外部编辑器同时将既有记忆置顶并新增手写记忆！
+          const currentDiskMd = await readFile(mdPath, 'utf8');
+          const editedDuringStream = `${currentDiskMd.replace(
+            '### 待置顶初始记忆',
+            '### [置顶] 待置顶初始记忆',
+          )}\n## 踩坑 (pitfall)\n\n### 流式窗口期手写新增踩坑\n- 内容: 在途整合期间外部编辑器保存的内容必须完整保留。\n`;
+          await writeFile(mdPath, editedDuringStream, 'utf8');
+
+          yield {
+            type: 'text-delta' as const,
+            index: 0,
+            text: JSON.stringify([
+              {
+                kind: 'decision',
+                title: '流式整合提炼：三路快照合并',
+                content: '后台整合提炼出的新决策记忆。',
+                tags: ['3way'],
+                sessionId: 'live-ordinary-race',
+              },
+            ]),
+          };
+          yield { type: 'finish' as const, reason: { kind: 'stop' as const } };
+        })();
+      },
+    });
+    root.provide('sessionProjections', {
+      snapshot: () => ({
+        values: {
+          modelSelection: {
+            next: { provider: 'broken-cred-provider', model: 'broken-m1' },
+            lastUsed: null,
+          },
+        },
+      }),
+    });
+    root.provide('sessions', { list: () => [liveSession], get: () => liveSession });
+    root.provide('tokenMeter', { contextPressure: () => ({}) });
+    root.provide('profileContext', {
+      name: 'fixture',
+      dir,
+      patchPath: '',
+      installAnchor: '',
+      cwd: '',
+      home: '',
+      startedBundles: [],
+      overlays: [],
+      telemetryDisabledEnv: undefined,
+    });
+    root.provide('sessionController', {
+      create: async () => ({ sessionId: SessionId('asi-maint-1') }),
+      rename: async () => ({ title: 'ASI', seq: 1 }),
+      resolveAgent: async () => ({ error: new Error('none') }),
+    });
+    root.provide('sessionQuery', {
+      // 首次启动预热仅返回 staleCold（模拟预热中断或后续新产生冷会话），整合时按需继续发现 goodCold！
+      listSessions: async () => {
+        ColdReadCount += 1;
+        return ColdReadCount === 1
+          ? [{ header: staleCold.header, live: false, persisted: true }]
+          : [
+              { header: staleCold.header, live: false, persisted: true },
+              { header: goodCold.header, live: false, persisted: true },
+            ];
+      },
+      readSession: async (id: SessionId) => {
+        const target = String(id) === 'cold-stale-prov' ? staleCold : goodCold;
+        return {
+          session: target.header,
+          inheritedEventCount: SessionLogOffset(0),
+          events: [...target.snapshotEvents()],
+        };
+      },
+    });
+
+    const senseFork = await root.plugin(AsiSensePlugin, {
+      storageRoot: join(dir, 'sense'),
+      helperPath: join(dir, 'nonexistent-helper'),
+      intervalMs: 10_000,
+    });
+    const needsFork = await root.plugin(AsiNeedsPlugin, { storageRoot: join(dir, 'needs') });
+    const sleepFork = await root.plugin(AsiSleepPlugin, { storageRoot: sleepStorage });
+
+    try {
+      await new Promise((r) => setTimeout(r, 35));
+      const seed = await root.asiSleep.createMemory({
+        kind: 'preference',
+        title: '待置顶初始记忆',
+        content: '初始未置顶，将在异步 llmExtract 期间由人类在 MEMORY.md 置顶。',
+        pinned: false,
+      });
+
+      await root.asiSleep.consolidateNow();
+
+      // 验证自动跳过 MISSING_CREDENTIAL 与未注册的 removed-legacy-provider，命中冷会话 deepseek/deepseek-reasoner 且无硬编码 temperature/maxTokens
+      expect(attemptedCalls.map((c) => `${String(c.provider)}/${String(c.model)}`)).toEqual([
+        'broken-cred-provider/broken-m1',
+        'deepseek/deepseek-reasoner',
+      ]);
+      expect(attemptedCalls[1]?.temperature).toBeUndefined();
+      expect(attemptedCalls[1]?.maxTokens).toBeUndefined();
+
+      // 验证在途整合新增条目 + 外部编辑器置顶修改 + 外部编辑器新增条目三方全部落盘共存！
+      const allAfter = await root.asiSleep.searchMemories('');
+      expect(allAfter.find((m) => m.id === seed.id)?.pinned).toBe(true);
+      expect(allAfter.some((m) => m.title.includes('流式窗口期手写新增踩坑'))).toBe(true);
+      expect(allAfter.some((m) => m.title.includes('流式整合提炼'))).toBe(true);
+
+      const finalJsonl = await readFile(join(sleepStorage, 'vault', 'memories.jsonl'), 'utf8');
+      expect(finalJsonl).toContain('流式窗口期手写新增踩坑');
+      expect(finalJsonl).toContain('流式整合提炼');
+    } finally {
+      sleepFork.dispose();
+      needsFork.dispose();
+      senseFork.dispose();
+      await new Promise((r) => setTimeout(r, 25));
+    }
+  });
 });

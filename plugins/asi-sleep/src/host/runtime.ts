@@ -668,7 +668,11 @@ export function createSleepRuntime(ports: SleepHostPorts): SleepRuntime {
 
     async searchMemories(query: string, kind?: MemoryKind): Promise<MemoryViewItem[]> {
       const now = clock.wall();
-      await vault.syncExternalChanges(now);
+      const synced = await vault.syncExternalChanges(now);
+      if (synced) {
+        ports.drives.notifySourceChanged('asi-sleep');
+        notify();
+      }
       const all = vault.list(now).map((e) => toViewItem(e, now));
       const hits = searchMemoryItems(all, query, {
         ...(kind ? { kind } : {}),
@@ -852,6 +856,9 @@ export function createSleepRuntime(ports: SleepHostPorts): SleepRuntime {
       offDriveSource?.();
       offDriveSource = undefined;
 
+      if (vault.hasPendingExternalFlush()) {
+        await vault.flush(clock.wall()).catch(() => undefined);
+      }
       await Promise.allSettled([activeConsolidationPromise ?? Promise.resolve(), stateWriteChain, vault.waitForIdle()]);
       subscribers.clear();
     },

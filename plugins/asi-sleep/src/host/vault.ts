@@ -36,9 +36,12 @@ const MAX_CONTENT_CHARS = 1_600;
 const MAX_TAG_CHARS = 40;
 const MAX_TAGS = 12;
 
+const MAX_SNAPSHOT_HISTORY = 16;
+
 const VAULT_SYNC_FOOTER_RE = /\n?<!--\s*asi-sleep-vault\s+md=([0-9a-f]+)(?:\s+jsonl=([0-9a-f]+))?\s*-->\s*$/;
-const PLACEHOLDER_LINE_RE = /^_暂无(?:未置顶)?条目_\s*$/;
+const PLACEHOLDER_LINE_RE = /^(?:_暂无(?:未置顶)?条目_|\*暂无(?:未置顶)?条目\*)\s*$/;
 const HTML_COMMENT_LINE_RE = /^<!--.*-->\s*$/;
+const OPEN_CODE_FENCE_RE = /^\s*(`{3,}(?=[^`]*$)|~{3,})/;
 
 function sha256Short(text: string): string {
   return createHash('sha256').update(text, 'utf8').digest('hex').slice(0, 24);
@@ -207,6 +210,7 @@ export interface ParsedMarkdownMemory {
   bracketKind?: MemoryKind;
   sectionKind?: MemoryKind;
   pinned?: boolean;
+  rawHeading?: string;
   title: string;
   content: string;
   tags?: string[];
@@ -292,12 +296,25 @@ function parseSectionHeader(heading: string): { isPinnedSection: boolean; kind?:
   return { isPinnedSection: false };
 }
 
+function parseBracketPinToken(raw: string): boolean | undefined {
+  const token = raw.trim().toLowerCase();
+  if (token === 'pinned' || token === '置顶' || token === '已置顶') {
+    return true;
+  }
+  if (token === 'unpinned' || token === '未置顶' || token === '取消置顶') {
+    return false;
+  }
+  return undefined;
+}
+
 function parseEntryHeading(rawHeading: string): {
+  rawHeading: string;
   title: string;
   bracketKind?: MemoryKind;
   bracketPinned?: boolean;
 } {
-  let rest = rawHeading.trim();
+  const trimmedHeading = rawHeading.trim();
+  let rest = trimmedHeading;
   let bracketKind: MemoryKind | undefined;
   let bracketPinned: boolean | undefined;
 
@@ -305,8 +322,8 @@ function parseEntryHeading(rawHeading: string): {
     const closeIdx = rest.indexOf(']');
     if (closeIdx <= 0) break;
     const inside = rest.slice(1, closeIdx).trim();
-    const maybeKind = parseKindToken(inside);
-    const maybePin = parsePinToken(inside);
+    const maybeKind = bracketKind === undefined ? parseKindToken(inside) : undefined;
+    const maybePin = bracketPinned === undefined ? parseBracketPinToken(inside) : undefined;
     if (maybeKind === undefined && maybePin === undefined) {
       break;
     }
@@ -316,7 +333,8 @@ function parseEntryHeading(rawHeading: string): {
   }
 
   return {
-    title: rest || rawHeading.trim(),
+    rawHeading: trimmedHeading,
+    title: rest || trimmedHeading,
     ...(bracketKind !== undefined ? { bracketKind } : {}),
     ...(bracketPinned !== undefined ? { bracketPinned } : {}),
   };
@@ -333,6 +351,7 @@ export function parseVaultMarkdown(rawMarkdown: string): ParsedMarkdownMemory[] 
   };
 
   interface EntryDraft {
+    rawHeading?: string;
     title: string;
     sectionPinned: boolean;
     sectionKind?: MemoryKind;
@@ -390,6 +409,7 @@ export function parseVaultMarkdown(rawMarkdown: string): ParsedMarkdownMemory[] 
       ...(draft.bracketKind ? { bracketKind: draft.bracketKind } : {}),
       ...(draft.sectionKind ? { sectionKind: draft.sectionKind } : {}),
       ...(resolvedPinned !== undefined ? { pinned: resolvedPinned } : {}),
+      ...(draft.rawHeading ? { rawHeading: draft.rawHeading } : {}),
       title: draft.title,
       content: contentText || draft.title,
       ...(draft.tags !== undefined ? { tags: draft.tags } : {}),
@@ -438,6 +458,10 @@ export function parseVaultMarkdown(rawMarkdown: string): ParsedMarkdownMemory[] 
         if (kindSeg) {
           const k = parseKindToken(stripSurroundingCodeTicks(kindSeg[1] ?? ''));
           if (k !== undefined) target.explicitKind = k;
+          continue;
+        }
+        if (/保留率.*\(\s*(?:未置顶|取消置顶|unpinned)\s*\)/i.test(seg)) {
+          target.explicitPinned = false;
         }
       }
       return true;
@@ -477,30 +501,48 @@ export function parseVaultMarkdown(rawMarkdown: string): ParsedMarkdownMemory[] 
     return false;
   };
 
-  for (const line of lines) {
+  const hasNextStructuralBoundary = (fromIndex: number): boolean => {
+    for (let j = fromIndex + 1; j < lines.length; j += 1) {
+      const nextTrimmed = (lines[j] ?? '').trim();
+      if (!nextTrimmed) continue;
+      return /^(?:[-*]\s+)?ID\s*[:：]\s*\S+/i.test(nextTrimmed) || PLACEHOLDER_LINE_RE.test(nextTrimmed);
+    }
+    return false;
+  };
+
+  for (let lineIdx = 0; lineIdx < lines.length; lineIdx += 1) {
+    const line = lines[lineIdx] ?? '';
     if (draft) {
-      const unindentedLine = draft.usedContentPrefix && line.startsWith('  ') ? line.slice(2) : line;
-      const fenceMatch = /^\s*(`{3,}|~{3,})/.exec(unindentedLine);
-      if (fenceMatch) {
-        const marker = fenceMatch[1] ?? '```';
-        const ch = marker[0] as '`' | '~';
+      if (draft.fenceChar && /^(?:##|###)\s+\S/.test(line) && hasNextStructuralBoundary(lineIdx)) {
+        draft.fenceChar = undefined;
+        draft.fenceLen = undefined;
+      } else {
+        const unindentedLine = draft.usedContentPrefix && line.startsWith('  ') ? line.slice(2) : line;
         if (!draft.fenceChar) {
-          draft.fenceChar = ch;
-          draft.fenceLen = marker.length;
-          draft.inContentMode = true;
+          const openFenceMatch = OPEN_CODE_FENCE_RE.exec(unindentedLine);
+          if (openFenceMatch) {
+            const marker = openFenceMatch[1] ?? '```';
+            draft.fenceChar = marker[0] as '`' | '~';
+            draft.fenceLen = marker.length;
+            draft.inContentMode = true;
+            draft.contentLines.push(unindentedLine);
+            continue;
+          }
+        } else {
+          const closeFenceMatch = /^\s*(`{3,}|~{3,})\s*$/.exec(unindentedLine);
+          if (closeFenceMatch) {
+            const marker = closeFenceMatch[1] ?? '```';
+            const ch = marker[0] as '`' | '~';
+            if (draft.fenceChar === ch && marker.length >= (draft.fenceLen ?? 3)) {
+              draft.fenceChar = undefined;
+              draft.fenceLen = undefined;
+              draft.contentLines.push(unindentedLine);
+              continue;
+            }
+          }
           draft.contentLines.push(unindentedLine);
           continue;
         }
-        if (draft.fenceChar === ch && marker.length >= (draft.fenceLen ?? 3)) {
-          draft.fenceChar = undefined;
-          draft.fenceLen = undefined;
-          draft.contentLines.push(unindentedLine);
-          continue;
-        }
-      }
-      if (draft.fenceChar) {
-        draft.contentLines.push(unindentedLine);
-        continue;
       }
     }
 
@@ -521,6 +563,7 @@ export function parseVaultMarkdown(rawMarkdown: string): ParsedMarkdownMemory[] 
       currentSection.sawH3 = true;
       const head = parseEntryHeading(h3Match[1] ?? '');
       draft = {
+        rawHeading: head.rawHeading,
         title: head.title,
         sectionPinned: currentSection.isPinnedSection,
         ...(currentSection.kind ? { sectionKind: currentSection.kind } : {}),
@@ -558,6 +601,7 @@ export function parseVaultMarkdown(rawMarkdown: string): ParsedMarkdownMemory[] 
                   ? { kind: currentSection.kind, sectionKind: currentSection.kind }
                   : {}),
               pinned: head.bracketPinned ?? currentSection.isPinnedSection,
+              rawHeading: head.rawHeading,
               title: shortTitle,
               content: fullContent,
             });
@@ -586,9 +630,16 @@ export function parseVaultMarkdown(rawMarkdown: string): ParsedMarkdownMemory[] 
 
     const contentPrefixMatch = /^(?:[-*]\s+)?(?:内容|content)\s*[:：]\s?(.*)$/i.exec(line);
     if (contentPrefixMatch) {
+      const firstLine = contentPrefixMatch[1] ?? '';
       draft.inContentMode = true;
       draft.usedContentPrefix = true;
-      draft.contentLines.push(contentPrefixMatch[1] ?? '');
+      const inlineOpenFence = OPEN_CODE_FENCE_RE.exec(firstLine);
+      if (inlineOpenFence) {
+        const marker = inlineOpenFence[1] ?? '```';
+        draft.fenceChar = marker[0] as '`' | '~';
+        draft.fenceLen = marker.length;
+      }
+      draft.contentLines.push(firstLine);
       continue;
     }
 
@@ -628,6 +679,31 @@ function inspectVaultMarkdownSync(
   return { hasFooter: true, mdMatchesFooter, jsonlMatchesFooter };
 }
 
+function balanceMarkdownFences(text: string): string {
+  let fenceChar: '`' | '~' | undefined;
+  let fenceLen = 0;
+  for (const rawLine of text.split(/\r?\n/)) {
+    if (!fenceChar) {
+      const m = OPEN_CODE_FENCE_RE.exec(rawLine);
+      if (m) {
+        const marker = m[1] ?? '```';
+        fenceChar = marker[0] as '`' | '~';
+        fenceLen = marker.length;
+      }
+    } else {
+      const m = /^\s*(`{3,}|~{3,})\s*$/.exec(rawLine);
+      if (m) {
+        const marker = m[1] ?? '```';
+        if (marker[0] === fenceChar && marker.length >= fenceLen) {
+          fenceChar = undefined;
+          fenceLen = 0;
+        }
+      }
+    }
+  }
+  return fenceChar ? `${text}\n${fenceChar.repeat(fenceLen)}` : text;
+}
+
 export function renderVaultMarkdown(entries: readonly MemoryEntry[], now: number, homeDir?: string): string {
   const lines: string[] = [
     '# ASI 记忆库 (Memory Vault)',
@@ -641,7 +717,10 @@ export function renderVaultMarkdown(entries: readonly MemoryEntry[], now: number
     lines.push('## 已置顶记忆 (Pinned · 永不衰减)', '');
     for (const item of pinned) {
       const safeTitle = sanitizeSleepText(item.title, MAX_TITLE_CHARS, homeDir);
-      const safeContent = sanitizeSleepText(item.content, MAX_CONTENT_CHARS, homeDir).replace(/\r?\n/g, '\n  ');
+      const safeContent = balanceMarkdownFences(sanitizeSleepText(item.content, MAX_CONTENT_CHARS, homeDir)).replace(
+        /\r?\n/g,
+        '\n  ',
+      );
       const tagText = item.tags.length > 0 ? ` · 标签: ${item.tags.map((t) => `\`${t}\``).join(', ')}` : '';
       const linkText =
         item.links && item.links.length > 0 ? ` · 关联: ${item.links.map((l) => `\`${l}\``).join(', ')}` : '';
@@ -661,7 +740,10 @@ export function renderVaultMarkdown(entries: readonly MemoryEntry[], now: number
     for (const item of group) {
       const retentionPct = Math.round(computeMemoryRetention(item.fsrs, false, now) * 100);
       const safeTitle = sanitizeSleepText(item.title, MAX_TITLE_CHARS, homeDir);
-      const safeContent = sanitizeSleepText(item.content, MAX_CONTENT_CHARS, homeDir).replace(/\r?\n/g, '\n  ');
+      const safeContent = balanceMarkdownFences(sanitizeSleepText(item.content, MAX_CONTENT_CHARS, homeDir)).replace(
+        /\r?\n/g,
+        '\n  ',
+      );
       const tagText = item.tags.length > 0 ? ` · 标签: ${item.tags.map((t) => `\`${t}\``).join(', ')}` : '';
       const linkText =
         item.links && item.links.length > 0 ? ` · 关联: ${item.links.map((l) => `\`${l}\``).join(', ')}` : '';
@@ -699,6 +781,8 @@ export class MemoryVault {
   private lastFlushedMarkdown: string | undefined;
   private lastObservedDiskMarkdown: string | undefined;
   private pendingFlushMarkdown: string | undefined;
+  private lastFlushedSnapshot: Map<string, MemoryEntry> | undefined;
+  private snapshotsByMdHash = new Map<string, Map<string, MemoryEntry>>();
   private needsFlushFromExternalMarkdown = false;
 
   constructor(
@@ -711,15 +795,139 @@ export class MemoryVault {
     this.journalJsonlPath = join(this.vaultDir, 'sleep-journal.jsonl');
   }
 
+  private recordFlushedSnapshot(mdBody: string, items: Iterable<MemoryEntry>): void {
+    const snap = new Map<string, MemoryEntry>();
+    for (const entry of items) {
+      snap.set(entry.id, structuredClone(entry));
+    }
+    this.lastFlushedSnapshot = snap;
+    const footerMatch = VAULT_SYNC_FOOTER_RE.exec(mdBody.replace(/\r\n/g, '\n'));
+    const mdHash = footerMatch?.[1];
+    if (mdHash) {
+      this.snapshotsByMdHash.delete(mdHash);
+      this.snapshotsByMdHash.set(mdHash, snap);
+      while (this.snapshotsByMdHash.size > MAX_SNAPSHOT_HISTORY) {
+        const oldest = this.snapshotsByMdHash.keys().next().value;
+        if (!oldest) break;
+        this.snapshotsByMdHash.delete(oldest);
+      }
+    }
+  }
+
+  private resolveAgainstRef(item: ParsedMarkdownMemory, ref: MemoryEntry): MemoryEntry {
+    let nextKind = item.kind ?? ref.kind;
+    let rawTitle = item.title;
+
+    // If user dragged a previously pinned `[旧分类] Title` block into a different unpinned H2 kind section,
+    // the old `[旧分类]` prefix came from the pinned section badge while `sectionKind` reflects the target section.
+    if (
+      ref.pinned &&
+      item.pinned === false &&
+      item.bracketKind === ref.kind &&
+      item.sectionKind &&
+      item.sectionKind !== ref.kind
+    ) {
+      nextKind = item.sectionKind;
+    } else if (
+      !ref.pinned &&
+      item.pinned === false &&
+      item.sectionKind === ref.kind &&
+      item.rawHeading &&
+      sanitizeSleepText(item.rawHeading, MAX_TITLE_CHARS, this.homeDir) === ref.title
+    ) {
+      // Unpinned entry whose literal title already started with `[分类] ...` inside its own section
+      nextKind = ref.kind;
+      rawTitle = item.rawHeading;
+    }
+
+    const nextPinned = item.pinned ?? ref.pinned;
+    const nextTitle = sanitizeSleepText(rawTitle, MAX_TITLE_CHARS, this.homeDir) || ref.title;
+    const nextContent = sanitizeSleepText(item.content || nextTitle, MAX_CONTENT_CHARS, this.homeDir) || nextTitle;
+
+    return sanitizeMemoryEntry(
+      {
+        ...ref,
+        kind: nextKind,
+        pinned: nextPinned,
+        title: nextTitle,
+        content: nextContent,
+        tags: item.tags !== undefined ? item.tags : ref.tags,
+        ...(item.topicKey !== undefined
+          ? item.topicKey.trim()
+            ? { topicKey: item.topicKey }
+            : {}
+          : ref.topicKey
+            ? { topicKey: ref.topicKey }
+            : {}),
+        updatedAt: ref.updatedAt,
+        fsrs: structuredClone(ref.fsrs),
+      },
+      this.homeDir,
+    );
+  }
+
   private reconcileMarkdownIntoEntries(rawMarkdown: string, now: number): { redacted: boolean } {
+    const footerMatch = VAULT_SYNC_FOOTER_RE.exec(rawMarkdown.replace(/\r\n/g, '\n'));
+    const footerMdHash = footerMatch?.[1];
+    const baseSnapshot =
+      footerMdHash && this.snapshotsByMdHash.has(footerMdHash)
+        ? this.snapshotsByMdHash.get(footerMdHash)
+        : this.lastFlushedSnapshot;
+
     const parsedItems = parseVaultMarkdown(rawMarkdown);
     const nextMap = new Map<string, MemoryEntry>();
     const claimedExistingIds = new Set<string>();
     const rawLinksById = new Map<string, string[] | undefined>();
     let redacted = false;
 
-    // Also inspect section lines inside rawMarkdown via parsed items for credential/home-path redaction
-    for (const item of parsedItems) {
+    const normalizedIds = parsedItems.map((item) =>
+      item.id ? sanitizeSleepText(item.id, 64, this.homeDir).replace(/\s+/g, '_') : undefined,
+    );
+
+    // Disambiguate copy-pasted duplicate IDs so an unmodified original block keeps its ID & FSRS
+    // even when a user pastes a duplicate block above it.
+    const idIndices = new Map<string, number[]>();
+    for (let idx = 0; idx < normalizedIds.length; idx += 1) {
+      const cid = normalizedIds[idx];
+      if (!cid) continue;
+      const list = idIndices.get(cid) ?? [];
+      list.push(idx);
+      idIndices.set(cid, list);
+    }
+    const preferredOwnerIdxById = new Map<string, number>();
+    for (const [cid, indices] of idIndices) {
+      if (indices.length === 0) continue;
+      if (indices.length === 1) {
+        preferredOwnerIdxById.set(cid, indices[0] ?? 0);
+        continue;
+      }
+      const ref = this.entries.get(cid) ?? baseSnapshot?.get(cid);
+      if (!ref) {
+        preferredOwnerIdxById.set(cid, indices[0] ?? 0);
+        continue;
+      }
+      let bestIdx = indices[0] ?? 0;
+      let bestScore = -1;
+      for (const candidateIdx of indices) {
+        const parsedItem = parsedItems[candidateIdx];
+        if (!parsedItem) continue;
+        const resolved = this.resolveAgainstRef(parsedItem, ref);
+        const score =
+          (resolved.title === ref.title ? 2 : 0) +
+          (resolved.content === ref.content ? 2 : 0) +
+          (resolved.kind === ref.kind ? 1 : 0);
+        if (score > bestScore) {
+          bestScore = score;
+          bestIdx = candidateIdx;
+        }
+      }
+      preferredOwnerIdxById.set(cid, bestIdx);
+    }
+
+    // Inspect parsed items for credential/home-path redaction and perform 3-way reconciliation
+    for (let idx = 0; idx < parsedItems.length; idx += 1) {
+      const item = parsedItems[idx];
+      if (!item) continue;
       if (
         (item.id && wasTextRedacted(item.id, this.homeDir)) ||
         wasTextRedacted(item.title, this.homeDir) ||
@@ -731,75 +939,118 @@ export class MemoryVault {
         redacted = true;
       }
 
-      const candidateRawId = item.id ? sanitizeSleepText(item.id, 64, this.homeDir).replace(/\s+/g, '_') : undefined;
-      const existing =
-        candidateRawId && !claimedExistingIds.has(candidateRawId) ? this.entries.get(candidateRawId) : undefined;
+      const candidateRawId = normalizedIds[idx];
+      const isPreferredOwner =
+        candidateRawId !== undefined &&
+        !claimedExistingIds.has(candidateRawId) &&
+        preferredOwnerIdxById.get(candidateRawId) === idx;
+      const liveExisting = isPreferredOwner && candidateRawId ? this.entries.get(candidateRawId) : undefined;
+      const baseExisting = isPreferredOwner && candidateRawId ? baseSnapshot?.get(candidateRawId) : undefined;
 
-      if (existing && candidateRawId) {
+      if (candidateRawId && isPreferredOwner && (liveExisting || baseExisting)) {
+        if (!liveExisting && baseExisting) {
+          // Deleted or REM-pruned in RAM since baseSnapshot: keep only if human explicitly modified it in MEMORY.md
+          const againstBase = this.resolveAgainstRef(item, baseExisting);
+          const normalizedBaseLinks = baseExisting.links ?? [];
+          const normalizedItemLinks =
+            item.links !== undefined
+              ? [...new Set(item.links.map((l) => sanitizeSleepText(l, 64, this.homeDir)).filter(Boolean))]
+              : normalizedBaseLinks;
+          const humanEditedDeleted =
+            againstBase.kind !== baseExisting.kind ||
+            againstBase.pinned !== baseExisting.pinned ||
+            againstBase.title !== baseExisting.title ||
+            againstBase.content !== baseExisting.content ||
+            againstBase.topicKey !== baseExisting.topicKey ||
+            JSON.stringify(againstBase.tags) !== JSON.stringify(baseExisting.tags) ||
+            JSON.stringify(normalizedItemLinks) !== JSON.stringify(normalizedBaseLinks);
+          if (!humanEditedDeleted) {
+            claimedExistingIds.add(candidateRawId);
+            continue;
+          }
+          claimedExistingIds.add(candidateRawId);
+          const resurrected: MemoryEntry = {
+            ...againstBase,
+            updatedAt: now,
+            fsrs: structuredClone(baseExisting.fsrs),
+          };
+          nextMap.set(resurrected.id, resurrected);
+          rawLinksById.set(resurrected.id, item.links !== undefined ? item.links : baseExisting.links);
+          continue;
+        }
+
+        const existing = liveExisting ?? baseExisting;
+        if (!existing) continue;
         claimedExistingIds.add(candidateRawId);
 
-        let nextKind = item.kind ?? existing.kind;
-        // If user dragged a previously pinned `[旧分类] Title` block into a different unpinned H2 kind section,
-        // the old `[旧分类]` prefix came from the pinned section badge while `sectionKind` reflects the target section.
-        if (
-          existing.pinned &&
-          item.pinned === false &&
-          item.bracketKind === existing.kind &&
-          item.sectionKind &&
-          item.sectionKind !== existing.kind
-        ) {
-          nextKind = item.sectionKind;
-        }
-        const nextPinned = item.pinned ?? existing.pinned;
-        const nextTitle = sanitizeSleepText(item.title, MAX_TITLE_CHARS, this.homeDir) || existing.title;
-        const nextContent = sanitizeSleepText(item.content || nextTitle, MAX_CONTENT_CHARS, this.homeDir) || nextTitle;
+        if (liveExisting && baseExisting) {
+          const againstBase = this.resolveAgainstRef(item, baseExisting);
+          const changedKind = againstBase.kind !== baseExisting.kind;
+          const changedPinned = againstBase.pinned !== baseExisting.pinned;
+          const changedTitle = againstBase.title !== baseExisting.title;
+          const changedContent = againstBase.content !== baseExisting.content;
+          const changedTopic = againstBase.topicKey !== baseExisting.topicKey;
+          const changedTags = JSON.stringify(againstBase.tags) !== JSON.stringify(baseExisting.tags);
+          const changedAny =
+            changedKind || changedPinned || changedTitle || changedContent || changedTopic || changedTags;
 
-        const provisional = sanitizeMemoryEntry(
-          {
-            ...existing,
-            kind: nextKind,
-            pinned: nextPinned,
-            title: nextTitle,
-            content: nextContent,
-            tags: item.tags !== undefined ? item.tags : existing.tags,
-            ...(item.topicKey !== undefined
-              ? item.topicKey.trim()
-                ? { topicKey: item.topicKey }
-                : {}
-              : existing.topicKey
-                ? { topicKey: existing.topicKey }
-                : {}),
-            updatedAt: existing.updatedAt,
+          const effectiveTopic = changedTopic ? againstBase.topicKey : liveExisting.topicKey;
+          const mergedProvisional = sanitizeMemoryEntry(
+            {
+              ...liveExisting,
+              kind: changedKind ? againstBase.kind : liveExisting.kind,
+              pinned: changedPinned ? againstBase.pinned : liveExisting.pinned,
+              title: changedTitle ? againstBase.title : liveExisting.title,
+              content: changedContent ? againstBase.content : liveExisting.content,
+              tags: changedTags ? againstBase.tags : liveExisting.tags,
+              ...(effectiveTopic ? { topicKey: effectiveTopic } : {}),
+              updatedAt: changedAny ? Math.max(now, liveExisting.updatedAt) : liveExisting.updatedAt,
+              fsrs: structuredClone(liveExisting.fsrs),
+            },
+            this.homeDir,
+          );
+          if (!effectiveTopic) {
+            delete mergedProvisional.topicKey;
+          }
+          const mergedEntry: MemoryEntry = {
+            ...mergedProvisional,
+            updatedAt: changedAny ? Math.max(now, liveExisting.updatedAt) : liveExisting.updatedAt,
+            fsrs: structuredClone(liveExisting.fsrs),
+          };
+          const baseLinks = baseExisting.links ?? [];
+          const parsedLinksNorm =
+            item.links !== undefined
+              ? [...new Set(item.links.map((l) => sanitizeSleepText(l, 64, this.homeDir)).filter(Boolean))]
+              : undefined;
+          const changedLinks =
+            parsedLinksNorm !== undefined && JSON.stringify(parsedLinksNorm) !== JSON.stringify(baseLinks);
+          nextMap.set(mergedEntry.id, mergedEntry);
+          rawLinksById.set(mergedEntry.id, changedLinks ? item.links : liveExisting.links);
+        } else {
+          const provisional = this.resolveAgainstRef(item, existing);
+          const changed =
+            provisional.kind !== existing.kind ||
+            provisional.pinned !== existing.pinned ||
+            provisional.title !== existing.title ||
+            provisional.content !== existing.content ||
+            provisional.topicKey !== existing.topicKey ||
+            JSON.stringify(provisional.tags) !== JSON.stringify(existing.tags);
+
+          const mergedEntry: MemoryEntry = {
+            ...provisional,
+            updatedAt: changed ? now : existing.updatedAt,
             fsrs: structuredClone(existing.fsrs),
-          },
-          this.homeDir,
-        );
-
-        const changed =
-          provisional.kind !== existing.kind ||
-          provisional.pinned !== existing.pinned ||
-          provisional.title !== existing.title ||
-          provisional.content !== existing.content ||
-          provisional.topicKey !== existing.topicKey ||
-          JSON.stringify(provisional.tags) !== JSON.stringify(existing.tags);
-
-        const mergedEntry: MemoryEntry = changed
-          ? {
-              ...provisional,
-              updatedAt: now,
-              fsrs: structuredClone(existing.fsrs),
-            }
-          : {
-              ...provisional,
-              updatedAt: existing.updatedAt,
-              fsrs: structuredClone(existing.fsrs),
-            };
-
-        nextMap.set(mergedEntry.id, mergedEntry);
-        rawLinksById.set(mergedEntry.id, item.links !== undefined ? item.links : existing.links);
+          };
+          nextMap.set(mergedEntry.id, mergedEntry);
+          rawLinksById.set(mergedEntry.id, item.links !== undefined ? item.links : existing.links);
+        }
       } else {
         const assignedId =
-          candidateRawId && !nextMap.has(candidateRawId) && !claimedExistingIds.has(candidateRawId)
+          candidateRawId &&
+          !nextMap.has(candidateRawId) &&
+          !claimedExistingIds.has(candidateRawId) &&
+          !this.entries.has(candidateRawId) &&
+          !baseSnapshot?.has(candidateRawId)
             ? candidateRawId
             : `mem_${randomUUID().slice(0, 12)}`;
         const nextKind: MemoryKind = item.kind ?? 'episode';
@@ -825,6 +1076,17 @@ export class MemoryVault {
         );
         nextMap.set(created.id, created);
         rawLinksById.set(created.id, item.links);
+      }
+    }
+
+    // Preserve concurrent in-RAM / background-consolidated entries that did not exist in baseSnapshot
+    if (baseSnapshot !== undefined) {
+      for (const [liveId, liveEntry] of this.entries) {
+        if (!baseSnapshot.has(liveId) && !nextMap.has(liveId)) {
+          const preserved = structuredClone(liveEntry);
+          nextMap.set(liveId, preserved);
+          rawLinksById.set(liveId, preserved.links);
+        }
       }
     }
 
@@ -900,6 +1162,8 @@ export class MemoryVault {
     this.journal = [];
     this.lastFlushedMarkdown = undefined;
     this.lastObservedDiskMarkdown = undefined;
+    this.lastFlushedSnapshot = undefined;
+    this.snapshotsByMdHash.clear();
     this.needsFlushFromExternalMarkdown = false;
     let redactedOnLoad = false;
     let rawJsonl = '';
@@ -979,16 +1243,17 @@ export class MemoryVault {
       } else if (syncInfo.jsonlMatchesFooter) {
         this.lastFlushedMarkdown = rawMd;
         this.lastObservedDiskMarkdown = rawMd;
+        this.recordFlushedSnapshot(rawMd, this.entries.values());
       } else {
         // MEMORY.md matches its own asi-sleep footer, while memories.jsonl differs (or does not exist).
-        // Check if MEMORY.md was explicitly replaced more recently than memories.jsonl, or if memories.jsonl is absent.
+        // Check if MEMORY.md was explicitly replaced at or after memories.jsonl, or if memories.jsonl is absent.
         let mdNewerThanJsonl = !hasJsonlFile;
         if (hasJsonlFile) {
           const [mdStat, jsonlStat] = await Promise.all([
             stat(this.markdownPath).catch(() => undefined),
             stat(this.memoriesJsonlPath).catch(() => undefined),
           ]);
-          if (mdStat && jsonlStat && mdStat.mtimeMs > jsonlStat.mtimeMs + 10) {
+          if (mdStat && jsonlStat && mdStat.mtimeMs >= jsonlStat.mtimeMs) {
             mdNewerThanJsonl = true;
           }
         }
@@ -1009,6 +1274,10 @@ export class MemoryVault {
 
     if (shouldFlush) {
       await this.flush(now);
+    } else if (this.lastFlushedSnapshot === undefined) {
+      this.lastFlushedSnapshot = new Map(
+        [...this.entries.entries()].map(([id, entry]) => [id, structuredClone(entry)]),
+      );
     }
     return { redactedOnLoad };
   }
@@ -1112,6 +1381,7 @@ export class MemoryVault {
         ]);
         this.lastFlushedMarkdown = mdBody;
         this.lastObservedDiskMarkdown = mdBody;
+        this.recordFlushedSnapshot(mdBody, sorted);
         this.needsFlushFromExternalMarkdown = false;
       } finally {
         this.pendingFlushMarkdown = undefined;

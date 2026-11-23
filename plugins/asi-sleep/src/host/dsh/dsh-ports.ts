@@ -233,6 +233,7 @@ export function createDshSleepPorts(ctx: Context, storageRoot: string, options?:
   const turnFirstSeenAt = new Map<string, number>();
   const coldSessionTurns = new Map<string, ConversationTurnInput[]>();
   const coldSessionRoutes = new Map<string, { provider: string; model: string; createdAt: number }>();
+  const inspectedColdRouteSessionIds = new Set<string>();
   const sessionTitles = new Map<string, string>();
 
   const getWorkspaceRegistry = (): WorkspaceRegistry | undefined =>
@@ -462,6 +463,7 @@ export function createDshSleepPorts(ctx: Context, storageRoot: string, options?:
           }
           const logSnap = await sq.readSession(rec.header.id as SessionId);
           if (signal.aborted) return;
+          inspectedColdRouteSessionIds.add(sid);
           const recordedRoute = extractRouteFromEvents(logSnap.events);
           if (recordedRoute) {
             coldSessionRoutes.set(sid, {
@@ -490,7 +492,24 @@ export function createDshSleepPorts(ctx: Context, storageRoot: string, options?:
     },
   };
 
-  const resolveLlmRoute = async (signal: AbortSignal): Promise<{ provider: string; model: string } | undefined> => {
+  const ROUTE_FALLBACK_FAILURE_CODES = new Set([
+    'NO_ADAPTER',
+    'MISSING_CREDENTIAL',
+    'INVALID_CREDENTIAL',
+    'AUTH',
+    'INVALID_REQUEST',
+    'UNSUPPORTED_REASONING_EFFORT',
+    'INVALID_MODEL_INFO',
+    'INVALID_MODEL_CONTEXT',
+    'INVALID_MODEL_MAX_TOKENS',
+    'INVALID_MODEL_REASONING',
+    'REGISTRATION_DISPOSED',
+  ]);
+
+  const collectSyncCandidateRoutes = (): {
+    usable: Array<{ provider: string; model: string }>;
+    unverified: Array<{ provider: string; model: string }>;
+  } => {
     const registeredProviders =
       typeof ctx.llm?.listProviders === 'function'
         ? new Set(
@@ -500,23 +519,28 @@ export function createDshSleepPorts(ctx: Context, storageRoot: string, options?:
     const isProviderUsable = (provider: string): boolean =>
       registeredProviders.size === 0 || registeredProviders.has(provider);
 
-    let unverifiedFallbackRoute: { provider: string; model: string } | undefined;
-    const acceptOrRemember = (
-      cand: { provider?: unknown; model?: unknown } | undefined,
-    ): { provider: string; model: string } | undefined => {
+    const usable: Array<{ provider: string; model: string }> = [];
+    const unverified: Array<{ provider: string; model: string }> = [];
+    const seen = new Set<string>();
+
+    const recordCandidate = (cand: { provider?: unknown; model?: unknown } | undefined): void => {
       const provider = typeof cand?.provider === 'string' ? cand.provider.trim() : '';
       const model = typeof cand?.model === 'string' ? cand.model.trim() : '';
-      if (!provider || !model) return undefined;
-      if (isProviderUsable(provider)) return { provider, model };
-      if (!unverifiedFallbackRoute) unverifiedFallbackRoute = { provider, model };
-      return undefined;
+      if (!provider || !model) return;
+      const key = `${provider}\0${model}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+      if (isProviderUsable(provider)) {
+        usable.push({ provider, model });
+      } else {
+        unverified.push({ provider, model });
+      }
     };
 
     // 1. Live ordinary Agent current model selection
     for (const agent of ctx.agents?.list() ?? []) {
       if (!isOrdinaryAgent(agent)) continue;
-      const hit = acceptOrRemember(agent.model?.current?.());
-      if (hit) return hit;
+      recordCandidate(agent.model?.current?.());
     }
 
     // Collect live ordinary Sessions ordered newest first
@@ -548,8 +572,7 @@ export function createDshSleepPorts(ctx: Context, storageRoot: string, options?:
                 lastUsed?: { provider?: unknown; model?: unknown } | null;
               }
             | undefined;
-          const hit = acceptOrRemember(ms?.next ?? ms?.lastUsed ?? undefined);
-          if (hit) return hit;
+          recordCandidate(ms?.next ?? ms?.lastUsed ?? undefined);
         } catch {
           // Ignore projection snapshot errors on mock sessions
         }
@@ -565,55 +588,89 @@ export function createDshSleepPorts(ctx: Context, storageRoot: string, options?:
             : typeof session.ownEvents === 'function'
               ? session.ownEvents()
               : [];
-        const hit = acceptOrRemember(extractRouteFromEvents(events));
-        if (hit) return hit;
+        recordCandidate(extractRouteFromEvents(events));
+        const liveHeaderCfg = (
+          session as Session & { requestHeader?: () => { config?: unknown } | undefined }
+        ).requestHeader?.()?.config as { provider?: unknown; model?: unknown } | undefined;
+        recordCandidate(liveHeaderCfg);
       } catch {
         // Ignore session event read errors
       }
     }
 
-    // 4. Cold persisted ordinary Sessions (`ctx.sessionQuery`)
-    const checkCachedColdRoutes = (): { provider: string; model: string } | undefined => {
-      const entries = [...coldSessionRoutes.entries()].sort((a, b) => b[1].createdAt - a[1].createdAt);
-      for (const [sid, info] of entries) {
-        if (isArchived(sid)) {
-          coldSessionRoutes.delete(sid);
-          continue;
-        }
-        const hit = acceptOrRemember(info);
-        if (hit) return hit;
+    // 4a. Already-cached cold persisted ordinary Session routes
+    const cachedEntries = [...coldSessionRoutes.entries()].sort((a, b) => b[1].createdAt - a[1].createdAt);
+    for (const [sid, info] of cachedEntries) {
+      if (isArchived(sid)) {
+        coldSessionRoutes.delete(sid);
+        continue;
       }
-      return undefined;
+      recordCandidate(info);
+    }
+
+    return { usable, unverified };
+  };
+
+  const collectAsyncFallbackRoutes = async (
+    signal: AbortSignal,
+    alreadyTried: ReadonlySet<string>,
+    syncUnverified: ReadonlyArray<{ provider: string; model: string }>,
+  ): Promise<Array<{ provider: string; model: string }>> => {
+    const registeredProviders =
+      typeof ctx.llm?.listProviders === 'function'
+        ? new Set(
+            (ctx.llm.listProviders() ?? []).map((p) => (typeof p?.id === 'string' ? p.id.trim() : '')).filter(Boolean),
+          )
+        : new Set<string>();
+    const isProviderUsable = (provider: string): boolean =>
+      registeredProviders.size === 0 || registeredProviders.has(provider);
+
+    const usable: Array<{ provider: string; model: string }> = [];
+    const unverified: Array<{ provider: string; model: string }> = [...syncUnverified];
+    const seen = new Set<string>(alreadyTried);
+    for (const u of unverified) seen.add(`${u.provider}\0${u.model}`);
+
+    const recordAsyncCandidate = (cand: { provider?: unknown; model?: unknown } | undefined): void => {
+      const provider = typeof cand?.provider === 'string' ? cand.provider.trim() : '';
+      const model = typeof cand?.model === 'string' ? cand.model.trim() : '';
+      if (!provider || !model) return;
+      const key = `${provider}\0${model}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+      if (isProviderUsable(provider)) {
+        usable.push({ provider, model });
+      } else {
+        unverified.push({ provider, model });
+      }
     };
 
-    const cachedColdHit = checkCachedColdRoutes();
-    if (cachedColdHit) return cachedColdHit;
-
+    // 4b. Uncached cold persisted ordinary Sessions (`ctx.sessionQuery`) — never blocked by earlier stale cache entries
     const sq = getSessionQuery();
-    if (
-      coldSessionRoutes.size === 0 &&
-      sq &&
-      typeof sq.listSessions === 'function' &&
-      typeof sq.readSession === 'function'
-    ) {
+    if (sq && typeof sq.listSessions === 'function' && typeof sq.readSession === 'function') {
       try {
         const records = await sq.listSessions(signal);
         let inspected = 0;
         for (const rec of records) {
-          if (signal.aborted || inspected >= 10) break;
+          if (signal.aborted || inspected >= 15) break;
           const sid = String(rec.header.id);
           if (isArchived(sid) || !isOrdinaryDshSession({ id: rec.header.id, header: rec.header }, excludedRoots)) {
             continue;
           }
+          const cached = coldSessionRoutes.get(sid);
+          if (cached) {
+            recordAsyncCandidate(cached);
+            continue;
+          }
+          if (inspectedColdRouteSessionIds.has(sid)) continue;
           inspected += 1;
           try {
             const logSnap = await sq.readSession(rec.header.id as SessionId);
-            if (signal.aborted) return undefined;
+            if (signal.aborted) return [];
+            inspectedColdRouteSessionIds.add(sid);
             const found = extractRouteFromEvents(logSnap.events);
             if (found) {
               coldSessionRoutes.set(sid, { ...found, createdAt: logSnap.session.createdAt || 0 });
-              const hit = acceptOrRemember(found);
-              if (hit) return hit;
+              recordAsyncCandidate(found);
             }
           } catch {
             // Isolate cold-session read errors
@@ -627,91 +684,148 @@ export function createDshSleepPorts(ctx: Context, storageRoot: string, options?:
     // 5. Registered `ctx.llm` providers & advertised models
     if (typeof ctx.llm?.listProviders === 'function' && typeof ctx.llm?.listModels === 'function') {
       for (const prov of ctx.llm.listProviders() ?? []) {
-        if (signal.aborted) return undefined;
+        if (signal.aborted) return [];
         const providerId = typeof prov?.id === 'string' ? prov.id.trim() : '';
         if (!providerId) continue;
         const models = await ctx.llm.listModels(providerId).catch(() => []);
-        if (signal.aborted) return undefined;
+        if (signal.aborted) return [];
         for (const m of models ?? []) {
           const modelId = typeof m?.id === 'string' ? m.id.trim() : '';
           if (modelId) {
-            return { provider: providerId, model: modelId };
+            const key = `${providerId}\0${modelId}`;
+            if (!seen.has(key)) {
+              seen.add(key);
+              usable.push({ provider: providerId, model: modelId });
+            }
+            break;
           }
         }
       }
     }
 
-    return unverifiedFallbackRoute;
+    for (const u of unverified) {
+      const key = `${u.provider}\0${u.model}`;
+      if (!alreadyTried.has(key)) {
+        usable.push(u);
+      }
+    }
+    return usable;
+  };
+
+  type StreamAttemptResult =
+    | { status: 'ok'; text: string | undefined }
+    | { status: 'aborted' }
+    | { status: 'route-error' }
+    | { status: 'failed' };
+
+  const runStreamOnce = async (
+    route: { provider: string; model: string },
+    prompt: string,
+    signal: AbortSignal,
+  ): Promise<StreamAttemptResult> => {
+    let onAbort: (() => void) | undefined;
+    const abortPromise = new Promise<'aborted'>((resolve) => {
+      if (signal.aborted) {
+        resolve('aborted');
+        return;
+      }
+      onAbort = () => resolve('aborted');
+      signal.addEventListener('abort', onAbort, { once: true });
+    });
+
+    const consumePromise = (async (): Promise<StreamAttemptResult> => {
+      try {
+        let text = '';
+        const deltaBlockIndices = new Set<number>();
+        // Omit both `temperature` and hardcoded `maxTokens` so reasoning models (DeepSeek Reasoner,
+        // OpenAI o-series, etc.) use route-native sampling defaults and DSH's `LlmRuntime` materializes
+        // each exact model's `defaultMaxTokens` without starving chain-of-thought reasoning blocks.
+        const stream = ctx.llm.stream({
+          provider: route.provider,
+          model: route.model,
+          system: 'You extract concise structured JSON memories and never output secrets.',
+          messages: [{ role: 'user', content: [{ type: 'text', text: prompt }] }],
+          signal,
+        });
+        for await (const chunk of stream) {
+          if (signal.aborted) return { status: 'aborted' };
+          if (chunk.type === 'text-delta') {
+            deltaBlockIndices.add(chunk.index);
+            text += chunk.text;
+          } else if (
+            chunk.type === 'block-end' &&
+            chunk.block?.type === 'text' &&
+            !deltaBlockIndices.has(chunk.index)
+          ) {
+            text += chunk.block.text;
+          } else if (chunk.type === 'finish') {
+            if (chunk.reason.kind === 'aborted') {
+              return { status: 'aborted' };
+            }
+            if (chunk.reason.kind === 'error') {
+              const errCode = (chunk.reason as { failure?: { code?: unknown } }).failure?.code;
+              if (typeof errCode === 'string' && ROUTE_FALLBACK_FAILURE_CODES.has(errCode)) {
+                return { status: 'route-error' };
+              }
+              return { status: 'failed' };
+            }
+          }
+        }
+        return { status: 'ok', text: text.trim() || undefined };
+      } catch (err) {
+        const errCode = (err as { code?: unknown } | undefined)?.code;
+        if (typeof errCode === 'string' && ROUTE_FALLBACK_FAILURE_CODES.has(errCode)) {
+          return { status: 'route-error' };
+        }
+        return { status: 'failed' };
+      }
+    })();
+
+    try {
+      const raced = await Promise.race([consumePromise, abortPromise]);
+      if (raced === 'aborted') {
+        void consumePromise.catch(() => undefined);
+        return { status: 'aborted' };
+      }
+      return raced;
+    } finally {
+      if (onAbort) signal.removeEventListener('abort', onAbort);
+    }
   };
 
   const llmExtract = async (prompt: string, signal: AbortSignal): Promise<string | undefined> => {
     if (!ctx.llm || typeof ctx.llm.stream !== 'function' || signal.aborted) return undefined;
-    const route = await resolveLlmRoute(signal);
-    if (!route || signal.aborted) return undefined;
 
-    const runStream = async (): Promise<string | undefined> => {
-      let onAbort: (() => void) | undefined;
-      const abortPromise = new Promise<'aborted'>((resolve) => {
-        if (signal.aborted) {
-          resolve('aborted');
-          return;
-        }
-        onAbort = () => resolve('aborted');
-        signal.addEventListener('abort', onAbort, { once: true });
-      });
+    const executeWithFallback = async (): Promise<string | undefined> => {
+      const tried = new Set<string>();
+      const syncRoutes = collectSyncCandidateRoutes();
 
-      const consumePromise = (async (): Promise<string | undefined> => {
-        try {
-          let text = '';
-          const deltaBlockIndices = new Set<number>();
-          // Omit `temperature` so reasoning models (DeepSeek Reasoner, o-series, etc.)
-          // use route-native defaults and never reject with unsupported-parameter finish errors;
-          // provide 4,096 maxTokens headroom so reasoning blocks do not starve the JSON output.
-          const stream = ctx.llm.stream({
-            provider: route.provider,
-            model: route.model,
-            system: 'You extract concise structured JSON memories and never output secrets.',
-            messages: [{ role: 'user', content: [{ type: 'text', text: prompt }] }],
-            maxTokens: 4_096,
-            signal,
-          });
-          for await (const chunk of stream) {
-            if (signal.aborted) break;
-            if (chunk.type === 'text-delta') {
-              deltaBlockIndices.add(chunk.index);
-              text += chunk.text;
-            } else if (
-              chunk.type === 'block-end' &&
-              chunk.block?.type === 'text' &&
-              !deltaBlockIndices.has(chunk.index)
-            ) {
-              text += chunk.block.text;
-            } else if (chunk.type === 'finish' && (chunk.reason.kind === 'error' || chunk.reason.kind === 'aborted')) {
-              return undefined;
-            }
-          }
-          return text.trim() || undefined;
-        } catch {
-          return undefined;
-        }
-      })();
-
-      try {
-        const raced = await Promise.race([consumePromise, abortPromise]);
-        if (raced === 'aborted') {
-          void consumePromise.catch(() => undefined);
-          return undefined;
-        }
-        return raced;
-      } finally {
-        if (onAbort) signal.removeEventListener('abort', onAbort);
+      for (const route of syncRoutes.usable.slice(0, 4)) {
+        if (signal.aborted) return undefined;
+        tried.add(`${route.provider}\0${route.model}`);
+        const res = await runStreamOnce(route, prompt, signal);
+        if (res.status === 'ok') return res.text;
+        if (res.status === 'aborted' || res.status === 'failed') return undefined;
       }
+
+      if (signal.aborted) return undefined;
+      const asyncRoutes = await collectAsyncFallbackRoutes(signal, tried, syncRoutes.unverified);
+      for (const route of asyncRoutes.slice(0, 4)) {
+        if (signal.aborted) return undefined;
+        const key = `${route.provider}\0${route.model}`;
+        if (tried.has(key)) continue;
+        tried.add(key);
+        const res = await runStreamOnce(route, prompt, signal);
+        if (res.status === 'ok') return res.text;
+        if (res.status === 'aborted' || res.status === 'failed') return undefined;
+      }
+      return undefined;
     };
 
     if (typeof ctx.agents?.withoutInitiator === 'function') {
-      return ctx.agents.withoutInitiator(runStream);
+      return ctx.agents.withoutInitiator(executeWithFallback);
     }
-    return runStream();
+    return executeWithFallback();
   };
 
   return {
