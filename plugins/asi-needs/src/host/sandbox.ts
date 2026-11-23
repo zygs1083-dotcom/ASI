@@ -105,6 +105,63 @@ async function measureAndCleanDir(
   return { deletedEntries, freedBytes, skippedSymlinks };
 }
 
+export interface CacheInspectResult {
+  totalBytes: number;
+  reclaimableBytes: number;
+  entryCount: number;
+  rootsChecked: number;
+}
+
+async function inspectDirBytes(
+  rootReal: string,
+  currentDir: string,
+): Promise<{ totalBytes: number; entryCount: number }> {
+  let totalBytes = 0;
+  let entryCount = 0;
+  const entries = await readdir(currentDir, { withFileTypes: true }).catch(() => []);
+  for (const entry of entries) {
+    const full = join(currentDir, entry.name);
+    const st = await lstat(full).catch(() => undefined);
+    if (!st || st.isSymbolicLink()) continue;
+    const real = await realpath(full).catch(() => undefined);
+    if (!real || !isStrictlyInside(rootReal, real)) continue;
+    if (st.isDirectory()) {
+      const sub = await inspectDirBytes(rootReal, real);
+      totalBytes += sub.totalBytes;
+      entryCount += sub.entryCount;
+    } else if (st.isFile()) {
+      totalBytes += st.size;
+      entryCount += 1;
+    }
+  }
+  return { totalBytes, entryCount };
+}
+
+export async function inspectSafeCaches(options: {
+  needsStorageRoot: string;
+  senseStorageRoot?: string;
+}): Promise<CacheInspectResult> {
+  const candidateRoots = [
+    join(options.needsStorageRoot, 'tmp'),
+    join(options.needsStorageRoot, 'cache'),
+    ...(options.senseStorageRoot ? [join(options.senseStorageRoot, 'tmp')] : []),
+  ];
+  let totalBytes = 0;
+  let entryCount = 0;
+  let rootsChecked = 0;
+  for (const dir of candidateRoots) {
+    const st = await lstat(dir).catch(() => undefined);
+    if (!st || st.isSymbolicLink() || !st.isDirectory()) continue;
+    const rootReal = await realpath(dir).catch(() => undefined);
+    if (!rootReal) continue;
+    rootsChecked += 1;
+    const sub = await inspectDirBytes(rootReal, rootReal);
+    totalBytes += sub.totalBytes;
+    entryCount += sub.entryCount;
+  }
+  return { totalBytes, reclaimableBytes: totalBytes, entryCount, rootsChecked };
+}
+
 export async function cleanSafeCaches(options: {
   needsStorageRoot: string;
   senseStorageRoot?: string;
@@ -244,8 +301,13 @@ export function upsertHelpCard(
   const summary = cleanText(input.summary, 280) || '自维护已触及安全或物理边界，请查看侧栏处理。';
   const proposedAction = input.proposedAction ? cleanText(input.proposedAction, 200) : undefined;
 
+  const normalizedTarget = input.actionTarget ? cleanText(input.actionTarget, 64) : undefined;
   const matchIdx = existing.findIndex(
-    (c) => c.status === 'open' && c.need === input.need && c.actionKind === actionKind,
+    (c) =>
+      c.status === 'open' &&
+      c.need === input.need &&
+      c.actionKind === actionKind &&
+      (c.actionTarget ?? '') === (normalizedTarget ?? ''),
   );
   const prev = matchIdx >= 0 ? existing[matchIdx] : undefined;
   if (prev) {
@@ -255,6 +317,7 @@ export function upsertHelpCard(
       title,
       summary,
       ...(proposedAction ? { proposedAction } : {}),
+      ...(normalizedTarget ? { actionTarget: normalizedTarget } : {}),
       updatedAt: input.now,
     };
     const next = [...existing];
@@ -270,7 +333,7 @@ export function upsertHelpCard(
     summary,
     ...(proposedAction ? { proposedAction } : {}),
     actionKind,
-    ...(input.actionTarget ? { actionTarget: cleanText(input.actionTarget, 64) } : {}),
+    ...(normalizedTarget ? { actionTarget: normalizedTarget } : {}),
     status: 'open',
     createdAt: input.now,
     updatedAt: input.now,

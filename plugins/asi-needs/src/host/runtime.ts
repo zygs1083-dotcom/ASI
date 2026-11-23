@@ -3,6 +3,9 @@ import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { performance } from 'node:perf_hooks';
 import {
+  type ActionMeasurement,
+  type AsiDrivesServiceApi,
+  type DriveSandboxToolResult,
   type HelpActionKind,
   type HelpCard,
   type MaintenanceOutcome,
@@ -14,11 +17,38 @@ import {
   type SenseSnapshot,
   sanitizeForModel,
 } from '@asi/sense-types';
+import {
+  ActionOutcomeLedger,
+  buildActionMeasurement,
+  computeDriveEnvFingerprint,
+  EpisodeCircuitBreaker,
+  type PersistedCircuitBreakerEntry,
+  primaryDiskFreeBytes,
+} from './action-memory.js';
+import {
+  CLEANABLE_EXTERNAL_CACHE_IDS,
+  cleanExternalCacheTarget,
+  EXTERNAL_CACHE_ACTIVE_PROTECTION_MS,
+  type ExternalCacheScanReport,
+  getCleanableExternalCacheRule,
+  isCleanableExternalCacheId,
+  scanExternalCachesAndTrash,
+  TRASH_READONLY_RULE,
+} from './cache-catalog.js';
 import { chooseCryDeliveryMode, formatCryMessage } from './cry.js';
+import { MaslowDriveArbiter, type RegisteredSandboxTool } from './drives.js';
 import { evaluateNeeds, NEED_LABELS, type PreviousNeedState } from './evaluator.js';
 import { InstinctController } from './instinct.js';
 import type { NeedsHostPorts } from './ports.js';
-import { cleanSafeCaches, compactIdleContexts, findStuckJobs, stopStuckJobs, upsertHelpCard } from './sandbox.js';
+import { sampleTopProcesses, type TopProcessesReport } from './process-top.js';
+import {
+  cleanSafeCaches,
+  compactIdleContexts,
+  findStuckJobs,
+  inspectSafeCaches,
+  stopStuckJobs,
+  upsertHelpCard,
+} from './sandbox.js';
 
 const AUTONOMOUS_COOLDOWN_MS = 120_000;
 const MAX_AUTONOMOUS_TURNS_PER_HOUR = 6;
@@ -40,13 +70,37 @@ interface PersistedNeedsState {
   maintTotalTurns?: number;
   maintLastRunAt?: number;
   internalSessionIds?: string[];
+  actionLedger?: NeedsSnapshot['actionLedger'];
+  circuitBreakers?: PersistedCircuitBreakerEntry[];
+}
+
+export interface SniffCausesReport {
+  scannedAt: number;
+  activeProtectionWindowMs: number;
+  asiInternalCache: {
+    totalBytes: number;
+    reclaimableBytes: number;
+    entryCount: number;
+  };
+  externalCaches: ExternalCacheScanReport['externalCaches'];
+  trash: ExternalCacheScanReport['trash'];
+  topProcesses: TopProcessesReport;
+  truncated: boolean;
 }
 
 export interface MaintenanceToolsApi {
   statusSnapshot(): NeedsSnapshot;
-  cleanCache(): Promise<{ deletedEntries: number; freedBytes: number; summary: string }>;
-  stopStuckJob(jobId?: string): Promise<{ stoppedIds: string[]; refusedActiveIds: string[]; summary: string }>;
-  compactContext(): Promise<{ compactedSessions: number; tokensSaved: number; summary: string }>;
+  sniffCauses(): Promise<SniffCausesReport>;
+  cleanCache(): Promise<{ deletedEntries: number; freedBytes: number; summary: string; gain: ActionMeasurement }>;
+  stopStuckJob(
+    jobId?: string,
+  ): Promise<{ stoppedIds: string[]; refusedActiveIds: string[]; summary: string; gain: ActionMeasurement }>;
+  compactContext(): Promise<{
+    compactedSessions: number;
+    tokensSaved: number;
+    summary: string;
+    gain: ActionMeasurement;
+  }>;
   requestHelp(input: {
     need: NeedKey;
     severity?: 'uncomfortable' | 'critical';
@@ -54,6 +108,7 @@ export interface MaintenanceToolsApi {
     summary: string;
     proposedAction?: string;
     actionKind?: HelpActionKind;
+    actionTarget?: string;
   }): Promise<{ card: HelpCard; deliveredCry: boolean }>;
 }
 
@@ -65,6 +120,17 @@ export interface NeedsActions {
   dismissHelp(cardId: string): Promise<void>;
   openMaintenanceSession(): Promise<string>;
   triggerCheck(): Promise<void>;
+}
+
+export interface NeedsDrivesRuntimeApi extends AsiDrivesServiceApi {
+  onToolsStructureChanged(listener: () => void): () => void;
+  registeredSandboxTools(): RegisteredSandboxTool[];
+  checkSandboxToolGuard(toolName: string): { allowed: boolean; reason?: string };
+  executeSandboxTool(
+    tool: RegisteredSandboxTool,
+    args: Record<string, unknown>,
+    signal: AbortSignal,
+  ): Promise<DriveSandboxToolResult & { gain: ActionMeasurement }>;
 }
 
 export interface NeedsRuntime {
@@ -80,14 +146,56 @@ export interface NeedsRuntime {
   reportTransportResult(reachable: boolean, errorText?: string): void;
   readonly tools: MaintenanceToolsApi;
   readonly actions: NeedsActions;
+  readonly drives?: NeedsDrivesRuntimeApi;
 }
 
-export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime {
+function formatHumanBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes <= 0) return '0 B';
+  if (bytes >= 1024 ** 3) return `${(bytes / 1024 ** 3).toFixed(2)} GB`;
+  if (bytes >= 1024 ** 2) return `${(bytes / 1024 ** 2).toFixed(1)} MB`;
+  if (bytes >= 1024) return `${Math.round(bytes / 1024)} KB`;
+  return `${Math.round(bytes)} B`;
+}
+
+function hasPathCharacters(value: string): boolean {
+  return value.includes('/') || value.includes('\\') || value.includes('..') || value.includes('\0');
+}
+
+export function validateHelpActionTarget(
+  actionKind: HelpActionKind,
+  actionTarget: string | undefined,
+): string | undefined {
+  if (actionKind === 'clean-external-cache') {
+    if (!actionTarget || hasPathCharacters(actionTarget) || !isCleanableExternalCacheId(actionTarget)) {
+      throw new Error(
+        `clean-external-cache requires a whitelisted targetId (${CLEANABLE_EXTERNAL_CACHE_IDS.join(', ')})`,
+      );
+    }
+    return actionTarget;
+  }
+  if (actionTarget === undefined || actionTarget === '') {
+    return undefined;
+  }
+  const trimmed = actionTarget.trim();
+  if (!trimmed) return undefined;
+  if (hasPathCharacters(trimmed)) {
+    throw new Error('Arbitrary filesystem paths are forbidden in actionTarget');
+  }
+  if (trimmed === TRASH_READONLY_RULE.id) {
+    throw new Error('Trash target is strictly read-only and cannot be attached to an action card');
+  }
+  return trimmed;
+}
+
+export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime & { readonly drives: NeedsDrivesRuntimeApi } {
   const clock = ports.clock ?? { wall: () => Date.now(), mono: () => performance.now() };
   const statePath = join(ports.storageRoot, 'state.json');
   const sandboxDir = join(ports.storageRoot, 'sandbox');
 
   const instinct = new InstinctController(ports.sense, ports.probeEndpoint);
+  const actionLedger = new ActionOutcomeLedger();
+  const circuitBreaker = new EpisodeCircuitBreaker();
+
   const listeners = new Set<() => void>();
   const internalSessions = new Map<string, () => void>();
   const criedEpisodeSeverity = new Map<NeedKey, EpisodeSeverity>();
@@ -98,6 +206,7 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime {
   let records: MaintenanceRecord[] = [];
   let previousStates: Partial<Record<NeedKey, PreviousNeedState>> = {};
   const escalatedCriticalInTurn = new Set<NeedKey>();
+  const activeTurnEffectiveNeeds = new Set<string>();
 
   let maintSessionId: string | undefined;
   let maintStatus: MaintenanceSessionStatus['status'] = 'not-created';
@@ -108,13 +217,6 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime {
   let rotateMaintainerNext = false;
   let pendingMaintenanceRecheck = false;
 
-  let latestSense: SenseSnapshot = ports.sense.snapshot();
-  let latestEval = evaluateNeeds({
-    snapshot: latestSense,
-    modelConnectivity: instinct.modelConnectivity(),
-    stuckJobCount: 0,
-  });
-
   let started = false;
   let stopped = false;
   let unsubscribeSense: (() => void) | undefined;
@@ -122,6 +224,24 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime {
   let turnAbort = new AbortController();
   let persistChain: Promise<void> = Promise.resolve();
   let reconcileInFlight: Promise<void> | undefined;
+
+  const arbiter = new MaslowDriveArbiter(() => {
+    if (started && !stopped) {
+      void scheduleProcess(ports.sense.snapshot());
+    }
+  });
+
+  let latestSense: SenseSnapshot = ports.sense.snapshot();
+  let latestEval = evaluateNeeds({
+    snapshot: latestSense,
+    modelConnectivity: instinct.modelConnectivity(),
+    stuckJobCount: 0,
+  });
+  let latestHigherOrder = arbiter.reconcile({
+    sense: latestSense,
+    l1Needs: latestEval.needs,
+    powerMode: latestSense.settings.powerMode,
+  });
 
   function notify(): void {
     if (stopped) return;
@@ -146,6 +266,8 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime {
       maintTotalTurns,
       ...(maintLastRunAt !== undefined ? { maintLastRunAt } : {}),
       internalSessionIds: [...internalSessions.keys()].slice(-20),
+      actionLedger: actionLedger.entries(),
+      circuitBreakers: circuitBreaker.serialize(),
     };
     persistChain = persistChain
       .then(async () => {
@@ -164,9 +286,11 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime {
       at: entry.at ?? clock.wall(),
       actor: entry.actor,
       ...(entry.need ? { need: entry.need } : {}),
+      ...(entry.driveKey ? { driveKey: entry.driveKey } : {}),
       action: entry.action,
       summary: entry.summary,
       outcome: entry.outcome,
+      ...(entry.gain ? { gain: entry.gain } : {}),
     };
     records = [rec, ...records].slice(0, MAX_RECORDS);
     void persistState();
@@ -194,6 +318,33 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime {
 
   function isCrySuppressed(need: NeedKey, severity: EpisodeSeverity): boolean {
     return isSeveritySuppressed(criedEpisodeSeverity.get(need), severity);
+  }
+
+  function currentIdleSessionCount(): number {
+    try {
+      return ports.compaction.listIdleSessionIds(new Set(internalSessions.keys())).length;
+    } catch {
+      return 0;
+    }
+  }
+
+  function fingerprintForDrive(
+    key: string,
+    snap: SenseSnapshot,
+    ev: {
+      zone: NeedKey extends never ? never : 'comfortable' | 'uncomfortable' | 'critical';
+      satisfaction: number;
+      evidence: Record<string, string | number | boolean | null>;
+    },
+    stuckCount?: number,
+  ): string {
+    return computeDriveEnvFingerprint({
+      key,
+      snapshot: snap,
+      evaluation: ev,
+      stuckJobCount: stuckCount ?? findStuckJobs(ports.jobs, snap.now).length,
+      idleSessionCount: currentIdleSessionCount(),
+    });
   }
 
   async function ensureMaintenanceSession(forceRotate = false): Promise<string> {
@@ -289,26 +440,70 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime {
     summary: string;
     proposedAction?: string;
     actionKind?: HelpActionKind;
+    actionTarget?: string;
   }): Promise<{ card: HelpCard; deliveredCry: boolean }> {
     const now = clock.wall();
     const actionKind: HelpActionKind = input.actionKind ?? 'acknowledge';
+    const validatedTarget = validateHelpActionTarget(actionKind, input.actionTarget);
+
+    let enrichedSummary = input.summary;
+    let enrichedProposedAction = input.proposedAction;
+
+    if (actionKind === 'clean-external-cache' && validatedTarget && ports.homeDir) {
+      const scan = await scanExternalCachesAndTrash({
+        homeDir: ports.homeDir,
+        now,
+        activeProtectionMs: EXTERNAL_CACHE_ACTIVE_PROTECTION_MS,
+      }).catch(() => undefined);
+      const matched = scan?.externalCaches.find((c) => c.targetId === validatedTarget);
+      const rule = getCleanableExternalCacheRule(validatedTarget);
+      if (matched) {
+        const sizeBadge = `（总计 ${formatHumanBytes(matched.totalBytes)}，超 1h 可清理 ${formatHumanBytes(matched.reclaimableBytes)}，风险分级 ${matched.risk}）`;
+        if (!enrichedSummary.includes(formatHumanBytes(matched.reclaimableBytes))) {
+          enrichedSummary = `${enrichedSummary} ${sizeBadge}`;
+        }
+        if (!enrichedProposedAction) {
+          enrichedProposedAction = `点击「批准清理外部缓存」将清理 ${matched.label} 中超过 1 小时未修改的陈旧项，自动跳过 1 小时内活跃子项。${matched.note}`;
+        }
+      } else if (rule && !enrichedProposedAction) {
+        enrichedProposedAction = `点击「批准清理外部缓存」将清理 ${rule.label} 中超过 1 小时未修改的陈旧缓存项，自动保护 1 小时内活跃子项。`;
+      }
+    }
+
     const prevSameKind = helpCards.find(
-      (c) => c.status === 'open' && c.need === input.need && c.actionKind === actionKind,
+      (c) =>
+        c.status === 'open' &&
+        c.need === input.need &&
+        c.actionKind === actionKind &&
+        (c.actionTarget ?? '') === (validatedTarget ?? ''),
     );
     const hadOtherUncomfortable =
       input.severity === 'critical' &&
       helpCards.some(
         (c) =>
-          c.status === 'open' && c.need === input.need && c.actionKind !== actionKind && c.severity === 'uncomfortable',
+          c.status === 'open' &&
+          c.need === input.need &&
+          (c.actionKind !== actionKind || (c.actionTarget ?? '') !== (validatedTarget ?? '')) &&
+          c.severity === 'uncomfortable',
       );
-    const res = upsertHelpCard(helpCards, { ...input, actionKind, now });
+    const res = upsertHelpCard(helpCards, {
+      need: input.need,
+      severity: input.severity,
+      title: input.title,
+      summary: enrichedSummary,
+      ...(enrichedProposedAction ? { proposedAction: enrichedProposedAction } : {}),
+      actionKind,
+      ...(validatedTarget ? { actionTarget: validatedTarget } : {}),
+      now,
+    });
     const sameContent =
       !res.created &&
       prevSameKind !== undefined &&
       prevSameKind.severity === res.card.severity &&
       prevSameKind.title === res.card.title &&
       prevSameKind.summary === res.card.summary &&
-      prevSameKind.proposedAction === res.card.proposedAction;
+      prevSameKind.proposedAction === res.card.proposedAction &&
+      prevSameKind.actionTarget === res.card.actionTarget;
 
     if (!sameContent) {
       helpCards = res.cards;
@@ -391,6 +586,7 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime {
 
     const nextPrev: Partial<Record<NeedKey, PreviousNeedState>> = {};
     let stateChanged = false;
+    const prevTrippedCount = circuitBreaker.trippedNeeds().length;
 
     for (const key of NEED_KEYS) {
       const ev = latestEval.needs[key];
@@ -406,6 +602,15 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime {
         ...(typeof ev.evidence.sessionId === 'string' ? { sessionId: ev.evidence.sessionId } : {}),
         ...(typeof ev.evidence.batteryDriven === 'boolean' ? { batteryDriven: ev.evidence.batteryDriven } : {}),
       };
+      const curDiskFree = key === 'space' ? primaryDiskFreeBytes(snap) : undefined;
+      circuitBreaker.reconcileNeed({
+        need: key,
+        driveActive: ev.driveActive,
+        zone: ev.zone,
+        satisfaction: ev.satisfaction,
+        envFingerprint: fingerprintForDrive(key, snap, ev, stuckCount),
+        ...(curDiskFree !== undefined ? { diskFreeBytes: curDiskFree } : {}),
+      });
       if (!ev.driveActive) {
         if (criedEpisodeSeverity.delete(key)) stateChanged = true;
         if (handledEpisodeSeverity.delete(key)) stateChanged = true;
@@ -420,6 +625,26 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime {
       }
     }
     previousStates = nextPrev;
+
+    const effPowerMode = ports.sense.getSettings().powerMode;
+    latestHigherOrder = arbiter.reconcile({
+      sense: snap,
+      l1Needs: latestEval.needs,
+      powerMode: effPowerMode,
+    });
+    for (const d of latestHigherOrder.higherOrderDrives) {
+      circuitBreaker.reconcileNeed({
+        need: d.key,
+        driveActive: d.driveActive && !d.suppressed,
+        zone: d.zone,
+        satisfaction: d.satisfaction,
+        envFingerprint: fingerprintForDrive(d.key, snap, d, stuckCount),
+      });
+    }
+
+    if (circuitBreaker.trippedNeeds().length !== prevTrippedCount) {
+      stateChanged = true;
+    }
     if (stateChanged) void persistState();
   }
 
@@ -484,35 +709,102 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime {
     }
   }
 
-  function hasSoftwareActionableDistress(): NeedKey[] {
+  function actionableL1SoftwareNeeds(ignoreCircuitBreaker: boolean): NeedKey[] {
     return latestEval.activeDrives.filter((key) => {
       if (key === 'energy') return false;
       const ev = latestEval.needs[key];
-      return ev.zone === 'uncomfortable' || ev.zone === 'critical';
+      if (ev.zone !== 'uncomfortable' && ev.zone !== 'critical') return false;
+      if (!ignoreCircuitBreaker && circuitBreaker.isTripped(key)) return false;
+      return true;
     });
   }
 
-  function buildMaintenancePrompt(distressedKeys: readonly NeedKey[]): string {
+  function actionableHigherOrderDrives(ignoreCircuitBreaker: boolean) {
+    return arbiter
+      .actionableHigherOrderDrives()
+      .filter((d) => ignoreCircuitBreaker || !circuitBreaker.isTripped(d.key));
+  }
+
+  function buildMaintenancePrompt(
+    distressedL1: readonly NeedKey[],
+    distressedHigher: readonly {
+      key: string;
+      tier: number;
+      label: string;
+      zone: string;
+      satisfaction: number;
+      summary: string;
+      evidence: Record<string, string | number | boolean | null>;
+    }[],
+  ): string {
     const lines = [
-      '你是 ASI 的后台自维护模块。当前检测到以下生存需求处于不适或危急状态，请在安全沙盒内诊断并尝试自救：',
+      '你是 ASI 的后台自维护模块。当前检测到以下需求处于不适或危急状态，请在安全沙盒内嗅探病因并尝试自救：',
       '',
     ];
-    for (const key of distressedKeys) {
+    for (const key of distressedL1) {
       const ev = latestEval.needs[key];
       const safeSummary = sanitizeForModel(ev.summary);
       const safeEvidence = sanitizeForModel(JSON.stringify(ev.evidence));
       lines.push(
-        `- [${NEED_LABELS[key]} | ${ev.zone} | 满足度 ${ev.satisfaction}%]: ${safeSummary} (证据: ${safeEvidence})`,
+        `- [L1 · ${NEED_LABELS[key]} | ${ev.zone} | 满足度 ${ev.satisfaction}%]: ${safeSummary} (证据: ${safeEvidence})`,
       );
     }
+    for (const hd of distressedHigher) {
+      const safeSummary = sanitizeForModel(hd.summary);
+      const safeEvidence = sanitizeForModel(JSON.stringify(hd.evidence));
+      lines.push(
+        `- [L${hd.tier} · ${sanitizeForModel(hd.label)} (${sanitizeForModel(hd.key)}) | ${hd.zone} | 满足度 ${hd.satisfaction}%]: ${safeSummary} (证据: ${safeEvidence})`,
+      );
+    }
+
+    const recommendations = actionLedger.formatPromptRecommendations([
+      ...distressedL1,
+      ...distressedHigher.map((d) => d.key),
+    ]);
+    if (recommendations.length > 0) {
+      lines.push('', '历史行动效果记忆（Action-Outcome Memory）：', ...recommendations);
+    }
+
     lines.push(
       '',
       '执行准则：',
-      '1. 仅使用你的只读查询工具（needs_status / env_state / env_detail）与白名单维护工具（needs_clean_cache / needs_stop_job / needs_compact_context）。',
-      '2. 严禁尝试删除用户文件、结束正常业务任务或修改系统配置。',
-      '3. 若安全自救后仍无法缓解，或问题源于用户目录大文件/外部进程/系统权限边界，请调用 needs_request_help 提交简洁清晰的求助卡，随后结束本轮。',
+      '1. 仅使用只读诊断工具（needs_status / needs_sniff_causes / env_state / env_detail）与当前沙盒挂载的白名单维护工具（needs_clean_cache / needs_stop_job / needs_compact_context / needs_request_help 及已授权高阶需求工具）。',
+      '2. 无人值守时仅自动清理 ASI 自身临时缓存（needs_clean_cache）；若 needs_sniff_causes 发现外部 safe/caution 开发者缓存大户，请调用 needs_request_help（actionKind="clean-external-cache" 且传入受控 targetId）请求用户一键批准清理。',
+      '3. 严禁尝试清空废纸篓、删除用户文件、强杀外部应用进程或修改系统配置。',
     );
     return lines.join('\n');
+  }
+
+  async function maybeProposeExternalCacheHelpCard(severity: EpisodeSeverity): Promise<void> {
+    if (!ports.homeDir) return;
+    if (isAutoHelpSuppressed('space', severity)) return;
+    const alreadyOpenExternal = helpCards.some(
+      (c) => c.need === 'space' && c.status === 'open' && c.actionKind === 'clean-external-cache',
+    );
+    if (alreadyOpenExternal) return;
+
+    const scan = await scanExternalCachesAndTrash({
+      homeDir: ports.homeDir,
+      now: clock.wall(),
+      activeProtectionMs: EXTERNAL_CACHE_ACTIVE_PROTECTION_MS,
+    }).catch(() => undefined);
+    const topHog = scan?.externalCaches.find((c) => c.approvable && c.reclaimableBytes > 0);
+    if (!topHog) return;
+
+    const trashHint =
+      scan && scan.trash.totalBytes > 0
+        ? `；另只读统计到废纸篓占用 ${formatHumanBytes(scan.trash.totalBytes)}（仅提示不代清）`
+        : '';
+
+    await raiseHelp({
+      need: 'space',
+      severity,
+      title: `发现可清理外部缓存：${topHog.label}（可释放 ${formatHumanBytes(topHog.reclaimableBytes)}）`,
+      summary: `扫描到 ${topHog.label} 总计 ${formatHumanBytes(topHog.totalBytes)}，其中修改时间超过 1 小时的可清理项为 ${formatHumanBytes(topHog.reclaimableBytes)}（风险分级：${topHog.risk}）${trashHint}。`,
+      proposedAction: `点击「批准清理外部缓存」将直接清除 ${topHog.label} 中超过 1 小时的陈旧缓存项，自动跳过 1 小时内活跃子项。${topHog.note}`,
+      actionKind: 'clean-external-cache',
+      actionTarget: topHog.targetId,
+    });
   }
 
   async function runMaintenanceCheck(manual: boolean): Promise<void> {
@@ -522,13 +814,15 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime {
       return;
     }
 
-    const distressed = manual
+    const distressedL1 = manual
       ? NEED_KEYS.filter((k) => latestEval.needs[k].driveActive)
-      : hasSoftwareActionableDistress();
-    if (!manual && distressed.length === 0) return;
+      : actionableL1SoftwareNeeds(false);
+    const distressedHigher = distressedL1.length === 0 ? actionableHigherOrderDrives(manual) : [];
+
+    if (!manual && distressedL1.length === 0 && distressedHigher.length === 0) return;
 
     if (effectiveConnectivity() === 'offline') {
-      for (const key of distressed) {
+      for (const key of distressedL1) {
         if (latestEval.needs[key].zone === 'critical') {
           await escalateNeedToCritical(
             key,
@@ -546,14 +840,14 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime {
     }
 
     if (!manual) {
-      const newlyCritical = distressed.some(
+      const newlyCritical = distressedL1.some(
         (k) => latestEval.needs[k].zone === 'critical' && !escalatedCriticalInTurn.has(k),
       );
       if (!newlyCritical && lastAutoRunMono !== undefined && monoNow - lastAutoRunMono < AUTONOMOUS_COOLDOWN_MS) {
         return;
       }
       if (autonomousTurnMonoTimes.length >= MAX_AUTONOMOUS_TURNS_PER_HOUR) {
-        for (const key of distressed) {
+        for (const key of distressedL1) {
           const ev = latestEval.needs[key];
           if (ev.zone === 'critical') {
             await escalateNeedToCritical(
@@ -567,8 +861,14 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime {
       }
     }
 
-    const targetKeys = distressed.length > 0 ? distressed : (['space', 'memory', 'mind'] as NeedKey[]);
-    const beforeSat = Object.fromEntries(targetKeys.map((k) => [k, latestEval.needs[k].satisfaction]));
+    const targetL1 =
+      distressedL1.length > 0
+        ? distressedL1
+        : distressedHigher.length > 0
+          ? []
+          : (['space', 'memory', 'mind'] as NeedKey[]);
+    const beforeSatL1 = Object.fromEntries(targetL1.map((k) => [k, latestEval.needs[k].satisfaction]));
+    const beforeSatHigher = Object.fromEntries(distressedHigher.map((d) => [d.key, d.satisfaction]));
 
     const shouldRotate = rotateMaintainerNext || maintTurnCount >= MAX_MAINTAINER_TURNS_BEFORE_ROTATE;
     rotateMaintainerNext = false;
@@ -578,7 +878,7 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime {
       sessionId = await ensureMaintenanceSession(shouldRotate);
     } catch {
       if (!stopped && !turnAbort.signal.aborted) {
-        for (const critKey of distressed) {
+        for (const critKey of distressedL1) {
           if (latestEval.needs[critKey].zone === 'critical') {
             await escalateNeedToCritical(
               critKey,
@@ -591,10 +891,11 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime {
       return;
     }
 
-    for (const k of targetKeys) {
+    for (const k of targetL1) {
       if (latestEval.needs[k].zone === 'critical') escalatedCriticalInTurn.add(k);
     }
 
+    activeTurnEffectiveNeeds.clear();
     maintStatus = 'running';
     maintLastRunAt = clock.wall();
     if (!manual) {
@@ -605,9 +906,9 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime {
 
     try {
       const prompt =
-        manual && distressed.length === 0
-          ? '用户触发了一次手动生存需求自检。请调用 needs_status 查看五大生存需求现状，确认各项舒适或执行必要的安全整理后简要总结。'
-          : buildMaintenancePrompt(targetKeys);
+        manual && distressedL1.length === 0 && distressedHigher.length === 0
+          ? '用户触发了一次手动生存需求自检。请调用 needs_status 查看五大生存需求现状，必要时调用 needs_sniff_causes 嗅探本机缓存与负载，确认各项舒适或执行必要的安全整理后简要总结。'
+          : buildMaintenancePrompt(targetL1, distressedHigher);
 
       await ports.sessions.runMaintenanceTurn(sessionId, prompt, turnAbort.signal);
       maintTurnCount += 1;
@@ -617,12 +918,21 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime {
       await ports.sense.refresh?.().catch(() => undefined);
       recomputeEval(ports.sense.snapshot());
 
-      const primaryNeed = targetKeys[0];
+      const primaryNeed = targetL1[0];
+      const primaryDriveKey = distressedHigher[0]?.key;
       let outcome: MaintenanceOutcome = 'info';
-      if (distressed.length > 0) {
-        const allCleared = distressed.every((k) => !latestEval.needs[k].driveActive);
-        const anyImproved = distressed.some((k) => latestEval.needs[k].satisfaction > (beforeSat[k] ?? 0));
-        const stillCritical = distressed.filter((k) => latestEval.needs[k].zone === 'critical');
+
+      if (distressedL1.length > 0) {
+        if (latestEval.needs.space.driveActive && distressedL1.includes('space')) {
+          const spaceSev: EpisodeSeverity = latestEval.needs.space.zone === 'critical' ? 'critical' : 'uncomfortable';
+          await maybeProposeExternalCacheHelpCard(spaceSev);
+        }
+
+        const allCleared = distressedL1.every((k) => !latestEval.needs[k].driveActive);
+        const anyImproved = distressedL1.some(
+          (k) => activeTurnEffectiveNeeds.has(k) || latestEval.needs[k].satisfaction > (beforeSatL1[k] ?? 0),
+        );
+        const stillCritical = distressedL1.filter((k) => latestEval.needs[k].zone === 'critical');
 
         for (const critKey of stillCritical) {
           await escalateNeedToCritical(
@@ -632,16 +942,67 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime {
           );
         }
 
+        if (!manual) {
+          for (const key of distressedL1) {
+            const ev = latestEval.needs[key];
+            const keyHadGain = activeTurnEffectiveNeeds.has(key) || ev.satisfaction > (beforeSatL1[key] ?? 0);
+            const hasOpenCard = helpCards.some((c) => c.need === key && c.status === 'open');
+            if (!keyHadGain && hasOpenCard && ev.driveActive && ev.zone !== 'comfortable') {
+              const tripDiskFree = key === 'space' ? primaryDiskFreeBytes(latestSense) : undefined;
+              circuitBreaker.trip({
+                need: key,
+                trippedAt: clock.wall(),
+                zoneAtTrip: ev.zone,
+                satisfactionAtTrip: ev.satisfaction,
+                envFingerprint: fingerprintForDrive(key, latestSense, ev),
+                ...(tripDiskFree !== undefined ? { diskFreeAtTrip: tripDiskFree } : {}),
+                reason: '安全自救零收益且已挂出求助卡，静默熔断避免重复唤醒模型',
+              });
+            }
+          }
+        }
+
         outcome = allCleared ? 'relieved' : stillCritical.length > 0 ? 'escalated' : anyImproved ? 'partial' : 'info';
+      } else if (distressedHigher.length > 0) {
+        const refreshedHigher = distressedHigher.map((d) => ({
+          key: d.key,
+          current: arbiter.findDrive(d.key),
+        }));
+        const allCleared = refreshedHigher.every((item) => !item.current?.driveActive);
+        const anyImproved = refreshedHigher.some(
+          (item) =>
+            activeTurnEffectiveNeeds.has(item.key) ||
+            (item.current?.satisfaction ?? 0) > (beforeSatHigher[item.key] ?? 0),
+        );
+        if (!manual) {
+          for (const item of refreshedHigher) {
+            const cur = item.current;
+            if (!cur?.driveActive || cur.zone === 'comfortable') continue;
+            const hadGain =
+              activeTurnEffectiveNeeds.has(item.key) || cur.satisfaction > (beforeSatHigher[item.key] ?? 0);
+            if (!hadGain) {
+              circuitBreaker.trip({
+                need: item.key,
+                trippedAt: clock.wall(),
+                zoneAtTrip: cur.zone,
+                satisfactionAtTrip: cur.satisfaction,
+                envFingerprint: fingerprintForDrive(item.key, latestSense, cur),
+                reason: '高阶需求自维护本轮无收益，静默熔断等待环境变化',
+              });
+            }
+          }
+        }
+        outcome = allCleared ? 'relieved' : anyImproved ? 'partial' : 'info';
       }
 
       addRecord({
         actor: 'maintainer',
         ...(primaryNeed ? { need: primaryNeed } : {}),
+        ...(primaryDriveKey ? { driveKey: primaryDriveKey } : {}),
         action: manual ? 'manual-check' : 'auto-maintain',
         summary:
           outcome === 'relieved'
-            ? '后台自维护完成，相关生存需求已恢复舒适区'
+            ? '后台自维护完成，相关需求已恢复舒适区'
             : outcome === 'escalated'
               ? '后台自维护触及安全边界或仍处危急，已发出求助卡'
               : '后台自维护巡检已完成',
@@ -651,7 +1012,7 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime {
       maintStatus = 'idle';
       if (!stopped && !turnAbort.signal.aborted) {
         recomputeEval(ports.sense.snapshot());
-        for (const critKey of distressed) {
+        for (const critKey of distressedL1) {
           if (latestEval.needs[critKey].zone === 'critical') {
             await escalateNeedToCritical(
               critKey,
@@ -663,12 +1024,14 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime {
       }
       addRecord({
         actor: 'maintainer',
-        ...(targetKeys[0] ? { need: targetKeys[0] } : {}),
+        ...(targetL1[0] ? { need: targetL1[0] } : {}),
+        ...(distressedHigher[0]?.key ? { driveKey: distressedHigher[0].key } : {}),
         action: 'auto-maintain',
         summary: '后台自维护会话执行中断，稍后按退避策略重试',
         outcome: 'failed',
       });
     } finally {
+      activeTurnEffectiveNeeds.clear();
       notify();
       if (!stopped && !latestSense.settings.paused && pendingMaintenanceRecheck) {
         pendingMaintenanceRecheck = false;
@@ -737,6 +1100,8 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime {
 
   function snapshot(): NeedsSnapshot {
     const settings = ports.sense.getSettings();
+    const brokenNeeds = circuitBreaker.trippedNeeds();
+    const drivesSnap = latestHigherOrder.snapshot;
     return {
       now: latestEval.now,
       paused: settings.paused,
@@ -754,43 +1119,130 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime {
         status: maintStatus,
         turnCount: maintTotalTurns,
         ...(maintLastRunAt !== undefined ? { lastRunAt: maintLastRunAt } : {}),
+        ...(brokenNeeds.length > 0 ? { circuitBrokenNeeds: brokenNeeds } : {}),
       },
       records: structuredClone(records),
+      actionLedger: actionLedger.entries(),
+      higherOrderDrives: structuredClone(latestHigherOrder.higherOrderDrives),
+      higherOrderSuppressed: drivesSnap.higherOrderSuppressed,
+      ...(drivesSnap.suppressionReason ? { higherOrderSuppressionReason: drivesSnap.suppressionReason } : {}),
     };
   }
 
   const tools: MaintenanceToolsApi = {
     statusSnapshot: () => snapshot(),
 
+    async sniffCauses() {
+      const now = clock.wall();
+      const [internalCache, externalScan, topProcesses] = await Promise.all([
+        inspectSafeCaches({
+          needsStorageRoot: ports.storageRoot,
+          senseStorageRoot: ports.sense.storageRoot,
+        }),
+        ports.homeDir
+          ? scanExternalCachesAndTrash({
+              homeDir: ports.homeDir,
+              now,
+              activeProtectionMs: EXTERNAL_CACHE_ACTIVE_PROTECTION_MS,
+            })
+          : Promise.resolve<ExternalCacheScanReport>({
+              scannedAt: now,
+              activeProtectionWindowMs: EXTERNAL_CACHE_ACTIVE_PROTECTION_MS,
+              externalCaches: [],
+              trash: {
+                exists: false,
+                paths: [],
+                totalBytes: 0,
+                itemCount: 0,
+                risk: 'risky',
+                cleanable: false,
+                note: TRASH_READONLY_RULE.note,
+              },
+              truncated: false,
+            }),
+        sampleTopProcesses({
+          now,
+          exec: ports.execProcessPs,
+          signal: turnAbort.signal,
+        }),
+      ]);
+
+      return {
+        scannedAt: now,
+        activeProtectionWindowMs: externalScan.activeProtectionWindowMs,
+        asiInternalCache: {
+          totalBytes: internalCache.totalBytes,
+          reclaimableBytes: internalCache.reclaimableBytes,
+          entryCount: internalCache.entryCount,
+        },
+        externalCaches: externalScan.externalCaches,
+        trash: externalScan.trash,
+        topProcesses,
+        truncated: externalScan.truncated,
+      };
+    },
+
     async cleanCache() {
       const now = clock.wall();
+      const beforeSat = latestEval.needs.space.satisfaction;
       const res = await cleanSafeCaches({
         needsStorageRoot: ports.storageRoot,
         senseStorageRoot: ports.sense.storageRoot,
         now,
       });
+      await ports.sense.refresh?.().catch(() => undefined);
+      recomputeEval(ports.sense.snapshot());
+      const afterSat = latestEval.needs.space.satisfaction;
+
+      const gain = buildActionMeasurement({
+        freedBytes: res.freedBytes,
+        satisfactionBefore: beforeSat,
+        satisfactionAfter: afterSat,
+      });
+      actionLedger.record({ need: 'space', action: 'needs_clean_cache', at: now, gain });
+      if (maintStatus === 'running' && gain.effective) {
+        activeTurnEffectiveNeeds.add('space');
+      }
+
       const mb = (res.freedBytes / 1024 ** 2).toFixed(1);
       const summary =
         res.deletedEntries > 0
-          ? `清理白名单临时缓存 ${res.deletedEntries} 项，释放 ${mb} MB`
-          : '白名单临时缓存目录已干净，无可清理项';
+          ? `清理 ASI 自有临时缓存 ${res.deletedEntries} 项，释放 ${mb} MB`
+          : 'ASI 自有临时缓存目录已干净，无可清理项';
       addRecord({
         actor: 'maintainer',
         need: 'space',
         action: 'needs_clean_cache',
         summary,
-        outcome: res.deletedEntries > 0 ? 'partial' : 'info',
+        outcome: gain.effective ? (latestEval.needs.space.driveActive ? 'partial' : 'relieved') : 'info',
+        gain,
       });
       notify();
-      return { deletedEntries: res.deletedEntries, freedBytes: res.freedBytes, summary };
+      return { deletedEntries: res.deletedEntries, freedBytes: res.freedBytes, summary, gain };
     },
 
     async stopStuckJob(jobId?: string) {
+      const now = clock.wall();
+      const beforeSat = latestEval.needs.memory.satisfaction;
       const res = stopStuckJobs({
         jobsPort: ports.jobs,
-        now: clock.wall(),
+        now,
         ...(jobId ? { targetJobId: jobId } : {}),
       });
+      await ports.sense.refresh?.().catch(() => undefined);
+      recomputeEval(ports.sense.snapshot());
+      const afterSat = latestEval.needs.memory.satisfaction;
+
+      const gain = buildActionMeasurement({
+        stoppedJobs: res.stoppedIds.length,
+        satisfactionBefore: beforeSat,
+        satisfactionAfter: afterSat,
+      });
+      actionLedger.record({ need: 'memory', action: 'needs_stop_job', at: now, gain });
+      if (maintStatus === 'running' && gain.effective) {
+        activeTurnEffectiveNeeds.add('memory');
+      }
+
       const summary =
         res.stoppedIds.length > 0
           ? `结束超时/无主后台任务 ${res.stoppedIds.length} 个（${res.stoppedIds.join(', ')}）`
@@ -802,13 +1254,16 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime {
         need: 'memory',
         action: 'needs_stop_job',
         summary,
-        outcome: res.stoppedIds.length > 0 ? 'partial' : 'info',
+        outcome: gain.effective ? (latestEval.needs.memory.driveActive ? 'partial' : 'relieved') : 'info',
+        gain,
       });
       notify();
-      return { ...res, summary };
+      return { ...res, summary, gain };
     },
 
     async compactContext() {
+      const now = clock.wall();
+      const beforeSat = latestEval.needs.mind.satisfaction;
       const res = await compactIdleContexts({
         compactionPort: ports.compaction,
         excludeSessionIds: new Set(internalSessions.keys()),
@@ -821,6 +1276,22 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime {
           return false;
         },
       });
+      await ports.sense.refresh?.().catch(() => undefined);
+      recomputeEval(ports.sense.snapshot());
+      const afterSat = latestEval.needs.mind.satisfaction;
+
+      const gain = buildActionMeasurement({
+        tokensSaved: res.tokensSaved,
+        satisfactionBefore: beforeSat,
+        satisfactionAfter: afterSat,
+      });
+      const effectiveOrRotated = gain.effective || res.compactedSessions > 0 || res.rotatedMaintainer;
+      const finalGain: ActionMeasurement = effectiveOrRotated ? { ...gain, effective: true } : gain;
+      actionLedger.record({ need: 'mind', action: 'needs_compact_context', at: now, gain: finalGain });
+      if (maintStatus === 'running' && finalGain.effective) {
+        activeTurnEffectiveNeeds.add('mind');
+      }
+
       const summary =
         res.compactedSessions > 0 || res.rotatedMaintainer
           ? `整理空闲会话 ${res.compactedSessions} 个（释放约 ${res.tokensSaved} tokens）${res.rotatedMaintainer ? '，并标记自维护会话轮换' : ''}`
@@ -830,11 +1301,11 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime {
         need: 'mind',
         action: 'needs_compact_context',
         summary,
-        outcome: res.compactedSessions > 0 || res.rotatedMaintainer ? 'relieved' : 'info',
+        outcome: finalGain.effective ? 'relieved' : 'info',
+        gain: finalGain,
       });
-      await ports.sense.refresh?.().catch(() => undefined);
       notify();
-      return { compactedSessions: res.compactedSessions, tokensSaved: res.tokensSaved, summary };
+      return { compactedSessions: res.compactedSessions, tokensSaved: res.tokensSaved, summary, gain: finalGain };
     },
 
     async requestHelp(input) {
@@ -847,6 +1318,7 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime {
         summary: input.summary,
         ...(input.proposedAction ? { proposedAction: input.proposedAction } : {}),
         ...(input.actionKind ? { actionKind: input.actionKind } : {}),
+        ...(input.actionTarget ? { actionTarget: input.actionTarget } : {}),
       });
       addRecord({
         actor: 'maintainer',
@@ -881,20 +1353,46 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime {
       if (card?.status !== 'open') return;
 
       const now = clock.wall();
+      const beforeSat = latestEval.needs[card.need].satisfaction;
       let actionSummary = `用户确认处理：${card.title}`;
+      let ledgerAction: string | undefined;
+      let freedBytes = 0;
+      let stoppedJobsCount = 0;
+      let tokensSaved = 0;
+
       if (card.actionKind === 'clean-cache') {
         const cleaned = await cleanSafeCaches({
           needsStorageRoot: ports.storageRoot,
           senseStorageRoot: ports.sense.storageRoot,
           now,
         });
-        actionSummary = `用户批准清理缓存，删除 ${cleaned.deletedEntries} 项`;
+        freedBytes = cleaned.freedBytes;
+        ledgerAction = 'clean-cache';
+        actionSummary = `用户批准清理自有缓存，删除 ${cleaned.deletedEntries} 项（释放 ${formatHumanBytes(cleaned.freedBytes)}）`;
+      } else if (card.actionKind === 'clean-external-cache') {
+        const targetId = validateHelpActionTarget('clean-external-cache', card.actionTarget);
+        if (!targetId) {
+          throw new Error('Missing whitelisted targetId for clean-external-cache');
+        }
+        const cleaned = await cleanExternalCacheTarget({
+          homeDir: ports.homeDir ?? '',
+          targetId,
+          now,
+          activeProtectionMs: EXTERNAL_CACHE_ACTIVE_PROTECTION_MS,
+        });
+        freedBytes = cleaned.freedBytes;
+        ledgerAction = `clean-external-cache:${cleaned.targetId}`;
+        const activeNote =
+          cleaned.skippedActiveEntries > 0 ? `，自动保护跳过 1 小时内活跃子项 ${cleaned.skippedActiveEntries} 项` : '';
+        actionSummary = `用户批准清理 ${cleaned.label}：清除陈旧缓存 ${cleaned.deletedEntries} 项，释放 ${formatHumanBytes(cleaned.freedBytes)}${activeNote}`;
       } else if (card.actionKind === 'stop-stuck-jobs') {
         const stoppedJobs = stopStuckJobs({
           jobsPort: ports.jobs,
           now,
           ...(card.actionTarget ? { targetJobId: card.actionTarget } : {}),
         });
+        stoppedJobsCount = stoppedJobs.stoppedIds.length;
+        ledgerAction = 'stop-stuck-jobs';
         actionSummary = `用户批准结束卡死任务（${stoppedJobs.stoppedIds.length} 个）`;
       } else if (card.actionKind === 'compact-context') {
         const compacted = await compactIdleContexts({
@@ -902,26 +1400,46 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime {
           excludeSessionIds: new Set(internalSessions.keys()),
           signal: turnAbort.signal,
         });
+        tokensSaved = compacted.tokensSaved;
+        ledgerAction = 'compact-context';
         actionSummary = `用户批准整理上下文（${compacted.compactedSessions} 个空闲会话）`;
       } else if (card.actionKind === 'enable-eco') {
         await ports.sense.setPowerMode('eco', '用户批准节能模式');
+        ledgerAction = 'enable-eco';
         actionSummary = '用户批准进入节能降频模式';
       } else if (card.actionKind === 'open-permissions') {
         await ports.sense.openPermissionSettings();
         actionSummary = '用户打开系统权限设置';
       }
 
+      await ports.sense.refresh?.().catch(() => undefined);
+      recomputeEval(ports.sense.snapshot());
+      const afterSat = latestEval.needs[card.need].satisfaction;
+
+      let gain: ActionMeasurement | undefined;
+      if (ledgerAction) {
+        gain = buildActionMeasurement({
+          freedBytes,
+          stoppedJobs: stoppedJobsCount,
+          tokensSaved,
+          satisfactionBefore: beforeSat,
+          satisfactionAfter: afterSat,
+        });
+        actionLedger.record({ need: card.need, action: ledgerAction, at: now, gain });
+      }
+
+      circuitBreaker.clear(card.need);
       recordEpisodeSeverity(criedEpisodeSeverity, card.need, card.severity);
       recordEpisodeSeverity(handledEpisodeSeverity, card.need, card.severity);
       helpCards = helpCards.map((c) => (c.id === cardId ? { ...c, status: 'approved', updatedAt: now } : c));
       addRecord({
         actor: 'user',
         need: card.need,
-        action: card.actionKind,
+        action: ledgerAction ?? card.actionKind,
         summary: actionSummary,
         outcome: 'relieved',
+        ...(gain ? { gain } : {}),
       });
-      await ports.sense.refresh?.().catch(() => undefined);
       await persistState();
       await scheduleProcess(ports.sense.snapshot());
     },
@@ -947,6 +1465,60 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime {
     },
   };
 
+  const drives: NeedsDrivesRuntimeApi = {
+    snapshot: () => arbiter.snapshot(),
+    subscribe: (listener) => arbiter.subscribe(listener),
+    registerSource: (registration) => arbiter.registerSource(registration),
+    notifySourceChanged: (sourceId) => arbiter.notifySourceChanged(sourceId),
+    onToolsStructureChanged: (listener) => arbiter.onToolsStructureChanged(listener),
+    registeredSandboxTools: () => arbiter.registeredSandboxTools(),
+    checkSandboxToolGuard: (toolName) => arbiter.checkSandboxToolGuard(toolName),
+
+    async executeSandboxTool(tool, args, signal) {
+      const guard = arbiter.checkSandboxToolGuard(tool.spec.name);
+      if (!guard.allowed) {
+        throw new Error(guard.reason ?? 'Sandbox tool is currently suspended');
+      }
+      const now = clock.wall();
+      const targetKey = tool.qualifiedDriveKey ?? `${tool.sourceId}:default`;
+      const beforeSat = arbiter.findDrive(targetKey)?.satisfaction;
+
+      const res = await tool.spec.execute(args, { signal });
+      await ports.sense.refresh?.().catch(() => undefined);
+      recomputeEval(ports.sense.snapshot());
+      const afterSat = arbiter.findDrive(targetKey)?.satisfaction;
+
+      const gain = buildActionMeasurement({
+        freedBytes: res.freedBytes,
+        stoppedJobs: res.stoppedJobs,
+        tokensSaved: res.tokensSaved,
+        satisfactionBefore: beforeSat,
+        satisfactionAfter: afterSat,
+      });
+      actionLedger.record({
+        need: targetKey,
+        action: tool.spec.name,
+        at: now,
+        gain,
+      });
+      if (maintStatus === 'running' && gain.effective) {
+        activeTurnEffectiveNeeds.add(targetKey);
+      }
+
+      const safeSummary = String(sanitizeForModel(res.summary || `${tool.spec.name} completed`)).slice(0, 240);
+      addRecord({
+        actor: 'maintainer',
+        driveKey: targetKey,
+        action: tool.spec.name,
+        summary: safeSummary,
+        outcome: gain.effective ? 'relieved' : 'info',
+        gain,
+      });
+      notify();
+      return { ...res, summary: safeSummary, gain };
+    },
+  };
+
   return {
     sandboxDir,
     async start() {
@@ -958,6 +1530,8 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime {
         const parsed = JSON.parse(raw) as PersistedNeedsState;
         if (Array.isArray(parsed.helpCards)) helpCards = parsed.helpCards.slice(0, 30);
         if (Array.isArray(parsed.records)) records = parsed.records.slice(0, MAX_RECORDS);
+        if (parsed.actionLedger) actionLedger.restore(parsed.actionLedger);
+        if (parsed.circuitBreakers) circuitBreaker.restore(parsed.circuitBreakers);
         if (parsed.previousStates && typeof parsed.previousStates === 'object') {
           const restored: Partial<Record<NeedKey, PreviousNeedState>> = {};
           for (const key of NEED_KEYS) {
@@ -1096,5 +1670,6 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime {
     },
     tools,
     actions,
+    drives,
   };
 }

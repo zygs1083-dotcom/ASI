@@ -19,3 +19,17 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+---
+
+Third-Party Open-Source Adaptations (MIT License):
+
+- Developer cache categories & risk tier taxonomy adapted from bysiber/cleardisk
+  (MIT License, Copyright (c) bysiber).
+- Artifact discovery & recent-activity safety guard adapted from guhcostan/mac-cleaner-cli
+  (MIT License, Copyright (c) Gustavo Costa).
+- Protected deletion root validation adapted from tw93/Mole
+  (MIT License, Copyright (c) Tw93).
+- POSIX process table parsing adapted from sindresorhus/ps-list
+  (MIT License, Copyright (c) Sindre Sorhus) and soyuka/pidusage
+  (MIT License, Copyright (c) Antoine Bluchet).

@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { mkdir } from 'node:fs/promises';
+import { homedir } from 'node:os';
 import type { Context } from '@deepseek-ai/cordis';
 import type { Agent } from '@deepseek-ai/dsh-agent';
 import type {} from '@deepseek-ai/dsh-api-session-controller';
@@ -18,7 +19,7 @@ declare module '@deepseek-ai/dsh-llm' {
   }
 }
 
-export function createDshNeedsPorts(ctx: Context, storageRoot: string): NeedsHostPorts {
+export function createDshNeedsPorts(ctx: Context, storageRoot: string, options?: { homeDir?: string }): NeedsHostPorts {
   const resolveAgent = (id: string): Agent | undefined => ctx.agents.get(SessionId(id));
   const getWorkspaceRegistry = (): WorkspaceRegistry | undefined =>
     (ctx as Context & { get(name: 'workspaceRegistry'): WorkspaceRegistry | undefined }).get('workspaceRegistry');
@@ -199,6 +200,7 @@ export function createDshNeedsPorts(ctx: Context, storageRoot: string): NeedsHos
 
   return {
     storageRoot,
+    homeDir: options?.homeDir ?? homedir(),
     sense: ctx.asiSense,
     jobs,
     compaction,
