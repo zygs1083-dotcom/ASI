@@ -110,7 +110,11 @@ describe('0.3.0 全景嗅探、一键外部缓存批准清理、行动效果记�
 
     await runtime.start();
     try {
-      await vi.waitFor(() => expect(sniffSnapshot).toBeDefined());
+      await vi.waitFor(() => {
+        expect(sniffSnapshot).toBeDefined();
+        expect(runtime.snapshot().maintenanceSession.turnCount).toBe(1);
+        expect(runtime.snapshot().maintenanceSession.status).toBe('idle');
+      });
       expect(sniffSnapshot?.externalCaches.map((c) => c.targetId)).toEqual(['homebrew', 'xcode-derived-data']);
       expect(sniffSnapshot?.externalCaches[1]?.totalBytes).toBe(32_768 + 8192);
       expect(sniffSnapshot?.externalCaches[1]?.reclaimableBytes).toBe(32_768);
@@ -1060,5 +1064,384 @@ describe('0.3.0 全景嗅探、一键外部缓存批准清理、行动效果记�
     } finally {
       await rt3.stop();
     }
+  });
+
+  it('深水并发边界：建会话期间新增同层/更高阶需求合并、自动回合中并发 triggerCheck 排队去重、pause/stop 中断回滚与轮换 ENOSPC 保活回退', async () => {
+    // 1. 建会话异步窗口内：L3 触发建会话期间更高优先级 L2 注册，放行后在同 1 轮按马斯洛序合并处理 L2+L3（绝不漏掉 L2 并误锁 120s）；
+    //    若需求在建会话完成前已自行恢复舒适，则跳过空跑并完整回滚冷却！
+    const dirA = await mkdtemp(join(tmpdir(), 'asi-030-deep-merge-'));
+    tempDirs.push(dirA);
+
+    let wallA = T0;
+    let monoA = 1_000;
+    let careSatA = 45;
+    let sleepSatA = 90;
+    const senseA = createMockSenseService(makeSnapshot({ now: wallA, mono: monoA }), dirA);
+    const createdA: string[] = [];
+    const promptsA: string[] = [];
+    let releaseCreateA: (() => void) | undefined;
+
+    const rtA = createNeedsRuntime({
+      storageRoot: dirA,
+      sense: senseA,
+      clock: { wall: () => wallA, mono: () => monoA },
+      probeEndpoint: async () => true,
+      jobs: { listActiveJobs: () => [], hasLiveOwner: () => true, killJob: () => 'already-finished' },
+      compaction: { listIdleSessionIds: () => [], compactIdleSession: async () => ({ compacted: false }) },
+      sessions: {
+        createMaintenanceSession: async (id) => {
+          createdA.push(id);
+          await new Promise<void>((resolve) => {
+            releaseCreateA = resolve;
+          });
+          return id;
+        },
+        hasSession: (id) => createdA.includes(id),
+        runMaintenanceTurn: async (_sid, prompt) => {
+          promptsA.push(prompt);
+          careSatA = 92;
+          sleepSatA = 94;
+        },
+        deliverCryToUserSession: async () => true,
+      },
+    });
+
+    await rtA.start();
+    try {
+      // 先注册 L3 触发首次异步建会话
+      rtA.drives.registerSource({
+        id: 'asi-care',
+        tier: 3,
+        label: '主动关怀',
+        evaluate: () => [{ key: 'digest', label: '摘要整理', satisfaction: careSatA, summary: '待生成' }],
+      });
+      await vi.waitFor(() => expect(releaseCreateA).toBeTypeOf('function'));
+
+      // 建会话尚未返回时，更高优先级的 L2 睡眠巩固注册进入不适
+      sleepSatA = 35;
+      rtA.drives.registerSource({
+        id: 'asi-sleep',
+        tier: 2,
+        label: '离线睡眠整理',
+        evaluate: () => [{ key: 'consolidation', label: '记忆巩固', satisfaction: sleepSatA, summary: '待合并' }],
+      });
+      await new Promise((r) => setTimeout(r, 10));
+
+      // 先测试“建会话完成前全部恢复舒适 -> 零回合空跑且回滚冷却”
+      careSatA = 95;
+      sleepSatA = 95;
+      wallA += 200;
+      monoA += 200;
+      senseA.emit((prev) => ({ ...prev, now: wallA, mono: monoA }));
+      await new Promise((r) => setTimeout(r, 10));
+
+      releaseCreateA?.();
+      await vi.waitFor(() => expect(rtA.snapshot().maintenanceSession.status).toBe('idle'));
+      expect(promptsA).toHaveLength(0);
+      expect(rtA.snapshot().maintenanceSession.turnCount).toBe(0);
+      expect(rtA.snapshot().maintenanceSession.lastRunAt).toBeUndefined();
+
+      // 由于空跑已回滚冷却，仅隔 5s（远小于 120s 冷却）L2 与 L3 再次进入不适即可立即唤醒并在单轮内按 L2 -> L3 序合并！
+      careSatA = 45;
+      sleepSatA = 35;
+      wallA += 5_000;
+      monoA += 5_000;
+      senseA.emit((prev) => ({ ...prev, now: wallA, mono: monoA }));
+      await vi.waitFor(() => {
+        expect(promptsA).toHaveLength(1);
+        expect(rtA.snapshot().maintenanceSession.status).toBe('idle');
+      });
+      const idxL2 = promptsA[0]?.indexOf('L2 · 记忆巩固 (asi-sleep:consolidation)') ?? -1;
+      const idxL3 = promptsA[0]?.indexOf('L3 · 摘要整理 (asi-care:digest)') ?? -1;
+      expect(idxL2).toBeGreaterThanOrEqual(0);
+      expect(idxL3).toBeGreaterThan(idxL2);
+
+      // L1 同层合并：当 memory 触发轮换建会话期间 space 也跌入 uncomfortable，单轮提示词同时包含 memory 与 space（绝不漏掉 space）
+      while (rtA.snapshot().maintenanceSession.turnCount < 12) {
+        await rtA.actions.triggerCheck();
+      }
+      const prevPromptCountA = promptsA.length;
+      releaseCreateA = undefined;
+      wallA += 150_000;
+      monoA += 150_000;
+      senseA.emit((prev) => {
+        const next = structuredClone(prev);
+        next.now = wallA;
+        next.mono = monoA;
+        next.state.self.body.memory = fact({
+          total: 32 * 1024 ** 3,
+          used: 30 * 1024 ** 3,
+          pressure: 'warn',
+          swapUsed: 2 * 1024 ** 3,
+        });
+        return next;
+      });
+      await vi.waitFor(() => expect(releaseCreateA).toBeTypeOf('function'));
+
+      wallA += 200;
+      monoA += 200;
+      senseA.emit((prev) => {
+        const next = structuredClone(prev);
+        next.now = wallA;
+        next.mono = monoA;
+        next.state.self.body.disks = {
+          kind: 'disks',
+          ...fact([{ mount: '/', total: 200 * 1024 ** 3, free: 10 * 1024 ** 3 }]),
+        };
+        return next;
+      });
+      await new Promise((r) => setTimeout(r, 10));
+
+      (releaseCreateA as (() => void) | undefined)?.();
+      await vi.waitFor(() => {
+        expect(promptsA).toHaveLength(prevPromptCountA + 1);
+        expect(rtA.snapshot().maintenanceSession.status).toBe('idle');
+      });
+      expect(promptsA.at(-1)).toContain('内存与进程');
+      expect(promptsA.at(-1)).toContain('空间');
+    } finally {
+      await rtA.stop();
+    }
+
+    // 2. 自动维护回合在途时（space 已静默熔断，memory 正在跑 auto-maintain），并发调用 2 次 triggerCheck()：
+    //    绝不丢弃手动自检，而是在在途自动回合结束后合并执行唯一 1 轮强制巡检（覆盖已熔断的 space）！
+    //    且跑满 12 轮触发会话轮换遭遇 ENOSPC 时，自动回退复用仍存活的旧会话完成自救，不误锁为 unavailable。
+    const dirB = await mkdtemp(join(tmpdir(), 'asi-030-deep-manual-rotate-'));
+    tempDirs.push(dirB);
+
+    let wallB = T0;
+    let monoB = 1_000;
+    let diskFreeB = 10 * 1024 ** 3; // space 不适
+    let hasStuckJobB = false;
+    let failRotateWithEnospc = false;
+
+    const makeSnapB = () => {
+      const s = makeSnapshot({ now: wallB, mono: monoB });
+      s.state.self.body.disks = {
+        kind: 'disks',
+        ...fact([{ mount: '/', total: 200 * 1024 ** 3, free: diskFreeB }]),
+      };
+      return s;
+    };
+    const senseB = createMockSenseService(makeSnapB(), dirB);
+    const liveSessionsB = new Set<string>();
+    const promptsB: string[] = [];
+    let releaseAutoMemoryTurn: (() => void) | undefined;
+    let releaseRotateAttempt: (() => void) | undefined;
+
+    const rtB = createNeedsRuntime({
+      storageRoot: dirB,
+      sense: senseB,
+      clock: { wall: () => wallB, mono: () => monoB },
+      probeEndpoint: async () => true,
+      jobs: {
+        listActiveJobs: () =>
+          hasStuckJobB ? [{ id: 'stuck-b', owner: 'dead', status: 'running', startedAt: T0 - 30 * 60_000 }] : [],
+        hasLiveOwner: () => false,
+        killJob: () => {
+          hasStuckJobB = false;
+          return 'requested';
+        },
+      },
+      compaction: { listIdleSessionIds: () => [], compactIdleSession: async () => ({ compacted: false }) },
+      sessions: {
+        createMaintenanceSession: async (id) => {
+          if (failRotateWithEnospc) {
+            await new Promise<void>((resolve) => {
+              releaseRotateAttempt = resolve;
+            });
+            throw new Error('ENOSPC: no space left on device');
+          }
+          liveSessionsB.add(id);
+          return id;
+        },
+        hasSession: (id) => liveSessionsB.has(id),
+        runMaintenanceTurn: async (_sid, prompt) => {
+          promptsB.push(prompt);
+          if (promptsB.length === 1) {
+            await rtB.tools.requestHelp({
+              need: 'space',
+              severity: 'uncomfortable',
+              title: '磁盘偏紧',
+              summary: '零收益挂卡进入熔断',
+            });
+          } else if (releaseAutoMemoryTurn === undefined && hasStuckJobB) {
+            await new Promise<void>((resolve) => {
+              releaseAutoMemoryTurn = resolve;
+            });
+            await rtB.tools.stopStuckJob();
+          }
+        },
+        deliverCryToUserSession: async () => true,
+      },
+    });
+
+    await rtB.start();
+    try {
+      // 第 1 轮自动维护后 space 进入零收益静默熔断
+      await vi.waitFor(() => {
+        expect(promptsB).toHaveLength(1);
+        expect(rtB.snapshot().maintenanceSession.circuitBrokenNeeds).toContain('space');
+      });
+
+      // 跨过冷却后 memory 出现残留卡死任务触发在途 auto-maintain（此时自动回合跳过已熔断的 space）
+      wallB += 150_000;
+      monoB += 150_000;
+      hasStuckJobB = true;
+      senseB.emit(() => makeSnapB());
+      await vi.waitFor(() => expect(releaseAutoMemoryTurn).toBeTypeOf('function'));
+      expect(promptsB[1]).toContain('内存与进程');
+      expect(promptsB[1]).not.toContain('空间');
+
+      // 在自动回合尚未结束时并发连点 2 次 triggerCheck()
+      const manualP1 = rtB.actions.triggerCheck();
+      const manualP2 = rtB.actions.triggerCheck();
+      await new Promise((r) => setTimeout(r, 15));
+      expect(promptsB).toHaveLength(2);
+
+      // 放行在途自动回合 -> 2 次并发 triggerCheck 合并排队跑且仅跑 1 轮手动自检，覆盖已熔断的 space！
+      releaseAutoMemoryTurn?.();
+      await Promise.all([manualP1, manualP2]);
+      expect(promptsB).toHaveLength(3);
+      expect(promptsB[2]).toContain('空间');
+      expect(rtB.snapshot().records[0]?.action).toBe('manual-check');
+
+      // 补足到 12 轮后触发会话轮换，模拟轮换建新会话抛 ENOSPC 且并发调用 openMaintenanceSession()
+      while (rtB.snapshot().maintenanceSession.turnCount < 12) {
+        await rtB.actions.triggerCheck();
+      }
+      const initialLiveId = rtB.snapshot().maintenanceSession.sessionId;
+      expect(initialLiveId).toBeDefined();
+
+      failRotateWithEnospc = true;
+      diskFreeB = 8 * 1024 ** 3;
+      const rotateCheckPromise = rtB.actions.triggerCheck();
+      await vi.waitFor(() => expect(releaseRotateAttempt).toBeTypeOf('function'));
+      const concurrentOpenDuringFailedRotate = rtB.actions.openMaintenanceSession();
+
+      releaseRotateAttempt?.();
+      const [openedFallbackId] = await Promise.all([concurrentOpenDuringFailedRotate, rotateCheckPromise]);
+      expect(openedFallbackId).toBe(initialLiveId);
+      expect(rtB.snapshot().maintenanceSession.sessionId).toBe(initialLiveId);
+      expect(rtB.snapshot().maintenanceSession.status).toBe('idle');
+      expect(rtB.snapshot().maintenanceSession.turnCount).toBe(13);
+    } finally {
+      await rtB.stop();
+    }
+
+    // 3. 在建会话失败/悬停及在途 runMaintenanceTurn 期间调用 pause(true) -> pause(false)，以及 stop() 并发注销清理：
+    //    暂停立即 abort 在途回合、零啼哭泄漏、零误熔断且完整回滚冷却，恢复 pause(false) 后无需等 120s 立即唤醒！
+    const dirC = await mkdtemp(join(tmpdir(), 'asi-030-deep-pause-stop-'));
+    tempDirs.push(dirC);
+
+    let wallC = T0;
+    let monoC = 1_000;
+    let diskFreeC = 512 * 1024 ** 2; // critical space
+    const makeSnapC = () => {
+      const s = makeSnapshot({ now: wallC, mono: monoC });
+      s.state.self.body.disks = {
+        kind: 'disks',
+        ...fact([{ mount: '/', total: 200 * 1024 ** 3, free: diskFreeC }]),
+      };
+      return s;
+    };
+    const senseC = createMockSenseService(makeSnapC(), dirC, () => makeSnapC());
+    const liveC = new Set<string>();
+    const criesC: string[] = [];
+    const seenSignalsC: AbortSignal[] = [];
+    let createCallsC = 0;
+    let rejectFirstCreateC: ((err: Error) => void) | undefined;
+    let releaseFirstTurnC: (() => void) | undefined;
+    let releaseStopCreateC: ((id: string) => void) | undefined;
+    let completedTurnsC = 0;
+
+    const rtC = createNeedsRuntime({
+      storageRoot: dirC,
+      sense: senseC,
+      clock: { wall: () => wallC, mono: () => monoC },
+      probeEndpoint: async () => true,
+      jobs: { listActiveJobs: () => [], hasLiveOwner: () => true, killJob: () => 'already-finished' },
+      compaction: { listIdleSessionIds: () => [], compactIdleSession: async () => ({ compacted: false }) },
+      sessions: {
+        createMaintenanceSession: async (id) => {
+          createCallsC += 1;
+          if (createCallsC === 1) {
+            return await new Promise<string>((_resolve, reject) => {
+              rejectFirstCreateC = reject;
+            });
+          }
+          if (createCallsC === 3) {
+            return await new Promise<string>((resolve) => {
+              releaseStopCreateC = resolve;
+            });
+          }
+          liveC.add(id);
+          return id;
+        },
+        hasSession: (id) => liveC.has(id),
+        runMaintenanceTurn: async (_sid, _prompt, signal) => {
+          seenSignalsC.push(signal);
+          if (seenSignalsC.length === 1) {
+            await new Promise<void>((resolve) => {
+              releaseFirstTurnC = resolve;
+              signal.addEventListener('abort', () => resolve(), { once: true });
+            });
+            if (signal.aborted) return;
+          }
+          completedTurnsC += 1;
+          diskFreeC = 120 * 1024 ** 3;
+        },
+        deliverCryToUserSession: async (_t, _e, content) => {
+          criesC.push(content);
+          return true;
+        },
+      },
+    });
+
+    const startPromiseC = rtC.start();
+    await vi.waitFor(() => expect(rejectFirstCreateC).toBeTypeOf('function'));
+    await startPromiseC;
+
+    // (a) 首次建会话悬停期间调用 pause(true)，随后建会话抛错：暂停态下绝不发 <asi-cry> 且冷却回滚
+    await rtC.actions.pause(true);
+    rejectFirstCreateC?.(new Error('transient session failure while pausing'));
+    await new Promise((r) => setTimeout(r, 15));
+    expect(criesC).toHaveLength(0);
+
+    // 仅隔 3s 调用 pause(false)：因冷却已回滚，立即重建会话并进入首轮 runMaintenanceTurn
+    wallC += 3_000;
+    monoC += 3_000;
+    await rtC.actions.pause(false);
+    await vi.waitFor(() => expect(releaseFirstTurnC).toBeTypeOf('function'));
+    expect(createCallsC).toBe(2);
+
+    // (b) 首轮 runMaintenanceTurn 尚在运行中调用 pause(true)：立即 abort 在途回合、不计完成轮次、不发啼哭、不记熔断且回滚冷却
+    await rtC.actions.pause(true);
+    await vi.waitFor(() => {
+      expect(seenSignalsC[0]?.aborted).toBe(true);
+      expect(rtC.snapshot().maintenanceSession.status).toBe('idle');
+    });
+    expect(completedTurnsC).toBe(0);
+    expect(criesC).toHaveLength(0);
+    expect(rtC.snapshot().maintenanceSession.turnCount).toBe(0);
+
+    // 仅隔 5s（< 120s）调用 pause(false)：立即重新运行自维护并恢复舒适！
+    wallC += 5_000;
+    monoC += 5_000;
+    await rtC.actions.pause(false);
+    await vi.waitFor(() => {
+      expect(completedTurnsC).toBe(1);
+      expect(rtC.snapshot().needs.space.zone).toBe('comfortable');
+    });
+
+    // (c) 模拟会话失效后新建会话悬停（且宿主重分配新 sessionId 注册）期间调用 stop()：零内部会话残留泄漏
+    liveC.clear();
+    const danglingOpen = rtC.actions.openMaintenanceSession();
+    await vi.waitFor(() => expect(releaseStopCreateC).toBeTypeOf('function'));
+    await rtC.stop();
+    rtC.registerMaintenanceSessionId('reassigned-after-stop');
+    releaseStopCreateC?.('reassigned-during-stop');
+    await expect(danglingOpen).rejects.toThrow(/stopped/);
+    expect(senseC.internalSessions().size).toBe(0);
   });
 });
