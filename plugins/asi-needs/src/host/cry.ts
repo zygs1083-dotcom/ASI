@@ -20,10 +20,12 @@ export function formatCryMessage(card: HelpCard): string {
   const safeTitle = String(sanitizeForModel(card.title)).trim();
   const safeSummary = String(sanitizeForModel(card.summary)).trim();
   const safeAction = card.proposedAction ? String(sanitizeForModel(card.proposedAction)).trim() : '';
+  const needAttr = card.need ?? card.driveKey ?? 'drive';
+  const needLabel = card.need ? NEED_LABELS[card.need] : (card.driveLabel ?? card.driveKey ?? '高阶看护');
 
   const lines = [
-    `<asi-cry need="${escapeAttr(card.need)}" severity="${escapeAttr(card.severity)}" card="${escapeAttr(card.id)}">`,
-    `【生存求助 · ${NEED_LABELS[card.need]}】${safeTitle}`,
+    `<asi-cry need="${escapeAttr(needAttr)}" severity="${escapeAttr(card.severity)}" card="${escapeAttr(card.id)}">`,
+    `【生存求助 · ${needLabel}】${safeTitle}`,
     safeSummary,
     ...(safeAction ? [`建议操作：${safeAction}`] : []),
     '（详细体征与一键处理见左侧「生存需求」面板；此消息仅在危急或自救受阻时发送一次。）',

@@ -52,13 +52,23 @@ export type HelpActionKind =
   | 'stop-stuck-jobs'
   | 'compact-context'
   | 'enable-eco'
-  | 'open-permissions';
+  | 'open-permissions'
+  | 'run-drive-action';
 
 export type HelpCardStatus = 'open' | 'approved' | 'dismissed' | 'resolved';
 
 export interface HelpCard {
   id: string;
-  need: NeedKey;
+  /** L1 physiological survival need key (present on L1 cards; omitted on higher-order drive cards). */
+  need?: NeedKey;
+  /** Qualified higher-order drive key (e.g. `'asi-care:workspace_bloat'`) when owned by a `ctx.asiDrives` source. */
+  driveKey?: string;
+  /** Display badge label for higher-order drive cards (e.g. `'L3 · 闲置工作树产物膨胀'`). */
+  driveLabel?: string;
+  /** Custom primary button label for `'run-drive-action'` cards. */
+  approveLabel?: string;
+  /** When true, strictly suppresses `<asi-cry>` foreground chat injection (sidebar-only silent card). */
+  silent?: boolean;
   severity: 'uncomfortable' | 'critical';
   title: string;
   summary: string;

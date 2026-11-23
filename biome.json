@@ -13,6 +13,7 @@
       "plugins/asi-sense/**",
       "plugins/asi-needs/**",
       "plugins/asi-sleep/**",
+      "plugins/asi-care/**",
       "package.json",
       "biome.json",
       "tsconfig.base.json",

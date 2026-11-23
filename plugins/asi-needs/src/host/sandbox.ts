@@ -286,7 +286,11 @@ function cleanText(raw: string, maxLen: number): string {
 export function upsertHelpCard(
   existing: HelpCard[],
   input: {
-    need: NeedKey;
+    need?: NeedKey;
+    driveKey?: string;
+    driveLabel?: string;
+    approveLabel?: string;
+    silent?: boolean;
     severity: 'uncomfortable' | 'critical';
     title: string;
     summary: string;
@@ -300,12 +304,15 @@ export function upsertHelpCard(
   const title = cleanText(input.title, 80) || '需要用户协助恢复运行环境';
   const summary = cleanText(input.summary, 280) || '自维护已触及安全或物理边界，请查看侧栏处理。';
   const proposedAction = input.proposedAction ? cleanText(input.proposedAction, 200) : undefined;
+  const driveLabel = input.driveLabel ? cleanText(input.driveLabel, 48) : undefined;
+  const approveLabel = input.approveLabel ? cleanText(input.approveLabel, 32) : undefined;
 
   const normalizedTarget = input.actionTarget ? cleanText(input.actionTarget, 64) : undefined;
   const matchIdx = existing.findIndex(
     (c) =>
       c.status === 'open' &&
-      c.need === input.need &&
+      (c.need ?? '') === (input.need ?? '') &&
+      (c.driveKey ?? '') === (input.driveKey ?? '') &&
       c.actionKind === actionKind &&
       (c.actionTarget ?? '') === (normalizedTarget ?? ''),
   );
@@ -316,6 +323,9 @@ export function upsertHelpCard(
       severity: input.severity === 'critical' || prev.severity === 'critical' ? 'critical' : 'uncomfortable',
       title,
       summary,
+      ...(driveLabel ? { driveLabel } : {}),
+      ...(approveLabel ? { approveLabel } : {}),
+      ...(input.silent !== undefined ? { silent: input.silent } : {}),
       ...(proposedAction ? { proposedAction } : {}),
       ...(normalizedTarget ? { actionTarget: normalizedTarget } : {}),
       updatedAt: input.now,
@@ -327,7 +337,11 @@ export function upsertHelpCard(
 
   const card: HelpCard = {
     id: `help-${randomUUID().slice(0, 8)}`,
-    need: input.need,
+    ...(input.need ? { need: input.need } : {}),
+    ...(input.driveKey ? { driveKey: input.driveKey } : {}),
+    ...(driveLabel ? { driveLabel } : {}),
+    ...(approveLabel ? { approveLabel } : {}),
+    ...(input.silent ? { silent: true } : {}),
     severity: input.severity,
     title,
     summary,

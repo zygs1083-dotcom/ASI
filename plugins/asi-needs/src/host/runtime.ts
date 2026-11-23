@@ -5,6 +5,8 @@ import { performance } from 'node:perf_hooks';
 import {
   type ActionMeasurement,
   type AsiDrivesServiceApi,
+  type DriveAbortSignal,
+  type DriveHelpCardProposal,
   type DriveSandboxToolResult,
   type HelpActionKind,
   type HelpCard,
@@ -55,6 +57,7 @@ const MAX_AUTONOMOUS_TURNS_PER_HOUR = 6;
 const MAX_MAINTAINER_TURNS_BEFORE_ROTATE = 12;
 const MAX_RECORDS = 40;
 const LIVENESS_HEARTBEAT_MS = 15_000;
+export const ORPHAN_HIGHER_CARD_GRACE_MS = 30_000;
 
 type EpisodeSeverity = 'uncomfortable' | 'critical';
 
@@ -124,13 +127,18 @@ export interface NeedsActions {
 }
 
 export interface NeedsDrivesRuntimeApi extends AsiDrivesServiceApi {
+  proposeHelpCard(sourceId: string, proposal: DriveHelpCardProposal): Promise<HelpCard>;
+  resolveHelpCards(
+    sourceId: string,
+    filter?: { driveKey?: string; actionTarget?: string; exceptActionTargets?: readonly string[] },
+  ): Promise<number>;
   onToolsStructureChanged(listener: () => void): () => void;
   registeredSandboxTools(): RegisteredSandboxTool[];
   checkSandboxToolGuard(toolName: string): { allowed: boolean; reason?: string };
   executeSandboxTool(
     tool: RegisteredSandboxTool,
     args: Record<string, unknown>,
-    signal: AbortSignal,
+    signal: AbortSignal | DriveAbortSignal,
   ): Promise<DriveSandboxToolResult & { gain: ActionMeasurement }>;
 }
 
@@ -144,6 +152,7 @@ export interface NeedsRuntime {
   subscribe(listener: () => void): () => void;
   registerMaintenanceSessionId(sessionId: string): void;
   isMaintenanceSession(sessionId: string): boolean;
+  isHigherOrderTurnActive?(): boolean;
   reportTransportResult(reachable: boolean, errorText?: string): void;
   readonly tools: MaintenanceToolsApi;
   readonly actions: NeedsActions;
@@ -173,6 +182,13 @@ export function validateHelpActionTarget(
       );
     }
     return actionTarget;
+  }
+  if (actionKind === 'run-drive-action') {
+    const trimmed = actionTarget?.trim();
+    if (!trimmed || hasPathCharacters(trimmed) || trimmed === TRASH_READONLY_RULE.id || trimmed.length > 64) {
+      throw new Error('run-drive-action requires a controlled non-path actionTarget identifier (1..64 chars)');
+    }
+    return trimmed;
   }
   if (actionTarget === undefined || actionTarget === '') {
     return undefined;
@@ -219,6 +235,7 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime & { read
   let lastHigherAutoRunMono: number | undefined;
   let activeRunningTier: 'l1' | 'higher' | null = null;
   let higherOrderTurnAbort: AbortController | undefined;
+  const inFlightHigherSandboxAborts = new Set<AbortController>();
   let rotateMaintainerNext = false;
   let pendingMaintenanceRecheck = false;
   let sessionCreationInFlight: Promise<string> | undefined;
@@ -226,20 +243,71 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime & { read
   let activeCheckManual = false;
   let maintCheckPromise: Promise<void> | undefined;
   let queuedManualCheckPromise: Promise<void> | undefined;
+  const handlingCardIds = new Set<string>();
 
   let started = false;
   let stopped = false;
+  let startedAtMono: number | undefined;
   let unsubscribeSense: (() => void) | undefined;
   let heartbeatTimer: ReturnType<typeof setInterval> | undefined;
+  let orphanCardGraceTimer: ReturnType<typeof setTimeout> | undefined;
   let turnAbort = new AbortController();
   let persistChain: Promise<void> = Promise.resolve();
-  let reconcileInFlight: Promise<void> | undefined;
+  let reconcileInFlight: Promise<void> = Promise.resolve();
 
-  const arbiter = new MaslowDriveArbiter(() => {
-    if (started && !stopped) {
-      void scheduleProcess(ports.sense.snapshot());
+  const arbiter = new MaslowDriveArbiter(
+    () => {
+      if (started && !stopped) {
+        void scheduleProcess(ports.sense.snapshot());
+      }
+    },
+    (unregisteredSourceId) => {
+      const now = clock.wall();
+      let changed = false;
+      helpCards = helpCards.map((c) => {
+        if (c.status === 'open' && c.driveKey?.startsWith(`${unregisteredSourceId}:`)) {
+          changed = true;
+          return { ...c, status: 'resolved', updatedAt: now };
+        }
+        return c;
+      });
+      for (const brokenKey of circuitBreaker.trippedNeeds()) {
+        if (brokenKey.startsWith(`${unregisteredSourceId}:`)) {
+          circuitBreaker.clear(brokenKey);
+          changed = true;
+        }
+      }
+      if (changed) {
+        void persistState();
+        notify();
+      }
+    },
+  );
+
+  function sweepOrphanHigherOrderCards(now: number): boolean {
+    let changed = false;
+    helpCards = helpCards.map((c) => {
+      if (c.status !== 'open' || !c.driveKey || handlingCardIds.has(c.id)) return c;
+      const colon = c.driveKey.indexOf(':');
+      const sourceId = colon > 0 ? c.driveKey.slice(0, colon) : '';
+      if (!sourceId || !arbiter.getSource(sourceId)) {
+        changed = true;
+        return { ...c, status: 'resolved', updatedAt: now };
+      }
+      return c;
+    });
+    for (const brokenKey of circuitBreaker.trippedNeeds()) {
+      const colon = brokenKey.indexOf(':');
+      if (colon > 0) {
+        const sourceId = brokenKey.slice(0, colon);
+        if (!arbiter.getSource(sourceId)) {
+          circuitBreaker.clear(brokenKey);
+          changed = true;
+        }
+      }
     }
-  });
+    return changed;
+  }
 
   let latestSense: SenseSnapshot = ports.sense.snapshot();
   let latestEval = evaluateNeeds({
@@ -315,6 +383,10 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime & { read
 
   function abortInFlightMaintenanceForPause(): void {
     pendingMaintenanceRecheck = false;
+    for (const ctrl of [...inFlightHigherSandboxAborts]) {
+      ctrl.abort();
+    }
+    inFlightHigherSandboxAborts.clear();
     if (maintCheckLocked || maintStatus === 'running') {
       turnAbort.abort();
       turnAbort = new AbortController();
@@ -481,6 +553,7 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime & { read
   }
 
   async function deliverCryIfNeeded(card: HelpCard): Promise<boolean> {
+    if (card.silent || !card.need) return false;
     if (isCrySuppressed(card.need, card.severity)) return false;
     const exclude = new Set(internalSessions.keys());
     const mode = chooseCryDeliveryMode(effectiveConnectivity());
@@ -699,9 +772,15 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime & { read
     });
     if (snap.settings.paused) {
       abortInFlightMaintenanceForPause();
-    } else if (latestHigherOrder.snapshot.higherOrderSuppressed && activeRunningTier === 'higher') {
-      higherOrderTurnAbort?.abort();
-      pendingMaintenanceRecheck = true;
+    } else if (latestHigherOrder.snapshot.higherOrderSuppressed) {
+      for (const ctrl of [...inFlightHigherSandboxAborts]) {
+        ctrl.abort();
+      }
+      inFlightHigherSandboxAborts.clear();
+      if (activeRunningTier === 'higher') {
+        higherOrderTurnAbort?.abort();
+        pendingMaintenanceRecheck = true;
+      }
     }
     for (const d of latestHigherOrder.higherOrderDrives) {
       circuitBreaker.reconcileNeed({
@@ -711,6 +790,21 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime & { read
         satisfaction: d.satisfaction,
         envFingerprint: fingerprintForDrive(d.key, snap, d, stuckCount),
       });
+      if (!d.driveActive) {
+        helpCards = helpCards.map((c) => {
+          if (c.driveKey === d.key && c.status === 'open') {
+            stateChanged = true;
+            return { ...c, status: 'resolved', updatedAt: snap.now };
+          }
+          return c;
+        });
+      }
+    }
+
+    if (startedAtMono !== undefined && clock.mono() - startedAtMono >= ORPHAN_HIGHER_CARD_GRACE_MS) {
+      if (sweepOrphanHigherOrderCards(snap.now)) {
+        stateChanged = true;
+      }
     }
 
     if (circuitBreaker.trippedNeeds().length !== prevTrippedCount) {
@@ -836,11 +930,19 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime & { read
       lines.push('', '历史行动效果记忆（Action-Outcome Memory）：', ...recommendations);
     }
 
+    const higherToolNames =
+      distressedHigher.length > 0
+        ? arbiter
+            .registeredSandboxTools()
+            .filter((t) => distressedHigher.some((d) => d.key.startsWith(`${t.sourceId}:`)))
+            .map((t) => t.spec.name)
+        : [];
+
     lines.push(
       '',
       '执行准则：',
-      '1. 仅使用只读诊断工具（needs_status / needs_sniff_causes / env_state / env_detail）与当前沙盒挂载的白名单维护工具（needs_clean_cache / needs_stop_job / needs_compact_context / needs_request_help 及已授权高阶需求工具）。',
-      '2. 无人值守时仅自动清理 ASI 自身临时缓存（needs_clean_cache）；若 needs_sniff_causes 发现外部 safe/caution 开发者缓存大户，请调用 needs_request_help（actionKind="clean-external-cache" 且传入受控 targetId）请求用户一键批准清理。',
+      `1. 仅使用只读诊断工具（needs_status / needs_sniff_causes / care_status / env_state / env_detail）与当前沙盒挂载的白名单维护工具（needs_clean_cache / needs_stop_job / needs_compact_context / needs_request_help${higherToolNames.length > 0 ? ` / ${higherToolNames.join(' / ')}` : ' 及已授权高阶需求工具'}）。`,
+      '2. 针对 L1 生理需求，无人值守仅自动清理 ASI 自身临时缓存（needs_clean_cache），外部 safe/caution 开发者缓存大户请调用 needs_request_help（actionKind="clean-external-cache" 且传入受控 targetId）请求批准；针对 L2–L4 高阶需求，可无人值守执行其挂载的一级零损沙盒工具，需人工批准或只读提示时必须调用对应高阶静默求助卡工具（如 care_request_help），严禁为高阶需求调用 needs_request_help 触发 <asi-cry> 打断用户前台对话。',
       '3. 严禁尝试清空废纸篓、删除用户文件、强杀外部应用进程或修改系统配置。',
     );
     return lines.join('\n');
@@ -1380,7 +1482,12 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime & { read
     await checkImmediateBoundaries(latestSense);
     if (!latestSense.settings.paused) {
       for (const openCard of helpCards) {
-        if (openCard.status === 'open' && !isCrySuppressed(openCard.need, openCard.severity)) {
+        if (
+          openCard.status === 'open' &&
+          !openCard.silent &&
+          openCard.need &&
+          !isCrySuppressed(openCard.need, openCard.severity)
+        ) {
           await deliverCryIfNeeded(openCard);
         }
       }
@@ -1612,6 +1719,11 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime & { read
     },
 
     async requestHelp(input) {
+      if (activeRunningTier === 'higher') {
+        throw new Error(
+          'needs_request_help (<asi-cry>) is forbidden during higher-order L2-L4 maintenance turns; use the drive silent help card tool (e.g. care_request_help)',
+        );
+      }
       const actionKind = input.actionKind ?? 'acknowledge';
       const validatedTarget = validateHelpActionTarget(actionKind, input.actionTarget);
       if (actionKind === 'clean-external-cache' && validatedTarget && ports.homeDir) {
@@ -1679,144 +1791,302 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime & { read
     },
 
     async approveHelp(cardId: string) {
+      if (handlingCardIds.has(cardId)) return;
       const card = helpCards.find((c) => c.id === cardId);
       if (card?.status !== 'open') return;
+      handlingCardIds.add(cardId);
 
-      const now = clock.wall();
-      const beforeSat = latestEval.needs[card.need].satisfaction;
-      let actionSummary = `用户确认处理：${card.title}`;
-      let ledgerAction: string | undefined;
-      let freedBytes = 0;
-      let stoppedJobsCount = 0;
-      let tokensSaved = 0;
+      try {
+        const now = clock.wall();
+        if (card.driveKey) {
+          const colonIdx = card.driveKey.indexOf(':');
+          const sourceId = colonIdx > 0 ? card.driveKey.slice(0, colonIdx) : '';
+          const ownerSource = sourceId ? arbiter.getSource(sourceId) : undefined;
+          if (!ownerSource || (card.actionKind === 'run-drive-action' && !ownerSource.executeHelpAction)) {
+            circuitBreaker.clear(card.driveKey);
+            helpCards = helpCards.map((c) => (c.id === cardId ? { ...c, status: 'resolved', updatedAt: now } : c));
+            addRecord({
+              actor: 'user',
+              driveKey: card.driveKey,
+              action: 'resolve-orphan-help-card',
+              summary: `对应高阶看护插件（${sourceId || card.driveKey}）未挂载或已卸载，已自动归档历史求助卡：${card.title}`,
+              outcome: 'relieved',
+            });
+            await persistState();
+            notify();
+            return;
+          }
 
-      if (card.actionKind === 'clean-cache') {
-        const cleaned = await cleanSafeCaches({
-          needsStorageRoot: ports.storageRoot,
-          senseStorageRoot: ports.sense.storageRoot,
-          now,
-        });
-        freedBytes = cleaned.freedBytes;
-        ledgerAction = 'clean-cache';
-        actionSummary = `用户批准清理自有缓存，删除 ${cleaned.deletedEntries} 项（释放 ${formatHumanBytes(cleaned.freedBytes)}）`;
-      } else if (card.actionKind === 'clean-external-cache') {
-        const targetId = validateHelpActionTarget('clean-external-cache', card.actionTarget);
-        if (!targetId) {
-          throw new Error('Missing whitelisted targetId for clean-external-cache');
+          const beforeSat = arbiter.findDrive(card.driveKey)?.satisfaction;
+          let actionSummary = `用户确认处理：${card.title}`;
+          let ledgerAction: string | undefined;
+          let freedBytes = 0;
+          let stoppedJobsCount = 0;
+          let tokensSaved = 0;
+
+          if (card.actionKind === 'run-drive-action') {
+            const targetId = validateHelpActionTarget('run-drive-action', card.actionTarget);
+            if (!targetId) {
+              throw new Error('Missing controlled actionTarget for run-drive-action');
+            }
+            const res = await arbiter.executeHelpAction(card.driveKey, {
+              cardId: card.id,
+              driveKey: card.driveKey,
+              actionTarget: targetId,
+              now,
+              signal: turnAbort.signal,
+            });
+            freedBytes = res.freedBytes ?? 0;
+            stoppedJobsCount = res.stoppedJobs ?? 0;
+            tokensSaved = res.tokensSaved ?? 0;
+            ledgerAction = res.ledgerAction?.trim() || `run-drive-action:${targetId}`;
+            actionSummary = String(sanitizeForModel(res.summary || actionSummary)).slice(0, 240);
+          } else {
+            await arbiter.notifyHelpAcknowledged(card.driveKey, {
+              cardId: card.id,
+              driveKey: card.driveKey,
+              ...(card.actionTarget ? { actionTarget: card.actionTarget } : {}),
+              now,
+            });
+          }
+
+          await ports.sense.refresh?.().catch(() => undefined);
+          recomputeEval(ports.sense.snapshot());
+          const afterDrive = arbiter.findDrive(card.driveKey);
+          const afterSat = afterDrive?.satisfaction;
+
+          let gain: ActionMeasurement | undefined;
+          if (ledgerAction) {
+            gain = buildActionMeasurement({
+              freedBytes,
+              stoppedJobs: stoppedJobsCount,
+              tokensSaved,
+              satisfactionBefore: beforeSat,
+              satisfactionAfter: afterSat,
+            });
+            actionLedger.record({ need: card.driveKey, action: ledgerAction, at: now, gain });
+          }
+
+          if (card.actionKind === 'acknowledge' && afterDrive?.driveActive && afterDrive.zone !== 'comfortable') {
+            circuitBreaker.trip({
+              need: card.driveKey,
+              trippedAt: now,
+              zoneAtTrip: afterDrive.zone,
+              satisfactionAtTrip: afterDrive.satisfaction,
+              envFingerprint: fingerprintForDrive(card.driveKey, latestSense, afterDrive),
+              reason: '用户已确认只读高阶提示卡，静默熔断等待环境变化',
+            });
+          } else {
+            circuitBreaker.clear(card.driveKey);
+          }
+          helpCards = helpCards.map((c) => (c.id === cardId ? { ...c, status: 'approved', updatedAt: now } : c));
+          const recordOutcome: MaintenanceOutcome = afterDrive?.driveActive
+            ? gain?.effective
+              ? 'partial'
+              : 'info'
+            : 'relieved';
+          addRecord({
+            actor: 'user',
+            driveKey: card.driveKey,
+            action: ledgerAction ?? card.actionKind,
+            summary: actionSummary,
+            outcome: recordOutcome,
+            ...(gain ? { gain } : {}),
+          });
+          await persistState();
+          await scheduleProcess(ports.sense.snapshot());
+          return;
         }
-        const cleaned = await cleanExternalCacheTarget({
-          homeDir: ports.homeDir ?? '',
-          targetId,
-          now,
-          activeProtectionMs: EXTERNAL_CACHE_ACTIVE_PROTECTION_MS,
+
+        if (!card.need) {
+          helpCards = helpCards.map((c) => (c.id === cardId ? { ...c, status: 'resolved', updatedAt: now } : c));
+          await persistState();
+          notify();
+          return;
+        }
+        const cardNeed = card.need;
+        const beforeSat = latestEval.needs[cardNeed].satisfaction;
+        let actionSummary = `用户确认处理：${card.title}`;
+        let ledgerAction: string | undefined;
+        let freedBytes = 0;
+        let stoppedJobsCount = 0;
+        let tokensSaved = 0;
+
+        if (card.actionKind === 'clean-cache') {
+          const cleaned = await cleanSafeCaches({
+            needsStorageRoot: ports.storageRoot,
+            senseStorageRoot: ports.sense.storageRoot,
+            now,
+          });
+          freedBytes = cleaned.freedBytes;
+          ledgerAction = 'clean-cache';
+          actionSummary = `用户批准清理自有缓存，删除 ${cleaned.deletedEntries} 项（释放 ${formatHumanBytes(cleaned.freedBytes)}）`;
+        } else if (card.actionKind === 'clean-external-cache') {
+          const targetId = validateHelpActionTarget('clean-external-cache', card.actionTarget);
+          if (!targetId) {
+            throw new Error('Missing whitelisted targetId for clean-external-cache');
+          }
+          const cleaned = await cleanExternalCacheTarget({
+            homeDir: ports.homeDir ?? '',
+            targetId,
+            now,
+            activeProtectionMs: EXTERNAL_CACHE_ACTIVE_PROTECTION_MS,
+          });
+          freedBytes = cleaned.freedBytes;
+          ledgerAction = `clean-external-cache:${cleaned.targetId}`;
+          const activeNote =
+            cleaned.skippedActiveEntries > 0
+              ? `，自动保护跳过 1 小时内活跃子项 ${cleaned.skippedActiveEntries} 项`
+              : '';
+          actionSummary = `用户批准清理 ${cleaned.label}：清除陈旧缓存 ${cleaned.deletedEntries} 项，释放 ${formatHumanBytes(cleaned.freedBytes)}${activeNote}`;
+        } else if (card.actionKind === 'stop-stuck-jobs') {
+          const stoppedJobs = stopStuckJobs({
+            jobsPort: ports.jobs,
+            now,
+            ...(card.actionTarget ? { targetJobId: card.actionTarget } : {}),
+          });
+          stoppedJobsCount = stoppedJobs.stoppedIds.length;
+          ledgerAction = 'stop-stuck-jobs';
+          actionSummary = `用户批准结束卡死任务（${stoppedJobs.stoppedIds.length} 个）`;
+        } else if (card.actionKind === 'compact-context') {
+          const compacted = await compactIdleContexts({
+            compactionPort: ports.compaction,
+            excludeSessionIds: new Set(internalSessions.keys()),
+            signal: turnAbort.signal,
+          });
+          tokensSaved = compacted.tokensSaved;
+          ledgerAction = 'compact-context';
+          actionSummary = `用户批准整理上下文（${compacted.compactedSessions} 个空闲会话）`;
+        } else if (card.actionKind === 'enable-eco') {
+          await ports.sense.setPowerMode('eco', '用户批准节能模式');
+          ledgerAction = 'enable-eco';
+          actionSummary = '用户批准进入节能降频模式';
+        } else if (card.actionKind === 'open-permissions') {
+          await ports.sense.openPermissionSettings();
+          actionSummary = '用户打开系统权限设置';
+        }
+
+        await ports.sense.refresh?.().catch(() => undefined);
+        recomputeEval(ports.sense.snapshot());
+        const afterSat = latestEval.needs[cardNeed].satisfaction;
+
+        let gain: ActionMeasurement | undefined;
+        if (ledgerAction) {
+          gain = buildActionMeasurement({
+            freedBytes,
+            stoppedJobs: stoppedJobsCount,
+            tokensSaved,
+            satisfactionBefore: beforeSat,
+            satisfactionAfter: afterSat,
+          });
+          actionLedger.record({ need: cardNeed, action: ledgerAction, at: now, gain });
+        }
+
+        circuitBreaker.clear(cardNeed);
+        recordEpisodeSeverity(criedEpisodeSeverity, cardNeed, card.severity);
+        helpCards = helpCards.map((c) => (c.id === cardId ? { ...c, status: 'approved', updatedAt: now } : c));
+
+        let proposedFollowUpExternal = false;
+        if (card.actionKind === 'clean-external-cache' && latestEval.needs.space.driveActive) {
+          const nextSev: EpisodeSeverity = latestEval.needs.space.zone === 'critical' ? 'critical' : 'uncomfortable';
+          proposedFollowUpExternal = await maybeProposeExternalCacheHelpCard(nextSev, {
+            allowAfterApprovedExternal: true,
+          });
+        }
+        if (!proposedFollowUpExternal) {
+          recordEpisodeSeverity(handledEpisodeSeverity, cardNeed, card.severity);
+        }
+
+        const recordOutcome: MaintenanceOutcome =
+          card.actionKind === 'clean-external-cache' && latestEval.needs[cardNeed].driveActive
+            ? freedBytes > 0
+              ? 'partial'
+              : 'info'
+            : 'relieved';
+        addRecord({
+          actor: 'user',
+          need: cardNeed,
+          action: ledgerAction ?? card.actionKind,
+          summary: actionSummary,
+          outcome: recordOutcome,
+          ...(gain ? { gain } : {}),
         });
-        freedBytes = cleaned.freedBytes;
-        ledgerAction = `clean-external-cache:${cleaned.targetId}`;
-        const activeNote =
-          cleaned.skippedActiveEntries > 0 ? `，自动保护跳过 1 小时内活跃子项 ${cleaned.skippedActiveEntries} 项` : '';
-        actionSummary = `用户批准清理 ${cleaned.label}：清除陈旧缓存 ${cleaned.deletedEntries} 项，释放 ${formatHumanBytes(cleaned.freedBytes)}${activeNote}`;
-      } else if (card.actionKind === 'stop-stuck-jobs') {
-        const stoppedJobs = stopStuckJobs({
-          jobsPort: ports.jobs,
-          now,
-          ...(card.actionTarget ? { targetJobId: card.actionTarget } : {}),
-        });
-        stoppedJobsCount = stoppedJobs.stoppedIds.length;
-        ledgerAction = 'stop-stuck-jobs';
-        actionSummary = `用户批准结束卡死任务（${stoppedJobs.stoppedIds.length} 个）`;
-      } else if (card.actionKind === 'compact-context') {
-        const compacted = await compactIdleContexts({
-          compactionPort: ports.compaction,
-          excludeSessionIds: new Set(internalSessions.keys()),
-          signal: turnAbort.signal,
-        });
-        tokensSaved = compacted.tokensSaved;
-        ledgerAction = 'compact-context';
-        actionSummary = `用户批准整理上下文（${compacted.compactedSessions} 个空闲会话）`;
-      } else if (card.actionKind === 'enable-eco') {
-        await ports.sense.setPowerMode('eco', '用户批准节能模式');
-        ledgerAction = 'enable-eco';
-        actionSummary = '用户批准进入节能降频模式';
-      } else if (card.actionKind === 'open-permissions') {
-        await ports.sense.openPermissionSettings();
-        actionSummary = '用户打开系统权限设置';
+        await persistState();
+        await scheduleProcess(ports.sense.snapshot());
+      } finally {
+        handlingCardIds.delete(cardId);
       }
-
-      await ports.sense.refresh?.().catch(() => undefined);
-      recomputeEval(ports.sense.snapshot());
-      const afterSat = latestEval.needs[card.need].satisfaction;
-
-      let gain: ActionMeasurement | undefined;
-      if (ledgerAction) {
-        gain = buildActionMeasurement({
-          freedBytes,
-          stoppedJobs: stoppedJobsCount,
-          tokensSaved,
-          satisfactionBefore: beforeSat,
-          satisfactionAfter: afterSat,
-        });
-        actionLedger.record({ need: card.need, action: ledgerAction, at: now, gain });
-      }
-
-      circuitBreaker.clear(card.need);
-      recordEpisodeSeverity(criedEpisodeSeverity, card.need, card.severity);
-      helpCards = helpCards.map((c) => (c.id === cardId ? { ...c, status: 'approved', updatedAt: now } : c));
-
-      let proposedFollowUpExternal = false;
-      if (card.actionKind === 'clean-external-cache' && latestEval.needs.space.driveActive) {
-        const nextSev: EpisodeSeverity = latestEval.needs.space.zone === 'critical' ? 'critical' : 'uncomfortable';
-        proposedFollowUpExternal = await maybeProposeExternalCacheHelpCard(nextSev, {
-          allowAfterApprovedExternal: true,
-        });
-      }
-      if (!proposedFollowUpExternal) {
-        recordEpisodeSeverity(handledEpisodeSeverity, card.need, card.severity);
-      }
-
-      const recordOutcome: MaintenanceOutcome =
-        card.actionKind === 'clean-external-cache' && latestEval.needs[card.need].driveActive
-          ? freedBytes > 0
-            ? 'partial'
-            : 'info'
-          : 'relieved';
-      addRecord({
-        actor: 'user',
-        need: card.need,
-        action: ledgerAction ?? card.actionKind,
-        summary: actionSummary,
-        outcome: recordOutcome,
-        ...(gain ? { gain } : {}),
-      });
-      await persistState();
-      await scheduleProcess(ports.sense.snapshot());
     },
 
     async dismissHelp(cardId: string) {
+      if (handlingCardIds.has(cardId)) return;
       const card = helpCards.find((c) => c.id === cardId);
       if (card?.status !== 'open') return;
-      const now = clock.wall();
-      if (card.actionKind === 'clean-external-cache' && card.actionTarget) {
-        dismissedExternalTargets.add(card.actionTarget);
-      }
-      recordEpisodeSeverity(criedEpisodeSeverity, card.need, card.severity);
-      recordEpisodeSeverity(handledEpisodeSeverity, card.need, card.severity);
-      helpCards = helpCards.map((c) => (c.id === cardId ? { ...c, status: 'dismissed', updatedAt: now } : c));
+      handlingCardIds.add(cardId);
+      try {
+        const now = clock.wall();
+        if (card.driveKey) {
+          const colonIdx = card.driveKey.indexOf(':');
+          const sourceId = colonIdx > 0 ? card.driveKey.slice(0, colonIdx) : '';
+          const ownerSource = sourceId ? arbiter.getSource(sourceId) : undefined;
+          arbiter.notifyHelpDismissed(card.driveKey, {
+            cardId: card.id,
+            driveKey: card.driveKey,
+            ...(card.actionTarget ? { actionTarget: card.actionTarget } : {}),
+            now,
+          });
+          helpCards = helpCards.map((c) => (c.id === cardId ? { ...c, status: 'dismissed', updatedAt: now } : c));
+          if (!ownerSource) {
+            circuitBreaker.clear(card.driveKey);
+          } else {
+            const hd = arbiter.findDrive(card.driveKey);
+            if (hd?.driveActive && hd.zone !== 'comfortable') {
+              circuitBreaker.trip({
+                need: card.driveKey,
+                trippedAt: now,
+                zoneAtTrip: hd.zone,
+                satisfactionAtTrip: hd.satisfaction,
+                envFingerprint: fingerprintForDrive(card.driveKey, latestSense, hd),
+                reason: '用户已忽略当前高阶需求求助卡，静默熔断避免重复唤醒模型',
+              });
+            }
+          }
+          await persistState();
+          notify();
+          return;
+        }
+        if (!card.need) {
+          helpCards = helpCards.map((c) => (c.id === cardId ? { ...c, status: 'dismissed', updatedAt: now } : c));
+          await persistState();
+          notify();
+          return;
+        }
+        const cardNeed = card.need;
+        if (card.actionKind === 'clean-external-cache' && card.actionTarget) {
+          dismissedExternalTargets.add(card.actionTarget);
+        }
+        recordEpisodeSeverity(criedEpisodeSeverity, cardNeed, card.severity);
+        recordEpisodeSeverity(handledEpisodeSeverity, cardNeed, card.severity);
+        helpCards = helpCards.map((c) => (c.id === cardId ? { ...c, status: 'dismissed', updatedAt: now } : c));
 
-      const ev = latestEval.needs[card.need];
-      if (card.need !== 'energy' && ev.driveActive && ev.zone !== 'comfortable') {
-        const tripDiskFree = card.need === 'space' ? primaryDiskFreeBytes(latestSense) : undefined;
-        circuitBreaker.trip({
-          need: card.need,
-          trippedAt: now,
-          zoneAtTrip: ev.zone,
-          satisfactionAtTrip: ev.satisfaction,
-          envFingerprint: fingerprintForDrive(card.need, latestSense, ev),
-          ...(tripDiskFree !== undefined ? { diskFreeAtTrip: tripDiskFree } : {}),
-          reason: '用户已忽略当前剧集求助卡，静默熔断避免重复唤醒模型',
-        });
+        const ev = latestEval.needs[cardNeed];
+        if (cardNeed !== 'energy' && ev.driveActive && ev.zone !== 'comfortable') {
+          const tripDiskFree = cardNeed === 'space' ? primaryDiskFreeBytes(latestSense) : undefined;
+          circuitBreaker.trip({
+            need: cardNeed,
+            trippedAt: now,
+            zoneAtTrip: ev.zone,
+            satisfactionAtTrip: ev.satisfaction,
+            envFingerprint: fingerprintForDrive(cardNeed, latestSense, ev),
+            ...(tripDiskFree !== undefined ? { diskFreeAtTrip: tripDiskFree } : {}),
+            reason: '用户已忽略当前剧集求助卡，静默熔断避免重复唤醒模型',
+          });
+        }
+        await persistState();
+        notify();
+      } finally {
+        handlingCardIds.delete(cardId);
       }
-      await persistState();
-      notify();
     },
 
     async openMaintenanceSession() {
@@ -1838,6 +2108,90 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime & { read
     registeredSandboxTools: () => arbiter.registeredSandboxTools(),
     checkSandboxToolGuard: (toolName) => arbiter.checkSandboxToolGuard(toolName),
 
+    async proposeHelpCard(sourceId, proposal) {
+      const src = arbiter.getSource(sourceId);
+      if (!src) {
+        throw new Error(`Unknown drive source: ${String(sourceId)}`);
+      }
+      const cleanRawKey = proposal.driveKey?.trim();
+      if (!cleanRawKey) {
+        throw new Error('driveKey is required for higher-order help card');
+      }
+      const qKey = arbiter.qualifySourceDriveKey(sourceId, cleanRawKey);
+      const actionKind = proposal.actionKind ?? 'acknowledge';
+      if (actionKind !== 'acknowledge' && actionKind !== 'run-drive-action') {
+        throw new Error(`Unsupported higher-order help actionKind: ${String(actionKind)}`);
+      }
+      if (actionKind === 'run-drive-action' && !src.executeHelpAction) {
+        throw new Error(`Drive source "${sourceId}" has not registered an executeHelpAction handler`);
+      }
+      const validatedTarget = validateHelpActionTarget(actionKind, proposal.actionTarget);
+      const now = clock.wall();
+      const curDrive = arbiter.findDrive(qKey);
+      const driveLabel = curDrive ? `L${src.tier} · ${curDrive.label}` : `L${src.tier} · ${src.label}`;
+      const severity: EpisodeSeverity =
+        proposal.severity ?? (curDrive?.zone === 'critical' ? 'critical' : 'uncomfortable');
+
+      const prevSame = helpCards.find(
+        (c) =>
+          c.status === 'open' &&
+          c.driveKey === qKey &&
+          c.actionKind === actionKind &&
+          (c.actionTarget ?? '') === (validatedTarget ?? ''),
+      );
+      const res = upsertHelpCard(helpCards, {
+        driveKey: qKey,
+        driveLabel,
+        ...(proposal.approveLabel ? { approveLabel: proposal.approveLabel } : {}),
+        silent: true,
+        severity,
+        title: proposal.title,
+        summary: proposal.summary,
+        ...(proposal.proposedAction ? { proposedAction: proposal.proposedAction } : {}),
+        actionKind,
+        ...(validatedTarget ? { actionTarget: validatedTarget } : {}),
+        now,
+      });
+      const sameContent =
+        !res.created &&
+        prevSame !== undefined &&
+        prevSame.severity === res.card.severity &&
+        prevSame.title === res.card.title &&
+        prevSame.summary === res.card.summary &&
+        prevSame.proposedAction === res.card.proposedAction &&
+        prevSame.approveLabel === res.card.approveLabel &&
+        prevSame.actionTarget === res.card.actionTarget;
+
+      if (!sameContent) {
+        helpCards = res.cards;
+        await persistState();
+        notify();
+      }
+      const activeCard = helpCards.find((c) => c.id === res.card.id) ?? (sameContent && prevSame ? prevSame : res.card);
+      return structuredClone(activeCard);
+    },
+
+    async resolveHelpCards(sourceId, filter) {
+      const prefix = `${sourceId}:`;
+      const targetKey = filter?.driveKey ? arbiter.qualifySourceDriveKey(sourceId, filter.driveKey) : undefined;
+      const keepSet = filter?.exceptActionTargets ? new Set(filter.exceptActionTargets) : undefined;
+      const now = clock.wall();
+      let resolvedCount = 0;
+      helpCards = helpCards.map((c) => {
+        if (c.status !== 'open' || handlingCardIds.has(c.id) || !c.driveKey?.startsWith(prefix)) return c;
+        if (targetKey && c.driveKey !== targetKey) return c;
+        if (filter?.actionTarget !== undefined && (c.actionTarget ?? '') !== filter.actionTarget) return c;
+        if (keepSet && c.actionTarget !== undefined && keepSet.has(c.actionTarget)) return c;
+        resolvedCount += 1;
+        return { ...c, status: 'resolved', updatedAt: now };
+      });
+      if (resolvedCount > 0) {
+        await persistState();
+        notify();
+      }
+      return resolvedCount;
+    },
+
     async executeSandboxTool(tool, args, signal) {
       const guard = arbiter.checkSandboxToolGuard(tool.spec.name);
       if (!guard.allowed) {
@@ -1847,7 +2201,31 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime & { read
       const targetKey = arbiter.resolveTargetDriveKey(tool) ?? `${tool.sourceId}:default`;
       const beforeSat = arbiter.findDrive(targetKey)?.satisfaction;
 
-      const res = await tool.spec.execute(args, { signal });
+      const preemptCtrl = new AbortController();
+      if (arbiter.snapshot().higherOrderSuppressed) {
+        preemptCtrl.abort();
+      }
+      inFlightHigherSandboxAborts.add(preemptCtrl);
+
+      const abortSources: AbortSignal[] = [turnAbort.signal, preemptCtrl.signal];
+      if (higherOrderTurnAbort) abortSources.push(higherOrderTurnAbort.signal);
+      if (signal instanceof AbortSignal) abortSources.push(signal);
+      const effectiveSignal =
+        signal && !(signal instanceof AbortSignal) && signal.aborted
+          ? AbortSignal.abort()
+          : AbortSignal.any(abortSources);
+
+      let res: Awaited<ReturnType<typeof tool.spec.execute>>;
+      try {
+        res = await tool.spec.execute(args, { signal: effectiveSignal });
+      } finally {
+        inFlightHigherSandboxAborts.delete(preemptCtrl);
+      }
+      if (effectiveSignal.aborted || signal?.aborted) {
+        const err = new Error('Higher-order sandbox tool aborted due to preemption');
+        err.name = 'AbortError';
+        throw err;
+      }
       await ports.sense.refresh?.().catch(() => undefined);
       recomputeEval(ports.sense.snapshot());
       const afterSat = arbiter.findDrive(targetKey)?.satisfaction;
@@ -1889,6 +2267,7 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime & { read
       if (started) return;
       started = true;
       stopped = false;
+      startedAtMono = clock.mono();
       try {
         const raw = await readFile(statePath, 'utf8');
         const parsed = JSON.parse(raw) as PersistedNeedsState;
@@ -1927,7 +2306,7 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime & { read
           previousStates = restored;
         }
         for (const card of helpCards) {
-          if (card.status === 'open' && (NEED_KEYS as readonly string[]).includes(card.need)) {
+          if (card.status === 'open' && card.need && (NEED_KEYS as readonly string[]).includes(card.need)) {
             const cur = previousStates[card.need];
             if (!cur?.driveActive) {
               previousStates[card.need] = {
@@ -1990,9 +2369,20 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime & { read
         // Fresh or unreadable state file
       }
       await scheduleProcess(ports.sense.snapshot());
+      if (stopped) return;
       unsubscribeSense = ports.sense.subscribe((snap) => {
         void scheduleProcess(snap);
       });
+      orphanCardGraceTimer = setTimeout(() => {
+        orphanCardGraceTimer = undefined;
+        const graceElapsed =
+          !ports.clock || (startedAtMono !== undefined && clock.mono() - startedAtMono >= ORPHAN_HIGHER_CARD_GRACE_MS);
+        if (!stopped && graceElapsed && sweepOrphanHigherOrderCards(clock.wall())) {
+          void persistState();
+          notify();
+        }
+      }, ORPHAN_HIGHER_CARD_GRACE_MS);
+      orphanCardGraceTimer.unref?.();
       heartbeatTimer = setInterval(() => {
         if (!stopped && instinct.modelConnectivity() !== 'online') {
           void scheduleProcess(ports.sense.snapshot());
@@ -2004,6 +2394,10 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime & { read
     async stop() {
       if (stopped) return;
       stopped = true;
+      if (orphanCardGraceTimer) {
+        clearTimeout(orphanCardGraceTimer);
+        orphanCardGraceTimer = undefined;
+      }
       if (heartbeatTimer) {
         clearInterval(heartbeatTimer);
         heartbeatTimer = undefined;
@@ -2014,6 +2408,10 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime & { read
       turnAbort = new AbortController();
       higherOrderTurnAbort?.abort();
       higherOrderTurnAbort = undefined;
+      for (const ctrl of [...inFlightHigherSandboxAborts]) {
+        ctrl.abort();
+      }
+      inFlightHigherSandboxAborts.clear();
       activeRunningTier = null;
       instinct.stop();
       for (const unregister of internalSessions.values()) {
@@ -2036,6 +2434,7 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime & { read
       registerMaintSession(sessionId);
     },
     isMaintenanceSession: (sessionId: string) => internalSessions.has(sessionId),
+    isHigherOrderTurnActive: () => activeRunningTier === 'higher',
     reportTransportResult(reachable: boolean, errorText?: string) {
       const changed = instinct.reportTransportResult(reachable, clock.wall(), errorText);
       if (changed) {

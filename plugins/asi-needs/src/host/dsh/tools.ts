@@ -33,7 +33,7 @@ import { CLEANABLE_EXTERNAL_CACHE_IDS } from '../cache-catalog.js';
 import type { RegisteredSandboxTool } from '../drives.js';
 import { type NeedsRuntime, validateHelpActionTarget } from '../runtime.js';
 
-const READONLY_GLOBAL_ALLOW = ['env_state', 'env_detail', 'needs_status'] as const;
+const READONLY_GLOBAL_ALLOW = ['env_state', 'env_detail', 'needs_status', 'care_status'] as const;
 
 export const MAINTENANCE_ACTION_TOOL_NAMES = [
   'needs_sniff_causes',
@@ -348,19 +348,30 @@ export function attachMaintainerScope(rootCtx: Context, agent: Agent, runtime: N
     if (!scopedTools) {
       throw new Error('tools service is not available on agent.ctx');
     }
-    const globalNames = rootCtx.tools.definitions().map((d) => d.name);
-    const allow = READONLY_GLOBAL_ALLOW.filter((name) => globalNames.includes(name));
-    if (allow.length > 0) {
-      disposers.push(scopedTools.restrict({ allow: [...allow] }));
-    } else if (globalNames.length > 0) {
-      disposers.push(scopedTools.restrict({ deny: globalNames }));
-    }
+    let restrictOff: (() => void) | undefined;
+    const syncRestrict = () => {
+      restrictOff?.();
+      restrictOff = undefined;
+      const globalNames = rootCtx.tools.definitions().map((d) => d.name);
+      const allow = READONLY_GLOBAL_ALLOW.filter((name) => globalNames.includes(name));
+      if (allow.length > 0) {
+        restrictOff = scopedTools.restrict({ allow: [...allow] });
+      } else if (globalNames.length > 0) {
+        restrictOff = scopedTools.restrict({ deny: globalNames });
+      }
+    };
+    syncRestrict();
+    disposers.push(() => {
+      restrictOff?.();
+      restrictOff = undefined;
+    });
 
     for (const tool of createMaintenanceActionTools(runtime)) {
       disposers.push(scopedTools.register(tool));
     }
 
     const syncExternalTools = () => {
+      syncRestrict();
       for (const off of extDisposers.splice(0).reverse()) off();
       for (const reg of runtime.drives?.registeredSandboxTools() ?? []) {
         extDisposers.push(scopedTools.register(createExternalDriveTool(reg, runtime)));
@@ -373,6 +384,9 @@ export function attachMaintainerScope(rootCtx: Context, agent: Agent, runtime: N
 
     disposers.push(
       scopedTools.guard((exec) => {
+        if (exec.name === 'needs_request_help' && runtime.isHigherOrderTurnActive?.()) {
+          return 'needs_request_help (<asi-cry>) is forbidden during higher-order L2-L4 maintenance turns; use the drive silent help card tool instead';
+        }
         if (ALLOWED_MAINTAINER_TOOLS.has(exec.name)) return undefined;
         const ext = runtime.drives?.checkSandboxToolGuard(exec.name);
         return ext?.allowed ? undefined : (ext?.reason ?? 'ASI maintenance sandbox forbids non-whitelisted tools');
@@ -387,8 +401,8 @@ export function attachMaintainerScope(rootCtx: Context, agent: Agent, runtime: N
           order: 2710,
           text: [
             'You are the dedicated background self-maintenance agent of ASI.',
-            'Operate strictly inside your read-only diagnostics (needs_status, needs_sniff_causes, env_state, env_detail) and safe sandbox tools (needs_clean_cache, needs_stop_job, needs_compact_context, needs_request_help, plus active non-suppressed higher-order drive tools).',
-            'Never attempt to empty Trash, delete user files, kill external applications, or alter system configuration; for external safe/caution developer caches use needs_request_help with actionKind="clean-external-cache" and a whitelisted targetId.',
+            'Operate strictly inside your read-only diagnostics (needs_status, needs_sniff_causes, care_status, env_state, env_detail) and safe sandbox tools (needs_clean_cache, needs_stop_job, needs_compact_context, needs_request_help, plus active non-suppressed higher-order drive tools).',
+            'Never attempt to empty Trash, delete user files, kill external applications, or alter system configuration; for external safe/caution developer caches use needs_request_help with actionKind="clean-external-cache" and a whitelisted targetId; for higher-order drives (L2-L4) never call needs_request_help (<asi-cry>) and always use their silent help card tool.',
           ].join(' '),
         }),
       );

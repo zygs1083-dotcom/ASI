@@ -4,7 +4,7 @@
  * needs with higher-order plugins (e.g. L2 `asi-sleep`, L3 `asi-care`).
  */
 
-import type { NeedZone } from './needs.js';
+import type { HelpCard, NeedZone } from './needs.js';
 import type { PowerMode, SenseSnapshot } from './service.js';
 
 /** Maslow hierarchy tier: 1 = physiological survival (built-in), 2..4 = higher-order drives. */
@@ -80,6 +80,38 @@ export interface ExternalDriveReading {
   autoMaintain?: boolean;
 }
 
+export interface DriveHelpActionInput {
+  cardId: string;
+  driveKey: string;
+  actionTarget?: string;
+  now: number;
+  signal: DriveAbortSignal;
+}
+
+export interface DriveHelpActionResult {
+  /** Action key recorded into Action-Outcome Memory ledger (defaults to `actionTarget` or `'run-drive-action'`). */
+  ledgerAction?: string;
+  summary: string;
+  freedBytes?: number;
+  stoppedJobs?: number;
+  tokensSaved?: number;
+}
+
+export interface DriveHelpCardProposal {
+  /** Drive key owned by this source (raw or `${sourceId}:${key}`). */
+  driveKey: string;
+  severity?: 'uncomfortable' | 'critical';
+  title: string;
+  summary: string;
+  proposedAction?: string;
+  /** `'run-drive-action'` invokes `executeHelpAction` upon user approval; `'acknowledge'` is read-only confirmation. */
+  actionKind?: 'acknowledge' | 'run-drive-action';
+  /** Controlled non-path target identifier validated by the owning drive source. */
+  actionTarget?: string;
+  /** Optional custom button label for `'run-drive-action'`. */
+  approveLabel?: string;
+}
+
 export interface DriveSourceRegistration {
   id: string;
   /** Higher-order Maslow tier (`2 | 3 | 4`); tier `1` is reserved for `asi-needs` physiological drives. */
@@ -87,6 +119,17 @@ export interface DriveSourceRegistration {
   label: string;
   evaluate: (snapshot: SenseSnapshot) => readonly ExternalDriveReading[];
   sandboxTools?: readonly DriveSandboxToolSpec[];
+  /** Optional controlled callback invoked when the user clicks Approve on a `'run-drive-action'` HelpCard for this source. */
+  executeHelpAction?: (input: DriveHelpActionInput) => Promise<DriveHelpActionResult>;
+  /** Optional callback invoked when the user clicks Acknowledge ("我已处理") on an `'acknowledge'` HelpCard for this source. */
+  onHelpAcknowledged?: (input: {
+    cardId: string;
+    driveKey: string;
+    actionTarget?: string;
+    now: number;
+  }) => void | Promise<void>;
+  /** Optional callback notified when the user dismisses an open HelpCard owned by this source. */
+  onHelpDismissed?: (input: { cardId: string; driveKey: string; actionTarget?: string; now: number }) => void;
 }
 
 export interface AsiDrivesSnapshot {
@@ -108,4 +151,11 @@ export interface AsiDrivesServiceApi {
   registerSource(registration: DriveSourceRegistration): () => void;
   /** Notify `asi-needs` that a registered source's state changed so arbitration reconciles immediately. */
   notifySourceChanged(sourceId?: string): void;
+  /** Propose or update a silent sidebar-only HelpCard for a registered higher-order drive (never sends `<asi-cry>`). */
+  proposeHelpCard?(sourceId: string, proposal: DriveHelpCardProposal): Promise<HelpCard>;
+  /** Resolve open HelpCards owned by `sourceId` (optionally scoped by `driveKey`, `actionTarget`, or `exceptActionTargets`). */
+  resolveHelpCards?(
+    sourceId: string,
+    filter?: { driveKey?: string; actionTarget?: string; exceptActionTargets?: readonly string[] },
+  ): Promise<number>;
 }
