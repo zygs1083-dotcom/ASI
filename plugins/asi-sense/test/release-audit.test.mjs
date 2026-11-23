@@ -1,6 +1,12 @@
-import { readFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { existsSync, readFileSync } from 'node:fs';
+import { userInfo } from 'node:os';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import { auditFiles, registryUrl, registryVersionAvailable } from '../scripts/release-audit.mjs';
+
+const pkgDir = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 
 describe('release audit', () => {
   it('keeps every source workspace private', () => {
@@ -14,6 +20,26 @@ describe('release audit', () => {
     ]) {
       expect(JSON.parse(readFileSync(new URL(path, import.meta.url))).private).toBe(true);
     }
+  });
+
+  it('builds clean-checkout artifacts and passes release-audit on real bundle files', { timeout: 30_000 }, () => {
+    const built = spawnSync(process.execPath, ['scripts/build.mjs'], { cwd: pkgDir, encoding: 'utf8' });
+    expect(built.status, built.stderr || built.stdout).toBe(0);
+
+    const files = ['package.json', 'cordis.patch.yml', 'scripts/dsh.sh', 'lib/index.js'];
+    if (existsSync(join(pkgDir, 'lib/asi-sense-helper'))) {
+      files.push('lib/asi-sense-helper');
+    }
+    const buffers = new Map(files.map((f) => [f, readFileSync(join(pkgDir, f))]));
+    buffers.set('LICENSE', readFileSync(join(pkgDir, '../../LICENSE')));
+
+    expect(() =>
+      auditFiles(
+        [...buffers.keys()].map((path) => ({ path })),
+        (path) => buffers.get(path),
+        userInfo().username,
+      ),
+    ).not.toThrow();
   });
 
   it('accepts only the intended files without local paths or usernames', () => {
