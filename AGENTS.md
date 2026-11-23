@@ -7,10 +7,11 @@
 
 ASI 是一组模块化 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（下称 DSH）插件。每个插件都是一个独立的 DSH 组合包（bundle），用 `dsh plugin add` 安装，插件之间仅通过 Cordis 服务（`ctx.*`）与 `packages/` 共享类型协作，合起来构成一套围绕生存需求与自发维护的 ASI 系统。
 
-当前包含两个核心插件（详细设计见 `docs/DESIGN.md`）：
+当前包含三个核心插件（详细设计见 `docs/DESIGN.md`）：
 
 1. **`asi-sense`（纯感官模块）**：无侧栏 UI 的纯后台 Cordis 服务（`ctx.asiSense`），专注采集本机身体体征（电源、内存、磁盘、CPU、温控、网络、进程、Token）、当前环境快照（位置链、前台应用窗口、活动任务、系统/权限状态）与最近 5 分钟短期趋势环，并向对话暴露只读工具 `env_state` / `env_detail`（含脱敏与隐私开关保护），绝不主动向对话注入动态事件消息。
-2. **`asi-needs`（婴儿期生存需求、自发维护与跨插件驱动仲裁）**：订阅 `ctx.asiSense`，按连续稳态张力与回滞模型实时评估五大基础生理需求（能量、空间、内存与进程、心智容量、体温负荷）；通过「零 Token 本能反射 + 独立后台自维护会话（含全景只读病因嗅探 `needs_sniff_causes` 与白名单安全沙盒工具） + 行动效果记忆与零收益静默熔断 + 按需啼哭求助（`<asi-cry>` 与支持 1 小时活跃保护的一键外部缓存批准求助卡）」自主维护运行环境；同时直接暴露 `ctx.asiDrives` 马斯洛多层需求仲裁服务（L1 生理不适或 `eco` 模式自动压制挂起 L2–L4 高阶需求），并注册唯一的统一侧栏面板「生存需求」（`asi-needs`）及全局只读工具 `needs_status`。
+2. **`asi-needs`（婴儿期生存需求、自发维护与跨插件驱动仲裁）**：订阅 `ctx.asiSense`，按连续稳态张力与回滞模型实时评估五大基础生理需求（能量、空间、内存与进程、心智容量、体温负荷）；通过「零 Token 本能反射 + 独立后台自维护会话（含全景只读病因嗅探 `needs_sniff_causes` 与白名单安全沙盒工具） + 行动效果记忆与零收益静默熔断 + 按需啼哭求助（`<asi-cry>` 与支持 1 小时活跃保护的一键外部缓存批准求助卡）」自主维护运行环境；同时直接暴露 `ctx.asiDrives` 马斯洛多层需求仲裁服务（L1 生理不适或 `eco` 模式自动压制挂起 L2–L4 高阶需求），并注册侧栏面板「生存需求」（`asi-needs`）及全局只读工具 `needs_status`。
+3. **`asi-sleep`（L2 睡眠与记忆整合模块）**：接入 `ctx.asiSense` 与 `ctx.asiDrives`（`tier: 2`），在普通对话累计 `>= 12` 轮或间隔 `>= 6h`（有新轮次）时产生睡眠困意，仅在会话空闲 `>= 10 分钟` 或锁屏且 L1 生理需求全部舒适时自动执行仿生 NREM+REM 双阶段睡眠记忆整合（自动上限 `<= 6` 次/天，L1 不适或 `eco` 模式即时压制/抢占中断）；结合 `ts-fsrs` 遗忘衰减与 `MiniSearch` 中英检索维护偏好（`preference`）、决策（`decision`）、踩坑（`pitfall`）、近期进展（`episode`）四类本地可读 Markdown/JSONL 记忆库，向日常对话仅暴露按需只读工具 `memory_recall` / `memory_profile`（零动态注入、100% 保护 Prompt Cache），并注册独立第 2 侧栏面板「记忆库」（`asi-sleep`）。
 
 新增插件或扩大范围，须由协调端写进本文件和设计文档。
 
