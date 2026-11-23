@@ -33,3 +33,11 @@ Third-Party Open-Source Adaptations (MIT License):
 - POSIX process table parsing adapted from sindresorhus/ps-list
   (MIT License, Copyright (c) Sindre Sorhus) and soyuka/pidusage
   (MIT License, Copyright (c) Antoine Bluchet).
+- Workspace build/dependency artifact profiles & ecosystem rules adapted from voidcosmos/npkill
+  (MIT License, Copyright (c) Npkill contributors).
+- Git porcelain status & multi-worktree parser adapted from steveukx/git-js (simple-git)
+  (MIT License, Copyright (c) Steve King).
+- Merged branch & clean worktree verification rules adapted from fcsonline/git-cleaner
+  (MIT License, Copyright (c) Ferran Basora).
+- Local TCP listening port & dev runtime inspection adapted from sindresorhus/fkill and sindresorhus/pid-port
+  (MIT License, Copyright (c) Sindre Sorhus).
