@@ -15,6 +15,8 @@
 import {
   type AsiDrivesSnapshot,
   type DriveEvaluation,
+  type DriveHelpActionInput,
+  type DriveHelpActionResult,
   type DriveSandboxToolSpec,
   type DriveSourceRegistration,
   type DriveTier,
@@ -41,6 +43,7 @@ const RESERVED_TOOL_NAMES = new Set([
   'env_state',
   'env_detail',
   'needs_status',
+  'care_status',
   'needs_sniff_causes',
   'needs_clean_cache',
   'needs_stop_job',
@@ -78,7 +81,56 @@ export class MaslowDriveArbiter {
     drives: [],
   };
 
-  constructor(private readonly onExternalChange?: () => void) {}
+  constructor(
+    private readonly onExternalChange?: () => void,
+    private readonly onSourceUnregistered?: (sourceId: string) => void,
+  ) {}
+
+  qualifySourceDriveKey(sourceId: string, rawKey: string): string {
+    return this.qualifyKey(sourceId, rawKey);
+  }
+
+  getSource(sourceId: string): DriveSourceRegistration | undefined {
+    return this.sources.get(sourceId);
+  }
+
+  async executeHelpAction(driveKey: string, input: DriveHelpActionInput): Promise<DriveHelpActionResult> {
+    const colon = driveKey.indexOf(':');
+    const sourceId = colon > 0 ? driveKey.slice(0, colon) : '';
+    const src = this.sources.get(sourceId);
+    if (!src?.executeHelpAction) {
+      throw new Error(`Drive source "${sourceId || driveKey}" cannot execute help action`);
+    }
+    return await src.executeHelpAction(input);
+  }
+
+  notifyHelpDismissed(
+    driveKey: string,
+    input: { cardId: string; driveKey: string; actionTarget?: string; now: number },
+  ): void {
+    const colon = driveKey.indexOf(':');
+    const sourceId = colon > 0 ? driveKey.slice(0, colon) : '';
+    const src = this.sources.get(sourceId);
+    try {
+      src?.onHelpDismissed?.(input);
+    } catch {
+      // Isolate dismissal callback errors
+    }
+  }
+
+  async notifyHelpAcknowledged(
+    driveKey: string,
+    input: { cardId: string; driveKey: string; actionTarget?: string; now: number },
+  ): Promise<void> {
+    const colon = driveKey.indexOf(':');
+    const sourceId = colon > 0 ? driveKey.slice(0, colon) : '';
+    const src = this.sources.get(sourceId);
+    try {
+      await src?.onHelpAcknowledged?.(input);
+    } catch {
+      // Isolate acknowledge callback errors
+    }
+  }
 
   private qualifyKey(sourceId: string, rawKey: string): string {
     const clean = rawKey.trim();
@@ -156,6 +208,7 @@ export class MaslowDriveArbiter {
           // Isolate structure listener errors
         }
       }
+      this.onSourceUnregistered?.(registration.id);
       this.onExternalChange?.();
     };
   }

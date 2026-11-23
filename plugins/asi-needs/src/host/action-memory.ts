@@ -235,7 +235,16 @@ export function computeDriveEnvFingerprint(input: {
   }
   const evidencePairs = Object.entries(evaluation.evidence ?? {})
     .sort(([a], [b]) => a.localeCompare(b))
-    .map(([k, v]) => `${k}=${String(v)}`)
+    .map(([k, v]) => {
+      if (typeof v === 'number' && Number.isFinite(v) && k.endsWith('Bytes')) {
+        const bucket = v <= 0 ? '0' : `b${Math.floor(v / (256 * 1024 ** 2)) + 1}`;
+        return `${k}=${bucket}`;
+      }
+      if (k === 'zombies' && typeof v === 'number' && Number.isFinite(v)) {
+        return `${k}=${v >= 10 ? `high:${v}` : 'low'}`;
+      }
+      return `${k}=${String(v)}`;
+    })
     .join('&');
   return evidencePairs ? `drive:${key}:${evidencePairs}` : `drive:${key}`;
 }

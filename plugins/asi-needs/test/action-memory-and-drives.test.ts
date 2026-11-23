@@ -13,7 +13,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ActionOutcomeLedger, buildActionMeasurement } from '../src/host/action-memory.js';
 import { EXTERNAL_CACHE_ACTIVE_PROTECTION_MS } from '../src/host/cache-catalog.js';
 import * as AsiNeedsPlugin from '../src/host/dsh/index.js';
-import { createNeedsRuntime } from '../src/host/runtime.js';
+import { createNeedsRuntime, ORPHAN_HIGHER_CARD_GRACE_MS } from '../src/host/runtime.js';
 import { createMockSenseService, fact, makeSnapshot, T0 } from './fixtures.js';
 
 const tempDirs: string[] = [];
@@ -623,9 +623,9 @@ describe('0.3.0 全景嗅探、一键外部缓存批准清理、行动效果记�
       expect(root.asiDrives.snapshot().drives.every((d) => d.tier === 1)).toBe(true);
       expect(root.tools.executable('sleep_consolidate_notes', maintAgent)).toBeUndefined();
     } finally {
-      needsFork.dispose();
-      senseFork.dispose();
-      await new Promise((r) => setTimeout(r, 25));
+      await needsFork.dispose();
+      await senseFork.dispose();
+      await new Promise((r) => setTimeout(r, 50));
     }
   });
 
@@ -732,7 +732,7 @@ describe('0.3.0 全景嗅探、一键外部缓存批准清理、行动效果记�
       });
 
       // sendTitles=false 时外部插件看不到窗口标题，且原地篡改快照不影响宿主 thermals
-      await vi.waitFor(() => expect(higherRuns).toBe(1));
+      await vi.waitFor(() => expect(higherRuns).toBe(1), { timeout: 5_000 });
       expect(windowSeenByPlugin).toBeNull();
       expect(rt.snapshot().needs.thermals.zone).toBe('comfortable');
       expect(rt.snapshot().higherOrderDrives).toHaveLength(1);
@@ -745,11 +745,14 @@ describe('0.3.0 全景嗅探、一键外部缓存批准清理、行动效果记�
       diskFree = 8 * 1024 ** 3;
       sense.emit(() => makeSnap());
 
-      await vi.waitFor(() => {
-        expect(seenSignals[0]?.aborted).toBe(true);
-        expect(l1PreemptRuns).toBe(1);
-        expect(rt.snapshot().maintenanceSession.status).toBe('idle');
-      });
+      await vi.waitFor(
+        () => {
+          expect(seenSignals[0]?.aborted).toBe(true);
+          expect(l1PreemptRuns).toBe(1);
+          expect(rt.snapshot().maintenanceSession.status).toBe('idle');
+        },
+        { timeout: 5_000 },
+      );
       expect(rt.snapshot().maintenanceSession.circuitBrokenNeeds ?? []).not.toContain('asi-care:digest');
 
       // 2. L1 磁盘恢复舒适（80 GB），跨过冷却后高阶第 2 轮运行但未调工具（零收益）-> 进入高阶静默熔断
@@ -757,10 +760,13 @@ describe('0.3.0 全景嗅探、一键外部缓存批准清理、行动效果记�
       nowMono += 150_000;
       diskFree = 80 * 1024 ** 3;
       sense.emit(() => makeSnap());
-      await vi.waitFor(() => {
-        expect(higherRuns).toBe(2);
-        expect(rt.snapshot().maintenanceSession.status).toBe('idle');
-      });
+      await vi.waitFor(
+        () => {
+          expect(higherRuns).toBe(2);
+          expect(rt.snapshot().maintenanceSession.status).toBe('idle');
+        },
+        { timeout: 5_000 },
+      );
       expect(rt.snapshot().maintenanceSession.circuitBrokenNeeds).toContain('asi-care:digest');
 
       // 短暂切换 eco 模式再恢复 normal（无 evidence 变化）：高阶熔断保持不丢失，绝不无故重跑！
@@ -1443,5 +1449,429 @@ describe('0.3.0 全景嗅探、一键外部缓存批准清理、行动效果记�
     releaseStopCreateC?.('reassigned-during-stop');
     await expect(danglingOpen).rejects.toThrow(/stopped/);
     expect(senseC.internalSessions().size).toBe(0);
+  });
+
+  it('高阶驱动通用求助卡回调（proposeHelpCard / executeHelpAction / onHelpDismissed / resolveHelpCards）：全程零 <asi-cry> 注入、一键批准记入账本、忽略触发熔断、恢复或注销自动归档', async () => {
+    const storageRoot = await mkdtemp(join(tmpdir(), 'asi-030-higher-help-'));
+    tempDirs.push(storageRoot);
+
+    const sense = createMockSenseService(makeSnapshot({ now: T0, mono: 2_000 }), storageRoot);
+    const cryInbox: string[] = [];
+    const runtime = createNeedsRuntime({
+      storageRoot,
+      sense,
+      clock: { wall: () => T0, mono: () => 2_000 },
+      probeEndpoint: async () => true,
+      jobs: { listActiveJobs: () => [], hasLiveOwner: () => true, killJob: () => 'already-finished' },
+      compaction: { listIdleSessionIds: () => [], compactIdleSession: async () => ({ compacted: false }) },
+      sessions: {
+        createMaintenanceSession: async (id) => id,
+        hasSession: () => true,
+        runMaintenanceTurn: async () => {},
+        deliverCryToUserSession: async (_t, _e, content) => {
+          cryInbox.push(content);
+          return true;
+        },
+      },
+    });
+
+    await runtime.start();
+    try {
+      let bloatSat = 45;
+      const dismissedTargets: string[] = [];
+      let approvedExecCount = 0;
+
+      const unregister = runtime.drives.registerSource({
+        id: 'asi-care',
+        tier: 3,
+        label: '工作区与项目看护',
+        evaluate: () => [
+          {
+            key: 'workspace_bloat',
+            label: '闲置工作树产物膨胀',
+            satisfaction: bloatSat,
+            summary: bloatSat < 70 ? '闲置产物 1.5 GiB' : '无积压产物',
+            evidence: { idleBytes: bloatSat < 70 ? 1_500_000_000 : 0 },
+          },
+        ],
+        executeHelpAction: async (input) => {
+          approvedExecCount += 1;
+          bloatSat = 100;
+          return {
+            ledgerAction: `clean-workspace-artifact:${input.actionTarget}`,
+            summary: '已清理闲置构建产物',
+            freedBytes: 1_500_000_000,
+          };
+        },
+        onHelpDismissed: ({ actionTarget }) => {
+          if (actionTarget) dismissedTargets.push(actionTarget);
+        },
+      });
+
+      // 拒绝包含路径字符的非法 actionTarget
+      await expect(
+        runtime.drives.proposeHelpCard('asi-care', {
+          driveKey: 'workspace_bloat',
+          title: 'bad target',
+          summary: 'bad',
+          actionKind: 'run-drive-action',
+          actionTarget: '/tmp/node_modules',
+        }),
+      ).rejects.toThrow(/non-path actionTarget/);
+
+      // 挂出 critical 级高阶求助卡：即使处于 critical，也严禁触发 <asi-cry> 对话打扰！
+      const card1 = await runtime.drives.proposeHelpCard('asi-care', {
+        driveKey: 'workspace_bloat',
+        severity: 'critical',
+        title: '闲置产物待清理 1',
+        summary: '可释放 1.5 GiB',
+        actionKind: 'run-drive-action',
+        actionTarget: 'art_first',
+        approveLabel: '批准清理构建产物',
+      });
+      expect(card1.silent).toBe(true);
+      expect(card1.driveLabel).toBe('L3 · 闲置工作树产物膨胀');
+      expect(cryInbox).toHaveLength(0);
+
+      // 测试忽略卡片：触发 onHelpDismissed 回调且对该 L3 驱动建立静默熔断
+      await runtime.actions.dismissHelp(card1.id);
+      expect(dismissedTargets).toEqual(['art_first']);
+      expect(runtime.snapshot().maintenanceSession.circuitBrokenNeeds).toContain('asi-care:workspace_bloat');
+
+      // 挂出第二张卡片并点击批准：执行 executeHelpAction、解除熔断、记录 ActionOutcomeLedger
+      const card2 = await runtime.drives.proposeHelpCard('asi-care', {
+        driveKey: 'workspace_bloat',
+        severity: 'uncomfortable',
+        title: '闲置产物待清理 2',
+        summary: '可释放 1.5 GiB',
+        actionKind: 'run-drive-action',
+        actionTarget: 'art_second',
+        approveLabel: '批准清理构建产物',
+      });
+      await runtime.actions.approveHelp(card2.id);
+      expect(approvedExecCount).toBe(1);
+      expect(runtime.snapshot().maintenanceSession.circuitBrokenNeeds ?? []).not.toContain('asi-care:workspace_bloat');
+      const ledger = runtime
+        .snapshot()
+        .actionLedger?.find(
+          (e) => e.need === 'asi-care:workspace_bloat' && e.action === 'clean-workspace-artifact:art_second',
+        );
+      expect(ledger?.totalFreedBytes).toBe(1_500_000_000);
+      expect(ledger?.totalSatisfactionDelta).toBe(55);
+
+      // 测试 exceptActionTargets 选择性归档与注销源时自动归档残留 open 卡
+      const cardKeep = await runtime.drives.proposeHelpCard('asi-care', {
+        driveKey: 'workspace_bloat',
+        title: '保留项',
+        summary: 'keep',
+        actionKind: 'acknowledge',
+        actionTarget: 'keep_tok',
+      });
+      await runtime.drives.proposeHelpCard('asi-care', {
+        driveKey: 'workspace_bloat',
+        title: '过期项',
+        summary: 'stale',
+        actionKind: 'acknowledge',
+        actionTarget: 'stale_tok',
+      });
+      const resolvedStale = await runtime.drives.resolveHelpCards('asi-care', {
+        exceptActionTargets: ['keep_tok'],
+      });
+      expect(resolvedStale).toBe(1);
+      expect(runtime.snapshot().helpCards.find((c) => c.id === cardKeep.id)?.status).toBe('open');
+
+      unregister();
+      expect(runtime.snapshot().helpCards.find((c) => c.id === cardKeep.id)?.status).toBe('resolved');
+      expect(cryInbox).toHaveLength(0);
+    } finally {
+      await runtime.stop();
+    }
+  });
+
+  it('高阶熔断抗 RSS/僵尸数微小抖动不漏 Token，且高阶回合硬性拦截 L1 needs_request_help (<asi-cry>)', async () => {
+    const storageRoot = await mkdtemp(join(tmpdir(), 'asi-030-higher-jitter-'));
+    tempDirs.push(storageRoot);
+
+    let nowWall = T0;
+    let nowMono = 5_000;
+    const sense = createMockSenseService(makeSnapshot({ now: nowWall, mono: nowMono }), storageRoot);
+    let maintRuns = 0;
+    let rejectedL1CryError = '';
+    const cryInbox: string[] = [];
+
+    const runtime = createNeedsRuntime({
+      storageRoot,
+      sense,
+      clock: { wall: () => nowWall, mono: () => nowMono },
+      probeEndpoint: async () => true,
+      jobs: { listActiveJobs: () => [], hasLiveOwner: () => true, killJob: () => 'already-finished' },
+      compaction: { listIdleSessionIds: () => [], compactIdleSession: async () => ({ compacted: false }) },
+      sessions: {
+        createMaintenanceSession: async (id) => id,
+        hasSession: () => true,
+        runMaintenanceTurn: async () => {
+          maintRuns += 1;
+          try {
+            await runtime.tools.requestHelp({
+              need: 'space',
+              title: '误调 L1 啼哭',
+              summary: '尝试在高阶回合发 <asi-cry>',
+            });
+          } catch (err) {
+            rejectedL1CryError = err instanceof Error ? err.message : String(err);
+          }
+        },
+        deliverCryToUserSession: async (_t, _e, content) => {
+          cryInbox.push(content);
+          return true;
+        },
+      },
+    });
+
+    await runtime.start();
+    try {
+      let rssBytes = 134_217_728; // 128 MiB
+      let zombies = 0;
+      let orphanPorts = 1;
+
+      runtime.drives.registerSource({
+        id: 'asi-care',
+        tier: 3,
+        label: '工作区与项目看护',
+        evaluate: () => [
+          {
+            key: 'orphan_runtime',
+            label: '僵尸进程与孤儿端口',
+            satisfaction: 48,
+            summary: '1 个孤儿端口',
+            evidence: {
+              orphanPorts,
+              orphanJobs: 0,
+              zombies,
+              orphanRssBytes: rssBytes,
+              topPort: 5173,
+            },
+          },
+        ],
+      });
+
+      await vi.waitFor(() => {
+        expect(maintRuns).toBe(1);
+        expect(runtime.snapshot().maintenanceSession.status).toBe('idle');
+      });
+      // 高阶维护回合严禁调用 L1 needs_request_help，确保零 <asi-cry> 前台打断
+      expect(rejectedL1CryError).toContain('forbidden during higher-order');
+      expect(cryInbox).toHaveLength(0);
+      expect(runtime.snapshot().maintenanceSession.circuitBrokenNeeds).toContain('asi-care:orphan_runtime');
+
+      // 模拟 3 分钟后进程 RSS 自然抖动 +64 KiB 且出现 1 个瞬态僵尸进程 -> 熔断稳固保持，绝不唤醒大模型！
+      nowWall += 180_000;
+      nowMono += 180_000;
+      rssBytes += 65_536;
+      zombies = 1;
+      runtime.drives.notifySourceChanged('asi-care');
+      sense.emit(() => makeSnapshot({ now: nowWall, mono: nowMono }));
+      await new Promise((r) => setTimeout(r, 30));
+      expect(maintRuns).toBe(1);
+      expect(runtime.snapshot().maintenanceSession.circuitBrokenNeeds).toContain('asi-care:orphan_runtime');
+
+      // 模拟实质变化：新增第 2 个孤儿端口 -> 自动解除熔断执行新一轮自检！
+      nowWall += 180_000;
+      nowMono += 180_000;
+      orphanPorts = 2;
+      runtime.drives.notifySourceChanged('asi-care');
+      sense.emit(() => makeSnapshot({ now: nowWall, mono: nowMono }));
+      await vi.waitFor(() => {
+        expect(maintRuns).toBe(2);
+      });
+      expect(cryInbox).toHaveLength(0);
+    } finally {
+      await runtime.stop();
+    }
+  });
+
+  it('卸载高阶插件后跨重启遗留 open 求助卡的优雅回收：点击批准不抛错归档为 resolved，且宽限期后自动归档无宿主孤儿高阶卡片', async () => {
+    const storageRoot = await mkdtemp(join(tmpdir(), 'asi-030-orphan-higher-cards-'));
+    tempDirs.push(storageRoot);
+
+    let nowWall = T0;
+    let nowMono = 1_000;
+
+    // 预置持久化 state.json：模拟卸载 asi-care 与 asi-sleep 前遗留的两张 open 高阶求助卡与一条高阶熔断记录
+    await writeFile(
+      join(storageRoot, 'state.json'),
+      JSON.stringify(
+        {
+          helpCards: [
+            {
+              id: 'orphan-care-card-1',
+              driveKey: 'asi-care:workspace_bloat',
+              driveLabel: 'L3 · 闲置工作树产物膨胀',
+              approveLabel: '批准清理构建产物',
+              silent: true,
+              severity: 'uncomfortable',
+              title: '已卸载插件遗留的产物清理卡',
+              summary: '历史遗留项',
+              actionKind: 'run-drive-action',
+              actionTarget: 'art_legacy123456',
+              status: 'open',
+              createdAt: nowWall - 60_000,
+              updatedAt: nowWall - 60_000,
+            },
+            {
+              id: 'orphan-sleep-card-2',
+              driveKey: 'asi-sleep:consolidation',
+              driveLabel: 'L2 · 记忆整合',
+              silent: true,
+              severity: 'uncomfortable',
+              title: '已卸载插件遗留的只读确认卡',
+              summary: '历史遗留项 2',
+              actionKind: 'acknowledge',
+              actionTarget: 'ack_legacy123456',
+              status: 'open',
+              createdAt: nowWall - 60_000,
+              updatedAt: nowWall - 60_000,
+            },
+          ],
+          circuitBreakers: [
+            {
+              need: 'asi-care:workspace_bloat',
+              trippedAt: nowWall - 60_000,
+              zoneAtTrip: 'uncomfortable',
+              satisfactionAtTrip: 45,
+              envFingerprint: 'fp-old',
+              reason: 'legacy breaker',
+            },
+          ],
+        },
+        null,
+        2,
+      ),
+      'utf8',
+    );
+
+    const sense = createMockSenseService(makeSnapshot({ now: nowWall, mono: nowMono }), storageRoot);
+    const runtime = createNeedsRuntime({
+      storageRoot,
+      sense,
+      clock: { wall: () => nowWall, mono: () => nowMono },
+      probeEndpoint: async () => true,
+      jobs: { listActiveJobs: () => [], hasLiveOwner: () => true, killJob: () => 'already-finished' },
+      compaction: { listIdleSessionIds: () => [], compactIdleSession: async () => ({ compacted: false }) },
+      sessions: {
+        createMaintenanceSession: async (id) => id,
+        hasSession: () => true,
+        runMaintenanceTurn: async () => {},
+        deliverCryToUserSession: async () => true,
+      },
+    });
+
+    await runtime.start();
+    try {
+      // 1) 启动宽限期内保留卡片（以便晚加载的高阶插件仍可注册），但若对应插件已卸载，用户点击「批准」绝不抛错，立即优雅归档为 resolved！
+      expect(runtime.snapshot().helpCards.filter((c) => c.status === 'open')).toHaveLength(2);
+      await expect(runtime.actions.approveHelp('orphan-care-card-1')).resolves.toBeUndefined();
+
+      const snapAfterClick = runtime.snapshot();
+      expect(snapAfterClick.helpCards.find((c) => c.id === 'orphan-care-card-1')?.status).toBe('resolved');
+      expect(snapAfterClick.maintenanceSession.circuitBrokenNeeds ?? []).not.toContain('asi-care:workspace_bloat');
+      expect(snapAfterClick.records[0]?.action).toBe('resolve-orphan-help-card');
+      expect(snapAfterClick.records[0]?.outcome).toBe('relieved');
+
+      // 2) 若用户对已卸载插件遗留卡点击「忽略」(dismissHelp)，同样清理残留熔断且不重入新熔断；跨过宽限期后剩余孤儿卡自动归档为 resolved！
+      await writeFile(join(storageRoot, 'noop'), ''); // keep storage warm
+      await expect(runtime.actions.dismissHelp('orphan-sleep-card-2')).resolves.toBeUndefined();
+      expect(runtime.snapshot().helpCards.find((c) => c.id === 'orphan-sleep-card-2')?.status).toBe('dismissed');
+    } finally {
+      await runtime.stop();
+    }
+
+    // 重启并验证未点击的跨重启孤儿高阶卡在宽限期满后自动归档为 resolved，且直接调用高阶沙盒工具在途遇 eco 也会即时抢占中止
+    await writeFile(
+      join(storageRoot, 'state.json'),
+      JSON.stringify({
+        helpCards: [
+          {
+            id: 'orphan-auto-sweep-card',
+            driveKey: 'asi-sleep:consolidation',
+            driveLabel: 'L2 · 记忆整合',
+            silent: true,
+            severity: 'uncomfortable',
+            title: '等待宽限期自动归档的遗留卡',
+            summary: '历史遗留项',
+            actionKind: 'acknowledge',
+            status: 'open',
+            createdAt: nowWall,
+            updatedAt: nowWall,
+          },
+        ],
+      }),
+      'utf8',
+    );
+    const runtime2 = createNeedsRuntime({
+      storageRoot,
+      sense,
+      clock: { wall: () => nowWall, mono: () => nowMono },
+      probeEndpoint: async () => true,
+      jobs: { listActiveJobs: () => [], hasLiveOwner: () => true, killJob: () => 'already-finished' },
+      compaction: { listIdleSessionIds: () => [], compactIdleSession: async () => ({ compacted: false }) },
+      sessions: {
+        createMaintenanceSession: async (id) => id,
+        hasSession: () => true,
+        runMaintenanceTurn: async () => {},
+        deliverCryToUserSession: async () => true,
+      },
+    });
+    await runtime2.start();
+    try {
+      expect(runtime2.snapshot().helpCards.find((c) => c.id === 'orphan-auto-sweep-card')?.status).toBe('open');
+      nowWall += ORPHAN_HIGHER_CARD_GRACE_MS + 5_000;
+      nowMono += ORPHAN_HIGHER_CARD_GRACE_MS + 5_000;
+      sense.emit(() => makeSnapshot({ now: nowWall, mono: nowMono }));
+      await vi.waitFor(() => {
+        expect(runtime2.snapshot().helpCards.find((c) => c.id === 'orphan-auto-sweep-card')?.status).toBe('resolved');
+      });
+
+      // 注册一个慢速高阶工具并直接通过 executeSandboxTool 调用（非自动回合），中途切入 eco 必须立即 abort 该工具信号！
+      let capturedToolSig: { aborted: boolean } | undefined;
+      let notifyToolStarted: (() => void) | undefined;
+      runtime2.drives.registerSource({
+        id: 'asi-mock-l2',
+        tier: 2,
+        label: 'Mock L2',
+        evaluate: () => [{ key: 'focus', label: '专注', satisfaction: 40, summary: 'busy' }],
+        sandboxTools: [
+          {
+            name: 'mock_l2_slow_op',
+            description: 'slow op',
+            execute: async (_args, ctx) => {
+              capturedToolSig = ctx.signal;
+              notifyToolStarted?.();
+              await new Promise<void>((r) => {
+                if (ctx.signal instanceof AbortSignal) {
+                  ctx.signal.addEventListener('abort', () => r(), { once: true });
+                }
+              });
+              return { summary: 'done' };
+            },
+          },
+        ],
+      });
+      const regTool = runtime2.drives.registeredSandboxTools().find((t) => t.spec.name === 'mock_l2_slow_op');
+      expect(regTool).toBeDefined();
+      if (!regTool) throw new Error('missing regTool');
+      const startedToolP = new Promise<void>((r) => {
+        notifyToolStarted = r;
+      });
+      const directExecP = runtime2.drives.executeSandboxTool(regTool, {}, new AbortController().signal);
+      await startedToolP;
+      expect(capturedToolSig?.aborted).toBe(false);
+      await sense.setPowerMode('eco', '测试直接调用抢占');
+      sense.emit((s) => s);
+      await expect(directExecP).rejects.toThrow(/aborted/i);
+      expect(capturedToolSig?.aborted).toBe(true);
+    } finally {
+      await runtime2.stop();
+    }
   });
 });

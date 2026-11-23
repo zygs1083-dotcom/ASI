@@ -19,6 +19,7 @@ const APPROVE_LABEL: Record<HelpActionKind, string> = {
   'compact-context': '批准整理上下文',
   'enable-eco': '启用节能模式',
   'open-permissions': '打开权限设置',
+  'run-drive-action': '批准执行看护动作',
 };
 
 export function HelpCardsSection({
@@ -68,13 +69,14 @@ export function HelpCardsSection({
           {openCards.map((card) => {
             const busy = busyId === card.id;
             const age = formatAge(now, card.updatedAt);
-            const approveLabel = APPROVE_LABEL[card.actionKind];
+            const approveLabel = card.approveLabel || APPROVE_LABEL[card.actionKind];
+            const needTag = card.need ? NEED_LABEL[card.need] : (card.driveLabel ?? card.driveKey ?? '高阶看护');
             return (
               <article key={card.id} className={css.helpCard} data-help-card={card.id} data-zone={card.severity}>
                 <div className={css.helpTop}>
                   <span className={css.helpTitle}>{card.title}</span>
                   <span className={css.helpNeedTag}>
-                    {NEED_LABEL[card.need]} · {card.severity === 'critical' ? '危急' : '不适'}
+                    {needTag} · {card.severity === 'critical' ? '危急' : '不适'}
                     {age === '刚刚' ? '' : ` · ${age}`}
                   </span>
                 </div>
@@ -83,6 +85,7 @@ export function HelpCardsSection({
                   <div className={css.helpReason}>
                     受控目标标识：{card.actionTarget}
                     {card.actionKind === 'clean-external-cache' ? '（自动跳过 1 小时内活跃项）' : ''}
+                    {card.actionKind === 'run-drive-action' ? '（执行前二次复核活跃豁免与安全护栏）' : ''}
                   </div>
                 )}
                 {card.proposedAction && <div className={css.helpReason}>建议处理：{card.proposedAction}</div>}

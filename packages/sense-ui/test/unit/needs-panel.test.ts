@@ -146,6 +146,97 @@ describe('NeedsPanel SSR 契约验证', () => {
     expect(html).toContain('L2');
     expect(html).toContain('已压制挂起');
   });
+
+  it('L3 asi-care 高阶静默求助卡（run-drive-action 自定义按钮文案）、三分驱动与动作收益账本标签正确渲染', () => {
+    const m = makeScenario('healthy');
+    m.helpCards = [
+      {
+        id: 'help-care-1',
+        driveKey: 'asi-care:workspace_bloat',
+        driveLabel: 'L3 · 闲置工作树产物膨胀',
+        approveLabel: '批准清理构建产物',
+        silent: true,
+        severity: 'uncomfortable',
+        title: '发现闲置构建产物：~/work/old-app/node_modules（1.45 GiB）',
+        summary: 'Node.js 依赖目录所在工作树已闲置 12d',
+        actionKind: 'run-drive-action',
+        actionTarget: 'art_123456abcdef',
+        status: 'open',
+        createdAt: T0 - 8_000,
+        updatedAt: T0 - 2_000,
+      },
+    ];
+    m.maintenanceSession = {
+      ...m.maintenanceSession,
+      circuitBrokenNeeds: ['asi-care:repo_hygiene'],
+    };
+    m.actionLedger = [
+      {
+        need: 'asi-care:workspace_bloat',
+        action: 'clean-workspace-artifact:node_modules',
+        attempts: 1,
+        effectiveCount: 1,
+        successRate: 1,
+        totalFreedBytes: 1_550_000_000,
+        totalStoppedJobs: 0,
+        totalTokensSaved: 0,
+        totalSatisfactionDelta: 45,
+        lastAttemptAt: T0 - 1_000,
+        lastEffective: true,
+      },
+    ];
+    m.higherOrderSuppressed = false;
+    m.higherOrderDrives = [
+      {
+        key: 'asi-care:repo_hygiene',
+        sourceId: 'asi-care',
+        tier: 3,
+        label: '仓库与工作树卫生',
+        satisfaction: 52,
+        urgency: 48,
+        zone: 'uncomfortable',
+        driveActive: true,
+        suppressed: false,
+        summary: '1 个工作树未提交改动静置 >24h',
+        evidence: { staleDirty: 1 },
+        updatedAt: T0,
+      },
+      {
+        key: 'asi-care:orphan_runtime',
+        sourceId: 'asi-care',
+        tier: 3,
+        label: '僵尸进程与孤儿端口',
+        satisfaction: 100,
+        urgency: 0,
+        zone: 'comfortable',
+        driveActive: false,
+        suppressed: false,
+        summary: '未发现孤儿开发监听端口',
+        evidence: { orphanPorts: 0 },
+        updatedAt: T0,
+      },
+      {
+        key: 'asi-care:workspace_bloat',
+        sourceId: 'asi-care',
+        tier: 3,
+        label: '闲置工作树产物膨胀',
+        satisfaction: 48,
+        urgency: 52,
+        zone: 'uncomfortable',
+        driveActive: true,
+        suppressed: false,
+        summary: '1 处闲置 ≥7d 构建产物共占用 1.45 GiB',
+        evidence: { idleArtifactCount: 1 },
+        updatedAt: T0,
+      },
+    ];
+    const html = renderHtml(m);
+    expect(html).toContain('L3 · 闲置工作树产物膨胀 · 不适');
+    expect(html).toContain('批准清理构建产物');
+    expect(html).toContain('受控目标标识：art_123456abcdef（执行前二次复核活跃豁免与安全护栏）');
+    expect(html).toContain('静默熔断省流中（L3 仓库与工作树卫生）');
+    expect(html).toContain('L3 闲置工作树产物膨胀 · clean-workspace-artifact:node_modules');
+  });
 });
 
 describe('diskDropRateBadge 5 分钟磁盘骤降徽标', () => {

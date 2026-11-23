@@ -41,8 +41,14 @@ const OUTCOME_TEXT: Record<MaintenanceOutcome, string> = {
   failed: '执行失败',
 };
 
+const HIGHER_DRIVE_LABEL: Record<string, string> = {
+  'asi-care:repo_hygiene': 'L3 仓库与工作树卫生',
+  'asi-care:orphan_runtime': 'L3 僵尸进程与孤儿端口',
+  'asi-care:workspace_bloat': 'L3 闲置工作树产物膨胀',
+};
+
 function formatNeedKeyLabel(key: string): string {
-  return NEED_LABEL[key as NeedKey] ?? key;
+  return NEED_LABEL[key as NeedKey] ?? HIGHER_DRIVE_LABEL[key] ?? key;
 }
 
 function formatGainSummary(gain?: ActionMeasurement): string | undefined {
@@ -188,7 +194,11 @@ export function MaintenanceSection({
           {records.slice(0, 10).map((rec) => {
             const age = formatAge(now, rec.at);
             const gainText = formatGainSummary(rec.gain);
-            const targetLabel = rec.need ? NEED_LABEL[rec.need] : rec.driveKey;
+            const targetLabel = rec.need
+              ? NEED_LABEL[rec.need]
+              : rec.driveKey
+                ? formatNeedKeyLabel(rec.driveKey)
+                : undefined;
             return (
               <li key={rec.id} className={css.recordItem} data-record={rec.id}>
                 <div className={css.recordTop}>
