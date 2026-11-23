@@ -33,3 +33,11 @@ Third-Party Open-Source Adaptations (MIT License):
 - POSIX process table parsing adapted from sindresorhus/ps-list
   (MIT License, Copyright (c) Sindre Sorhus) and soyuka/pidusage
   (MIT License, Copyright (c) Antoine Bluchet).
+- Two-phase biological NREM/REM sleep memory consolidation, clustering, belief
+  conflict resolution, and associative linking adapted from Fozikio/cortex-engine
+  (MIT License, Copyright (c) Fozikio).
+- Free Spaced Repetition Scheduler (FSRS) retention and forgetting curve model
+  powered by open-spaced-repetition/ts-fsrs (MIT License, Copyright (c) Open
+  Spaced Repetition).
+- Pure TypeScript BM25, prefix, and fuzzy full-text memory indexing powered by
+  lucaong/minisearch (MIT License, Copyright (c) Luca Ongaro).

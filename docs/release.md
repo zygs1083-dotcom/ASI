@@ -1,8 +1,8 @@
-# 发布 ASI 插件（asi-sense + asi-needs）
+# 发布 ASI 插件（asi-sense + asi-needs + asi-sleep）
 
-本文是负责人批准并亲自执行的操作；准备分支不会发布任何包。自 `0.2.0` 起，ASI 采用模块化双插件架构，由纯后台感官模块 `asi-sense` 与生存需求及统一侧栏模块 `asi-needs` 两个独立 DSH 组合包组成，对外分发时需同步构建、审计并发布这两个包。
+本文是负责人批准并亲自执行的操作；准备分支不会发布任何包。自 `0.3.0` 起，ASI 采用模块化多插件架构，由纯后台感官模块 `asi-sense`、生存需求及多层仲裁模块 `asi-needs` 与 L2 睡眠记忆整合模块 `asi-sleep` 三个独立 DSH 组合包组成，对外分发时需同步构建、审计并发布这三个包。
 
-先选定**一个**目标 registry：npm 公网或下文的自建 registry。发布前检查两个包名的归属、权限和版本；registry 的 404 不保证包名尚未被他人抢先注册。
+先选定**一个**目标 registry：npm 公网或下文的自建 registry。发布前检查三个包名的归属、权限和版本；registry 的 404 不保证包名尚未被他人抢先注册。
 
 ## 构建和检查
 
@@ -14,17 +14,19 @@ pnpm check
 pnpm -r publish --dry-run --no-git-checks
 pnpm --filter asi-sense release:check
 pnpm --filter asi-needs release:check
+pnpm --filter asi-sleep release:check
 ```
 
-两个插件的 `release:check` 分工如下：
+三个插件的 `release:check` 分工如下：
 
 - `pnpm --filter asi-sense release:check`：在 macOS arm64 上构建并验证 Swift helper（`strip -S` 删除含本机构建路径的调试符号并重新 ad-hoc `codesign` 签名），生成精简 `plugins/asi-sense/dist/asi-sense-<version>.tgz` 并校验 `0.2.2-rc.3 || 0.2.2-rc.5` 启动器，再用 `npm pack --dry-run` 列出文件及大小，运行 `plugins/asi-sense/scripts/release-audit.mjs` 检查包内内容、当前用户名和意外文件，最后向目标 registry（默认 npm 公网，或通过 `ASI_RELEASE_REGISTRY` 指定）查询当前版本。仅明确的 `E404` 视为版本不存在；其他查询错误会失败。
-- `pnpm --filter asi-needs release:check`：生成 TypeRT 协议产物、构建 Host/Client bundle，生成精简 `plugins/asi-needs/dist/asi-needs-<version>.tgz` 并校验包清单与 `0.2.2-rc.3 || 0.2.2-rc.5` 启动器，再用 `npm pack --dry-run` 列出文件及大小，运行 `plugins/asi-needs/scripts/release-audit.mjs` 检查白名单文件、敏感内容与当前用户名，最后同样向目标 registry（默认 npm 公网，或通过 `ASI_RELEASE_REGISTRY` 指定）查询当前版本并断言返回 `E404`（`asi-needs` 为纯 JS/CSS 组合包，打包与审计在 Linux 与 macOS 上均可运行）。检查均不读取 npm 用户配置或 token，不能验证需要认证才能读取的 registry。
+- `pnpm --filter asi-needs release:check` 与 `pnpm --filter asi-sleep release:check`：分别生成 TypeRT 协议产物、构建 Host/Client bundle，生成精简 `plugins/asi-needs/dist/asi-needs-<version>.tgz` 与 `plugins/asi-sleep/dist/asi-sleep-<version>.tgz` 并校验包清单与 `0.2.2-rc.3 || 0.2.2-rc.5` 启动器，再用 `npm pack --dry-run` 列出文件及大小，运行各自 `scripts/release-audit.mjs` 检查白名单文件、敏感内容与当前用户名，最后同样向目标 registry（默认 npm 公网，或通过 `ASI_RELEASE_REGISTRY` 指定）查询当前版本并断言返回 `E404`（`asi-needs` 与 `asi-sleep` 均为纯 JS/CSS 组合包，打包与审计在 Linux 与 macOS 上均可运行）。检查均不读取 npm 用户配置或 token，不能验证需要认证才能读取的 registry。
 
 发布物是精简打包产物：
 
 - `plugins/asi-sense/dist/asi-sense-<version>.tgz`（包含 `LICENSE`、`package.json`、`cordis.patch.yml`、`lib/index.js`、`lib/asi-sense-helper`、`scripts/dsh.sh`）
 - `plugins/asi-needs/dist/asi-needs-<version>.tgz`（包含 `LICENSE`、`package.json`、`cordis.patch.yml`、`lib/index.js`、`lib/client.js`、`lib/typert.host.js`、`scripts/dsh.sh`）
+- `plugins/asi-sleep/dist/asi-sleep-<version>.tgz`（包含 `LICENSE`、`package.json`、`cordis.patch.yml`、`lib/index.js`、`lib/client.js`、`lib/typert.host.js`、`scripts/dsh.sh`）
 
 不要直接发布含 `workspace:*` 依赖和源码的插件源码目录。所有源码 `package.json` 均保持 `private: true`，递归发布 dry-run 应显示没有源码包可发布；只有通过各自 `release:check` 的发行 tgz 才能用于发布。检查后不要替换或修改这两个 tgz。
 
@@ -140,7 +142,7 @@ console.log('tgz 回退来源、启用状态和 bundle 顺序已核对');
 NODE
 ```
 
-如果核对失败，停止并保留备份供排查，不要覆盖其他用户更改。备份可能含凭据，应限制权限并按本机保密要求处理。重启 Desktop 后，左侧栏仅展示唯一的「生存需求」入口（`asi-needs`），而在「插件」管理页中可分别查看 `asi-sense` 与 `asi-needs`；只要 registry 有更新的兼容稳定版，详情会出现更新按钮并需确认。通过 tgz 回退后，不会继续自动发现 registry 更新，须再次原位切回包名安装。
+如果核对失败，停止并保留备份供排查，不要覆盖其他用户更改。备份可能含凭据，应限制权限并按本机保密要求处理。重启 Desktop 后，左侧栏展示「生存需求」（`asi-needs`）与「记忆库」（`asi-sleep`）两个面板入口，而在「插件」管理页中可分别查看 `asi-sense`、`asi-needs` 与 `asi-sleep`；只要 registry 有更新的兼容稳定版，详情会出现更新按钮并需确认。通过 tgz 回退后，不会继续自动发现 registry 更新，须再次原位切回包名安装。
 
 `asi-sense` 与 `asi-needs` 均没有 npm 作用域，不能仅给这两个包设置 scope registry；上述命令修改此 profile 的默认 registry，可能影响其他无作用域包，但会保留其他 `.npmrc` 设置和凭据。先评估其他包和代理；如单独配置了 DSH plugin-manager 的 `registry`，其首选源也须与目标一致。一次性 `--registry` 不会持久改变重启后的更新源。
 

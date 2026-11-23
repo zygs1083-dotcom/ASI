@@ -26,6 +26,8 @@ export interface DriveEvaluation {
   urgency: number;
   zone: NeedZone;
   driveActive: boolean;
+  /** When false, discomfort is visible in arbitration/UI while autonomous wakeup in `asi-needs` is deferred. */
+  autoMaintain?: boolean;
   /** True when suspended because L1 physiological survival is distressed or `eco` mode is active. */
   suppressed: boolean;
   suppressionReason?: string;
@@ -70,6 +72,12 @@ export interface ExternalDriveReading {
   satisfaction: number;
   summary: string;
   evidence?: Record<string, string | number | boolean | null>;
+  /**
+   * When `false`, discomfort is still tracked and displayed in `ctx.asiDrives`,
+   * while autonomous wakeup of `asi-needs` maintainer session is deferred (e.g.
+   * `asi-sleep` gating on its quiet window and running its own sleep cycle).
+   */
+  autoMaintain?: boolean;
 }
 
 export interface DriveSourceRegistration {
