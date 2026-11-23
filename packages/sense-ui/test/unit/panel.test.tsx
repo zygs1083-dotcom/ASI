@@ -129,4 +129,21 @@ describe('结构与分区', () => {
     renderPanel(makeScenario('desktop-no-battery'));
     expect(document.querySelector('details[data-tile="battery"]')).toBeNull();
   });
+
+  it('0.3.0 外部缓存求助卡一键批准、动作收益账本与高阶需求仲裁在 320px 无横向溢出且触发回调', async () => {
+    const onApproveHelp = vi.fn(async () => {});
+    const { container } = render(
+      <div style={{ display: 'flex', flexDirection: 'column', width: 320, height: 520 }}>
+        <NeedsPanel {...makeProps(makeScenario('external-cache-arbitration'), { onApproveHelp })} />
+      </div>,
+    );
+    const panel = container.querySelector<HTMLElement>('[data-panel]')!;
+    expect(panel.scrollWidth).toBeLessThanOrEqual(panel.clientWidth);
+    expect(screen.getByText(/受控目标标识：xcode-derived-data/)).toBeTruthy();
+    expect(screen.getByText('动作收益账本（历史实测）')).toBeTruthy();
+    expect(screen.getByText('高阶需求仲裁（ctx.asiDrives）')).toBeTruthy();
+
+    fireEvent.click(screen.getByRole('button', { name: '批准清理外部缓存' }));
+    await waitFor(() => expect(onApproveHelp).toHaveBeenCalledWith('help-ext-cache-1'));
+  });
 });

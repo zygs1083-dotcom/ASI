@@ -48,7 +48,13 @@ export function NeedsPanel(props: NeedsPanelProps) {
       <details open className={css.section}>
         <summary>生存需求</summary>
         <div className={css.sectionBody}>
-          <NeedsSection needs={model.needs} overallZone={model.overallZone} />
+          <NeedsSection
+            needs={model.needs}
+            overallZone={model.overallZone}
+            higherOrderDrives={model.higherOrderDrives}
+            higherOrderSuppressed={model.higherOrderSuppressed}
+            higherOrderSuppressionReason={model.higherOrderSuppressionReason}
+          />
         </div>
       </details>
 
@@ -61,6 +67,7 @@ export function NeedsPanel(props: NeedsPanelProps) {
             instinct={model.instinct}
             session={model.maintenanceSession}
             records={model.recentMaintenance}
+            actionLedger={model.actionLedger}
             onOpenSession={props.onOpenMaintenanceSession}
             onTriggerCheck={props.onTriggerCheck}
           />
