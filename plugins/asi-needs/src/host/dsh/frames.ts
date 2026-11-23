@@ -3,7 +3,8 @@ import type { DisksFact, DiskVolume, Fact, NeedsPanelModel } from '@asi/sense-ui
 import type { NeedsRuntime } from '../runtime.js';
 
 export type FramesSource = ((signal: AbortSignal) => AsyncIterable<NeedsPanelModel>) & {
-  invalidate?: () => void;
+  invalidate?: (sinceRevision?: number) => void;
+  revision?: () => number;
 };
 
 function computeStaleInMs(observedAt: number, ttlMs: number, now: number): number | undefined {
@@ -118,15 +119,22 @@ export interface FramesSourceOptions {
 export function createFramesSource(runtime: NeedsRuntime, options?: FramesSourceOptions): FramesSource {
   const throttleMs = Math.max(0, options?.throttleMs ?? DEFAULT_FRAME_THROTTLE_MS);
   const now = options?.now ?? (() => performance.now());
-  const subscribers = new Set<() => void>();
+  const subscribers = new Set<(sinceRevision?: number) => void>();
+  let currentRevision = 0;
 
   const source = async function* (signal: AbortSignal): AsyncIterable<NeedsPanelModel> {
+    if (signal.aborted) {
+      return;
+    }
+
     let changed = true;
     let immediate = true;
     let timerFired = false;
     let lastEmitAt = Number.NEGATIVE_INFINITY;
+    let emittedRevision = -1;
     let wake: (() => void) | undefined;
     let timer: ReturnType<typeof setTimeout> | undefined;
+    let cleanedUp = false;
 
     const clearTimer = () => {
       if (timer !== undefined) {
@@ -163,27 +171,48 @@ export function createFramesSource(runtime: NeedsRuntime, options?: FramesSource
     };
 
     const onRuntimeChange = () => {
+      currentRevision += 1;
       changed = true;
       if (wake !== undefined) {
         scheduleWake();
       }
     };
 
-    const onInvalidate = () => {
+    const onInvalidate = (sinceRevision?: number) => {
+      if (sinceRevision !== undefined && !changed && emittedRevision > sinceRevision) {
+        return;
+      }
+      currentRevision += 1;
       changed = true;
       immediate = true;
       clearTimer();
       triggerWake();
     };
 
-    const onAbort = () => {
+    let off: (() => void) | undefined = runtime.subscribe(onRuntimeChange);
+
+    const cleanup = () => {
+      if (cleanedUp) return;
+      cleanedUp = true;
       clearTimer();
-      triggerWake();
+      signal.removeEventListener('abort', onAbort);
+      subscribers.delete(onInvalidate);
+      const unsub = off;
+      off = undefined;
+      unsub?.();
     };
 
-    const off = runtime.subscribe(onRuntimeChange);
+    function onAbort(): void {
+      cleanup();
+      triggerWake();
+    }
+
     subscribers.add(onInvalidate);
     signal.addEventListener('abort', onAbort);
+    if (signal.aborted) {
+      cleanup();
+      return;
+    }
 
     try {
       while (!signal.aborted) {
@@ -216,21 +245,20 @@ export function createFramesSource(runtime: NeedsRuntime, options?: FramesSource
         changed = false;
         immediate = false;
         timerFired = false;
+        emittedRevision = currentRevision;
         lastEmitAt = now();
         yield buildPanelModel(runtime);
       }
     } finally {
-      clearTimer();
-      signal.removeEventListener('abort', onAbort);
-      subscribers.delete(onInvalidate);
-      off();
+      cleanup();
     }
   };
 
   return Object.assign(source, {
-    invalidate: () => {
+    revision: () => currentRevision,
+    invalidate: (sinceRevision?: number) => {
       for (const invalidateSubscriber of [...subscribers]) {
-        invalidateSubscriber();
+        invalidateSubscriber(sinceRevision);
       }
     },
   });

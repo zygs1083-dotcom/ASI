@@ -962,4 +962,246 @@ describe('NeedsRuntime 自发维护闭环、冷却预算与啼哭求助生命周
       await rtLegacy.stop();
     }
   });
+
+  it('网关离线、自维护建会话/执行抛错、并发维护运行中升级及多张 open 卡同需求升级时，危急 <asi-cry> 均可靠送达且不重复', async () => {
+    // 1. 网关离线期间软件需求从 uncomfortable 恶化为 critical：无需等待模型会话，直接升级求助卡并投递 parked-offline <asi-cry>
+    const offlineDir = await mkdtemp(join(tmpdir(), 'asi-needs-offline-esc-'));
+    tempDirs.push(offlineDir);
+
+    let nowWall = T0;
+    let nowMono = 1_000;
+    let gatewayOnline = true;
+    const senseOffline = createMockSenseService({ now: nowWall, mono: nowMono });
+    const offlineCries: { content: string; mode: string }[] = [];
+
+    const rtOffline = createNeedsRuntime({
+      storageRoot: offlineDir,
+      sense: senseOffline,
+      clock: { wall: () => nowWall, mono: () => nowMono },
+      probeEndpoint: async () => gatewayOnline,
+      jobs: { listActiveJobs: () => [], hasLiveOwner: () => true, killJob: () => 'already-finished' },
+      compaction: { listIdleSessionIds: () => [], compactIdleSession: async () => ({ compacted: false }) },
+      sessions: {
+        createMaintenanceSession: async (id) => id,
+        hasSession: () => true,
+        runMaintenanceTurn: async () => {},
+        deliverCryToUserSession: async (_t, _e, content, mode) => {
+          offlineCries.push({ content, mode });
+          return true;
+        },
+      },
+    });
+
+    await rtOffline.start();
+    try {
+      // 先在 uncomfortable 阶段提交两张不同 actionKind 的 open 求助卡
+      nowWall += 2_000;
+      nowMono += 2_000;
+      senseOffline.emit((prev) => {
+        const next = structuredClone(prev);
+        next.now = nowWall;
+        next.mono = nowMono;
+        next.state.self.body.disks = {
+          kind: 'disks',
+          ...fact([{ mount: '/', total: 200 * 1024 ** 3, free: 12 * 1024 ** 3 }]),
+        };
+        return next;
+      });
+      await vi.waitFor(() => expect(rtOffline.snapshot().needs.space.zone).toBe('uncomfortable'));
+
+      const { card: c1 } = await rtOffline.tools.requestHelp({
+        need: 'space',
+        severity: 'uncomfortable',
+        title: '清理临时目录',
+        summary: '白名单缓存约 50MB',
+        actionKind: 'clean-cache',
+      });
+      const { card: c2 } = await rtOffline.tools.requestHelp({
+        need: 'space',
+        severity: 'uncomfortable',
+        title: '检查大文件',
+        summary: '~/Downloads 占用偏高',
+        actionKind: 'acknowledge',
+      });
+      expect(offlineCries).toHaveLength(1);
+      expect(offlineCries[0]?.content).toContain('severity="uncomfortable"');
+
+      // 网关断连（跨过 60s 在线探活间隔后连续两次探活失败进入 offline），同时磁盘跌入 critical
+      gatewayOnline = false;
+      nowWall += 65_000;
+      nowMono += 65_000;
+      senseOffline.emit((prev) => ({ ...prev, now: nowWall, mono: nowMono }));
+      await vi.waitFor(() => expect(rtOffline.snapshot().instinct.modelConnectivity).toBe('degraded'));
+      nowWall += 12_000;
+      nowMono += 12_000;
+      senseOffline.emit((prev) => {
+        const next = structuredClone(prev);
+        next.now = nowWall;
+        next.mono = nowMono;
+        next.state.self.body.disks = {
+          kind: 'disks',
+          ...fact([{ mount: '/', total: 200 * 1024 ** 3, free: 1 * 1024 ** 3 }]),
+        };
+        return next;
+      });
+
+      await vi.waitFor(() => {
+        expect(rtOffline.snapshot().instinct.modelConnectivity).toBe('offline');
+        const spaceCries = offlineCries.filter((c) => c.content.includes('need="space"'));
+        expect(spaceCries).toHaveLength(2);
+      });
+
+      // 两张同需求 open 卡均已原位升级为 critical 且保留原诊断信息，space 危急 <asi-cry> 以 parked-offline 模式仅投递一次
+      const spaceCards = rtOffline.snapshot().helpCards.filter((c) => c.need === 'space' && c.status === 'open');
+      expect(spaceCards).toHaveLength(2);
+      expect(spaceCards.every((c) => c.severity === 'critical')).toBe(true);
+      expect(spaceCards.find((c) => c.id === c1.id)?.summary).toContain('白名单缓存约 50MB');
+      expect(spaceCards.find((c) => c.id === c2.id)?.summary).toContain('~/Downloads 占用偏高');
+      const critSpaceCry = offlineCries.find(
+        (c) => c.content.includes('need="space"') && c.content.includes('severity="critical"'),
+      );
+      expect(critSpaceCry?.mode).toBe('parked-offline');
+
+      // 连续重复危急采样不刷新未变求助卡的 updatedAt，也不重复发送 <asi-cry>
+      const energyCardBefore = rtOffline.snapshot().helpCards.find((c) => c.need === 'energy' && c.status === 'open');
+      const totalCriesBefore = offlineCries.length;
+      nowWall += 5_000;
+      nowMono += 5_000;
+      senseOffline.emit((prev) => ({ ...prev, now: nowWall, mono: nowMono }));
+      await new Promise((r) => setTimeout(r, 20));
+      const energyCardAfter = rtOffline.snapshot().helpCards.find((c) => c.need === 'energy' && c.status === 'open');
+      expect(energyCardAfter?.updatedAt).toBe(energyCardBefore?.updatedAt);
+      expect(offlineCries).toHaveLength(totalCriesBefore);
+    } finally {
+      await rtOffline.stop();
+    }
+
+    // 2. 自维护会话在并发运行其他需求时另一需求恶化为 critical，且随后建会话/执行因磁盘满抛错：仍立即补跑并升级啼哭
+    const failDir = await mkdtemp(join(tmpdir(), 'asi-needs-fail-esc-'));
+    tempDirs.push(failDir);
+
+    let tWall = T0;
+    let tMono = 1_000;
+    let releaseFirstTurn: (() => void) | undefined;
+    let failNextTurn = false;
+    const senseFail = createMockSenseService({ now: tWall, mono: tMono });
+    const failCries: string[] = [];
+
+    const rtFail = createNeedsRuntime({
+      storageRoot: failDir,
+      sense: senseFail,
+      clock: { wall: () => tWall, mono: () => tMono },
+      probeEndpoint: async () => true,
+      jobs: {
+        listActiveJobs: () => [{ id: 'j1', owner: 'dead', status: 'running', startedAt: T0 - 20 * 60_000 }],
+        hasLiveOwner: () => false,
+        killJob: () => 'already-finished',
+      },
+      compaction: { listIdleSessionIds: () => [], compactIdleSession: async () => ({ compacted: false }) },
+      sessions: {
+        createMaintenanceSession: async (id) => id,
+        hasSession: () => true,
+        runMaintenanceTurn: async () => {
+          if (failNextTurn) {
+            throw new Error('ENOSPC: no space left on device');
+          }
+          await new Promise<void>((resolve) => {
+            releaseFirstTurn = resolve;
+          });
+        },
+        deliverCryToUserSession: async (_t, _e, content) => {
+          failCries.push(content);
+          return true;
+        },
+      },
+    });
+
+    await rtFail.start();
+    try {
+      await vi.waitFor(() => expect(releaseFirstTurn).toBeTypeOf('function'));
+
+      // 先对 space 发起并忽略一张 uncomfortable 求助卡
+      const { card: ignoredSpace } = await rtFail.tools.requestHelp({
+        need: 'space',
+        severity: 'uncomfortable',
+        title: '空间偏紧',
+        summary: '12GB',
+      });
+      await rtFail.actions.dismissHelp(ignoredSpace.id);
+      expect(failCries).toHaveLength(1);
+
+      // 当 memory 自维护轮仍在 running 时，space 突然恶化为 critical（且后续不再有新的外部 sense 事件），并且下一轮自维护抛 ENOSPC
+      failNextTurn = true;
+      tWall += 5_000;
+      tMono += 5_000;
+      senseFail.emit((prev) => {
+        const next = structuredClone(prev);
+        next.now = tWall;
+        next.mono = tMono;
+        next.state.self.body.disks = {
+          kind: 'disks',
+          ...fact([{ mount: '/', total: 200 * 1024 ** 3, free: 512 * 1024 ** 2 }]),
+        };
+        return next;
+      });
+      await new Promise((r) => setTimeout(r, 20));
+
+      // 释放首轮维护：自动触发 pendingMaintenanceRecheck，并在第二轮抛错时兜底升级 space 危急求助卡与 <asi-cry>
+      releaseFirstTurn?.();
+      await vi.waitFor(() => {
+        expect(failCries).toHaveLength(2);
+      });
+      expect(failCries[1]).toContain('need="space"');
+      expect(failCries[1]).toContain('severity="critical"');
+      expect(
+        rtFail.snapshot().helpCards.some((c) => c.need === 'space' && c.status === 'open' && c.severity === 'critical'),
+      ).toBe(true);
+    } finally {
+      await rtFail.stop();
+    }
+
+    // 3. 旧版 criedEpisodes 存档在危急处理后回滞至 uncomfortable 重启时，保留 critical 抑制不重复啼哭
+    const hystLegacyDir = await mkdtemp(join(tmpdir(), 'asi-needs-legacy-hyst-'));
+    tempDirs.push(hystLegacyDir);
+    await writeFile(
+      join(hystLegacyDir, 'state.json'),
+      JSON.stringify({
+        criedEpisodes: ['space'],
+        handledEpisodeSeverity: { space: 'critical' },
+        previousStates: { space: { zone: 'uncomfortable', driveActive: true, satisfaction: 50 } },
+      }),
+      'utf8',
+    );
+    const critSpaceSnap = makeSnapshot({ now: T0, mono: 1_000 });
+    critSpaceSnap.state.self.body.disks = {
+      kind: 'disks',
+      ...fact([{ mount: '/', total: 200 * 1024 ** 3, free: 1 * 1024 ** 3 }]),
+    };
+    const senseHyst = createMockSenseService(critSpaceSnap);
+    const hystCries: string[] = [];
+    const rtHyst = createNeedsRuntime({
+      storageRoot: hystLegacyDir,
+      sense: senseHyst,
+      clock: { wall: () => T0, mono: () => 1_000 },
+      probeEndpoint: async () => true,
+      jobs: { listActiveJobs: () => [], hasLiveOwner: () => true, killJob: () => 'already-finished' },
+      compaction: { listIdleSessionIds: () => [], compactIdleSession: async () => ({ compacted: false }) },
+      sessions: {
+        createMaintenanceSession: async (id) => id,
+        hasSession: () => true,
+        runMaintenanceTurn: async () => {},
+        deliverCryToUserSession: async (_t, _e, content) => {
+          hystCries.push(content);
+          return true;
+        },
+      },
+    });
+    await rtHyst.start();
+    try {
+      await new Promise((r) => setTimeout(r, 30));
+      expect(hystCries).toHaveLength(0);
+    } finally {
+      await rtHyst.stop();
+    }
+  });
 });

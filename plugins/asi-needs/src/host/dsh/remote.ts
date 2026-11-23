@@ -26,12 +26,13 @@ export class AsiNeedsRemote extends TypertRemoteService {
     }
   }
 
-  private async userAction(action: () => Promise<void>): Promise<void> {
+  private async userAction<T>(action: () => Promise<T>): Promise<T> {
     this.checkUser();
+    const revBefore = this.framesSource.revision?.();
     try {
-      await action();
+      return await action();
     } finally {
-      this.framesSource.invalidate?.();
+      this.framesSource.invalidate?.(revBefore);
     }
   }
 
@@ -82,12 +83,7 @@ export class AsiNeedsRemote extends TypertRemoteService {
 
   @Remote
   async openMaintenanceSession(): Promise<string> {
-    this.checkUser();
-    try {
-      return await this.actions.openMaintenanceSession();
-    } finally {
-      this.framesSource.invalidate?.();
-    }
+    return await this.userAction(() => this.actions.openMaintenanceSession());
   }
 
   @Remote

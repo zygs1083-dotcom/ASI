@@ -1,6 +1,8 @@
 import type { NeedsSnapshot, SenseSnapshot } from '@asi/sense-types';
+import { Context } from '@deepseek-ai/cordis';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createFramesSource, DEFAULT_FRAME_THROTTLE_MS } from '../src/host/dsh/frames.js';
+import { AsiNeedsRemote } from '../src/host/dsh/remote.js';
 import type { NeedsRuntime } from '../src/host/runtime.js';
 import { fact, makeSnapshot, T0 } from './fixtures.js';
 
@@ -246,7 +248,7 @@ describe('createFramesSource 侧栏帧流节流合并与资源清理', () => {
     const { runtime, emitCpu, getSnapshotCalls, listeners, offSpy } = createStubRuntime(0.2);
     const source = createFramesSource(runtime, { throttleMs: 200 });
 
-    // 1. 传入预先已 aborted 的 signal：不产生帧、不遗留定时器或监听器
+    // 1. 传入预先已 aborted 的 signal：不产生帧、不订阅 runtime、不遗留定时器或监听器
     const preAborted = new AbortController();
     preAborted.abort();
     const deadIter = source(preAborted.signal)[Symbol.asyncIterator]();
@@ -255,6 +257,7 @@ describe('createFramesSource 侧栏帧流节流合并与资源清理', () => {
     expect(getSnapshotCalls()).toBe(0);
     expect(vi.getTimerCount()).toBe(0);
     expect(listeners.size).toBe(0);
+    expect(offSpy).toHaveBeenCalledTimes(0);
 
     // 2. 两个并发订阅者 + 慢消费者（在尚未调用第二次 next() 前发生多次更新）：
     // 中止其中一个订阅者不影响另一个订阅者按节流窗口收到最新合并帧
@@ -289,9 +292,130 @@ describe('createFramesSource 侧栏帧流节流合并与资源清理', () => {
     expect(frame2.value?.state.self.body.cpu.value?.usage).toBe(0.91);
     expect(vi.getTimerCount()).toBe(0);
 
+    // 订阅者 2 当前停在 yield 挂起点（模拟慢速 WebSocket 背压未拉取下一帧），此时直接触发 abort()：
+    // 无需等待消费者调用 iterator.return()，runtime 订阅与内部回调必须立即同步清理！
     c2.abort();
-    await iter2.return?.();
     expect(listeners.size).toBe(0);
-    expect(offSpy).toHaveBeenCalledTimes(3);
+    expect(offSpy).toHaveBeenCalledTimes(2);
+  });
+
+  it('尾部合并帧发出后紧接着的新更新继续受节流保护；Remote userAction 修订号去重避免双帧重复推送', async () => {
+    vi.useFakeTimers();
+    const { runtime, emitCpu, getSnapshotCalls, setPaused } = createStubRuntime(0.1);
+    const source = createFramesSource(runtime, { throttleMs: 200 });
+    const controller = new AbortController();
+    const iterator = source(controller.signal)[Symbol.asyncIterator]();
+
+    // t=0 首帧
+    await iterator.next();
+    expect(getSnapshotCalls()).toBe(1);
+
+    // t=50 更新 -> 在 t=200 尾部发出第 2 帧
+    const p2 = iterator.next();
+    await vi.advanceTimersByTimeAsync(50);
+    emitCpu(0.4);
+    await vi.advanceTimersByTimeAsync(150);
+    expect((await p2).value?.state.self.body.cpu.value?.usage).toBe(0.4);
+    expect(getSnapshotCalls()).toBe(2);
+
+    // t=210（距尾部帧仅 10ms）再次更新：必须继续节流至 t=400，不能在 t=210 立即发出
+    const p3 = iterator.next();
+    let p3Done = false;
+    void p3.then(() => {
+      p3Done = true;
+    });
+    await vi.advanceTimersByTimeAsync(10);
+    emitCpu(0.7);
+    expect(p3Done).toBe(false);
+    expect(vi.getTimerCount()).toBe(1);
+    await vi.advanceTimersByTimeAsync(190);
+    expect((await p3).value?.state.self.body.cpu.value?.usage).toBe(0.7);
+    expect(getSnapshotCalls()).toBe(3);
+
+    // 模拟静默 5s 后 Remote.userAction 执行（action 内已触发 runtime notify 并立即推出了新帧，随后 finally 调用 invalidate(revBefore)）：
+    // 只应推送 1 帧而非重复推送第 2 帧
+    const p4 = iterator.next();
+    await vi.advanceTimersByTimeAsync(5_000);
+    const revBefore = source.revision?.();
+    setPaused(true);
+    emitCpu(0.71);
+    const f4 = await p4;
+    expect(f4.value?.paused).toBe(true);
+    expect(getSnapshotCalls()).toBe(4);
+
+    const p5 = iterator.next();
+    let p5Resolved = false;
+    void p5.then(() => {
+      p5Resolved = true;
+    });
+    source.invalidate?.(revBefore);
+    await Promise.resolve();
+    expect(p5Resolved).toBe(false);
+    expect(getSnapshotCalls()).toBe(4);
+
+    // 若 action 未触发 runtime notify（例如无状态变更通知），invalidate(revBeforeStillSame) 仍正常立即刷新 1 帧
+    const revNoNotify = source.revision?.();
+    setPaused(false);
+    source.invalidate?.(revNoNotify);
+    const f5 = await p5;
+    expect(f5.value?.paused).toBe(false);
+    expect(getSnapshotCalls()).toBe(5);
+
+    controller.abort();
+  });
+
+  it('真实 AsiNeedsRemote 流与动作联动：节流生效且点击 pause / openPermissionSettings 均精确单帧刷新不双发', async () => {
+    vi.useFakeTimers();
+    const stub = createStubRuntime(0.25);
+    stub.runtime.actions = {
+      pause: async (paused: boolean) => {
+        await Promise.resolve();
+        stub.setPaused(paused);
+        stub.emitCpu(0.26);
+      },
+      setSendTitles: async () => {},
+      openPermissionSettings: async () => {
+        await Promise.resolve();
+      },
+      approveHelp: async () => {},
+      dismissHelp: async () => {},
+      openMaintenanceSession: async () => 'asi-maint-1',
+      triggerCheck: async () => {},
+    };
+
+    const ctx = new Context();
+    const remote = new AsiNeedsRemote(ctx, stub.runtime.actions, createFramesSource(stub.runtime, { throttleMs: 200 }));
+    const controller = new AbortController();
+    const stream = remote.frames(controller.signal)[Symbol.asyncIterator]();
+
+    const first = await stream.next();
+    expect(first.value?.paused).toBe(false);
+    expect(stub.getSnapshotCalls()).toBe(1);
+
+    // 静默 3 秒后执行真实 remote.pause(true)：内部 notify 立即推送 1 帧，finally 的 invalidate(revBefore) 不产生重复第 2 帧
+    const secondPromise = stream.next();
+    await vi.advanceTimersByTimeAsync(3_000);
+    await remote.pause(true);
+    const second = await secondPromise;
+    expect(second.value?.paused).toBe(true);
+    expect(stub.getSnapshotCalls()).toBe(2);
+
+    const thirdPromise = stream.next();
+    let thirdResolved = false;
+    void thirdPromise.then(() => {
+      thirdResolved = true;
+    });
+    await Promise.resolve();
+    expect(thirdResolved).toBe(false);
+    expect(stub.getSnapshotCalls()).toBe(2);
+
+    // 执行不触发 runtime notify 的动作 openPermissionSettings：invalidate(revBefore) 立即推送 1 帧
+    await remote.openPermissionSettings();
+    const third = await thirdPromise;
+    expect(third.done).toBe(false);
+    expect(stub.getSnapshotCalls()).toBe(3);
+
+    controller.abort();
+    expect(stub.listeners.size).toBe(0);
   });
 });

@@ -106,6 +106,7 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime {
   let maintLastRunAt: number | undefined;
   let lastAutoRunMono: number | undefined;
   let rotateMaintainerNext = false;
+  let pendingMaintenanceRecheck = false;
 
   let latestSense: SenseSnapshot = ports.sense.snapshot();
   let latestEval = evaluateNeeds({
@@ -228,10 +229,49 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime {
     }
   }
 
+  function effectiveConnectivity() {
+    const raw = instinct.modelConnectivity();
+    const evalConn = latestEval.needs.energy.evidence.modelConnectivity;
+    if (raw === 'offline' || evalConn === 'offline') return 'offline' as const;
+    if (raw === 'degraded' || evalConn === 'degraded') return 'degraded' as const;
+    return 'online' as const;
+  }
+
+  function mergeEscalatedSummary(evalSummary: string, prevSummary: string): string {
+    const fresh = String(sanitizeForModel(evalSummary)).trim();
+    const prior = String(sanitizeForModel(prevSummary)).trim();
+    if (!prior || prior === fresh || fresh.includes(prior)) {
+      return fresh.length > 280 ? `${fresh.slice(0, 279)}…` : fresh;
+    }
+    const combined = `${fresh}（此前诊断：${prior}）`;
+    return combined.length > 280 ? `${combined.slice(0, 279)}…` : combined;
+  }
+
+  function upgradeOpenCardsToCritical(key: NeedKey, now: number): HelpCard | undefined {
+    const evalSummary = latestEval.needs[key].summary;
+    let changed = false;
+    helpCards = helpCards.map((card) => {
+      if (card.need === key && card.status === 'open' && card.severity === 'uncomfortable') {
+        changed = true;
+        return {
+          ...card,
+          severity: 'critical',
+          summary: mergeEscalatedSummary(evalSummary, card.summary),
+          updatedAt: now,
+        };
+      }
+      return card;
+    });
+    if (!changed) {
+      return helpCards.find((c) => c.need === key && c.status === 'open' && c.severity === 'critical');
+    }
+    return helpCards.find((c) => c.need === key && c.status === 'open' && c.severity === 'critical');
+  }
+
   async function deliverCryIfNeeded(card: HelpCard): Promise<boolean> {
     if (isCrySuppressed(card.need, card.severity)) return false;
     const exclude = new Set(internalSessions.keys());
-    const mode = chooseCryDeliveryMode(instinct.modelConnectivity());
+    const mode = chooseCryDeliveryMode(effectiveConnectivity());
     const delivered = await ports.sessions
       .deliverCryToUserSession(latestSense.activeSessionId, exclude, formatCryMessage(card), mode)
       .catch(() => false);
@@ -250,14 +290,43 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime {
     proposedAction?: string;
     actionKind?: HelpActionKind;
   }): Promise<{ card: HelpCard; deliveredCry: boolean }> {
-    const res = upsertHelpCard(helpCards, { ...input, now: clock.wall() });
-    helpCards = res.cards;
-    const deliveredCry = await deliverCryIfNeeded(res.card);
-    if (!deliveredCry) {
+    const now = clock.wall();
+    const actionKind: HelpActionKind = input.actionKind ?? 'acknowledge';
+    const prevSameKind = helpCards.find(
+      (c) => c.status === 'open' && c.need === input.need && c.actionKind === actionKind,
+    );
+    const hadOtherUncomfortable =
+      input.severity === 'critical' &&
+      helpCards.some(
+        (c) =>
+          c.status === 'open' && c.need === input.need && c.actionKind !== actionKind && c.severity === 'uncomfortable',
+      );
+    const res = upsertHelpCard(helpCards, { ...input, actionKind, now });
+    const sameContent =
+      !res.created &&
+      prevSameKind !== undefined &&
+      prevSameKind.severity === res.card.severity &&
+      prevSameKind.title === res.card.title &&
+      prevSameKind.summary === res.card.summary &&
+      prevSameKind.proposedAction === res.card.proposedAction;
+
+    if (!sameContent) {
+      helpCards = res.cards;
+    }
+    if (hadOtherUncomfortable) {
+      upgradeOpenCardsToCritical(input.need, now);
+    }
+
+    const activeCard =
+      helpCards.find((c) => c.id === res.card.id) ?? (sameContent && prevSameKind ? prevSameKind : res.card);
+    const deliveredCry = await deliverCryIfNeeded(activeCard);
+    if ((!sameContent || hadOtherUncomfortable) && !deliveredCry) {
       await persistState();
     }
-    notify();
-    return { card: res.card, deliveredCry };
+    if (!sameContent || hadOtherUncomfortable || deliveredCry) {
+      notify();
+    }
+    return { card: activeCard, deliveredCry };
   }
 
   async function escalateNeedToCritical(
@@ -265,29 +334,39 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime {
     defaultTitle: string,
     defaultProposedAction: string,
   ): Promise<void> {
-    const openCriticalCard = helpCards.find((c) => c.need === key && c.status === 'open' && c.severity === 'critical');
-    if (openCriticalCard) {
-      await deliverCryIfNeeded(openCriticalCard);
-      return;
-    }
-    if (isAutoHelpSuppressed(key, 'critical')) return;
+    const hadUncomfortableOpen = helpCards.some(
+      (c) => c.need === key && c.status === 'open' && c.severity === 'uncomfortable',
+    );
+    const existingOpenCritical = helpCards.find(
+      (c) => c.need === key && c.status === 'open' && c.severity === 'critical',
+    );
 
-    const openUncomfortableIdx = helpCards.findIndex((c) => c.need === key && c.status === 'open');
-    const prevOpen = openUncomfortableIdx >= 0 ? helpCards[openUncomfortableIdx] : undefined;
-    if (prevOpen) {
-      const upgraded: HelpCard = {
-        ...prevOpen,
-        severity: 'critical',
-        summary: latestEval.needs[key].summary,
-        updatedAt: clock.wall(),
-      };
-      helpCards = helpCards.map((c, idx) => (idx === openUncomfortableIdx ? upgraded : c));
-      const deliveredCry = await deliverCryIfNeeded(upgraded);
-      if (!deliveredCry) {
+    if (existingOpenCritical) {
+      if (hadUncomfortableOpen) {
+        upgradeOpenCardsToCritical(key, clock.wall());
+      }
+      const deliveredCry = await deliverCryIfNeeded(existingOpenCritical);
+      if (hadUncomfortableOpen && !deliveredCry) {
         await persistState();
       }
-      notify();
+      if (hadUncomfortableOpen || deliveredCry) {
+        notify();
+      }
       return;
+    }
+
+    if (isAutoHelpSuppressed(key, 'critical')) return;
+
+    if (hadUncomfortableOpen) {
+      const upgraded = upgradeOpenCardsToCritical(key, clock.wall());
+      if (upgraded) {
+        const deliveredCry = await deliverCryIfNeeded(upgraded);
+        if (!deliveredCry) {
+          await persistState();
+        }
+        notify();
+        return;
+      }
     }
 
     await raiseHelp({
@@ -362,7 +441,7 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime {
         bat.value.powerState !== 'charged' &&
         bat.value.powerState !== 'external' &&
         (batPercent < 15 || lowMinutesLeft);
-      const gatewayOffline = instinct.modelConnectivity() === 'offline';
+      const gatewayOffline = effectiveConnectivity() === 'offline';
 
       if (unpluggedCriticalBat || gatewayOffline) {
         await raiseHelp({
@@ -438,13 +517,28 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime {
 
   async function runMaintenanceCheck(manual: boolean): Promise<void> {
     if (stopped || latestSense.settings.paused) return;
-    if (maintStatus === 'running') return;
-    if (instinct.modelConnectivity() === 'offline') return;
+    if (maintStatus === 'running') {
+      if (!manual) pendingMaintenanceRecheck = true;
+      return;
+    }
 
     const distressed = manual
       ? NEED_KEYS.filter((k) => latestEval.needs[k].driveActive)
       : hasSoftwareActionableDistress();
     if (!manual && distressed.length === 0) return;
+
+    if (effectiveConnectivity() === 'offline') {
+      for (const key of distressed) {
+        if (latestEval.needs[key].zone === 'critical') {
+          await escalateNeedToCritical(
+            key,
+            `${NEED_LABELS[key]}危急（模型网关离线，无法后台自救）`,
+            '当前模型网关不可达，无法运行后台安全维护会话；请人工排查或恢复网络连接。',
+          );
+        }
+      }
+      return;
+    }
 
     const monoNow = clock.mono();
     while (autonomousTurnMonoTimes[0] !== undefined && monoNow - autonomousTurnMonoTimes[0] > 3_600_000) {
@@ -475,9 +569,6 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime {
 
     const targetKeys = distressed.length > 0 ? distressed : (['space', 'memory', 'mind'] as NeedKey[]);
     const beforeSat = Object.fromEntries(targetKeys.map((k) => [k, latestEval.needs[k].satisfaction]));
-    for (const k of targetKeys) {
-      if (latestEval.needs[k].zone === 'critical') escalatedCriticalInTurn.add(k);
-    }
 
     const shouldRotate = rotateMaintainerNext || maintTurnCount >= MAX_MAINTAINER_TURNS_BEFORE_ROTATE;
     rotateMaintainerNext = false;
@@ -486,7 +577,22 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime {
     try {
       sessionId = await ensureMaintenanceSession(shouldRotate);
     } catch {
+      if (!stopped && !turnAbort.signal.aborted) {
+        for (const critKey of distressed) {
+          if (latestEval.needs[critKey].zone === 'critical') {
+            await escalateNeedToCritical(
+              critKey,
+              `${NEED_LABELS[critKey]}危急且无法创建自维护沙盒会话，需人工协助`,
+              '后台自维护会话初始化失败（可能磁盘已满或会话服务受阻），请人工介入处理。',
+            );
+          }
+        }
+      }
       return;
+    }
+
+    for (const k of targetKeys) {
+      if (latestEval.needs[k].zone === 'critical') escalatedCriticalInTurn.add(k);
     }
 
     maintStatus = 'running';
@@ -543,6 +649,18 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime {
       });
     } catch {
       maintStatus = 'idle';
+      if (!stopped && !turnAbort.signal.aborted) {
+        recomputeEval(ports.sense.snapshot());
+        for (const critKey of distressed) {
+          if (latestEval.needs[critKey].zone === 'critical') {
+            await escalateNeedToCritical(
+              critKey,
+              `${NEED_LABELS[critKey]}危急且后台自维护执行中断，需人工协助`,
+              '后台自维护会话未能完成自救，请人工排查当前资源压力。',
+            );
+          }
+        }
+      }
       addRecord({
         actor: 'maintainer',
         ...(targetKeys[0] ? { need: targetKeys[0] } : {}),
@@ -552,6 +670,10 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime {
       });
     } finally {
       notify();
+      if (!stopped && !latestSense.settings.paused && pendingMaintenanceRecheck) {
+        pendingMaintenanceRecheck = false;
+        void runMaintenanceCheck(false);
+      }
     }
   }
 
@@ -590,7 +712,7 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime {
     }
 
     await checkImmediateBoundaries(latestSense);
-    if (!latestSense.settings.paused && latestSense.activeSessionId) {
+    if (!latestSense.settings.paused) {
       for (const openCard of helpCards) {
         if (openCard.status === 'open' && !isCrySuppressed(openCard.need, openCard.severity)) {
           await deliverCryIfNeeded(openCard);
@@ -871,6 +993,12 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime {
             }
           }
         }
+        if (parsed.handledEpisodeSeverity && typeof parsed.handledEpisodeSeverity === 'object') {
+          for (const key of NEED_KEYS) {
+            const sev = parsed.handledEpisodeSeverity[key];
+            if (sev === 'uncomfortable' || sev === 'critical') handledEpisodeSeverity.set(key, sev);
+          }
+        }
         if (parsed.criedEpisodeSeverity && typeof parsed.criedEpisodeSeverity === 'object') {
           for (const key of NEED_KEYS) {
             const sev = parsed.criedEpisodeSeverity[key];
@@ -882,19 +1010,14 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime {
               const hasCriticalCard = helpCards.some(
                 (c) => c.need === k && c.status === 'open' && c.severity === 'critical',
               );
+              const wasHandledCritical = handledEpisodeSeverity.get(k) === 'critical';
               const prevZone = previousStates[k]?.zone;
               const inferred: EpisodeSeverity =
-                hasCriticalCard || prevZone === 'critical' || prevZone !== 'uncomfortable'
+                hasCriticalCard || wasHandledCritical || prevZone === 'critical' || prevZone !== 'uncomfortable'
                   ? 'critical'
                   : 'uncomfortable';
               criedEpisodeSeverity.set(k, inferred);
             }
-          }
-        }
-        if (parsed.handledEpisodeSeverity && typeof parsed.handledEpisodeSeverity === 'object') {
-          for (const key of NEED_KEYS) {
-            const sev = parsed.handledEpisodeSeverity[key];
-            if (sev === 'uncomfortable' || sev === 'critical') handledEpisodeSeverity.set(key, sev);
           }
         }
         if (Array.isArray(parsed.internalSessionIds)) {
