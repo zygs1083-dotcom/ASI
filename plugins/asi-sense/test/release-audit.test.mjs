@@ -9,16 +9,22 @@ import { auditFiles, registryUrl, registryVersionAvailable } from '../scripts/re
 const pkgDir = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 
 describe('release audit', () => {
-  it('keeps every source workspace private', () => {
+  it('keeps every source workspace private and aligned at 0.4.0', () => {
     for (const path of [
       '../../../package.json',
       '../../../packages/body-probe/package.json',
       '../../../packages/sense-types/package.json',
       '../../../packages/sense-ui/package.json',
       '../../asi-needs/package.json',
+      '../../asi-sleep/package.json',
+      '../../asi-care/package.json',
       '../package.json',
     ]) {
-      expect(JSON.parse(readFileSync(new URL(path, import.meta.url))).private).toBe(true);
+      const manifest = JSON.parse(readFileSync(new URL(path, import.meta.url)));
+      expect(manifest.private).toBe(true);
+      if (path !== '../../../package.json') {
+        expect(manifest.version).toBe('0.4.0');
+      }
     }
   });
 

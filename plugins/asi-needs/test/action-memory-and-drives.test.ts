@@ -1874,4 +1874,135 @@ describe('0.3.0 全景嗅探、一键外部缓存批准清理、行动效果记�
       await runtime2.stop();
     }
   });
+
+  it('L2 asi-sleep (autoMaintain=false) 与 L3 asi-care (静默求助卡 + 自动回合) 并存仲裁：L2 等待静默期既不空唤醒会话，也不阻塞 L3 自治与一键批准', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'asi-040-four-plugin-coexist-'));
+    tempDirs.push(dir);
+
+    let nowWall = T0;
+    let nowMono = 1_000;
+    const sense = createMockSenseService(makeSnapshot({ now: nowWall, mono: nowMono }), dir);
+    const maintPrompts: string[] = [];
+    const cries: string[] = [];
+    let careBloatSat = 100;
+
+    const rt = createNeedsRuntime({
+      storageRoot: dir,
+      sense,
+      clock: { wall: () => nowWall, mono: () => nowMono },
+      probeEndpoint: async () => true,
+      jobs: { listActiveJobs: () => [], hasLiveOwner: () => true, killJob: () => 'already-finished' },
+      compaction: { listIdleSessionIds: () => [], compactIdleSession: async () => ({ compacted: false }) },
+      sessions: {
+        createMaintenanceSession: async (id) => id,
+        hasSession: () => true,
+        runMaintenanceTurn: async (_sid, prompt) => {
+          maintPrompts.push(prompt);
+          await rt.drives.proposeHelpCard('asi-care', {
+            driveKey: 'workspace_bloat',
+            title: '发现闲置工作树构建产物',
+            summary: '~/work/wt-old/node_modules 闲置 9 天（1.5 GiB）',
+            actionKind: 'run-drive-action',
+            actionTarget: 'art_demo01',
+            approveLabel: '批准清理构建产物',
+          });
+        },
+        deliverCryToUserSession: async (_target, _exclude, text) => {
+          cries.push(text);
+          return true;
+        },
+      },
+    });
+
+    await rt.start();
+    try {
+      // 保留工具名（含 memory_recall / memory_profile / care_status）严禁被外部高阶源抢注为沙盒工具
+      expect(() =>
+        rt.drives.registerSource({
+          id: 'bad-collision',
+          tier: 4,
+          label: '冲突测试',
+          evaluate: () => [],
+          sandboxTools: [{ name: 'memory_recall', description: 'dup', execute: async () => ({ summary: 'x' }) }],
+        }),
+      ).toThrow(/Forbidden or reserved sandbox tool name/);
+
+      rt.drives.registerSource({
+        id: 'asi-sleep',
+        tier: 2,
+        label: '离线睡眠与记忆整合',
+        evaluate: () => [
+          {
+            key: 'consolidation',
+            label: '睡眠记忆整合',
+            satisfaction: 42,
+            autoMaintain: false,
+            summary: '累计 14 轮待睡眠整合（等待 10 分钟静默期）',
+            evidence: { unconsolidatedTurns: 14, quietWindow: false },
+          },
+        ],
+      });
+
+      rt.drives.registerSource({
+        id: 'asi-care',
+        tier: 3,
+        label: '工作区与项目看护',
+        evaluate: () => [
+          {
+            key: 'workspace_bloat',
+            label: '闲置工作树产物膨胀',
+            satisfaction: careBloatSat,
+            summary: careBloatSat < 60 ? '闲置产物 1.5 GiB' : '无膨胀',
+            evidence: { bloatBytes: careBloatSat < 60 ? 1_600_000_000 : 0 },
+          },
+        ],
+        executeHelpAction: async (input) => {
+          expect(input.actionTarget).toBe('art_demo01');
+          careBloatSat = 100;
+          return {
+            ledgerAction: 'clean-workspace-artifact:node_modules',
+            summary: '已清理闲置构建产物 1.5 GiB',
+            freedBytes: 1_600_000_000,
+          };
+        },
+      });
+
+      // 阶段 1：仅 L2 asi-sleep 不适（autoMaintain=false），L3 舒适 -> activeTier=2 可见，但绝不唤醒自维护会话！
+      await new Promise((r) => setTimeout(r, 25));
+      expect(rt.drives.snapshot().activeTier).toBe(2);
+      expect(maintPrompts).toHaveLength(0);
+
+      // 阶段 2：L3 asi-care 进入不适 -> L2 的 autoMaintain=false 不阻塞 L3 唤醒，且提示词仅针对 L3、全程零 <asi-cry>！
+      careBloatSat = 45;
+      nowWall += 5_000;
+      nowMono += 5_000;
+      rt.drives.notifySourceChanged('asi-care');
+
+      await vi.waitFor(() => {
+        expect(maintPrompts).toHaveLength(1);
+        expect(rt.snapshot().helpCards.some((c) => c.status === 'open' && c.actionTarget === 'art_demo01')).toBe(true);
+      });
+      expect(maintPrompts[0]).toContain('asi-care:workspace_bloat');
+      expect(maintPrompts[0]).not.toContain('asi-sleep:consolidation');
+      expect(cries).toHaveLength(0);
+
+      // 阶段 3：用户在侧栏一键批准静默求助卡 -> 执行回调恢复舒适并记入 ActionOutcomeLedger
+      const openCard = rt.snapshot().helpCards.find((c) => c.status === 'open' && c.actionTarget === 'art_demo01');
+      expect(openCard?.silent).toBe(true);
+      await rt.actions.approveHelp(openCard?.id ?? '');
+
+      expect(rt.snapshot().higherOrderDrives?.find((d) => d.key === 'asi-care:workspace_bloat')?.satisfaction).toBe(
+        100,
+      );
+      const ledgerEntry = rt
+        .snapshot()
+        .actionLedger?.find(
+          (e) => e.need === 'asi-care:workspace_bloat' && e.action === 'clean-workspace-artifact:node_modules',
+        );
+      expect(ledgerEntry?.effectiveCount).toBe(1);
+      expect(cries).toHaveLength(0);
+    } finally {
+      await rt.stop();
+    }
+  });
 });

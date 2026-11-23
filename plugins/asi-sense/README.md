@@ -21,13 +21,17 @@
 pnpm install --frozen-lockfile
 pnpm --filter asi-sense pack:dist
 pnpm --filter asi-needs pack:dist
+pnpm --filter asi-sleep pack:dist
+pnpm --filter asi-care pack:dist
 ```
 
-使用匹配的 DSH CLI（`0.2.2-rc.3` 或 `0.2.2-rc.5`）同时安装感官模块与生存需求模块：
+使用匹配的 DSH CLI（`0.2.2-rc.3` 或 `0.2.2-rc.5`）依次安装四个组合包（保留 profile 中既有的 `dsh-context` / `dsh-superagent` 等插件）：
 
 ```sh
-dsh plugin --profile desktop add ./plugins/asi-sense/dist/asi-sense-0.3.0.tgz
-dsh plugin --profile desktop add ./plugins/asi-needs/dist/asi-needs-0.3.0.tgz
+dsh plugin --profile desktop add ./plugins/asi-sense/dist/asi-sense-0.4.0.tgz
+dsh plugin --profile desktop add ./plugins/asi-needs/dist/asi-needs-0.4.0.tgz
+dsh plugin --profile desktop add ./plugins/asi-sleep/dist/asi-sleep-0.4.0.tgz
+dsh plugin --profile desktop add ./plugins/asi-care/dist/asi-care-0.4.0.tgz
 ```
 
 完整的隔离 Web profile 启动与升级说明见 [docs/install-and-update.md](../../docs/install-and-update.md)。

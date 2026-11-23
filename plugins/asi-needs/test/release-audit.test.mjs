@@ -12,6 +12,7 @@ const pkgDir = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 describe('asi-needs 发布包卫生审计', () => {
   it('package.json 保持 private=true 且声明兼容 0.2.2-rc.3 || 0.2.2-rc.5', async () => {
     const manifest = JSON.parse(await readFile(join(pkgDir, 'package.json'), 'utf8'));
+    expect(manifest.version).toBe('0.4.0');
     expect(manifest.private).toBe(true);
     expect(manifest.engines.dsh).toBe('0.2.2-rc.3 || 0.2.2-rc.5');
     for (const dep of [
@@ -184,6 +185,101 @@ describe('asi-needs 发布包卫生审计', () => {
             'asi-needs': 'file:/old/asi-needs-0.2.0.tgz',
           },
           dsh: { profile: { bundles: ['asi-sense'] } },
+        }),
+      );
+      expect(runRollbackCheck().status).toBe(0);
+
+      // 3. 从 0.3.0 双插件升级至 0.4.0 四插件并完整保留 dsh-context / dsh-superagent，以及回退至 0.3.0 tgz
+      for (const pkg of ['asi-sense', 'asi-needs', 'asi-sleep', 'asi-care']) {
+        await mkdir(join(profileDir, 'node_modules', pkg), { recursive: true });
+        await writeFile(join(profileDir, 'node_modules', pkg, 'package.json'), '{"version":"0.4.0"}');
+      }
+      const runUpgrade040 = () =>
+        spawnSync(process.execPath, ['-', profileDir, backupPath, '0.4.0', '0.4.0', '0.4.0', '0.4.0'], {
+          input: verifyUpgradeScript,
+          encoding: 'utf8',
+        });
+
+      await writeFile(
+        backupPath,
+        JSON.stringify({
+          dependencies: {
+            'dsh-context': '0.2.2-rc.3',
+            'dsh-superagent': '0.2.2-rc.3',
+            'asi-sense': 'file:/old/asi-sense-0.3.0.tgz',
+            'asi-needs': 'file:/old/asi-needs-0.3.0.tgz',
+          },
+          dsh: { profile: { bundles: ['dsh-context', 'dsh-superagent', 'asi-sense', 'asi-needs'] } },
+        }),
+      );
+
+      // 若 dsh-superagent 被意外丢失，核对脚本必须拦截报错
+      await writeFile(
+        join(profileDir, 'package.json'),
+        JSON.stringify({
+          dependencies: {
+            'dsh-context': '0.2.2-rc.3',
+            'asi-sense': '0.4.0',
+            'asi-needs': '0.4.0',
+            'asi-sleep': '0.4.0',
+            'asi-care': '0.4.0',
+          },
+          dsh: {
+            profile: {
+              bundles: ['dsh-context', 'dsh-superagent', 'asi-sense', 'asi-needs', 'asi-sleep', 'asi-care'],
+            },
+          },
+        }),
+      );
+      expect(runUpgrade040().status).not.toBe(0);
+
+      // 完整保留 dsh-context + dsh-superagent 且追加 asi-sleep + asi-care 时通过
+      await writeFile(
+        join(profileDir, 'package.json'),
+        JSON.stringify({
+          dependencies: {
+            'dsh-context': '0.2.2-rc.3',
+            'dsh-superagent': '0.2.2-rc.3',
+            'asi-sense': '0.4.0',
+            'asi-needs': '0.4.0',
+            'asi-sleep': '0.4.0',
+            'asi-care': '0.4.0',
+          },
+          dsh: {
+            profile: {
+              bundles: ['dsh-context', 'dsh-superagent', 'asi-sense', 'asi-needs', 'asi-sleep', 'asi-care'],
+            },
+          },
+        }),
+      );
+      expect(runUpgrade040().status).toBe(0);
+
+      // 回退到 0.3.0 时若残留 asi-care 报错，干净移除新增包并恢复 0.3.0 file: 时通过
+      await writeFile(
+        join(profileDir, 'package.json'),
+        JSON.stringify({
+          dependencies: {
+            'dsh-context': '0.2.2-rc.3',
+            'dsh-superagent': '0.2.2-rc.3',
+            'asi-sense': 'file:/old/asi-sense-0.3.0.tgz',
+            'asi-needs': 'file:/old/asi-needs-0.3.0.tgz',
+            'asi-care': '0.4.0',
+          },
+          dsh: { profile: { bundles: ['dsh-context', 'dsh-superagent', 'asi-sense', 'asi-needs'] } },
+        }),
+      );
+      expect(runRollbackCheck().status).not.toBe(0);
+
+      await writeFile(
+        join(profileDir, 'package.json'),
+        JSON.stringify({
+          dependencies: {
+            'dsh-context': '0.2.2-rc.3',
+            'dsh-superagent': '0.2.2-rc.3',
+            'asi-sense': 'file:/old/asi-sense-0.3.0.tgz',
+            'asi-needs': 'file:/old/asi-needs-0.3.0.tgz',
+          },
+          dsh: { profile: { bundles: ['dsh-context', 'dsh-superagent', 'asi-sense', 'asi-needs'] } },
         }),
       );
       expect(runRollbackCheck().status).toBe(0);
