@@ -99,7 +99,7 @@ export class ActionOutcomeLedger {
         totalFreedBytes: Math.max(0, Math.round(Number(rec.totalFreedBytes) || 0)),
         totalStoppedJobs: Math.max(0, Math.round(Number(rec.totalStoppedJobs) || 0)),
         totalTokensSaved: Math.max(0, Math.round(Number(rec.totalTokensSaved) || 0)),
-        totalSatisfactionDelta: Math.round(Number(rec.totalSatisfactionDelta) || 0),
+        totalSatisfactionDelta: Math.max(0, Math.round(Number(rec.totalSatisfactionDelta) || 0)),
         lastAttemptAt: Number.isFinite(rec.lastAttemptAt) ? Number(rec.lastAttemptAt) : 0,
         lastEffective: Boolean(rec.lastEffective),
       };
@@ -155,8 +155,8 @@ export class ActionOutcomeLedger {
     for (const need of needs) {
       const items = this.entriesForNeed(need);
       if (items.length === 0) continue;
-      const effective = items.filter((i) => i.effectiveCount > 0);
-      const ineffective = items.filter((i) => i.effectiveCount === 0 && i.attempts > 0);
+      const effective = items.filter((i) => i.effectiveCount > 0 && (i.lastEffective || i.successRate >= 0.5));
+      const ineffective = items.filter((i) => i.attempts > 0 && !effective.includes(i));
       const parts: string[] = [];
       if (effective.length > 0) {
         const top = effective
@@ -171,9 +171,13 @@ export class ActionOutcomeLedger {
       if (ineffective.length > 0) {
         const zeroList = ineffective
           .slice(0, 3)
-          .map((i) => `${sanitizeForModel(i.action)}（0/${i.attempts} 有效）`)
+          .map((i) =>
+            i.effectiveCount === 0
+              ? `${sanitizeForModel(i.action)}（0/${i.attempts} 有效）`
+              : `${sanitizeForModel(i.action)}（近期零收益，${i.effectiveCount}/${i.attempts} 有效）`,
+          )
           .join('、');
-        parts.push(`以下动作历史零收益：${zeroList}，若无新迹象请先调用 needs_sniff_causes 嗅探病因或发起求助`);
+        parts.push(`以下动作历史或近期零收益：${zeroList}，若无新迹象请先调用 needs_sniff_causes 嗅探病因或发起求助`);
       }
       if (parts.length > 0) {
         lines.push(`- [${sanitizeForModel(need)}] ${parts.join('；')}`);
@@ -207,7 +211,7 @@ export function computeDriveEnvFingerprint(input: {
   stuckJobCount: number;
   idleSessionCount: number;
 }): string {
-  const { key, snapshot, stuckJobCount, idleSessionCount } = input;
+  const { key, snapshot, evaluation, stuckJobCount, idleSessionCount } = input;
   if (key === 'space') {
     const disks = effectiveDisks(snapshot.state.self.body.disks, Number.NEGATIVE_INFINITY);
     const mounts = (disks.value ?? [])
@@ -229,7 +233,11 @@ export function computeDriveEnvFingerprint(input: {
     const th = snapshot.state.self.body.thermal;
     return `thermals:${th.status === 'ok' ? (th.value ?? 'unknown') : th.status}`;
   }
-  return `drive:${key}`;
+  const evidencePairs = Object.entries(evaluation.evidence ?? {})
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([k, v]) => `${k}=${String(v)}`)
+    .join('&');
+  return evidencePairs ? `drive:${key}:${evidencePairs}` : `drive:${key}`;
 }
 
 export class EpisodeCircuitBreaker {

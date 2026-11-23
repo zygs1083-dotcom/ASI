@@ -254,17 +254,21 @@ export function createMaintenanceActionTools(runtime: NeedsRuntime) {
         throw new ToolArgsError([err instanceof Error ? err.message : 'invalid actionTarget']);
       }
       const severity = args.severity === 'critical' || args.severity === 'uncomfortable' ? args.severity : undefined;
-      return sanitizeValueForModel(
-        await runtime.tools.requestHelp({
-          need: args.need as NeedKey,
-          ...(severity ? { severity } : {}),
-          title: args.title,
-          summary: args.summary,
-          ...(args.proposedAction ? { proposedAction: args.proposedAction } : {}),
-          actionKind,
-          ...(validatedTarget ? { actionTarget: validatedTarget } : {}),
-        }),
-      );
+      try {
+        return sanitizeValueForModel(
+          await runtime.tools.requestHelp({
+            need: args.need as NeedKey,
+            ...(severity ? { severity } : {}),
+            title: args.title,
+            summary: args.summary,
+            ...(args.proposedAction ? { proposedAction: args.proposedAction } : {}),
+            actionKind,
+            ...(validatedTarget ? { actionTarget: validatedTarget } : {}),
+          }),
+        );
+      } catch (err) {
+        throw new ToolArgsError([err instanceof Error ? err.message : 'invalid help card request']);
+      }
     },
   });
 

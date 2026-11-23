@@ -10,6 +10,7 @@ import { NativeToolExecutor } from '@deepseek-ai/dsh-tool-executor-native';
 import ToolsService, { defineTool } from '@deepseek-ai/dsh-tools';
 import * as AsiSensePlugin from 'asi-sense';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { ActionOutcomeLedger, buildActionMeasurement } from '../src/host/action-memory.js';
 import { EXTERNAL_CACHE_ACTIVE_PROTECTION_MS } from '../src/host/cache-catalog.js';
 import * as AsiNeedsPlugin from '../src/host/dsh/index.js';
 import { createNeedsRuntime } from '../src/host/runtime.js';
@@ -47,21 +48,26 @@ describe('0.3.0 全景嗅探、一键外部缓存批准清理、行动效果记�
     const fakeHome = join(rootDir, 'home');
 
     const derived = join(fakeHome, 'Library', 'Developer', 'Xcode', 'DerivedData');
+    const brew = join(fakeHome, 'Library', 'Caches', 'Homebrew');
     const trash = join(fakeHome, '.Trash');
     await mkdir(join(storageRoot, 'tmp'), { recursive: true });
     await mkdir(derived, { recursive: true });
+    await mkdir(brew, { recursive: true });
     await mkdir(trash, { recursive: true });
 
     const ownTmpFile = join(storageRoot, 'tmp', 'asi-temp.bin');
+    const staleBrewFile = join(brew, 'bottle-1.0.tar.gz');
     const staleCacheFile = join(derived, 'stale-build.bin');
     const activeCacheFile = join(derived, 'active-build.bin');
     const trashFile = join(trash, 'user-trash.zip');
 
     await writeFile(ownTmpFile, Buffer.alloc(4096));
+    await writeFile(staleBrewFile, Buffer.alloc(49_152));
     await writeFile(staleCacheFile, Buffer.alloc(32_768));
     await writeFile(activeCacheFile, Buffer.alloc(8192));
     await writeFile(trashFile, Buffer.alloc(65_536));
 
+    await setMtime(staleBrewFile, T0 - 3 * EXTERNAL_CACHE_ACTIVE_PROTECTION_MS);
     await setMtime(staleCacheFile, T0 - 2 * EXTERNAL_CACHE_ACTIVE_PROTECTION_MS);
     await setMtime(activeCacheFile, T0 - 10 * 60_000); // 10 分钟前活跃编译文件
 
@@ -105,33 +111,32 @@ describe('0.3.0 全景嗅探、一键外部缓存批准清理、行动效果记�
     await runtime.start();
     try {
       await vi.waitFor(() => expect(sniffSnapshot).toBeDefined());
-      expect(sniffSnapshot?.externalCaches[0]?.targetId).toBe('xcode-derived-data');
-      expect(sniffSnapshot?.externalCaches[0]?.totalBytes).toBe(32_768 + 8192);
-      expect(sniffSnapshot?.externalCaches[0]?.reclaimableBytes).toBe(32_768);
+      expect(sniffSnapshot?.externalCaches.map((c) => c.targetId)).toEqual(['homebrew', 'xcode-derived-data']);
+      expect(sniffSnapshot?.externalCaches[1]?.totalBytes).toBe(32_768 + 8192);
+      expect(sniffSnapshot?.externalCaches[1]?.reclaimableBytes).toBe(32_768);
       expect(sniffSnapshot?.trash.totalBytes).toBe(65_536);
       expect(sniffSnapshot?.topProcesses.byCpu[0]?.name).toBe('Xcode');
 
-      // 无人值守自维护只删掉了 ASI 自有临时文件，外部 DerivedData 与废纸篓均未触碰！
+      // 无人值守自维护只删掉了 ASI 自有临时文件，外部缓存与废纸篓均未触碰！
       await expect(stat(ownTmpFile)).rejects.toThrow();
+      expect((await stat(staleBrewFile)).isFile()).toBe(true);
       expect((await stat(staleCacheFile)).isFile()).toBe(true);
       expect((await stat(activeCacheFile)).isFile()).toBe(true);
       expect((await stat(trashFile)).isFile()).toBe(true);
 
-      // 自动生成带受控白名单 targetId 的外部缓存求助卡
+      // 自动生成带受控白名单 targetId 的头号外部缓存大户（homebrew）求助卡
       await vi.waitFor(() => {
-        const extCard = runtime
+        const firstCard = runtime
           .snapshot()
           .helpCards.find((c) => c.status === 'open' && c.actionKind === 'clean-external-cache');
-        expect(extCard).toBeDefined();
+        expect(firstCard?.actionTarget).toBe('homebrew');
       });
-      const extCard = runtime
+      const brewCard = runtime
         .snapshot()
         .helpCards.find((c) => c.status === 'open' && c.actionKind === 'clean-external-cache');
-      if (!extCard) throw new Error('missing extCard');
-      expect(extCard.actionTarget).toBe('xcode-derived-data');
-      expect(extCard.summary).toContain('废纸篓');
+      if (!brewCard) throw new Error('missing brewCard');
 
-      // 拒绝任意路径或废纸篓入参
+      // 拒绝任意路径、废纸篓以及本机 0 字节不可清理的目标（防止幻觉挂出空批准卡）
       await expect(
         runtime.tools.requestHelp({
           need: 'space',
@@ -150,8 +155,30 @@ describe('0.3.0 全景嗅探、一键外部缓存批准清理、行动效果记�
           actionTarget: 'macos-trash',
         }),
       ).rejects.toThrow(/whitelisted targetId/);
+      await expect(
+        runtime.tools.requestHelp({
+          need: 'space',
+          title: '空外部缓存目标测试',
+          summary: '本机不存在 playwright 缓存',
+          actionKind: 'clean-external-cache',
+          actionTarget: 'playwright-browsers',
+        }),
+      ).rejects.toThrow(/0 reclaimable bytes/);
 
-      // 用户点击侧栏求助卡「批准清理外部缓存」：模拟释放空间后磁盘余量回升
+      // 第一步批准清理 homebrew 后磁盘仍偏紧（12 GB / 200 GB）-> 自动跟进挂出第二大户 xcode-derived-data 求助卡！
+      diskFreeBytes = 12 * 1024 ** 3;
+      await runtime.actions.approveHelp(brewCard.id);
+      await expect(stat(staleBrewFile)).rejects.toThrow();
+
+      const extCard = runtime
+        .snapshot()
+        .helpCards.find((c) => c.status === 'open' && c.actionKind === 'clean-external-cache');
+      expect(extCard).toBeDefined();
+      if (!extCard) throw new Error('missing second extCard');
+      expect(extCard.actionTarget).toBe('xcode-derived-data');
+      expect(extCard.summary).toContain('废纸篓');
+
+      // 第二步点击「批准清理外部缓存」清理 xcode-derived-data：模拟释放空间后磁盘余量回升舒适区
       diskFreeBytes = 45 * 1024 ** 3;
       await runtime.actions.approveHelp(extCard.id);
 
@@ -222,7 +249,10 @@ describe('0.3.0 全景嗅探、一键外部缓存批准清理、行动效果记�
 
     await rt1.start();
     try {
-      await vi.waitFor(() => expect(maintTurns1).toBe(1));
+      await vi.waitFor(() => {
+        expect(maintTurns1).toBe(1);
+        expect(rt1.snapshot().maintenanceSession.status).toBe('idle');
+      });
       expect(rt1.snapshot().maintenanceSession.circuitBrokenNeeds).toContain('space');
 
       // 跨过 120s 冷却（+180s、+360s）且仅有微小抖动（< 50MB）：零收益静默熔断生效，绝不重复拉起大模型！
@@ -277,7 +307,10 @@ describe('0.3.0 全景嗅探、一键外部缓存批准清理、行动效果记�
       nowMono += 150_000;
       diskFree = 11 * 1024 ** 3;
       sense2.emit(() => makeDiskSnap());
-      await vi.waitFor(() => expect(maintTurns2).toBe(1));
+      await vi.waitFor(() => {
+        expect(maintTurns2).toBe(1);
+        expect(rt2.snapshot().maintenanceSession.status).toBe('idle');
+      });
       expect(prompts2[0]).toContain('Action-Outcome Memory');
       expect(prompts2[0]).toContain('needs_clean_cache');
 
@@ -289,16 +322,73 @@ describe('0.3.0 全景嗅探、一键外部缓存批准清理、行动效果记�
       nowMono += 20_000;
       diskFree = 1.5 * 1024 ** 3;
       sense2.emit(() => makeDiskSnap());
-      await vi.waitFor(() => expect(maintTurns2).toBe(2));
+      await vi.waitFor(() => {
+        expect(maintTurns2).toBe(2);
+        expect(rt2.snapshot().maintenanceSession.status).toBe('idle');
+      });
 
-      // 解除条件 3：用户点击求助卡「我已处理」(approveHelp) -> 解除熔断
+      // 解除条件 3：用户点击求助卡「我已处理」(approveHelp) -> 解除熔断跑一次复核，若仍零收益则自动重新闭合熔断，绝不后续无限空转！
       expect(rt2.snapshot().maintenanceSession.circuitBrokenNeeds).toContain('space');
       const openCard = rt2.snapshot().helpCards.find((c) => c.need === 'space' && c.status === 'open');
       if (!openCard) throw new Error('missing openCard');
       nowWall += 150_000;
       nowMono += 150_000;
       await rt2.actions.approveHelp(openCard.id);
-      await vi.waitFor(() => expect(maintTurns2).toBe(3));
+      await vi.waitFor(() => {
+        expect(maintTurns2).toBe(3);
+        expect(rt2.snapshot().maintenanceSession.status).toBe('idle');
+      });
+      expect(rt2.snapshot().maintenanceSession.circuitBrokenNeeds).toContain('space');
+
+      // 再推进 180s：即使卡片已变成 approved（无 open 卡），熔断依然稳固生效，不再每 120s 泄漏 Token！
+      nowWall += 180_000;
+      nowMono += 180_000;
+      sense2.emit(() => makeDiskSnap());
+      await new Promise((r) => setTimeout(r, 25));
+      expect(maintTurns2).toBe(3);
+
+      // 新剧集测试「忽略」(dismissHelp)：恢复舒适后再次跌入 uncomfortable 并直接忽略求助卡，立即进入静默熔断不空转
+      diskFree = 80 * 1024 ** 3;
+      sense2.emit(() => makeDiskSnap());
+      await vi.waitFor(() => expect(rt2.snapshot().needs.space.zone).toBe('comfortable'));
+
+      nowWall += 180_000;
+      nowMono += 180_000;
+      diskFree = 14 * 1024 ** 3;
+      sense2.emit(() => makeDiskSnap());
+      await vi.waitFor(() => {
+        expect(maintTurns2).toBe(4);
+        expect(rt2.snapshot().maintenanceSession.status).toBe('idle');
+      });
+      const { card: dismissTargetCard } = await rt2.tools.requestHelp({
+        need: 'space',
+        severity: 'uncomfortable',
+        title: '忽略后静默测试',
+        summary: '用户暂不清理',
+      });
+      await rt2.actions.dismissHelp(dismissTargetCard.id);
+      expect(rt2.snapshot().maintenanceSession.circuitBrokenNeeds).toContain('space');
+
+      nowWall += 180_000;
+      nowMono += 180_000;
+      sense2.emit(() => makeDiskSnap());
+      await new Promise((r) => setTimeout(r, 25));
+      expect(maintTurns2).toBe(4);
+
+      // 校验账本推荐逻辑：早期成功 1 次但随后连续失败 4 次（1/5，lastEffective=false）的动作标为近期零收益，不再盲目优先推荐
+      const ledger = new ActionOutcomeLedger();
+      ledger.record({
+        need: 'space',
+        action: 'needs_clean_cache',
+        at: 1,
+        gain: buildActionMeasurement({ freedBytes: 1024 }),
+      });
+      for (let i = 0; i < 4; i += 1) {
+        ledger.record({ need: 'space', action: 'needs_clean_cache', at: 2 + i, gain: buildActionMeasurement({}) });
+      }
+      const recText = ledger.formatPromptRecommendations(['space']).join('\n');
+      expect(recText).toContain('近期零收益，1/5 有效');
+      expect(recText).not.toContain('优先推荐历史有效动作');
     } finally {
       await rt2.stop();
     }
@@ -528,6 +618,172 @@ describe('0.3.0 全景嗅探、一键外部缓存批准清理、行动效果记�
       needsFork.dispose();
       senseFork.dispose();
       await new Promise((r) => setTimeout(r, 25));
+    }
+  });
+
+  it('高阶回合运行中途突遇 L1 危机或 eco 时立即抢占中断且不误记熔断；高阶熔断跨短暂 eco 保持并在 evidence 变更时精准唤醒；省略 driveKey 自动关联收益', async () => {
+    const storageRoot = await mkdtemp(join(tmpdir(), 'asi-030-drives-preempt-'));
+    tempDirs.push(storageRoot);
+
+    let nowWall = T0;
+    let nowMono = 1_000;
+    let diskFree = 80 * 1024 ** 3; // L1 舒适
+
+    const makeSnap = () => {
+      const s = makeSnapshot({ now: nowWall, mono: nowMono });
+      s.settings.sendTitles = false;
+      s.state.env.focusedWindow = fact({ title: 'Secret Private Title' });
+      s.state.self.body.disks = {
+        kind: 'disks',
+        ...fact([{ mount: '/', total: 200 * 1024 ** 3, free: diskFree }]),
+      };
+      return s;
+    };
+
+    const sense = createMockSenseService(makeSnap(), storageRoot);
+    const seenSignals: AbortSignal[] = [];
+    let releaseHigherTurn: (() => void) | undefined;
+    let l1PreemptRuns = 0;
+    let higherRuns = 0;
+
+    const rt = createNeedsRuntime({
+      storageRoot,
+      sense,
+      clock: { wall: () => nowWall, mono: () => nowMono },
+      probeEndpoint: async () => true,
+      jobs: { listActiveJobs: () => [], hasLiveOwner: () => true, killJob: () => 'already-finished' },
+      compaction: { listIdleSessionIds: () => [], compactIdleSession: async () => ({ compacted: false }) },
+      sessions: {
+        createMaintenanceSession: async (id) => id,
+        hasSession: () => true,
+        runMaintenanceTurn: async (_sid, prompt, signal) => {
+          seenSignals.push(signal);
+          if (prompt.includes('[L1 ·')) {
+            l1PreemptRuns += 1;
+            return;
+          }
+          higherRuns += 1;
+          if (higherRuns === 1) {
+            await new Promise<void>((resolve) => {
+              releaseHigherTurn = resolve;
+              signal.addEventListener('abort', () => resolve(), { once: true });
+            });
+          } else if (higherRuns === 3) {
+            const tool = rt.drives.registeredSandboxTools()[0];
+            if (tool) {
+              await rt.drives.executeSandboxTool(tool, {}, signal);
+            }
+          }
+        },
+        deliverCryToUserSession: async () => true,
+      },
+    });
+
+    await rt.start();
+    try {
+      let careSat = 40;
+      let careFragments = 5;
+      let windowSeenByPlugin: unknown = 'unset';
+
+      rt.drives.registerSource({
+        id: 'asi-care',
+        tier: 3,
+        label: '主动关怀',
+        evaluate: (snap) => {
+          windowSeenByPlugin = snap.state.env.focusedWindow.value;
+          // 尝试原地篡改传入快照不应污染宿主
+          snap.state.self.body.thermal = fact('critical');
+          return [
+            {
+              key: 'digest',
+              label: '摘要整理',
+              satisfaction: careSat,
+              summary: '待整理摘要',
+              evidence: { fragments: careFragments },
+            },
+            // 同源重复 key 自动去重
+            {
+              key: 'digest',
+              label: '重复项',
+              satisfaction: 99,
+              summary: 'duplicate',
+            },
+          ];
+        },
+        sandboxTools: [
+          {
+            // 故意省略 driveKey，验证自动关联到 asi-care:digest 并计算满足度 Δ
+            name: 'care_build_digest',
+            description: 'Build local digest',
+            execute: async () => {
+              careSat = 95;
+              return { summary: '摘要生成完毕' };
+            },
+          },
+        ],
+      });
+
+      // sendTitles=false 时外部插件看不到窗口标题，且原地篡改快照不影响宿主 thermals
+      await vi.waitFor(() => expect(higherRuns).toBe(1));
+      expect(windowSeenByPlugin).toBeNull();
+      expect(rt.snapshot().needs.thermals.zone).toBe('comfortable');
+      expect(rt.snapshot().higherOrderDrives).toHaveLength(1);
+      expect(releaseHigherTurn).toBeTypeOf('function');
+
+      // 1. 高阶回合运行中途，L1 磁盘空间突跌至 8 GB（uncomfortable）！
+      // 验证：在途高阶回合 signal 立即被 abort，不被误记入 circuitBrokenNeeds，且 L1 不受高阶冷却阻塞立即接管运行！
+      nowWall += 5_000;
+      nowMono += 5_000;
+      diskFree = 8 * 1024 ** 3;
+      sense.emit(() => makeSnap());
+
+      await vi.waitFor(() => {
+        expect(seenSignals[0]?.aborted).toBe(true);
+        expect(l1PreemptRuns).toBe(1);
+        expect(rt.snapshot().maintenanceSession.status).toBe('idle');
+      });
+      expect(rt.snapshot().maintenanceSession.circuitBrokenNeeds ?? []).not.toContain('asi-care:digest');
+
+      // 2. L1 磁盘恢复舒适（80 GB），跨过冷却后高阶第 2 轮运行但未调工具（零收益）-> 进入高阶静默熔断
+      nowWall += 150_000;
+      nowMono += 150_000;
+      diskFree = 80 * 1024 ** 3;
+      sense.emit(() => makeSnap());
+      await vi.waitFor(() => {
+        expect(higherRuns).toBe(2);
+        expect(rt.snapshot().maintenanceSession.status).toBe('idle');
+      });
+      expect(rt.snapshot().maintenanceSession.circuitBrokenNeeds).toContain('asi-care:digest');
+
+      // 短暂切换 eco 模式再恢复 normal（无 evidence 变化）：高阶熔断保持不丢失，绝不无故重跑！
+      await sense.setPowerMode('eco', '临时节能');
+      nowWall += 150_000;
+      nowMono += 150_000;
+      sense.emit(() => makeSnap());
+      await sense.setPowerMode('normal');
+      nowWall += 150_000;
+      nowMono += 150_000;
+      sense.emit(() => makeSnap());
+      await new Promise((r) => setTimeout(r, 25));
+      expect(higherRuns).toBe(2);
+      expect(rt.snapshot().maintenanceSession.circuitBrokenNeeds).toContain('asi-care:digest');
+
+      // 3. 插件内部 evidence 发生实质变化并调用 notifySourceChanged -> 精准解除高阶熔断，执行无 driveKey 工具并记录满足度 Δ！
+      careFragments = 18;
+      nowWall += 150_000;
+      nowMono += 150_000;
+      rt.drives.notifySourceChanged('asi-care');
+      await vi.waitFor(() => {
+        expect(higherRuns).toBe(3);
+        expect(rt.snapshot().higherOrderDrives?.[0]?.zone).toBe('comfortable');
+      });
+      const careLedger = rt
+        .snapshot()
+        .actionLedger?.find((e) => e.need === 'asi-care:digest' && e.action === 'care_build_digest');
+      expect(careLedger?.effectiveCount).toBe(1);
+      expect(careLedger?.totalSatisfactionDelta).toBe(55);
+    } finally {
+      await rt.stop();
     }
   });
 });

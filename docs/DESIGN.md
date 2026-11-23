@@ -77,32 +77,32 @@ ASI 保持 `asi-sense` + `asi-needs` 基础双包安装不变，插件之间仅�
 
 工作流与安全边界：
 1. **全景只读嗅探工具 `needs_sniff_causes`（仅挂载于后台自维护会话）**：
-   - 扫描受控字典内的外部开发者缓存（Xcode `DerivedData` / `Archives`、Homebrew、pnpm、npm、pip、uv、Cargo、Go Build/Mod、Gradle、Playwright 浏览器），精确区分**总体积（`totalBytes`）**与**修改时间超过 1 小时的可清理体积（`reclaimableBytes`）**；
-   - 只读统计系统废纸篓（`~/.Trash`）体积与项目数（固定 `risk: 'risky'`、`cleanable: false`，仅作提示）；
+   - 按规则独立配额扫描受控字典内的外部开发者缓存（Xcode `DerivedData` / `Archives`、Homebrew、pnpm、npm、pip、uv、Cargo、Go Build/Mod、Gradle、Playwright 浏览器），防止大型包缓存目录耗尽配额饥饿后序规则，精确区分**总体积（`totalBytes`）**与**修改时间超过 1 小时的可清理体积（`reclaimableBytes`）**；
+   - 只读统计系统废纸篓（`~/.Trash`）体积与项目数（独立配额、固定 `risk: 'risky'`、`cleanable: false`，仅作提示）；
    - 采样当前 Top CPU / Top RSS 进程摘要（仅供负载归因参考，绝不强杀外部进程）；
    - 全部输出统一经 `sanitizeForModel` 脱敏与 `~` 路径归一化，普通用户日常对话不挂载该工具。
 2. **无人值守 vs 求助卡一键批准清理**：
    - 无人值守时，后台会话**仅自动清理 ASI 自身沙盒临时目录**（`needs_clean_cache`）；
-   - 当检测到外部 `safe/caution` 缓存大户时，生成携带精确体积与**受控白名单 `actionTarget` 标识**（`actionKind: 'clean-external-cache'`，严格拒绝任意路径或 `macos-trash` 入参）的求助卡；
-   - 用户在侧栏点击「批准清理外部缓存」时，宿主执行 `lstat`（防符号链接）+ `realpath` 包含校验 + `validateProtectedTargetRoot` 防护，**直接清除该目标内修改时间 `>= 1 小时`（`3,600,000 ms`）的陈旧缓存项以立即释放磁盘空间，并自动跳过最近 1 小时内刚修改过的活跃子项**（防止误删正在进行的编译或包下载）。废纸篓、用户文件与外部进程永远只提示不代动。
+   - 当检测到外部 `safe/caution` 缓存大户时，生成携带精确体积与**受控白名单 `actionTarget` 标识**（`actionKind: 'clean-external-cache'`，严格拒绝任意路径、`macos-trash` 或无超 1h 可清理字节的目标入参）的求助卡；多缓存大户场景下批准清理首项后若空间仍紧，自动顺延提议下一未忽略的可清理大户；
+   - 用户在侧栏点击「批准清理外部缓存」时，宿主执行 `lstat`（防符号链接）+ `realpath` 包含校验 + `validateProtectedTargetRoot` 防护，**直接清除该目标内修改时间 `>= 1 小时`（`3,600,000 ms`）的陈旧缓存项以立即释放磁盘空间，并自动跳过最近 1 小时内刚修改过的活跃子项**（对 Xcode 工程工作区、`.xcarchive` / `.app` 包束、Playwright 浏览器目录与 `.cargo/git/db` 裸仓库按原子子项整体保护，防止半删损坏活跃编译或包束）。废纸篓、用户文件与外部进程永远只提示不代动。
 
 ### 3.3 行动效果记忆（Action-Outcome Memory）与零收益静默熔断
 
 1. **宿主自动实测前后增益（`ActionMeasurement`）**：
    - 每次执行自维护工具、高阶需求沙盒工具或用户批准求助卡动作前后，宿主自动刷新感官并实测真实增益（`freedBytes`、`stoppedJobs`、`tokensSaved`、`satisfactionBefore -> satisfactionAfter` 提升 `satisfactionDelta`），写入维护记录与持久化 `state.json`。
 2. **零收益静默熔断（`EpisodeCircuitBreaker`，省 Token）**：
-   - 同一异常剧集内，若安全自救动作已试过但无实际收益（`!effective` 且满足度未提升）并且已挂出 `open` 求助卡，宿主自动对该需求启动**静默熔断**，不再每过 120 秒重复唤醒大模型空转；
-   - 仅当出现以下任一事件时自动解除熔断：① 环境发生实质变化（如磁盘余量较熔断基线变化 `>= 512 MiB`、新增卡死任务/空闲可压缩会话、满足度变化 `>= 10%`）；② 严重度从 `uncomfortable` 恶化升级至 `critical`；③ 用户点击求助卡「批准 / 我已处理」；④ 需求恢复至 `comfortable` 舒适区。
+   - 同一异常剧集内，若安全自救动作已试过但无实际收益（`!effective` 且满足度未提升）并且已挂出或已处理求助卡（或用户主动点击「忽略」），宿主自动对该需求启动**静默熔断**，不再每过 120 秒重复唤醒大模型空转；
+   - 仅当出现以下任一事件时自动解除熔断：① 环境发生实质变化（如磁盘余量较熔断基线变化 `>= 512 MiB`、新增卡死任务/空闲可压缩会话、高阶需求 `evidence` 变更、满足度变化 `>= 10%`）；② 严重度从 `uncomfortable` 恶化升级至 `critical`；③ 用户点击求助卡「批准 / 我已处理」（触发单轮复核，若仍零收益则重新闭合熔断）；④ 需求恢复至 `comfortable` 舒适区。
 3. **持久化动作收益账本（`ActionOutcomeLedger`）**：
    - 长期累计每个 `(需求 × 动作)` 的尝试次数、有效次数、有效率（`successRate`）与累计释放空间/节省 Token/满足度总增益；
-   - 唤醒后台自维护会话时自动注入历史有效率推荐（优先推荐高收益动作、警示历史零收益动作），并在统一侧栏「自发维护」面板实时展示。
+   - 唤醒后台自维护会话时自动注入历史有效率推荐（优先推荐高收益动作、警示历史及近期零收益动作），并在统一侧栏「自发维护」面板实时展示。
 
 ### 3.4 跨插件统一需求仲裁服务（`ctx.asiDrives`）
 
 `asi-needs` 直接向 Cordis 暴露 `ctx.asiDrives`（`AsiDrivesService`），内置马斯洛多层需求仲裁器（`MaslowDriveArbiter`）：
 - **L1（生理生存层，内置）**：`asi-needs` 自身五大生存需求（`energy`、`space`、`memory`、`mind`、`thermals`）；
-- **L2–L4（高阶需求层，开放扩展）**：支持未来独立组合包插件（如 L2 `asi-sleep` 离线记忆巩固、L3 `asi-care` 主动关怀）调用 `ctx.asiDrives.registerSource({ id, tier: 2 | 3 | 4, label, evaluate, sandboxTools })` 动态注册需求源与专属沙盒工具；
-- **生理优先与节能自动压制**：只要任一 L1 生理需求处于不适/危急/回滞恢复期，或 `asi-sense` 处于 `'eco'` 节能降频模式，所有 `L2–L4` 高阶需求均自动标记 `suppressed = true` 挂起——既不触发后台唤醒，也在 `agent.ctx.tools.guard` 层动态拦截高阶沙盒工具；待 L1 彻底恢复舒适且回到 `'normal'` 模式后，高阶需求按层级优先序共享同一后台自维护会话与每小时轮次预算，并自动接入统一侧栏与动作收益账本。
+- **L2–L4（高阶需求层，开放扩展）**：支持未来独立组合包插件（如 L2 `asi-sleep` 离线记忆巩固、L3 `asi-care` 主动关怀）调用 `ctx.asiDrives.registerSource({ id, tier: 2 | 3 | 4, label, evaluate, sandboxTools })` 动态注册需求源与专属沙盒工具（评估入参深拷贝隔离并在 `sendTitles=false` 时自动遮蔽窗口标题）；
+- **生理优先、在途抢占与节能自动压制**：只要任一 L1 生理需求处于不适/危急/回滞恢复期，或 `asi-sense` 处于 `'eco'` 节能降频模式，所有 `L2–L4` 高阶需求均自动标记 `suppressed = true` 挂起——不仅阻止高阶后台唤醒、在 `agent.ctx.tools.guard` 层即时拦截高阶沙盒工具，还会通过专属 `AbortSignal` 立即抢占中断在途高阶维护回合（不误记高阶熔断、不挤占 L1 自救冷却）；待 L1 彻底恢复舒适且回到 `'normal'` 模式后，高阶需求按层级优先序共享同一后台自维护会话与每小时轮次预算，并自动接入统一侧栏与动作收益账本。
 
 ## 4. 统一侧栏界面（`@asi/sense-ui` + `asi-needs`）
 

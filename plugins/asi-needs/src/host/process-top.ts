@@ -72,16 +72,38 @@ export const defaultProcessExec: ProcessExecFn = async (signal) => {
   }
 };
 
+function truncateCodePoints(value: string, maxChars: number): string {
+  const chars = [...value];
+  return chars.length > maxChars ? `${chars.slice(0, maxChars - 1).join('')}…` : value;
+}
+
 function normalizeProcessName(rawComm: string): string {
   const trimmed = rawComm.trim();
   if (!trimmed) return 'unknown';
+  let withoutTrailing = trimmed;
+  while (withoutTrailing.endsWith('/') || withoutTrailing.endsWith('\\')) {
+    withoutTrailing = withoutTrailing.slice(0, -1);
+  }
+  withoutTrailing = withoutTrailing.trim();
+  if (!withoutTrailing) return 'unknown';
+
   // On macOS `comm=` may include bundle path `/Applications/Foo.app/Contents/MacOS/Foo`;
-  // extract only the executable basename so local directory/user paths are not leaked.
-  const slashIdx = Math.max(trimmed.lastIndexOf('/'), trimmed.lastIndexOf('\\'));
-  const base = slashIdx >= 0 ? trimmed.slice(slashIdx + 1).trim() : trimmed;
-  const cleaned = String(sanitizeForModel(base || trimmed)).trim();
+  // extract only the executable basename when formatted as a filesystem path, while keeping
+  // non-path Linux kernel worker names (`kworker/...`) intact and never leaking trailing-slash dirs.
+  const slashCount = [...withoutTrailing].filter((ch) => ch === '/').length;
+  const isPathLike =
+    withoutTrailing.startsWith('/') ||
+    withoutTrailing.startsWith('~') ||
+    withoutTrailing.startsWith('.') ||
+    withoutTrailing.includes('\\') ||
+    withoutTrailing.toLowerCase().includes('.app') ||
+    slashCount >= 2;
+  const slashIdx = isPathLike ? Math.max(withoutTrailing.lastIndexOf('/'), withoutTrailing.lastIndexOf('\\')) : -1;
+  const base = slashIdx >= 0 ? withoutTrailing.slice(slashIdx + 1).trim() : withoutTrailing;
+  if (!base) return 'unknown';
+  const cleaned = String(sanitizeForModel(base)).trim();
   if (!cleaned) return 'unknown';
-  return cleaned.length > 64 ? `${cleaned.slice(0, 63)}…` : cleaned;
+  return truncateCodePoints(cleaned, 64);
 }
 
 export function parsePsTable(stdout: string): ProcessBrief[] {
@@ -154,7 +176,7 @@ export async function sampleTopProcesses(options: {
       byCpu: [],
       byMemory: [],
       note,
-      error: String(sanitizeForModel(rawErr)).slice(0, 120),
+      error: [...String(sanitizeForModel(rawErr))].slice(0, 120).join(''),
     };
   }
 }

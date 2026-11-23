@@ -72,6 +72,7 @@ interface PersistedNeedsState {
   internalSessionIds?: string[];
   actionLedger?: NeedsSnapshot['actionLedger'];
   circuitBreakers?: PersistedCircuitBreakerEntry[];
+  dismissedExternalTargets?: string[];
 }
 
 export interface SniffCausesReport {
@@ -200,6 +201,7 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime & { read
   const internalSessions = new Map<string, () => void>();
   const criedEpisodeSeverity = new Map<NeedKey, EpisodeSeverity>();
   const handledEpisodeSeverity = new Map<NeedKey, EpisodeSeverity>();
+  const dismissedExternalTargets = new Set<string>();
   const autonomousTurnMonoTimes: number[] = [];
 
   let helpCards: HelpCard[] = [];
@@ -213,7 +215,10 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime & { read
   let maintTurnCount = 0;
   let maintTotalTurns = 0;
   let maintLastRunAt: number | undefined;
-  let lastAutoRunMono: number | undefined;
+  let lastL1AutoRunMono: number | undefined;
+  let lastHigherAutoRunMono: number | undefined;
+  let activeRunningTier: 'l1' | 'higher' | null = null;
+  let higherOrderTurnAbort: AbortController | undefined;
   let rotateMaintainerNext = false;
   let pendingMaintenanceRecheck = false;
 
@@ -268,6 +273,7 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime & { read
       internalSessionIds: [...internalSessions.keys()].slice(-20),
       actionLedger: actionLedger.entries(),
       circuitBreakers: circuitBreaker.serialize(),
+      ...(dismissedExternalTargets.size > 0 ? { dismissedExternalTargets: [...dismissedExternalTargets] } : {}),
     };
     persistChain = persistChain
       .then(async () => {
@@ -614,6 +620,10 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime & { read
       if (!ev.driveActive) {
         if (criedEpisodeSeverity.delete(key)) stateChanged = true;
         if (handledEpisodeSeverity.delete(key)) stateChanged = true;
+        if (key === 'space' && dismissedExternalTargets.size > 0) {
+          dismissedExternalTargets.clear();
+          stateChanged = true;
+        }
         escalatedCriticalInTurn.delete(key);
         helpCards = helpCards.map((c) => {
           if (c.need === key && c.status === 'open') {
@@ -632,10 +642,14 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime & { read
       l1Needs: latestEval.needs,
       powerMode: effPowerMode,
     });
+    if (latestHigherOrder.snapshot.higherOrderSuppressed && activeRunningTier === 'higher') {
+      higherOrderTurnAbort?.abort();
+      pendingMaintenanceRecheck = true;
+    }
     for (const d of latestHigherOrder.higherOrderDrives) {
       circuitBreaker.reconcileNeed({
         need: d.key,
-        driveActive: d.driveActive && !d.suppressed,
+        driveActive: d.driveActive,
         zone: d.zone,
         satisfaction: d.satisfaction,
         envFingerprint: fingerprintForDrive(d.key, snap, d, stuckCount),
@@ -775,21 +789,26 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime & { read
     return lines.join('\n');
   }
 
-  async function maybeProposeExternalCacheHelpCard(severity: EpisodeSeverity): Promise<void> {
-    if (!ports.homeDir) return;
-    if (isAutoHelpSuppressed('space', severity)) return;
+  async function maybeProposeExternalCacheHelpCard(
+    severity: EpisodeSeverity,
+    options?: { allowAfterApprovedExternal?: boolean },
+  ): Promise<boolean> {
+    if (!ports.homeDir) return false;
+    if (!options?.allowAfterApprovedExternal && isAutoHelpSuppressed('space', severity)) return false;
     const alreadyOpenExternal = helpCards.some(
       (c) => c.need === 'space' && c.status === 'open' && c.actionKind === 'clean-external-cache',
     );
-    if (alreadyOpenExternal) return;
+    if (alreadyOpenExternal) return true;
 
     const scan = await scanExternalCachesAndTrash({
       homeDir: ports.homeDir,
       now: clock.wall(),
       activeProtectionMs: EXTERNAL_CACHE_ACTIVE_PROTECTION_MS,
     }).catch(() => undefined);
-    const topHog = scan?.externalCaches.find((c) => c.approvable && c.reclaimableBytes > 0);
-    if (!topHog) return;
+    const topHog = scan?.externalCaches.find(
+      (c) => c.approvable && c.reclaimableBytes > 0 && !dismissedExternalTargets.has(c.targetId),
+    );
+    if (!topHog) return false;
 
     const trashHint =
       scan && scan.trash.totalBytes > 0
@@ -805,12 +824,18 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime & { read
       actionKind: 'clean-external-cache',
       actionTarget: topHog.targetId,
     });
+    return true;
   }
 
   async function runMaintenanceCheck(manual: boolean): Promise<void> {
     if (stopped || latestSense.settings.paused) return;
     if (maintStatus === 'running') {
-      if (!manual) pendingMaintenanceRecheck = true;
+      if (!manual) {
+        pendingMaintenanceRecheck = true;
+        if (activeRunningTier === 'higher' && arbiter.snapshot().higherOrderSuppressed) {
+          higherOrderTurnAbort?.abort();
+        }
+      }
       return;
     }
 
@@ -839,11 +864,21 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime & { read
       autonomousTurnMonoTimes.shift();
     }
 
+    const isHigherOrderOnlyTurn = distressedL1.length === 0 && distressedHigher.length > 0;
+
     if (!manual) {
       const newlyCritical = distressedL1.some(
         (k) => latestEval.needs[k].zone === 'critical' && !escalatedCriticalInTurn.has(k),
       );
-      if (!newlyCritical && lastAutoRunMono !== undefined && monoNow - lastAutoRunMono < AUTONOMOUS_COOLDOWN_MS) {
+      const relevantLastRunMono = isHigherOrderOnlyTurn
+        ? Math.max(lastL1AutoRunMono ?? Number.NEGATIVE_INFINITY, lastHigherAutoRunMono ?? Number.NEGATIVE_INFINITY)
+        : lastL1AutoRunMono;
+      if (
+        !newlyCritical &&
+        relevantLastRunMono !== undefined &&
+        Number.isFinite(relevantLastRunMono) &&
+        monoNow - relevantLastRunMono < AUTONOMOUS_COOLDOWN_MS
+      ) {
         return;
       }
       if (autonomousTurnMonoTimes.length >= MAX_AUTONOMOUS_TURNS_PER_HOUR) {
@@ -897,9 +932,19 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime & { read
 
     activeTurnEffectiveNeeds.clear();
     maintStatus = 'running';
+    activeRunningTier = isHigherOrderOnlyTurn ? 'higher' : 'l1';
+    const localHigherAbort = isHigherOrderOnlyTurn ? new AbortController() : undefined;
+    higherOrderTurnAbort = localHigherAbort;
+    const effectiveTurnSignal = localHigherAbort
+      ? AbortSignal.any([turnAbort.signal, localHigherAbort.signal])
+      : turnAbort.signal;
     maintLastRunAt = clock.wall();
     if (!manual) {
-      lastAutoRunMono = monoNow;
+      if (isHigherOrderOnlyTurn) {
+        lastHigherAutoRunMono = monoNow;
+      } else {
+        lastL1AutoRunMono = monoNow;
+      }
       autonomousTurnMonoTimes.push(monoNow);
     }
     notify();
@@ -910,10 +955,9 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime & { read
           ? '用户触发了一次手动生存需求自检。请调用 needs_status 查看五大生存需求现状，必要时调用 needs_sniff_causes 嗅探本机缓存与负载，确认各项舒适或执行必要的安全整理后简要总结。'
           : buildMaintenancePrompt(targetL1, distressedHigher);
 
-      await ports.sessions.runMaintenanceTurn(sessionId, prompt, turnAbort.signal);
+      await ports.sessions.runMaintenanceTurn(sessionId, prompt, effectiveTurnSignal);
       maintTurnCount += 1;
       maintTotalTurns += 1;
-      maintStatus = 'idle';
 
       await ports.sense.refresh?.().catch(() => undefined);
       recomputeEval(ports.sense.snapshot());
@@ -921,6 +965,7 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime & { read
       const primaryNeed = targetL1[0];
       const primaryDriveKey = distressedHigher[0]?.key;
       let outcome: MaintenanceOutcome = 'info';
+      const higherPreempted = Boolean(localHigherAbort?.signal.aborted);
 
       if (distressedL1.length > 0) {
         if (latestEval.needs.space.driveActive && distressedL1.includes('space')) {
@@ -946,8 +991,10 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime & { read
           for (const key of distressedL1) {
             const ev = latestEval.needs[key];
             const keyHadGain = activeTurnEffectiveNeeds.has(key) || ev.satisfaction > (beforeSatL1[key] ?? 0);
-            const hasOpenCard = helpCards.some((c) => c.need === key && c.status === 'open');
-            if (!keyHadGain && hasOpenCard && ev.driveActive && ev.zone !== 'comfortable') {
+            const curSev: EpisodeSeverity = ev.zone === 'critical' ? 'critical' : 'uncomfortable';
+            const hasOpenOrHandledCard =
+              helpCards.some((c) => c.need === key && c.status === 'open') || isAutoHelpSuppressed(key, curSev);
+            if (!keyHadGain && hasOpenOrHandledCard && ev.driveActive && ev.zone !== 'comfortable') {
               const tripDiskFree = key === 'space' ? primaryDiskFreeBytes(latestSense) : undefined;
               circuitBreaker.trip({
                 need: key,
@@ -956,14 +1003,14 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime & { read
                 satisfactionAtTrip: ev.satisfaction,
                 envFingerprint: fingerprintForDrive(key, latestSense, ev),
                 ...(tripDiskFree !== undefined ? { diskFreeAtTrip: tripDiskFree } : {}),
-                reason: '安全自救零收益且已挂出求助卡，静默熔断避免重复唤醒模型',
+                reason: '安全自救零收益且求助卡已挂出或已处理，静默熔断避免重复唤醒模型',
               });
             }
           }
         }
 
         outcome = allCleared ? 'relieved' : stillCritical.length > 0 ? 'escalated' : anyImproved ? 'partial' : 'info';
-      } else if (distressedHigher.length > 0) {
+      } else if (distressedHigher.length > 0 && !higherPreempted) {
         const refreshedHigher = distressedHigher.map((d) => ({
           key: d.key,
           current: arbiter.findDrive(d.key),
@@ -974,10 +1021,10 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime & { read
             activeTurnEffectiveNeeds.has(item.key) ||
             (item.current?.satisfaction ?? 0) > (beforeSatHigher[item.key] ?? 0),
         );
-        if (!manual) {
+        if (!manual && !arbiter.snapshot().higherOrderSuppressed) {
           for (const item of refreshedHigher) {
             const cur = item.current;
-            if (!cur?.driveActive || cur.zone === 'comfortable') continue;
+            if (!cur?.driveActive || cur.suppressed || cur.zone === 'comfortable') continue;
             const hadGain =
               activeTurnEffectiveNeeds.has(item.key) || cur.satisfaction > (beforeSatHigher[item.key] ?? 0);
             if (!hadGain) {
@@ -1000,8 +1047,9 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime & { read
         ...(primaryNeed ? { need: primaryNeed } : {}),
         ...(primaryDriveKey ? { driveKey: primaryDriveKey } : {}),
         action: manual ? 'manual-check' : 'auto-maintain',
-        summary:
-          outcome === 'relieved'
+        summary: higherPreempted
+          ? 'L1 生理需求或节能模式激活，已挂起并抢占当前高阶维护回合'
+          : outcome === 'relieved'
             ? '后台自维护完成，相关需求已恢复舒适区'
             : outcome === 'escalated'
               ? '后台自维护触及安全边界或仍处危急，已发出求助卡'
@@ -1009,8 +1057,8 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime & { read
         outcome,
       });
     } catch {
-      maintStatus = 'idle';
-      if (!stopped && !turnAbort.signal.aborted) {
+      const preemptedCatch = Boolean(localHigherAbort?.signal.aborted);
+      if (!stopped && !turnAbort.signal.aborted && !preemptedCatch) {
         recomputeEval(ports.sense.snapshot());
         for (const critKey of distressedL1) {
           if (latestEval.needs[critKey].zone === 'critical') {
@@ -1027,10 +1075,19 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime & { read
         ...(targetL1[0] ? { need: targetL1[0] } : {}),
         ...(distressedHigher[0]?.key ? { driveKey: distressedHigher[0].key } : {}),
         action: 'auto-maintain',
-        summary: '后台自维护会话执行中断，稍后按退避策略重试',
-        outcome: 'failed',
+        summary: preemptedCatch
+          ? 'L1 生理需求或节能模式激活，已抢占中断高阶维护回合'
+          : '后台自维护会话执行中断，稍后按退避策略重试',
+        outcome: preemptedCatch ? 'info' : 'failed',
       });
     } finally {
+      if (maintStatus === 'running') {
+        maintStatus = 'idle';
+      }
+      activeRunningTier = null;
+      if (higherOrderTurnAbort === localHigherAbort) {
+        higherOrderTurnAbort = undefined;
+      }
       activeTurnEffectiveNeeds.clear();
       notify();
       if (!stopped && !latestSense.settings.paused && pendingMaintenanceRecheck) {
@@ -1309,6 +1366,21 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime & { read
     },
 
     async requestHelp(input) {
+      const actionKind = input.actionKind ?? 'acknowledge';
+      const validatedTarget = validateHelpActionTarget(actionKind, input.actionTarget);
+      if (actionKind === 'clean-external-cache' && validatedTarget && ports.homeDir) {
+        const scan = await scanExternalCachesAndTrash({
+          homeDir: ports.homeDir,
+          now: clock.wall(),
+          activeProtectionMs: EXTERNAL_CACHE_ACTIVE_PROTECTION_MS,
+        });
+        const matched = scan.externalCaches.find((c) => c.targetId === validatedTarget);
+        if (!matched || matched.reclaimableBytes <= 0) {
+          throw new Error(
+            `External cache target "${validatedTarget}" has 0 reclaimable bytes older than 1 hour; inspect needs_sniff_causes or use actionKind="acknowledge"`,
+          );
+        }
+      }
       const severity =
         input.severity ?? (latestEval.needs[input.need].zone === 'critical' ? 'critical' : 'uncomfortable');
       const result = await raiseHelp({
@@ -1318,7 +1390,7 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime & { read
         summary: input.summary,
         ...(input.proposedAction ? { proposedAction: input.proposedAction } : {}),
         ...(input.actionKind ? { actionKind: input.actionKind } : {}),
-        ...(input.actionTarget ? { actionTarget: input.actionTarget } : {}),
+        ...(validatedTarget ? { actionTarget: validatedTarget } : {}),
       });
       addRecord({
         actor: 'maintainer',
@@ -1430,14 +1502,31 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime & { read
 
       circuitBreaker.clear(card.need);
       recordEpisodeSeverity(criedEpisodeSeverity, card.need, card.severity);
-      recordEpisodeSeverity(handledEpisodeSeverity, card.need, card.severity);
       helpCards = helpCards.map((c) => (c.id === cardId ? { ...c, status: 'approved', updatedAt: now } : c));
+
+      let proposedFollowUpExternal = false;
+      if (card.actionKind === 'clean-external-cache' && latestEval.needs.space.driveActive) {
+        const nextSev: EpisodeSeverity = latestEval.needs.space.zone === 'critical' ? 'critical' : 'uncomfortable';
+        proposedFollowUpExternal = await maybeProposeExternalCacheHelpCard(nextSev, {
+          allowAfterApprovedExternal: true,
+        });
+      }
+      if (!proposedFollowUpExternal) {
+        recordEpisodeSeverity(handledEpisodeSeverity, card.need, card.severity);
+      }
+
+      const recordOutcome: MaintenanceOutcome =
+        card.actionKind === 'clean-external-cache' && latestEval.needs[card.need].driveActive
+          ? freedBytes > 0
+            ? 'partial'
+            : 'info'
+          : 'relieved';
       addRecord({
         actor: 'user',
         need: card.need,
         action: ledgerAction ?? card.actionKind,
         summary: actionSummary,
-        outcome: 'relieved',
+        outcome: recordOutcome,
         ...(gain ? { gain } : {}),
       });
       await persistState();
@@ -1448,9 +1537,26 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime & { read
       const card = helpCards.find((c) => c.id === cardId);
       if (card?.status !== 'open') return;
       const now = clock.wall();
+      if (card.actionKind === 'clean-external-cache' && card.actionTarget) {
+        dismissedExternalTargets.add(card.actionTarget);
+      }
       recordEpisodeSeverity(criedEpisodeSeverity, card.need, card.severity);
       recordEpisodeSeverity(handledEpisodeSeverity, card.need, card.severity);
       helpCards = helpCards.map((c) => (c.id === cardId ? { ...c, status: 'dismissed', updatedAt: now } : c));
+
+      const ev = latestEval.needs[card.need];
+      if (card.need !== 'energy' && ev.driveActive && ev.zone !== 'comfortable') {
+        const tripDiskFree = card.need === 'space' ? primaryDiskFreeBytes(latestSense) : undefined;
+        circuitBreaker.trip({
+          need: card.need,
+          trippedAt: now,
+          zoneAtTrip: ev.zone,
+          satisfactionAtTrip: ev.satisfaction,
+          envFingerprint: fingerprintForDrive(card.need, latestSense, ev),
+          ...(tripDiskFree !== undefined ? { diskFreeAtTrip: tripDiskFree } : {}),
+          reason: '用户已忽略当前剧集求助卡，静默熔断避免重复唤醒模型',
+        });
+      }
       await persistState();
       notify();
     },
@@ -1480,7 +1586,7 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime & { read
         throw new Error(guard.reason ?? 'Sandbox tool is currently suspended');
       }
       const now = clock.wall();
-      const targetKey = tool.qualifiedDriveKey ?? `${tool.sourceId}:default`;
+      const targetKey = arbiter.resolveTargetDriveKey(tool) ?? `${tool.sourceId}:default`;
       const beforeSat = arbiter.findDrive(targetKey)?.satisfaction;
 
       const res = await tool.spec.execute(args, { signal });
@@ -1532,6 +1638,13 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime & { read
         if (Array.isArray(parsed.records)) records = parsed.records.slice(0, MAX_RECORDS);
         if (parsed.actionLedger) actionLedger.restore(parsed.actionLedger);
         if (parsed.circuitBreakers) circuitBreaker.restore(parsed.circuitBreakers);
+        if (Array.isArray(parsed.dismissedExternalTargets)) {
+          for (const t of parsed.dismissedExternalTargets) {
+            if (typeof t === 'string' && isCleanableExternalCacheId(t)) {
+              dismissedExternalTargets.add(t);
+            }
+          }
+        }
         if (parsed.previousStates && typeof parsed.previousStates === 'object') {
           const restored: Partial<Record<NeedKey, PreviousNeedState>> = {};
           for (const key of NEED_KEYS) {
@@ -1641,6 +1754,9 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime & { read
       unsubscribeSense = undefined;
       turnAbort.abort();
       turnAbort = new AbortController();
+      higherOrderTurnAbort?.abort();
+      higherOrderTurnAbort = undefined;
+      activeRunningTier = null;
       instinct.stop();
       for (const unregister of internalSessions.values()) {
         unregister();

@@ -11,6 +11,7 @@
  *   anti-symlink-escape containment adapted from `tw93/Mole` (MIT License, Copyright (c) Tw93).
  */
 
+import type { Dirent, Stats } from 'node:fs';
 import { lstat, readdir, realpath, rmdir, unlink } from 'node:fs/promises';
 import { join, resolve, sep } from 'node:path';
 import type { CacheRiskLevel } from '@asi/sense-types';
@@ -18,9 +19,10 @@ import type { CacheRiskLevel } from '@asi/sense-types';
 /** Default 1-hour active modification protection window (3,600,000 ms). */
 export const EXTERNAL_CACHE_ACTIVE_PROTECTION_MS = 60 * 60_000;
 
-const DEFAULT_MAX_SCAN_ENTRIES = 25_000;
+const DEFAULT_MAX_SCAN_ENTRIES_PER_RULE = 10_000;
 const DEFAULT_MAX_SCAN_DEPTH = 12;
 const EVENT_LOOP_YIELD_EVERY = 400;
+const ATOMIC_BUNDLE_SUFFIXES = ['.xcarchive', '.app', '.framework', '.dsym', '.bundle', '.git'] as const;
 
 export const MIT_CACHE_ADAPTATION_SOURCES = [
   'bysiber/cleardisk (MIT)',
@@ -38,6 +40,12 @@ export interface ExternalCacheRule {
   readonly cleanable: boolean;
   /** Home-relative path segment tuples (`~/<seg0>/<seg1>/...`). */
   readonly homeSubpaths: readonly (readonly string[])[];
+  /**
+   * When true, each top-level child directory under the cache root represents an
+   * atomic project workspace or installation unit (e.g. Xcode DerivedData project
+   * or Playwright browser); any <1h activity inside it protects the whole unit.
+   */
+  readonly atomicTopDirs?: boolean;
   readonly note: string;
 }
 
@@ -53,6 +61,7 @@ export const EXTERNAL_CACHE_RULES: readonly ExternalCacheRule[] = [
     risk: 'safe',
     cleanable: true,
     homeSubpaths: [['Library', 'Developer', 'Xcode', 'DerivedData']],
+    atomicTopDirs: true,
     note: 'Xcode 编译中间产物与索引缓存，下次构建会自动重建；自动跳过 1 小时内活跃项目。',
   },
   {
@@ -178,6 +187,7 @@ export const EXTERNAL_CACHE_RULES: readonly ExternalCacheRule[] = [
       ['Library', 'Caches', 'ms-playwright'],
       ['.cache', 'ms-playwright'],
     ],
+    atomicTopDirs: true,
     note: 'Playwright 测试浏览器内核二进制；清理后跑 E2E 前需执行 playwright install。',
   },
 ] as const;
@@ -333,7 +343,55 @@ export interface ExternalCacheScanReport {
 interface WalkBudget {
   remaining: number;
   truncated: boolean;
-  opsSinceYield: number;
+  yieldState: { opsSinceYield: number };
+}
+
+function isAtomicBundleDirName(name: string): boolean {
+  const lower = name.toLowerCase();
+  if (lower === '.git') return true;
+  return ATOMIC_BUNDLE_SUFFIXES.some((ext) => lower.length > ext.length && lower.endsWith(ext));
+}
+
+function subpathUsesAtomicTopDirs(rule: ExternalCacheRule, segs: readonly string[]): boolean {
+  if (rule.atomicTopDirs) return true;
+  // `~/.cargo/git/db/<repo>` directories are bare Git repositories that must never be half-deleted.
+  return segs.length >= 3 && segs[0] === '.cargo' && segs[1] === 'git' && segs[2] === 'db';
+}
+
+function isAtomicSubdir(entryName: string, isTopLevelChild: boolean, atomicTopDirs: boolean): boolean {
+  return (isTopLevelChild && atomicTopDirs) || isAtomicBundleDirName(entryName);
+}
+
+async function resolveContainedRealpath(
+  rootReal: string,
+  fullPath: string,
+): Promise<{ status: 'ok'; real: string } | { status: 'missing' } | { status: 'escaped' }> {
+  try {
+    const real = await realpath(fullPath);
+    if (!isStrictlyInside(rootReal, real)) {
+      return { status: 'escaped' };
+    }
+    return { status: 'ok', real };
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException)?.code;
+    if (code === 'ENOENT' || code === 'ENOTDIR') {
+      return { status: 'missing' };
+    }
+    return { status: 'escaped' };
+  }
+}
+
+async function readDirSafe(dir: string): Promise<{ entries: Dirent[]; unreadable: boolean }> {
+  try {
+    const entries = await readdir(dir, { withFileTypes: true });
+    return { entries, unreadable: false };
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException)?.code;
+    if (code === 'ENOENT' || code === 'ENOTDIR') {
+      return { entries: [], unreadable: false };
+    }
+    return { entries: [], unreadable: true };
+  }
 }
 
 async function tickBudget(budget: WalkBudget): Promise<boolean> {
@@ -342,12 +400,108 @@ async function tickBudget(budget: WalkBudget): Promise<boolean> {
     return false;
   }
   budget.remaining -= 1;
-  budget.opsSinceYield += 1;
-  if (budget.opsSinceYield >= EVENT_LOOP_YIELD_EVERY) {
-    budget.opsSinceYield = 0;
+  budget.yieldState.opsSinceYield += 1;
+  if (budget.yieldState.opsSinceYield >= EVENT_LOOP_YIELD_EVERY) {
+    budget.yieldState.opsSinceYield = 0;
     await new Promise<void>((r) => setImmediate(r));
   }
   return true;
+}
+
+async function measureAtomicSubtree(
+  rootReal: string,
+  unitReal: string,
+  unitStat: Stats,
+  now: number,
+  activeProtectionMs: number,
+  depth: number,
+  budget: WalkBudget,
+  isUnitRoot = true,
+): Promise<{
+  totalBytes: number;
+  fileCount: number;
+  skippedSymlinks: number;
+  hasActive: boolean;
+  hasUnverified: boolean;
+}> {
+  let totalBytes = 0;
+  let fileCount = 0;
+  let skippedSymlinks = 0;
+  let hasActive = false;
+  let hasUnverified = false;
+
+  if (depth > DEFAULT_MAX_SCAN_DEPTH) {
+    budget.truncated = true;
+    return { totalBytes, fileCount, skippedSymlinks, hasActive, hasUnverified: true };
+  }
+
+  const { entries, unreadable } = await readDirSafe(unitReal);
+  if (unreadable) {
+    return { totalBytes, fileCount, skippedSymlinks, hasActive, hasUnverified: true };
+  }
+  if (entries.length === 0) {
+    if (isUnitRoot && activeProtectionMs > 0 && now - unitStat.mtimeMs < activeProtectionMs) {
+      hasActive = true;
+    }
+    return { totalBytes, fileCount, skippedSymlinks, hasActive, hasUnverified };
+  }
+
+  for (const entry of entries) {
+    if (!(await tickBudget(budget))) {
+      hasUnverified = true;
+      break;
+    }
+    const full = join(unitReal, entry.name);
+    const st = await lstat(full).catch(() => undefined);
+    if (!st) continue;
+    if (st.isSymbolicLink()) {
+      skippedSymlinks += 1;
+      continue;
+    }
+    const contained = await resolveContainedRealpath(rootReal, full);
+    if (contained.status === 'missing') continue;
+    if (contained.status === 'escaped') {
+      skippedSymlinks += 1;
+      continue;
+    }
+    if (st.isDirectory()) {
+      const sub = await measureAtomicSubtree(
+        rootReal,
+        contained.real,
+        st,
+        now,
+        activeProtectionMs,
+        depth + 1,
+        budget,
+        false,
+      );
+      totalBytes += sub.totalBytes;
+      fileCount += sub.fileCount;
+      skippedSymlinks += sub.skippedSymlinks;
+      if (sub.hasActive) hasActive = true;
+      if (sub.hasUnverified) hasUnverified = true;
+    } else if (st.isFile()) {
+      totalBytes += st.size;
+      fileCount += 1;
+      if (activeProtectionMs > 0 && now - st.mtimeMs < activeProtectionMs) {
+        hasActive = true;
+      }
+    } else if (activeProtectionMs > 0 && now - st.mtimeMs < activeProtectionMs) {
+      hasActive = true;
+    }
+  }
+
+  if (
+    isUnitRoot &&
+    fileCount === 0 &&
+    !hasActive &&
+    activeProtectionMs > 0 &&
+    now - unitStat.mtimeMs < activeProtectionMs
+  ) {
+    hasActive = true;
+  }
+
+  return { totalBytes, fileCount, skippedSymlinks, hasActive, hasUnverified };
 }
 
 async function measureDirTree(
@@ -356,6 +510,7 @@ async function measureDirTree(
   now: number,
   activeProtectionMs: number,
   depth: number,
+  atomicTopDirs: boolean,
   budget: WalkBudget,
 ): Promise<{
   totalBytes: number;
@@ -375,7 +530,7 @@ async function measureDirTree(
     return { totalBytes, reclaimableBytes, staleEntryCount, activeEntryCount, skippedSymlinks };
   }
 
-  const entries = await readdir(currentReal, { withFileTypes: true }).catch(() => []);
+  const { entries } = await readDirSafe(currentReal);
   for (const entry of entries) {
     if (!(await tickBudget(budget))) break;
     const full = join(currentReal, entry.name);
@@ -385,18 +540,47 @@ async function measureDirTree(
       skippedSymlinks += 1;
       continue;
     }
-    const real = await realpath(full).catch(() => undefined);
-    if (!real || !isStrictlyInside(rootReal, real)) {
+    const contained = await resolveContainedRealpath(rootReal, full);
+    if (contained.status === 'missing') continue;
+    if (contained.status === 'escaped') {
       skippedSymlinks += 1;
       continue;
     }
     if (st.isDirectory()) {
-      const sub = await measureDirTree(rootReal, real, now, activeProtectionMs, depth + 1, budget);
-      totalBytes += sub.totalBytes;
-      reclaimableBytes += sub.reclaimableBytes;
-      staleEntryCount += sub.staleEntryCount;
-      activeEntryCount += sub.activeEntryCount;
-      skippedSymlinks += sub.skippedSymlinks;
+      if (activeProtectionMs > 0 && isAtomicSubdir(entry.name, depth === 0, atomicTopDirs)) {
+        const unit = await measureAtomicSubtree(
+          rootReal,
+          contained.real,
+          st,
+          now,
+          activeProtectionMs,
+          depth + 1,
+          budget,
+        );
+        totalBytes += unit.totalBytes;
+        skippedSymlinks += unit.skippedSymlinks;
+        if (unit.hasActive || unit.hasUnverified) {
+          activeEntryCount += unit.fileCount;
+        } else {
+          reclaimableBytes += unit.totalBytes;
+          staleEntryCount += unit.fileCount;
+        }
+      } else {
+        const sub = await measureDirTree(
+          rootReal,
+          contained.real,
+          now,
+          activeProtectionMs,
+          depth + 1,
+          atomicTopDirs,
+          budget,
+        );
+        totalBytes += sub.totalBytes;
+        reclaimableBytes += sub.reclaimableBytes;
+        staleEntryCount += sub.staleEntryCount;
+        activeEntryCount += sub.activeEntryCount;
+        skippedSymlinks += sub.skippedSymlinks;
+      }
     } else if (st.isFile()) {
       totalBytes += st.size;
       if (activeProtectionMs <= 0 || now - st.mtimeMs >= activeProtectionMs) {
@@ -418,11 +602,9 @@ export async function scanExternalCachesAndTrash(options: {
   maxEntries?: number;
 }): Promise<ExternalCacheScanReport> {
   const activeProtectionMs = Math.max(0, options.activeProtectionMs ?? EXTERNAL_CACHE_ACTIVE_PROTECTION_MS);
-  const budget: WalkBudget = {
-    remaining: Math.max(200, options.maxEntries ?? DEFAULT_MAX_SCAN_ENTRIES),
-    truncated: false,
-    opsSinceYield: 0,
-  };
+  const perRuleEntries = Math.max(200, options.maxEntries ?? DEFAULT_MAX_SCAN_ENTRIES_PER_RULE);
+  const yieldState = { opsSinceYield: 0 };
+  let anyTruncated = false;
 
   const emptyReport: ExternalCacheScanReport = {
     scannedAt: options.now,
@@ -451,6 +633,11 @@ export async function scanExternalCachesAndTrash(options: {
 
   for (const rule of EXTERNAL_CACHE_RULES) {
     if (!rule.cleanable || (rule.risk !== 'safe' && rule.risk !== 'caution')) continue;
+    const ruleBudget: WalkBudget = {
+      remaining: perRuleEntries,
+      truncated: false,
+      yieldState,
+    };
     let totalBytes = 0;
     let reclaimableBytes = 0;
     let staleEntryCount = 0;
@@ -473,13 +660,23 @@ export async function scanExternalCachesAndTrash(options: {
       seenGlobalRoots.add(rootReal);
       matchedDisplayPaths.push(formatTildePath(segs));
 
-      const measured = await measureDirTree(rootReal, rootReal, options.now, activeProtectionMs, 0, budget);
+      const atomicTop = subpathUsesAtomicTopDirs(rule, segs);
+      const measured = await measureDirTree(
+        rootReal,
+        rootReal,
+        options.now,
+        activeProtectionMs,
+        0,
+        atomicTop,
+        ruleBudget,
+      );
       totalBytes += measured.totalBytes;
       reclaimableBytes += measured.reclaimableBytes;
       staleEntryCount += measured.staleEntryCount;
       activeEntryCount += measured.activeEntryCount;
       skippedSymlinks += measured.skippedSymlinks;
     }
+    if (ruleBudget.truncated) anyTruncated = true;
 
     if (matchedDisplayPaths.length > 0 && (totalBytes > 0 || skippedSymlinks > 0 || activeEntryCount > 0)) {
       scanned.push({
@@ -502,7 +699,12 @@ export async function scanExternalCachesAndTrash(options: {
 
   scanned.sort((a, b) => b.reclaimableBytes - a.reclaimableBytes || b.totalBytes - a.totalBytes);
 
-  // Read-only Trash sizing (never cleanable)
+  // Read-only Trash sizing (never cleanable; isolated budget so large caches never starve Trash reporting)
+  const trashBudget: WalkBudget = {
+    remaining: perRuleEntries,
+    truncated: false,
+    yieldState,
+  };
   let trashExists = false;
   let trashBytes = 0;
   let trashItems = 0;
@@ -519,9 +721,10 @@ export async function scanExternalCachesAndTrash(options: {
     trashPaths.push(formatTildePath(segs));
     const topItems = await readdir(trashReal).catch(() => []);
     trashItems += topItems.length;
-    const measured = await measureDirTree(trashReal, trashReal, options.now, 0, 0, budget);
+    const measured = await measureDirTree(trashReal, trashReal, options.now, 0, 0, false, trashBudget);
     trashBytes += measured.totalBytes;
   }
+  if (trashBudget.truncated) anyTruncated = true;
 
   return {
     scannedAt: options.now,
@@ -536,7 +739,7 @@ export async function scanExternalCachesAndTrash(options: {
       cleanable: false,
       note: TRASH_READONLY_RULE.note,
     },
-    truncated: budget.truncated,
+    truncated: anyTruncated,
   };
 }
 
@@ -552,27 +755,123 @@ export interface ExternalCacheCleanResult {
   rootsCleaned: number;
 }
 
+async function inspectAtomicCleanability(
+  rootReal: string,
+  unitReal: string,
+  unitStat: Stats,
+  now: number,
+  activeProtectionMs: number,
+  ops: { count: number },
+  isUnitRoot = true,
+): Promise<{
+  totalBytes: number;
+  fileCount: number;
+  skippedSymlinks: number;
+  hasActive: boolean;
+  hasUnreadable: boolean;
+}> {
+  let totalBytes = 0;
+  let fileCount = 0;
+  let skippedSymlinks = 0;
+  let hasActive = false;
+  let hasUnreadable = false;
+
+  const { entries, unreadable } = await readDirSafe(unitReal);
+  if (unreadable) {
+    return { totalBytes, fileCount, skippedSymlinks, hasActive, hasUnreadable: true };
+  }
+  if (entries.length === 0) {
+    if (isUnitRoot && activeProtectionMs > 0 && now - unitStat.mtimeMs < activeProtectionMs) {
+      hasActive = true;
+    }
+    return { totalBytes, fileCount, skippedSymlinks, hasActive, hasUnreadable };
+  }
+
+  for (const entry of entries) {
+    ops.count += 1;
+    if (ops.count % EVENT_LOOP_YIELD_EVERY === 0) {
+      await new Promise<void>((r) => setImmediate(r));
+    }
+    const full = join(unitReal, entry.name);
+    const st = await lstat(full).catch(() => undefined);
+    if (!st) continue;
+    if (st.isSymbolicLink()) {
+      skippedSymlinks += 1;
+      continue;
+    }
+    const contained = await resolveContainedRealpath(rootReal, full);
+    if (contained.status === 'missing') continue;
+    if (contained.status === 'escaped') {
+      skippedSymlinks += 1;
+      continue;
+    }
+    if (st.isDirectory()) {
+      const sub = await inspectAtomicCleanability(rootReal, contained.real, st, now, activeProtectionMs, ops, false);
+      totalBytes += sub.totalBytes;
+      fileCount += sub.fileCount;
+      skippedSymlinks += sub.skippedSymlinks;
+      if (sub.hasActive) hasActive = true;
+      if (sub.hasUnreadable) hasUnreadable = true;
+    } else if (st.isFile()) {
+      totalBytes += st.size;
+      fileCount += 1;
+      if (activeProtectionMs > 0 && now - st.mtimeMs < activeProtectionMs) {
+        hasActive = true;
+      }
+    } else if (activeProtectionMs > 0 && now - st.mtimeMs < activeProtectionMs) {
+      hasActive = true;
+    }
+  }
+
+  if (
+    isUnitRoot &&
+    fileCount === 0 &&
+    !hasActive &&
+    activeProtectionMs > 0 &&
+    now - unitStat.mtimeMs < activeProtectionMs
+  ) {
+    hasActive = true;
+  }
+
+  return { totalBytes, fileCount, skippedSymlinks, hasActive, hasUnreadable };
+}
+
 async function cleanStaleEntriesInDir(
   rootReal: string,
   currentReal: string,
   now: number,
   activeProtectionMs: number,
   isTopRoot: boolean,
+  atomicTopDirs: boolean,
   ops: { count: number },
+  insideVerifiedStaleUnit = false,
 ): Promise<{
   deletedEntries: number;
   freedBytes: number;
   skippedActiveEntries: number;
   protectedActiveBytes: number;
   skippedSymlinks: number;
+  hadProtectedSubtree: boolean;
 }> {
   let deletedEntries = 0;
   let freedBytes = 0;
   let skippedActiveEntries = 0;
   let protectedActiveBytes = 0;
   let skippedSymlinks = 0;
+  let hadProtectedSubtree = false;
 
-  const entries = await readdir(currentReal, { withFileTypes: true }).catch(() => []);
+  const { entries, unreadable } = await readDirSafe(currentReal);
+  if (unreadable) {
+    return {
+      deletedEntries,
+      freedBytes,
+      skippedActiveEntries,
+      protectedActiveBytes,
+      skippedSymlinks,
+      hadProtectedSubtree: true,
+    };
+  }
+
   for (const entry of entries) {
     ops.count += 1;
     if (ops.count % EVENT_LOOP_YIELD_EVERY === 0) {
@@ -585,30 +884,61 @@ async function cleanStaleEntriesInDir(
       skippedSymlinks += 1;
       continue;
     }
-    const real = await realpath(full).catch(() => undefined);
-    if (!real || !isStrictlyInside(rootReal, real)) {
+    const contained = await resolveContainedRealpath(rootReal, full);
+    if (contained.status === 'missing') continue;
+    if (contained.status === 'escaped') {
       skippedSymlinks += 1;
       continue;
     }
+    const real = contained.real;
 
     if (st.isDirectory()) {
-      const childEntriesBefore = await readdir(real).catch(() => []);
-      const sub = await cleanStaleEntriesInDir(rootReal, real, now, activeProtectionMs, false, ops);
+      let verifiedStaleUnit = insideVerifiedStaleUnit;
+      if (!verifiedStaleUnit && activeProtectionMs > 0 && isAtomicSubdir(entry.name, isTopRoot, atomicTopDirs)) {
+        const atomicState = await inspectAtomicCleanability(rootReal, real, st, now, activeProtectionMs, ops);
+        if (atomicState.hasActive || atomicState.hasUnreadable) {
+          skippedActiveEntries += atomicState.fileCount;
+          protectedActiveBytes += atomicState.totalBytes;
+          skippedSymlinks += atomicState.skippedSymlinks;
+          hadProtectedSubtree = true;
+          continue;
+        }
+        verifiedStaleUnit = true;
+      }
+
+      const { entries: childEntriesBefore, unreadable: childUnreadable } = await readDirSafe(real);
+      if (childUnreadable) {
+        hadProtectedSubtree = true;
+        continue;
+      }
+      const sub = await cleanStaleEntriesInDir(
+        rootReal,
+        real,
+        now,
+        activeProtectionMs,
+        false,
+        false,
+        ops,
+        verifiedStaleUnit,
+      );
       deletedEntries += sub.deletedEntries;
       freedBytes += sub.freedBytes;
       skippedActiveEntries += sub.skippedActiveEntries;
       protectedActiveBytes += sub.protectedActiveBytes;
       skippedSymlinks += sub.skippedSymlinks;
+      if (sub.hadProtectedSubtree) hadProtectedSubtree = true;
 
       const canRemoveEmptyDir =
-        childEntriesBefore.length > 0
-          ? sub.skippedActiveEntries === 0 && sub.skippedSymlinks === 0
+        verifiedStaleUnit || childEntriesBefore.length > 0
+          ? sub.skippedActiveEntries === 0 && sub.skippedSymlinks === 0 && !sub.hadProtectedSubtree
           : activeProtectionMs <= 0 || now - st.mtimeMs >= activeProtectionMs;
       if (canRemoveEmptyDir) {
         const remaining = await readdir(real).catch(() => ['keep']);
         if (remaining.length === 0) {
           await rmdir(real).catch(() => undefined);
         }
+      } else {
+        hadProtectedSubtree = true;
       }
     } else if (st.isFile()) {
       if (activeProtectionMs > 0 && now - st.mtimeMs < activeProtectionMs) {
@@ -623,6 +953,8 @@ async function cleanStaleEntriesInDir(
       } catch {
         // Ignore concurrent deletion race
       }
+    } else {
+      hadProtectedSubtree = true;
     }
   }
 
@@ -630,7 +962,14 @@ async function cleanStaleEntriesInDir(
     await rmdir(currentReal).catch(() => undefined);
   }
 
-  return { deletedEntries, freedBytes, skippedActiveEntries, protectedActiveBytes, skippedSymlinks };
+  return {
+    deletedEntries,
+    freedBytes,
+    skippedActiveEntries,
+    protectedActiveBytes,
+    skippedSymlinks,
+    hadProtectedSubtree,
+  };
 }
 
 /**
@@ -699,7 +1038,8 @@ export async function cleanExternalCacheTarget(options: {
     seenRoots.add(rootReal);
     rootsCleaned += 1;
 
-    const res = await cleanStaleEntriesInDir(rootReal, rootReal, options.now, activeProtectionMs, true, ops);
+    const atomicTop = subpathUsesAtomicTopDirs(rule, segs);
+    const res = await cleanStaleEntriesInDir(rootReal, rootReal, options.now, activeProtectionMs, true, atomicTop, ops);
     deletedEntries += res.deletedEntries;
     freedBytes += res.freedBytes;
     skippedActiveEntries += res.skippedActiveEntries;

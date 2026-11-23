@@ -51,6 +51,11 @@ const RESERVED_TOOL_NAMES = new Set([
 const VALID_ID_RE = /^[a-z][a-z0-9_-]{1,48}$/;
 const VALID_TOOL_NAME_RE = /^[a-z][a-z0-9_]{2,63}$/;
 
+function sliceCodePoints(value: string, maxChars: number): string {
+  const chars = [...value];
+  return chars.length > maxChars ? chars.slice(0, maxChars).join('') : value;
+}
+
 export interface RegisteredSandboxTool {
   sourceId: string;
   tier: 2 | 3 | 4;
@@ -233,18 +238,31 @@ export class MaslowDriveArbiter {
     });
 
     const higherOrderDrives: DriveEvaluation[] = [];
+    const seenKeys = new Set<string>(NEED_KEYS);
     const sortedSources = [...this.sources.values()].sort((a, b) => a.tier - b.tier || a.id.localeCompare(b.id));
+    const isolatedSense =
+      sortedSources.length > 0
+        ? (() => {
+            const cloned = structuredClone(sense);
+            if (!cloned.settings.sendTitles) {
+              cloned.state.env.focusedWindow.value = null;
+            }
+            return cloned;
+          })()
+        : sense;
 
     for (const src of sortedSources) {
       let readings: readonly ReturnType<DriveSourceRegistration['evaluate']>[number][] = [];
       try {
-        readings = src.evaluate(sense) ?? [];
+        readings = src.evaluate(isolatedSense) ?? [];
       } catch {
         continue;
       }
       for (const r of readings) {
         if (!r?.key?.trim()) continue;
         const qKey = this.qualifyKey(src.id, r.key);
+        if (seenKeys.has(qKey)) continue;
+        seenKeys.add(qKey);
         const prev = this.prevHigherStates.get(qKey);
         const h = applyHysteresis(r.satisfaction, prev);
         this.prevHigherStates.set(qKey, {
@@ -253,8 +271,8 @@ export class MaslowDriveArbiter {
           satisfaction: h.satisfaction,
         });
 
-        const cleanLabel = String(sanitizeForModel(r.label || r.key)).slice(0, 48);
-        const cleanSummary = String(sanitizeForModel(r.summary || '')).slice(0, 240);
+        const cleanLabel = sliceCodePoints(String(sanitizeForModel(r.label || r.key)), 48);
+        const cleanSummary = sliceCodePoints(String(sanitizeForModel(r.summary || '')), 240);
         const cleanEvidence: Record<string, string | number | boolean | null> = {};
         for (const [ek, ev] of Object.entries(r.evidence ?? {})) {
           if (ev === null || typeof ev === 'boolean') {
@@ -322,6 +340,14 @@ export class MaslowDriveArbiter {
   findDrive(key: string): DriveEvaluation | undefined {
     const d = this.latestSnapshot.drives.find((item) => item.key === key);
     return d ? structuredClone(d) : undefined;
+  }
+
+  resolveTargetDriveKey(tool: RegisteredSandboxTool): string | undefined {
+    if (tool.qualifiedDriveKey) return tool.qualifiedDriveKey;
+    const candidates = this.latestSnapshot.drives.filter((d) => d.sourceId === tool.sourceId);
+    if (candidates.length === 0) return undefined;
+    const active = candidates.filter((d) => d.driveActive).sort((a, b) => b.urgency - a.urgency);
+    return (active[0] ?? candidates[0])?.key;
   }
 
   snapshot(): AsiDrivesSnapshot {
