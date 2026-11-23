@@ -10,7 +10,14 @@ export default defineConfig({
       enabled: true,
       provider: 'playwright',
       headless: true,
-      instances: [{ browser: 'chromium', launch: { channel: 'chrome' } }],
+      instances: [
+        {
+          browser: 'chromium',
+          launch: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH
+            ? { executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH }
+            : { channel: 'chrome' },
+        },
+      ],
     },
   },
 });

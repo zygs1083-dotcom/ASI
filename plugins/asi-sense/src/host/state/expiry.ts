@@ -50,18 +50,16 @@ export class FactExpiry {
             ? '/env/frontApp'
             : signal.kind === 'window.focused' || signal.kind === 'window.title-changed'
               ? '/env/focusedWindow'
-              : signal.kind === 'file.changed'
-                ? '/env/watchedPaths'
-                : signal.kind === 'job.started' || signal.kind === 'job.exited'
-                  ? '/env/activeJobs'
-                  : signal.kind === 'agent.status'
-                    ? '/self/activity'
-                    : signal.kind === 'system.sleep' ||
-                        signal.kind === 'system.wake' ||
-                        signal.kind === 'screen.locked' ||
-                        signal.kind === 'screen.unlocked'
-                      ? '/env/system'
-                      : '';
+              : signal.kind === 'job.started' || signal.kind === 'job.exited'
+                ? '/env/activeJobs'
+                : signal.kind === 'agent.status'
+                  ? '/self/activity'
+                  : signal.kind === 'system.sleep' ||
+                      signal.kind === 'system.wake' ||
+                      signal.kind === 'screen.locked' ||
+                      signal.kind === 'screen.unlocked'
+                    ? '/env/system'
+                    : '';
       if (path) touched.set(path, signal);
     }
     const visit = (value: unknown, path: string, reference?: number): void => {
@@ -85,10 +83,7 @@ export class FactExpiry {
         const stamp = JSON.stringify([entry.status, entry.observedAt, entry.ttlMs, entry.source]);
         const source = entry.source as { id?: string } | undefined;
         const signal = touched.get(path);
-        const received =
-          !!signal &&
-          source?.id === signal?.source.id &&
-          (entry.observedAt === signal?.at || path === '/env/watchedPaths');
+        const received = !!signal && source?.id === signal.source.id && entry.observedAt === signal.at;
         if (received || deadlines.get(path)?.stamp !== stamp) {
           const previous = deadlines.get(path);
           const prefix = '/self/body/disks/value/';

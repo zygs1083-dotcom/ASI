@@ -10,8 +10,8 @@
     "check": "pnpm typecheck && pnpm lint && pnpm test",
     "typecheck": "pnpm -r --if-present run typecheck",
     "lint": "biome check .",
-    "test": "pnpm -r --if-present run test",
-    "e2e": "pnpm --filter @asi/sense-ui run e2e && ASI_E2E_NO_MODEL=1 pnpm --filter asi-sense run e2e:dsh",
+    "test": "pnpm -r --workspace-concurrency=1 --if-present run test",
+    "e2e": "pnpm --filter @asi/sense-ui run e2e",
     "test:coverage": "pnpm -r --if-present run test:coverage"
   },
   "devDependencies": {

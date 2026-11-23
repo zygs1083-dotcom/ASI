@@ -3,7 +3,7 @@
 import type { Severity } from './health';
 import { HISTORY_WINDOW_MS, sampleHistory } from './history';
 import type { SparkThreshold } from './thresholds';
-import type { MetricInsight, MetricPoint } from './view-model';
+import type { MetricPoint } from './view-model';
 
 type SegSev = 'warn' | 'critical';
 
@@ -119,7 +119,7 @@ export function buildSpark(
   points: MetricPoint[],
   anchor: number,
   opts: {
-    baseline?: MetricInsight['baseline'];
+    baseline?: { low: number; high: number };
     thresholds?: SparkThreshold[];
     severity?: Severity;
     expanded?: boolean;

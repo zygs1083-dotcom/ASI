@@ -66,8 +66,6 @@ describe('StateStore isolation', () => {
     expect(st.snapshot().env.frontApp.value?.name).toBe('Late');
     st.apply(sig({ id: '2', kind: 'app.activated', at: 80, data: { name: 'Older' } }));
     expect(st.snapshot().env.frontApp.value?.name).toBe('Older');
-    st.apply(sig({ id: 'file', kind: 'file.changed', at: 90, subject: '/r/late' }));
-    expect(st.snapshot().env.watchedPaths.observedAt).toBe(90);
   });
 });
 
@@ -87,19 +85,16 @@ describe('StateStore guards', () => {
     expect(f.value).toBeNull();
   });
 
-  it('dedups repeated signal.id before counting', () => {
+  it('dedups repeated signal.id before applying', () => {
     const st = storeAt(new FakeClock());
-    const seen: number[] = [];
-    st.subscribe((s) => seen.push(s.env.watchedPaths.value?.['/r/a']?.changes ?? 0));
-    st.apply(sig({ id: 'f', kind: 'file.changed', at: 1, subject: '/r/a' }));
-    st.apply(sig({ id: 'f', kind: 'file.changed', at: 2, subject: '/r/a' }));
-    st.apply(sig({ id: 'g', kind: 'file.changed', at: 3, subject: '/r/a' }));
-    expect(st.snapshot().env.watchedPaths.value?.['/r/a']).toEqual({
-      lastChange: 3,
-      changes: 2,
-    });
+    const seen: string[] = [];
+    st.subscribe((s) => seen.push(s.env.frontApp.value?.name ?? '?'));
+    st.apply(sig({ id: 'f', kind: 'app.activated', at: 1, data: { name: 'A' } }));
+    st.apply(sig({ id: 'f', kind: 'app.activated', at: 2, data: { name: 'B' } }));
+    st.apply(sig({ id: 'g', kind: 'app.activated', at: 3, data: { name: 'C' } }));
+    expect(st.snapshot().env.frontApp.value?.name).toBe('C');
     // subscribers saw only the two unique inputs
-    expect(seen).toEqual([1, 2]);
+    expect(seen).toEqual(['A', 'C']);
   });
 
   it('writes __proto__/constructor keys safely in dictionaries', () => {
@@ -132,14 +127,8 @@ describe('StateStore guards', () => {
       status: 'ok',
       lastSignalAt: 2,
     });
-    st.apply(sig({ id: '3', kind: 'file.changed', at: 3, subject: '__proto__' }));
-    st.apply(sig({ id: '4', kind: 'file.changed', at: 4, subject: 'constructor' }));
-    const w = st.snapshot().env.watchedPaths.value ?? {};
-    const protoEntry = Object.getOwnPropertyDescriptor(w, '__proto__')?.value;
-    expect(protoEntry).toEqual({ lastChange: 3, changes: 1 });
-    expect(w.constructor).toEqual({ lastChange: 4, changes: 1 });
     // no prototype pollution leaked out of the dictionaries
-    expect(Object.getPrototypeOf({})).not.toBe(protoEntry);
+    expect(Object.getPrototypeOf({})).not.toBe(Object.getOwnPropertyDescriptor(sources, '__proto__')?.value);
     expect(SRC.id).toBe('fs');
   });
 });

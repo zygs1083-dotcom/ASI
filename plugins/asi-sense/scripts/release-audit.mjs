@@ -3,8 +3,6 @@ const allowed = new Set([
   'package.json',
   'cordis.patch.yml',
   'lib/index.js',
-  'lib/client.js',
-  'lib/typert.host.js',
   'lib/asi-sense-helper',
   'scripts/dsh.sh',
 ]);
@@ -50,10 +48,8 @@ const safeMatches = new Set(
       '/self/activity',
       '/env/frontApp',
       '/env/focusedWindow',
-      '/env/watchedPaths',
       '/env/activeJobs',
       '/env/system',
-      // Built-in global file-watch exclusion prefixes.
       '/private/var',
       '/private/tmp',
       '/private/etc',
@@ -69,7 +65,6 @@ const safeMatches = new Set(
       '/-/g',
       '/_/g',
     ],
-    'lib/typert.host.js': ['/-/g', '/_/g'],
     'scripts/dsh.sh': ['/bin/sh', '/dev/null'],
   }).flatMap(([path, matches]) => matches.map((match) => `${path}:${match}`)),
 );
@@ -102,7 +97,7 @@ export function auditFiles(files, read, username) {
         .replace(/file:\/\//gi, '');
       for (const [kind, pattern] of sensitive) {
         for (const match of text.matchAll(pattern)) {
-          if (!safeMatches.has(`${path}:${match[0]}`)) throw new Error(`Possible ${kind} in ${path}`);
+          if (!safeMatches.has(`${path}:${match[0]}`)) throw new Error(`Possible ${kind} in ${path}: ${match[0]}`);
         }
       }
       if (username && text.toLowerCase().includes(username.toLowerCase())) throw new Error(`Local username in ${path}`);

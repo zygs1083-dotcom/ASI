@@ -1,6 +1,5 @@
-import type { Body, Fact, SourceRef } from '@asi/sense-types';
+import { effectiveDisks } from '@asi/sense-types';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { bodyThresholdSignals } from '../../../plugins/asi-sense/src/host/attention/thresholds.js';
 import { collectDisks, DiskSampler, type DisksDeps, type StatFsResult } from '../src/disks.js';
 
 const statfs = (r: StatFsResult) => async () => r;
@@ -245,7 +244,7 @@ describe('DiskSampler', () => {
     expect(f.observedAt).toBe(0); // 无新鲜卷时回落到全部记录元数据
   });
 
-  it('keeps sampler-produced stale and unreadable volumes out of floor transitions', async () => {
+  it('marks sampler-produced stale and unreadable volumes indeterminate for downstream evaluators', async () => {
     let failRoot = false;
     const { s } = make({
       statfs: async (p) => {
@@ -265,29 +264,10 @@ describe('DiskSampler', () => {
       { mount: '/', status: 'stale' },
       { mount: '/data', status: 'ok' },
     ]);
-    const source: SourceRef = { id: 'test', api: 'fixture', host: 'fake' };
-    const missing: Fact<never> = { value: null, status: 'unknown', source, observedAt: 0, ttlMs: 1 };
-    const body: Body = {
-      cpu: missing,
-      memory: missing,
-      disks: disk,
-      battery: missing,
-      thermal: missing,
-      network: missing,
-      harnessProcess: missing,
-      tokens: missing,
-    };
-    const previous = {
-      body: { ...body, disks: { ...missing, kind: 'disks' as const } },
-      at: 0,
-      monotonicAt: 0,
-      source,
-    };
-    const next = { body, at: t, monotonicAt: t, source };
-    expect(bodyThresholdSignals(previous, next).signals).toEqual([]);
-    const held = bodyThresholdSignals({ ...previous, state: { 'disk:/': 'critical' } }, next);
-    expect(held.signals).toEqual([]);
-    expect(held.state['disk:/']).toBe('critical');
+    const effective = effectiveDisks(disk, t);
+    expect(effective.status).toBe('ok');
+    expect(effective.indeterminateMounts).toEqual(['/']);
+    expect(effective.value?.filter((v) => v.status === 'ok')).toMatchObject([{ mount: '/data', free: 90, total: 100 }]);
     s.stop();
   });
 

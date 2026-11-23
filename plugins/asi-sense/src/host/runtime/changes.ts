@@ -1,4 +1,4 @@
-import type { SenseState } from '@asi/sense-types';
+import type { SenseSnapshot, SenseState } from '@asi/sense-types';
 import type { SenseActions } from './ports.ts';
 
 export function createStateListeners() {
@@ -12,6 +12,28 @@ export function createStateListeners() {
       }
     },
     subscribe(listener: (state: SenseState) => void) {
+      listeners.add(listener);
+      return () => listeners.delete(listener);
+    },
+    clear: () => listeners.clear(),
+  };
+}
+
+export function createSnapshotListeners() {
+  const listeners = new Set<(snapshot: SenseSnapshot) => void>();
+  return {
+    get size(): number {
+      return listeners.size;
+    },
+    notify(snapshot: SenseSnapshot) {
+      for (const listener of [...listeners]) {
+        if (!listeners.has(listener)) continue;
+        try {
+          listener(structuredClone(snapshot));
+        } catch {}
+      }
+    },
+    subscribe(listener: (snapshot: SenseSnapshot) => void) {
       listeners.add(listener);
       return () => listeners.delete(listener);
     },
@@ -78,32 +100,9 @@ export function createChanges() {
 export function observableActions(actions: SenseActions, changed: () => void): SenseActions {
   const publish = <T>(task: Promise<T>): Promise<T> => task.finally(changed);
   return {
-    selectTarget: (id) => publish(actions.selectTarget?.(id) ?? Promise.reject(new Error('target unavailable'))),
-    dismissTargetNotice: () => publish(actions.dismissTargetNotice?.() ?? Promise.resolve()),
-    toggleRule: (id, enabled) => publish(actions.toggleRule(id, enabled)),
-    confirmRule: (id) => publish(actions.confirmRule(id)),
-    deleteRule: (id) => publish(actions.deleteRule(id)),
     pause: (value) => publish(actions.pause(value)),
     setSendTitles: (value) => publish(actions.setSendTitles(value)),
-    setGlobalFileWatch: (value) =>
-      publish(actions.setGlobalFileWatch?.(value) ?? Promise.reject(new Error('globalFileWatch unavailable'))),
-    retryGlobalFileWatch: () =>
-      publish(actions.retryGlobalFileWatch?.() ?? Promise.reject(new Error('globalFileWatch unavailable'))),
-    addFileExclusion: (pattern) =>
-      publish(actions.addFileExclusion?.(pattern) ?? Promise.reject(new Error('addFileExclusion unavailable'))),
-    removeFileExclusion: (pattern) =>
-      publish(actions.removeFileExclusion?.(pattern) ?? Promise.reject(new Error('removeFileExclusion unavailable'))),
+    setPowerMode: (mode, reason) => publish(actions.setPowerMode(mode, reason)),
     openPermissionSettings: () => publish(actions.openPermissionSettings()),
-    revertTuning: (id) => publish(actions.revertTuning(id)),
-    lockParam: (param, locked) => publish(actions.lockParam(param, locked)),
-    feedback: (id, verdict) => publish(actions.feedback(id, verdict)),
-    acceptRebaseline: (id) => publish(actions.acceptRebaseline(id)),
-    resumeTuning: () => publish(actions.resumeTuning()),
-    resetTuning: () => publish(actions.resetTuning()),
-    retryTuningBackup: () => publish(actions.retryTuningBackup()),
-    dismissTuningBackup: () => publish(actions.dismissTuningBackup()),
-    listMonths: () => actions.listMonths(),
-    loadMonthly: (month) => actions.loadMonthly(month),
-    clearHistory: () => publish(actions.clearHistory()),
   };
 }

@@ -11,6 +11,7 @@
       "packages/sense-ui/**",
       "packages/sense-types/**",
       "plugins/asi-sense/**",
+      "plugins/asi-needs/**",
       "package.json",
       "biome.json",
       "tsconfig.base.json",

@@ -173,8 +173,6 @@ try {
     version: 1,
     paused: true,
     sendTitles: false,
-    rules: [{ id: 'fixture-rule', match: { kind: 'file.changed' }, level: 'record', createdBy: 'user' }],
-    disabled: ['fixture-rule'],
   });
   const settingsPath = join(home, 'data/asi-sense/settings.json');
   await writeFile(settingsPath, settings);

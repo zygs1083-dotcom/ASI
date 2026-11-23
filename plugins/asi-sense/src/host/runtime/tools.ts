@@ -1,12 +1,7 @@
-import type { WatchRule } from '@asi/sense-types';
-import { createWatchRule, validateRule } from '../attention/rules.ts';
-import type { BodySource } from '../sources/body.ts';
 import type { DshSource } from '../sources/dsh.ts';
-import type { FileSource } from '../sources/files.ts';
 import type { HelperSource } from '../sources/helper.ts';
-import type { RuntimeAttention } from './attention.ts';
-import type { MetricQueryParams, MetricTimeline } from './metrics.ts';
-import type { DshPort, SenseActions, TuneRequest } from './ports.ts';
+import type { SenseBus } from './bus.ts';
+import type { DshPort, SenseActions } from './ports.ts';
 import type { Settings } from './settings.ts';
 
 export function pauseAction(
@@ -48,27 +43,20 @@ export function pauseAction(
 }
 
 export function runtimeTools(
-  attention: RuntimeAttention,
-  body: BodySource,
-  settings: Settings,
-  actions: SenseActions,
-  files: FileSource,
+  bus: SenseBus,
   helper: HelperSource,
-  syncRules: () => Promise<void>,
-  check: () => void,
   titlesAllowed: () => boolean,
-  changed: () => void,
   dsh: DshPort,
   dshSource: DshSource,
-  metrics: MetricTimeline,
 ) {
   return {
     refreshDetail: () => helper.refreshDetail(),
-    envMetrics: (params?: MetricQueryParams) => metrics.query(params),
     envState: (section?: 'self' | 'env' | 'observation', sessionId?: string) => {
-      const state = dshSource.stateFor(sessionId ?? attention.currentSessionId(), attention.state());
+      const targetSession =
+        sessionId !== undefined && !bus.isInternalSession(sessionId) ? sessionId : bus.currentSessionId();
+      const state = dshSource.stateFor(targetSession, bus.state());
       if (!titlesAllowed()) state.env.focusedWindow.value = null;
-      if (sessionId !== undefined) {
+      if (sessionId !== undefined && !bus.isInternalSession(sessionId)) {
         try {
           if (!dshSource.hasSession(sessionId)) throw new Error('session unavailable');
           if (!dsh.modelJobs) throw new Error('job source unavailable');
@@ -79,59 +67,6 @@ export function runtimeTools(
         }
       }
       return section ? state[section] : state;
-    },
-    envWatch: async (request: {
-      action: 'list' | 'add' | 'remove';
-      rule?: Omit<WatchRule, 'approved' | 'createdBy'>;
-      id?: string;
-    }) => {
-      check();
-      if ('param' in request) throw new Error('unsupported-param');
-      if (request.action === 'list') return settings.list();
-      if (request.action === 'add' && request.rule) {
-        const input = structuredClone(request.rule);
-        const rule = createWatchRule({ ...input, createdBy: 'agent', approved: input.level !== 'wake' });
-        if (validateRule(rule).length) throw new TypeError('invalid watch rule');
-        if (settings.list().some((item) => item.id === rule.id)) throw new Error('rule id already exists');
-        const prepared = await files.prepare(rule);
-        try {
-          check();
-          await settings.update((draft) => {
-            prepared.check();
-            if (draft.rules.some((item) => item.id === rule.id)) throw new Error('rule id already exists');
-            draft.rules.push(rule);
-          });
-          check();
-          await syncRules();
-          check();
-        } finally {
-          await prepared.release();
-        }
-        changed();
-        return settings.list();
-      }
-      if (request.action === 'remove' && request.id) {
-        const rule = settings.list().find((item) => item.id === request.id);
-        if (rule?.createdBy !== 'agent') throw new Error('only agent rules can be removed');
-        await actions.deleteRule(request.id);
-        return settings.list();
-      }
-      throw new TypeError('invalid env_watch request');
-    },
-    bodyTune: async (request: TuneRequest) => {
-      check();
-      try {
-        const result = await ('action' in request
-          ? body.tuner.feedback(request.alertId, request.verdict)
-          : body.tuner.get(request.param) === undefined
-            ? Promise.reject(new Error('unsupported-param'))
-            : body.tuner.propose(request));
-        check();
-        if ('action' in request && result.applied) attention.feedback(request.alertId, request.verdict);
-        return result;
-      } finally {
-        changed();
-      }
     },
   };
 }

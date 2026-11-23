@@ -1,9 +1,20 @@
-/** 场景补充：上下文接近满/回退估值与卷级新鲜度混杂的磁盘场景。 */
+/** 场景补充：上下文接近满、回退估值与卷级新鲜度混杂的磁盘场景。 */
 
-import type { SensePanelModel } from '../view-model';
-import { fact, makeBody, makeHistory, makeInsights, makeState, panelModel, series, T0 } from './fixtures';
+import type { NeedsPanelModel } from '../view-model';
+import {
+  fact,
+  makeBody,
+  makeHistory,
+  makeMaintenanceSession,
+  makeNeed,
+  makeNeeds,
+  makeState,
+  panelModel,
+  series,
+  T0,
+} from './fixtures';
 
-export function contextAlmostFull(): SensePanelModel {
+export function contextAlmostFull(): NeedsPanelModel {
   const body = makeBody();
   body.tokens = fact({
     contextWindow: 128_000,
@@ -15,36 +26,31 @@ export function contextAlmostFull(): SensePanelModel {
   });
   return panelModel(makeState({ self: { ...makeState().self, body } }), {
     history: makeHistory({ tokens: series(60, 5_000, (i) => 90_000 + i * 470) }),
-    // 宿主在该读数下 floor 层确会触发 warn（剩余 7.4% < 12%），
-    // 否则 sources 含 floor 而 triggered 为空会把行压回 good。
-    insights: makeInsights({
-      tokens: {
-        baseline: { low: 30_000, high: 60_000 },
-        sources: ['floor', 'baseline'],
-        triggered: ['floor'],
-        severity: 'warn',
-      },
+    needs: makeNeeds({
+      mind: makeNeed('mind', 32, '上下文仅剩 7%（9.5k），后台准备压缩空闲会话'),
+    }),
+    maintenanceSession: makeMaintenanceSession({
+      status: 'running',
+      lastRunAt: T0 - 8_000,
+      turnCount: 1,
     }),
   });
 }
 
-/** 上下文窗口容量来自回退估值：环/余量降饱和为「容量未确认」，无告警。 */
-export function tokenFallback(): SensePanelModel {
+export function tokenFallback(): NeedsPanelModel {
   const m = contextAlmostFull();
   m.state.self.body.tokens = fact({
     ...m.state.self.body.tokens.value!,
     contextWindowSource: 'fallback',
   });
+  m.needs = makeNeeds({
+    mind: makeNeed('mind', 42, '上下文回退估值较紧（93%），空闲时可尝试整理'),
+  });
+  m.overallZone = 'uncomfortable';
   return m;
 }
 
-/**
- * 卷级新鲜度混杂（与 DiskSampler.sample 实际产物同形）：
- * 根卷显式 stale（保留值灰显）、/data 显式 ok；父事实 ok，元数据只来自
- * 唯一的 fresh 卷（observedAt/ttlMs 沿用 /data）；网络盘挂起列入
- * unavailableMounts（不产数字、历史、图）。
- */
-export function diskPartial(): SensePanelModel {
+export function diskPartial(): NeedsPanelModel {
   const state = makeState();
   state.self.body.disks = {
     kind: 'disks',
@@ -76,6 +82,10 @@ export function diskPartial(): SensePanelModel {
       disks: {
         '/': series(60, 5_000, (i) => 0.62 + 0.005 * Math.sin(i / 20)),
         '/data': series(60, 5_000, (i) => 0.2 + 0.004 * Math.sin(i / 20)),
+      },
+      diskFree: {
+        '/': series(60, 5_000, () => 175e9),
+        '/data': series(60, 5_000, () => 160e9),
       },
     }),
   });

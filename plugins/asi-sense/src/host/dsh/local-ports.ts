@@ -1,138 +1,18 @@
 import { spawn } from 'node:child_process';
-import { existsSync, lstatSync, statSync, watch } from 'node:fs';
 import * as fs from 'node:fs/promises';
-import { dirname, isAbsolute, relative, resolve, sep } from 'node:path';
+import { isAbsolute } from 'node:path';
 import { performance } from 'node:perf_hooks';
 import { BodyProbe } from '@asi/body-probe';
 import type { Context } from '@deepseek-ai/cordis';
 import type { SensePorts } from '../runtime/ports.ts';
-import { FileHistoryStoragePort } from './history-storage.ts';
 import { FileStoragePort } from './storage.ts';
 
 export function localPorts(ctx: Context, storageRoot: string): Omit<SensePorts, 'dsh'> {
   if (!isAbsolute(storageRoot)) throw new TypeError('asi-sense storageRoot must be absolute');
   return {
     clock: { wall: Date.now, mono: () => performance.now() },
-    history: new FileHistoryStoragePort(storageRoot, undefined, (error) =>
-      ctx.logger.warn(
-        `asi-sense history directory sync failed: ${error instanceof Error ? error.message : String(error)}`,
-      ),
-    ),
-    storage: new FileStoragePort(
-      storageRoot,
-      fs,
-      () => ctx.logger.warn('asi-sense storage directory sync failed'),
-      () => ctx.logger.warn('asi-sense unrecognized or invalid body snapshot backed up; AI tuning disabled'),
-      (code) => ctx.logger.warn(`asi-sense body snapshot recovery failed: ${code}`),
-    ),
+    storage: new FileStoragePort(storageRoot, fs, () => ctx.logger.warn('asi-sense storage directory sync failed')),
     helper: { spawn: (path) => spawn(path, [], { stdio: 'pipe' }) },
     probe: { create: () => new BodyProbe() },
-    files: {
-      watch(root, callback, opts?: { recursive?: boolean }) {
-        const target = resolve(root);
-        const startedAt = Date.now();
-        let watcher: ReturnType<typeof watch>;
-        let closed = false;
-        const fail = (error?: unknown) => {
-          ctx.logger.warn('asi-sense file watcher failed');
-          const code = (error as NodeJS.ErrnoException | undefined)?.code;
-          const rawPath = (error as { path?: unknown } | undefined)?.path;
-          const event = {
-            path: target,
-            change: 'modify' as const,
-            watchError: true,
-            ...(typeof code === 'string' && code.length > 0
-              ? { errorCode: code, errorPath: typeof rawPath === 'string' && rawPath.trim() ? rawPath : target }
-              : {}),
-          };
-          callback(event);
-        };
-        const inside = (parent: string, child: string) => {
-          const rel = relative(parent, child);
-          return rel !== '..' && !rel.startsWith(`..${sep}`) && !isAbsolute(rel);
-        };
-        const attach = () => {
-          let candidate = target;
-          for (;;) {
-            try {
-              const directory = statSync(candidate).isDirectory();
-              if (!directory) {
-                candidate = dirname(candidate);
-                continue;
-              }
-              const base = candidate;
-              let nextClosed = false;
-              const next = watch(
-                base,
-                // `recursive:false` only applies at the target dir itself: an
-                // ancestor fallback still needs recursion to observe the
-                // target's appearance; delivered events stay inside(target).
-                { recursive: base === target ? opts?.recursive !== false : base !== dirname(target) },
-                (event, filename) => {
-                  if (closed || nextClosed || watcher !== next) return;
-                  const path = !directory || filename === null ? base : resolve(base, filename.toString());
-                  if (!inside(base, path)) return;
-                  try {
-                    if (
-                      (base !== '/' && !existsSync(base)) ||
-                      (base !== target &&
-                        existsSync(target) &&
-                        (dirname(target) !== base || statSync(target).isDirectory()))
-                    ) {
-                      attach();
-                    }
-                  } catch (error) {
-                    fail(error);
-                    return;
-                  }
-                  if (!inside(target, path) || filename === null) return;
-                  let at = Date.now();
-                  let change: 'add' | 'modify' | 'delete' = event === 'change' ? 'modify' : 'add';
-                  try {
-                    const mtime = lstatSync(path).mtimeMs;
-                    if (Number.isFinite(mtime) && mtime >= startedAt) at = mtime;
-                  } catch (error) {
-                    const code = (error as NodeJS.ErrnoException | undefined)?.code;
-                    if (code === 'EACCES' || code === 'EPERM') {
-                      callback({ path: target, change: 'modify', watchError: true, errorCode: code, errorPath: path });
-                      return;
-                    }
-                    if (event !== 'change' && (code === 'ENOENT' || code === 'ENOTDIR' || !existsSync(path))) {
-                      change = 'delete';
-                    }
-                  }
-                  callback({ path, change, at });
-                },
-              );
-              next.on('close', () => {
-                if (closed || nextClosed || watcher !== next) return;
-                nextClosed = true;
-                fail(Object.assign(new Error('file watcher closed unexpectedly'), { code: 'ECLOSE' }));
-              });
-              next.on('error', (error) => {
-                if (closed || nextClosed || watcher !== next) return;
-                fail(error);
-              });
-              const previous = watcher;
-              watcher = next;
-              previous?.close();
-              return;
-            } catch (error) {
-              const code = (error as NodeJS.ErrnoException).code;
-              const parent = dirname(candidate);
-              if ((code !== 'ENOENT' && code !== 'ENOTDIR') || parent === candidate) throw error;
-              candidate = parent;
-            }
-          }
-        };
-        attach();
-        return {
-          close: () => {
-            closed = true;
-            watcher.close();
-          },
-        };
-      },
-    },
   };
 }

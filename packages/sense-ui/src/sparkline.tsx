@@ -5,7 +5,7 @@ import { buildSpark, type RangeBandPoint, sameThresholds } from './geometry';
 import type { Severity } from './health';
 import { HISTORY_WINDOW_MS } from './history';
 import type { SparkThreshold } from './thresholds';
-import type { MetricInsight, MetricKey, MetricPoint } from './view-model';
+import type { MetricKey, MetricPoint } from './view-model';
 import css from './viz.module.css';
 
 export { HISTORY_WINDOW_MS, sampleHistory } from './history';
@@ -21,7 +21,7 @@ interface SparklineProps {
   /** 严重度决定容器 data-sev 与末点标记（颜色只作用于越界段，不整体染色）。 */
   severity?: Severity;
   /** 与 points 同单位的基线区间；未提供不画带、不虚构。 */
-  baseline?: MetricInsight['baseline'];
+  baseline?: { low: number; high: number };
   /** min/max 区间阴影带（与 points 同时间窗口与单位）。 */
   minMaxBand?: readonly RangeBandPoint[];
   /** 时间窗口（ms），默认 HISTORY_WINDOW_MS（5 分钟）；24h 图传 86_400_000。 */

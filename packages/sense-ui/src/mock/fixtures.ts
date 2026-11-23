@@ -1,4 +1,4 @@
-/** 预览与测试用的确定性夹具；全部为编造数据，不含真实主机名/标题。 */
+/** 预览与测试用的确定性夹具；全部为编造数据，不含真实主机名/标题/凭据。 */
 
 import type {
   BodyHistory,
@@ -6,20 +6,28 @@ import type {
   DiskVolume,
   Fact,
   FactStatus,
-  MetricInsight,
-  MetricKey,
+  InstinctState,
+  MaintenanceSessionStatus,
   MetricPoint,
-  SenseEvent,
-  SensePanelModel,
-  SenseRule,
+  NeedEvaluation,
+  NeedKey,
+  NeedsPanelModel,
+  NeedZone,
   SenseState,
-  Signal,
   SourceRef,
 } from '../view-model';
 
 export const T0 = 1_763_300_000_000;
 
 export const src = (api: string): SourceRef => ({ id: api, api, host: 'demo-host' });
+
+const LABELS: Record<NeedKey, string> = {
+  energy: '能量',
+  space: '空间',
+  memory: '内存与进程',
+  mind: '心智容量',
+  thermals: '体温负荷',
+};
 
 export function fact<T>(
   value: T | null,
@@ -35,7 +43,6 @@ export function fact<T>(
   };
 }
 
-/** 无值的事实（denied/unavailable/unsupported/unknown/stale-null），T 由赋值上下文推断。 */
 export function emptyFact<T>(status: FactStatus, reason?: string): Fact<T> {
   return fact<T>(null, { status, reason });
 }
@@ -71,26 +78,10 @@ export function makeHistory(over: Partial<BodyHistory> = {}): BodyHistory {
       '/': series(60, 5_000, sine(0.62, 0.005, 20)),
       '/demo/vol': series(60, 5_000, sine(0.4, 0.004, 20)),
     },
-    ...over,
-  };
-}
-
-/** 已就绪场景的基线区间（与 history 同单位）；learning 场景自行提供无 band 的版本。 */
-export function makeInsights(
-  over: Partial<Record<MetricKey, MetricInsight>> = {},
-): Partial<Record<MetricKey, MetricInsight>> {
-  return {
-    cpu: { baseline: { low: 0.18, high: 0.5 }, sources: ['floor', 'rate', 'baseline'], triggered: [] },
-    memory: { baseline: { low: 0.5, high: 0.7 }, sources: ['floor', 'baseline'], triggered: [] },
-    battery: { baseline: { low: 60, high: 95 }, sources: ['floor'], triggered: [] },
-    thermal: { sources: ['floor'], triggered: [] },
-    networkRx: { baseline: { low: 100_000, high: 700_000 }, sources: ['rate', 'baseline'], triggered: [] },
-    networkTx: { baseline: { low: 30_000, high: 160_000 }, sources: ['rate'], triggered: [] },
-    processCpu: { baseline: { low: 0.02, high: 0.16 }, sources: ['floor'], triggered: [] },
-    processRss: { baseline: { low: 400e6, high: 560e6 }, sources: ['baseline'], triggered: [] },
-    tokens: { baseline: { low: 30_000, high: 60_000 }, sources: ['floor', 'baseline'], triggered: [] },
-    'disk:/': { baseline: { low: 0.55, high: 0.7 }, sources: ['floor', 'baseline'], triggered: [] },
-    'disk:/demo/vol': { baseline: { low: 0.35, high: 0.45 }, sources: ['floor'], triggered: [] },
+    diskFree: {
+      '/': series(60, 5_000, (i) => 175e9 - i * 50_000),
+      '/demo/vol': series(60, 5_000, () => 72e9),
+    },
     ...over,
   };
 }
@@ -138,8 +129,8 @@ export function makeState(over: Partial<SenseState> = {}): SenseState {
     self: {
       activity: fact('tool'),
       pending: fact({ inbox: 2, jobs: 1 }),
-      tools: fact(['env_state', 'env_watch', 'env_detail', 'shell']),
-      permissions: fact({ 辅助功能: 'granted', 完全磁盘访问: 'granted' }),
+      tools: fact(['env_state', 'env_detail', 'needs_status']),
+      permissions: fact({ 辅助功能: 'granted' }),
       body: makeBody(),
     },
     env: {
@@ -152,23 +143,11 @@ export function makeState(over: Partial<SenseState> = {}): SenseState {
       frontApp: fact({ name: 'Terminal', bundleId: 'com.demo.terminal' }),
       focusedWindow: fact({ title: 'demo.ts — project' }),
       activeJobs: fact([{ id: 'job-1', name: 'pnpm test', owner: 'fixture-session', status: 'running' }]),
-      watchedPaths: fact({ 'src/**': { lastChange: T0 - 32_000, changes: 7 } }),
-      globalFileWatch: fact({
-        enabled: true,
-        status: 'running',
-        root: '/',
-        windowMs: 10_000,
-        eventsPerSec: 0,
-        degraded: false,
-        countOnly: false,
-        deniedPaths: [],
-        exclusions: ['/System', '/Library', '~/Library', 'node_modules', '.git'],
-      }),
     },
     observation: {
       sources: {
         'macos-helper': { status: 'ok', lastSignalAt: T0 - 2_000 },
-        'file-watch': { status: 'ok', lastSignalAt: T0 - 30_000 },
+        'body-probe': { status: 'ok', lastSignalAt: T0 - 2_000 },
         'dsh-events': { status: 'ok', lastSignalAt: T0 - 1_000 },
       },
     },
@@ -184,81 +163,80 @@ export function makeState(over: Partial<SenseState> = {}): SenseState {
   };
 }
 
-export function makeEvent(
-  i: number,
-  over: Partial<Omit<SenseEvent, 'signal'>> & { signal?: Partial<Signal> } = {},
-): SenseEvent {
-  const { signal: sigOver, ...rest } = over;
-  const kinds = ['app.activated', 'window.focused', 'file.changed', 'job.exited'];
-  const kind = kinds[i % kinds.length]!;
-  const subjects: Record<string, string> = {
-    'app.activated': 'com.demo.browser',
-    'window.focused': 'demo.ts — project',
-    'file.changed': '/demo/project/src/a.ts',
-    'job.exited': 'job-7',
-  };
+export function makeNeed(
+  key: NeedKey,
+  satisfaction: number,
+  summary: string,
+  over: Partial<NeedEvaluation> = {},
+): NeedEvaluation {
+  const clamped = Math.max(0, Math.min(100, Math.round(satisfaction)));
+  const zone: NeedZone = clamped < 25 ? 'critical' : clamped < 60 ? 'uncomfortable' : 'comfortable';
   return {
-    signal: {
-      id: `sig-${i}`,
-      kind,
-      at: T0 - i * 4_000,
-      source: src('demo'),
-      subject: subjects[kind]!,
-      data: {},
-      cause: rest.cause ?? 'user',
-      ...sigOver,
-    },
-    level: 'record',
-    reason: '默认记录规则',
-    cause: 'user',
-    ...rest,
-  };
-}
-
-/** 面板模型：默认空事件、默认规则、now=T0、默认历史与 insight。 */
-export function panelModel(state: SenseState, over: Partial<SensePanelModel> = {}): SensePanelModel {
-  return {
-    state,
-    events: over.events ?? [],
-    rules: over.rules ?? makeRules(),
-    paused: false,
-    sendTitles: true,
-    now: T0,
-    history: makeHistory(),
-    insights: makeInsights(),
+    key,
+    label: LABELS[key],
+    satisfaction: clamped,
+    urgency: 100 - clamped,
+    zone,
+    driveActive: zone !== 'comfortable',
+    summary,
+    evidence: {},
+    updatedAt: T0,
     ...over,
   };
 }
 
-export function makeRules(): SenseRule[] {
-  return [
-    {
-      id: 'rule-pending',
-      name: '测试失败时唤醒',
-      enabled: true,
-      confirmed: false,
-      match: { kind: 'job.exited', where: { exitCode: '!=0' } },
-      level: 'wake',
-      note: '测试失败时看日志并决定是否提醒我',
-      createdBy: 'agent',
-    },
-    {
-      id: 'rule-save',
-      name: 'src 下文件保存',
-      enabled: true,
-      confirmed: true,
-      match: { kind: 'file.changed', subject: 'src/**' },
-      level: 'context',
-      createdBy: 'user',
-    },
-    {
-      id: 'rule-app',
-      name: '应用切换记录',
-      enabled: false,
-      confirmed: true,
-      match: { kind: 'app.activated' },
-      level: 'record',
-      createdBy: 'user',
-    },
-  ];
+export function makeNeeds(over: Partial<Record<NeedKey, NeedEvaluation>> = {}): Record<NeedKey, NeedEvaluation> {
+  return {
+    energy: makeNeed('energy', 86, '电量 76% · 模型网关连通正常'),
+    space: makeNeed('space', 88, '主卷剩余 163.0 GB（38%），空间充裕'),
+    memory: makeNeed('memory', 82, '系统内存压力正常，DSH 占用 488 MB'),
+    mind: makeNeed('mind', 78, '上下文余量 64%（剩余 81.8k）'),
+    thermals: makeNeed('thermals', 92, '设备温度正常，CPU 负载平稳'),
+    ...over,
+  };
+}
+
+export function computeOverallZone(needs: Record<NeedKey, NeedEvaluation>): NeedZone {
+  const vals = Object.values(needs);
+  if (vals.some((n) => n.zone === 'critical')) return 'critical';
+  if (vals.some((n) => n.zone === 'uncomfortable')) return 'uncomfortable';
+  return 'comfortable';
+}
+
+export function makeInstinct(over: Partial<InstinctState> = {}): InstinctState {
+  return {
+    powerMode: 'normal',
+    modelConnectivity: 'online',
+    probeCount: 0,
+    lastProbeAt: T0 - 5_000,
+    ...over,
+  };
+}
+
+export function makeMaintenanceSession(over: Partial<MaintenanceSessionStatus> = {}): MaintenanceSessionStatus {
+  return {
+    sessionId: 'maint-demo-1',
+    title: 'ASI 自维护',
+    status: 'idle',
+    turnCount: 0,
+    ...over,
+  };
+}
+
+export function panelModel(state: SenseState, over: Partial<NeedsPanelModel> = {}): NeedsPanelModel {
+  const needs = over.needs ?? makeNeeds();
+  return {
+    now: T0,
+    paused: false,
+    sendTitles: true,
+    state,
+    history: makeHistory(),
+    needs,
+    overallZone: over.overallZone ?? computeOverallZone(needs),
+    instinct: makeInstinct(),
+    maintenanceSession: makeMaintenanceSession(),
+    helpCards: [],
+    recentMaintenance: [],
+    ...over,
+  };
 }

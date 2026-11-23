@@ -2,28 +2,23 @@ import { cleanup, fireEvent, render, waitFor } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { fact } from '../../src/mock/fixtures';
 import { makeScenario } from '../../src/mock/scenarios';
-import { SensePanel } from '../../src/SensePanel';
-import type { SensePanelModel, SensePanelProps } from '../../src/view-model';
+import { NeedsPanel } from '../../src/NeedsPanel';
+import type { NeedsPanelModel, NeedsPanelProps } from '../../src/view-model';
 
 afterEach(cleanup);
 
-function renderPanel(model: SensePanelModel) {
-  const props: SensePanelProps = {
+function renderPanel(model: NeedsPanelModel) {
+  const props: NeedsPanelProps = {
     model,
-    onToggleRule: vi.fn(),
-    onConfirmRule: vi.fn(),
-    onDeleteRule: vi.fn(),
     onPause: vi.fn(),
     onToggleTitles: vi.fn(),
     onOpenPermissionSettings: vi.fn(),
-    onRevertTuning: vi.fn(),
-    onLockParam: vi.fn(),
-    onFeedback: vi.fn(),
-    onResumeTuning: vi.fn(async () => {}),
-    onResetTuning: vi.fn(async () => {}),
-    onAcceptRebaseline: vi.fn(async () => {}),
+    onApproveHelp: vi.fn(),
+    onDismissHelp: vi.fn(),
+    onOpenMaintenanceSession: vi.fn(),
+    onTriggerCheck: vi.fn(),
   };
-  render(<SensePanel {...props} />);
+  render(<NeedsPanel {...props} />);
 }
 
 describe('电池状态文案', () => {
@@ -53,7 +48,7 @@ describe('电池状态文案', () => {
       '未充电 · 估算中',
     ],
     ['来源未知', { percent: 80, charging: false, minutesLeft: 30 }, '未充电'],
-  ])('%s', (_name, battery, expected) => {
+  ] as const)('%s', (_name, battery, expected) => {
     const model = makeScenario('healthy');
     model.state.self.body.battery = fact(battery);
     renderPanel(model);
@@ -64,7 +59,7 @@ describe('电池状态文案', () => {
 
   it('过期读数不显示当前续航或充满估计', () => {
     const model = makeScenario('healthy');
-    const battery = { percent: 40, charging: true, powerState: 'charging', minutesLeft: 70 };
+    const battery = { percent: 40, charging: true, powerState: 'charging' as const, minutesLeft: 70 };
     model.state.self.body.battery = fact(battery, { status: 'stale' });
     renderPanel(model);
     const summary = document.querySelector('details[data-tile="battery"] summary')!;

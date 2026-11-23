@@ -8,26 +8,18 @@ import {
   type DisksFact,
   type Fact,
   type MetricPoint,
-  type SensePanelModel,
+  type NeedsPanelModel,
   THERMAL_ORDINAL,
 } from '../view-model';
 
 const HISTORY_MS = 300_000;
 
-/**
- * 续期判定：原始 status 为 ok 且距上次观察已满 2/3·TTL（TTL 有限为正）。
- * 非 ok 事实永不续期；未到期事实返回原引用，保证未采样数据零改动。
- */
 const due = (observedAt: number, ttlMs: number, now: number): boolean =>
   Number.isFinite(ttlMs) && ttlMs > 0 && (now - observedAt) * 3 >= ttlMs * 2;
 
 const renew = <T>(f: Fact<T>, now: number): Fact<T> =>
   f.status === 'ok' && due(f.observedAt, f.ttlMs, now) ? { ...f, observedAt: now } : f;
 
-/**
- * 磁盘事实续期：各卷按有效状态和期限独立判断，仅新鲜卷到 2/3·TTL 时
- * 刷新 observedAt；续期时物化未刷新的卷，避免父级变化复活旧卷。
- */
 function renewDisks(f: DisksFact, now: number): DisksFact {
   const volumes = effectiveDisks(f, now).value ?? [];
   if (!volumes.some((v) => v.status === 'ok' && due(v.observedAt, v.ttlMs, now))) return f;
@@ -44,21 +36,18 @@ function renewDisks(f: DisksFact, now: number): DisksFact {
   return { ...f, value, status, observedAt, ttlMs };
 }
 
-/** 仅在值非 null 时追加历史点；始终裁剪到最近 5 分钟。 */
 const push = (pts: MetricPoint[], now: number, v: number | null | undefined): MetricPoint[] => {
   const pruned = pts.filter((p) => p.at > now - HISTORY_MS);
   return v == null ? pruned : [...pruned, { at: now, value: v }];
 };
 
-export function tick(m: SensePanelModel): SensePanelModel {
+export function tick(m: NeedsPanelModel): NeedsPanelModel {
   const now = m.now + 1_000;
   if (m.paused) return { ...m, now };
   const t = now / 1_000;
   const b0 = m.state.self.body;
   const body: Body = { ...b0 };
 
-  // cpu / network / tokens 做正弦动态并随采样落新 observedAt；
-  // 其余 ok 事实按 2/3·TTL 周期续期（静止也是有效观测），非 ok 原样保留。
   if (body.cpu.status === 'ok') {
     body.cpu = { ...body.cpu, observedAt: now };
     if (body.cpu.value) {
@@ -121,8 +110,6 @@ export function tick(m: SensePanelModel): SensePanelModel {
   const pv = ok(body.harnessProcess);
   const tv = ok(body.tokens);
   const previousDisks = effectiveDisks(b0.disks, now).value ?? [];
-  // 历史只随「本次采样有变化的事实」推进：未更新的事实保留原数组引用；
-  // 变化时先按 5 分钟窗裁剪，值缺失/不可用不补点。
   const history: BodyHistory = {
     ...m.history,
     cpu: body.cpu !== b0.cpu ? push(m.history.cpu, now, cv?.usage) : m.history.cpu,
@@ -154,8 +141,20 @@ export function tick(m: SensePanelModel): SensePanelModel {
             }),
           )
         : m.history.disks,
+    diskFree:
+      body.disks !== b0.disks
+        ? Object.fromEntries(
+            Object.entries(m.history.diskFree ?? {}).map(([mount, pts]) => {
+              const d = body.disks.value?.find((v) => v.mount === mount);
+              const previous = previousDisks.find((v) => v.mount === mount);
+              if (!d || d.observedAt === previous?.observedAt) return [mount, pts];
+              const v = diskUsable(body.disks, d, now) && d.total > 0 ? d.free : null;
+              return [mount, push(pts, now, v)];
+            }),
+          )
+        : m.history.diskFree,
   };
-  // 身体以外的 self/env 事实同样按周期续期；全部未变时保留原对象引用。
+
   const s0 = m.state.self;
   const activity = renew(s0.activity, now);
   const pending = renew(s0.pending, now);
@@ -185,15 +184,8 @@ export function tick(m: SensePanelModel): SensePanelModel {
   const frontApp = renew(e0.frontApp, now);
   const focusedWindow = renew(e0.focusedWindow, now);
   const activeJobs = renew(e0.activeJobs, now);
-  const watchedPaths = renew(e0.watchedPaths, now);
-  const globalFileWatch = e0.globalFileWatch ? renew(e0.globalFileWatch, now) : undefined;
   const env =
-    whereSame &&
-    frontApp === e0.frontApp &&
-    focusedWindow === e0.focusedWindow &&
-    activeJobs === e0.activeJobs &&
-    watchedPaths === e0.watchedPaths &&
-    globalFileWatch === e0.globalFileWatch
+    whereSame && frontApp === e0.frontApp && focusedWindow === e0.focusedWindow && activeJobs === e0.activeJobs
       ? e0
       : {
           ...e0,
@@ -201,8 +193,6 @@ export function tick(m: SensePanelModel): SensePanelModel {
           frontApp,
           focusedWindow,
           activeJobs,
-          watchedPaths,
-          ...(globalFileWatch ? { globalFileWatch } : {}),
         };
   return {
     ...m,

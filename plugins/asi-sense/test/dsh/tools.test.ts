@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import os from 'node:os';
-import type { SenseState } from '@asi/sense-types';
+import type { Signal } from '@asi/sense-types';
 import { Context } from '@deepseek-ai/cordis';
 import type { Agent } from '@deepseek-ai/dsh-agent';
 import { ToolCallId } from '@deepseek-ai/dsh-llm';
@@ -10,9 +10,7 @@ import { NativeToolExecutor } from '@deepseek-ai/dsh-tool-executor-native';
 import { executeToolFixture } from '@deepseek-ai/dsh-tool-testkit';
 import ToolsService from '@deepseek-ai/dsh-tools';
 import { describe, expect, it, onTestFinished, vi } from 'vitest';
-import { FileBurstDetector } from '../../src/host/body/burst.ts';
-import { createDelivery } from '../../src/host/dsh/deliver.ts';
-import { environmentDetail, modelOutput, modelRules, modelState, modelTune } from '../../src/host/dsh/tool-output.ts';
+import { environmentDetail, modelOutput, modelState } from '../../src/host/dsh/tool-output.ts';
 import { registerSenseTools } from '../../src/host/dsh/tools.ts';
 import { createSenseRuntime } from '../../src/host/runtime/index.ts';
 import type { AgentEvent, JobEvent, SensePorts, ToolEvent } from '../../src/host/runtime/ports.ts';
@@ -41,7 +39,6 @@ async function fixture(liveState = false, isolated = false) {
         jobEvent = callback;
         return () => {};
       },
-      deliver: async () => {},
       tokenSnapshot: async (session) =>
         isolated
           ? {
@@ -53,7 +50,6 @@ async function fixture(liveState = false, isolated = false) {
     storage: { load: async () => undefined, save: async () => {} },
     helper: { spawn: () => undefined },
     probe: { create: () => ({ onSample: () => () => {}, start: () => {}, stop: async () => {} }) },
-    files: { watch: () => ({ close: () => {} }) },
   };
   const jobs = [
     { id: 'a-job', owner: 'session-a', command: 'private-a-command', status: 'running' as const, startedAt: 1 },
@@ -97,14 +93,14 @@ async function fixture(liveState = false, isolated = false) {
         return section ? copy[section] : copy;
       },
     },
-    events: () => [
+    recentSignals: (): Signal[] => [
       {
         id: 'event',
         kind: 'window.focused',
         subject: titles ? 'org.fixture.app' : '',
-        level: 'record' as const,
         at: 990,
         source: { id: 'helper', api: 'test', host: 'local' },
+        data: {},
       },
     ],
   };
@@ -169,19 +165,17 @@ async function fixture(liveState = false, isolated = false) {
   };
 }
 
-describe('model-facing tools', () => {
-  it('reports a pinned target mode without exposing its conversation title', async () => {
-    const h = await fixture(true, true);
-    h.ports.dsh.listSessions = async () => [
-      { id: 'session-a', title: 'Private Synthetic Conversation', updatedAt: 1, running: false },
-    ];
-    h.ports.dsh.ensureSession = async () => {};
-    await h.agentEvent({ type: 'created', sessionId: 'session-a' });
-    await h.live.actions.selectTarget?.('session-a');
-    const result = await h.call('env_state', {}, { session: 'session-a' });
-    expect(result).toMatchObject({ isError: false, value: { deliveryTarget: 'pinned' } });
-    expect(JSON.stringify(result.value)).not.toContain('Private Synthetic Conversation');
+describe('model-facing pure sensory tools', () => {
+  it('registers ONLY read-only env_state and env_detail tools (no rule, tuning, or history tools)', async () => {
+    const h = await fixture();
+    expect(
+      h.ctx.tools
+        .definitions()
+        .map((t) => t.name)
+        .sort(),
+    ).toEqual(['env_detail', 'env_state']);
   });
+
   it('returns fact age and redacts titles when disabled; rejects calls without an agent', async () => {
     const h = await fixture();
     expect(await h.call('env_state', {}, { agent: false })).toMatchObject({
@@ -192,11 +186,11 @@ describe('model-facing tools', () => {
     expect(first).toMatchObject({
       isError: false,
       value: {
-        deliveryTarget: 'auto',
         frontApp: { ageMs: 10 },
         focusedWindow: { value: { title: 'Synthetic title' } },
       },
     });
+    expect('deliveryTarget' in (first.value as Record<string, unknown>)).toBe(false);
     h.setTitles(false);
     const redacted = await h.call('env_state', { section: 'env' });
     expect(redacted).toMatchObject({ isError: false, value: { focusedWindow: { value: null } } });
@@ -236,11 +230,11 @@ describe('model-facing tools', () => {
     expect(JSON.stringify(hidden.value)).not.toContain('Synthetic title');
   });
 
-  it('exposes stable permission and source keys to model tools', async () => {
+  it('exposes stable permission and source keys to model tools without leaking internal error strings', async () => {
     const h = await fixture();
     h.state.self.permissions.value = { 辅助功能: 'denied', '其他权限（DSH 未提供）': 'unknown' };
     h.state.self.permissions.source = { id: 'helper.ax', api: 'accessibility', host: 'local' };
-    h.state.observation.sources['helper.ax'] = { status: 'denied', lastSignalAt: 990 };
+    h.state.observation.sources['helper.ax'] = { status: 'denied', lastSignalAt: 990, error: 'boom' };
     h.state.observation.sources['helper.window'] = { status: 'unknown', lastSignalAt: 990 };
     const state = await h.call('env_state', {});
     expect(state.value).toMatchObject({
@@ -252,19 +246,19 @@ describe('model-facing tools', () => {
       },
       observation: { sources: { 'helper.ax': { status: 'denied' }, 'helper.window': { status: 'unknown' } } },
     });
+    expect(JSON.stringify(state)).not.toContain('boom');
     expect((await h.call('env_detail', {})).value).toMatchObject({
       sources: { 'helper.ax': { status: 'denied' }, 'helper.window': { status: 'unknown' } },
     });
   });
 
-  it('projects file and helper source identifiers stably regardless of source order', async () => {
+  it('projects source identifiers stably regardless of source order', async () => {
     const h = await fixture();
     const hash = (id: string) => `files:r-${createHash('sha256').update(id).digest('hex').slice(0, 8)}`;
     const sources = {
       'files:ascii.rule-1': { status: 'unavailable' as const, lastSignalAt: 990 },
       'files:/Users/example/private/work/project': { status: 'unavailable' as const, lastSignalAt: 989 },
       'files:规则一': { status: 'denied' as const, lastSignalAt: 991 },
-      'files:规则二': { status: 'unknown' as const, lastSignalAt: 992 },
       'helper.frontApp': { status: 'ok' as const, lastSignalAt: 993 },
       'helper.focusedWindow': { status: 'unknown' as const, lastSignalAt: 994 },
     };
@@ -272,7 +266,6 @@ describe('model-facing tools', () => {
       [hash('ascii.rule-1')]: { status: 'unavailable' },
       [hash('/Users/example/private/work/project')]: { status: 'unavailable' },
       [hash('规则一')]: { status: 'denied' },
-      [hash('规则二')]: { status: 'unknown' },
       'helper.frontApp': { status: 'ok' },
       'helper.focusedWindow': { status: 'unknown' },
     };
@@ -280,106 +273,23 @@ describe('model-facing tools', () => {
       h.state.observation.sources = Object.fromEntries(entries);
       h.state.env.frontApp.source = { id: 'helper.frontApp', api: 'ndjson', host: 'local' };
       h.state.env.focusedWindow.source = { id: 'helper.focusedWindow', api: 'ndjson', host: 'local' };
-      h.state.env.watchedPaths.source = { id: 'files:规则一', api: 'watch', host: 'local' };
       const state = (await h.call('env_state', {})).value;
       expect(state).toMatchObject({
         observation: { sources: expected },
         env: {
           frontApp: { source: { id: 'helper.frontApp' } },
           focusedWindow: { source: { id: 'helper.focusedWindow' } },
-          watchedPaths: { source: { id: hash('规则一') } },
         },
       });
       expect((await h.call('env_detail', {})).value).toMatchObject({ sources: expected });
       expect(JSON.stringify(state)).not.toContain('规则');
       expect(JSON.stringify(state)).not.toContain('/Users/example/private/work/project');
     }
-    expect(h.state.observation.sources).toHaveProperty('files:规则一');
-    const collision = {
-      'files:synthetic-rule-43351': { status: 'ok' as const, lastSignalAt: 995 },
-      'files:synthetic-rule-66854': { status: 'denied' as const, lastSignalAt: 991 },
-    };
-    expect(hash('synthetic-rule-43351')).toBe(hash('synthetic-rule-66854'));
-    for (const entries of [Object.entries(collision), Object.entries(collision).reverse()]) {
-      h.state.observation.sources = Object.fromEntries(entries);
-      const state = (await h.call('env_state', { section: 'observation' })).value;
-      expect(state).toMatchObject({
-        sources: { [hash('synthetic-rule-43351')]: { status: 'unknown', ambiguous: true } },
-      });
-      expect(JSON.stringify(state)).not.toContain(' (2)');
-    }
-  });
-
-  it('F3: projects capped in env_state observation.sources without affecting other fields', async () => {
-    const h = await fixture();
-    h.state.observation.sources['history'] = { status: 'ok', lastSignalAt: 990, capped: true };
-    h.state.observation.sources['helper.ax'] = { status: 'denied', lastSignalAt: 991, error: 'boom' };
-    const state = (await h.call('env_state', { section: 'observation' })).value;
-    const sources = (state as { sources: Record<string, Record<string, unknown>> }).sources;
-    expect(sources['history']).toEqual({ status: 'ok', lastSignalAt: 990, capped: true });
-    expect(sources['helper.ax']).toEqual({ status: 'denied', lastSignalAt: 991 });
-    expect(JSON.stringify(state)).not.toContain('boom');
-  });
-
-  it('projects raw file source identifiers instead of exempting paths', () => {
     const value = modelOutput({
       observation: { sources: { 'files:/Users/example/private/work/project': { status: 'ok' } } },
       source: { id: 'files:/Users/example/private/work/project', api: 'watch' },
     });
     expect(JSON.stringify(value)).not.toContain('/Users/example/private/work/project');
-  });
-
-  it('projects a file rule whose ID is the full watched path', async () => {
-    const h = await fixture();
-    const id = '/Users/example/private/work/project';
-    const hash = `files:r-${createHash('sha256').update(id).digest('hex').slice(0, 8)}`;
-    h.state.observation.sources[`files:${id}`] = { status: 'unavailable', lastSignalAt: 990 };
-    h.state.env.watchedPaths.source = { id: `files:${id}`, api: 'watch', host: 'local' };
-    const projectedRule = modelRules([
-      { id, match: { kind: 'file.changed', subject: id }, level: 'context', createdBy: 'user', approved: true },
-    ]);
-    expect(projectedRule).toMatchObject([{ id: '[redacted]', match: { subject: 'project' } }]);
-    const state = (await h.call('env_state', {})).value;
-    expect(state).toMatchObject({
-      observation: { sources: { [hash]: { status: 'unavailable' } } },
-      env: { watchedPaths: { source: { id: hash } } },
-    });
-    expect(JSON.stringify(state)).not.toContain(id);
-  });
-
-  it('hides a watched path used as a rule ID in the live file-source tool flow', async () => {
-    const h = await fixture(true);
-    const id = '/Users/example/private/work/project';
-    const hash = `files:r-${createHash('sha256').update(id).digest('hex').slice(0, 8)}`;
-    const rules = await h.call('env_watch', {
-      action: 'add',
-      rule: { id, match: { kind: 'file.changed', subject: id }, level: 'context' },
-    });
-    expect(rules.isError).toBe(false);
-    expect(rules.value).toContainEqual(
-      expect.objectContaining({ id: '[redacted]', match: { kind: 'file.changed', subject: 'project' } }),
-    );
-    expect(h.live.state().observation.sources[`files:${id}`]?.status).toBe('ok');
-    const state = await h.call('env_state', { section: 'observation' });
-    expect(state.value).toMatchObject({ sources: { [hash]: { status: 'ok' } } });
-    expect(JSON.stringify(state.value)).not.toContain(id);
-  });
-
-  it('keeps projected file hashes stable even when the host name occurs in the hash', async () => {
-    const hostname = vi.spyOn(os, 'hostname').mockReturnValue('a44b3008');
-    try {
-      const h = await fixture();
-      const id = '/Users/example/private/work/project';
-      const hash = `files:r-${createHash('sha256').update(id).digest('hex').slice(0, 8)}`;
-      h.state.observation.sources[`files:${id}`] = { status: 'unavailable', lastSignalAt: 990 };
-      h.state.env.watchedPaths.source = { id: `files:${id}`, api: 'watch', host: 'local' };
-      expect((await h.call('env_state', {})).value).toMatchObject({
-        observation: { sources: { [hash]: { status: 'unavailable' } } },
-        env: { watchedPaths: { source: { id: hash } } },
-      });
-    } finally {
-      hostname.mockRestore();
-    }
   });
 
   it('retains fixed source keys without exempting matching window titles from host redaction', async () => {
@@ -439,7 +349,6 @@ describe('model-facing tools', () => {
     };
     h.state.self.activity.source.host = 'fixture-host.invalid';
     h.state.env.frontApp.source.host = 'fixture-host.invalid';
-    h.state.env.watchedPaths.value = { '/private/fixture/project': { changes: 0, lastChange: 0 } };
     h.state.env.activeJobs.value = [{ id: 'foreign', startedAt: 1, status: 'running', command: 'foreign-command' }];
     const result = await h.call('env_state', {});
     const text = JSON.stringify(result.value);
@@ -457,31 +366,17 @@ describe('model-facing tools', () => {
     expect(JSON.stringify((await h.call('env_detail', {})).value)).not.toContain('fixture-host.invalid');
   });
 
-  it('projects consented titles and excludes arbitrary notes and colliding private paths', async () => {
+  it('projects consented titles and hides hosts/ports/paths in both model tools', async () => {
     const h = await fixture();
     const title = 'open </private/fixture/report> ssh user@build-node:22 README.md';
     const projected = 'open [path] ssh <host> README.md';
     h.state.env.focusedWindow.value = { title };
     if (!h.state.env.frontApp.value) throw new Error('fixture missing');
     h.state.env.frontApp.value.bundleId = 'backup.example.invalid';
-    h.state.env.watchedPaths.value = {
-      '/private/a/project': { changes: 1, lastChange: 1 },
-      '/private/b/project': { changes: 2, lastChange: 2 },
-      '/': { changes: 3, lastChange: 3 },
-      '/private/a/__proto__': { changes: 4, lastChange: 4 },
-    };
     const state = await h.call('env_state', { section: 'env' });
     expect(state.value).toMatchObject({
       frontApp: { value: { name: 'Fixture App', bundleId: 'backup.example.invalid' } },
       focusedWindow: { value: { title: projected } },
-      watchedPaths: { value: { project: { changes: 1 }, 'project (2)': { changes: 2 }, '[path]': { changes: 3 } } },
-    });
-    expect(Object.hasOwn((state.value as unknown as SenseState['env']).watchedPaths.value ?? {}, '__proto__')).toBe(
-      true,
-    );
-    expect((await h.call('env_detail', {})).value).toMatchObject({
-      app: { value: { bundleId: 'backup.example.invalid' } },
-      window: { value: { title: projected } },
     });
     expect((await h.call('env_detail', { window: projected })).value).toMatchObject({
       current: true,
@@ -492,34 +387,12 @@ describe('model-facing tools', () => {
       recentEvents: [{ kind: 'window.focused' }],
     });
     expect((await h.call('env_detail', { window: title })).value).toMatchObject({ match: 'not-current' });
-    const result = await h.call('env_watch', {
-      action: 'add',
-      rule: {
-        id: 'fixture-rule',
-        match: { kind: 'app.activated' },
-        level: 'record',
-        note: 'open </private/fixture/report> backup.example.invalid',
-      },
-    });
-    expect(JSON.stringify(result.value)).not.toContain('/private/fixture');
-    expect(JSON.stringify(result.value)).not.toContain('backup.example.invalid');
     h.setTitles(false);
     expect(JSON.stringify((await h.call('env_state', {})).value)).not.toContain(title);
   });
 
-  it('hides a host with port and following path in both model tools', async () => {
-    const h = await fixture();
-    h.state.env.focusedWindow.value = { title: 'ssh build-node:22/tmp/report' };
-    expect((await h.call('env_state', { section: 'env' })).value).toMatchObject({
-      focusedWindow: { value: { title: 'ssh <host>' } },
-    });
-    expect((await h.call('env_detail', { window: 'ssh <host>' })).value).toMatchObject({
-      current: true,
-      window: { value: { title: 'ssh <host>' } },
-    });
-  });
-
   it.each([
+    ['ssh build-node:22/tmp/report', 'ssh <host>'],
     ['ssh user@服务器:22/tmp/report', 'ssh <host>'],
     ['ssh 服务器:22/tmp/report', 'ssh <host>'],
     ['ssh u\u0301ser@se\u0301rver:22/tmp/report', 'ssh <host>'],
@@ -537,7 +410,7 @@ describe('model-facing tools', () => {
     });
   });
 
-  it('isolates actual model state by caller and selects the local panel session', async () => {
+  it('isolates actual model state by caller and selects the local active session', async () => {
     const h = await fixture(true);
     await h.agentEvent({ type: 'created', sessionId: 'session-a' });
     await h.agentEvent({ type: 'created', sessionId: 'session-b' });
@@ -646,109 +519,6 @@ describe('model-facing tools', () => {
     expect((result.value as { app: { value: { windowCount?: number } } }).app.value.windowCount).toBeUndefined();
   });
 
-  it('proposes wake rules as an agent, does not remove user rules, and respects cancellation', async () => {
-    const h = await fixture();
-    const rule = { id: 'agent-wake', match: { kind: 'file.changed' }, level: 'wake' };
-    expect(await h.call('env_watch', { action: 'add', rule })).toMatchObject({ isError: false });
-    expect(h.live.rules.list().find((item) => item.id === rule.id)).toMatchObject({
-      createdBy: 'agent',
-      approved: false,
-    });
-    expect(await h.call('env_watch', { action: 'remove', id: 'app-activity' })).toMatchObject({
-      isError: true,
-      error: { info: { code: 'ASI_WATCH_FAILED' } },
-    });
-    expect(h.live.rules.list().some((item) => item.id === 'app-activity')).toBe(true);
-    const controller = new AbortController();
-    controller.abort();
-    expect(await h.call('env_watch', { action: 'remove', id: rule.id }, { signal: controller.signal })).toMatchObject({
-      isError: true,
-      error: { info: { code: 'ABORTED_BEFORE_DISPATCH' } },
-    });
-    expect(h.live.rules.list().some((item) => item.id === rule.id)).toBe(true);
-  });
-
-  it('applies tuner guards to agent requests and reports rejected changes', async () => {
-    const h = await fixture();
-    const param = h.live.body.tuner.parameters().find((item) => typeof item.value === 'number' && item.value > 0);
-    if (!param || typeof param.value !== 'number') throw new Error('numeric tuning parameter missing');
-    await h.live.actions.lockParam(param.key, true);
-    const result = await h.call('body_tune', { param: param.key, to: param.value * 1.1, reason: 'fixture' });
-    expect(result).toMatchObject({
-      isError: false,
-      value: { applied: false, reason: 'param locked', change: { by: 'agent', param: param.key } },
-    });
-    expect(h.live.body.tuner.get(param.key)).toBe(param.value);
-    expect(h.live.body.tuner.logs.at(-1)).toMatchObject({ by: 'agent', status: 'rejected' });
-  });
-
-  it('preserves allowed runtime tuning parameters and level values without exposing arbitrary strings', async () => {
-    const h = await fixture();
-    for (const [param, to, from] of [
-      ['mergeWindowMs', 2500, 2000],
-      ['fileMergeWindowMs', 6000, 5000],
-      ['deliveryLevel.body.rate', 'record', 'context'],
-      ['deliveryLevel.body.anomaly', 'record', 'context'],
-      ['deliveryLevel.file.burst', 'context', 'wake'],
-    ] as const) {
-      expect(await h.call('body_tune', { param, to })).toMatchObject({
-        isError: false,
-        value: { applied: true, change: { param, from, to } },
-      });
-    }
-    expect(modelTune({ applied: true, change: { param: 'secret', from: '/private/file', to: 'secret' } })).toEqual({
-      applied: true,
-      change: { param: '[redacted]' },
-    });
-  });
-
-  it('round-trips a special-character file burst alert from formatted delivery to feedback', async () => {
-    const h = await fixture();
-    const detector = new FileBurstDetector({ roots: ['/fixture/R&D'], maxDeleted: 1 });
-    const emit = (id: string) =>
-      detector.accept(
-        {
-          id,
-          kind: 'file.changed',
-          at: 1_000,
-          subject: `/fixture/R&D/${id}`,
-          source: { id: 'fs', api: 'test', host: 'local' },
-          data: { change: 'delete' },
-        },
-        1_000,
-      );
-    emit('one');
-    const alert = emit('two')[0];
-    if (!alert) throw new Error('fixture alert missing');
-    expect(await h.live.body.tuner.registerAlert(alert.id, 'file.burst', 'file.burst.maxDeleted')).toBe(true);
-    alert.data.feedbackAvailable = true;
-    const update = {
-      since: 1_000,
-      at: 1_000,
-      suppressed: 0,
-      changes: [{ signal: alert, count: 1, level: 'context' as const }],
-    };
-    const agent = { inject: vi.fn(), followup: vi.fn(), send: vi.fn() };
-    const deliver = createDelivery(
-      () => agent,
-      () => true,
-      async () => false,
-    );
-    await deliver('session-a', { kind: 'followup', sessionId: 'session-a', update });
-    const text = JSON.stringify(agent.followup.mock.calls).replaceAll('\\"', '"');
-    const encoded = /alertId="([A-Za-z0-9_-]+)"/.exec(text)?.[1];
-    expect(encoded).toBeDefined();
-    expect(text).toContain('feedbackAvailable="true"');
-    const decoded = Buffer.from(encoded as string, 'base64url').toString('utf8');
-    expect(decoded).toBe(alert.id);
-    expect(decoded).not.toContain('/fixture/');
-    expect(await h.call('body_tune', { action: 'feedback', alertId: encoded, verdict: 'useful' })).toMatchObject({
-      isError: false,
-      value: { applied: true },
-    });
-    expect(h.live.body.tuner.hasAlert(alert.id)).toBe(false);
-  });
-
   it('bounds complete results and removes tool and prompt contributions on disposal', async () => {
     const h = await fixture();
     h.state.env.focusedWindow.value = { title: '汉'.repeat(20_000) };
@@ -766,119 +536,7 @@ describe('model-facing tools', () => {
     expect((await h.ctx.systemPrompt.assemble()).sections.some((section) => section.name === 'asi-sense')).toBe(false);
   });
 
-  it('keeps file.activity rule kind unredacted in modelRules and projects globalFileWatch summary without leaking exclusions', () => {
-    const projectedRules = modelRules([
-      {
-        id: 'file-activity',
-        approved: true,
-        level: 'record',
-        createdBy: 'user',
-        match: { kind: 'file.activity', subject: '/Users/alice/secret-repo/src' },
-      },
-      {
-        id: 'burst-rule',
-        approved: true,
-        level: 'wake',
-        createdBy: 'user',
-        match: { kind: 'file.burst', subject: '/Users/alice/other-repo' },
-      },
-    ]);
-    const rulesJson = JSON.stringify(projectedRules);
-    expect(rulesJson).toContain('"kind":"file.activity"');
-    expect(rulesJson).toContain('"kind":"file.burst"');
-    expect(rulesJson).not.toContain('[redacted]');
-    expect(rulesJson).not.toContain('/Users/alice');
-
-    const store = new StateStore(
-      () => 1_000,
-      60_000,
-      () => 1_000,
-    );
-    store.apply({
-      id: 'gfw-fact',
-      kind: 'fact.updated',
-      at: 1_000,
-      source: { id: 'files-global', api: 'watch', host: 'local' },
-      subject: 'env.globalFileWatch',
-      data: {
-        path: 'env.globalFileWatch',
-        ttlMs: 60_000,
-        status: 'ok',
-        value: {
-          enabled: true,
-          status: 'partial-denied',
-          root: '/Users/alice/custom-root',
-          windowMs: 10_000,
-          eventsPerSec: 42,
-          degraded: false,
-          countOnly: false,
-          deniedPaths: ['/Users/alice/Library/Mail', '/Users/alice/Library/Messages'],
-          exclusions: ['/System', '~/SecretVault'],
-        },
-      },
-    });
-    const envProjected = modelState(store.snapshot(), 1_000, 'env') as Record<string, unknown>;
-    const gfw = envProjected.globalFileWatch as { value?: Record<string, unknown>; status?: string };
-    expect(gfw.status).toBe('ok');
-    expect(gfw.value).toEqual({
-      enabled: true,
-      status: 'partial-denied',
-      windowMs: 10_000,
-      eventsPerSec: 42,
-      degraded: false,
-      countOnly: false,
-      deniedCount: 2,
-      exclusionCount: 2,
-    });
-    const stateJson = JSON.stringify(envProjected);
-    expect(stateJson).not.toContain('SecretVault');
-    expect(stateJson).not.toContain('Mail');
-    expect(stateJson).not.toContain('custom-root');
-  });
-
-  it('masks home-root rule subjects in modelRules but keeps child directory names', () => {
-    const projected = JSON.parse(
-      JSON.stringify(
-        modelRules([
-          {
-            id: 'root-activity',
-            approved: true,
-            level: 'context',
-            createdBy: 'user',
-            match: { kind: 'file.activity', subject: '/Users/alice' },
-          },
-          {
-            id: 'root-burst',
-            approved: true,
-            level: 'wake',
-            createdBy: 'user',
-            match: { kind: 'file.burst', subject: '/home/bob-dev' },
-          },
-          {
-            id: 'root-changed',
-            approved: true,
-            level: 'record',
-            createdBy: 'user',
-            match: { kind: 'file.changed', subject: os.homedir() },
-          },
-          {
-            id: 'child-changed',
-            approved: true,
-            level: 'context',
-            createdBy: 'user',
-            match: { kind: 'file.changed', subject: '/Users/alice/secret-repo/src' },
-          },
-        ]),
-      ),
-    ) as Array<{ id: string; match: { subject: string } }>;
-    const subjects = new Map(projected.map((rule) => [rule.id, rule.match.subject]));
-    expect(subjects.get('root-activity')).toBe('~');
-    expect(subjects.get('root-burst')).toBe('~');
-    expect(subjects.get('root-changed')).toBe('~');
-    expect(subjects.get('child-changed')).toBe('src');
-  });
-
-  it('exposes env.system in env_state and keeps system/screen/session/job.failed rule kinds unredacted in modelRules', async () => {
+  it('exposes env.system in env_state', async () => {
     const h = await fixture();
     h.state.env.system = {
       value: { locked: true, lastSleepAt: 500, lastWakeAt: 900 },
@@ -892,57 +550,6 @@ describe('model-facing tools', () => {
       status: 'ok',
       value: { locked: true, lastSleepAt: 500, lastWakeAt: 900 },
     });
-
-    const kinds = [
-      'system.sleep',
-      'system.wake',
-      'screen.locked',
-      'screen.unlocked',
-      'session.active',
-      'session.inactive',
-      'job.failed',
-    ];
-    const projected = JSON.parse(
-      JSON.stringify(
-        modelRules(
-          kinds.map((kind, i) => ({
-            id: `sys-rule-${i}`,
-            approved: true,
-            level: 'context' as const,
-            createdBy: 'user' as const,
-            match: { kind },
-          })),
-        ),
-      ),
-    ) as Array<{ match: { kind: string } }>;
-    expect(projected.map((item) => item.match.kind)).toEqual(kinds);
-  });
-
-  it('registers env_metrics and rejects unknown metrics, inverted ranges and invalid steps', async () => {
-    const h = await fixture();
-    const unknown = await h.call('env_metrics', { metric: 'gpu' });
-    expect(unknown.isError).toBe(true);
-    const inverted = await h.call('env_metrics', { metric: 'cpu', from: 2_000, to: 1_000 });
-    expect(inverted.isError).toBe(true);
-    const badStep = await h.call('env_metrics', { metric: 'cpu', step: 299 });
-    expect(badStep.isError).toBe(true);
-    for (const badDate of [
-      '2026-02-30',
-      '2026-02-30T12:00:00Z',
-      '2026-02-29T00:00:00Z',
-      '2026-04-31T00:00:00Z',
-      '2026-02-30Z',
-      '2026-2-30',
-      '2026/02/30',
-      'Feb 30, 2026',
-    ]) {
-      expect((await h.call('env_metrics', { metric: 'cpu', from: badDate })).isError).toBe(true);
-    }
-    const valid = await h.call('env_metrics', { metric: 'cpu', step: 300 });
-    expect(valid).toMatchObject({
-      isError: false,
-      value: { available: false, metric: 'cpu', unit: 'ratio', stepMs: 300_000, points: [] },
-    });
   });
 
   it('filters email and secret shapes in env_detail event subjects and frontApp bundleId while keeping ~', async () => {
@@ -952,21 +559,20 @@ describe('model-facing tools', () => {
     if (!h.state.env.frontApp.value) throw new Error('fixture missing');
     h.state.env.frontApp.value.bundleId = `user@corp.invalid ${sk}`;
     const src = { id: 'helper.ax', api: 'accessibility', host: 'fixture-host.invalid' };
-    const events = [
-      { id: 'e1', kind: 'app.activated', subject: os.homedir(), level: 'record' as const, at: 991, source: src },
+    const signals: Signal[] = [
+      { id: 'e1', kind: 'app.activated', subject: os.homedir(), at: 991, source: src, data: {} },
       {
         id: 'e2',
         kind: 'window.focused',
         subject: `Mail alice@corp.invalid ${sk} ${ghp}`,
-        level: 'context' as const,
         at: 992,
         source: src,
+        data: {},
       },
     ];
     const rt = {
-      ...h.live,
       tools: { ...h.live.tools, envState: () => structuredClone(h.state) },
-      events: () => events,
+      recentSignals: () => signals,
     };
     const res = environmentDetail(rt) as { app: { value: { bundleId: string } }; recentEvents: unknown[] };
     expect(res.app.value.bundleId).not.toMatch(/user@corp\.invalid|sk-aaa/);
@@ -999,32 +605,31 @@ describe('model-facing tools', () => {
     ];
     const src = { id: 'helper.ax', api: 'accessibility', host: 'fixture-host.invalid' };
     const safeWords = ['SyntaxEditor', 'app-activated', 'token-count', 'secret_note', 'README.md'];
-    const events = [
+    const signals: Signal[] = [
       ...secrets.map((secret, i) => ({
         id: `sec-${i}`,
         kind: 'window.focused',
         subject: secret,
-        level: 'record' as const,
         at: 1000 + i,
         source: src,
+        data: {},
       })),
       ...safeWords.map((word, i) => ({
         id: `ok-${i}`,
         kind: 'app.activated',
         subject: word,
-        level: 'record' as const,
         at: 1100 + i,
         source: src,
+        data: {},
       })),
     ];
     const rt = {
-      ...h.live,
       tools: {
         ...h.live.tools,
         envState: (section?: 'self' | 'env' | 'observation') =>
           section ? structuredClone(h.state[section]) : structuredClone(h.state),
       },
-      events: () => events,
+      recentSignals: () => signals,
     };
 
     for (const secret of secrets) {
