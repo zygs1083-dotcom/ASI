@@ -8,6 +8,7 @@
 |---|---|---|---|
 | [`asi-sense`](plugins/asi-sense/README.md) | **纯感官模块**：采集本机身体体征（电源、内存、磁盘、CPU、温控、网络、DSH 进程、Token）、当前环境快照与最近 5 分钟短期趋势环，提供 `ctx.asiSense` 服务及只读工具 `env_state` / `env_detail`，绝不主动向对话注入动态事件消息 | 无（纯后台服务） | `0.3.0` |
 | [`asi-needs`](plugins/asi-needs/README.md) | **生存需求、自发维护与多层驱动仲裁**：订阅 `ctx.asiSense`，实时评估五大 L1 生理需求（能量、空间、内存与进程、心智容量、体温负荷）；内置后台全景只读病因嗅探（`needs_sniff_causes`）、求助卡一键批准外部开发者缓存清理（含 1 小时活跃保护期）、行动效果记忆（Action-Outcome Memory）与零收益静默熔断，并暴露 `ctx.asiDrives` 跨插件马斯洛多层仲裁服务与全局只读工具 `needs_status` | **生存需求**（`id: 'asi-needs'`） | `0.3.0` |
+| [`asi-care`](plugins/asi-care/README.md) | **L3 工作区与项目看护**：零配置聚合本地工作区与自动展开 Git 兄弟工作树，按快慢双速探针（3m/30m）与 2h 活跃豁免评估三条正交 L3 驱动（`repo_hygiene` / `orphan_runtime` / `workspace_bloat`）；复用统一侧栏静默求助卡与动作收益账本承载二级一键批准，全程零 `<asi-cry>` 对话打断，仅向普通对话暴露只读工具 `care_status` | 复用统一侧栏（无新增图标） | `0.3.0` |
 
 共享工作区库位于 `packages/`：`@asi/sense-types`（感官、生存需求、行动效果记忆与 `ctx.asiDrives` 共享契约及凭据脱敏）、`@asi/body-probe`（macOS 体征探针）与 `@asi/sense-ui`（统一 `NeedsPanel` 界面组件）。
 

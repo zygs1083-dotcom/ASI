@@ -101,8 +101,15 @@ ASI 保持 `asi-sense` + `asi-needs` 基础双包安装不变，插件之间仅�
 
 `asi-needs` 直接向 Cordis 暴露 `ctx.asiDrives`（`AsiDrivesService`），内置马斯洛多层需求仲裁器（`MaslowDriveArbiter`）：
 - **L1（生理生存层，内置）**：`asi-needs` 自身五大生存需求（`energy`、`space`、`memory`、`mind`、`thermals`）；
-- **L2–L4（高阶需求层，开放扩展）**：支持未来独立组合包插件（如 L2 `asi-sleep` 离线记忆巩固、L3 `asi-care` 主动关怀）调用 `ctx.asiDrives.registerSource({ id, tier: 2 | 3 | 4, label, evaluate, sandboxTools })` 动态注册需求源与专属沙盒工具（评估入参深拷贝隔离并在 `sendTitles=false` 时自动遮蔽窗口标题）；
+- **L2–L4（高阶需求层，开放扩展）**：支持独立组合包插件（如 L2 `asi-sleep` 离线记忆巩固、L3 `asi-care` 工作区与项目看护）调用 `ctx.asiDrives.registerSource({ id, tier: 2 | 3 | 4, label, evaluate, sandboxTools, executeHelpAction, onHelpDismissed })` 动态注册需求源、专属沙盒工具与受控求助卡批准回调（评估入参深拷贝隔离并在 `sendTitles=false` 时自动遮蔽窗口标题），并通过 `proposeHelpCard` / `resolveHelpCards` 在统一侧栏挂载静默求助卡（`silent: true`，严禁触发 `<asi-cry>` 对话注入），用户批准后自动计量真实收益写入 `ActionOutcomeLedger`；
 - **生理优先、在途抢占与节能自动压制**：只要任一 L1 生理需求处于不适/危急/回滞恢复期，或 `asi-sense` 处于 `'eco'` 节能降频模式，所有 `L2–L4` 高阶需求均自动标记 `suppressed = true` 挂起——不仅阻止高阶后台唤醒、在 `agent.ctx.tools.guard` 层即时拦截高阶沙盒工具，还会通过专属 `AbortSignal` 立即抢占中断在途高阶维护回合（不误记高阶熔断、不挤占 L1 自救冷却）；待 L1 彻底恢复舒适且回到 `'normal'` 模式后，高阶需求按层级优先序共享同一后台自维护会话与每小时轮次预算，并自动接入统一侧栏与动作收益账本。
+
+### 3.5 `asi-care`：L3 本地工作区与项目看护（`0.3.0`）
+
+`asi-care` 作为独立无侧栏图标的组合包接入 `ctx.asiDrives`（`tier: 3`），与监听外部远端工单的 `dsh-superagent` 及单会话 `dsh-context` 互补，专注本机工作区与多工作树卫生：
+1. **零配置发现 + Git 兄弟工作树展开 + 2h 活跃豁免**：自动聚合 DSH `workspaceRegistry`、普通会话 `cwd` 与可选 `extraRoots`（排除 `ignorePaths`、ASI 内部目录及 `~/.secrets` / `~/.Trash`），通过 `git worktree list --porcelain` 自动展开全部兄弟工作树；凡有活跃 DSH 会话或 `2 小时` 内存在文件变动的工作树自动豁免扣分与清理。
+2. **快慢双速探针与正交三分驱动**：快探针每 `3 分钟` 巡检 Git 状态/锁（带 `--no-optional-locks` / `GIT_OPTIONAL_LOCKS=0`）与 `lsof` 监听端口，慢探针每 `30 分钟` 按配额遍历非活跃工作树构建产物；输出 `repo_hygiene`、`orphan_runtime`、`workspace_bloat` 三条独立熔断的 L3 驱动。
+3. **MIT 开源裁剪内化与三级自治护栏**：源码级内化改造 `npkill`、`simple-git`、`git-cleaner`、`fkill` / `pid-port` 解析与校验规则（零第三方运行时依赖）；一级无人值守仅执行 `git worktree prune`、经 `lsof` 复核零进程占用的超时 `.git/*.lock` 与无主 DSH 任务；二级清理 `>=7d` 闲置构建产物（`>=1 GiB` 不适）、移除 `>=3d` 干净已合入 worktree（不带 `--force`）及向 `>2h` 本地孤儿开发端口发送 `SIGTERM` 一律须用户点击侧栏静默求助卡批准；三级未提交改动（`>24h`）、未推送提交与冲突残留（`>2h`）永远只读提示。普通对话仅暴露只读工具 `care_status`，全程零 `<asi-cry>` 前台打扰。
 
 ## 4. 统一侧栏界面（`@asi/sense-ui` + `asi-needs`）
 
