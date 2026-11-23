@@ -572,4 +572,394 @@ describe('NeedsRuntime 自发维护闭环、冷却预算与啼哭求助生命周
       await runtime.stop();
     }
   });
+
+  it('同一剧集从 uncomfortable 升级为 critical 时：无论 uncomfortable 求助卡已忽略、已批准还是仍 open，危急 <asi-cry> 均能正常送达且不重复', async () => {
+    const storageRoot = await mkdtemp(join(tmpdir(), 'asi-needs-escalate-cry-'));
+    tempDirs.push(storageRoot);
+
+    let nowWall = T0;
+    let nowMono = 1_000;
+    const sense = createMockSenseService({ now: nowWall, mono: nowMono });
+    const cries: string[] = [];
+    let shouldRequestUncomfortableCard = true;
+
+    const runtime = createNeedsRuntime({
+      storageRoot,
+      sense,
+      clock: { wall: () => nowWall, mono: () => nowMono },
+      probeEndpoint: async () => true,
+      jobs: { listActiveJobs: () => [], hasLiveOwner: () => true, killJob: () => 'already-finished' },
+      compaction: { listIdleSessionIds: () => [], compactIdleSession: async () => ({ compacted: false }) },
+      sessions: {
+        createMaintenanceSession: async (id) => id,
+        hasSession: () => true,
+        runMaintenanceTurn: async () => {
+          if (shouldRequestUncomfortableCard) {
+            shouldRequestUncomfortableCard = false;
+            await runtime.tools.requestHelp({
+              need: 'space',
+              severity: 'uncomfortable',
+              title: '磁盘空间偏紧',
+              summary: '剩余约 6%，建议排查下载目录大文件',
+              actionKind: 'acknowledge',
+            });
+          }
+        },
+        deliverCryToUserSession: async (_target, _exclude, content) => {
+          cries.push(content);
+          return true;
+        },
+      },
+    });
+
+    await runtime.start();
+    try {
+      // 阶段 1（场景 A：忽略 uncomfortable 求助卡后恶化为 critical）：
+      // 磁盘剩余 12GB / 200GB（6% -> uncomfortable），产生 uncomfortable 求助卡并发出首条 uncomfortable <asi-cry>
+      nowWall += 5_000;
+      nowMono += 5_000;
+      sense.emit((prev) => {
+        const next = structuredClone(prev);
+        next.now = nowWall;
+        next.mono = nowMono;
+        next.state.self.body.disks = {
+          kind: 'disks',
+          ...fact([{ mount: '/', total: 200 * 1024 ** 3, free: 12 * 1024 ** 3 }]),
+        };
+        return next;
+      });
+
+      await vi.waitFor(() => {
+        expect(runtime.snapshot().helpCards.some((c) => c.need === 'space' && c.status === 'open')).toBe(true);
+        expect(cries).toHaveLength(1);
+      });
+      expect(cries[0]).toContain('severity="uncomfortable"');
+
+      // 用户点击「忽略」该 uncomfortable 求助卡；在同一 uncomfortable 阶段不会再次告警或啼哭
+      const uncomfCard = runtime.snapshot().helpCards.find((c) => c.need === 'space' && c.status === 'open');
+      await runtime.actions.dismissHelp(uncomfCard?.id ?? '');
+      nowWall += 10_000;
+      nowMono += 10_000;
+      sense.emit((prev) => ({ ...prev, now: nowWall, mono: nowMono }));
+      await new Promise((r) => setTimeout(r, 20));
+      expect(runtime.snapshot().helpCards.filter((c) => c.status === 'open')).toHaveLength(0);
+      expect(cries).toHaveLength(1);
+
+      // 同一剧集内磁盘继续恶化至 2GB / 200GB（1% -> critical）：必须升级生成危急求助卡并送达一条 critical <asi-cry>
+      nowWall += 10_000;
+      nowMono += 10_000;
+      sense.emit((prev) => {
+        const next = structuredClone(prev);
+        next.now = nowWall;
+        next.mono = nowMono;
+        next.state.self.body.disks = {
+          kind: 'disks',
+          ...fact([{ mount: '/', total: 200 * 1024 ** 3, free: 2 * 1024 ** 3 }]),
+        };
+        return next;
+      });
+
+      await vi.waitFor(() => {
+        const critOpen = runtime
+          .snapshot()
+          .helpCards.find((c) => c.need === 'space' && c.status === 'open' && c.severity === 'critical');
+        expect(critOpen).toBeDefined();
+        expect(cries).toHaveLength(2);
+      });
+      expect(cries[1]).toContain('severity="critical"');
+
+      // 同一危急剧集后续采样绝不重复发送第二条 critical <asi-cry>
+      nowWall += 10_000;
+      nowMono += 10_000;
+      sense.emit((prev) => ({ ...prev, now: nowWall, mono: nowMono }));
+      await new Promise((r) => setTimeout(r, 20));
+      expect(cries).toHaveLength(2);
+
+      // 阶段 2（场景 B：uncomfortable 求助卡保持 open 未处理时直接恶化为 critical，以及 approveHelp 后升级）：
+      // 先恢复至舒适区重置剧集
+      nowWall += 130_000;
+      nowMono += 130_000;
+      sense.emit((prev) => {
+        const next = structuredClone(prev);
+        next.now = nowWall;
+        next.mono = nowMono;
+        next.state.self.body.disks = {
+          kind: 'disks',
+          ...fact([{ mount: '/', total: 200 * 1024 ** 3, free: 120 * 1024 ** 3 }]),
+        };
+        return next;
+      });
+      await vi.waitFor(() => expect(runtime.snapshot().needs.space.zone).toBe('comfortable'));
+
+      // 新剧集：产生 open 状态的 uncomfortable 求助卡（clean-cache），用户尚未点击任何按钮
+      shouldRequestUncomfortableCard = false;
+      nowWall += 5_000;
+      nowMono += 5_000;
+      sense.emit((prev) => {
+        const next = structuredClone(prev);
+        next.now = nowWall;
+        next.mono = nowMono;
+        next.state.self.body.disks = {
+          kind: 'disks',
+          ...fact([{ mount: '/', total: 200 * 1024 ** 3, free: 12 * 1024 ** 3 }]),
+        };
+        return next;
+      });
+      await vi.waitFor(() => expect(runtime.snapshot().needs.space.zone).toBe('uncomfortable'));
+      const { card: pendingCard } = await runtime.tools.requestHelp({
+        need: 'space',
+        severity: 'uncomfortable',
+        title: '建议清理临时缓存',
+        summary: '空间进入不适区',
+        actionKind: 'clean-cache',
+      });
+      expect(cries).toHaveLength(3);
+      expect(cries[2]).toContain('severity="uncomfortable"');
+
+      // 用户未处理该 open 卡，磁盘直接跌入 critical -> 原 open 卡自动升级为 critical 且补发一次 critical <asi-cry>
+      nowWall += 15_000;
+      nowMono += 15_000;
+      sense.emit((prev) => {
+        const next = structuredClone(prev);
+        next.now = nowWall;
+        next.mono = nowMono;
+        next.state.self.body.disks = {
+          kind: 'disks',
+          ...fact([{ mount: '/', total: 200 * 1024 ** 3, free: 2 * 1024 ** 3 }]),
+        };
+        return next;
+      });
+      await vi.waitFor(() => {
+        const upgraded = runtime.snapshot().helpCards.find((c) => c.id === pendingCard.id);
+        expect(upgraded?.severity).toBe('critical');
+        expect(cries).toHaveLength(4);
+      });
+      expect(cries[3]).toContain('severity="critical"');
+
+      // 阶段 3（场景 C：approveHelp 处理 uncomfortable 卡后在同一剧集恶化为 critical）：
+      nowWall += 130_000;
+      nowMono += 130_000;
+      sense.emit((prev) => {
+        const next = structuredClone(prev);
+        next.now = nowWall;
+        next.mono = nowMono;
+        next.state.self.body.disks = {
+          kind: 'disks',
+          ...fact([{ mount: '/', total: 200 * 1024 ** 3, free: 120 * 1024 ** 3 }]),
+        };
+        return next;
+      });
+      await vi.waitFor(() => expect(runtime.snapshot().needs.space.zone).toBe('comfortable'));
+
+      nowWall += 5_000;
+      nowMono += 5_000;
+      sense.emit((prev) => {
+        const next = structuredClone(prev);
+        next.now = nowWall;
+        next.mono = nowMono;
+        next.state.self.body.disks = {
+          kind: 'disks',
+          ...fact([{ mount: '/', total: 200 * 1024 ** 3, free: 12 * 1024 ** 3 }]),
+        };
+        return next;
+      });
+      await vi.waitFor(() => expect(runtime.snapshot().needs.space.zone).toBe('uncomfortable'));
+      const { card: approveCard } = await runtime.tools.requestHelp({
+        need: 'space',
+        severity: 'uncomfortable',
+        title: '确认磁盘提示',
+        summary: '空间偏紧',
+        actionKind: 'acknowledge',
+      });
+      expect(cries).toHaveLength(5);
+      await runtime.actions.approveHelp(approveCard.id);
+
+      // approveHelp 处理了 uncomfortable 卡后，同一剧集跌入 critical 仍能正常升级并送达 critical <asi-cry>
+      nowWall += 15_000;
+      nowMono += 15_000;
+      sense.emit((prev) => {
+        const next = structuredClone(prev);
+        next.now = nowWall;
+        next.mono = nowMono;
+        next.state.self.body.disks = {
+          kind: 'disks',
+          ...fact([{ mount: '/', total: 200 * 1024 ** 3, free: 1 * 1024 ** 3 }]),
+        };
+        return next;
+      });
+      await vi.waitFor(() => expect(cries).toHaveLength(6));
+      expect(cries[5]).toContain('severity="critical"');
+    } finally {
+      await runtime.stop();
+    }
+  });
+
+  it('跨重启保留 uncomfortable 啼哭抑制且允许重启后升级 critical；高危已处理状态不被低危卡片操作降级；兼容旧版 criedEpisodes 存档', async () => {
+    const storageRoot = await mkdtemp(join(tmpdir(), 'asi-needs-persist-sev-'));
+    tempDirs.push(storageRoot);
+
+    let nowWall = T0;
+    let nowMono = 1_000;
+    const diskUncomfSnap = makeSnapshot({ now: nowWall, mono: nowMono });
+    diskUncomfSnap.state.self.body.disks = {
+      kind: 'disks',
+      ...fact([{ mount: '/', total: 200 * 1024 ** 3, free: 12 * 1024 ** 3 }]),
+    };
+    const sense1 = createMockSenseService(diskUncomfSnap);
+    const cries1: string[] = [];
+
+    const rt1 = createNeedsRuntime({
+      storageRoot,
+      sense: sense1,
+      clock: { wall: () => nowWall, mono: () => nowMono },
+      probeEndpoint: async () => true,
+      jobs: { listActiveJobs: () => [], hasLiveOwner: () => true, killJob: () => 'already-finished' },
+      compaction: { listIdleSessionIds: () => [], compactIdleSession: async () => ({ compacted: false }) },
+      sessions: {
+        createMaintenanceSession: async (id) => id,
+        hasSession: () => true,
+        runMaintenanceTurn: async () => {},
+        deliverCryToUserSession: async (_t, _e, content) => {
+          cries1.push(content);
+          return true;
+        },
+      },
+    });
+
+    await rt1.start();
+    // 发起一次 uncomfortable 求助卡并立即停止（验证 deliverCryIfNeeded 自身已持久化 criedEpisodeSeverity）
+    await rt1.tools.requestHelp({
+      need: 'space',
+      severity: 'uncomfortable',
+      title: '空间进入不适区',
+      summary: '剩余 6%',
+    });
+    expect(cries1).toHaveLength(1);
+    await rt1.stop();
+
+    // 重启为 rt2：处于同一 uncomfortable 剧集时不再重复发 uncomfortable <asi-cry>，但恶化至 critical 时正常升级啼哭
+    const sense2 = createMockSenseService(diskUncomfSnap);
+    const cries2: string[] = [];
+    const rt2 = createNeedsRuntime({
+      storageRoot,
+      sense: sense2,
+      clock: { wall: () => nowWall + 5_000, mono: () => 500 },
+      probeEndpoint: async () => true,
+      jobs: { listActiveJobs: () => [], hasLiveOwner: () => true, killJob: () => 'already-finished' },
+      compaction: { listIdleSessionIds: () => [], compactIdleSession: async () => ({ compacted: false }) },
+      sessions: {
+        createMaintenanceSession: async (id) => id,
+        hasSession: () => true,
+        runMaintenanceTurn: async () => {},
+        deliverCryToUserSession: async (_t, _e, content) => {
+          cries2.push(content);
+          return true;
+        },
+      },
+    });
+
+    await rt2.start();
+    try {
+      expect(cries2).toHaveLength(0);
+      await rt2.tools.requestHelp({
+        need: 'space',
+        severity: 'uncomfortable',
+        title: '重复不适请求',
+        summary: '不应重复啼哭',
+      });
+      expect(cries2).toHaveLength(0);
+
+      // 升级到 critical -> 正常发送 critical <asi-cry>
+      sense2.emit((prev) => {
+        const next = structuredClone(prev);
+        next.now = nowWall + 10_000;
+        next.mono = 2_000;
+        next.state.self.body.disks = {
+          kind: 'disks',
+          ...fact([{ mount: '/', total: 200 * 1024 ** 3, free: 1 * 1024 ** 3 }]),
+        };
+        return next;
+      });
+      await vi.waitFor(() => expect(cries2).toHaveLength(1));
+      expect(cries2[0]).toContain('severity="critical"');
+
+      // 先留下一张旧的 uncomfortable 卡，再忽略 critical 卡，然后忽略旧 uncomfortable 卡：
+      // 验证 handledEpisodeSeverity 与 criedEpisodeSeverity 不会被降级回 uncomfortable
+      const { card: lowCard } = await rt2.tools.requestHelp({
+        need: 'space',
+        severity: 'uncomfortable',
+        title: '附带清理提示',
+        summary: '低级别附加卡',
+        actionKind: 'clean-cache',
+      });
+      const critCard = rt2
+        .snapshot()
+        .helpCards.find((c) => c.need === 'space' && c.status === 'open' && c.severity === 'critical');
+      await rt2.actions.dismissHelp(critCard?.id ?? '');
+      await rt2.actions.dismissHelp(lowCard.id);
+
+      // 即使跨过 120s 冷却再次自检，由于 critical 已处理且未被降级，不应重新弹出 critical 卡或啼哭
+      nowWall += 200_000;
+      nowMono += 200_000;
+      await rt2.actions.triggerCheck();
+      expect(rt2.snapshot().helpCards.filter((c) => c.need === 'space' && c.status === 'open')).toHaveLength(0);
+      expect(cries2).toHaveLength(1);
+    } finally {
+      await rt2.stop();
+    }
+
+    // 兼容旧版 state.json（仅含布尔数组 criedEpisodes: ['energy'] 且 previousStates 为 uncomfortable）
+    const legacyDir = await mkdtemp(join(tmpdir(), 'asi-needs-legacy-state-'));
+    tempDirs.push(legacyDir);
+    await writeFile(
+      join(legacyDir, 'state.json'),
+      JSON.stringify({
+        criedEpisodes: ['energy'],
+        previousStates: { energy: { zone: 'uncomfortable', driveActive: true, satisfaction: 45 } },
+      }),
+      'utf8',
+    );
+    const batSnap = makeSnapshot({ now: T0, mono: 1_000 });
+    batSnap.state.self.body.battery = fact({ percent: 30, charging: false, powerState: 'battery', minutesLeft: 60 });
+    const senseLegacy = createMockSenseService(batSnap);
+    const criesLegacy: string[] = [];
+    const rtLegacy = createNeedsRuntime({
+      storageRoot: legacyDir,
+      sense: senseLegacy,
+      clock: { wall: () => T0, mono: () => 1_000 },
+      probeEndpoint: async () => true,
+      jobs: { listActiveJobs: () => [], hasLiveOwner: () => true, killJob: () => 'already-finished' },
+      compaction: { listIdleSessionIds: () => [], compactIdleSession: async () => ({ compacted: false }) },
+      sessions: {
+        createMaintenanceSession: async (id) => id,
+        hasSession: () => true,
+        runMaintenanceTurn: async () => {},
+        deliverCryToUserSession: async (_t, _e, content) => {
+          criesLegacy.push(content);
+          return true;
+        },
+      },
+    });
+    await rtLegacy.start();
+    try {
+      await rtLegacy.tools.requestHelp({
+        need: 'energy',
+        severity: 'uncomfortable',
+        title: '电量偏低',
+        summary: '30%',
+      });
+      expect(criesLegacy).toHaveLength(0);
+
+      // 电量跌至 8%（critical 物理边界）时成功升级并发送 critical <asi-cry>
+      senseLegacy.emit((prev) => {
+        const next = structuredClone(prev);
+        next.state.self.body.battery = fact({ percent: 8, charging: false, powerState: 'battery', minutesLeft: 10 });
+        return next;
+      });
+      await vi.waitFor(() => expect(criesLegacy).toHaveLength(1));
+      expect(criesLegacy[0]).toContain('severity="critical"');
+    } finally {
+      await rtLegacy.stop();
+    }
+  });
 });

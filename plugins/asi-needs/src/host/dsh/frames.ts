@@ -108,18 +108,83 @@ export function buildPanelModel(runtime: NeedsRuntime): NeedsPanelModel {
   };
 }
 
-export function createFramesSource(runtime: NeedsRuntime): FramesSource {
+export const DEFAULT_FRAME_THROTTLE_MS = 200;
+
+export interface FramesSourceOptions {
+  throttleMs?: number;
+  now?: () => number;
+}
+
+export function createFramesSource(runtime: NeedsRuntime, options?: FramesSourceOptions): FramesSource {
+  const throttleMs = Math.max(0, options?.throttleMs ?? DEFAULT_FRAME_THROTTLE_MS);
+  const now = options?.now ?? (() => performance.now());
   const subscribers = new Set<() => void>();
+
   const source = async function* (signal: AbortSignal): AsyncIterable<NeedsPanelModel> {
     let changed = true;
+    let immediate = true;
+    let timerFired = false;
+    let lastEmitAt = Number.NEGATIVE_INFINITY;
     let wake: (() => void) | undefined;
-    const notify = () => {
-      changed = true;
-      wake?.();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+
+    const clearTimer = () => {
+      if (timer !== undefined) {
+        clearTimeout(timer);
+        timer = undefined;
+      }
     };
-    const off = runtime.subscribe(notify);
-    subscribers.add(notify);
-    signal.addEventListener('abort', notify);
+
+    const triggerWake = () => {
+      const fn = wake;
+      wake = undefined;
+      fn?.();
+    };
+
+    const scheduleWake = () => {
+      if (immediate || throttleMs <= 0) {
+        clearTimer();
+        triggerWake();
+        return;
+      }
+      const remainingMs = lastEmitAt + throttleMs - now();
+      if (remainingMs <= 0) {
+        clearTimer();
+        triggerWake();
+        return;
+      }
+      if (timer === undefined) {
+        timer = setTimeout(() => {
+          timer = undefined;
+          timerFired = true;
+          triggerWake();
+        }, Math.ceil(remainingMs));
+      }
+    };
+
+    const onRuntimeChange = () => {
+      changed = true;
+      if (wake !== undefined) {
+        scheduleWake();
+      }
+    };
+
+    const onInvalidate = () => {
+      changed = true;
+      immediate = true;
+      clearTimer();
+      triggerWake();
+    };
+
+    const onAbort = () => {
+      clearTimer();
+      triggerWake();
+    };
+
+    const off = runtime.subscribe(onRuntimeChange);
+    subscribers.add(onInvalidate);
+    signal.addEventListener('abort', onAbort);
+
     try {
       while (!signal.aborted) {
         if (!changed) {
@@ -129,18 +194,44 @@ export function createFramesSource(runtime: NeedsRuntime): FramesSource {
           wake = undefined;
           continue;
         }
+
+        if (!immediate && !timerFired && throttleMs > 0) {
+          const remainingMs = lastEmitAt + throttleMs - now();
+          if (remainingMs > 0) {
+            await new Promise<void>((resolve) => {
+              wake = resolve;
+              clearTimer();
+              timer = setTimeout(() => {
+                timer = undefined;
+                timerFired = true;
+                triggerWake();
+              }, Math.ceil(remainingMs));
+            });
+            clearTimer();
+            wake = undefined;
+            continue;
+          }
+        }
+
         changed = false;
+        immediate = false;
+        timerFired = false;
+        lastEmitAt = now();
         yield buildPanelModel(runtime);
       }
     } finally {
-      signal.removeEventListener('abort', notify);
-      subscribers.delete(notify);
+      clearTimer();
+      signal.removeEventListener('abort', onAbort);
+      subscribers.delete(onInvalidate);
       off();
     }
   };
+
   return Object.assign(source, {
     invalidate: () => {
-      for (const notify of subscribers) notify();
+      for (const invalidateSubscriber of [...subscribers]) {
+        invalidateSubscriber();
+      }
     },
   });
 }
