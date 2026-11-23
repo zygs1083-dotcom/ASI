@@ -1,8 +1,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import { makeScenario, SCENARIOS, type ScenarioName } from '../mock/scenarios';
-import { MOCK_MONTHLY_2026_10 } from '../mock/scenarios-history';
-import { SensePanel } from '../SensePanel';
-import type { SensePanelModel } from '../view-model';
+import { NeedsPanel } from '../NeedsPanel';
+import type { NeedsPanelModel } from '../view-model';
 import { tick } from './tick';
 
 type Theme = 'light' | 'dark';
@@ -28,8 +27,7 @@ export function App() {
   const [scenario, setScenario] = useState(readQuery().scenario);
   const [theme, setTheme] = useState(readQuery().theme);
   const [realtime, setRealtime] = useState(readQuery().realtime);
-  const [model, setModel] = useState<SensePanelModel>(() => makeScenario(readQuery().scenario));
-  const [historyCleared, setHistoryCleared] = useState(false);
+  const [model, setModel] = useState<NeedsPanelModel>(() => makeScenario(readQuery().scenario));
   const [lastAction, setLastAction] = useState('');
 
   useEffect(() => applyTheme(theme), [theme]);
@@ -42,30 +40,10 @@ export function App() {
 
   const switchScenario = (name: ScenarioName) => {
     setScenario(name);
-    setHistoryCleared(false);
     setModel(makeScenario(name));
   };
 
-  const onListMonths = useCallback(async () => {
-    if (historyCleared || scenario === 'history-empty') return [];
-    return ['2026-10', '2026-09'];
-  }, [historyCleared, scenario]);
-
-  const onLoadMonthly = useCallback(
-    async (month: string) => {
-      if (scenario === 'history-monthly-error') {
-        throw new Error('月度汇总读取失败（模拟错误）');
-      }
-      if (month === '2026-10') {
-        return { available: true as const, summary: MOCK_MONTHLY_2026_10 };
-      }
-      return { available: false as const, reason: '该月份暂无已归档的月度总结' };
-    },
-    [scenario],
-  );
-
   const act = useCallback((text: string) => setLastAction(text), []);
-  const onOpenPermissionSettings = useCallback(() => act('请求打开系统授权设置'), [act]);
 
   return (
     <>
@@ -75,7 +53,7 @@ export function App() {
           <select value={scenario} onChange={(e) => switchScenario(e.target.value as ScenarioName)}>
             {SCENARIOS.map((s) => (
               <option key={s} value={s}>
-                {s === 'rebaseline-suggested' ? '重新基线建议' : s}
+                {s}
               </option>
             ))}
           </select>
@@ -94,192 +72,33 @@ export function App() {
         <span className="demoAction">{lastAction}</span>
       </nav>
       <main className="stage">
-        <SensePanel
+        <NeedsPanel
           model={model}
           onPause={(p) => {
             setModel((m) => ({ ...m, paused: p }));
-            act(p ? '已暂停感知' : '已恢复感知');
+            act(p ? '已暂停感知与自维护' : '已恢复感知与自维护');
           }}
           onToggleTitles={(on) => {
             setModel((m) => ({ ...m, sendTitles: on }));
             act(on ? '窗口标题发给模型' : '窗口标题已隐藏');
           }}
-          onToggleGlobalFileWatch={(on) => {
-            setModel((m) => {
-              const cur = m.state.env.globalFileWatch;
-              if (!cur?.value) return m;
-              return {
-                ...m,
-                state: {
-                  ...m.state,
-                  env: {
-                    ...m.state.env,
-                    globalFileWatch: {
-                      ...cur,
-                      value: {
-                        ...cur.value,
-                        enabled: on,
-                        status: on ? (cur.value.degraded ? 'degraded' : 'running') : 'disabled',
-                      },
-                    },
-                  },
-                },
-              };
-            });
-            act(on ? '开启全盘文件监视' : '关闭全盘文件监视');
-          }}
-          onRetryGlobalFileWatch={async () => {
-            setModel((m) => {
-              const cur = m.state.env.globalFileWatch;
-              if (!cur?.value) return m;
-              return {
-                ...m,
-                state: {
-                  ...m.state,
-                  env: {
-                    ...m.state.env,
-                    globalFileWatch: {
-                      ...cur,
-                      status: 'ok',
-                      reason: undefined,
-                      value: {
-                        ...cur.value,
-                        enabled: true,
-                        status: cur.value.degraded ? 'degraded' : 'running',
-                        reason: undefined,
-                        retryAt: undefined,
-                      },
-                    },
-                  },
-                },
-              };
-            });
-            act('重试全盘文件监视');
-          }}
-          onAddFileExclusion={async (pattern) => {
-            setModel((m) => {
-              const cur = m.state.env.globalFileWatch;
-              if (!cur?.value) return m;
-              const next = cur.value.exclusions.includes(pattern)
-                ? cur.value.exclusions
-                : [...cur.value.exclusions, pattern];
-              return {
-                ...m,
-                state: {
-                  ...m.state,
-                  env: { ...m.state.env, globalFileWatch: { ...cur, value: { ...cur.value, exclusions: next } } },
-                },
-              };
-            });
-            act(`添加排除项 ${pattern}`);
-          }}
-          onRemoveFileExclusion={async (pattern) => {
-            setModel((m) => {
-              const cur = m.state.env.globalFileWatch;
-              if (!cur?.value) return m;
-              return {
-                ...m,
-                state: {
-                  ...m.state,
-                  env: {
-                    ...m.state.env,
-                    globalFileWatch: {
-                      ...cur,
-                      value: { ...cur.value, exclusions: cur.value.exclusions.filter((x) => x !== pattern) },
-                    },
-                  },
-                },
-              };
-            });
-            act(`移除排除项 ${pattern}`);
-          }}
-          onToggleRule={(id, enabled) => {
+          onOpenPermissionSettings={() => act('请求打开系统授权设置')}
+          onApproveHelp={(id) => {
             setModel((m) => ({
               ...m,
-              rules: m.rules.map((r) => (r.id === id ? { ...r, enabled } : r)),
+              helpCards: m.helpCards.map((c) => (c.id === id ? { ...c, status: 'approved', updatedAt: m.now } : c)),
             }));
-            act(`${enabled ? '启用' : '停用'}规则 ${id}`);
+            act(`已批准求助 ${id}`);
           }}
-          onConfirmRule={(id) => {
+          onDismissHelp={(id) => {
             setModel((m) => ({
               ...m,
-              rules: m.rules.map((r) => (r.id === id ? { ...r, confirmed: true } : r)),
+              helpCards: m.helpCards.map((c) => (c.id === id ? { ...c, status: 'dismissed', updatedAt: m.now } : c)),
             }));
-            act(`确认规则 ${id}`);
+            act(`已忽略求助 ${id}`);
           }}
-          onDeleteRule={(id) => {
-            setModel((m) => ({ ...m, rules: m.rules.filter((r) => r.id !== id) }));
-            act(`删除/拒绝规则 ${id}`);
-          }}
-          onOpenPermissionSettings={onOpenPermissionSettings}
-          onLockParam={(key, locked) => {
-            setModel((m) => ({
-              ...m,
-              tuning: m.tuning && {
-                ...m.tuning,
-                parameters: m.tuning.parameters.map((p) => (p.key === key ? { ...p, locked } : p)),
-              },
-            }));
-            act(`${locked ? '锁定' : '解锁'}参数 ${key}`);
-          }}
-          onRevertTuning={(id) => {
-            // 预览示意：把参数值退回 previous 并把日志标为已撤销；
-            // 真实宿主才拥有调参护栏（锁定不阻止用户撤销）。
-            setModel((m) => {
-              if (!m.tuning) return m;
-              const entry = m.tuning.log.find((e) => e.id === id);
-              if (!entry) return m;
-              return {
-                ...m,
-                tuning: {
-                  ...m.tuning,
-                  parameters: m.tuning.parameters.map((p) =>
-                    p.key === entry.paramKey ? { ...p, value: entry.previous } : p,
-                  ),
-                  log: m.tuning.log.map((e) => (e.id === id ? { ...e, reverted: true } : e)),
-                },
-              };
-            });
-            act(`撤销调整 ${id}`);
-          }}
-          onFeedback={(signalId, value) => {
-            setModel((m) => ({
-              ...m,
-              events: m.events.map((e) => (e.signal.id === signalId ? { ...e, feedback: value } : e)),
-            }));
-            act(`反馈${value === 'useful' ? '有用' : '噪音'} ${signalId}`);
-          }}
-          onResumeTuning={async () => {
-            setModel((m) => ({
-              ...m,
-              tuning: m.tuning && { ...m.tuning, disabled: undefined },
-            }));
-            act('恢复 AI 调参');
-          }}
-          onResetTuning={async () => {
-            setModel((m) => ({
-              ...m,
-              tuning: m.tuning && { parameters: [], log: [] },
-            }));
-            act('重置调参');
-          }}
-          onAcceptRebaseline={async (id) => {
-            setModel((m) => ({
-              ...m,
-              tuning: m.tuning && {
-                ...m.tuning,
-                suggestions: m.tuning.suggestions?.filter((s) => s.id !== id),
-              },
-            }));
-            act(`确认重新基线 ${id}`);
-          }}
-          onListMonths={onListMonths}
-          onLoadMonthly={onLoadMonthly}
-          onClearHistory={async () => {
-            setHistoryCleared(true);
-            setModel((m) => ({ ...m, events: [], timeline: undefined }));
-            act('清除历史数据');
-          }}
+          onOpenMaintenanceSession={() => act('打开后台自维护会话')}
+          onTriggerCheck={() => act('触发立即自检')}
         />
       </main>
     </>

@@ -21,6 +21,7 @@ export function useClock(fallback: number): number {
 export function useSampling(metric?: MetricKey, override?: number): { paused: boolean; interval: number } {
   const { paused, intervals } = useContext(SamplingCtx);
   const value = override ?? (metric ? intervals?.[metric] : undefined);
-  const fallback = metric?.startsWith('disk:') ? 10_000 : metric === 'battery' ? 30_000 : 2000;
+  const fallback =
+    metric?.startsWith('disk:') || metric?.startsWith('diskFree:') ? 10_000 : metric === 'battery' ? 30_000 : 2000;
   return { paused, interval: value && Number.isFinite(value) && value > 0 ? value : fallback };
 }

@@ -1,11 +1,12 @@
 {
   "name": "@asi/sense-ui",
   "private": true,
-  "version": "0.1.5",
+  "version": "0.2.0",
   "type": "module",
-  "description": "asi-sense 侧栏面板：React 纯 props 组件 + Vite 预览",
+  "description": "asi-needs 统一侧栏面板：生存需求、核心体征、自维护与求助卡（React 纯 props 组件 + Vite 预览）",
   "engines": {
-    "dsh": "0.2.2-rc.3"
+    "node": "^22.12.0 || ^24.0.0 || >=26.0.0",
+    "dsh": "0.2.2-rc.3 || 0.2.2-rc.5"
   },
   "scripts": {
     "dev": "vite",

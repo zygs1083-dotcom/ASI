@@ -28,13 +28,13 @@ const MEM_PARTS = [
 
 export const CpuTile = memoTile(
   'cpu',
-  (m) => [m.state.self.body.cpu, m.insights?.cpu, m.history.cpu],
+  (m) => [m.state.self.body.cpu, m.history.cpu],
   function CpuTile({ model, rows, ctx }: MetricTileProps) {
     const { cpu } = model.state.self.body;
     const { now } = model;
     const fresh = isUsable(cpu, now);
     const v = fresh ? cpu.value! : null;
-    const thr = fresh ? chartThresholds('cpu', model.insights?.cpu) : { lines: [] };
+    const thr = fresh ? chartThresholds('cpu') : { lines: [] };
     return (
       <Tile
         tileKey="cpu"
@@ -45,8 +45,6 @@ export const CpuTile = memoTile(
           <TileDetail
             fact={cpu}
             now={now}
-            events={model.events}
-            onAdjust={ctx.onAdjust}
             onOpenPermissionSettings={ctx.onOpenPermissionSettings}
             metrics={[
               {
@@ -55,7 +53,6 @@ export const CpuTile = memoTile(
                 points: model.history.cpu,
                 format: formatPercent,
                 valueText: cpu.value ? formatPercent(cpu.value.usage) : undefined,
-                insight: model.insights?.cpu,
                 severity: rows.cpu.severity,
               },
             ]}
@@ -83,7 +80,6 @@ export const CpuTile = memoTile(
                 label="CPU 使用率"
                 format={formatPercent}
                 severity={rows.cpu.severity}
-                baseline={fresh ? model.insights?.cpu?.baseline : undefined}
                 thresholds={thr.lines}
               />
               <span className={css.cores} aria-hidden="true">
@@ -103,13 +99,13 @@ export const CpuTile = memoTile(
 
 export const MemoryTile = memoTile(
   'memory',
-  (m) => [m.state.self.body.memory, m.insights?.memory, m.history.memory],
+  (m) => [m.state.self.body.memory, m.history.memory],
   function MemoryTile({ model, rows, ctx }: MetricTileProps) {
     const { memory } = model.state.self.body;
     const { now } = model;
     const fresh = isUsable(memory, now);
     const v = fresh ? memory.value! : null;
-    const thr = fresh ? chartThresholds('memory', model.insights?.memory) : { lines: [] };
+    const thr = fresh ? chartThresholds('memory') : { lines: [] };
     return (
       <Tile
         tileKey="memory"
@@ -120,8 +116,6 @@ export const MemoryTile = memoTile(
           <TileDetail
             fact={memory}
             now={now}
-            events={model.events}
-            onAdjust={ctx.onAdjust}
             onOpenPermissionSettings={ctx.onOpenPermissionSettings}
             metrics={[
               {
@@ -132,7 +126,6 @@ export const MemoryTile = memoTile(
                 valueText: memory.value
                   ? `${formatBytes(memory.value.used)} / ${formatBytes(memory.value.total)}`
                   : undefined,
-                insight: model.insights?.memory,
                 severity: rows.memory.severity,
               },
             ]}
@@ -185,7 +178,6 @@ export const MemoryTile = memoTile(
                 label="内存占用"
                 format={formatPercent}
                 severity={rows.memory.severity}
-                baseline={fresh ? model.insights?.memory?.baseline : undefined}
                 thresholds={thr.lines}
               />
             </>

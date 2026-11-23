@@ -20,13 +20,12 @@ const THERMAL_TEXT = {
 
 export const ThermalTile = memoTile(
   'thermal',
-  (m) => [m.state.self.body.thermal, m.insights?.thermal, m.history.thermal],
+  (m) => [m.state.self.body.thermal, m.history.thermal],
   function ThermalTile({ model, rows, ctx }: MetricTileProps) {
     const { thermal } = model.state.self.body;
     const { now } = model;
     const fresh = isUsable(thermal, now);
-    const v = fresh ? thermal.value! : null;
-    const thr = fresh ? chartThresholds('thermal', model.insights?.thermal) : { lines: [] };
+    const thr = fresh ? chartThresholds('thermal') : { lines: [] };
     return (
       <Tile
         tileKey="thermal"
@@ -37,8 +36,6 @@ export const ThermalTile = memoTile(
           <TileDetail
             fact={thermal}
             now={now}
-            events={model.events}
-            onAdjust={ctx.onAdjust}
             onOpenPermissionSettings={ctx.onOpenPermissionSettings}
             metrics={[
               {
@@ -47,7 +44,6 @@ export const ThermalTile = memoTile(
                 points: model.history.thermal,
                 format: formatThermalOrdinal,
                 valueText: thermal.value ? THERMAL_TEXT[thermal.value] : undefined,
-                insight: model.insights?.thermal,
                 severity: rows.thermal.severity,
               },
             ]}
@@ -66,7 +62,6 @@ export const ThermalTile = memoTile(
                 label="温控档位"
                 format={formatThermalOrdinal}
                 severity={rows.thermal.severity}
-                baseline={fresh ? model.insights?.thermal?.baseline : undefined}
                 thresholds={thr.lines}
               />
             </>
@@ -79,13 +74,12 @@ export const ThermalTile = memoTile(
 
 export const BatteryTile = memoTile(
   'battery',
-  (m) => [m.state.self.body.battery, m.insights?.battery, m.history.battery],
+  (m) => [m.state.self.body.battery, m.history.battery],
   function BatteryTile({ model, rows, ctx }: MetricTileProps) {
     const { battery } = model.state.self.body;
     const { now } = model;
     const fresh = isUsable(battery, now);
-    const v = fresh ? battery.value : null;
-    const thr = fresh ? chartThresholds('battery', model.insights?.battery) : { lines: [] };
+    const thr = fresh ? chartThresholds('battery') : { lines: [] };
     return (
       <Tile
         tileKey="battery"
@@ -96,8 +90,6 @@ export const BatteryTile = memoTile(
           <TileDetail
             fact={battery}
             now={now}
-            events={model.events}
-            onAdjust={ctx.onAdjust}
             onOpenPermissionSettings={ctx.onOpenPermissionSettings}
             metrics={[
               {
@@ -106,7 +98,6 @@ export const BatteryTile = memoTile(
                 points: model.history.battery,
                 format: formatPercentValue,
                 valueText: battery.value ? formatPercentValue(battery.value.percent) : undefined,
-                insight: model.insights?.battery,
                 severity: rows.battery.severity,
               },
             ]}
@@ -116,31 +107,31 @@ export const BatteryTile = memoTile(
         <FactStatusText fact={battery} now={now}>
           {(val) => {
             if (!val) return null;
-            const battery: NonNullable<SharedBody['battery']['value']> = val;
+            const b: NonNullable<SharedBody['battery']['value']> = val;
             const estimate =
-              fresh && battery.minutesLeft != null && Number.isFinite(battery.minutesLeft) && battery.minutesLeft > 0
-                ? formatDuration(battery.minutesLeft * 60)
+              fresh && b.minutesLeft != null && Number.isFinite(b.minutesLeft) && b.minutesLeft > 0
+                ? formatDuration(b.minutesLeft * 60)
                 : null;
             return (
               <>
                 <span className={css.tileValue}>{formatPercentValue(val.percent)}</span>
                 <span className={css.tileSub}>
-                  {battery.powerState === 'charged'
+                  {b.powerState === 'charged'
                     ? '已充满 · 接通电源'
-                    : battery.powerState === 'external'
+                    : b.powerState === 'external'
                       ? '未充电 · 接通电源'
-                      : battery.powerState === 'charging' || (!battery.powerState && battery.charging)
+                      : b.powerState === 'charging' || (!b.powerState && b.charging)
                         ? '充电中'
                         : '未充电'}
-                  {fresh && battery.powerState === 'charging'
+                  {fresh && b.powerState === 'charging'
                     ? estimate
                       ? ` · 约 ${estimate} 后充满`
                       : ' · 估算中'
-                    : fresh && battery.powerState === 'battery'
+                    : fresh && b.powerState === 'battery'
                       ? estimate
                         ? ` · 约剩 ${estimate}`
                         : ' · 估算中'
-                      : fresh && battery.powerState !== 'charged' && battery.estimatePending
+                      : fresh && b.powerState !== 'charged' && b.estimatePending
                         ? ' · 估算中'
                         : ''}
                 </span>
@@ -151,7 +142,6 @@ export const BatteryTile = memoTile(
                   label="电池电量"
                   format={formatPercentValue}
                   severity={rows.battery.severity}
-                  baseline={fresh ? model.insights?.battery?.baseline : undefined}
                   thresholds={thr.lines}
                 />
               </>

@@ -12,19 +12,12 @@ import { type MetricTileProps, memoTile } from './tiles-basic';
 
 export const NetworkTile = memoTile(
   'network',
-  (m) => [
-    m.state.self.body.network,
-    m.insights?.networkRx,
-    m.insights?.networkTx,
-    m.history.networkRx,
-    m.history.networkTx,
-  ],
+  (m) => [m.state.self.body.network, m.history.networkRx, m.history.networkTx],
   function NetworkTile({ model, rows, ctx }: MetricTileProps) {
     const { network } = model.state.self.body;
-    const { now, insights } = model;
+    const { now } = model;
     const fresh = isUsable(network, now);
-    const v = fresh ? network.value! : null;
-    const rxThr = fresh ? chartThresholds('networkRx', insights?.networkRx) : { lines: [] };
+    const rxThr = fresh ? chartThresholds('networkRx') : { lines: [] };
     return (
       <Tile
         tileKey="network"
@@ -35,8 +28,6 @@ export const NetworkTile = memoTile(
           <TileDetail
             fact={network}
             now={now}
-            events={model.events}
-            onAdjust={ctx.onAdjust}
             onOpenPermissionSettings={ctx.onOpenPermissionSettings}
             metrics={[
               {
@@ -45,7 +36,6 @@ export const NetworkTile = memoTile(
                 points: model.history.networkRx,
                 format: formatRate,
                 valueText: network.value ? formatRate(network.value.rxBps) : undefined,
-                insight: insights?.networkRx,
                 severity: rows.network.severity,
               },
               {
@@ -54,7 +44,6 @@ export const NetworkTile = memoTile(
                 points: model.history.networkTx,
                 format: formatRate,
                 valueText: network.value ? formatRate(network.value.txBps) : undefined,
-                insight: insights?.networkTx,
                 severity: rows.network.severity,
               },
             ]}
@@ -75,7 +64,6 @@ export const NetworkTile = memoTile(
                 label="网络下行"
                 format={formatRate}
                 severity={rows.network.severity}
-                baseline={fresh ? insights?.networkRx?.baseline : undefined}
                 thresholds={rxThr.lines}
               />
             </>
@@ -88,19 +76,13 @@ export const NetworkTile = memoTile(
 
 export const ProcessTile = memoTile(
   'process',
-  (m) => [
-    m.state.self.body.harnessProcess,
-    m.insights?.processCpu,
-    m.insights?.processRss,
-    m.history.processCpu,
-    m.history.processRss,
-  ],
+  (m) => [m.state.self.body.harnessProcess, m.history.processCpu, m.history.processRss],
   function ProcessTile({ model, rows, ctx }: MetricTileProps) {
     const { harnessProcess } = model.state.self.body;
-    const { now, insights } = model;
+    const { now } = model;
     const fresh = isUsable(harnessProcess, now);
     const v = fresh ? harnessProcess.value! : null;
-    const rssThr = fresh ? chartThresholds('processRss', insights?.processRss) : { lines: [] };
+    const rssThr = fresh ? chartThresholds('processRss') : { lines: [] };
     return (
       <Tile
         tileKey="process"
@@ -111,8 +93,6 @@ export const ProcessTile = memoTile(
           <TileDetail
             fact={harnessProcess}
             now={now}
-            events={model.events}
-            onAdjust={ctx.onAdjust}
             onOpenPermissionSettings={ctx.onOpenPermissionSettings}
             metrics={[
               {
@@ -121,7 +101,6 @@ export const ProcessTile = memoTile(
                 points: model.history.processRss,
                 format: formatBytes,
                 valueText: harnessProcess.value ? formatBytes(harnessProcess.value.rss) : undefined,
-                insight: insights?.processRss,
                 severity: rows.process.severity,
               },
               {
@@ -130,7 +109,6 @@ export const ProcessTile = memoTile(
                 points: model.history.processCpu,
                 format: formatPercent,
                 valueText: harnessProcess.value ? formatPercent(harnessProcess.value.cpu) : undefined,
-                insight: insights?.processCpu,
                 severity: rows.process.severity,
               },
             ]}
@@ -150,7 +128,6 @@ export const ProcessTile = memoTile(
                 label="DSH 内存"
                 format={formatBytes}
                 severity={rows.process.severity}
-                baseline={fresh ? insights?.processRss?.baseline : undefined}
                 thresholds={rssThr.lines}
               />
             </>

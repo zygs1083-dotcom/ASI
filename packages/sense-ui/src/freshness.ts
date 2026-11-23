@@ -1,12 +1,12 @@
 import { useEffect, useMemo, useState } from 'react';
-import type { SensePanelModel } from './view-model';
+import type { NeedsPanelModel } from './view-model';
 
-function project(model: SensePanelModel, elapsed: number) {
+function project(model: NeedsPanelModel, elapsed: number) {
   let deadline = Infinity;
   function expire<T extends { status?: string; staleInMs?: number }>(value: T, fallback?: string): T {
     if ((value.status ?? fallback) !== 'ok' || !Number.isFinite(value.staleInMs)) return value;
-    if (value.staleInMs! <= elapsed) return { ...value, status: 'stale' };
-    deadline = Math.min(deadline, value.staleInMs!);
+    if ((value.staleInMs ?? Infinity) <= elapsed) return { ...value, status: 'stale' };
+    deadline = Math.min(deadline, value.staleInMs ?? Infinity);
     return value;
   }
   function group<T extends object>(value: T): T {
@@ -25,7 +25,7 @@ function project(model: SensePanelModel, elapsed: number) {
   let body = group(originalSelf.body);
   const disks = body.disks;
   const volumes = disks.value?.map((volume) => expire(volume, disks.status));
-  if (volumes?.some((volume, index) => volume !== disks.value![index])) {
+  if (volumes?.some((volume, index) => volume !== disks.value?.[index])) {
     body = { ...body, disks: { ...disks, value: volumes } };
   }
   let self = group(originalSelf);
@@ -42,7 +42,7 @@ function project(model: SensePanelModel, elapsed: number) {
   };
 }
 
-export function useFreshModel(model: SensePanelModel): SensePanelModel {
+export function useFreshModel(model: NeedsPanelModel): NeedsPanelModel {
   const started = useMemo(() => ({ model, at: performance.now() }), [model]).at;
   const [clock, setClock] = useState({ model, elapsed: 0 });
   const elapsed = clock.model === model ? clock.elapsed : 0;

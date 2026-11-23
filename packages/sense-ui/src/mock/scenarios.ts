@@ -1,67 +1,74 @@
-/** 八个演示场景，供预览与 e2e 截图使用。 */
+/** 演示场景，供预览与测试使用。 */
 
-import type { SenseEvent, SensePanelModel } from '../view-model';
+import type { NeedsPanelModel } from '../view-model';
 import {
   denied,
+  disksFixture,
   emptyFact,
   fact,
   makeBody,
-  makeEvent,
   makeHistory,
-  makeInsights,
+  makeInstinct,
+  makeMaintenanceSession,
+  makeNeed,
+  makeNeeds,
   makeState,
   panelModel,
   series,
   T0,
 } from './fixtures';
 import { contextAlmostFull, diskPartial, tokenFallback } from './scenarios-extra';
-import { historyAwayAnomaly, historyEmpty, historyReady } from './scenarios-history';
 
 export const SCENARIOS = [
   'healthy',
   'memory-pressure',
   'context-almost-full',
   'permission-denied',
-  'busy-events',
   'desktop-no-battery',
-  'learning',
   'rapid-change',
+  'low-energy',
   'token-fallback',
   'disk-partial',
-  'tuning-disabled',
-  'rebaseline-suggested',
-  'history-ready',
-  'history-empty',
-  'history-away-anomaly',
-  'history-monthly-error',
-  'history-capped',
 ] as const;
 
 export type ScenarioName = (typeof SCENARIOS)[number];
 
-function healthy(): SensePanelModel {
-  const events = [
-    makeEvent(1, { level: 'context', reason: '命中保存合并', ruleName: 'src 下文件保存' }),
-    makeEvent(2),
-    makeEvent(3, { cause: 'agent', reason: 'Agent 工具写入', level: 'record' }),
-    makeEvent(4, { level: 'wake', reason: '任务非 0 退出', ruleName: '测试失败时唤醒' }),
-  ];
-  return panelModel(makeState(), { events });
+function healthy(): NeedsPanelModel {
+  return panelModel(makeState());
 }
 
-function memoryPressure(): SensePanelModel {
+function memoryPressure(): NeedsPanelModel {
   const body = makeBody();
   body.memory = fact({ total: 32e9, used: 29.1e9, pressure: 'warn', swapUsed: 3.2e9 }, { api: 'vm_stat' });
   return panelModel(makeState({ self: { ...makeState().self, body } }), {
     history: makeHistory({ memory: series(60, 5_000, (i) => 0.82 + 0.09 * Math.sin(i / 8)) }),
+    needs: makeNeeds({
+      memory: makeNeed('memory', 40, '系统内存压力偏高（已用 27.1 GB），正在排查残留任务'),
+    }),
+    maintenanceSession: makeMaintenanceSession({
+      status: 'running',
+      lastRunAt: T0 - 15_000,
+      turnCount: 2,
+    }),
+    recentMaintenance: [
+      {
+        id: 'rec-mem-1',
+        at: T0 - 25_000,
+        actor: 'maintainer',
+        need: 'memory',
+        action: 'needs_stop_job',
+        summary: '结束超时无主任务 job-orphan-3，释放 420 MB',
+        outcome: 'partial',
+      },
+    ],
   });
 }
 
-function permissionDenied(): SensePanelModel {
+function permissionDenied(): NeedsPanelModel {
   const state = makeState();
   state.env.focusedWindow = denied('未授予辅助功能权限');
   state.env.frontApp = fact({ name: 'Finder', bundleId: 'com.demo.finder' }, { status: 'stale', ageMs: 120_000 });
-  state.self.permissions = fact({ 辅助功能: 'denied', 完全磁盘访问: 'granted' });
+  state.self.permissions = fact({ 辅助功能: 'denied' });
   const body = makeBody();
   body.thermal = emptyFact('unavailable', 'helper 未上报温控');
   body.battery = emptyFact('unknown');
@@ -76,241 +83,119 @@ function permissionDenied(): SensePanelModel {
   return panelModel(state);
 }
 
-function busyEvents(): SensePanelModel {
-  const events: SenseEvent[] = Array.from({ length: 237 }, (_, i) => {
-    const n = 237 - i;
-    const over: Partial<SenseEvent> = {};
-    if (n % 11 === 0) {
-      over.level = 'suppressed';
-      over.reason = '唤醒预算超限已抑制';
-    } else if (n % 7 === 0) {
-      over.level = 'context';
-      over.reason = '命中保存合并';
-      over.ruleName = 'src 下文件保存';
-      over.count = 3;
-    } else if (n % 13 === 0) {
-      over.level = 'wake';
-      over.reason = '任务非 0 退出';
-      over.ruleName = '测试失败时唤醒';
-    }
-    if (n % 5 === 0) over.cause = 'agent';
-    return makeEvent(n, over);
-  });
-  return panelModel(makeState(), { events });
-}
-
-function desktopNoBattery(): SensePanelModel {
+function desktopNoBattery(): NeedsPanelModel {
   const body = makeBody();
   body.battery = fact(null);
-  return panelModel(makeState({ self: { ...makeState().self, body } }));
-}
-
-/**
- * 基线学习进行中（37%）：floor/rate 阈值来源已有，学习基线尚未提供，
- * 因此趋势线不画 band（不虚构），来源标注只列 floor/rate。
- */
-function learning(): SensePanelModel {
-  return panelModel(makeState(), {
-    learning: { status: 'learning', collectedMs: 0.37 * 86_400_000, targetMs: 86_400_000 },
-    insights: {
-      cpu: { sources: ['floor', 'rate'], triggered: [] },
-      memory: { sources: ['floor', 'rate'], triggered: [] },
-      'disk:/': { sources: ['floor', 'rate'], triggered: [] },
-      tokens: { sources: ['floor'], triggered: [] },
-    },
+  return panelModel(makeState({ self: { ...makeState().self, body } }), {
+    needs: makeNeeds({
+      energy: makeNeed('energy', 95, '台式机外接电源 · 模型网关连通正常'),
+    }),
   });
 }
 
-/** 快速变化：速率/异常/文件爆发告警 + 调整日志（含各操作者与一条锁定参数）。 */
-function rapidChange(): SensePanelModel {
-  const events = [
-    makeEvent(1, {
-      signal: { kind: 'body.rate', subject: '磁盘 /', data: { feedbackAvailable: true } },
-      level: 'wake',
-      reason: '磁盘可用空间变化率触发',
-      detail: {
-        kind: 'body.rate',
-        metric: 'disk:/',
-        windowMs: 60_000,
-        delta: -2.1 * 1024 ** 3,
-        unit: 'bytes',
-        timeToFloorMs: 9 * 60_000,
+function rapidChange(): NeedsPanelModel {
+  const body = makeBody();
+  body.disks = disksFixture([
+    { mount: '/', total: 460e9, free: 18e9 },
+    { mount: '/demo/vol', total: 120e9, free: 72e9 },
+  ]);
+  return panelModel(makeState({ self: { ...makeState().self, body } }), {
+    history: makeHistory({
+      disks: {
+        '/': series(60, 5_000, (i) => 0.88 + (i / 60) * 0.08),
+        '/demo/vol': series(60, 5_000, () => 0.4),
+      },
+      diskFree: {
+        '/': series(60, 5_000, (i) => 28.5e9 - i * 175e6),
+        '/demo/vol': series(60, 5_000, () => 72e9),
       },
     }),
-    makeEvent(2, {
-      signal: { kind: 'body.anomaly', subject: '网络下行', data: { feedbackAvailable: true } },
-      level: 'context',
-      reason: '网络下行偏离基线',
-      detail: {
-        kind: 'body.anomaly',
-        metric: 'networkRx',
-        current: 1_400_000,
-        baseline: 420_000,
-        deviation: 2.33,
-        unit: 'bytes',
-      },
+    needs: makeNeeds({
+      space: makeNeed('space', 18, '主卷仅剩 16.8 GB（3.9%），且每分钟骤降约 2.1 GB'),
     }),
-    makeEvent(3, {
-      signal: { kind: 'file.burst', subject: '/demo/project/tmp', data: { feedbackAvailable: true } },
-      level: 'wake',
-      reason: '目录突发大量删除',
-      detail: {
-        kind: 'file.burst',
-        directory: '/demo/project/tmp',
-        windowMs: 60_000,
-        created: 2,
-        modified: 4,
-        deleted: 70,
-        excessiveDeletion: true,
+    helpCards: [
+      {
+        id: 'help-space-1',
+        need: 'space',
+        severity: 'critical',
+        title: '磁盘空间即将耗尽，需人工释放大文件',
+        summary:
+          '主卷 / 剩余不足 4%，后台已清理插件临时区 380 MB，但剩余大文件位于用户目录，插件不会删除任何用户文件。',
+        proposedAction: '请检查构建产物或下载目录中的大文件并手动清理。',
+        actionKind: 'acknowledge',
+        status: 'open',
+        createdAt: T0 - 45_000,
+        updatedAt: T0 - 12_000,
       },
-    }),
-    makeEvent(4),
-  ];
-  return panelModel(makeState(), {
-    events,
-    insights: makeInsights({
-      'disk:/': {
-        baseline: { low: 0.55, high: 0.7 },
-        sources: ['floor', 'rate', 'baseline'],
-        triggered: ['rate'],
-        severity: 'warn',
-        // 宿主当前投影：采样点 T0，9 分钟后见底；事件里的 timeToFloorMs 只是当时预计
-        currentEta: {
-          asOf: T0,
-          sampleIntervalMs: 30_000,
-          timeToThresholdMs: 9 * 60_000,
-          ratePerMinute: -2.1 * 1024 ** 3,
-        },
+    ],
+    recentMaintenance: [
+      {
+        id: 'rec-space-1',
+        at: T0 - 50_000,
+        actor: 'maintainer',
+        need: 'space',
+        action: 'needs_clean_cache',
+        summary: '清理沙盒临时缓存 14 项，释放 380 MB，但仍未恢复至安全线',
+        outcome: 'escalated',
       },
-      networkRx: {
-        baseline: { low: 100_000, high: 700_000 },
-        sources: ['rate', 'baseline'],
-        triggered: ['baseline'],
-        severity: 'warn',
-      },
-    }),
-    tuning: {
-      parameters: [
-        { key: 'cpu.anomalySigma', label: 'CPU 异常灵敏度', value: 4, unit: 'σ', locked: false },
-        { key: 'watch.interval', label: '采样间隔', value: 5, unit: '秒', locked: true },
-        { key: 'wake.budget', label: '唤醒预算', value: 3, unit: '次/小时', locked: false },
-      ],
-      log: [
-        {
-          id: 't-1',
-          paramKey: 'cpu.anomalySigma',
-          previous: 3,
-          next: 4,
-          by: 'agent',
-          reason: '连续噪音反馈，将异常判定从 3σ 调整到 4σ',
-          at: T0 - 3_600_000,
-        },
-        {
-          id: 't-2',
-          paramKey: 'watch.interval',
-          previous: 10,
-          next: 5,
-          by: 'user',
-          reason: '希望更快看到变化',
-          at: T0 - 7_200_000,
-        },
-        {
-          id: 't-3',
-          paramKey: 'wake.budget',
-          previous: 5,
-          next: 3,
-          by: 'auto',
-          reason: '夜间自动降频',
-          at: T0 - 86_400_000,
-          reverted: true,
-        },
-      ],
-    },
+    ],
   });
 }
 
-function tuningDisabled(): SensePanelModel {
-  const model = rapidChange();
-  return { ...model, tuning: { ...model.tuning!, disabled: { reason: 'restore-failed' } } };
+function lowEnergy(): NeedsPanelModel {
+  const body = makeBody();
+  body.battery = fact({ percent: 7, charging: false, powerState: 'battery', minutesLeft: 18 });
+  return panelModel(makeState({ self: { ...makeState().self, body } }), {
+    needs: makeNeeds({
+      energy: makeNeed('energy', 12, '电池仅剩 7%（未插电）且模型网关失联'),
+    }),
+    instinct: makeInstinct({
+      powerMode: 'eco',
+      powerReason: '电量低于 15% 且未接电源',
+      modelConnectivity: 'offline',
+      probeCount: 3,
+      lastProbeAt: T0 - 4_000,
+    }),
+    helpCards: [
+      {
+        id: 'help-energy-1',
+        need: 'energy',
+        severity: 'critical',
+        title: '电量危急且模型网关失联',
+        summary: '当前电量仅剩 7%（约 18 分钟），已自动进入本能节能降频并静默重连网关。',
+        proposedAction: '请尽快接通电源适配器，并检查本地网关服务状态。',
+        actionKind: 'acknowledge',
+        status: 'open',
+        createdAt: T0 - 30_000,
+        updatedAt: T0 - 4_000,
+      },
+    ],
+    recentMaintenance: [
+      {
+        id: 'rec-instinct-1',
+        at: T0 - 30_000,
+        actor: 'instinct',
+        need: 'energy',
+        action: 'eco-mode',
+        summary: '触发零 Token 本能反射：切换采样至节能模式并退避探活网关',
+        outcome: 'partial',
+      },
+    ],
+  });
 }
 
-function rebaselineSuggested(): SensePanelModel {
-  const model = rapidChange();
-  return {
-    ...model,
-    tuning: {
-      ...model.tuning!,
-      disabled: { reason: 'storage-failed' },
-      suggestions: [
-        {
-          id: 'baseline-cpu',
-          metric: 'cpu',
-          unit: 'ratio',
-          slotLabel: '周二 14 时',
-          from: 0.2,
-          to: 0.68,
-          samples: 12,
-          dates: 3,
-        },
-        {
-          id: 'baseline-network',
-          metric: 'networkRx',
-          unit: 'bytes-per-second',
-          slotLabel: '周五 10 时',
-          from: 400_000,
-          to: 1_400_000,
-          samples: 9,
-          dates: 3,
-        },
-        {
-          id: 'baseline-disk',
-          metric: 'disk:/demo',
-          unit: 'bytes',
-          slotLabel: '周三 9 时',
-          from: 80 * 1024 ** 3,
-          to: 60 * 1024 ** 3,
-          samples: 10,
-          dates: 3,
-        },
-        {
-          id: 'baseline-context',
-          metric: 'tokens',
-          unit: 'tokens',
-          slotLabel: '周四 11 时',
-          from: 50_000,
-          to: 30_000,
-          samples: 11,
-          dates: 3,
-        },
-      ],
-    },
-  };
-}
-
-const BUILDERS: Record<ScenarioName, () => SensePanelModel> = {
+const BUILDERS: Record<ScenarioName, () => NeedsPanelModel> = {
   healthy,
   'memory-pressure': memoryPressure,
   'context-almost-full': contextAlmostFull,
   'permission-denied': permissionDenied,
-  'busy-events': busyEvents,
   'desktop-no-battery': desktopNoBattery,
-  learning,
   'rapid-change': rapidChange,
+  'low-energy': lowEnergy,
   'token-fallback': tokenFallback,
   'disk-partial': diskPartial,
-  'tuning-disabled': tuningDisabled,
-  'rebaseline-suggested': rebaselineSuggested,
-  'history-ready': () => historyReady(healthy()),
-  'history-empty': () => historyEmpty(healthy()),
-  'history-away-anomaly': () => historyAwayAnomaly(healthy()),
-  'history-monthly-error': () => historyReady(healthy()),
-  'history-capped': () => {
-    const model = historyReady(healthy());
-    model.state.observation.sources['history'] = { status: 'ok', lastSignalAt: T0 - 5_000, capped: true };
-    return model;
-  },
 };
 
-export function makeScenario(name: ScenarioName): SensePanelModel {
+export function makeScenario(name: ScenarioName): NeedsPanelModel {
   return BUILDERS[name]();
 }

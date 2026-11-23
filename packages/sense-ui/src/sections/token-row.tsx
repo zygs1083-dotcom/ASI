@@ -20,18 +20,15 @@ const WINDOW_SOURCE_TEXT = {
 
 export const TokenTile = memoTile(
   'tokens',
-  (m) => [m.state.self.body.tokens, m.insights?.tokens, m.history.tokens],
+  (m) => [m.state.self.body.tokens, m.history.tokens],
   function TokenTile({ model, rows, ctx }: MetricTileProps) {
     const f = model.state.self.body.tokens;
     const { now } = model;
     const fresh = isUsable(f, now);
-    // denied/unavailable 的保留值不进摘要/明细；stale 保留值仍可灰显
     const v = fresh || effectiveStatus(f, now) === 'stale' ? f.value : null;
-    // 回退估值容量未确认：不画容量派生底线，也不消费 token insight
     const unconfirmed = v?.contextWindowSource === 'fallback';
-    const insight = fresh && !unconfirmed ? model.insights?.tokens : undefined;
     const win = unconfirmed ? undefined : v?.contextWindow;
-    const thr = fresh ? chartThresholds('tokens', insight, win ?? undefined) : { lines: [] };
+    const thr = fresh ? chartThresholds('tokens', win ?? undefined) : { lines: [] };
 
     return (
       <Tile
@@ -44,8 +41,6 @@ export const TokenTile = memoTile(
           <TileDetail
             fact={f}
             now={now}
-            events={model.events}
-            onAdjust={ctx.onAdjust}
             onOpenPermissionSettings={ctx.onOpenPermissionSettings}
             metrics={[
               {
@@ -57,7 +52,6 @@ export const TokenTile = memoTile(
                   v?.contextWindow != null && v.contextUsed != null
                     ? `${formatTokens(v.contextUsed)} / ${formatTokens(v.contextWindow)}`
                     : undefined,
-                insight,
                 severity: rows.tokens.severity,
                 tokenWindow: win ?? undefined,
               },
@@ -77,15 +71,7 @@ export const TokenTile = memoTile(
       >
         <FactStatusText fact={f} now={now}>
           {(val) => (
-            <TokenSummary
-              v={val}
-              rows={rows}
-              model={model}
-              thr={thr.lines}
-              fresh={fresh}
-              confirmed={!unconfirmed}
-              baseline={insight?.baseline}
-            />
+            <TokenSummary v={val} rows={rows} model={model} thr={thr.lines} fresh={fresh} confirmed={!unconfirmed} />
           )}
         </FactStatusText>
       </Tile>
@@ -93,15 +79,10 @@ export const TokenTile = memoTile(
   },
 );
 
-/**
- * 按宿主投影的增速估算填满剩余上下文所需分钟数。
- * 任一输入缺失/非有限/增速 ≤0 都不估算（不编造斜率）。
- */
 function fillMinutes(v: TokenVitals): number | null {
   const { contextWindow: win, contextUsed: used, contextGrowthPerMinute: rate } = v;
   if (win == null || used == null || rate == null) return null;
   if (![win, used, rate].every(Number.isFinite) || win <= 0 || rate <= 0) return null;
-  // 结果同样要有限且在 7 天内：极小正增速会让除法溢出为 Infinity。
   const minutes = (win - used) / rate;
   if (!Number.isFinite(minutes) || minutes > MAX_DISPLAY_MINUTES) return null;
   return Math.max(0, Math.ceil(minutes));
@@ -114,17 +95,13 @@ function TokenSummary({
   thr,
   fresh,
   confirmed,
-  baseline,
 }: {
   v: TokenVitals;
   rows: MetricTileProps['rows'];
   model: MetricTileProps['model'];
   thr: ReturnType<typeof chartThresholds>['lines'];
-  /** 事实新鲜（非过期保留值）才允许任何当前推算。 */
   fresh: boolean;
-  /** 容量已确认（非回退估值）才给余量/压缩派生。 */
   confirmed: boolean;
-  baseline?: import('../view-model').MetricInsight['baseline'];
 }) {
   const { now } = model;
   const hasContext = v.contextWindow != null && v.contextUsed != null && v.contextWindow > 0;
@@ -184,14 +161,12 @@ function TokenSummary({
         label="上下文占用"
         format={formatTokens}
         severity={rows.tokens.severity}
-        baseline={baseline}
         thresholds={thr}
       />
     </>
   );
 }
 
-/** 明细附加行：精确会话用量 + denied 余额授权动作（填满预估在摘要区）。 */
 function TokenExtra({ v, onOpenPermissionSettings }: { v: TokenVitals; onOpenPermissionSettings: () => void }) {
   const { input, output, cacheRead, cacheWrite } = v.sessionUsage;
 
@@ -213,7 +188,6 @@ function TokenExtra({ v, onOpenPermissionSettings }: { v: TokenVitals; onOpenPer
   );
 }
 
-/** 压缩距离：阈值未提供/已达/预计触发/剩余，四种措辞明确，不显示无解释的 0。 */
 function CompressionDistance({ v }: { v: TokenVitals }) {
   const t = v.compressionThreshold;
   if (t == null) return <>压缩阈值未提供</>;
@@ -230,10 +204,6 @@ function CompressionDistance({ v }: { v: TokenVitals }) {
   return <>距自动压缩 {formatTokens(Math.max(0, t - (v.contextUsed ?? 0)))}</>;
 }
 
-/**
- * 余额：status 为 unavailable/denied 时不泄露金额，只显示状态与原因；
- * stale 灰显并标注；无余额给既有解释。denied 的授权动作在展开明细里。
- */
 function BalanceLine({ v }: { v: TokenVitals }) {
   const status = v.balanceStatus;
   if (status === 'unavailable' || status === 'unsupported' || status === 'unknown') {

@@ -1,9 +1,7 @@
 import { useMemo } from 'react';
-import { attentionLine } from '../attention';
 import { ClockProvider, SamplingProvider } from '../clock';
-import { formatPercent } from '../format';
 import { evaluateBody, type Severity } from '../health';
-import type { LearningState, SensePanelProps } from '../view-model';
+import type { NeedsPanelProps } from '../view-model';
 import css from './body.module.css';
 import { DisksTile } from './disk-rows';
 import mcss from './monitor.module.css';
@@ -12,7 +10,7 @@ import { BatteryTile, ThermalTile } from './tiles-extra';
 import { NetworkTile, ProcessTile } from './tiles-net-proc';
 import { TokenTile } from './token-row';
 
-type Panel = Pick<SensePanelProps, 'model' | 'onOpenPermissionSettings'>;
+type Panel = Pick<NeedsPanelProps, 'model' | 'onOpenPermissionSettings'>;
 
 const SEV_WORD = {
   good: '良好',
@@ -32,44 +30,8 @@ function Ecg() {
   );
 }
 
-/** 基线学习进度：只呈现 model 提供的 collected/target，不做推断。 */
-function LearningStrip({ l }: { l: LearningState }) {
-  const valid = Number.isFinite(l.targetMs) && l.targetMs > 0;
-  return (
-    <span className={mcss.learning}>
-      {valid ? (
-        <>
-          <span className={mcss.monitorSub}>
-            基线学习 {formatPercent(Math.min(1, Math.max(0, l.collectedMs / l.targetMs)))} ·{' '}
-            {l.status === 'learning' ? '学习中' : '已就绪'}
-          </span>
-          <progress
-            className={mcss.learnBar}
-            value={Math.min(1, Math.max(0, l.collectedMs / l.targetMs))}
-            max={1}
-            aria-label="基线学习进度"
-          />
-        </>
-      ) : (
-        <span className={mcss.monitorSub}>基线学习 进度不可用</span>
-      )}
-    </span>
-  );
-}
-
-/** 监护概览：大写严重度词 + 状态句（有匹配的近期宿主投影时换成优先警示行）。
- *  读数不完整时词旁另出「部分」徽标——警示句被覆盖也不丢完整性提示。 */
-function Monitor({
-  model,
-  sev,
-  sentence,
-  partial,
-}: {
-  model: Panel['model'];
-  sev: Severity;
-  sentence: string;
-  partial?: boolean;
-}) {
+/** 监护概览：大写严重度词 + 状态句。读数不完整时词旁另出「部分」徽标。 */
+function Monitor({ sev, sentence, partial }: { sev: Severity; sentence: string; partial?: boolean }) {
   return (
     <div className={mcss.monitor} data-sev={sev}>
       <Ecg />
@@ -79,26 +41,18 @@ function Monitor({
           {partial ? <span className={mcss.monitorPartial}>部分</span> : null}
         </strong>
         <span className={mcss.monitorSub}>{sentence}</span>
-        {model.learning?.status === 'learning' && <LearningStrip l={model.learning} />}
       </div>
     </div>
   );
 }
 
-export function BodySection({
-  model,
-  onOpenPermissionSettings,
-  onAdjustMetric,
-}: Panel & { onAdjustMetric?: () => void }) {
+export function BodySection({ model, onOpenPermissionSettings }: Panel) {
   const { body } = model.state.self;
   const { now } = model;
-  const insights = model.insights ?? {};
-  const evalResult = evaluateBody(body, now, insights);
+  const evalResult = evaluateBody(body, now);
   const rows = evalResult.rows;
-  const sentence = attentionLine(model, evalResult) ?? evalResult.sentence;
   const ctx: TileCtx = {
     model,
-    onAdjust: onAdjustMetric,
     onOpenPermissionSettings,
   };
   const sampling = useMemo(
@@ -108,7 +62,7 @@ export function BodySection({
 
   return (
     <>
-      <Monitor model={model} sev={evalResult.severity} sentence={sentence} partial={evalResult.partial} />
+      <Monitor sev={evalResult.severity} sentence={evalResult.sentence} partial={evalResult.partial} />
       <ClockProvider value={now}>
         <SamplingProvider value={sampling}>
           <div className={css.tiles}>

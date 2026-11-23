@@ -1,5 +1,5 @@
 /**
- * 磁盘卡片：默认只显示「需要注意的盘」（触发 insight / 最差剩余比例），
+ * 磁盘卡片：默认只显示「需要注意的盘」（最差剩余比例），
  * 其余挂载点在明细里逐个展开，各自着色、不再重复行级标签。
  * 每卷可带 status/observedAt/ttlMs（diskFact 按状态投影）；
  * unavailableMounts 的挂载点只显示「无法读取」，无数字、无历史、无图。
@@ -12,23 +12,20 @@ import {
   diskSeverity,
   diskUsable,
   diskValid,
-  effectiveSeverity,
   effectiveStatus,
-  maxSeverity,
   type Severity,
   unavailableMountSet,
 } from '../health';
 import { DiskIcon } from '../icons';
 import { Sparkline } from '../sparkline';
 import { chartThresholds } from '../thresholds';
-import type { DiskVolume, MetricInsight, MetricKey, SenseEvent } from '../view-model';
+import type { DiskVolume, MetricPoint } from '../view-model';
 import css from './body.module.css';
 import { DisksDetail } from './disks-detail';
 import { type DetailMetric, Tile } from './tile';
 import { type MetricTileProps, memoTile } from './tiles-basic';
 
 type Disk = DiskVolume;
-type Insights = Partial<Record<MetricKey, MetricInsight>>;
 
 const SEV_RANK: Record<Severity, number> = {
   good: 0,
@@ -37,35 +34,32 @@ const SEV_RANK: Record<Severity, number> = {
   critical: 2,
 };
 
-/** 最近 5 分钟内匹配的 body.rate 事件 → 每分钟变化徽标（如 −2.1 GB/分）。 */
-export function rateBadge(metric: MetricKey, events: SenseEvent[], now: number): string | undefined {
-  let latest: { at: number; text: string } | null = null;
-  for (const e of events) {
-    const d = e.detail;
-    if (!d || d.kind !== 'body.rate' || d.metric !== metric) continue;
-    const at = e.signal.at;
-    if (!Number.isFinite(at) || at > now || at < now - 300_000) continue;
-    if (!Number.isFinite(d.windowMs) || d.windowMs <= 0) continue;
-    const perMin = d.delta / (d.windowMs / 60_000);
-    if (!Number.isFinite(perMin)) continue;
-    const text = `${formatSignedDelta(perMin, d.unit)}/分`;
-    if (!latest || at > latest.at) latest = { at, text };
-  }
-  return latest?.text;
+/** 从最近 5 分钟 diskFree 趋势环计算显著骤降徽标（≤ −100 MB/分时显示）。 */
+export function diskDropRateBadge(points: MetricPoint[] | undefined, now: number): string | undefined {
+  if (!points || points.length < 2) return undefined;
+  const recent = points.filter(
+    (p) => Number.isFinite(p.at) && Number.isFinite(p.value) && p.at >= now - 300_000 && p.at <= now,
+  );
+  if (recent.length < 2) return undefined;
+  const first = recent[0]!;
+  const last = recent[recent.length - 1]!;
+  const dtMs = last.at - first.at;
+  if (dtMs < 30_000) return undefined;
+  const perMin = (last.value - first.value) / (dtMs / 60_000);
+  if (!Number.isFinite(perMin) || perMin > -100 * 1024 * 1024) return undefined;
+  return `${formatSignedDelta(perMin, 'bytes')}/分`;
 }
 
-function diskSev(d: Disk, insights: Insights, fresh: boolean): Severity {
+function diskSev(d: Disk): Severity {
   const freeRatio = d.total > 0 ? d.free / d.total : 0;
-  const insight = fresh ? insights[`disk:${d.mount}`] : undefined;
-  if (insight?.sources.includes('floor')) return effectiveSeverity(insight);
-  return maxSeverity(diskSeverity(freeRatio), effectiveSeverity(insight));
+  return diskSeverity(freeRatio);
 }
 
 /** 需要注意的盘：严重度最高者优先，同级取剩余比例最低。 */
-function attentionDisk(disks: Disk[], insights: Insights, fresh: boolean): Disk {
+function attentionDisk(disks: Disk[]): Disk {
   return disks.reduce((best, d) => {
-    const sevD = SEV_RANK[diskSev(d, insights, fresh)];
-    const sevB = SEV_RANK[diskSev(best, insights, fresh)];
+    const sevD = SEV_RANK[diskSev(d)];
+    const sevB = SEV_RANK[diskSev(best)];
     if (sevD !== sevB) return sevD > sevB ? d : best;
     const ratio = (x: Disk) => (x.total > 0 ? x.free / x.total : 0);
     return ratio(d) < ratio(best) ? d : best;
@@ -92,22 +86,14 @@ function FreeStrip({ d, label }: { d: Disk; label?: boolean }) {
 
 export const DisksTile = memoTile(
   'disks',
-  (m) => [
-    m.state.self.body.disks,
-    m.history.disks,
-    // 只盯本卡用到的挂载点 insight，无关指标 insight 更新不重渲
-    ...(m.state.self.body.disks.value ?? []).map((d) => m.insights?.[`disk:${d.mount}` as const]),
-  ],
+  (m) => [m.state.self.body.disks, m.history.disks, m.history.diskFree],
   function DisksTile({ model, rows, ctx }: MetricTileProps) {
     const { disks } = model.state.self.body;
-    const { now, events, insights } = model;
+    const { now } = model;
     const unavail = unavailableMountSet(disks);
-    // 卷级状态权威：父级失鲜/拒绝不再整列置灰，显式新鲜卷照常展示
     const raw = disks.value ?? [];
     const usable = (d: Disk): boolean => diskUsable(disks, d, now);
 
-    // 可展示卷：有效读数、带卷级元数据（stale 保留值/unknown 状态行）、或
-    // unavailableMounts（value 未含也补「无法读取」）；无元数据无效读数不展示
     const entries: Disk[] = [
       ...(raw ?? []).filter(
         (d) => diskValid(d) || unavail.has(d.mount) || d.status != null || d.observedAt != null || d.ttlMs != null,
@@ -117,17 +103,15 @@ export const DisksTile = memoTile(
         .map((m) => ({ mount: m, total: 0, free: 0 })),
     ];
     const freshVols = entries.filter(usable);
-    // 主摘要选盘：新鲜告警卷 > 根卷非新鲜（陈旧值优先展示根）> 最差新鲜卷
-    const worstFresh = freshVols.length ? attentionDisk(freshVols, insights ?? {}, true) : null;
-    const alert = worstFresh && SEV_RANK[diskSev(worstFresh, insights ?? {}, true)] > 0 ? worstFresh : null;
+    const worstFresh = freshVols.length ? attentionDisk(freshVols) : null;
+    const alert = worstFresh && SEV_RANK[diskSev(worstFresh)] > 0 ? worstFresh : null;
     const root = entries.find((d) => d.mount === '/');
     const focus = alert ?? (root && !usable(root) ? root : null) ?? worstFresh ?? entries[0] ?? null;
-    const sev = (d: Disk): Severity => (usable(d) ? diskSev(d, insights ?? {}, true) : 'unknown');
+    const sev = (d: Disk): Severity => (usable(d) ? diskSev(d) : 'unknown');
     const focusDf = focus && diskValid(focus) && !unavail.has(focus.mount) ? diskFact(disks, focus, now) : null;
     const focusEff = focusDf ? effectiveStatus(focusDf, now) : null;
     const focusUsable = focus != null && usable(focus);
 
-    // 明细图块只给 ok/stale 卷：unavailable/unknown 卷无读数，不产数字与图
     const metrics: DetailMetric[] = entries
       .filter((d) => {
         if (unavail.has(d.mount) || !diskValid(d)) return false;
@@ -143,8 +127,7 @@ export const DisksTile = memoTile(
           points: model.history.disks[d.mount] ?? [],
           format: formatPercent,
           valueText: `剩余 ${formatBytes(d.free)} / ${formatBytes(d.total)}`,
-          badge: u ? rateBadge(key, events, now) : undefined,
-          insight: u ? insights?.[key] : undefined,
+          badge: u ? diskDropRateBadge(model.history.diskFree?.[d.mount], now) : undefined,
           severity: sev(d),
           fact: diskFact(disks, d, now),
         };
@@ -160,8 +143,6 @@ export const DisksTile = memoTile(
           <DisksDetail
             disks={disks}
             now={now}
-            events={events}
-            onAdjust={ctx.onAdjust}
             onOpenPermissionSettings={ctx.onOpenPermissionSettings}
             metrics={metrics}
             extra={entries.map((d) => {
@@ -190,7 +171,6 @@ export const DisksTile = memoTile(
           </span>
         ) : null}
         {focus == null ? (
-          // 无可展示卷时父事实兜底：denied 原因 / 不可用状态 / 无有效读数
           <DisksStatusText fact={disks} now={now}>
             {() => <span className={css.tileSub}>无有效磁盘读数</span>}
           </DisksStatusText>
@@ -206,36 +186,33 @@ export const DisksTile = memoTile(
             </FactStatusText>
           </span>
         ) : (
-          // 卷级事实标注：新鲜告警卷优先，陈旧值灰显，父级不再一票置灰
           <FactStatusText fact={focusDf!} now={now}>
-            {(d) => (
-              <>
-                <span className={css.tileValue}>
-                  <span className={css.mainLabel}>剩余</span>
-                  {formatBytes(d.free)}
-                </span>
-                <span className={css.tileSub}>
-                  共 {formatBytes(d.total)} · {d.mount}
-                  {entries.length > 1 ? ` · 共 ${entries.length} 盘` : ''}
-                  {focusUsable && rateBadge(`disk:${d.mount}`, events, now) ? (
-                    <em className={css.rateEm}>{rateBadge(`disk:${d.mount}`, events, now)}</em>
-                  ) : null}
-                </span>
-                <FreeStrip d={d} />
-                <Sparkline
-                  metric={`disk:${d.mount}`}
-                  points={model.history.disks[d.mount] ?? []}
-                  now={now}
-                  label={`磁盘 ${d.mount} 已用率`}
-                  format={formatPercent}
-                  severity={sev(focus)}
-                  baseline={focusUsable ? insights?.[`disk:${d.mount}`]?.baseline : undefined}
-                  thresholds={
-                    focusUsable ? chartThresholds(`disk:${d.mount}`, insights?.[`disk:${d.mount}`]).lines : []
-                  }
-                />
-              </>
-            )}
+            {(d) => {
+              const badge = focusUsable ? diskDropRateBadge(model.history.diskFree?.[d.mount], now) : undefined;
+              return (
+                <>
+                  <span className={css.tileValue}>
+                    <span className={css.mainLabel}>剩余</span>
+                    {formatBytes(d.free)}
+                  </span>
+                  <span className={css.tileSub}>
+                    共 {formatBytes(d.total)} · {d.mount}
+                    {entries.length > 1 ? ` · 共 ${entries.length} 盘` : ''}
+                    {badge ? <em className={css.rateEm}>{badge}</em> : null}
+                  </span>
+                  <FreeStrip d={d} />
+                  <Sparkline
+                    metric={`disk:${d.mount}`}
+                    points={model.history.disks[d.mount] ?? []}
+                    now={now}
+                    label={`磁盘 ${d.mount} 已用率`}
+                    format={formatPercent}
+                    severity={sev(focus)}
+                    thresholds={focusUsable ? chartThresholds(`disk:${d.mount}`).lines : []}
+                  />
+                </>
+              );
+            }}
           </FactStatusText>
         )}
       </Tile>
