@@ -73,6 +73,7 @@ export class BodySource {
           );
       },
       changed,
+      () => (this.eco ? 45_000 : 15_000),
     );
   }
 

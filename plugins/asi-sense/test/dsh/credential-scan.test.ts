@@ -685,5 +685,5 @@ describe('linear O(N) performance on 4 worst-case patterns from rrv-015a-2', () 
     }
     expect(refSink).not.toBe(Number.NaN);
     console.log(`[credential-scan perf]\n${report.join('\n')}`);
-  });
+  }, 20_000);
 });

@@ -12,6 +12,7 @@ import {
   type NeedKey,
   type NeedsSnapshot,
   type SenseSnapshot,
+  sanitizeForModel,
 } from '@asi/sense-types';
 import { chooseCryDeliveryMode, formatCryMessage } from './cry.js';
 import { evaluateNeeds, NEED_LABELS, type PreviousNeedState } from './evaluator.js';
@@ -28,6 +29,14 @@ const LIVENESS_HEARTBEAT_MS = 15_000;
 interface PersistedNeedsState {
   helpCards?: HelpCard[];
   records?: MaintenanceRecord[];
+  previousStates?: Partial<Record<NeedKey, PreviousNeedState>>;
+  criedEpisodes?: NeedKey[];
+  handledEpisodeSeverity?: Partial<Record<NeedKey, 'uncomfortable' | 'critical'>>;
+  maintSessionId?: string;
+  maintTurnCount?: number;
+  maintTotalTurns?: number;
+  maintLastRunAt?: number;
+  internalSessionIds?: string[];
 }
 
 export interface MaintenanceToolsApi {
@@ -56,11 +65,14 @@ export interface NeedsActions {
 }
 
 export interface NeedsRuntime {
+  readonly sandboxDir: string;
   start(): Promise<void>;
   stop(): Promise<void>;
   snapshot(): NeedsSnapshot;
   senseSnapshot(): SenseSnapshot;
+  factStaleInMs(path: string): number | undefined;
   subscribe(listener: () => void): () => void;
+  registerMaintenanceSessionId(sessionId: string): void;
   isMaintenanceSession(sessionId: string): boolean;
   reportTransportResult(reachable: boolean, errorText?: string): void;
   readonly tools: MaintenanceToolsApi;
@@ -76,6 +88,7 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime {
   const listeners = new Set<() => void>();
   const internalSessions = new Map<string, () => void>();
   const criedEpisodes = new Set<NeedKey>();
+  const handledEpisodeSeverity = new Map<NeedKey, 'uncomfortable' | 'critical'>();
   const autonomousTurnMonoTimes: number[] = [];
 
   let helpCards: HelpCard[] = [];
@@ -121,6 +134,14 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime {
     const payload: PersistedNeedsState = {
       helpCards: helpCards.slice(0, 30),
       records: records.slice(0, MAX_RECORDS),
+      previousStates: structuredClone(previousStates),
+      criedEpisodes: [...criedEpisodes],
+      handledEpisodeSeverity: Object.fromEntries(handledEpisodeSeverity),
+      ...(maintSessionId ? { maintSessionId } : {}),
+      maintTurnCount,
+      maintTotalTurns,
+      ...(maintLastRunAt !== undefined ? { maintLastRunAt } : {}),
+      internalSessionIds: [...internalSessions.keys()].slice(-20),
     };
     persistChain = persistChain
       .then(async () => {
@@ -153,6 +174,12 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime {
     internalSessions.set(id, unregister);
   }
 
+  function isAutoHelpSuppressed(need: NeedKey, severity: 'uncomfortable' | 'critical'): boolean {
+    const handled = handledEpisodeSeverity.get(need);
+    if (!handled) return false;
+    return handled === 'critical' || severity === 'uncomfortable';
+  }
+
   async function ensureMaintenanceSession(forceRotate = false): Promise<string> {
     if (!forceRotate && maintSessionId && ports.sessions.hasSession(maintSessionId)) {
       return maintSessionId;
@@ -163,6 +190,9 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime {
     try {
       const createdId = await ports.sessions.createMaintenanceSession(requested, sandboxDir, 'ASI 自维护');
       if (createdId !== requested) {
+        const dropRequested = internalSessions.get(requested);
+        dropRequested?.();
+        internalSessions.delete(requested);
         registerMaintSession(createdId);
       }
       maintSessionId = createdId;
@@ -170,6 +200,7 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime {
       if (maintStatus === 'not-created' || maintStatus === 'unavailable') {
         maintStatus = 'idle';
       }
+      void persistState();
       notify();
       return createdId;
     } catch (err) {
@@ -222,17 +253,29 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime {
     });
 
     const nextPrev: Partial<Record<NeedKey, PreviousNeedState>> = {};
-    let cardsChanged = false;
+    let stateChanged = false;
 
     for (const key of NEED_KEYS) {
       const ev = latestEval.needs[key];
-      nextPrev[key] = { zone: ev.zone, driveActive: ev.driveActive };
+      const prior = previousStates[key];
+      if (prior?.zone !== ev.zone || prior?.driveActive !== ev.driveActive) {
+        stateChanged = true;
+      }
+      nextPrev[key] = {
+        zone: ev.zone,
+        driveActive: ev.driveActive,
+        satisfaction: ev.satisfaction,
+        ...(typeof ev.evidence.mount === 'string' ? { mount: ev.evidence.mount } : {}),
+        ...(typeof ev.evidence.sessionId === 'string' ? { sessionId: ev.evidence.sessionId } : {}),
+        ...(typeof ev.evidence.batteryDriven === 'boolean' ? { batteryDriven: ev.evidence.batteryDriven } : {}),
+      };
       if (!ev.driveActive) {
         criedEpisodes.delete(key);
+        handledEpisodeSeverity.delete(key);
         escalatedCriticalInTurn.delete(key);
         helpCards = helpCards.map((c) => {
           if (c.need === key && c.status === 'open') {
-            cardsChanged = true;
+            stateChanged = true;
             return { ...c, status: 'resolved', updatedAt: snap.now };
           }
           return c;
@@ -240,16 +283,19 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime {
       }
     }
     previousStates = nextPrev;
-    if (cardsChanged) void persistState();
+    if (stateChanged) void persistState();
   }
 
   async function checkImmediateBoundaries(snap: SenseSnapshot): Promise<void> {
     if (snap.settings.paused) return;
 
     const energy = latestEval.needs.energy;
-    if (energy.zone === 'critical') {
+    if (energy.zone === 'critical' && !isAutoHelpSuppressed('energy', 'critical')) {
       const bat = snap.state.self.body.battery;
       const batPercent = bat.value?.percent ?? 0;
+      const batMinutes = bat.value?.minutesLeft;
+      const lowMinutesLeft =
+        batMinutes !== undefined && Number.isFinite(batMinutes) && batMinutes > 0 && batMinutes <= 15;
       const unpluggedCriticalBat =
         bat.status === 'ok' &&
         bat.value !== null &&
@@ -257,7 +303,7 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime {
         bat.value.powerState !== 'charging' &&
         bat.value.powerState !== 'charged' &&
         bat.value.powerState !== 'external' &&
-        batPercent < 15;
+        (batPercent < 15 || lowMinutesLeft);
       const gatewayOffline = instinct.modelConnectivity() === 'offline';
 
       if (unpluggedCriticalBat || gatewayOffline) {
@@ -268,7 +314,9 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime {
             unpluggedCriticalBat && gatewayOffline
               ? '电量危急且模型网关失联'
               : unpluggedCriticalBat
-                ? `电量危急（仅剩 ${Math.round(batPercent)}%），请接通电源`
+                ? lowMinutesLeft && batPercent >= 15
+                  ? `续航危急（不足 ${Math.ceil(batMinutes ?? 15)} 分钟），请接通电源`
+                  : `电量危急（仅剩 ${Math.round(batPercent)}%），请接通电源`
                 : '模型网关失联，无法完成对话与自维护请求',
           summary: energy.summary,
           proposedAction:
@@ -283,7 +331,11 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime {
     }
 
     const thermals = latestEval.needs.thermals;
-    if (thermals.zone === 'critical' && snap.state.self.body.thermal.value === 'critical') {
+    if (
+      thermals.zone === 'critical' &&
+      snap.state.self.body.thermal.value === 'critical' &&
+      !isAutoHelpSuppressed('thermals', 'critical')
+    ) {
       await raiseHelp({
         need: 'thermals',
         severity: 'critical',
@@ -310,8 +362,10 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime {
     ];
     for (const key of distressedKeys) {
       const ev = latestEval.needs[key];
+      const safeSummary = sanitizeForModel(ev.summary);
+      const safeEvidence = sanitizeForModel(JSON.stringify(ev.evidence));
       lines.push(
-        `- [${NEED_LABELS[key]} | ${ev.zone} | 满足度 ${ev.satisfaction}%]: ${ev.summary} (证据: ${JSON.stringify(ev.evidence)})`,
+        `- [${NEED_LABELS[key]} | ${ev.zone} | 满足度 ${ev.satisfaction}%]: ${safeSummary} (证据: ${safeEvidence})`,
       );
     }
     lines.push(
@@ -349,7 +403,7 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime {
       if (autonomousTurnMonoTimes.length >= MAX_AUTONOMOUS_TURNS_PER_HOUR) {
         for (const key of distressed) {
           const ev = latestEval.needs[key];
-          if (ev.zone === 'critical') {
+          if (ev.zone === 'critical' && !isAutoHelpSuppressed(key, 'critical')) {
             await raiseHelp({
               need: key,
               severity: 'critical',
@@ -399,6 +453,7 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime {
       maintTotalTurns += 1;
       maintStatus = 'idle';
 
+      await ports.sense.refresh?.().catch(() => undefined);
       recomputeEval(ports.sense.snapshot());
 
       const primaryNeed = targetKeys[0];
@@ -410,7 +465,7 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime {
 
         for (const critKey of stillCritical) {
           const hasOpenCard = helpCards.some((c) => c.need === critKey && c.status === 'open');
-          if (!hasOpenCard) {
+          if (!hasOpenCard && !isAutoHelpSuppressed(critKey, 'critical')) {
             await raiseHelp({
               need: critKey,
               severity: 'critical',
@@ -489,6 +544,13 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime {
     }
 
     await checkImmediateBoundaries(latestSense);
+    if (!latestSense.settings.paused && latestSense.activeSessionId) {
+      for (const openCard of helpCards) {
+        if (openCard.status === 'open' && !criedEpisodes.has(openCard.need)) {
+          await deliverCryIfNeeded(openCard);
+        }
+      }
+    }
     notify();
 
     if (!latestSense.settings.paused) {
@@ -602,6 +664,7 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime {
         summary,
         outcome: res.compactedSessions > 0 || res.rotatedMaintainer ? 'relieved' : 'info',
       });
+      await ports.sense.refresh?.().catch(() => undefined);
       notify();
       return { compactedSessions: res.compactedSessions, tokensSaved: res.tokensSaved, summary };
     },
@@ -680,6 +743,8 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime {
         actionSummary = '用户打开系统权限设置';
       }
 
+      criedEpisodes.add(card.need);
+      handledEpisodeSeverity.set(card.need, card.severity);
       helpCards = helpCards.map((c) => (c.id === cardId ? { ...c, status: 'approved', updatedAt: now } : c));
       addRecord({
         actor: 'user',
@@ -688,6 +753,7 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime {
         summary: actionSummary,
         outcome: 'relieved',
       });
+      await ports.sense.refresh?.().catch(() => undefined);
       await persistState();
       await scheduleProcess(ports.sense.snapshot());
     },
@@ -697,6 +763,7 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime {
       if (card?.status !== 'open') return;
       const now = clock.wall();
       criedEpisodes.add(card.need);
+      handledEpisodeSeverity.set(card.need, card.severity);
       helpCards = helpCards.map((c) => (c.id === cardId ? { ...c, status: 'dismissed', updatedAt: now } : c));
       await persistState();
       notify();
@@ -713,6 +780,7 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime {
   };
 
   return {
+    sandboxDir,
     async start() {
       if (started) return;
       started = true;
@@ -722,6 +790,73 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime {
         const parsed = JSON.parse(raw) as PersistedNeedsState;
         if (Array.isArray(parsed.helpCards)) helpCards = parsed.helpCards.slice(0, 30);
         if (Array.isArray(parsed.records)) records = parsed.records.slice(0, MAX_RECORDS);
+        if (parsed.previousStates && typeof parsed.previousStates === 'object') {
+          const restored: Partial<Record<NeedKey, PreviousNeedState>> = {};
+          for (const key of NEED_KEYS) {
+            const entry = parsed.previousStates[key];
+            if (
+              entry &&
+              (entry.zone === 'comfortable' || entry.zone === 'uncomfortable' || entry.zone === 'critical') &&
+              typeof entry.driveActive === 'boolean'
+            ) {
+              restored[key] = {
+                zone: entry.zone,
+                driveActive: entry.driveActive,
+                ...(typeof entry.satisfaction === 'number' && Number.isFinite(entry.satisfaction)
+                  ? { satisfaction: entry.satisfaction }
+                  : {}),
+                ...(typeof entry.mount === 'string' ? { mount: entry.mount } : {}),
+                ...(typeof entry.sessionId === 'string' ? { sessionId: entry.sessionId } : {}),
+                ...(typeof entry.batteryDriven === 'boolean' ? { batteryDriven: entry.batteryDriven } : {}),
+              };
+            }
+          }
+          previousStates = restored;
+        }
+        for (const card of helpCards) {
+          if (card.status === 'open' && (NEED_KEYS as readonly string[]).includes(card.need)) {
+            const cur = previousStates[card.need];
+            if (!cur?.driveActive) {
+              previousStates[card.need] = {
+                zone: card.severity === 'critical' ? 'critical' : 'uncomfortable',
+                driveActive: true,
+                satisfaction: card.severity === 'critical' ? 20 : 45,
+              };
+            }
+          }
+        }
+        if (Array.isArray(parsed.criedEpisodes)) {
+          for (const k of parsed.criedEpisodes) {
+            if ((NEED_KEYS as readonly string[]).includes(k)) criedEpisodes.add(k);
+          }
+        }
+        if (parsed.handledEpisodeSeverity && typeof parsed.handledEpisodeSeverity === 'object') {
+          for (const key of NEED_KEYS) {
+            const sev = parsed.handledEpisodeSeverity[key];
+            if (sev === 'uncomfortable' || sev === 'critical') handledEpisodeSeverity.set(key, sev);
+          }
+        }
+        if (Array.isArray(parsed.internalSessionIds)) {
+          for (const id of parsed.internalSessionIds.slice(-20)) {
+            if (typeof id === 'string' && id.trim()) registerMaintSession(id);
+          }
+        }
+        if (typeof parsed.maintTurnCount === 'number' && Number.isFinite(parsed.maintTurnCount)) {
+          maintTurnCount = Math.max(0, Math.floor(parsed.maintTurnCount));
+        }
+        if (typeof parsed.maintTotalTurns === 'number' && Number.isFinite(parsed.maintTotalTurns)) {
+          maintTotalTurns = Math.max(0, Math.floor(parsed.maintTotalTurns));
+        }
+        if (typeof parsed.maintLastRunAt === 'number' && Number.isFinite(parsed.maintLastRunAt)) {
+          maintLastRunAt = parsed.maintLastRunAt;
+        }
+        if (typeof parsed.maintSessionId === 'string' && parsed.maintSessionId.trim()) {
+          registerMaintSession(parsed.maintSessionId);
+          if (ports.sessions.hasSession(parsed.maintSessionId)) {
+            maintSessionId = parsed.maintSessionId;
+            maintStatus = 'idle';
+          }
+        }
       } catch {
         // Fresh or unreadable state file
       }
@@ -757,12 +892,16 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime {
     },
 
     snapshot,
-    senseSnapshot: () => latestSense,
+    senseSnapshot: () => ports.sense.snapshot(),
+    factStaleInMs: (path: string) => ports.sense.factStaleInMs?.(path),
     subscribe(listener) {
       listeners.add(listener);
       return () => {
         listeners.delete(listener);
       };
+    },
+    registerMaintenanceSessionId(sessionId: string) {
+      registerMaintSession(sessionId);
     },
     isMaintenanceSession: (sessionId: string) => internalSessions.has(sessionId),
     reportTransportResult(reachable: boolean, errorText?: string) {

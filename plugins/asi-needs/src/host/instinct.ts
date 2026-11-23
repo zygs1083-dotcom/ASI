@@ -26,9 +26,13 @@ const BASE_BACKOFF_MS = 10_000;
 const MAX_BACKOFF_MS = 60_000;
 const PROBE_TIMEOUT_MS = 3_000;
 
-function isForbiddenHost(hostname: string): boolean {
-  const lower = hostname.toLowerCase();
-  return lower === '192.168.0.35' || lower === '192.168.0.34';
+const FORBIDDEN_TUNNEL_PORTS = new Set(['19030', '18030', '12345', '12234', '12235', '13306']);
+
+function isForbiddenEndpoint(url: URL): boolean {
+  const lower = url.hostname.toLowerCase();
+  if (lower === '192.168.0.35' || lower === '192.168.0.34') return true;
+  const isLoopback = lower === 'localhost' || lower === '[::1]' || /^127(?:\.\d{1,3}){3}$/.test(lower);
+  return isLoopback && FORBIDDEN_TUNNEL_PORTS.has(url.port);
 }
 
 export const defaultEndpointProbe: EndpointProbe = async (endpoint, signal) => {
@@ -38,7 +42,7 @@ export const defaultEndpointProbe: EndpointProbe = async (endpoint, signal) => {
   } catch {
     return false;
   }
-  if ((url.protocol !== 'http:' && url.protocol !== 'https:') || isForbiddenHost(url.hostname)) {
+  if ((url.protocol !== 'http:' && url.protocol !== 'https:') || isForbiddenEndpoint(url)) {
     return true;
   }
   const ac = new AbortController();
@@ -46,12 +50,24 @@ export const defaultEndpointProbe: EndpointProbe = async (endpoint, signal) => {
   signal.addEventListener('abort', onAbort, { once: true });
   const timer = setTimeout(() => ac.abort(), PROBE_TIMEOUT_MS);
   try {
-    const res = await fetch(url.origin, {
-      method: 'HEAD',
+    try {
+      const head = await fetch(url.href, {
+        method: 'HEAD',
+        redirect: 'manual',
+        signal: ac.signal,
+      });
+      if (head.status < 500) return true;
+    } catch {
+      // Fallback to zero-body GET for gateways/proxies that reject or drop HEAD
+    }
+    if (ac.signal.aborted) return false;
+    const getRes = await fetch(url.href, {
+      method: 'GET',
       redirect: 'manual',
       signal: ac.signal,
     });
-    return res.status < 500;
+    await getRes.body?.cancel().catch(() => undefined);
+    return getRes.status < 500;
   } catch {
     return false;
   } finally {
@@ -125,9 +141,9 @@ export class InstinctController {
     const endpointFact = snapshot.state.env.where.model;
     const netFact = snapshot.state.self.body.network;
     const endpoint = endpointFact.status === 'ok' ? endpointFact.value?.endpoint : undefined;
-    const isLocal = endpointFact.status === 'ok' ? endpointFact.value?.local === true : false;
+    const isRemote = endpointFact.status === 'ok' && endpointFact.value?.local === false;
 
-    if (!isLocal && netFact.status === 'ok' && netFact.value?.online === false) {
+    if (isRemote && netFact.status === 'ok' && netFact.value?.online === false) {
       const prev = this.connectivity;
       if (prev !== 'offline') {
         this.connectivity = 'offline';
@@ -215,8 +231,15 @@ export class InstinctController {
         bat.value.powerState === 'charging' ||
         bat.value.powerState === 'charged' ||
         bat.value.powerState === 'external';
-      if (!plugged && bat.value.percent <= 20) {
-        return `电池低电量（${Math.round(bat.value.percent)}%）自动降频省电`;
+      const lowMinutes =
+        bat.value.minutesLeft !== undefined &&
+        Number.isFinite(bat.value.minutesLeft) &&
+        bat.value.minutesLeft > 0 &&
+        bat.value.minutesLeft <= 15;
+      if (!plugged && (bat.value.percent <= 20 || lowMinutes)) {
+        return lowMinutes && bat.value.percent > 20
+          ? `电池剩余续航不足 ${Math.ceil(bat.value.minutesLeft ?? 15)} 分钟自动降频省电`
+          : `电池低电量（${Math.round(bat.value.percent)}%）自动降频省电`;
       }
     }
     const therm = snapshot.state.self.body.thermal;

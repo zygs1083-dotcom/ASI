@@ -180,4 +180,125 @@ describe('evaluateNeeds 五大生存需求评估', () => {
       evaluateNeeds({ snapshot: sustained, modelConnectivity: 'online', stuckJobCount: 0 }).needs.thermals.zone,
     ).toBe('critical');
   });
+
+  it('读数短暂 stale / unknown 或单卷过期时保持已激活的回滞驱动，不误清零；墙钟跳变不误判卷过期', () => {
+    const GiB = 1024 ** 3;
+
+    // 1. 磁盘：`/` 进入 critical 后，即使 `/` 短暂 stale 而 `/data` 仍 ok，space 仍保持 critical 驱动
+    const critRoot = makeSnapshot();
+    critRoot.state.self.body.disks = {
+      kind: 'disks',
+      ...fact([
+        { mount: '/', total: 500 * GiB, free: 1 * GiB, status: 'ok' },
+        { mount: '/data', total: 500 * GiB, free: 300 * GiB, status: 'ok' },
+      ]),
+    };
+    const step1 = evaluateNeeds({ snapshot: critRoot, modelConnectivity: 'online', stuckJobCount: 0 });
+    expect(step1.needs.space).toMatchObject({ zone: 'critical', driveActive: true });
+
+    const rootStale = makeSnapshot();
+    rootStale.state.self.body.disks = {
+      kind: 'disks',
+      ...fact([
+        { mount: '/', total: 500 * GiB, free: 1 * GiB, status: 'stale' },
+        { mount: '/data', total: 500 * GiB, free: 300 * GiB, status: 'ok' },
+      ]),
+    };
+    const step2 = evaluateNeeds({
+      snapshot: rootStale,
+      modelConnectivity: 'online',
+      stuckJobCount: 0,
+      previous: {
+        space: {
+          zone: step1.needs.space.zone,
+          driveActive: step1.needs.space.driveActive,
+          satisfaction: step1.needs.space.satisfaction,
+          mount: String(step1.needs.space.evidence.mount),
+        },
+      },
+    });
+    expect(step2.needs.space).toMatchObject({ zone: 'critical', driveActive: true });
+
+    // 墙钟大幅跳变（now + 1h）但单调时钟仍标记 status: 'ok' 时，不应因 observedAt + ttlMs < now 误判忽略危急卷
+    const jumpedWall = makeSnapshot({ now: T0 + 3_600_000 });
+    jumpedWall.state.self.body.disks = {
+      kind: 'disks',
+      ...fact([{ mount: '/', total: 500 * GiB, free: 1 * GiB, status: 'ok', observedAt: T0 - 1_000, ttlMs: 30_000 }]),
+    };
+    expect(
+      evaluateNeeds({ snapshot: jumpedWall, modelConnectivity: 'online', stuckJobCount: 0 }).needs.space.zone,
+    ).toBe('critical');
+
+    // 2. 能量 / 内存 / 心智 / 温控：驱动激活后传感器短暂 stale 时保持回滞驱动；新会话 unknown 则正常释放
+    const distressed = makeSnapshot({ activeSessionId: 'sess-a' });
+    distressed.state.self.body.battery = fact({ percent: 8, charging: false, powerState: 'battery' });
+    distressed.state.self.body.memory = fact({
+      total: 32 * GiB,
+      used: 31 * GiB,
+      pressure: 'critical',
+      swapUsed: 8 * GiB,
+    });
+    distressed.state.self.body.thermal = fact('critical');
+    distressed.state.self.body.tokens = fact({
+      contextWindow: 100_000,
+      contextWindowSource: 'configured',
+      contextUsed: 96_000,
+      sessionUsage: { input: 96_000, output: 1_000, cacheRead: 0, cacheWrite: 0 },
+    });
+    const d1 = evaluateNeeds({ snapshot: distressed, modelConnectivity: 'online', stuckJobCount: 0 });
+    const prev = {
+      energy: {
+        zone: d1.needs.energy.zone,
+        driveActive: d1.needs.energy.driveActive,
+        satisfaction: d1.needs.energy.satisfaction,
+        batteryDriven: true,
+      },
+      memory: {
+        zone: d1.needs.memory.zone,
+        driveActive: d1.needs.memory.driveActive,
+        satisfaction: d1.needs.memory.satisfaction,
+      },
+      thermals: {
+        zone: d1.needs.thermals.zone,
+        driveActive: d1.needs.thermals.driveActive,
+        satisfaction: d1.needs.thermals.satisfaction,
+      },
+      mind: {
+        zone: d1.needs.mind.zone,
+        driveActive: d1.needs.mind.driveActive,
+        satisfaction: d1.needs.mind.satisfaction,
+        sessionId: 'sess-a',
+      },
+    };
+
+    const staleSnap = makeSnapshot({ activeSessionId: 'sess-a' });
+    staleSnap.state.self.body.battery = fact(null, { status: 'stale' });
+    staleSnap.state.self.body.memory = fact(null, { status: 'stale' });
+    staleSnap.state.self.body.thermal = fact(null, { status: 'stale' });
+    staleSnap.state.self.body.cpu = fact(null, { status: 'stale' });
+    staleSnap.state.self.body.harnessProcess = fact(null, { status: 'stale' });
+    staleSnap.state.self.body.tokens = fact(null, { status: 'stale' });
+
+    const dStale = evaluateNeeds({
+      snapshot: staleSnap,
+      modelConnectivity: 'online',
+      stuckJobCount: 0,
+      previous: prev,
+    });
+    expect(dStale.needs.energy).toMatchObject({ zone: 'critical', driveActive: true });
+    expect(dStale.needs.memory).toMatchObject({ zone: 'critical', driveActive: true });
+    expect(dStale.needs.thermals).toMatchObject({ zone: 'critical', driveActive: true });
+    expect(dStale.needs.mind).toMatchObject({ zone: 'critical', driveActive: true });
+
+    // 用户切换到全新空白会话 sess-b（tokens 尚未采样为 unknown）时，不应把旧会话心智危急扣在新会话头上
+    const switchedSnap = makeSnapshot({ activeSessionId: 'sess-b' });
+    switchedSnap.state.self.body.tokens = fact(null, { status: 'unknown' });
+    const dSwitched = evaluateNeeds({
+      snapshot: switchedSnap,
+      modelConnectivity: 'online',
+      stuckJobCount: 0,
+      previous: prev,
+    });
+    expect(dSwitched.needs.mind).toMatchObject({ zone: 'comfortable', driveActive: false });
+  });
 });

@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { mkdir } from 'node:fs/promises';
 import type { Context } from '@deepseek-ai/cordis';
 import type { Agent } from '@deepseek-ai/dsh-agent';
 import type {} from '@deepseek-ai/dsh-api-session-controller';
@@ -6,6 +7,7 @@ import type { CompactionEngine } from '@deepseek-ai/dsh-compaction';
 import { JobId } from '@deepseek-ai/dsh-jobs';
 import { freezeMessage, MessageId } from '@deepseek-ai/dsh-llm';
 import { SessionId } from '@deepseek-ai/dsh-session';
+import type { WorkspaceRegistry } from '@deepseek-ai/dsh-workspace';
 import type { CryDeliveryMode } from '../cry.js';
 import type { NeedsHostPorts } from '../ports.js';
 import type { CompactionPort, JobsPort, ManagedJobInfo } from '../sandbox.js';
@@ -18,6 +20,23 @@ declare module '@deepseek-ai/dsh-llm' {
 
 export function createDshNeedsPorts(ctx: Context, storageRoot: string): NeedsHostPorts {
   const resolveAgent = (id: string): Agent | undefined => ctx.agents.get(SessionId(id));
+  const getWorkspaceRegistry = (): WorkspaceRegistry | undefined =>
+    (ctx as Context & { get(name: 'workspaceRegistry'): WorkspaceRegistry | undefined }).get('workspaceRegistry');
+
+  const isUserOrdinaryAgent = (agent: Agent): boolean => {
+    if (agent.session?.header?.origin === 'subagent') return false;
+    const wr = getWorkspaceRegistry();
+    if (wr?.archivedSessionIds.includes(agent.id)) return false;
+    return true;
+  };
+
+  const isKnownSession = (sessionId: string): boolean => {
+    const sid = SessionId(sessionId);
+    if (resolveAgent(sessionId)) return true;
+    if (ctx.sessions?.list().some((s) => s.id === sid)) return true;
+    const wr = getWorkspaceRegistry();
+    return Boolean(wr?.list().some((ws) => ws.sessionIds.includes(sid)));
+  };
 
   const jobs: JobsPort = {
     listActiveJobs(): ManagedJobInfo[] {
@@ -43,8 +62,7 @@ export function createDshNeedsPorts(ctx: Context, storageRoot: string): NeedsHos
     },
 
     hasLiveOwner(sessionId: string): boolean {
-      if (resolveAgent(sessionId)) return true;
-      return Boolean(ctx.sessions?.list().some((s) => s.id === sessionId));
+      return isKnownSession(sessionId);
     },
 
     killJob(id: string, owner: string | undefined, reason: string) {
@@ -60,7 +78,7 @@ export function createDshNeedsPorts(ctx: Context, storageRoot: string): NeedsHos
     listIdleSessionIds(excludeIds: ReadonlySet<string>): string[] {
       return ctx.agents
         .list()
-        .filter((agent) => agent.status === 'idle' && !excludeIds.has(agent.id))
+        .filter((agent) => agent.status === 'idle' && !excludeIds.has(agent.id) && isUserOrdinaryAgent(agent))
         .map((agent) => agent.id);
     },
 
@@ -71,14 +89,22 @@ export function createDshNeedsPorts(ctx: Context, storageRoot: string): NeedsHos
       if (!engine) return { compacted: false };
       const res = await engine.compactNow(agent, signal);
       if (!res) return { compacted: false };
-      return { compacted: true };
+      return {
+        compacted: true,
+        ...(typeof res.shadowedTokenCount === 'number' ? { tokensSaved: res.shadowedTokenCount } : {}),
+      };
     },
   };
 
   const sessions: NeedsHostPorts['sessions'] = {
     async createMaintenanceSession(requestedId: string, cwd: string, title: string): Promise<string> {
+      await mkdir(cwd, { recursive: true });
       const sid = SessionId(requestedId);
-      const created = await ctx.sessionController.create({ cwd, sessionId: sid });
+      const wr = getWorkspaceRegistry();
+      const ws = wr ? await wr.create(cwd, title).catch(() => undefined) : undefined;
+      const created = await ctx.sessionController.create(
+        ws ? { workspaceId: ws.id, sessionId: sid } : { cwd, sessionId: sid },
+      );
       const actualId = created.sessionId;
       await ctx.sessionController.rename({ sessionId: actualId, title }).catch(() => undefined);
       const resolved = await ctx.sessionController.resolveAgent(actualId);
@@ -87,8 +113,7 @@ export function createDshNeedsPorts(ctx: Context, storageRoot: string): NeedsHos
     },
 
     hasSession(sessionId: string): boolean {
-      if (resolveAgent(sessionId)) return true;
-      return Boolean(ctx.sessions?.list().some((s) => s.id === sessionId));
+      return isKnownSession(sessionId);
     },
 
     async runMaintenanceTurn(sessionId: string, prompt: string, signal: AbortSignal): Promise<void> {
@@ -104,6 +129,13 @@ export function createDshNeedsPorts(ctx: Context, storageRoot: string): NeedsHos
         content: [{ type: 'text', text: prompt }],
       });
 
+      let turnError: unknown;
+      const offError = ctx.on('agent/error', ({ agent: errAgent, error }) => {
+        if (errAgent.id === agent.id && turnError === undefined) {
+          turnError = error ?? new Error('Maintenance turn failed');
+        }
+      });
+
       const onAbort = () => {
         try {
           agent.cancel({ kind: 'disposed' });
@@ -116,7 +148,12 @@ export function createDshNeedsPorts(ctx: Context, storageRoot: string): NeedsHos
         agent.followup(msg);
         await agent.whenIdle();
       } finally {
+        offError();
         signal.removeEventListener('abort', onAbort);
+      }
+      if (signal.aborted) return;
+      if (turnError !== undefined) {
+        throw turnError instanceof Error ? turnError : new Error(String(turnError));
       }
     },
 
@@ -128,14 +165,19 @@ export function createDshNeedsPorts(ctx: Context, storageRoot: string): NeedsHos
     ): Promise<boolean> {
       let agent: Agent | undefined;
       if (targetSessionId && !excludeSessionIds.has(targetSessionId)) {
-        agent = resolveAgent(targetSessionId);
-        if (!agent) {
+        const candidate = resolveAgent(targetSessionId);
+        if (candidate && isUserOrdinaryAgent(candidate)) {
+          agent = candidate;
+        } else if (!candidate) {
           const resolved = await ctx.sessionController.resolveAgent(SessionId(targetSessionId)).catch(() => undefined);
-          if (resolved && 'agent' in resolved) agent = resolved.agent;
+          if (resolved && 'agent' in resolved && isUserOrdinaryAgent(resolved.agent)) {
+            agent = resolved.agent;
+          }
         }
       }
       if (!agent) {
-        agent = ctx.agents.list().find((a) => !excludeSessionIds.has(a.id));
+        const candidates = ctx.agents.list().filter((a) => !excludeSessionIds.has(a.id) && isUserOrdinaryAgent(a));
+        agent = candidates.at(-1);
       }
       if (!agent) return false;
 

@@ -276,6 +276,25 @@ export function createSenseRuntime(ports: SensePorts, options: SenseOptions = {}
     snapshot: buildSnapshot,
     subscribeSnapshot: snapshotListeners.subscribe,
     factMeta: (path: string) => expiry.factMeta(path),
+    factStaleInMs: (path: string) => {
+      const mountPrefix = 'self.body.disks.mount#';
+      const normalized = path.startsWith(mountPrefix)
+        ? `/self/body/disks/value/${path.slice(mountPrefix.length)}`
+        : path.startsWith('/')
+          ? path
+          : `/${path.replaceAll('.', '/')}`;
+      const meta = expiry.factMeta(normalized);
+      return meta && Number.isFinite(meta.deadlineMono) ? Math.max(0, meta.deadlineMono - clock.mono()) : undefined;
+    },
+    refresh: async () => {
+      if (!running || paused) return;
+      dsh.targetChanged();
+      const session = bus.currentSessionId();
+      if (session) {
+        await body.tokens(session, () => running && !paused && bus.currentSessionId() === session);
+      }
+      changed();
+    },
     subscribe: listeners.subscribe,
     onChange,
     recentSignals: () => bus.recentSignals(),

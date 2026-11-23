@@ -9,6 +9,7 @@ import SystemPrompt from '@deepseek-ai/dsh-system-prompt';
 import { NativeToolExecutor } from '@deepseek-ai/dsh-tool-executor-native';
 import ToolsService, { defineTool } from '@deepseek-ai/dsh-tools';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { createDshNeedsPorts } from '../src/host/dsh/dsh-ports.js';
 import {
   createMaintenanceActionTools,
   MAINTENANCE_ACTION_TOOL_NAMES,
@@ -166,6 +167,166 @@ describe('工具作用域隔离：普通对话 vs 专用后台自维护会话', 
           agent: userAgent,
         } as never),
       ).toBeUndefined();
+    } finally {
+      offTools();
+      await runtime.stop();
+    }
+  });
+
+  it('当 sessionController.create 重分配新会话 ID 或冷恢复时，凭专属 sandboxDir cwd 仍同步施加工具沙盒限制；createDshNeedsPorts 正确挂载 Workspace、透传压缩 Token 数、过滤 subagent/归档会话并上抛回合错误', async () => {
+    const storageRoot = await mkdtemp(join(tmpdir(), 'asi-needs-ports-'));
+    tempDirs.push(storageRoot);
+
+    const root = new Context();
+    await root.plugin(SystemPrompt);
+    await root.plugin(ToolsService);
+    root.tools.setExecutor(new NativeToolExecutor(root));
+
+    for (const name of ['env_state', 'env_detail', 'shell']) {
+      root.tools.register(
+        defineTool({
+          name,
+          description: `mock ${name}`,
+          parameters: {},
+          output: { schema: { type: 'json' }, render: (_a, v) => [{ type: 'text', text: JSON.stringify(v) }] },
+          async execute() {
+            return { ok: true };
+          },
+        }),
+      );
+    }
+
+    const agentsList: Agent[] = [];
+    const createdWorkspaces: { id: string; path: string; title?: string; sessionIds: string[] }[] = [];
+    const cryInbox: { agentId: string; text: string }[] = [];
+    let failTurn = false;
+
+    root.provide('agents', {
+      list: () => agentsList,
+      get: (id: string) => agentsList.find((a) => a.id === id),
+    });
+    root.provide('jobs', { list: () => [], kill: () => 'already-finished' });
+    root.provide('asiSense', createMockSenseService(undefined, storageRoot));
+    root.provide('workspaceRegistry', {
+      archivedSessionIds: [SessionId('archived-user')],
+      create: async (path: string, title?: string) => {
+        const ws = { id: 'ws-maint-1', path, title, sessionIds: [] as string[] };
+        createdWorkspaces.push(ws);
+        return ws;
+      },
+      list: () => createdWorkspaces,
+    });
+    root.provide('compaction', {
+      compactNow: async () => ({ shadowedTokenCount: 42_500 }),
+    });
+    root.provide('sessionController', {
+      create: async (req: { workspaceId?: string; cwd?: string; sessionId?: string }) => {
+        // 故意忽略 requested sessionId，重分配全新 mintedId，并在返回前触发 agent/created！
+        const mintedId = 'session-minted-by-dsh-999';
+        const ws = createdWorkspaces.find((w) => w.id === req.workspaceId);
+        ws?.sessionIds.push(mintedId);
+        const agent = {
+          id: SessionId(mintedId),
+          status: 'idle' as const,
+          session: { header: { cwd: ws?.path ?? req.cwd } },
+          followup: () => {
+            if (failTurn) {
+              emitAgentEvent(root, agent as unknown as Agent, 'agent/error', {
+                turn: 1,
+                step: 1,
+                error: new Error('provider boom'),
+              });
+            }
+          },
+          send: () => {},
+          cancel: () => {},
+          whenIdle: async () => {},
+        } as unknown as Agent & { ctx: Context };
+        (agent as { ctx: Context }).ctx = createScope(root, agent).ctx;
+        agentsList.push(agent);
+        emitAgentEvent(root, agent, 'agent/created', { source: 'startup' });
+        return { sessionId: SessionId(mintedId) };
+      },
+      rename: async () => ({ title: 'ASI 自维护', seq: 1 }),
+      resolveAgent: async (sid: string) => {
+        const found = agentsList.find((a) => a.id === sid);
+        return found ? { agent: found } : { error: new Error('not found') };
+      },
+    });
+
+    // 注册 subagent、已归档会话、正常用户会话
+    for (const spec of [
+      { id: 'subagent-1', origin: 'subagent' as const },
+      { id: 'archived-user', origin: undefined },
+      { id: 'live-user-1', origin: undefined },
+    ]) {
+      const a = {
+        id: SessionId(spec.id),
+        status: 'idle' as const,
+        session: { header: { ...(spec.origin ? { origin: spec.origin } : {}) } },
+        followup: (msg: { content: { text: string }[] }) =>
+          cryInbox.push({ agentId: spec.id, text: msg.content[0]?.text ?? '' }),
+        send: (msg: { content: { text: string }[] }) =>
+          cryInbox.push({ agentId: spec.id, text: msg.content[0]?.text ?? '' }),
+      } as unknown as Agent & { ctx: Context };
+      (a as { ctx: Context }).ctx = createScope(root, a).ctx;
+      agentsList.push(a);
+    }
+
+    const ports = createDshNeedsPorts(root, storageRoot);
+    const runtime = createNeedsRuntime(ports);
+    const offTools = registerNeedsTools(root, runtime);
+    await runtime.start();
+
+    try {
+      // 1. 打开自维护会话：挂载到 Workspace 且即便 ID 被重分配为 session-minted-by-dsh-999，仍在 agent/created 瞬间被沙盒隔离
+      const sid = await runtime.actions.openMaintenanceSession();
+      expect(sid).toBe('session-minted-by-dsh-999');
+      expect(createdWorkspaces).toHaveLength(1);
+      expect(ports.sessions.hasSession(sid)).toBe(true);
+
+      const mintedAgent = agentsList.find((a) => a.id === sid);
+      expect(mintedAgent).toBeDefined();
+      if (!mintedAgent) throw new Error('missing mintedAgent');
+      expect(root.tools.executable('shell', mintedAgent)).toBeUndefined();
+      expect(
+        root.tools
+          .definitions(mintedAgent)
+          .map((d) => d.name)
+          .sort(),
+      ).toEqual(
+        [
+          'env_detail',
+          'env_state',
+          'needs_clean_cache',
+          'needs_compact_context',
+          'needs_request_help',
+          'needs_status',
+          'needs_stop_job',
+        ].sort(),
+      );
+
+      // 2. 空闲会话枚举与压缩：过滤 subagent、已归档会话与内部自维护会话，且正确透传 shadowedTokenCount
+      const idleIds = ports.compaction.listIdleSessionIds(new Set([sid]));
+      expect(idleIds).toEqual(['live-user-1']);
+      const compRes = await ports.compaction.compactIdleSession('live-user-1', new AbortController().signal);
+      expect(compRes).toEqual({ compacted: true, tokensSaved: 42_500 });
+
+      // 3. 啼哭投递：若 target 为 subagent 则跳过，回退投递至真实普通用户会话 live-user-1
+      const delivered = await ports.sessions.deliverCryToUserSession(
+        'subagent-1',
+        new Set([sid]),
+        '<asi-cry>help</asi-cry>',
+        'wakeup',
+      );
+      expect(delivered).toBe(true);
+      expect(cryInbox).toEqual([{ agentId: 'live-user-1', text: '<asi-cry>help</asi-cry>' }]);
+
+      // 4. 自维护回合报错时如实抛出异常而非静默当作成功
+      failTurn = true;
+      await expect(ports.sessions.runMaintenanceTurn(sid, 'check', new AbortController().signal)).rejects.toThrow(
+        'provider boom',
+      );
     } finally {
       offTools();
       await runtime.stop();

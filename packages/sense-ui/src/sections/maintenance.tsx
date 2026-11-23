@@ -106,7 +106,7 @@ export function MaintenanceSection({
       <div className={css.maintActions}>
         <button
           type="button"
-          disabled={busy || !session.sessionId}
+          disabled={busy || (paused && !session.sessionId)}
           onClick={() => void run('打开自维护会话', onOpenSession)}
         >
           查看自维护会话

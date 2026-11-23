@@ -16,8 +16,16 @@ export function demoSrc(api = 'demo'): SourceRef {
   return { id: api, api, host: 'demo-host' };
 }
 
+export function fact(
+  value: null,
+  opts?: { status?: FactStatus; observedAt?: number; ttlMs?: number; reason?: string; api?: string },
+): Fact<never>;
 export function fact<T>(
   value: T,
+  opts?: { status?: FactStatus; observedAt?: number; ttlMs?: number; reason?: string; api?: string },
+): Fact<T>;
+export function fact<T>(
+  value: T | null,
   opts: { status?: FactStatus; observedAt?: number; ttlMs?: number; reason?: string; api?: string } = {},
 ): Fact<T> {
   return {
@@ -114,7 +122,11 @@ export function makeSnapshot(over: Partial<SenseSnapshot> = {}): SenseSnapshot {
   };
 }
 
-export function createMockSenseService(initial?: Partial<SenseSnapshot>, storageRoot?: string) {
+export function createMockSenseService(
+  initial?: Partial<SenseSnapshot>,
+  storageRoot?: string,
+  onRefresh?: (current: SenseSnapshot) => SenseSnapshot | undefined,
+) {
   let current = makeSnapshot(initial);
   const listeners = new Set<(snap: SenseSnapshot) => void>();
   const internalIds = new Set<string>();
@@ -125,6 +137,13 @@ export function createMockSenseService(initial?: Partial<SenseSnapshot>, storage
   } = {
     storageRoot,
     snapshot: () => structuredClone(current),
+    async refresh() {
+      const next = onRefresh?.(current);
+      if (next) {
+        current = next;
+        for (const fn of [...listeners]) fn(structuredClone(current));
+      }
+    },
     subscribe(fn) {
       listeners.add(fn);
       return () => {

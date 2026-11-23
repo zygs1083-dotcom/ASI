@@ -64,6 +64,14 @@ export class AsiSenseService extends Service implements AsiSenseServiceApi {
   recentSignals(): Signal[] {
     return this.runtime.recentSignals();
   }
+
+  refresh(): Promise<void> {
+    return this.runtime.refresh();
+  }
+
+  factStaleInMs(path: string): number | undefined {
+    return this.runtime.factStaleInMs(path);
+  }
 }
 
 export const name = 'asi-sense';
@@ -117,8 +125,8 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   try {
     await runtime.start();
     if (disposed) return;
-    new AsiSenseService(ctx, runtime, config.storageRoot);
     offTools = registerSenseTools(ctx, runtime, local.clock.wall);
+    new AsiSenseService(ctx, runtime, config.storageRoot);
   } catch (error) {
     await dispose();
     throw error;

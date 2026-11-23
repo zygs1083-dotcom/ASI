@@ -23,6 +23,7 @@ export class TokenFacts {
     private readonly current: () => TokenFact,
     private readonly write: (fact: TokenFact, observedMono?: number) => void,
     private readonly changed: () => void,
+    private readonly ttlMs: () => number = () => 15_000,
   ) {}
 
   get hasReading(): boolean {
@@ -73,7 +74,7 @@ export class TokenFacts {
       status: 'unknown',
       source: { id: 'tokens', api: 'dsh', host: 'local' },
       observedAt: this.clock.wall(),
-      ttlMs: 15_000,
+      ttlMs: this.ttlMs(),
       reason: this.reason(),
     };
   }
@@ -121,7 +122,7 @@ export class TokenFacts {
       status: snapshot ? 'ok' : 'unavailable',
       source: { id: 'tokens', api: 'dsh', host: 'local' },
       observedAt: this.clock.wall(),
-      ttlMs: 15_000,
+      ttlMs: this.ttlMs(),
       ...(!snapshot ? { reason: failed && this.hasSession ? '用量读取失败' : this.reason() } : {}),
     };
     this.readings.set(session, { fact, source: snapshot?.contextWindowSource, mono: this.clock.mono() });

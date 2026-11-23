@@ -14,6 +14,7 @@
  *      outside the 7 whitelisted names.
  */
 
+import { realpathSync } from 'node:fs';
 import { type HelpActionKind, NEED_KEYS, type NeedKey, sanitizeForModel } from '@asi/sense-types';
 import type { Context } from '@deepseek-ai/cordis';
 import type { Agent } from '@deepseek-ai/dsh-agent';
@@ -233,8 +234,27 @@ export function createMaintenanceActionTools(runtime: NeedsRuntime) {
   return [cleanCache, stopJob, compactContext, requestHelp];
 }
 
+function tryRealpath(p: string): string {
+  try {
+    return realpathSync(p);
+  } catch {
+    return p;
+  }
+}
+
+function ensureMaintainerRegistered(agent: Agent, runtime: NeedsRuntime): boolean {
+  if (runtime.isMaintenanceSession(agent.id)) return true;
+  const cwd = (agent as { session?: { header?: { cwd?: string } } }).session?.header?.cwd;
+  if (!cwd || !runtime.sandboxDir) return false;
+  if (cwd === runtime.sandboxDir || tryRealpath(cwd) === tryRealpath(runtime.sandboxDir)) {
+    runtime.registerMaintenanceSessionId(agent.id);
+    return true;
+  }
+  return false;
+}
+
 export function attachMaintainerScope(rootCtx: Context, agent: Agent, runtime: NeedsRuntime): () => void {
-  if (!runtime.isMaintenanceSession(agent.id)) return () => {};
+  if (!ensureMaintainerRegistered(agent, runtime)) return () => {};
 
   const disposers: (() => void)[] = [];
   try {
@@ -292,7 +312,7 @@ export function registerNeedsTools(ctx: Context, runtime: NeedsRuntime): () => v
     disposers.push(ctx.tools.register(createNeedsStatusTool(runtime)));
 
     const bindAgent = (agent: Agent) => {
-      if (!runtime.isMaintenanceSession(agent.id) || scopedDisposers.has(agent.id)) return;
+      if (!ensureMaintainerRegistered(agent, runtime) || scopedDisposers.has(agent.id)) return;
       scopedDisposers.set(agent.id, attachMaintainerScope(ctx, agent, runtime));
     };
 

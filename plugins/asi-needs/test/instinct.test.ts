@@ -1,3 +1,4 @@
+import { createServer } from 'node:http';
 import { describe, expect, it, vi } from 'vitest';
 import { evaluateNeeds } from '../src/host/evaluator.js';
 import { defaultEndpointProbe, InstinctController } from '../src/host/instinct.js';
@@ -76,9 +77,53 @@ describe('InstinctController 零 Token 本能反射', () => {
     expect(sense.getSettings().powerMode).toBe('normal');
   });
 
-  it('生产受限地址（192.168.0.35 / .34）绝不发起真实网络连接', async () => {
+  it('生产受限地址（192.168.0.35 / .34）及本机生产隧道端口绝不发起真实网络连接', async () => {
     const ac = new AbortController();
     expect(await defaultEndpointProbe('http://192.168.0.35:8080', ac.signal)).toBe(true);
     expect(await defaultEndpointProbe('http://192.168.0.34:8080', ac.signal)).toBe(true);
+    expect(await defaultEndpointProbe('http://127.0.0.1:19030/v1', ac.signal)).toBe(true);
+    expect(await defaultEndpointProbe('http://localhost:13306', ac.signal)).toBe(true);
+  });
+
+  it('无活跃会话（model endpoint unknown）且系统断网时绝不误报网关失联；剩余续航 <=15 分钟触发 eco；HEAD 405 回退 GET', async () => {
+    const sense = createMockSenseService();
+    const instinct = new InstinctController(sense, async () => false);
+
+    // 1. 无活跃会话时 model 为 unknown + Wi-Fi 断开，不应误判云端网关失联
+    const wifiOff = makeSnapshot({ now: T0, activeSessionId: undefined });
+    wifiOff.state.env.where.model = fact(null, { status: 'unknown' });
+    wifiOff.state.self.body.network = fact({ online: false, rxBps: 0, txBps: 0 });
+    const evalWifiOff = evaluateNeeds({ snapshot: wifiOff, modelConnectivity: 'online', stuckJobCount: 0 });
+    await instinct.reconcile(wifiOff, evalWifiOff.needs, false);
+    expect(instinct.modelConnectivity()).toBe('online');
+
+    // 2. 电量 22% 但剩余续航仅 12 分钟（energy critical）时同样立即开启 eco
+    const shortLeft = makeSnapshot({ now: T0 + 5_000 });
+    shortLeft.state.self.body.battery = fact({ percent: 22, charging: false, powerState: 'battery', minutesLeft: 12 });
+    const evalShort = evaluateNeeds({ snapshot: shortLeft, modelConnectivity: 'online', stuckJobCount: 0 });
+    expect(evalShort.needs.energy.zone).toBe('critical');
+    await instinct.reconcile(shortLeft, evalShort.needs, false);
+    expect(sense.getSettings().powerMode).toBe('eco');
+
+    // 3. defaultEndpointProbe 对不支持 HEAD (501) 但支持 GET /v1 的本地网关回退探活成功
+    const methods: string[] = [];
+    const srv = createServer((req, res) => {
+      methods.push(`${req.method}:${req.url}`);
+      if (req.method === 'HEAD') {
+        res.writeHead(501).end();
+        return;
+      }
+      res.writeHead(401, { 'content-type': 'application/json' }).end('{"error":"auth"}');
+    });
+    await new Promise<void>((resolve) => srv.listen(0, '127.0.0.1', () => resolve()));
+    try {
+      const addr = srv.address();
+      const port = typeof addr === 'object' && addr ? addr.port : 0;
+      const ok = await defaultEndpointProbe(`http://127.0.0.1:${port}/v1`, new AbortController().signal);
+      expect(ok).toBe(true);
+      expect(methods).toEqual(['HEAD:/v1', 'GET:/v1']);
+    } finally {
+      await new Promise<void>((resolve) => srv.close(() => resolve()));
+    }
   });
 });

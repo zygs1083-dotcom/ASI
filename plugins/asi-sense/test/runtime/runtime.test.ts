@@ -265,4 +265,37 @@ describe('pure sensory createSenseRuntime', () => {
     expect(s.paused).toBe(false);
     expect(s.sendTitles).toBe(true);
   });
+
+  it('extends token TTL in eco mode (45s), supports on-demand refresh(), and reports monotonic factStaleInMs()', async () => {
+    const h = harness();
+    let usedTokens = 90_000;
+    h.setTokenFn(async () => ({
+      contextUsed: usedTokens,
+      contextWindow: 100_000,
+      contextWindowSource: 'configured',
+      sessionUsage: { input: usedTokens, output: 1_000, cacheRead: 0, cacheWrite: 0 },
+    }));
+    await h.runtime.start();
+    await h.agent({ type: 'created', sessionId: 'user-eco' });
+    await h.agent({ type: 'pre-step', sessionId: 'user-eco', userInitiated: true });
+    expect(h.runtime.state().self.body.tokens.value?.contextUsed).toBe(90_000);
+
+    // Switch to eco mode: token poll interval is 15_000ms, TTL is 45_000ms so tokens never expire at 15s/20s
+    await h.runtime.actions.setPowerMode('eco', 'test-eco');
+    await h.advance(20_000);
+    expect(h.runtime.state().self.body.tokens.status).toBe('ok');
+    expect(h.runtime.state().self.body.tokens.ttlMs).toBe(45_000);
+
+    // On-demand refresh() immediately reflects post-compaction token usage without waiting for next poll
+    usedTokens = 12_000;
+    await h.runtime.refresh();
+    expect(h.runtime.state().self.body.tokens.value?.contextUsed).toBe(12_000);
+
+    // Monotonic factStaleInMs stays accurate even if wall clock jumps forward by +1 hour
+    vi.setSystemTime(Date.now() + 3_600_000);
+    const rem = h.runtime.factStaleInMs('self.body.tokens');
+    expect(rem).toBe(45_000);
+
+    await h.runtime.stop();
+  });
 });

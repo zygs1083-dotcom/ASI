@@ -112,11 +112,51 @@ export function apply(ctx: Context): void {
 
   const navigateToSession = (sessionId: string) => {
     ctx.layout.selectPanel(null);
-    if (typeof document !== 'undefined') {
+    const navSignal = ctx.layout.beginNavigation?.();
+
+    const tryServiceSelect = (): boolean => {
+      const lookup = ctx as Context & {
+        get(name: string): { selectSession?: (id: string) => void; openSession?: (id: string) => void } | undefined;
+      };
+      for (const serviceName of ['uiSession', 'uiWorkspace', 'sessions']) {
+        try {
+          const svc = lookup.get(serviceName);
+          if (typeof svc?.selectSession === 'function') {
+            svc.selectSession(sessionId);
+            return true;
+          }
+          if (typeof svc?.openSession === 'function') {
+            svc.openSession(sessionId);
+            return true;
+          }
+        } catch {
+          // Optional service lookup or selection failed; fall back to sidebar DOM row.
+        }
+      }
+      return false;
+    };
+
+    const tryClickSidebarRow = (): boolean => {
+      if (typeof document === 'undefined') return false;
       const escaped = typeof CSS !== 'undefined' && CSS.escape ? CSS.escape(sessionId) : sessionId;
       const row = document.querySelector<HTMLElement>(`[data-row-key="session:${escaped}"]`);
-      row?.click();
-    }
+      if (!row) return false;
+      row.click();
+      return true;
+    };
+
+    if (tryServiceSelect()) return;
+    if (tryClickSidebarRow()) return;
+    if (typeof document === 'undefined') return;
+
+    let attempts = 0;
+    const retry = () => {
+      if (navSignal?.aborted || attempts >= 10) return;
+      attempts += 1;
+      if (tryClickSidebarRow()) return;
+      setTimeout(retry, 80);
+    };
+    setTimeout(retry, 60);
   };
 
   ctx.effect(async function* () {

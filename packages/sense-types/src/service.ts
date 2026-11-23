@@ -53,4 +53,8 @@ export interface AsiSenseServiceApi {
   registerInternalSession(sessionId: string): () => void;
   /** Return recent in-memory foreground signals (bounded, never persisted). */
   recentSignals(): Signal[];
+  /** Force an immediate refresh of DSH and active-session token facts (e.g. after background maintenance). */
+  refresh?(): Promise<void>;
+  /** Return remaining monotonic freshness (ms) for a fact path (e.g. `/self/body/cpu`), or `undefined` when untracked. */
+  factStaleInMs?(path: string): number | undefined;
 }

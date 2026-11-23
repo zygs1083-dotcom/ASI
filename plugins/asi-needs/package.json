@@ -124,7 +124,6 @@
     "pack:dist": "pnpm run build && node scripts/pack-dist.mjs && node scripts/pack-verify.mjs",
     "release:check": "pnpm run pack:dist && node scripts/release-check.mjs",
     "check": "pnpm run typecheck && pnpm exec biome check . && pnpm test",
-    "e2e:registry": "node scripts/e2e-registry.mjs",
     "generate": "node scripts/generate-typert.mjs",
     "typecheck": "pnpm run generate && tsc -p tsconfig.json",
     "test": "vitest run",

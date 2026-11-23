@@ -29,6 +29,10 @@ export const NEED_LABELS: Record<NeedKey, string> = {
 export interface PreviousNeedState {
   zone: NeedZone;
   driveActive: boolean;
+  satisfaction?: number;
+  mount?: string;
+  sessionId?: string;
+  batteryDriven?: boolean;
 }
 
 export interface EvaluateNeedsInput {
@@ -50,6 +54,12 @@ export interface EvaluatedNeedsResult {
 function clamp100(value: number): number {
   if (!Number.isFinite(value)) return 100;
   return Math.max(0, Math.min(100, Math.round(value)));
+}
+
+function holdDriveSat(prev: PreviousNeedState): number {
+  const fallback = prev.zone === 'critical' ? 20 : 45;
+  const raw = prev.satisfaction !== undefined && Number.isFinite(prev.satisfaction) ? prev.satisfaction : fallback;
+  return Math.min(69, clamp100(raw));
 }
 
 export function applyHysteresis(
@@ -155,10 +165,20 @@ function evalEnergy(
       batSat = Math.min(batSat, 15);
       batSummary = `续航不足 ${Math.ceil(b.minutesLeft)} 分钟，急需接通电源`;
     }
+  } else if (
+    prev?.driveActive &&
+    prev.batteryDriven !== false &&
+    battery.status !== 'unsupported' &&
+    battery.status !== 'denied'
+  ) {
+    batSat = holdDriveSat(prev);
+    evidence.batteryPercent = null;
+    batSummary = '电源读数暂不可用，保持上次状态';
   } else {
     evidence.batteryPercent = null;
     batSummary = '电源状态待读取';
   }
+  evidence.batteryDriven = batSat < 70;
 
   const connSat = effectiveConn === 'offline' ? 15 : effectiveConn === 'degraded' ? 45 : 100;
   const raw = Math.min(batSat, connSat);
@@ -182,7 +202,7 @@ function evalEnergy(
 }
 
 function evalSpace(snapshot: SenseSnapshot, prev?: PreviousNeedState): NeedEvaluation {
-  const disks = effectiveDisks(snapshot.state.self.body.disks, snapshot.now);
+  const disks = effectiveDisks(snapshot.state.self.body.disks, Number.NEGATIVE_INFINITY);
   const freshVolumes = (disks.value ?? []).filter(
     (v) => v.status === 'ok' && Number.isFinite(v.total) && v.total > 0 && Number.isFinite(v.free) && v.free >= 0,
   );
@@ -190,13 +210,19 @@ function evalSpace(snapshot: SenseSnapshot, prev?: PreviousNeedState): NeedEvalu
 
   const firstVol = freshVolumes[0];
   if (!firstVol) {
-    const h = applyHysteresis(100, prev);
+    const raw =
+      prev?.driveActive && disks.status !== 'unsupported' && disks.status !== 'denied' ? holdDriveSat(prev) : 100;
+    const h = applyHysteresis(raw, prev);
     return {
       key: 'space',
       label: NEED_LABELS.space,
       ...h,
-      summary: partialCount > 0 ? '磁盘读数已过期或暂不可用，保持上次状态' : '磁盘空间待采集',
-      evidence: { freshVolumes: 0, indeterminateVolumes: partialCount },
+      summary: partialCount > 0 || prev?.driveActive ? '磁盘读数已过期或暂不可用，保持上次状态' : '磁盘空间待采集',
+      evidence: {
+        ...(prev?.mount ? { mount: prev.mount } : {}),
+        freshVolumes: 0,
+        indeterminateVolumes: partialCount,
+      },
       updatedAt: snapshot.now,
     };
   }
@@ -238,6 +264,30 @@ function evalSpace(snapshot: SenseSnapshot, prev?: PreviousNeedState): NeedEvalu
       worstFree = vol.free;
       worstRatio = ratio;
       worstDropPerMin = dropPerMin;
+    }
+  }
+
+  const prevMountIndeterminate =
+    prev?.driveActive === true &&
+    partialCount > 0 &&
+    (prev.mount === undefined || disks.indeterminateMounts.includes(prev.mount));
+  if (prevMountIndeterminate && prev) {
+    const held = holdDriveSat(prev);
+    if (held < worstSat) {
+      const h = applyHysteresis(held, prev);
+      const targetMount = prev.mount ?? disks.indeterminateMounts[0] ?? worstMount;
+      return {
+        key: 'space',
+        label: NEED_LABELS.space,
+        ...h,
+        summary: `卷 ${targetMount} 读数已过期或暂不可用，保持上次状态`,
+        evidence: {
+          mount: targetMount,
+          freshVolumes: freshVolumes.length,
+          indeterminateVolumes: partialCount,
+        },
+        updatedAt: snapshot.now,
+      };
     }
   }
 
@@ -284,6 +334,9 @@ function evalMemory(snapshot: SenseSnapshot, stuckJobCount: number, prev?: Previ
       memSat = Math.max(70, Math.round(100 - Math.max(0, ratio - 0.5) * 60));
       memDesc = `系统内存正常（已用 ${Math.round(ratio * 100)}%）`;
     }
+  } else if (prev?.driveActive && memory.status !== 'unsupported' && memory.status !== 'denied') {
+    memSat = holdDriveSat(prev);
+    memDesc = '系统内存读数暂不可用，保持上次状态';
   }
 
   let procSat = 100;
@@ -325,6 +378,7 @@ function evalMemory(snapshot: SenseSnapshot, stuckJobCount: number, prev?: Previ
 
 function evalMind(snapshot: SenseSnapshot, prev?: PreviousNeedState): NeedEvaluation {
   const { tokens } = snapshot.state.self.body;
+  const sessionId = snapshot.activeSessionId;
   if (
     tokens.status !== 'ok' ||
     !tokens.value ||
@@ -334,13 +388,28 @@ function evalMind(snapshot: SenseSnapshot, prev?: PreviousNeedState): NeedEvalua
     !Number.isFinite(tokens.value.contextWindow) ||
     !Number.isFinite(tokens.value.contextUsed)
   ) {
-    const h = applyHysteresis(100, prev);
+    const sameSessionReadingMissing =
+      prev?.driveActive === true &&
+      (sessionId !== undefined || tokens.status === 'unknown') &&
+      (prev.sessionId === undefined || sessionId === undefined || prev.sessionId === sessionId) &&
+      tokens.reason !== '没有活动会话' &&
+      tokens.reason !== '会话中尚未收到用量';
+    const raw = sameSessionReadingMissing && prev ? holdDriveSat(prev) : 100;
+    const h = applyHysteresis(raw, prev);
     return {
       key: 'mind',
       label: NEED_LABELS.mind,
       ...h,
-      summary: '暂无活动上下文容量压力',
-      evidence: { contextUsed: null, contextWindow: null },
+      summary: sameSessionReadingMissing ? '上下文容量读数刷新中，保持上次状态' : '暂无活动上下文容量压力',
+      evidence: {
+        ...(sessionId
+          ? { sessionId }
+          : prev?.sessionId && sameSessionReadingMissing
+            ? { sessionId: prev.sessionId }
+            : {}),
+        contextUsed: null,
+        contextWindow: null,
+      },
       updatedAt: snapshot.now,
     };
   }
@@ -379,6 +448,7 @@ function evalMind(snapshot: SenseSnapshot, prev?: PreviousNeedState): NeedEvalua
         ? `上下文余量 ${remPct}%${sourceTag}`
         : `上下文仅剩 ${remPct}%${sourceTag}，空闲时可压缩整理`,
     evidence: {
+      ...(sessionId ? { sessionId } : {}),
       contextUsed: Math.round(used),
       contextWindow: Math.round(win),
       remainingRatio: Number(rem.toFixed(4)),
@@ -406,6 +476,9 @@ function evalThermals(snapshot: SenseSnapshot, prev?: PreviousNeedState): NeedEv
       thermSat = 78;
       thermDesc = '设备温度略高';
     }
+  } else if (prev?.driveActive && (thermal.status === 'stale' || thermal.status === 'unknown')) {
+    thermSat = holdDriveSat(prev);
+    thermDesc = '温控读数暂不可用，保持上次状态';
   }
 
   let cpuSat = 100;

@@ -186,12 +186,23 @@ export function createDshPort(
           call(cb, { type: 'post-step', sessionId: agent.id });
         }
       });
+      const offCompact = ctx.on(
+        'session/event',
+        (session, event) => {
+          const eventType: string = event.type;
+          if (eventType === 'compaction/end' || eventType === 'compaction/prune') {
+            call(cb, { type: 'post-step', sessionId: session.id });
+          }
+        },
+        { global: true },
+      );
       for (const agent of ctx.agents.list()) call(cb, { type: 'created', sessionId: agent.id });
       return () => {
         offCreated();
         offDisposed();
         offStep();
         offStatus();
+        offCompact();
         turns.clear();
       };
     },
