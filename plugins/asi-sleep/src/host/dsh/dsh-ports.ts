@@ -1,16 +1,18 @@
 import { realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
+import { dirname, join } from 'node:path';
 import type { Context } from '@deepseek-ai/cordis';
 import type { Agent } from '@deepseek-ai/dsh-agent';
 import type {} from '@deepseek-ai/dsh-llm';
-import type { Session } from '@deepseek-ai/dsh-session';
+import type { Session, SessionEvent, SessionId } from '@deepseek-ai/dsh-session';
+import type { SessionQueryEngine } from '@deepseek-ai/dsh-session-query';
 import type { WorkspaceRegistry } from '@deepseek-ai/dsh-workspace';
 import type { ConversationTurnInput } from '../consolidator.js';
 import type { SleepConversationPort, SleepHostPorts } from '../ports.js';
 
-const INTERNAL_SESSION_ID_RE = /^asi-(?:maint|sleep|care|sense|internal)(?:[-_:]|$)/i;
+export const INTERNAL_SESSION_ID_RE = /^asi-(?:maint|sleep|care|sense|internal)(?:[-_:]|$)/i;
 const INTERNAL_CWD_RE =
-  /(?:^|[\\/])(?:asi-(?:needs|sleep|care|sense)[\\/]sandbox|data[\\/]asi-(?:needs|sleep|care|sense))(?:[\\/]|$)/i;
+  /(?:^|[\\/])(?:(?:asi[-_])?(?:needs|sleep|care|sense)[\\/]sandbox|data[\\/]asi-(?:needs|sleep|care|sense))(?:[\\/]|$)/i;
 
 function safeRealpath(p: string): string {
   try {
@@ -26,6 +28,28 @@ function isInsideRoot(candidate: string | undefined, root: string | undefined): 
   const rc = safeRealpath(candidate);
   const rr = safeRealpath(root);
   return rc === rr || rc.startsWith(`${rr}/`);
+}
+
+export function buildExcludedInternalRoots(storageRoot: string, senseStorageRoot?: string): string[] {
+  const roots = new Set<string>([storageRoot]);
+  if (senseStorageRoot) {
+    roots.add(senseStorageRoot);
+    const parent = dirname(senseStorageRoot);
+    if (parent && parent !== '/') {
+      roots.add(join(parent, 'asi-needs'));
+      roots.add(join(parent, 'asi-care'));
+      roots.add(join(parent, 'needs', 'sandbox'));
+      roots.add(join(parent, 'care', 'sandbox'));
+    }
+  }
+  const sleepParent = dirname(storageRoot);
+  if (sleepParent && sleepParent !== '/') {
+    roots.add(join(sleepParent, 'asi-needs'));
+    roots.add(join(sleepParent, 'asi-care'));
+    roots.add(join(sleepParent, 'needs', 'sandbox'));
+    roots.add(join(sleepParent, 'care', 'sandbox'));
+  }
+  return [...roots];
 }
 
 export function isOrdinaryDshSession(
@@ -47,12 +71,137 @@ export function isOrdinaryDshSession(
   return true;
 }
 
+export function extractTurnsFromOwnEvents(
+  sessionId: string,
+  cwd: string | undefined,
+  events: readonly SessionEvent[],
+  isRunning: boolean,
+  fallbackNow: number,
+  sessionTitle?: string,
+): ConversationTurnInput[] {
+  interface DraftEventTurn {
+    turnId: string;
+    seq: number;
+    at: number;
+    turnNumber?: number;
+    closedStatus?: 'completed' | 'failed' | 'open';
+    userText: string;
+    assistantTexts: string[];
+    toolNames: string[];
+  }
+
+  const drafts: DraftEventTurn[] = [];
+  let current: DraftEventTurn | undefined;
+  let activeTurnNumber: number | undefined;
+  let sawTurnLifecycle = false;
+
+  for (const event of events) {
+    if (event.type === 'turn/start') {
+      sawTurnLifecycle = true;
+      activeTurnNumber = event.data.turn;
+      continue;
+    }
+
+    if (event.type === 'user/message') {
+      if (event.surfaceOp !== 'append') continue;
+      const src = event.data.source as { kind?: string; form?: string } | undefined;
+      if (src?.kind !== 'user' || src.form !== undefined) continue;
+      const textParts: string[] = [];
+      for (const block of event.data.content ?? []) {
+        if (block.type === 'text' && block.text.trim()) {
+          textParts.push(block.text.trim());
+        }
+      }
+      const userText = textParts.join('\n').trim();
+      if (!userText) continue;
+      const eventTime =
+        typeof event.time === 'number' && Number.isFinite(event.time) && event.time > 0 ? event.time : fallbackNow;
+      current = {
+        turnId: String(event.data.id),
+        seq: Number(event.seq),
+        at: eventTime,
+        ...(activeTurnNumber !== undefined ? { turnNumber: activeTurnNumber, closedStatus: 'open' } : {}),
+        userText,
+        assistantTexts: [],
+        toolNames: [],
+      };
+      drafts.push(current);
+      continue;
+    }
+
+    if (event.type === 'assistant/message' && current) {
+      if (event.surfaceOp !== 'append') continue;
+      if (event.data.interrupted) continue;
+      current.seq = Math.max(current.seq, Number(event.seq));
+      for (const block of event.data.message.content ?? []) {
+        if (block.type === 'text' && block.text.trim()) {
+          current.assistantTexts.push(block.text.trim());
+        } else if (block.type === 'tool-call' && typeof block.name === 'string') {
+          if (!current.toolNames.includes(block.name)) current.toolNames.push(block.name);
+        }
+      }
+      continue;
+    }
+
+    if (event.type === 'tool/call' && current) {
+      current.seq = Math.max(current.seq, Number(event.seq));
+      if (typeof event.data.name === 'string' && !current.toolNames.includes(event.data.name)) {
+        current.toolNames.push(event.data.name);
+      }
+      continue;
+    }
+
+    if (event.type === 'turn/end') {
+      sawTurnLifecycle = true;
+      const reasonKind = event.data.reason?.kind;
+      if (current && (current.turnNumber === undefined || current.turnNumber === event.data.turn)) {
+        current.seq = Math.max(current.seq, Number(event.seq));
+        current.closedStatus = reasonKind === 'completed' || reasonKind === 'max-tokens' ? 'completed' : 'failed';
+      }
+      activeTurnNumber = undefined;
+    }
+  }
+
+  const completedDrafts = sawTurnLifecycle
+    ? drafts.filter((d, idx) => {
+        if (isRunning && idx === drafts.length - 1 && d.closedStatus !== 'completed') return false;
+        if (d.closedStatus === 'open' || d.closedStatus === 'failed') return false;
+        return true;
+      })
+    : isRunning && drafts.length > 0
+      ? drafts.slice(0, -1)
+      : drafts;
+
+  const out: ConversationTurnInput[] = [];
+  for (const d of completedDrafts) {
+    const assistantText = d.assistantTexts.join('\n').trim();
+    if (!assistantText) continue;
+    out.push({
+      turnId: d.turnId,
+      sessionId,
+      seq: d.seq,
+      ...(sessionTitle ? { sessionTitle } : {}),
+      ...(cwd ? { cwd } : {}),
+      at: d.at,
+      userText: d.userText,
+      assistantText,
+      ...(d.toolNames.length > 0 ? { toolNames: d.toolNames } : {}),
+    });
+  }
+  return out;
+}
+
 export function createDshSleepPorts(ctx: Context, storageRoot: string, options?: { homeDir?: string }): SleepHostPorts {
-  const excludedRoots = [storageRoot, ctx.asiSense?.storageRoot];
+  const excludedRoots = buildExcludedInternalRoots(storageRoot, ctx.asiSense?.storageRoot);
   const turnFirstSeenAt = new Map<string, number>();
+  const coldSessionTurns = new Map<string, ConversationTurnInput[]>();
+  const sessionTitles = new Map<string, string>();
 
   const getWorkspaceRegistry = (): WorkspaceRegistry | undefined =>
     (ctx as Context & { get(name: 'workspaceRegistry'): WorkspaceRegistry | undefined }).get('workspaceRegistry');
+
+  const getSessionQuery = (): SessionQueryEngine | undefined =>
+    (ctx as Context & { get(name: 'sessionQuery'): SessionQueryEngine | undefined }).get('sessionQuery');
 
   const isArchived = (sessionId: string): boolean => {
     const wr = getWorkspaceRegistry();
@@ -67,6 +216,19 @@ export function createDshSleepPorts(ctx: Context, storageRoot: string, options?:
 
   const extractSessionTurns = (session: Session, isRunning: boolean, now: number): ConversationTurnInput[] => {
     if (!isOrdinaryDshSession(session, excludedRoots)) return [];
+    const sid = String(session.id);
+    const cwd = session.header?.cwd;
+    const title = sessionTitles.get(sid);
+
+    if (typeof session.ownEvents === 'function') {
+      try {
+        const own = session.ownEvents();
+        return extractTurnsFromOwnEvents(sid, cwd, own, isRunning, now, title);
+      } catch {
+        // Fall through to deriveMessages fallback if mock session throws
+      }
+    }
+
     if (typeof session.deriveMessages !== 'function') return [];
 
     let messages: ReturnType<Session['deriveMessages']>;
@@ -76,15 +238,15 @@ export function createDshSleepPorts(ctx: Context, storageRoot: string, options?:
       return [];
     }
 
-    interface DraftTurn {
+    interface FallbackDraftTurn {
       turnId: string;
       userText: string;
       assistantTexts: string[];
       toolNames: string[];
     }
 
-    const drafts: DraftTurn[] = [];
-    let current: DraftTurn | undefined;
+    const drafts: FallbackDraftTurn[] = [];
+    let current: FallbackDraftTurn | undefined;
 
     for (const msg of messages) {
       if (msg.role === 'user') {
@@ -118,8 +280,6 @@ export function createDshSleepPorts(ctx: Context, storageRoot: string, options?:
 
     const completedDrafts = isRunning && drafts.length > 0 ? drafts.slice(0, -1) : drafts;
     const out: ConversationTurnInput[] = [];
-    const sid = String(session.id);
-    const cwd = session.header?.cwd;
 
     for (const d of completedDrafts) {
       const assistantText = d.assistantTexts.join('\n').trim();
@@ -137,6 +297,7 @@ export function createDshSleepPorts(ctx: Context, storageRoot: string, options?:
       out.push({
         turnId: d.turnId,
         sessionId: sid,
+        ...(title ? { sessionTitle: title } : {}),
         ...(cwd ? { cwd } : {}),
         at: seenAt,
         userText: d.userText,
@@ -168,7 +329,15 @@ export function createDshSleepPorts(ctx: Context, storageRoot: string, options?:
 
       const allTurns: ConversationTurnInput[] = [];
       for (const [sid, session] of sessionsMap) {
+        coldSessionTurns.delete(sid);
         allTurns.push(...extractSessionTurns(session, runningIds.has(sid), now));
+      }
+      for (const [sid, coldTurns] of coldSessionTurns) {
+        if (isArchived(sid)) {
+          coldSessionTurns.delete(sid);
+          continue;
+        }
+        allTurns.push(...coldTurns);
       }
       return allTurns;
     },
@@ -186,6 +355,7 @@ export function createDshSleepPorts(ctx: Context, storageRoot: string, options?:
         (session, event) => {
           if (!isOrdinaryDshSession(session, excludedRoots) || isArchived(String(session.id))) return;
           if (event.type === 'user/message') {
+            if (event.surfaceOp !== 'append') return;
             const src = (event.data as { source?: { kind?: string; form?: string } })?.source;
             if (src?.kind === 'user' && src.form === undefined) listener();
             return;
@@ -208,10 +378,57 @@ export function createDshSleepPorts(ctx: Context, storageRoot: string, options?:
         offAgentStatus();
       };
     },
+
+    async warmColdSessions(signal: AbortSignal): Promise<void> {
+      const sq = getSessionQuery();
+      if (!sq || typeof sq.listSessions !== 'function' || typeof sq.readSession !== 'function') return;
+      const records = await sq.listSessions(signal);
+      if (signal.aborted) return;
+
+      const liveIds = new Set<string>([
+        ...(ctx.agents?.list() ?? []).map((a) => String(a.id)),
+        ...(ctx.sessions?.list() ?? []).map((s) => String(s.id)),
+      ]);
+
+      let inspected = 0;
+      for (const rec of records) {
+        if (signal.aborted || inspected >= 25) break;
+        const sid = String(rec.header.id);
+        if (rec.live || liveIds.has(sid) || isArchived(sid)) continue;
+        if (!isOrdinaryDshSession({ id: rec.header.id, header: rec.header }, excludedRoots)) continue;
+        inspected += 1;
+        try {
+          if (typeof sq.readTitle === 'function') {
+            const titleSnap = await sq.readTitle(rec.header.id as SessionId, signal).catch(() => undefined);
+            if (titleSnap && typeof titleSnap.title === 'string' && titleSnap.title.trim()) {
+              sessionTitles.set(sid, titleSnap.title.trim());
+            }
+          }
+          const logSnap = await sq.readSession(rec.header.id as SessionId);
+          if (signal.aborted) return;
+          if (ctx.sessions?.get?.(rec.header.id as SessionId)) continue;
+          const inherited = Math.max(0, Number(logSnap.inheritedEventCount ?? 0));
+          const ownEvents = logSnap.events.slice(inherited);
+          const extracted = extractTurnsFromOwnEvents(
+            sid,
+            logSnap.session.cwd,
+            ownEvents,
+            false,
+            logSnap.session.createdAt || Date.now(),
+            sessionTitles.get(sid),
+          );
+          if (extracted.length > 0) {
+            coldSessionTurns.set(sid, extracted);
+          }
+        } catch {
+          // Isolate cold-session read errors
+        }
+      }
+    },
   };
 
   const llmExtract = async (prompt: string, signal: AbortSignal): Promise<string | undefined> => {
-    if (!ctx.llm || typeof ctx.llm.stream !== 'function') return undefined;
+    if (!ctx.llm || typeof ctx.llm.stream !== 'function' || signal.aborted) return undefined;
     let route: { provider: string; model: string } | undefined;
     for (const agent of ctx.agents?.list() ?? []) {
       if (!isOrdinaryAgent(agent)) continue;
@@ -224,25 +441,48 @@ export function createDshSleepPorts(ctx: Context, storageRoot: string, options?:
     if (!route) return undefined;
 
     const runStream = async (): Promise<string | undefined> => {
-      let text = '';
-      const stream = ctx.llm.stream({
-        provider: route.provider,
-        model: route.model,
-        system: 'You extract concise structured JSON memories and never output secrets.',
-        messages: [{ role: 'user', content: [{ type: 'text', text: prompt }] }],
-        temperature: 0.1,
-        maxTokens: 1_200,
-        signal,
+      let onAbort: (() => void) | undefined;
+      const abortPromise = new Promise<'aborted'>((resolve) => {
+        if (signal.aborted) {
+          resolve('aborted');
+          return;
+        }
+        onAbort = () => resolve('aborted');
+        signal.addEventListener('abort', onAbort, { once: true });
       });
-      for await (const chunk of stream) {
-        if (signal.aborted) break;
-        if (chunk.type === 'text-delta') {
-          text += chunk.text;
-        } else if (chunk.type === 'finish' && (chunk.reason.kind === 'error' || chunk.reason.kind === 'aborted')) {
+
+      const consumePromise = (async (): Promise<string | undefined> => {
+        let text = '';
+        const stream = ctx.llm.stream({
+          provider: route.provider,
+          model: route.model,
+          system: 'You extract concise structured JSON memories and never output secrets.',
+          messages: [{ role: 'user', content: [{ type: 'text', text: prompt }] }],
+          temperature: 0.1,
+          maxTokens: 1_200,
+          signal,
+        });
+        for await (const chunk of stream) {
+          if (signal.aborted) break;
+          if (chunk.type === 'text-delta') {
+            text += chunk.text;
+          } else if (chunk.type === 'finish' && (chunk.reason.kind === 'error' || chunk.reason.kind === 'aborted')) {
+            return undefined;
+          }
+        }
+        return text.trim() || undefined;
+      })();
+
+      try {
+        const raced = await Promise.race([consumePromise, abortPromise]);
+        if (raced === 'aborted') {
+          void consumePromise.catch(() => undefined);
           return undefined;
         }
+        return raced;
+      } finally {
+        if (onAbort) signal.removeEventListener('abort', onAbort);
       }
-      return text.trim() || undefined;
     };
 
     if (typeof ctx.agents?.withoutInitiator === 'function') {

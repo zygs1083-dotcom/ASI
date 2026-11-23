@@ -34,8 +34,9 @@ import { computeMemoryRetention, createInitialFsrsState, strengthenFsrsState } f
 import type { SleepHostPorts } from './ports.js';
 import { MemoryVault, sanitizeMemoryEntry, sanitizeSleepText } from './vault.js';
 
-const MAX_TRACKED_TURN_KEYS = 2_000;
-const MAX_PANEL_MEMORIES = 200;
+const MAX_TRACKED_TURN_KEYS = 10_000;
+const MAX_TRACKED_SESSION_WATERMARKS = 2_000;
+const MAX_PANEL_MEMORIES = 500;
 
 interface PersistedSleepState {
   autoSleepPaused?: boolean;
@@ -44,6 +45,7 @@ interface PersistedSleepState {
   lastOrdinaryActivityAt?: number;
   autoRunTimestamps?: number[];
   consolidatedTurnKeys?: string[];
+  consolidatedSessionWatermarks?: Record<string, number>;
 }
 
 export interface RecallQueryInput {
@@ -133,6 +135,7 @@ export function createSleepRuntime(ports: SleepHostPorts): SleepRuntime {
   let autoRunTimestamps: number[] = [];
   const consolidatedTurnKeys: string[] = [];
   const consolidatedTurnKeySet = new Set<string>();
+  const consolidatedSessionWatermarks = new Map<string, number>();
 
   let latestSense: SenseSnapshot = ports.sense.snapshot();
   let higherOrderSuppressed = false;
@@ -141,6 +144,8 @@ export function createSleepRuntime(ports: SleepHostPorts): SleepRuntime {
   let activeConsolidationPromise: Promise<SleepConsolidationRecord> | undefined;
   let activeConsolidationAbort: AbortController | undefined;
   let activeConsolidationTrigger: SleepConsolidationTrigger | null = null;
+  let manualPreemptPending = false;
+  let coldWarmupAbort: AbortController | undefined;
 
   let quietTimer: ReturnType<typeof setTimeout> | undefined;
   let timeThresholdTimer: ReturnType<typeof setTimeout> | undefined;
@@ -174,16 +179,75 @@ export function createSleepRuntime(ports: SleepHostPorts): SleepRuntime {
     }
   }
 
-  function recordConsolidatedKeys(keys: readonly string[]): void {
+  function isTurnConsolidated(turn: Pick<ConversationTurnInput, 'sessionId' | 'turnId' | 'seq'>): boolean {
+    if (typeof turn.seq === 'number' && Number.isFinite(turn.seq)) {
+      const watermark = consolidatedSessionWatermarks.get(turn.sessionId);
+      if (watermark !== undefined && turn.seq <= watermark) {
+        return true;
+      }
+    }
+    return consolidatedTurnKeySet.has(turnKeyOf(turn));
+  }
+
+  function recordConsolidatedKeys(keys: readonly string[], liveProtectedKeys?: ReadonlySet<string>): void {
     for (const key of keys) {
       if (consolidatedTurnKeySet.has(key)) continue;
       consolidatedTurnKeySet.add(key);
       consolidatedTurnKeys.push(key);
     }
-    while (consolidatedTurnKeys.length > MAX_TRACKED_TURN_KEYS) {
-      const evicted = consolidatedTurnKeys.shift();
-      if (evicted) consolidatedTurnKeySet.delete(evicted);
+    if (consolidatedTurnKeys.length > MAX_TRACKED_TURN_KEYS) {
+      let excess = consolidatedTurnKeys.length - MAX_TRACKED_TURN_KEYS;
+      if (liveProtectedKeys && liveProtectedKeys.size > 0) {
+        let idx = 0;
+        while (excess > 0 && idx < consolidatedTurnKeys.length) {
+          const candidate = consolidatedTurnKeys[idx];
+          if (candidate && !liveProtectedKeys.has(candidate)) {
+            consolidatedTurnKeys.splice(idx, 1);
+            consolidatedTurnKeySet.delete(candidate);
+            excess -= 1;
+          } else {
+            idx += 1;
+          }
+        }
+      } else {
+        while (excess > 0 && consolidatedTurnKeys.length > 0) {
+          const evicted = consolidatedTurnKeys.shift();
+          if (evicted) consolidatedTurnKeySet.delete(evicted);
+          excess -= 1;
+        }
+      }
+      // Hard safety ceiling in case a single process holds >50k non-seq mock turns in RAM
+      while (consolidatedTurnKeys.length > 50_000) {
+        const evicted = consolidatedTurnKeys.shift();
+        if (evicted) consolidatedTurnKeySet.delete(evicted);
+      }
     }
+  }
+
+  function recordConsolidatedTurns(
+    turns: readonly Pick<ConversationTurnInput, 'sessionId' | 'turnId' | 'seq'>[],
+    liveTurns?: readonly Pick<ConversationTurnInput, 'sessionId' | 'turnId' | 'seq'>[],
+  ): void {
+    const keysToRecord: string[] = [];
+    for (const t of turns) {
+      if (typeof t.seq === 'number' && Number.isFinite(t.seq)) {
+        const prev = consolidatedSessionWatermarks.get(t.sessionId);
+        const nextSeq = prev !== undefined ? Math.max(prev, Math.trunc(t.seq)) : Math.trunc(t.seq);
+        consolidatedSessionWatermarks.delete(t.sessionId);
+        consolidatedSessionWatermarks.set(t.sessionId, nextSeq);
+      } else {
+        keysToRecord.push(turnKeyOf(t));
+      }
+    }
+    while (consolidatedSessionWatermarks.size > MAX_TRACKED_SESSION_WATERMARKS) {
+      const oldestSession = consolidatedSessionWatermarks.keys().next().value;
+      if (!oldestSession) break;
+      consolidatedSessionWatermarks.delete(oldestSession);
+    }
+    const liveProtected = liveTurns
+      ? new Set(liveTurns.filter((t) => !(typeof t.seq === 'number' && Number.isFinite(t.seq))).map(turnKeyOf))
+      : undefined;
+    recordConsolidatedKeys(keysToRecord, liveProtected);
   }
 
   function pruneOldAutoTimestamps(now: number): void {
@@ -200,6 +264,7 @@ export function createSleepRuntime(ports: SleepHostPorts): SleepRuntime {
         lastOrdinaryActivityAt,
         autoRunTimestamps: [...autoRunTimestamps],
         consolidatedTurnKeys: [...consolidatedTurnKeys],
+        consolidatedSessionWatermarks: Object.fromEntries(consolidatedSessionWatermarks),
       };
       const tmp = `${statePath}.${randomUUID()}.tmp`;
       try {
@@ -222,12 +287,17 @@ export function createSleepRuntime(ports: SleepHostPorts): SleepRuntime {
     } catch {
       all = [];
     }
-    const pending = all.filter((t) => !consolidatedTurnKeySet.has(turnKeyOf(t)));
+    const pending = all.filter((t) => !isTurnConsolidated(t));
     if (pending.length === 0) {
       firstUnconsolidatedTurnAt = null;
-    } else if (firstUnconsolidatedTurnAt === null) {
-      const earliest = Math.min(...pending.map((t) => (Number.isFinite(t.at) && t.at > 0 ? t.at : now)));
-      firstUnconsolidatedTurnAt = earliest;
+    } else {
+      let earliest = Number.POSITIVE_INFINITY;
+      for (const t of pending) {
+        if (typeof t.at === 'number' && Number.isFinite(t.at) && t.at > 0 && t.at < earliest) {
+          earliest = t.at;
+        }
+      }
+      firstUnconsolidatedTurnAt = Number.isFinite(earliest) ? earliest : (firstUnconsolidatedTurnAt ?? now);
     }
     return pending;
   }
@@ -397,7 +467,13 @@ export function createSleepRuntime(ports: SleepHostPorts): SleepRuntime {
         const commitNow = clock.wall();
         vault.replaceAll(result.memories);
         const savedRecord = vault.appendJournal({ ...result.record, at: commitNow });
-        recordConsolidatedKeys(turnsToProcess.map(turnKeyOf));
+        let latestAllTurns: ConversationTurnInput[] = turnsToProcess;
+        try {
+          latestAllTurns = ports.conversations.listCompletedOrdinaryTurns();
+        } catch {
+          latestAllTurns = turnsToProcess;
+        }
+        recordConsolidatedTurns(turnsToProcess, latestAllTurns);
         lastSleepAt = commitNow;
         pendingOrdinaryTurns(commitNow);
 
@@ -437,7 +513,7 @@ export function createSleepRuntime(ports: SleepHostPorts): SleepRuntime {
     const evaluated = computeEvaluated(latestSense);
     ports.drives.notifySourceChanged('asi-sleep');
 
-    if (!activeConsolidationPromise && evaluated.canAutoConsolidate) {
+    if (!activeConsolidationPromise && !manualPreemptPending && evaluated.canAutoConsolidate) {
       void executeConsolidation('auto').catch(() => {
         // Preempted or transient failure; timers reschedule in finally
       });
@@ -459,9 +535,15 @@ export function createSleepRuntime(ports: SleepHostPorts): SleepRuntime {
     async consolidateNow(): Promise<SleepConsolidationRecord> {
       if (stopped) throw new Error('asi-sleep runtime is stopped');
       if (activeConsolidationPromise && activeConsolidationTrigger !== 'manual') {
-        activeConsolidationAbort?.abort();
-        await activeConsolidationPromise.catch(() => undefined);
+        manualPreemptPending = true;
+        try {
+          activeConsolidationAbort?.abort();
+          await activeConsolidationPromise.catch(() => undefined);
+        } finally {
+          manualPreemptPending = false;
+        }
       }
+      if (stopped) throw new Error('asi-sleep runtime is stopped');
       return executeConsolidation('manual');
     },
 
@@ -475,13 +557,19 @@ export function createSleepRuntime(ports: SleepHostPorts): SleepRuntime {
     },
 
     async createMemory(input: MemoryCreateInput): Promise<MemoryViewItem> {
-      if (!isMemoryKind(input.kind)) {
+      if (!input || typeof input !== 'object' || Array.isArray(input) || !isMemoryKind(input.kind)) {
         throw new Error('Invalid memory kind');
       }
-      const title = sanitizeSleepText(input.title ?? '', 140, ports.homeDir);
-      const content = sanitizeSleepText(input.content ?? '', 1_600, ports.homeDir);
+      const title = typeof input.title === 'string' ? sanitizeSleepText(input.title, 140, ports.homeDir) : '';
+      const content = typeof input.content === 'string' ? sanitizeSleepText(input.content, 1_600, ports.homeDir) : '';
       if (!title || !content) {
         throw new Error('title and content are required');
+      }
+      if (input.tags !== undefined && !Array.isArray(input.tags)) {
+        throw new Error('tags must be an array of strings');
+      }
+      if (input.topicKey !== undefined && typeof input.topicKey !== 'string') {
+        throw new Error('topicKey must be a string');
       }
       const now = clock.wall();
       const created = vault.upsert({
@@ -489,8 +577,8 @@ export function createSleepRuntime(ports: SleepHostPorts): SleepRuntime {
         kind: input.kind,
         title,
         content,
-        tags: input.tags ?? [],
-        ...(input.topicKey ? { topicKey: input.topicKey } : {}),
+        tags: Array.isArray(input.tags) ? input.tags : [],
+        ...(typeof input.topicKey === 'string' && input.topicKey.trim() ? { topicKey: input.topicKey } : {}),
         pinned: Boolean(input.pinned),
         confidence: 1,
         sourceSessionIds: ['manual'],
@@ -507,10 +595,26 @@ export function createSleepRuntime(ports: SleepHostPorts): SleepRuntime {
     },
 
     async updateMemory(id: string, patch: MemoryUpdateInput): Promise<MemoryViewItem> {
+      const safeId = sanitizeSleepText(typeof id === 'string' ? id : '', 64, ports.homeDir);
       const existing = vault.get(id);
-      if (!existing) throw new Error(`Memory not found: ${id}`);
+      if (!existing) throw new Error(`Memory not found: ${safeId || 'unknown'}`);
+      if (!patch || typeof patch !== 'object' || Array.isArray(patch)) {
+        throw new Error('patch must be an object');
+      }
       if (patch.kind !== undefined && !isMemoryKind(patch.kind)) {
         throw new Error('Invalid memory kind');
+      }
+      if (patch.title !== undefined && typeof patch.title !== 'string') {
+        throw new Error('title must be a string');
+      }
+      if (patch.content !== undefined && typeof patch.content !== 'string') {
+        throw new Error('content must be a string');
+      }
+      if (patch.tags !== undefined && !Array.isArray(patch.tags)) {
+        throw new Error('tags must be an array of strings');
+      }
+      if (patch.topicKey !== undefined && typeof patch.topicKey !== 'string') {
+        throw new Error('topicKey must be a string');
       }
       const nextTitle = patch.title !== undefined ? sanitizeSleepText(patch.title, 140, ports.homeDir) : existing.title;
       const nextContent =
@@ -549,8 +653,9 @@ export function createSleepRuntime(ports: SleepHostPorts): SleepRuntime {
     },
 
     async deleteMemory(id: string): Promise<void> {
+      const safeId = sanitizeSleepText(typeof id === 'string' ? id : '', 64, ports.homeDir);
       const existed = vault.delete(id);
-      if (!existed) throw new Error(`Memory not found: ${id}`);
+      if (!existed) throw new Error(`Memory not found: ${safeId || 'unknown'}`);
       const now = clock.wall();
       await vault.flush(now);
       ports.drives.notifySourceChanged('asi-sleep');
@@ -604,6 +709,13 @@ export function createSleepRuntime(ports: SleepHostPorts): SleepRuntime {
         }
         if (Array.isArray(parsed.consolidatedTurnKeys)) {
           recordConsolidatedKeys(parsed.consolidatedTurnKeys.filter((k): k is string => typeof k === 'string'));
+        }
+        if (parsed.consolidatedSessionWatermarks && typeof parsed.consolidatedSessionWatermarks === 'object') {
+          for (const [sid, seqVal] of Object.entries(parsed.consolidatedSessionWatermarks)) {
+            if (sid && typeof seqVal === 'number' && Number.isFinite(seqVal) && seqVal >= 0) {
+              consolidatedSessionWatermarks.set(sid, Math.trunc(seqVal));
+            }
+          }
         }
       } catch {
         // Fresh state
@@ -701,6 +813,21 @@ export function createSleepRuntime(ports: SleepHostPorts): SleepRuntime {
       });
 
       reconcileAndMaybeSleep();
+
+      if (ports.conversations.warmColdSessions) {
+        coldWarmupAbort = new AbortController();
+        const warmupSignal = coldWarmupAbort.signal;
+        void ports.conversations
+          .warmColdSessions(warmupSignal)
+          .then(() => {
+            if (!stopped && !warmupSignal.aborted) {
+              reconcileAndMaybeSleep();
+            }
+          })
+          .catch(() => {
+            // Optional cold-session hydration is best-effort
+          });
+      }
     },
 
     async stop(): Promise<void> {
@@ -708,6 +835,8 @@ export function createSleepRuntime(ports: SleepHostPorts): SleepRuntime {
       stopped = true;
       started = false;
       clearTimers();
+      coldWarmupAbort?.abort();
+      coldWarmupAbort = undefined;
       activeConsolidationAbort?.abort();
       offConversations?.();
       offConversations = undefined;

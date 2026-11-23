@@ -2,9 +2,13 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { type ConversationTurnInput, runTwoPhaseSleepConsolidation } from '../src/host/consolidator.js';
+import {
+  type ConversationTurnInput,
+  parseLlmCandidatesJson,
+  runTwoPhaseSleepConsolidation,
+} from '../src/host/consolidator.js';
 import { createInitialFsrsState } from '../src/host/fsrs.js';
-import { MemoryVault } from '../src/host/vault.js';
+import { MemoryVault, maskHomePath, sanitizeSleepText } from '../src/host/vault.js';
 
 const T0 = 1_764_000_000_000;
 const DAY = 86_400_000;
@@ -211,5 +215,164 @@ describe('NREM + REM 双阶段睡眠记忆巩固与 Markdown/JSONL 脱敏存储�
 
     const scrubbedDisk = await readFile(vaultReloaded.memoriesJsonlPath, 'utf8');
     expect(scrubbedDisk).not.toContain(secretB);
+
+    // 回归：tags / topicKey / sleep-journal.jsonl 中手工混入的密钥与主目录在 load 时同样触发脱敏回写
+    const secretC = ['ghp', 'C9d8E7f6G5h4I3j2K1l0M9n8O7p6'].join('_');
+    const tamperedMeta = JSON.parse(scrubbedDisk.trim()) as Record<string, unknown>;
+    tamperedMeta.tags = ['security', `tok-${secretC}`];
+    tamperedMeta.topicKey = `${fakeHome}/secret-topic`;
+    await writeFile(vaultReloaded.memoriesJsonlPath, `${JSON.stringify(tamperedMeta)}\n`, 'utf8');
+    await writeFile(
+      vaultReloaded.journalJsonlPath,
+      `${JSON.stringify({
+        id: 'sleep_1',
+        at: T0,
+        trigger: 'manual',
+        turnsProcessed: 1,
+        nremCandidates: 1,
+        createdCount: 1,
+        mergedCount: 0,
+        conflictsResolved: 0,
+        prunedCount: 0,
+        linksUpdated: 0,
+        durationMs: 10,
+        summary: `日志误含 ${secretC} 与 ${fakeHome}/dir`,
+      })}\n`,
+      'utf8',
+    );
+
+    const vaultMetaReloaded = new MemoryVault(dir, fakeHome);
+    const metaLoadRes = await vaultMetaReloaded.load(T0 + 2_000);
+    expect(metaLoadRes.redactedOnLoad).toBe(true);
+    const reScrubbedJsonl = await readFile(vaultMetaReloaded.memoriesJsonlPath, 'utf8');
+    const reScrubbedJournal = await readFile(vaultMetaReloaded.journalJsonlPath, 'utf8');
+    expect(reScrubbedJsonl).not.toContain(secretC);
+    expect(reScrubbedJsonl).not.toContain(fakeHome);
+    expect(reScrubbedJournal).not.toContain(secretC);
+    expect(reScrubbedJournal).not.toContain(fakeHome);
+  });
+
+  it('回归防护：置顶记忆在冲突或强化时绝不被覆盖标题/内容；主目录边界与零宽绕过防护；短句提炼与多会话精确归属', async () => {
+    const fakeHome = '/Users/alice';
+    // 1. maskHomePath 路径边界与零宽字符绕过防护
+    expect(maskHomePath('/Users/alice2/project', fakeHome)).toBe('/Users/alice2/project');
+    expect(sanitizeSleepText('/Users/\u200balice/project', 200, fakeHome)).toBe('~/project');
+
+    // 2. 置顶偏好遇相反立场对话（以及并存的未置顶旧冲突项）：置顶项标题/内容原样锁定，未置顶旧冲突项被清除
+    const pinnedPref = {
+      id: 'mem_pinned_pnpm',
+      kind: 'preference' as const,
+      title: '统一使用 pnpm',
+      content: '严格使用 pnpm',
+      tags: ['pnpm'],
+      topicKey: 'preference:package-manager',
+      pinned: true,
+      confidence: 1,
+      sourceSessionIds: ['manual'],
+      evidenceCount: 1,
+      recallCount: 0,
+      createdAt: T0,
+      updatedAt: T0,
+      fsrs: createInitialFsrsState('preference', T0),
+    };
+    const staleUnpinnedPref = {
+      id: 'mem_stale_npm',
+      kind: 'preference' as const,
+      title: '默认使用 npm',
+      content: '早期使用 npm',
+      tags: ['npm'],
+      topicKey: 'preference:package-manager',
+      pinned: false,
+      confidence: 0.7,
+      sourceSessionIds: ['sess-old'],
+      evidenceCount: 1,
+      recallCount: 0,
+      createdAt: T0,
+      updatedAt: T0,
+      fsrs: createInitialFsrsState('preference', T0),
+    };
+
+    const resConflict = await runTwoPhaseSleepConsolidation({
+      turns: [
+        {
+          turnId: 't-yarn',
+          sessionId: 'sess-home',
+          cwd: fakeHome, // cwd 恰等于主目录，绝不可把用户名 alice 提取进 tags！
+          at: T0 + 5_000,
+          userText: '请始终中文回复。改用 yarn 管理依赖，不再使用 pnpm 了，因为某个旧工程需要长描述文本测试！',
+          assistantText: '收到，保持中文回复。',
+        },
+      ],
+      existingMemories: [pinnedPref, staleUnpinnedPref],
+      now: T0 + 10_000,
+      trigger: 'manual',
+      signal: new AbortController().signal,
+      homeDir: fakeHome,
+    });
+
+    const afterPinned = resConflict.memories.find((m) => m.id === 'mem_pinned_pnpm');
+    expect(afterPinned).toBeDefined();
+    expect(afterPinned?.title).toBe('统一使用 pnpm');
+    expect(afterPinned?.content).toBe('严格使用 pnpm');
+    expect(resConflict.memories.some((m) => m.id === 'mem_stale_npm')).toBe(false);
+    // 7 字中文短句「请始终中文回复」成功提炼，且所有 tags 中绝不含用户名 alice
+    expect(resConflict.memories.some((m) => m.title.includes('请始终中文回复'))).toBe(true);
+    for (const mem of resConflict.memories) {
+      expect(mem.tags).not.toContain('alice');
+    }
+
+    // 3. 置顶记忆遇同立场但更长文本的强化时：evidenceCount 增加，但用户策展的标题与内容不被篡改
+    const resReinforce = await runTwoPhaseSleepConsolidation({
+      turns: [
+        {
+          turnId: 't-pnpm-long',
+          sessionId: 'sess-reinforce',
+          at: T0 + 20_000,
+          userText: '以后都用 pnpm workspace 来管理整个单仓所有子包与锁文件，保持极其详细的长文本描述。',
+          assistantText: '好的，统一使用 pnpm。',
+        },
+      ],
+      existingMemories: [pinnedPref],
+      now: T0 + 25_000,
+      trigger: 'manual',
+      signal: new AbortController().signal,
+      homeDir: fakeHome,
+    });
+    const reinforcedPinned = resReinforce.memories.find((m) => m.id === 'mem_pinned_pnpm');
+    expect(reinforcedPinned?.title).toBe('统一使用 pnpm');
+    expect(reinforcedPinned?.content).toBe('严格使用 pnpm');
+    expect(reinforcedPinned?.evidenceCount).toBeGreaterThan(1);
+
+    // 4. 多会话 LLM 提取结果仅归属匹配的源会话，绝不污染同批次无关会话 ID
+    const sourceTurns: ConversationTurnInput[] = [
+      {
+        turnId: 'ta',
+        sessionId: 'sess-postgres',
+        at: T0,
+        userText: '数据库选型使用 PostgreSQL 连接池',
+        assistantText: '已配置 PostgreSQL',
+      },
+      {
+        turnId: 'tb',
+        sessionId: 'sess-swift',
+        at: T0 + 1_000,
+        userText: '原生辅助进程使用 Swift 编译',
+        assistantText: '已配置 Swift',
+      },
+    ];
+    const llmParsed = parseLlmCandidatesJson(
+      JSON.stringify([
+        {
+          kind: 'decision',
+          title: '采用 PostgreSQL 数据库连接池',
+          content: '后端持久化统一连接 PostgreSQL。',
+          tags: ['postgresql'],
+        },
+      ]),
+      ['sess-postgres', 'sess-swift'],
+      fakeHome,
+      sourceTurns,
+    );
+    expect(llmParsed[0]?.sourceSessionIds).toEqual(['sess-postgres']);
   });
 });

@@ -35,17 +35,23 @@ function sliceChars(text: string, maxChars: number): string {
   return chars.length > maxChars ? chars.slice(0, maxChars).join('') : text;
 }
 
+function escapeRegExp(literal: string): string {
+  return literal.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
 export function maskHomePath(input: string, homeDir?: string): string {
   if (!input || !homeDir) return input;
-  const cleanHome = homeDir.endsWith('/') && homeDir.length > 1 ? homeDir.slice(0, -1) : homeDir;
+  const cleanHome = homeDir.replace(/[\\/]+$/, '');
   if (!cleanHome || cleanHome === '/') return input;
-  return input.split(cleanHome).join('~');
+  const pattern = new RegExp(`${escapeRegExp(cleanHome)}(?=$|[\\\\/\\s"'\`),;:!?\\]}])`, 'g');
+  return input.replace(pattern, '~');
 }
 
 export function sanitizeSleepText(input: string, maxChars: number, homeDir?: string): string {
-  const homeMasked = maskHomePath(input, homeDir);
-  const redacted = sanitizeForModel(homeMasked).trim();
-  return sliceChars(redacted, maxChars);
+  const preMasked = maskHomePath(input, homeDir);
+  const redacted = sanitizeForModel(preMasked).trim();
+  const postMasked = maskHomePath(redacted, homeDir).trim();
+  return sliceChars(postMasked, maxChars);
 }
 
 function isMemoryKind(value: unknown): value is MemoryKind {
@@ -261,9 +267,17 @@ export class MemoryVault {
         if (!trimmed) continue;
         try {
           const parsed = JSON.parse(trimmed) as MemoryEntry;
-          if (!parsed || typeof parsed !== 'object') continue;
+          if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) continue;
           const sanitized = sanitizeMemoryEntry(parsed, this.homeDir);
-          if (sanitized.title !== parsed.title || sanitized.content !== parsed.content) {
+          if (
+            sanitized.id !== parsed.id ||
+            sanitized.title !== parsed.title ||
+            sanitized.content !== parsed.content ||
+            sanitized.topicKey !== parsed.topicKey ||
+            JSON.stringify(sanitized.tags) !== JSON.stringify(parsed.tags ?? []) ||
+            JSON.stringify(sanitized.sourceSessionIds) !== JSON.stringify(parsed.sourceSessionIds ?? []) ||
+            JSON.stringify(sanitized.links ?? []) !== JSON.stringify(parsed.links ?? [])
+          ) {
             redactedOnLoad = true;
           }
           this.entries.set(sanitized.id, sanitized);
@@ -282,8 +296,12 @@ export class MemoryVault {
         if (!trimmed) continue;
         try {
           const parsed = JSON.parse(trimmed) as SleepConsolidationRecord;
-          if (!parsed || typeof parsed !== 'object') continue;
-          this.journal.push(sanitizeConsolidationRecord(parsed, this.homeDir));
+          if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) continue;
+          const sanitizedRec = sanitizeConsolidationRecord(parsed, this.homeDir);
+          if (sanitizedRec.id !== parsed.id || sanitizedRec.summary !== parsed.summary) {
+            redactedOnLoad = true;
+          }
+          this.journal.push(sanitizedRec);
         } catch {
           // Ignore malformed journal entry
         }

@@ -468,8 +468,9 @@
 
 @media (prefers-reduced-motion: reduce) {
   .panel,
-  .panel * {
-    transition: none !important;
-    animation: none !important;
+  .panel *,
+  .section > summary::before {
+    transition: none;
+    animation: none;
   }
 }

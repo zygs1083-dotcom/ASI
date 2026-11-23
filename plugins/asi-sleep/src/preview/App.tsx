@@ -5,13 +5,14 @@ import type { MemoryKind, MemoryViewItem, SleepConsolidationRecord, SleepPanelMo
 
 type Theme = 'light' | 'dark';
 
-function readQuery(): { scenario: SleepScenarioName; theme: Theme } {
+function readQuery(): { scenario: SleepScenarioName; theme: Theme; failActions: boolean } {
   const q = new URLSearchParams(location.search);
   const s = q.get('scenario');
   const t = q.get('theme');
   return {
     scenario: (SLEEP_SCENARIOS as readonly string[]).includes(s ?? '') ? (s as SleepScenarioName) : 'healthy-vault',
     theme: t === 'dark' ? 'dark' : 'light',
+    failActions: q.get('failActions') === '1',
   };
 }
 
@@ -112,6 +113,7 @@ export function App() {
             return rec;
           }}
           onToggleAutoSleepPaused={async (paused) => {
+            if (initial.failActions) throw new Error('模拟连接中断：暂停开关失败');
             setModel((prev) => ({ ...prev, autoSleepPaused: paused }));
             setLastAction(paused ? '已暂停自动睡眠' : '已恢复自动睡眠');
           }}
@@ -172,6 +174,7 @@ export function App() {
             return undefined;
           }}
           onTogglePin={async (id, pinned) => {
+            if (initial.failActions) throw new Error('模拟连接中断：置顶切换失败');
             setModel((prev) => {
               const nextMemories = prev.memories.map((m) =>
                 m.id === id ? { ...m, pinned, retention: pinned ? 1 : 0.85 } : m,
@@ -182,6 +185,7 @@ export function App() {
             return undefined;
           }}
           onDeleteMemory={async (id) => {
+            if (initial.failActions) throw new Error('模拟连接中断：删除记忆失败');
             setModel((prev) => {
               const nextMemories = prev.memories.filter((m) => m.id !== id);
               return { ...prev, memories: nextMemories, ...recomputeCounts(nextMemories) };

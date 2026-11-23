@@ -3,7 +3,7 @@ import type { Context } from '@deepseek-ai/cordis';
 import type {} from '@deepseek-ai/dsh-app-boot';
 import z from '@deepseek-ai/schemastery';
 import { createSleepRuntime } from '../runtime.js';
-import { createDshSleepPorts } from './dsh-ports.js';
+import { buildExcludedInternalRoots, createDshSleepPorts } from './dsh-ports.js';
 import { createSleepFramesSource } from './frames.js';
 import { AsiSleepRemote } from './remote.js';
 import { registerSleepTools } from './tools.js';
@@ -53,7 +53,11 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   ctx.effect(() => dispose, 'asi-sleep runtime');
 
   try {
-    offTools = registerSleepTools(ctx, runtime, [config.storageRoot, ctx.asiSense?.storageRoot]);
+    offTools = registerSleepTools(
+      ctx,
+      runtime,
+      buildExcludedInternalRoots(config.storageRoot, ctx.asiSense?.storageRoot),
+    );
     await runtime.start();
     if (disposed) return;
     new AsiSleepRemote(ctx, runtime.actions, createSleepFramesSource(runtime));

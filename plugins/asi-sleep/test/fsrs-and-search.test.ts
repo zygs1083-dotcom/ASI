@@ -125,5 +125,12 @@ describe('MiniSearch 中英混合分词、BM25、前缀与模糊检索', () => {
 
     // 按 kind 过滤
     expect(searchMemoryItems(docs, '', { kind: 'pitfall' }).map((h) => h.id)).toEqual(['m2']);
+
+    // 回归：含中文助词「的/了/在」或英文停用词「about/the」的无关查询绝不因单字拆分误命中无关记忆
+    expect(searchMemoryItems(docs, '关于数据库的迁移决策')).toEqual([]);
+    expect(searchMemoryItems(docs, 'decision about postgresql')).toEqual([]);
+
+    // 单汉字精确查询依然可命中含该汉字的记忆
+    expect(searchMemoryItems(docs, '禁').map((h) => h.id)).toContain('m1');
   });
 });

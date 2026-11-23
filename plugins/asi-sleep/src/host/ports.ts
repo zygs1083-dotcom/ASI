@@ -13,6 +13,8 @@ export interface SleepConversationPort {
   anyOrdinarySessionRunning(): boolean;
   /** Subscribe to activity in ordinary user conversations; returns unsubscribe disposer. */
   onOrdinaryActivity(listener: () => void): () => void;
+  /** Optional cold-session hydration from persisted session corpus (`ctx.sessionQuery`) on startup. */
+  warmColdSessions?(signal: AbortSignal): Promise<void>;
 }
 
 export interface SleepHostPorts {

@@ -1,5 +1,5 @@
 import type { NeedZone } from '@asi/sense-types';
-import { type FormEvent, useMemo, useState } from 'react';
+import { type FormEvent, useEffect, useMemo, useState } from 'react';
 import { searchMemoryItems } from '../shared/search.js';
 import {
   MEMORY_KIND_LABELS,
@@ -11,7 +11,7 @@ import {
   type SleepConsolidationRecord,
   type SleepPanelModel,
 } from '../shared/types.js';
-import css from './panel.module.css';
+import css from './sleep-panel.module.css';
 
 export interface SleepPanelActions {
   onConsolidateNow: () => Promise<SleepConsolidationRecord | undefined>;
@@ -20,6 +20,7 @@ export interface SleepPanelActions {
   onUpdateMemory: (id: string, patch: MemoryUpdateInput) => Promise<MemoryViewItem | undefined>;
   onTogglePin: (id: string, pinned: boolean) => Promise<MemoryViewItem | undefined>;
   onDeleteMemory: (id: string) => Promise<void>;
+  onSearchMemories?: (query: string, kind?: MemoryKind) => Promise<MemoryViewItem[]>;
 }
 
 export interface SleepPanelProps extends SleepPanelActions {
@@ -86,14 +87,64 @@ export function SleepPanel(props: SleepPanelProps) {
   const [busyConsolidate, setBusyConsolidate] = useState(false);
   const [feedback, setFeedback] = useState<string | null>(null);
   const [privacyOpen, setPrivacyOpen] = useState(false);
+  const [remoteSearchResults, setRemoteSearchResults] = useState<MemoryViewItem[] | null>(null);
+
+  const hasOverflowVault = model.totalMemories > model.memories.length;
+  const onSearchMemories = props.onSearchMemories;
+
+  useEffect(() => {
+    if (!hasOverflowVault || !onSearchMemories || (!query.trim() && kindFilter === 'all')) {
+      setRemoteSearchResults(null);
+      return;
+    }
+    let cancelled = false;
+    void onSearchMemories(query, kindFilter === 'all' ? undefined : kindFilter)
+      .then((items) => {
+        if (!cancelled) setRemoteSearchResults(items);
+      })
+      .catch(() => {
+        if (!cancelled) setRemoteSearchResults(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [hasOverflowVault, onSearchMemories, query, kindFilter]);
 
   const filteredMemories = useMemo(() => {
+    if (remoteSearchResults !== null) {
+      return remoteSearchResults;
+    }
     return searchMemoryItems(model.memories, query, {
       ...(kindFilter !== 'all' ? { kind: kindFilter } : {}),
       includeLowRetention: true,
-      limit: 200,
+      limit: 500,
     });
-  }, [model.memories, query, kindFilter]);
+  }, [model.memories, query, kindFilter, remoteSearchResults]);
+
+  const handleToggleAutoSleepPaused = async (paused: boolean) => {
+    try {
+      await props.onToggleAutoSleepPaused(paused);
+    } catch (err) {
+      setFeedback(err instanceof Error ? err.message : '更新自动睡眠设置失败');
+    }
+  };
+
+  const handleTogglePin = async (id: string, nextPinned: boolean) => {
+    try {
+      await props.onTogglePin(id, nextPinned);
+    } catch (err) {
+      setFeedback(err instanceof Error ? err.message : '更新置顶状态失败');
+    }
+  };
+
+  const handleDeleteMemory = async (id: string) => {
+    try {
+      await props.onDeleteMemory(id);
+      if (editingId === id) setEditingId(null);
+    } catch (err) {
+      setFeedback(err instanceof Error ? err.message : '删除记忆失败');
+    }
+  };
 
   const handleConsolidateNow = async () => {
     if (busyConsolidate || model.consolidating) return;
@@ -245,7 +296,7 @@ export function SleepPanel(props: SleepPanelProps) {
                 type="checkbox"
                 data-testid="auto-sleep-pause-toggle"
                 checked={model.autoSleepPaused}
-                onChange={(e) => void props.onToggleAutoSleepPaused(e.currentTarget.checked)}
+                onChange={(e) => void handleToggleAutoSleepPaused(e.currentTarget.checked)}
               />
               暂停自动睡眠整合
             </label>
@@ -512,7 +563,7 @@ export function SleepPanel(props: SleepPanelProps) {
                         <button
                           type="button"
                           aria-label={`${item.pinned ? '取消置顶' : '置顶'} ${item.title}`}
-                          onClick={() => void props.onTogglePin(item.id, !item.pinned)}
+                          onClick={() => void handleTogglePin(item.id, !item.pinned)}
                         >
                           {item.pinned ? '取消置顶' : '置顶'}
                         </button>
@@ -522,7 +573,7 @@ export function SleepPanel(props: SleepPanelProps) {
                         <button
                           type="button"
                           aria-label={`删除 ${item.title}`}
-                          onClick={() => void props.onDeleteMemory(item.id)}
+                          onClick={() => void handleDeleteMemory(item.id)}
                         >
                           删除
                         </button>

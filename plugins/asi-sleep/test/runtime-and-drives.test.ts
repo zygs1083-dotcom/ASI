@@ -512,4 +512,134 @@ describe('SleepRuntime 困意曲线、静默窗口、每日 6 次自动配额、
       await rt.stop();
     }
   });
+
+  it('回归防护：活跃会话超 2,200 轮对话与进程重启后水位线零驱逐（绝不死循环重复消耗自动配额），且手动整合抢占在途自动整合零竞态', async () => {
+    const storageRoot = await mkdtemp(join(tmpdir(), 'asi-sleep-watermark-'));
+    tempDirs.push(storageRoot);
+
+    let now = T0;
+    const senseH = makeSenseHarness(() => now);
+    const drivesH = makeDrivesHarness(senseH.api, () => now);
+
+    // 构造 2,250 轮活跃会话历史（包含带 seq 的 DSH 事件轮次与不带 seq 的普通轮次）
+    const turns: ConversationTurnInput[] = [];
+    for (let s = 1; s <= 3; s += 1) {
+      for (let i = 1; i <= 750; i += 1) {
+        turns.push({
+          turnId: `t-${s}-${i}`,
+          sessionId: `long-sess-${s}`,
+          ...(s <= 2 ? { seq: i * 4 } : {}),
+          at: T0 + i * 100,
+          userText: i === 750 ? `第 ${s} 会话结论：决定采用 MiniSearch 检索 (${s})` : `普通进展讨论 ${i}`,
+          assistantText: '已完成步骤。',
+        });
+      }
+    }
+
+    const rt1 = createSleepRuntime({
+      storageRoot,
+      clock: { wall: () => now, mono: () => now - T0 + 1_000 },
+      sense: senseH.api,
+      drives: drivesH.api,
+      conversations: {
+        listCompletedOrdinaryTurns: () => turns,
+        anyOrdinarySessionRunning: () => false,
+        onOrdinaryActivity: () => () => {},
+      },
+    });
+
+    await rt1.start();
+    try {
+      expect(rt1.panelModel().drive.unconsolidatedTurns).toBe(2_250);
+      senseH.setLocked(true);
+      await vi.waitFor(() => {
+        expect(rt1.panelModel().consolidating).toBe(false);
+        expect(rt1.panelModel().drive.autoRunsToday).toBe(1);
+      });
+      expect(rt1.panelModel().drive.unconsolidatedTurns).toBe(0);
+      expect(rt1.panelModel().drive.satisfaction).toBe(100);
+
+      // 连续发出多次锁屏感官心跳：绝不因 >2,000 轮驱逐而死循环消耗第 2..6 次自动配额！
+      for (let tick = 0; tick < 4; tick += 1) {
+        now += 5_000;
+        senseH.emit();
+        await new Promise((r) => setTimeout(r, 15));
+      }
+      expect(rt1.panelModel().drive.autoRunsToday).toBe(1);
+      expect(rt1.panelModel().drive.unconsolidatedTurns).toBe(0);
+    } finally {
+      await rt1.stop();
+    }
+
+    // 模拟进程重启后重新挂载同一 storageRoot：2,250 轮历史依然保持 0 未整合
+    const rt2 = createSleepRuntime({
+      storageRoot,
+      clock: { wall: () => now, mono: () => now - T0 + 1_000 },
+      sense: senseH.api,
+      drives: drivesH.api,
+      conversations: {
+        listCompletedOrdinaryTurns: () => turns,
+        anyOrdinarySessionRunning: () => false,
+        onOrdinaryActivity: () => () => {},
+      },
+    });
+
+    let slowAutoStarted: (() => void) | undefined;
+    const slowAutoEntered = new Promise<void>((r) => {
+      slowAutoStarted = r;
+    });
+    let llmCallCount = 0;
+
+    const rtPreempt = createSleepRuntime({
+      storageRoot: await mkdtemp(join(tmpdir(), 'asi-sleep-manual-race-')).then((d) => {
+        tempDirs.push(d);
+        return d;
+      }),
+      clock: { wall: () => now, mono: () => now - T0 + 1_000 },
+      sense: senseH.api,
+      drives: drivesH.api,
+      conversations: {
+        listCompletedOrdinaryTurns: () => turns.slice(0, 14),
+        anyOrdinarySessionRunning: () => false,
+        onOrdinaryActivity: () => () => {},
+      },
+      llmExtract: async (_prompt, signal) => {
+        llmCallCount += 1;
+        if (llmCallCount === 1) {
+          slowAutoStarted?.();
+          await new Promise<void>((_resolve, reject) => {
+            signal.addEventListener(
+              'abort',
+              () => {
+                // 在 abort 回调期间故意触发感官广播，验证不会抢跑新的 auto 任务压过 manual！
+                senseH.emit();
+                const err = new Error('aborted');
+                err.name = 'AbortError';
+                reject(err);
+              },
+              { once: true },
+            );
+          });
+        }
+        // manual 执行期间突发 L1 不适，手动整合不应被中断！
+        drivesH.setL1Distressed(true);
+        return '[]';
+      },
+    });
+
+    await rt2.start();
+    await rtPreempt.start();
+    try {
+      expect(rt2.panelModel().drive.unconsolidatedTurns).toBe(0);
+
+      await slowAutoEntered;
+      const manualRec = await rtPreempt.actions.consolidateNow();
+      expect(manualRec.trigger).toBe('manual');
+      expect(manualRec.turnsProcessed).toBe(14);
+      expect(rtPreempt.panelModel().drive.autoRunsToday).toBe(0);
+    } finally {
+      await rtPreempt.stop();
+      await rt2.stop();
+    }
+  });
 });

@@ -16,6 +16,27 @@ const KANA_HANGUL_RUN_RE = /[\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Han
 const IDENT_RUN_RE = /[A-Za-z0-9]+(?:[._-][A-Za-z0-9]+)*/g;
 const CAMEL_BOUNDARY_RE = /([a-z0-9])([A-Z])/g;
 const PURE_ASCII_TERM_RE = /^[a-z0-9_.-]+$/;
+const CJK_STOP_CHARS = new Set([...'的了是在有和与及或把被让给对从向到于着过吗呢吧啊']);
+const CJK_PARTICLE_SPLIT_RE = /[的了是在有和与及或把被让给对从向到于着过吗呢吧啊]+/gu;
+const EN_QUERY_STOP_WORDS = new Set([
+  'the',
+  'and',
+  'for',
+  'with',
+  'about',
+  'from',
+  'that',
+  'this',
+  'what',
+  'how',
+  'why',
+  'when',
+  'where',
+  'are',
+  'was',
+  'were',
+  'into',
+]);
 
 export function tokenizeCjkAndLatin(raw: string): string[] {
   if (!raw) return [];
@@ -39,14 +60,15 @@ export function tokenizeCjkAndLatin(raw: string): string[] {
   for (const match of normalized.matchAll(HAN_RUN_RE)) {
     const chars = [...match[0]];
     if (chars.length === 1) {
-      tokens.push(chars[0] ?? '');
+      const ch = chars[0] ?? '';
+      if (ch && !CJK_STOP_CHARS.has(ch)) tokens.push(ch);
       continue;
     }
     for (let i = 0; i < chars.length - 1; i += 1) {
       tokens.push(`${chars[i]}${chars[i + 1]}`);
     }
     for (const ch of chars) {
-      tokens.push(ch);
+      if (!CJK_STOP_CHARS.has(ch)) tokens.push(ch);
     }
   }
 
@@ -62,6 +84,57 @@ export function tokenizeCjkAndLatin(raw: string): string[] {
   }
 
   return tokens.filter(Boolean);
+}
+
+export function tokenizeSearchQuery(raw: string): string[] {
+  if (!raw) return [];
+  const bounded = raw.length > MAX_TOKENIZE_CHARS ? raw.slice(0, MAX_TOKENIZE_CHARS) : raw;
+  const normalized = bounded.normalize('NFKC');
+  const latinTokens: string[] = [];
+  const cjkTokens: string[] = [];
+
+  for (const match of normalized.matchAll(IDENT_RUN_RE)) {
+    const full = match[0];
+    const lowerFull = full.toLowerCase();
+    latinTokens.push(lowerFull);
+    const expanded = full.replace(CAMEL_BOUNDARY_RE, '$1 $2').toLowerCase();
+    const parts = expanded.split(/[\s._-]+/).filter((part) => part.length >= 2);
+    if (parts.length > 1) {
+      for (const part of parts) {
+        if (part !== lowerFull) latinTokens.push(part);
+      }
+    }
+  }
+
+  for (const match of normalized.matchAll(HAN_RUN_RE)) {
+    const segments = match[0].split(CJK_PARTICLE_SPLIT_RE).filter(Boolean);
+    for (const seg of segments) {
+      const chars = [...seg];
+      if (chars.length === 1) {
+        const ch = chars[0] ?? '';
+        if (ch && !CJK_STOP_CHARS.has(ch)) cjkTokens.push(ch);
+      } else {
+        for (let i = 0; i < chars.length - 1; i += 1) {
+          cjkTokens.push(`${chars[i]}${chars[i + 1]}`);
+        }
+      }
+    }
+  }
+
+  for (const match of normalized.matchAll(KANA_HANGUL_RUN_RE)) {
+    const chars = [...match[0]];
+    if (chars.length === 1) {
+      cjkTokens.push(chars[0] ?? '');
+    } else {
+      for (let i = 0; i < chars.length - 1; i += 1) {
+        cjkTokens.push(`${chars[i]}${chars[i + 1]}`);
+      }
+    }
+  }
+
+  const nonStopLatin = latinTokens.filter((t) => !EN_QUERY_STOP_WORDS.has(t));
+  const finalLatin = nonStopLatin.length > 0 || cjkTokens.length > 0 ? nonStopLatin : latinTokens;
+  return [...finalLatin, ...cjkTokens].filter(Boolean);
 }
 
 export interface SearchableMemoryLike {
@@ -138,6 +211,7 @@ export function searchMemoryItems<T extends SearchableMemoryLike>(
     storeFields: ['id'],
     tokenize: tokenizeCjkAndLatin,
     searchOptions: {
+      tokenize: tokenizeSearchQuery,
       boost: { title: 3, tagsText: 2.5, topicKey: 2, content: 1 },
       combineWith: 'OR',
       prefix: (term) => [...term].length >= 2,

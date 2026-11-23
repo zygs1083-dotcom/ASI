@@ -12,9 +12,10 @@ import type { Context } from '@deepseek-ai/cordis';
 import type { Agent } from '@deepseek-ai/dsh-agent';
 import { defineTool, ToolArgsError, ToolContextUnavailableError, type ToolRunContext } from '@deepseek-ai/dsh-tools';
 import type { JsonValue } from '@deepseek-ai/dsh-util-values';
+import type { WorkspaceRegistry } from '@deepseek-ai/dsh-workspace';
 import { MEMORY_KINDS, type MemoryKind } from '../../shared/types.js';
 import type { SleepRuntime } from '../runtime.js';
-import { isOrdinaryDshSession } from './dsh-ports.js';
+import { INTERNAL_SESSION_ID_RE, isOrdinaryDshSession } from './dsh-ports.js';
 
 const output = {
   schema: { type: 'json' } as const,
@@ -54,7 +55,11 @@ export function sanitizeValueForModel(value: unknown): JsonValue {
   return null;
 }
 
-export function createMemoryRecallTool(runtime: SleepRuntime, excludedRoots: readonly (string | undefined)[] = []) {
+export function createMemoryRecallTool(
+  runtime: SleepRuntime,
+  excludedRoots: readonly (string | undefined)[] = [],
+  isArchivedSession?: (sessionId: string) => boolean,
+) {
   return defineTool({
     name: 'memory_recall',
     description:
@@ -95,9 +100,13 @@ export function createMemoryRecallTool(runtime: SleepRuntime, excludedRoots: rea
       ) {
         throw new ToolArgsError(['limit must be a positive number']);
       }
-      const ordinaryCaller = agent.session
-        ? isOrdinaryDshSession(agent.session, excludedRoots)
-        : !String(agent.id).startsWith('asi-maint-');
+      if (args.includeLowRetention !== undefined && typeof args.includeLowRetention !== 'boolean') {
+        throw new ToolArgsError(['includeLowRetention must be a boolean']);
+      }
+      const sid = String(agent.id ?? '');
+      const ordinaryCaller =
+        !isArchivedSession?.(sid) &&
+        (agent.session ? isOrdinaryDshSession(agent.session, excludedRoots) : !INTERNAL_SESSION_ID_RE.test(sid));
 
       const result = await runtime.recall({
         query: args.query,
@@ -154,7 +163,13 @@ export function registerSleepTools(
   runtime: SleepRuntime,
   excludedRoots: readonly (string | undefined)[] = [],
 ): () => void {
-  const offRecall = ctx.tools.register(createMemoryRecallTool(runtime, excludedRoots));
+  const isArchivedSession = (sessionId: string): boolean => {
+    const wr = (ctx as Context & { get(name: 'workspaceRegistry'): WorkspaceRegistry | undefined }).get(
+      'workspaceRegistry',
+    );
+    return Boolean(wr?.archivedSessionIds.some((id) => String(id) === sessionId));
+  };
+  const offRecall = ctx.tools.register(createMemoryRecallTool(runtime, excludedRoots, isArchivedSession));
   const offProfile = ctx.tools.register(createMemoryProfileTool(runtime));
   return () => {
     offProfile();

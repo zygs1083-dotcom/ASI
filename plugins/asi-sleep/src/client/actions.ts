@@ -4,7 +4,13 @@ import type { SleepPanelActions } from './SleepPanel.js';
 
 type Api = Pick<
   TypertRemoteNamespaceMap['asiSleep'],
-  'consolidateNow' | 'setAutoSleepPaused' | 'createMemory' | 'updateMemory' | 'togglePin' | 'deleteMemory'
+  | 'consolidateNow'
+  | 'setAutoSleepPaused'
+  | 'createMemory'
+  | 'updateMemory'
+  | 'togglePin'
+  | 'deleteMemory'
+  | 'searchMemories'
 >;
 
 export function createSleepActions(api: Api) {
@@ -40,6 +46,7 @@ export function createSleepActions(api: Api) {
     onUpdateMemory: (id, patch) => complete(() => api.updateMemory(id, patch)),
     onTogglePin: (id, pinned) => complete(() => api.togglePin(id, pinned)),
     onDeleteMemory: (id) => complete(() => api.deleteMemory(id)),
+    onSearchMemories: (query, kind) => complete(() => api.searchMemories(query, kind)),
   };
 
   return {

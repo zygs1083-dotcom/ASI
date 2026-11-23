@@ -71,8 +71,12 @@ test.describe('SleepPanel「记忆库」响应式布局与 axe 无障碍验证',
     await page.getByRole('button', { name: /^全部/ }).click();
     await expect(page.locator('[data-memory-id]')).toHaveCount(4);
 
-    // 3. 图形化搜索（支持中文与英文关键词）
+    // 3. 图形化搜索（支持中文词组、无关助词零误报与英文关键词）
     const searchInput = page.getByTestId('memory-search-input');
+    await searchInput.fill('关于数据库的迁移决策');
+    await expect(page.getByTestId('empty-memories-hint')).toBeVisible();
+    await searchInput.fill('对比度');
+    await expect(page.locator('[data-memory-id]')).toHaveCount(1);
     await searchInput.fill('esbuild');
     await expect(page.locator('[data-memory-id]')).toHaveCount(1);
     await page.getByRole('button', { name: '清空搜索词' }).click();
@@ -113,6 +117,27 @@ test.describe('SleepPanel「记忆库」响应式布局与 axe 无障碍验证',
 
     await expectNoOverflow(page);
     await axeCheck(page);
+    expect(errors).toEqual([]);
+  });
+
+  test('RPC 动作异常时捕获拒绝并展示反馈横幅，零未捕获 Promise 异常 (pageerror)', async ({ page }) => {
+    const errors = watchErrors(page);
+    await page.setViewportSize({ width: 340, height: 900 });
+    await page.goto('/?scenario=healthy-vault&theme=light&failActions=1');
+    await page.getByRole('heading', { name: '记忆库' }).waitFor();
+
+    await page.getByTestId('auto-sleep-pause-toggle').click();
+    await expect(page.getByTestId('sleep-feedback')).toContainText('暂停开关失败');
+
+    await page
+      .getByRole('button', { name: /^取消置顶/ })
+      .first()
+      .click();
+    await expect(page.getByTestId('sleep-feedback')).toContainText('置顶切换失败');
+
+    await page.getByRole('button', { name: /^删除/ }).first().click();
+    await expect(page.getByTestId('sleep-feedback')).toContainText('删除记忆失败');
+
     expect(errors).toEqual([]);
   });
 });

@@ -20,13 +20,15 @@ import {
   type SleepConsolidationTrigger,
 } from '../shared/types.js';
 import { computeMemoryRetention, createInitialFsrsState, shouldPruneMemory, strengthenFsrsState } from './fsrs.js';
-import { sanitizeMemoryEntry, sanitizeSleepText } from './vault.js';
+import { maskHomePath, sanitizeMemoryEntry, sanitizeSleepText } from './vault.js';
 
 const MAX_UNPINNED_VAULT_CAPACITY = 450;
 
 export interface ConversationTurnInput {
   turnId: string;
   sessionId: string;
+  /** Optional monotonic event sequence within `sessionId` for O(1) durable watermarks. */
+  seq?: number;
   sessionTitle?: string;
   cwd?: string;
   at: number;
@@ -63,7 +65,7 @@ export interface ConsolidationEngineOutput {
 }
 
 const PREFERENCE_RE =
-  /(?:偏好|习惯|喜欢用|倾向于|统一用|统一使用|优先使用|优先用|默认使用|默认用|请始终|以后都用|不要用|禁止用|严禁使用|\b(?:i\s+prefer|always\s+use|prefer\s+using|never\s+use|do\s+not\s+use|please\s+use)\b)/i;
+  /(?:偏好|习惯|喜欢用|倾向于|统一用|统一使用|优先使用|优先用|默认使用|默认用|请始终|以后都用|不要用|禁止用|严禁使用|改用|换成|不再用|不再使用|不要再用|\b(?:i\s+prefer|always\s+use|prefer\s+using|never\s+use|do\s+not\s+use|please\s+use|switched\s+(?:to|from)|migrated\s+(?:to|from)|no\s+longer\s+use|stop\s+using)\b)/i;
 const DECISION_RE =
   /(?:决定采用|决定使用|最终定稿|架构决策|技术方案定为|约定使用|方案选择|确认采用|敲定|\b(?:we\s+decided|decision:|architectural\s+decision|agreed\s+to\s+use|settled\s+on|chosen\s+approach)\b)/i;
 const PITFALL_RE =
@@ -163,7 +165,7 @@ function inferTopicKey(kind: MemoryKind, text: string, explicitTopic?: string): 
   return undefined;
 }
 
-function extractTagsFromText(text: string, cwd?: string): string[] {
+function extractTagsFromText(text: string, cwd?: string, homeDir?: string): string[] {
   const tags: string[] = [];
   const techMatches = text.match(
     /\b(?:typescript|javascript|react|vitest|playwright|pnpm|npm|yarn|bun|biome|esbuild|vite|swift|macos|cordis|dsh|minisearch|fsrs|jsonl|markdown|css|axe)\b/gi,
@@ -175,9 +177,12 @@ function extractTagsFromText(text: string, cwd?: string): string[] {
     }
   }
   if (cwd) {
-    const base = cwd.split(/[\\/]/).filter(Boolean).at(-1);
-    if (base && base !== '~' && !tags.includes(base.toLowerCase())) {
-      tags.push(base.toLowerCase());
+    const maskedCwd = maskHomePath(cwd, homeDir);
+    const homeBase = homeDir?.split(/[\\/]/).filter(Boolean).at(-1)?.toLowerCase();
+    const base = maskedCwd.split(/[\\/]/).filter(Boolean).at(-1);
+    const lowBase = base?.toLowerCase();
+    if (lowBase && lowBase !== '~' && lowBase !== homeBase && !tags.includes(lowBase)) {
+      tags.push(lowBase);
     }
   }
   return tags.slice(0, 8);
@@ -187,7 +192,7 @@ function splitMeaningfulSentences(text: string): string[] {
   return text
     .split(/(?:[\n\r]+|(?<=[。！？!?；;])\s*)/)
     .map((s) => s.trim())
-    .filter((s) => [...s].length >= 8);
+    .filter((s) => [...s].length >= 5);
 }
 
 /**
@@ -237,7 +242,7 @@ export function extractDeterministicNremCandidates(
         kind: matchedKind,
         title,
         content: contextDetail,
-        tags: extractTagsFromText(`${title} ${contextDetail}`, turn.cwd),
+        tags: extractTagsFromText(`${title} ${contextDetail}`, turn.cwd, homeDir),
         ...(topicKey ? { topicKey } : {}),
         ...(supersedes ? { supersedes: true } : {}),
         confidence: fromUser ? 0.88 : 0.8,
@@ -275,7 +280,7 @@ export function extractDeterministicNremCandidates(
       kind: 'episode',
       title,
       content: sanitizeSleepText(contentParts.join(' '), 700, homeDir),
-      tags: extractTagsFromText(`${firstUser} ${lastAssistant}`, firstTurn.cwd),
+      tags: extractTagsFromText(`${firstUser} ${lastAssistant}`, firstTurn.cwd, homeDir),
       topicKey: `episode:session-${sessionId}`,
       confidence: 0.78,
       sourceSessionIds: [sessionId],
@@ -297,7 +302,7 @@ function buildLlmConsolidationPrompt(turns: readonly ConversationTurnInput[], ho
     'You are the ASI NREM/REM sleep memory consolidation extractor.',
     'Extract high-value long-term memories from the sanitized conversation turns below into a JSON array.',
     'Allowed kinds: "preference" (user habits/preferences), "decision" (architectural/product choices), "pitfall" (bugs/root-causes/gotchas), "episode" (concise session milestone).',
-    'Return ONLY a valid JSON array of objects: [{"kind":"preference|decision|pitfall|episode","title":"<=80 chars","content":"<=400 chars","tags":["tag1"],"topicKey":"optional-canonical-topic","supersedes":false,"confidence":0.9}].',
+    'Return ONLY a valid JSON array of objects: [{"kind":"preference|decision|pitfall|episode","title":"<=80 chars","content":"<=400 chars","tags":["tag1"],"topicKey":"optional-canonical-topic","sessionId":"optional-source-session","supersedes":false,"confidence":0.9}].',
     'Never invent facts and never echo secrets.',
     '',
     ...snippets,
@@ -308,6 +313,7 @@ export function parseLlmCandidatesJson(
   rawText: string,
   defaultSessionIds: readonly string[],
   homeDir?: string,
+  sourceTurns?: readonly ConversationTurnInput[],
 ): NremCandidate[] {
   const trimmed = rawText.trim();
   if (!trimmed) return [];
@@ -321,6 +327,20 @@ export function parseLlmCandidatesJson(
     return [];
   }
   if (!Array.isArray(parsed)) return [];
+
+  const sessionTokenIndex = new Map<string, Set<string>>();
+  if (sourceTurns) {
+    for (const t of sourceTurns) {
+      const sid = sanitizeSleepText(t.sessionId, 64, homeDir);
+      if (!sid) continue;
+      const existingSet = sessionTokenIndex.get(sid) ?? new Set<string>();
+      for (const tok of significantTokenSet(`${t.userText} ${t.assistantText}`)) {
+        existingSet.add(tok);
+      }
+      sessionTokenIndex.set(sid, existingSet);
+    }
+  }
+
   const out: NremCandidate[] = [];
   for (const item of parsed.slice(0, 24)) {
     if (!item || typeof item !== 'object') continue;
@@ -339,6 +359,36 @@ export function parseLlmCandidatesJson(
       : [];
     const rawTopic = typeof rec.topicKey === 'string' ? sanitizeSleepText(rec.topicKey, 64, homeDir) : undefined;
     const topicKey = inferTopicKey(kind as MemoryKind, `${title} ${content}`, rawTopic);
+
+    let attributedSessions: string[] = [];
+    if (typeof rec.sessionId === 'string' && rec.sessionId.trim()) {
+      const explicitSid = sanitizeSleepText(rec.sessionId, 64, homeDir);
+      if (explicitSid && (defaultSessionIds.length === 0 || defaultSessionIds.includes(explicitSid))) {
+        attributedSessions = [explicitSid];
+      }
+    }
+    if (attributedSessions.length === 0 && sessionTokenIndex.size > 1) {
+      const candToks = significantTokenSet(`${title} ${content} ${tags.join(' ')}`);
+      const scoredSessions: Array<{ sid: string; overlap: number }> = [];
+      for (const [sid, sToks] of sessionTokenIndex) {
+        let overlap = 0;
+        for (const tok of candToks) {
+          if (sToks.has(tok)) overlap += 1;
+        }
+        if (overlap > 0) scoredSessions.push({ sid, overlap });
+      }
+      scoredSessions.sort((a, b) => b.overlap - a.overlap);
+      const topOverlap = scoredSessions[0]?.overlap ?? 0;
+      if (topOverlap > 0) {
+        attributedSessions = scoredSessions
+          .filter((s) => s.overlap >= Math.max(1, Math.ceil(topOverlap * 0.6)))
+          .map((s) => s.sid);
+      }
+    }
+    if (attributedSessions.length === 0) {
+      attributedSessions = defaultSessionIds.length > 0 ? [defaultSessionIds[0] ?? ''] : [];
+    }
+
     out.push({
       kind: kind as MemoryKind,
       title,
@@ -350,7 +400,7 @@ export function parseLlmCandidatesJson(
         typeof rec.confidence === 'number' && Number.isFinite(rec.confidence)
           ? Math.max(0.4, Math.min(1, rec.confidence))
           : 0.85,
-      sourceSessionIds: [...defaultSessionIds].slice(0, 8),
+      sourceSessionIds: attributedSessions.filter(Boolean).slice(0, 8),
       evidenceCount: 1,
     });
   }
@@ -528,7 +578,7 @@ export async function runTwoPhaseSleepConsolidation(
         const rawLlm = await llmExtract(prompt, signal);
         throwIfAborted(signal);
         if (rawLlm) {
-          llmCandidates = parseLlmCandidatesJson(rawLlm, sessionIds, homeDir);
+          llmCandidates = parseLlmCandidatesJson(rawLlm, sessionIds, homeDir, turns);
         }
       } catch (err) {
         if (signal.aborted || (err instanceof Error && err.name === 'AbortError')) {
@@ -554,24 +604,50 @@ export async function runTwoPhaseSleepConsolidation(
     throwIfAborted(signal);
     const candTokens = significantTokenSet(`${cand.title} ${cand.content} ${cand.tags.join(' ')}`);
 
-    // 2a. Check belief/preference conflict against existing entries first
-    const conflictIdx = working.findIndex((existing) => isConflictingStance(existing, cand));
-    if (conflictIdx >= 0) {
-      const superseded = working[conflictIdx];
-      if (superseded && !superseded.pinned) {
-        working.splice(conflictIdx, 1);
-        conflictsResolved += 1;
+    // 2a. Check belief/preference conflict against ALL existing entries first.
+    // Pinned entries are user-locked ground truth: never delete or overwrite them with conflicting stances.
+    const unpinnedConflictIndices: number[] = [];
+    let hasPinnedConflict = false;
+    for (let i = 0; i < working.length; i += 1) {
+      const existing = working[i];
+      if (!existing || !isConflictingStance(existing, cand)) continue;
+      if (existing.pinned) {
+        hasPinnedConflict = true;
+      } else {
+        unpinnedConflictIndices.push(i);
+      }
+    }
+
+    if (unpinnedConflictIndices.length > 0 || hasPinnedConflict) {
+      const inheritedTags: string[] = [];
+      const inheritedSessions: string[] = [];
+      let inheritedTopic: string | undefined;
+
+      for (let k = unpinnedConflictIndices.length - 1; k >= 0; k -= 1) {
+        const idx = unpinnedConflictIndices[k];
+        if (idx === undefined) continue;
+        const removed = working.splice(idx, 1)[0];
+        if (removed) {
+          conflictsResolved += 1;
+          inheritedTags.push(...removed.tags);
+          inheritedSessions.push(...removed.sourceSessionIds);
+          if (!inheritedTopic && removed.topicKey) inheritedTopic = removed.topicKey;
+        }
+      }
+
+      if (!hasPinnedConflict && unpinnedConflictIndices.length > 0) {
+        const resolvedTopic = cand.topicKey ?? inheritedTopic;
         const replacement = sanitizeMemoryEntry(
           {
             id: `mem_${randomUUID().slice(0, 12)}`,
             kind: cand.kind,
             title: cand.title,
             content: cand.content,
-            tags: [...new Set([...superseded.tags, ...cand.tags])].slice(0, 10),
-            ...((cand.topicKey ?? superseded.topicKey) ? { topicKey: cand.topicKey ?? superseded.topicKey } : {}),
+            tags: [...new Set([...inheritedTags, ...cand.tags])].slice(0, 10),
+            ...(resolvedTopic ? { topicKey: resolvedTopic } : {}),
             pinned: false,
             confidence: cand.confidence,
-            sourceSessionIds: [...new Set([...superseded.sourceSessionIds, ...cand.sourceSessionIds])],
+            sourceSessionIds: [...new Set([...inheritedSessions, ...cand.sourceSessionIds])],
             evidenceCount: cand.evidenceCount,
             recallCount: 0,
             createdAt: now,
@@ -582,8 +658,8 @@ export async function runTwoPhaseSleepConsolidation(
         );
         working.push(replacement);
         createdCount += 1;
-        continue;
       }
+      continue;
     }
 
     // 2b. Check cross-session deduplication / reinforcement
@@ -592,6 +668,7 @@ export async function runTwoPhaseSleepConsolidation(
     for (let i = 0; i < working.length; i += 1) {
       const existing = working[i];
       if (!existing || existing.kind !== cand.kind) continue;
+      if (isConflictingStance(existing, cand)) continue;
       if (cand.topicKey && existing.topicKey === cand.topicKey) {
         bestIdx = i;
         bestSim = 1;
@@ -608,12 +685,16 @@ export async function runTwoPhaseSleepConsolidation(
     if (bestIdx >= 0) {
       const existing = working[bestIdx];
       if (existing) {
-        const richerContent =
-          cand.kind === 'episode' || cand.content.length > existing.content.length ? cand.content : existing.content;
+        const nextTitle = existing.pinned ? existing.title : cand.kind === 'episode' ? cand.title : existing.title;
+        const richerContent = existing.pinned
+          ? existing.content
+          : cand.kind === 'episode' || cand.content.length > existing.content.length
+            ? cand.content
+            : existing.content;
         working[bestIdx] = sanitizeMemoryEntry(
           {
             ...existing,
-            title: cand.kind === 'episode' ? cand.title : existing.title,
+            title: nextTitle,
             content: richerContent,
             tags: [...new Set([...existing.tags, ...cand.tags])].slice(0, 10),
             confidence: Math.max(existing.confidence, cand.confidence),
