@@ -18,8 +18,8 @@ pnpm --filter asi-needs release:check
 
 两个插件的 `release:check` 分工如下：
 
-- `pnpm --filter asi-sense release:check`：在 macOS arm64 上构建并验证 Swift helper（`strip -S` 删除含本机构建路径的调试符号并重新 ad-hoc `codesign` 签名），生成精简 `plugins/asi-sense/dist/asi-sense-<version>.tgz` 并校验 `0.2.2-rc.3 || 0.2.2-rc.5` 启动器，再用 `npm pack --dry-run` 列出文件及大小，运行 `plugins/asi-sense/scripts/release-audit.mjs` 检查包内内容、当前用户名和意外文件，最后向目标 registry（默认 npm 公网，或通过 `ASI_RELEASE_REGISTRY` 指定）查询当前版本。仅明确的 `E404` 视为版本不存在；其他查询错误会失败。检查不读取 npm 用户配置或 token，不能验证需要认证才能读取的 registry。
-- `pnpm --filter asi-needs release:check`：生成 TypeRT 协议产物、构建 Host/Client bundle，生成精简 `plugins/asi-needs/dist/asi-needs-<version>.tgz` 并校验包清单与 `0.2.2-rc.3 || 0.2.2-rc.5` 启动器，再运行 `plugins/asi-needs/scripts/release-audit.mjs` 检查白名单文件、敏感内容与当前用户名（`asi-needs` 为纯 JS/CSS 组合包，本地打包与审计在 Linux 与 macOS 上均可运行；正式发布前还须按下节命令核对目标 registry 上该版本为 `E404`）。
+- `pnpm --filter asi-sense release:check`：在 macOS arm64 上构建并验证 Swift helper（`strip -S` 删除含本机构建路径的调试符号并重新 ad-hoc `codesign` 签名），生成精简 `plugins/asi-sense/dist/asi-sense-<version>.tgz` 并校验 `0.2.2-rc.3 || 0.2.2-rc.5` 启动器，再用 `npm pack --dry-run` 列出文件及大小，运行 `plugins/asi-sense/scripts/release-audit.mjs` 检查包内内容、当前用户名和意外文件，最后向目标 registry（默认 npm 公网，或通过 `ASI_RELEASE_REGISTRY` 指定）查询当前版本。仅明确的 `E404` 视为版本不存在；其他查询错误会失败。
+- `pnpm --filter asi-needs release:check`：生成 TypeRT 协议产物、构建 Host/Client bundle，生成精简 `plugins/asi-needs/dist/asi-needs-<version>.tgz` 并校验包清单与 `0.2.2-rc.3 || 0.2.2-rc.5` 启动器，再用 `npm pack --dry-run` 列出文件及大小，运行 `plugins/asi-needs/scripts/release-audit.mjs` 检查白名单文件、敏感内容与当前用户名，最后同样向目标 registry（默认 npm 公网，或通过 `ASI_RELEASE_REGISTRY` 指定）查询当前版本并断言返回 `E404`（`asi-needs` 为纯 JS/CSS 组合包，打包与审计在 Linux 与 macOS 上均可运行）。检查均不读取 npm 用户配置或 token，不能验证需要认证才能读取的 registry。
 
 发布物是精简打包产物：
 
@@ -41,20 +41,6 @@ pnpm --filter asi-needs release:check
 
 SENSE_VERSION=$(node -p "require('./plugins/asi-sense/package.json').version")
 NEEDS_VERSION=$(node -p "require('./plugins/asi-needs/package.json').version")
-
-node - "$NEEDS_VERSION" <<'NODE'
-const { spawnSync } = require('node:child_process');
-const version = process.argv[2];
-const view = spawnSync(
-  'npm',
-  ['view', `asi-needs@${version}`, 'version', '--json', '--userconfig=/dev/null', '--registry=https://registry.npmjs.org/'],
-  { encoding: 'utf8' },
-);
-if (view.status === 0 || JSON.parse(view.stdout || '{}')?.error?.code !== 'E404') {
-  throw new Error(`asi-needs@${version} 已存在或查询失败`);
-}
-console.log(`Registry https://registry.npmjs.org/: asi-needs@${version} not found (E404)`);
-NODE
 
 npm publish "./plugins/asi-sense/dist/asi-sense-$SENSE_VERSION.tgz" --registry=https://registry.npmjs.org/ --access=public
 npm publish "./plugins/asi-needs/dist/asi-needs-$NEEDS_VERSION.tgz" --registry=https://registry.npmjs.org/ --access=public
@@ -90,46 +76,67 @@ pnpm --dir "$PROFILE" config get registry
 ```sh
 "$DSH" plugin --profile desktop add "asi-sense@$SENSE_VERSION"
 "$DSH" plugin --profile desktop add "asi-needs@$NEEDS_VERSION"
-node - "$PROFILE/package.json" "$BACKUP/package.json" "$SENSE_VERSION" "$NEEDS_VERSION" <<'NODE'
+node - "$PROFILE" "$BACKUP/package.json" "$SENSE_VERSION" "$NEEDS_VERSION" <<'NODE'
 const fs = require('node:fs');
-const [current, before] = process.argv.slice(2, 4).map(path => JSON.parse(fs.readFileSync(path, 'utf8')));
-const [, , , , senseVer, needsVer] = process.argv;
+const path = require('node:path');
+const [profileDir, backupPath, senseVer, needsVer] = process.argv.slice(2);
+const current = JSON.parse(fs.readFileSync(path.join(profileDir, 'package.json'), 'utf8'));
+const before = JSON.parse(fs.readFileSync(backupPath, 'utf8'));
 const senseSpec = current.dependencies?.['asi-sense']?.replace(/^[~^]/, '');
 const needsSpec = current.dependencies?.['asi-needs']?.replace(/^[~^]/, '');
-const beforeBundles = before.dsh?.profile?.bundles ?? [];
+const installedSense = JSON.parse(
+  fs.readFileSync(path.join(profileDir, 'node_modules/asi-sense/package.json'), 'utf8'),
+).version;
+const installedNeeds = JSON.parse(
+  fs.readFileSync(path.join(profileDir, 'node_modules/asi-needs/package.json'), 'utf8'),
+).version;
+const beforeDeps = before.dependencies ?? {};
+const expectedBundles = [...(before.dsh?.profile?.bundles ?? [])];
+for (const name of ['asi-sense', 'asi-needs']) {
+  if (!Object.hasOwn(beforeDeps, name) && !expectedBundles.some(b => (typeof b === 'string' ? b : b?.name) === name)) {
+    expectedBundles.push(name);
+  }
+}
 const currentBundles = current.dsh?.profile?.bundles ?? [];
-const expectedBundles = beforeBundles.some(b => (typeof b === 'string' ? b : b?.name) === 'asi-needs')
-  ? beforeBundles
-  : [...beforeBundles, currentBundles.find(b => (typeof b === 'string' ? b : b?.name) === 'asi-needs')].filter(Boolean);
 if (
   senseSpec !== senseVer ||
   needsSpec !== needsVer ||
+  installedSense !== senseVer ||
+  installedNeeds !== needsVer ||
   JSON.stringify(currentBundles) !== JSON.stringify(expectedBundles)
 ) {
-  throw new Error('安装源、启用状态或 bundle 顺序不符；不要重启，先检查备份');
+  throw new Error('安装源、实际安装版本、启用状态或 bundle 顺序不符；不要重启，先检查备份');
 }
-console.log('双插件 registry 依赖、启用状态和 bundle 顺序已核对');
+console.log('双插件 registry 依赖、已安装版本、启用状态和 bundle 顺序已核对');
 NODE
 ```
 
-必须显式指定版本号：实测无版本的 `add asi-sense` / `add asi-needs` 可能保留已有 `file:` 源。原位替换不删除已有依赖名；若从 `0.1.x` 单插件首次升级到 `0.2.0` 双插件，`asi-sense` 原位保留原顺序，`asi-needs` 追加启用。若任一步失败，不要假定安装未变：先检查 profile、依赖和诊断，再用旧 tgz 原位回退（若升级前已是双插件则回退两个 tgz；若升级前为 `0.1.x` 单插件则移除 `asi-needs` 并回退旧 `asi-sense` tgz）并再次对比备份：
+必须显式指定版本号：实测无版本的 `add asi-sense` / `add asi-needs` 可能保留已有 `file:` 源。原位替换不删除已有依赖名；仅新增安装的依赖名会追加到 `dsh.profile.bundles` 末尾（例如从 `0.1.x` 单插件首次升级到 `0.2.0` 双插件时，`asi-sense` 原位保留原选择和顺序，`asi-needs` 追加启用）。若任一步失败，不要假定安装未变：先检查 profile、依赖和诊断，再用旧 tgz 回退并对比备份（若升级前为 `0.1.x` 单插件无旧 `asi-needs` tgz，将 `OLD_NEEDS_TGZ` 留空以移除新增的 `asi-needs`）：
 
 ```sh
 OLD_SENSE_TGZ="/absolute/path/to/previous-asi-sense.tgz"
-OLD_NEEDS_TGZ="/absolute/path/to/previous-asi-needs.tgz"
+OLD_NEEDS_TGZ="/absolute/path/to/previous-asi-needs.tgz" # 若升级前为 0.1.x 单插件无此包，留空 ""
 "$DSH" plugin --profile desktop add "$OLD_SENSE_TGZ"
-"$DSH" plugin --profile desktop add "$OLD_NEEDS_TGZ"
+if [ -n "$OLD_NEEDS_TGZ" ]; then
+  "$DSH" plugin --profile desktop add "$OLD_NEEDS_TGZ"
+else
+  "$DSH" plugin --profile desktop remove asi-needs
+fi
 node - "$PROFILE/package.json" "$BACKUP/package.json" <<'NODE'
 const fs = require('node:fs');
-const [current, before] = process.argv.slice(2).map(path => JSON.parse(fs.readFileSync(path, 'utf8')));
+const [current, before] = process.argv.slice(2, 4).map(p => JSON.parse(fs.readFileSync(p, 'utf8')));
+const hadNeeds = Object.hasOwn(before.dependencies ?? {}, 'asi-needs');
+const needsOk = hadNeeds
+  ? Boolean(current.dependencies?.['asi-needs']?.startsWith('file:'))
+  : !Object.hasOwn(current.dependencies ?? {}, 'asi-needs');
 if (
   !current.dependencies?.['asi-sense']?.startsWith('file:') ||
-  !current.dependencies?.['asi-needs']?.startsWith('file:') ||
-  JSON.stringify(current.dsh?.profile?.bundles) !== JSON.stringify(before.dsh?.profile?.bundles)
+  !needsOk ||
+  JSON.stringify(current.dsh?.profile?.bundles ?? []) !== JSON.stringify(before.dsh?.profile?.bundles ?? [])
 ) {
   throw new Error('回退后的来源或 bundle 列表不符；不要重启，先检查备份');
 }
-console.log('双插件 tgz 来源、启用状态和 bundle 顺序已核对');
+console.log('tgz 回退来源、启用状态和 bundle 顺序已核对');
 NODE
 ```
 
@@ -179,24 +186,10 @@ packages:
 REGISTRY=http://100.108.45.41:4873/
 npm login --auth-type=legacy --registry="$REGISTRY"
 ASI_RELEASE_REGISTRY="$REGISTRY" pnpm --filter asi-sense release:check
-pnpm --filter asi-needs release:check
+ASI_RELEASE_REGISTRY="$REGISTRY" pnpm --filter asi-needs release:check
 
 SENSE_VERSION=$(node -p "require('./plugins/asi-sense/package.json').version")
 NEEDS_VERSION=$(node -p "require('./plugins/asi-needs/package.json').version")
-
-node - "$NEEDS_VERSION" "$REGISTRY" <<'NODE'
-const { spawnSync } = require('node:child_process');
-const [version, registry] = process.argv.slice(2);
-const view = spawnSync(
-  'npm',
-  ['view', `asi-needs@${version}`, 'version', '--json', '--userconfig=/dev/null', `--registry=${registry}`],
-  { encoding: 'utf8' },
-);
-if (view.status === 0 || JSON.parse(view.stdout || '{}')?.error?.code !== 'E404') {
-  throw new Error(`asi-needs@${version} 已存在或查询失败`);
-}
-console.log(`Registry ${registry}: asi-needs@${version} not found (E404)`);
-NODE
 
 npm publish "./plugins/asi-sense/dist/asi-sense-$SENSE_VERSION.tgz" --registry="$REGISTRY" --access=public
 npm publish "./plugins/asi-needs/dist/asi-needs-$NEEDS_VERSION.tgz" --registry="$REGISTRY" --access=public
