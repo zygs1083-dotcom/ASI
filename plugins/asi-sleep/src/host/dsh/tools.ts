@@ -149,6 +149,7 @@ export function createMemoryProfileTool(runtime: SleepRuntime) {
       ) {
         throw new ToolArgsError(['limitPerKind must be a positive number']);
       }
+      await runtime.vault.syncExternalChanges();
       const snapshot = runtime.profile({
         ...(args.kind ? { kind: args.kind } : {}),
         ...(args.limitPerKind !== undefined ? { limitPerKind: args.limitPerKind } : {}),

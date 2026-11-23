@@ -4,10 +4,11 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
   type ConversationTurnInput,
+  LLM_CONSOLIDATION_BATCH_SIZE,
   parseLlmCandidatesJson,
   runTwoPhaseSleepConsolidation,
 } from '../src/host/consolidator.js';
-import { createInitialFsrsState } from '../src/host/fsrs.js';
+import { createInitialFsrsState, strengthenFsrsState } from '../src/host/fsrs.js';
 import { MemoryVault, maskHomePath, sanitizeSleepText } from '../src/host/vault.js';
 
 const T0 = 1_764_000_000_000;
@@ -374,5 +375,329 @@ describe('NREM + REM 双阶段睡眠记忆巩固与 Markdown/JSONL 脱敏存储�
       sourceTurns,
     );
     expect(llmParsed[0]?.sourceSessionIds).toEqual(['sess-postgres']);
+  });
+
+  it('双向人类可编辑 MEMORY.md：启动 load() 与运行时读写/落盘前自动检测外部手工编辑，对账增删改、置顶/分类迁移、保留已有 FSRS 并强制脱敏', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'asi-sleep-md-bi-'));
+    tempDirs.push(dir);
+    const fakeHome = '/Users/editoruser';
+    const leakedSecret = ['sk', 'proj', 'ABCDEF1234567890abcdef123456'].join('-');
+
+    const vault = new MemoryVault(dir, fakeHome);
+    await vault.load(T0);
+
+    const maturedFsrs = strengthenFsrsState(
+      strengthenFsrsState(createInitialFsrsState('preference', T0), T0 + 3_600_000, 'recall'),
+      T0 + 7_200_000,
+      'recall',
+    );
+
+    vault.upsert({
+      id: 'mem_keep_fsrs',
+      kind: 'preference',
+      title: '默认使用浅色模式',
+      content: '编辑器平时使用浅色背景。',
+      tags: ['ui', 'theme'],
+      topicKey: 'pref:theme',
+      pinned: false,
+      confidence: 0.92,
+      sourceSessionIds: ['sess-1'],
+      evidenceCount: 3,
+      recallCount: 2,
+      createdAt: T0,
+      updatedAt: T0 + 7_200_000,
+      lastRecalledAt: T0 + 7_200_000,
+      links: ['mem_to_delete'],
+      fsrs: maturedFsrs,
+    });
+    vault.upsert({
+      id: 'mem_to_delete',
+      kind: 'episode',
+      title: '临时待删里程碑',
+      content: '将在 MEMORY.md 中被人类手工删除。',
+      tags: ['temp'],
+      pinned: false,
+      confidence: 0.8,
+      sourceSessionIds: ['sess-1'],
+      evidenceCount: 1,
+      recallCount: 0,
+      createdAt: T0,
+      updatedAt: T0,
+      fsrs: createInitialFsrsState('episode', T0),
+    });
+    vault.upsert({
+      id: 'mem_pinned_move',
+      kind: 'preference',
+      title: '旧置顶偏好将迁入决策',
+      content: '原本置顶，手工拖入决策章节并取消置顶。',
+      tags: ['arch'],
+      pinned: true,
+      confidence: 1,
+      sourceSessionIds: ['manual'],
+      evidenceCount: 1,
+      recallCount: 1,
+      createdAt: T0,
+      updatedAt: T0,
+      fsrs: maturedFsrs,
+    });
+    await vault.flush(T0 + 10_000);
+
+    // 阶段 1：模拟进程离线期间人类直接手工编辑 vault/MEMORY.md：
+    // - 修改 mem_keep_fsrs 标题、多行内容与标签，并移动到「已置顶记忆」；
+    // - 删除 mem_to_delete（并验证 mem_keep_fsrs 指向它的悬空关联自动清理）；
+    // - 将原置顶 mem_pinned_move 移入 `## 决策 (decision)` 取消置顶并变更为 decision；
+    // - 手工新增一段无 ID 的 `###` 踩坑记忆（故意带入本机主目录与密钥，验证脱敏与新 ID + 初始 FSRS 分配）！
+    const handEditedOfflineMd = [
+      '# ASI 记忆库 (Memory Vault)',
+      '',
+      '## 已置顶记忆 (Pinned · 永不衰减)',
+      '',
+      '### [偏好] [UI] 默认使用深色高对比模式',
+      '- ID: `mem_keep_fsrs` · FSRS 保留率: **99%** · 标签: `ui`, dark-mode',
+      '- 内容: 编辑器统一改用深色高对比背景：',
+      '- 夜间护眼',
+      '- 路径配置位于 /Users/editoruser/.config/dsh',
+      '',
+      '## 决策 (decision)',
+      '',
+      '### [偏好] 旧置顶偏好将迁入决策',
+      '- ID: `mem_pinned_move` · 保留率: **100% (已置顶)** · 回忆 1 次 · 标签: `arch`',
+      '- 内容: 已由人类手工迁移至决策分类并取消置顶。',
+      '',
+      '## 踩坑 (pitfall)',
+      '',
+      '### 手工新增：严禁硬编码推理网关密钥',
+      '- 标签: llm, security',
+      `调试 /Users/editoruser/work 时切勿写入 ${leakedSecret}，应走本地网关。`,
+      '',
+    ].join('\n');
+    await writeFile(vault.markdownPath, handEditedOfflineMd, 'utf8');
+
+    const reloaded = new MemoryVault(dir, fakeHome);
+    const loadResult = await reloaded.load(T0 + 20_000);
+    expect(loadResult.redactedOnLoad).toBe(true);
+
+    // 1a. 已删除条目彻底移除，且悬空链接已被清理
+    expect(reloaded.get('mem_to_delete')).toBeUndefined();
+
+    // 1b. 编辑过的已有 ID 完整保留原有 FSRS 状态、evidenceCount、recallCount、topicKey，同时标题/多行内容/标签/置顶已生效且脱敏
+    const kept = reloaded.get('mem_keep_fsrs');
+    expect(kept).toBeDefined();
+    expect(kept?.pinned).toBe(true);
+    expect(kept?.kind).toBe('preference');
+    expect(kept?.title).toBe('[UI] 默认使用深色高对比模式');
+    expect(kept?.content).toContain('- 夜间护眼');
+    expect(kept?.content).toContain('~/.config/dsh');
+    expect(kept?.content).not.toContain(fakeHome);
+    expect(kept?.tags).toEqual(['ui', 'dark-mode']);
+    expect(kept?.topicKey).toBe('pref:theme');
+    expect(kept?.fsrs).toEqual(maturedFsrs);
+    expect(kept?.evidenceCount).toBe(3);
+    expect(kept?.recallCount).toBe(2);
+    expect(kept?.links).toBeUndefined();
+
+    // 1c. 从置顶区拖入 `## 决策 (decision)` 的条目成功取消置顶并变更为 decision，且保留 FSRS
+    const moved = reloaded.get('mem_pinned_move');
+    expect(moved?.pinned).toBe(false);
+    expect(moved?.kind).toBe('decision');
+    expect(moved?.fsrs).toEqual(maturedFsrs);
+
+    // 1d. 手工新增无 ID 章节分配了 `mem_*` ID 与初始 FSRS，且密钥与主目录在内存与磁盘双文件中均已脱敏
+    const allAfterLoad = reloaded.list(T0 + 20_000);
+    expect(allAfterLoad).toHaveLength(3);
+    const handAdded = allAfterLoad.find((m) => m.id !== 'mem_keep_fsrs' && m.id !== 'mem_pinned_move');
+    expect(handAdded?.id).toMatch(/^mem_/);
+    expect(handAdded?.kind).toBe('pitfall');
+    expect(handAdded?.tags).toEqual(['llm', 'security']);
+    expect(handAdded?.content).toContain('~/work');
+    expect(handAdded?.content).toContain('[redacted]');
+    expect(handAdded?.content).not.toContain(leakedSecret);
+    expect(handAdded?.fsrs.reps).toBeGreaterThanOrEqual(1);
+
+    const diskJsonlAfterLoad = await readFile(reloaded.memoriesJsonlPath, 'utf8');
+    const diskMdAfterLoad = await readFile(reloaded.markdownPath, 'utf8');
+    expect(diskJsonlAfterLoad).toContain(handAdded?.id ?? '');
+    expect(diskJsonlAfterLoad).not.toContain('mem_to_delete');
+    expect(diskJsonlAfterLoad).not.toContain(leakedSecret);
+    expect(diskMdAfterLoad).toContain(`ID: \`${handAdded?.id}\``);
+    expect(diskMdAfterLoad).not.toContain(leakedSecret);
+
+    // 阶段 2：运行时在线期间（不重启 MemoryVault），人类再次在外部编辑器修改 MEMORY.md，
+    // 紧接着直接触发读取与 flush/upsert，验证绝不覆盖丢失人类在线编辑！
+    const liveEditedMd = diskMdAfterLoad
+      .replace('已由人类手工迁移至决策分类并取消置顶。', '在线二次编辑后的最新架构决策内容。')
+      .replace('_暂无未置顶条目_', '- 终端输出偏好: 始终输出简洁清晰的中文说明');
+    await writeFile(reloaded.markdownPath, liveEditedMd, 'utf8');
+
+    // 在线同步读取立即感知外部编辑，随后 upsert 新条目并 flush 不会冲掉外部修改
+    expect(reloaded.get('mem_pinned_move', T0 + 30_000)?.content).toBe('在线二次编辑后的最新架构决策内容。');
+    reloaded.upsert({
+      id: 'mem_ui_added',
+      kind: 'episode',
+      title: '侧栏并发新增条目',
+      content: '验证外部编辑 MEMORY.md 后再从 UI 新增条目双方共存。',
+      tags: ['sync'],
+      pinned: false,
+      confidence: 1,
+      sourceSessionIds: ['manual'],
+      evidenceCount: 1,
+      recallCount: 0,
+      createdAt: T0 + 30_000,
+      updatedAt: T0 + 30_000,
+      fsrs: createInitialFsrsState('episode', T0 + 30_000),
+    });
+    await reloaded.flush(T0 + 30_000);
+
+    const finalEntries = reloaded.list(T0 + 30_000);
+    expect(finalEntries.some((m) => m.id === 'mem_ui_added')).toBe(true);
+    expect(finalEntries.find((m) => m.id === 'mem_pinned_move')?.content).toBe('在线二次编辑后的最新架构决策内容。');
+    expect(finalEntries.some((m) => m.content.includes('始终输出简洁清晰的中文说明'))).toBe(true);
+
+    const finalJsonlLines = (await readFile(reloaded.memoriesJsonlPath, 'utf8')).trim().split('\n');
+    expect(finalJsonlLines).toHaveLength(finalEntries.length);
+  });
+
+  it('超过 24 轮未整合对话时按批调用 llmExtract（零漏提早期轮次、按时间序消解跨批冲突、支持批间 AbortSignal 中断）', async () => {
+    expect(LLM_CONSOLIDATION_BATCH_SIZE).toBe(24);
+    const totalTurns = 55; // 24 + 24 + 7 = 3 个批次
+    const turns: ConversationTurnInput[] = [];
+    for (let i = 1; i <= totalTurns; i += 1) {
+      turns.push({
+        turnId: `turn-${i}`,
+        sessionId: i <= 20 ? 'sess-early' : 'sess-late',
+        seq: i,
+        at: T0 + i * 1_000,
+        userText:
+          i === 3
+            ? '早期隐藏口令线索：代号 ALPHA_EARLY_BATCH_FACT，采用旧版 npm 脚本。'
+            : i === 52
+              ? '晚期反转线索：代号 OMEGA_LATE_BATCH_FACT，决定改用 pnpm 替代 npm。'
+              : `第 ${i} 轮常规问答`,
+        assistantText: `第 ${i} 轮常规回复`,
+      });
+    }
+
+    // 故意打乱输入顺序（把晚期轮次放前面、早期轮次放后面），验证引擎按真实时间序分批提取与冲突消解
+    const shuffledTurns = [...turns.slice(30), ...turns.slice(0, 30)];
+    const seenPrompts: string[] = [];
+
+    const out = await runTwoPhaseSleepConsolidation({
+      turns: shuffledTurns,
+      existingMemories: [],
+      now: T0 + 100_000,
+      trigger: 'manual',
+      signal: new AbortController().signal,
+      llmExtract: async (prompt) => {
+        seenPrompts.push(prompt);
+        if (prompt.includes('ALPHA_EARLY_BATCH_FACT')) {
+          return JSON.stringify([
+            {
+              kind: 'decision',
+              title: '早期批次提炼记忆',
+              content: '来自前 24 轮批次（含 ALPHA_EARLY_BATCH_FACT）的专属提取结果。',
+              tags: ['early-batch'],
+              topicKey: 'arch:early-fact',
+            },
+            {
+              kind: 'preference',
+              title: '旧包管理器 npm',
+              content: '早期使用 npm。',
+              tags: ['npm'],
+              topicKey: 'pref:package-manager',
+            },
+          ]);
+        }
+        if (prompt.includes('OMEGA_LATE_BATCH_FACT')) {
+          return JSON.stringify([
+            {
+              kind: 'preference',
+              title: '改用 pnpm 替代 npm',
+              content: '晚期批次决定统一改用 pnpm，不再使用 npm。',
+              tags: ['pnpm'],
+              topicKey: 'pref:package-manager',
+              supersedes: true,
+            },
+          ]);
+        }
+        return '[]';
+      },
+    });
+
+    // 55 轮拆分为 3 个批次（24 + 24 + 7），绝不丢弃前 31 轮！
+    expect(seenPrompts).toHaveLength(3);
+    expect(seenPrompts[0]).toContain('ALPHA_EARLY_BATCH_FACT');
+    expect(seenPrompts[2]).toContain('OMEGA_LATE_BATCH_FACT');
+    expect(out.record.turnsProcessed).toBe(55);
+    expect(out.memories.some((m) => m.title === '早期批次提炼记忆')).toBe(true);
+    // 跨批次立场反转：第 3 批 supersedes=true 的 pnpm 新偏好自动淘汰第 1 批的旧 npm 偏好
+    const pkgPref = out.memories.find((m) => m.topicKey === 'pref:package-manager');
+    expect(pkgPref?.title).toContain('pnpm');
+    expect(out.record.conflictsResolved).toBeGreaterThanOrEqual(1);
+
+    // 验证批间 AbortSignal 抢占：在第 1 批返回时触发 abort，第 2、3 批绝不继续请求且立即抛出 AbortError
+    const abortCtrl = new AbortController();
+    let abortedBatchCalls = 0;
+    await expect(
+      runTwoPhaseSleepConsolidation({
+        turns,
+        existingMemories: [],
+        now: T0 + 110_000,
+        trigger: 'auto',
+        signal: abortCtrl.signal,
+        llmExtract: async () => {
+          abortedBatchCalls += 1;
+          abortCtrl.abort();
+          return '[]';
+        },
+      }),
+    ).rejects.toMatchObject({ name: 'AbortError' });
+    expect(abortedBatchCalls).toBe(1);
+
+    // 边界：LLM 响应前缀含 `[Turn 1]` 方括号说明且包裹在 ```json 代码块中时，仍能稳健解析 JSON 数组
+    const fencedWithPrefix = `参考 [Turn 1] 与 [Turn 2] 的上下文，提炼结果如下：\n\`\`\`json\n[{"kind":"pitfall","title":"避免 indexOf 首括号误判","content":"前缀含方括号时仍应准确解析 JSON 数组"}]\n\`\`\``;
+    const fencedParsed = parseLlmCandidatesJson(fencedWithPrefix, ['sess-early']);
+    expect(fencedParsed).toHaveLength(1);
+    expect(fencedParsed[0]?.title).toBe('避免 indexOf 首括号误判');
+  });
+
+  it('MEMORY.md 边界：支持代码块内 `#` 注释与后置 `- 标签:` 元数据，且清空全部条目时准确同步清空 memories.jsonl', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'asi-sleep-md-edge-'));
+    tempDirs.push(dir);
+    const vault = new MemoryVault(dir, '/Users/tester');
+    await vault.load(T0);
+
+    const codeFenceMd = [
+      '# ASI 记忆库 (Memory Vault)',
+      '',
+      '## 踩坑 (pitfall)',
+      '',
+      '### 构建前清理旧产物脚本',
+      '- 内容: 执行干净检出模拟时按以下步骤运行：',
+      '```sh',
+      '# 注意：代码块内的井号注释绝不能被误判为 H1 标题截断！',
+      '## 二级井号同样保留',
+      'rm -rf plugins/asi-sleep/lib',
+      '```',
+      '- 标签: build, clean-checkout',
+      '',
+    ].join('\n');
+    await writeFile(vault.markdownPath, codeFenceMd, 'utf8');
+    await vault.syncExternalChanges(T0 + 1_000);
+
+    const items = vault.list(T0 + 1_000);
+    expect(items).toHaveLength(1);
+    expect(items[0]?.tags).toEqual(['build', 'clean-checkout']);
+    expect(items[0]?.content).toContain('# 注意:代码块内的井号注释绝不能被误判为 H1 标题截断!');
+    expect(items[0]?.content).toContain('rm -rf plugins/asi-sleep/lib');
+
+    // 当人类清空 MEMORY.md 中全部条目（仅保留标题与空章节）时，memories.jsonl 同步清空为 0 条
+    await writeFile(
+      vault.markdownPath,
+      '# ASI 记忆库 (Memory Vault)\n\n## 踩坑 (pitfall)\n\n_暂无未置顶条目_\n',
+      'utf8',
+    );
+    await vault.syncExternalChanges(T0 + 2_000);
+    expect(vault.list(T0 + 2_000)).toHaveLength(0);
+    expect(await readFile(vault.memoriesJsonlPath, 'utf8')).toBe('');
   });
 });

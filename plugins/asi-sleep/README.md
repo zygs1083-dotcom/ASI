@@ -17,7 +17,7 @@
    - **零动态消息注入、零动态系统提示词篡改**，100% 保护对话 Prompt Cache；每次 `memory_recall` 命中自动强化对应记忆的 FSRS 稳定度（`stability`）与保留率。
 4. **独立侧栏「记忆库」（`id: 'asi-sleep'`）与双向凭据脱敏**：
    - 提供图形化搜索、四类记忆筛选、FSRS 保留率与稳定度可视化、记忆增删改与**置顶锁定（置顶项保留率恒定 100%，永不衰减或修剪）**、自动睡眠暂停开关及「立即睡眠整合」按钮。
-   - 本地持久化为可读 `vault/MEMORY.md` + `vault/memories.jsonl` + `vault/sleep-journal.jsonl`，在**落盘前、读取后与模型/工具输出前**全链路强制执行 `sanitizeForModel` 脱敏与主目录 `~` 归一化。
+   - 本地持久化为人类可直接查看并**双向编辑**的 `vault/MEMORY.md` + `vault/memories.jsonl` + `vault/sleep-journal.jsonl`（手工修改 `MEMORY.md` 的标题/内容/标签/置顶/分类、删除条目或新增章节会自动对账同步回 `memories.jsonl`，保留已有 ID 的 FSRS 状态并为手写新增条目分配 ID 与初始 FSRS），在**落盘前、读取后与模型/工具输出前**全链路强制执行 `sanitizeForModel` 脱敏与主目录 `~` 归一化。
 
 ## 开源复用与 MIT 署名说明
 

@@ -436,11 +436,12 @@ export function createSleepRuntime(ports: SleepHostPorts): SleepRuntime {
     const task = (async (): Promise<SleepConsolidationRecord> => {
       try {
         const now = clock.wall();
+        await vault.syncExternalChanges(now);
         const turnsToProcess = pendingOrdinaryTurns(now);
 
         const result = await runTwoPhaseSleepConsolidation({
           turns: turnsToProcess,
-          existingMemories: () => vault.list(),
+          existingMemories: () => vault.list(clock.wall()),
           now,
           trigger,
           signal: localAbort.signal,
@@ -572,6 +573,7 @@ export function createSleepRuntime(ports: SleepHostPorts): SleepRuntime {
         throw new Error('topicKey must be a string');
       }
       const now = clock.wall();
+      await vault.syncExternalChanges(now);
       const created = vault.upsert({
         id: `mem_${randomUUID().slice(0, 12)}`,
         kind: input.kind,
@@ -595,8 +597,10 @@ export function createSleepRuntime(ports: SleepHostPorts): SleepRuntime {
     },
 
     async updateMemory(id: string, patch: MemoryUpdateInput): Promise<MemoryViewItem> {
+      const now = clock.wall();
+      await vault.syncExternalChanges(now);
       const safeId = sanitizeSleepText(typeof id === 'string' ? id : '', 64, ports.homeDir);
-      const existing = vault.get(id);
+      const existing = vault.get(id, now);
       if (!existing) throw new Error(`Memory not found: ${safeId || 'unknown'}`);
       if (!patch || typeof patch !== 'object' || Array.isArray(patch)) {
         throw new Error('patch must be an object');
@@ -622,7 +626,6 @@ export function createSleepRuntime(ports: SleepHostPorts): SleepRuntime {
       if (!nextTitle || !nextContent) {
         throw new Error('title and content cannot be empty');
       }
-      const now = clock.wall();
       const unpinning = existing.pinned && patch.pinned === false;
       const nextFsrs = unpinning ? { ...existing.fsrs, lastReview: now } : existing.fsrs;
 
@@ -653,10 +656,11 @@ export function createSleepRuntime(ports: SleepHostPorts): SleepRuntime {
     },
 
     async deleteMemory(id: string): Promise<void> {
-      const safeId = sanitizeSleepText(typeof id === 'string' ? id : '', 64, ports.homeDir);
-      const existed = vault.delete(id);
-      if (!existed) throw new Error(`Memory not found: ${safeId || 'unknown'}`);
       const now = clock.wall();
+      await vault.syncExternalChanges(now);
+      const safeId = sanitizeSleepText(typeof id === 'string' ? id : '', 64, ports.homeDir);
+      const existed = vault.delete(id, now);
+      if (!existed) throw new Error(`Memory not found: ${safeId || 'unknown'}`);
       await vault.flush(now);
       ports.drives.notifySourceChanged('asi-sleep');
       notify();
@@ -664,7 +668,8 @@ export function createSleepRuntime(ports: SleepHostPorts): SleepRuntime {
 
     async searchMemories(query: string, kind?: MemoryKind): Promise<MemoryViewItem[]> {
       const now = clock.wall();
-      const all = vault.list().map((e) => toViewItem(e, now));
+      await vault.syncExternalChanges(now);
+      const all = vault.list(now).map((e) => toViewItem(e, now));
       const hits = searchMemoryItems(all, query, {
         ...(kind ? { kind } : {}),
         includeLowRetention: true,
@@ -847,13 +852,16 @@ export function createSleepRuntime(ports: SleepHostPorts): SleepRuntime {
       offDriveSource?.();
       offDriveSource = undefined;
 
-      await Promise.allSettled([activeConsolidationPromise ?? Promise.resolve(), stateWriteChain]);
+      await Promise.allSettled([activeConsolidationPromise ?? Promise.resolve(), stateWriteChain, vault.waitForIdle()]);
       subscribers.clear();
     },
 
     panelModel(): SleepPanelModel {
       const ev = computeEvaluated(ports.sense.snapshot());
-      const allEntries = vault.list();
+      const allEntries = vault.list(ev.now);
+      if (!stopped && vault.hasPendingExternalFlush()) {
+        void vault.flush(ev.now);
+      }
       const countsByKind: Record<MemoryKind, number> = {
         preference: 0,
         decision: 0,
@@ -897,8 +905,9 @@ export function createSleepRuntime(ports: SleepHostPorts): SleepRuntime {
 
     async recall(input: RecallQueryInput): Promise<RecallQueryResult> {
       const now = clock.wall();
+      await vault.syncExternalChanges(now);
       const query = sanitizeSleepText(input.query ?? '', 400, ports.homeDir);
-      const allEntries = vault.list();
+      const allEntries = vault.list(now);
       const views = allEntries.map((e) => toViewItem(e, now));
       const limit = Math.max(1, Math.min(20, Math.trunc(input.limit ?? 8)));
       const ranked = searchMemoryItems(views, query, {
@@ -958,7 +967,10 @@ export function createSleepRuntime(ports: SleepHostPorts): SleepRuntime {
     profile(input?: ProfileQueryInput): ProfileQueryResult {
       const now = clock.wall();
       const limitPerKind = Math.max(1, Math.min(15, Math.trunc(input?.limitPerKind ?? 5)));
-      const allEntries = vault.list();
+      const allEntries = vault.list(now);
+      if (!stopped && vault.hasPendingExternalFlush()) {
+        void vault.flush(now);
+      }
       const countsByKind: Record<MemoryKind, number> = {
         preference: 0,
         decision: 0,

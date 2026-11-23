@@ -154,8 +154,8 @@ function inferTopicKey(kind: MemoryKind, text: string, explicitTopic?: string): 
     return explicitTopic
       .trim()
       .toLowerCase()
-      .replace(/[^a-z0-9\p{Script=Han}_-]+/gu, '-')
-      .replace(/^-+|-+$/g, '');
+      .replace(/[^a-z0-9\p{Script=Han}:_-]+/gu, '-')
+      .replace(/^[-:]+|[-:]+$/g, '');
   }
   for (const fam of KNOWN_TOPIC_FAMILIES) {
     if (fam.pattern.test(text)) {
@@ -291,8 +291,10 @@ export function extractDeterministicNremCandidates(
   return candidates;
 }
 
+export const LLM_CONSOLIDATION_BATCH_SIZE = 24;
+
 function buildLlmConsolidationPrompt(turns: readonly ConversationTurnInput[], homeDir?: string): string {
-  const snippets = turns.slice(-24).map((t, idx) => {
+  const snippets = turns.slice(0, LLM_CONSOLIDATION_BATCH_SIZE).map((t, idx) => {
     const u = sanitizeSleepText(t.userText, 360, homeDir);
     const a = sanitizeSleepText(t.assistantText, 360, homeDir);
     const sid = sanitizeSleepText(t.sessionId, 40, homeDir);
@@ -309,6 +311,38 @@ function buildLlmConsolidationPrompt(turns: readonly ConversationTurnInput[], ho
   ].join('\n\n');
 }
 
+function extractJsonArrayFromText(trimmed: string): unknown[] | undefined {
+  for (const fenceMatch of trimmed.matchAll(/```(?:json)?\s*([\s\S]*?)```/gi)) {
+    const body = (fenceMatch[1] ?? '').trim();
+    const fStart = body.indexOf('[');
+    const fEnd = body.lastIndexOf(']');
+    if (fStart >= 0 && fEnd > fStart) {
+      try {
+        const candidate = JSON.parse(body.slice(fStart, fEnd + 1)) as unknown;
+        if (Array.isArray(candidate)) return candidate;
+      } catch {
+        // Try next fenced block or bracket scan
+      }
+    }
+  }
+
+  const lastClose = trimmed.lastIndexOf(']');
+  if (lastClose <= 0) return undefined;
+  let searchFrom = 0;
+  for (let attempts = 0; attempts < 16; attempts += 1) {
+    const openIdx = trimmed.indexOf('[', searchFrom);
+    if (openIdx < 0 || openIdx >= lastClose) break;
+    try {
+      const candidate = JSON.parse(trimmed.slice(openIdx, lastClose + 1)) as unknown;
+      if (Array.isArray(candidate)) return candidate;
+    } catch {
+      // Advance past non-JSON bracket (e.g. `[Turn 1]`)
+    }
+    searchFrom = openIdx + 1;
+  }
+  return undefined;
+}
+
 export function parseLlmCandidatesJson(
   rawText: string,
   defaultSessionIds: readonly string[],
@@ -317,16 +351,8 @@ export function parseLlmCandidatesJson(
 ): NremCandidate[] {
   const trimmed = rawText.trim();
   if (!trimmed) return [];
-  const start = trimmed.indexOf('[');
-  const end = trimmed.lastIndexOf(']');
-  if (start < 0 || end <= start) return [];
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(trimmed.slice(start, end + 1));
-  } catch {
-    return [];
-  }
-  if (!Array.isArray(parsed)) return [];
+  const parsed = extractJsonArrayFromText(trimmed);
+  if (!parsed) return [];
 
   const sessionTokenIndex = new Map<string, Set<string>>();
   if (sourceTurns) {
@@ -399,7 +425,7 @@ export function parseLlmCandidatesJson(
       confidence:
         typeof rec.confidence === 'number' && Number.isFinite(rec.confidence)
           ? Math.max(0.4, Math.min(1, rec.confidence))
-          : 0.85,
+          : 0.9,
       sourceSessionIds: attributedSessions.filter(Boolean).slice(0, 8),
       evidenceCount: 1,
     });
@@ -418,6 +444,11 @@ export function clusterNremCandidates(candidates: readonly NremCandidate[]): Nre
     let merged = false;
     for (const cluster of clusters) {
       if (cluster.candidate.kind !== cand.kind) continue;
+      if (Boolean(cand.supersedes) !== Boolean(cluster.candidate.supersedes)) {
+        // Keep stance-reversing candidates distinct from prior non-superseding stances so
+        // Phase 2 REM conflict resolution replaces older stances in chronological order.
+        continue;
+      }
       const sameTopic =
         Boolean(cand.topicKey) &&
         cluster.candidate.topicKey === cand.topicKey &&
@@ -565,26 +596,36 @@ export async function runTwoPhaseSleepConsolidation(
   const { turns, existingMemories, now, trigger, signal, homeDir, llmExtract } = input;
   throwIfAborted(signal);
 
-  const sessionIds = [...new Set(turns.map((t) => sanitizeSleepText(t.sessionId, 64, homeDir)).filter(Boolean))];
+  const orderedTurns = turns
+    .map((turn, index) => ({ turn, index }))
+    .sort((a, b) => a.turn.at - b.turn.at || (a.turn.seq ?? 0) - (b.turn.seq ?? 0) || a.index - b.index)
+    .map((entry) => entry.turn);
 
   // Phase 1: NREM extraction + intra-batch clustering
   let rawCandidates: NremCandidate[] = [];
-  if (turns.length > 0) {
-    const deterministic = extractDeterministicNremCandidates(turns, homeDir);
-    let llmCandidates: NremCandidate[] = [];
+  if (orderedTurns.length > 0) {
+    const deterministic = extractDeterministicNremCandidates(orderedTurns, homeDir);
+    const llmCandidates: NremCandidate[] = [];
     if (llmExtract) {
-      try {
-        const prompt = buildLlmConsolidationPrompt(turns, homeDir);
-        const rawLlm = await llmExtract(prompt, signal);
+      for (let offset = 0; offset < orderedTurns.length; offset += LLM_CONSOLIDATION_BATCH_SIZE) {
         throwIfAborted(signal);
-        if (rawLlm) {
-          llmCandidates = parseLlmCandidatesJson(rawLlm, sessionIds, homeDir, turns);
+        const batchTurns = orderedTurns.slice(offset, offset + LLM_CONSOLIDATION_BATCH_SIZE);
+        const batchSessionIds = [
+          ...new Set(batchTurns.map((t) => sanitizeSleepText(t.sessionId, 64, homeDir)).filter(Boolean)),
+        ];
+        try {
+          const prompt = buildLlmConsolidationPrompt(batchTurns, homeDir);
+          const rawLlm = await llmExtract(prompt, signal);
+          throwIfAborted(signal);
+          if (rawLlm) {
+            llmCandidates.push(...parseLlmCandidatesJson(rawLlm, batchSessionIds, homeDir, batchTurns));
+          }
+        } catch (err) {
+          if (signal.aborted || (err instanceof Error && err.name === 'AbortError')) {
+            throw err;
+          }
+          // Gracefully fall back to deterministic NREM extraction for failed batch if LLM is offline/unavailable
         }
-      } catch (err) {
-        if (signal.aborted || (err instanceof Error && err.name === 'AbortError')) {
-          throw err;
-        }
-        // Gracefully fall back to deterministic NREM extraction if LLM is offline/unavailable
       }
     }
     rawCandidates = [...llmCandidates, ...deterministic];

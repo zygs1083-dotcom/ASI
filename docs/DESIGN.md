@@ -121,7 +121,7 @@ ASI 由 `asi-sense`、`asi-needs` 与 `asi-sleep` 独立组合包构成，插件
    - 改造自 `Fozikio/cortex-engine`（MIT）的双阶段睡眠整合流水线：**NREM 阶段**增量提炼并同批聚类四类记忆（`preference` 偏好、`decision` 决策、`pitfall` 踩坑、`episode` 近期进展）；**REM 阶段**跨会话去重强化、消解偏好/决策立场反转冲突、建立跨会话关联链接并按遗忘曲线修剪过期记忆。
    - 集成 `open-spaced-repetition/ts-fsrs`（MIT）计算连续时间幂律保留率 $R(t)$，命中 `memory_recall` 自动强化稳定度 $S$；手动置顶（`pinned: true`）条目恒定锁定 `100%` 保留率且永不衰减修剪。
    - 集成 `lucaong/minisearch`（MIT）并扩展中英双语二元词组 + 驼峰/代码标识符分词器，支持毫秒级本地 BM25 + 前缀 + 拼写容错检索。
-   - 本地落盘为人类可读 `vault/MEMORY.md` + 结构化 `vault/memories.jsonl` + `vault/sleep-journal.jsonl`。
+   - 本地落盘为人类可直接查看并**双向编辑**的 `vault/MEMORY.md` + 结构化 `vault/memories.jsonl` + `vault/sleep-journal.jsonl`（外部手工编辑 `MEMORY.md` 在启动与读写/落盘前自动对账同步回 `memories.jsonl`，保留原有 FSRS 状态并强制脱敏）。
 2. **困意曲线、静默窗口与生理抢占仲裁**：
    - 注册至 `ctx.asiDrives`（`id: 'asi-sleep', tier: 2`），当普通对话未整合轮次 `>= 12`（或有新轮次且距上次睡眠 `>= 6 小时`）时进入不适区（`satisfaction < 60`）；
    - 严格跳过后台自维护沙盒与子代理（`subagent`）会话；

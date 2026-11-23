@@ -3,15 +3,21 @@
  *
  * Persists consolidated memories to `<storageRoot>/vault/`:
  * - `memories.jsonl`: canonical structured store (one sanitized JSON object per line)
- * - `MEMORY.md`: human-readable Markdown digest grouped by pinned & memory kinds
+ * - `MEMORY.md`: human-readable & bidirectionally human-editable Markdown vault
  * - `sleep-journal.jsonl`: bounded history of NREM/REM sleep consolidation runs
+ *
+ * Supports external human edits to `MEMORY.md` (detected on startup `load()` and
+ * before reads, mutations, and flushes), reconciling manual title/content/tag/pin/kind
+ * edits, deletions, and hand-added Markdown sections back into `memories.jsonl` while
+ * preserving existing FSRS state for matched IDs.
  *
  * Enforces `sanitizeForModel` + home-directory `~` redaction BOTH before writing
  * to disk AND after reading from disk.
  */
 
-import { randomUUID } from 'node:crypto';
-import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
+import { createHash, randomUUID } from 'node:crypto';
+import { readFileSync } from 'node:fs';
+import { mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { sanitizeForModel } from '@asi/sense-types';
 import {
@@ -29,6 +35,24 @@ const MAX_TITLE_CHARS = 140;
 const MAX_CONTENT_CHARS = 1_600;
 const MAX_TAG_CHARS = 40;
 const MAX_TAGS = 12;
+
+const VAULT_SYNC_FOOTER_RE = /\n?<!--\s*asi-sleep-vault\s+md=([0-9a-f]+)(?:\s+jsonl=([0-9a-f]+))?\s*-->\s*$/;
+const PLACEHOLDER_LINE_RE = /^_暂无(?:未置顶)?条目_\s*$/;
+const HTML_COMMENT_LINE_RE = /^<!--.*-->\s*$/;
+
+function sha256Short(text: string): string {
+  return createHash('sha256').update(text, 'utf8').digest('hex').slice(0, 24);
+}
+
+function wasTextRedacted(raw: string, homeDir?: string): boolean {
+  if (!raw) return false;
+  const preMasked = maskHomePath(raw, homeDir);
+  if (preMasked !== raw) return true;
+  const redacted = sanitizeForModel(preMasked);
+  if (redacted !== preMasked) return true;
+  const postMasked = maskHomePath(redacted, homeDir);
+  return postMasked !== redacted;
+}
 
 function sliceChars(text: string, maxChars: number): string {
   const chars = [...text];
@@ -177,11 +201,438 @@ export function sanitizeConsolidationRecord(
   };
 }
 
+export interface ParsedMarkdownMemory {
+  id?: string;
+  kind?: MemoryKind;
+  bracketKind?: MemoryKind;
+  sectionKind?: MemoryKind;
+  pinned?: boolean;
+  title: string;
+  content: string;
+  tags?: string[];
+  topicKey?: string;
+  links?: string[];
+}
+
+function parseKindToken(raw: string): MemoryKind | undefined {
+  const token = raw.trim().toLowerCase();
+  if (token === 'preference' || token === '偏好') return 'preference';
+  if (token === 'decision' || token === '决策') return 'decision';
+  if (token === 'pitfall' || token === '踩坑') return 'pitfall';
+  if (token === 'episode' || token === '近期进展' || token === '进展') return 'episode';
+  return undefined;
+}
+
+function parsePinToken(raw: string): boolean | undefined {
+  const token = raw.trim().toLowerCase();
+  if (
+    token === 'pinned' ||
+    token === '置顶' ||
+    token === '已置顶' ||
+    token === 'true' ||
+    token === 'yes' ||
+    token === '是' ||
+    token === '1'
+  ) {
+    return true;
+  }
+  if (
+    token === 'unpinned' ||
+    token === '未置顶' ||
+    token === '取消置顶' ||
+    token === 'false' ||
+    token === 'no' ||
+    token === '否' ||
+    token === '0'
+  ) {
+    return false;
+  }
+  return undefined;
+}
+
+function stripSurroundingCodeTicks(value: string): string {
+  return value
+    .trim()
+    .replace(/^`+|`+$/g, '')
+    .replace(/^["']+|["']+$/g, '')
+    .trim();
+}
+
+function parseCommaOrTickList(raw: string, stripHashPrefix = false): string[] {
+  const trimmed = raw.trim();
+  if (!trimmed || /^(?:none|nil|empty|无|空|-|—)$/i.test(trimmed)) return [];
+  const items: string[] = [];
+  for (const part of trimmed.split(/[,，、;；]+/)) {
+    let cleaned = stripSurroundingCodeTicks(part);
+    if (stripHashPrefix) {
+      cleaned = cleaned.replace(/^#+/, '').trim();
+    }
+    if (cleaned) items.push(cleaned);
+  }
+  return items;
+}
+
+function parseSectionHeader(heading: string): { isPinnedSection: boolean; kind?: MemoryKind } {
+  const text = heading.trim();
+  if (text.includes('已置顶') || /\bpinned\b/i.test(text)) {
+    return { isPinnedSection: true };
+  }
+  if (/\bpreference\b/i.test(text) || text.includes('偏好')) {
+    return { isPinnedSection: false, kind: 'preference' };
+  }
+  if (/\bdecision\b/i.test(text) || text.includes('决策')) {
+    return { isPinnedSection: false, kind: 'decision' };
+  }
+  if (/\bpitfall\b/i.test(text) || text.includes('踩坑')) {
+    return { isPinnedSection: false, kind: 'pitfall' };
+  }
+  if (/\bepisode\b/i.test(text) || text.includes('近期进展') || text.includes('进展')) {
+    return { isPinnedSection: false, kind: 'episode' };
+  }
+  return { isPinnedSection: false };
+}
+
+function parseEntryHeading(rawHeading: string): {
+  title: string;
+  bracketKind?: MemoryKind;
+  bracketPinned?: boolean;
+} {
+  let rest = rawHeading.trim();
+  let bracketKind: MemoryKind | undefined;
+  let bracketPinned: boolean | undefined;
+
+  while (rest.startsWith('[')) {
+    const closeIdx = rest.indexOf(']');
+    if (closeIdx <= 0) break;
+    const inside = rest.slice(1, closeIdx).trim();
+    const maybeKind = parseKindToken(inside);
+    const maybePin = parsePinToken(inside);
+    if (maybeKind === undefined && maybePin === undefined) {
+      break;
+    }
+    if (maybeKind !== undefined) bracketKind = maybeKind;
+    if (maybePin !== undefined) bracketPinned = maybePin;
+    rest = rest.slice(closeIdx + 1).trim();
+  }
+
+  return {
+    title: rest || rawHeading.trim(),
+    ...(bracketKind !== undefined ? { bracketKind } : {}),
+    ...(bracketPinned !== undefined ? { bracketPinned } : {}),
+  };
+}
+
+export function parseVaultMarkdown(rawMarkdown: string): ParsedMarkdownMemory[] {
+  const normalized = rawMarkdown.replace(/\r\n/g, '\n').replace(VAULT_SYNC_FOOTER_RE, '');
+  const lines = normalized.split('\n');
+  const parsed: ParsedMarkdownMemory[] = [];
+
+  let currentSection: { isPinnedSection: boolean; kind?: MemoryKind; sawH3: boolean } = {
+    isPinnedSection: false,
+    sawH3: false,
+  };
+
+  interface EntryDraft {
+    title: string;
+    sectionPinned: boolean;
+    sectionKind?: MemoryKind;
+    bracketKind?: MemoryKind;
+    bracketPinned?: boolean;
+    explicitKind?: MemoryKind;
+    explicitPinned?: boolean;
+    id?: string;
+    tags?: string[];
+    topicKey?: string;
+    links?: string[];
+    inContentMode: boolean;
+    usedContentPrefix: boolean;
+    fenceChar?: '`' | '~';
+    fenceLen?: number;
+    contentLines: string[];
+  }
+
+  let draft: EntryDraft | undefined;
+
+  const finalizeDraft = () => {
+    if (!draft) return;
+    while (draft.contentLines.length > 0) {
+      const last = draft.contentLines[draft.contentLines.length - 1] ?? '';
+      if (!last.trim() || PLACEHOLDER_LINE_RE.test(last.trim())) {
+        draft.contentLines.pop();
+      } else {
+        break;
+      }
+    }
+    const contentText = draft.contentLines.join('\n').trim();
+    const resolvedPinned =
+      draft.explicitPinned !== undefined
+        ? draft.explicitPinned
+        : draft.bracketPinned !== undefined
+          ? draft.bracketPinned
+          : draft.sectionPinned
+            ? true
+            : draft.sectionKind !== undefined
+              ? false
+              : undefined;
+
+    let resolvedKind: MemoryKind | undefined;
+    if (draft.explicitKind !== undefined) {
+      resolvedKind = draft.explicitKind;
+    } else if (draft.bracketKind !== undefined) {
+      resolvedKind = draft.bracketKind;
+    } else if (draft.sectionKind !== undefined) {
+      resolvedKind = draft.sectionKind;
+    }
+
+    parsed.push({
+      ...(draft.id ? { id: draft.id } : {}),
+      ...(resolvedKind ? { kind: resolvedKind } : {}),
+      ...(draft.bracketKind ? { bracketKind: draft.bracketKind } : {}),
+      ...(draft.sectionKind ? { sectionKind: draft.sectionKind } : {}),
+      ...(resolvedPinned !== undefined ? { pinned: resolvedPinned } : {}),
+      title: draft.title,
+      content: contentText || draft.title,
+      ...(draft.tags !== undefined ? { tags: draft.tags } : {}),
+      ...(draft.topicKey !== undefined ? { topicKey: draft.topicKey } : {}),
+      ...(draft.links !== undefined ? { links: draft.links } : {}),
+    });
+    draft = undefined;
+  };
+
+  const tryApplyMetadataLine = (target: EntryDraft, rawLine: string, allowBarePrefix: boolean): boolean => {
+    const check = allowBarePrefix ? rawLine.trim() : rawLine;
+    const prefixRe = allowBarePrefix ? '^(?:[-*]\\s+)?' : '^[-*]\\s+';
+
+    const idMetaMatch = new RegExp(`${prefixRe}ID\\s*[:：]\\s*(.+)$`, 'i').exec(check);
+    if (idMetaMatch) {
+      const segments = (idMetaMatch[1] ?? '').split(/\s*(?:·|\|)\s*/);
+      const rawId = stripSurroundingCodeTicks(segments[0] ?? '');
+      if (rawId && !/^(?:new|auto|none|todo|待生成)$/i.test(rawId)) {
+        target.id = rawId;
+      }
+      if (target.tags === undefined) target.tags = [];
+      if (target.links === undefined) target.links = [];
+      for (const seg of segments.slice(1)) {
+        const tagSeg = /^(?:标签|tags?)\s*[:：]\s*(.*)$/i.exec(seg);
+        if (tagSeg) {
+          target.tags = parseCommaOrTickList(tagSeg[1] ?? '', true);
+          continue;
+        }
+        const linkSeg = /^(?:关联|links?)\s*[:：]\s*(.*)$/i.exec(seg);
+        if (linkSeg) {
+          target.links = parseCommaOrTickList(linkSeg[1] ?? '', false);
+          continue;
+        }
+        const topicSeg = /^(?:话题|topic(?:\s*key)?)\s*[:：]\s*(.*)$/i.exec(seg);
+        if (topicSeg) {
+          target.topicKey = stripSurroundingCodeTicks(topicSeg[1] ?? '');
+          continue;
+        }
+        const pinSeg = /^(?:置顶|pinned)\s*[:：]\s*(.*)$/i.exec(seg);
+        if (pinSeg) {
+          const p = parsePinToken(stripSurroundingCodeTicks(pinSeg[1] ?? ''));
+          if (p !== undefined) target.explicitPinned = p;
+          continue;
+        }
+        const kindSeg = /^(?:类型|分类|kind)\s*[:：]\s*(.*)$/i.exec(seg);
+        if (kindSeg) {
+          const k = parseKindToken(stripSurroundingCodeTicks(kindSeg[1] ?? ''));
+          if (k !== undefined) target.explicitKind = k;
+        }
+      }
+      return true;
+    }
+
+    const standaloneTags = new RegExp(`${prefixRe}(?:标签|tags?)\\s*[:：]\\s*(.*)$`, 'i').exec(check);
+    if (standaloneTags) {
+      target.tags = parseCommaOrTickList(standaloneTags[1] ?? '', true);
+      return true;
+    }
+    const standaloneLinks = new RegExp(`${prefixRe}(?:关联|links?)\\s*[:：]\\s*(.*)$`, 'i').exec(check);
+    if (standaloneLinks) {
+      target.links = parseCommaOrTickList(standaloneLinks[1] ?? '', false);
+      return true;
+    }
+    const standaloneTopic = new RegExp(`${prefixRe}(?:话题|topic(?:\\s*key)?)\\s*[:：]\\s*(.*)$`, 'i').exec(check);
+    if (standaloneTopic) {
+      target.topicKey = stripSurroundingCodeTicks(standaloneTopic[1] ?? '');
+      return true;
+    }
+    const standalonePin = new RegExp(`${prefixRe}(?:置顶|pinned)\\s*[:：]\\s*(.*)$`, 'i').exec(check);
+    if (standalonePin) {
+      const p = parsePinToken(stripSurroundingCodeTicks(standalonePin[1] ?? ''));
+      if (p !== undefined) {
+        target.explicitPinned = p;
+        return true;
+      }
+    }
+    const standaloneKind = new RegExp(`${prefixRe}(?:类型|分类|kind)\\s*[:：]\\s*(.*)$`, 'i').exec(check);
+    if (standaloneKind) {
+      const k = parseKindToken(stripSurroundingCodeTicks(standaloneKind[1] ?? ''));
+      if (k !== undefined) {
+        target.explicitKind = k;
+        return true;
+      }
+    }
+    return false;
+  };
+
+  for (const line of lines) {
+    if (draft) {
+      const unindentedLine = draft.usedContentPrefix && line.startsWith('  ') ? line.slice(2) : line;
+      const fenceMatch = /^\s*(`{3,}|~{3,})/.exec(unindentedLine);
+      if (fenceMatch) {
+        const marker = fenceMatch[1] ?? '```';
+        const ch = marker[0] as '`' | '~';
+        if (!draft.fenceChar) {
+          draft.fenceChar = ch;
+          draft.fenceLen = marker.length;
+          draft.inContentMode = true;
+          draft.contentLines.push(unindentedLine);
+          continue;
+        }
+        if (draft.fenceChar === ch && marker.length >= (draft.fenceLen ?? 3)) {
+          draft.fenceChar = undefined;
+          draft.fenceLen = undefined;
+          draft.contentLines.push(unindentedLine);
+          continue;
+        }
+      }
+      if (draft.fenceChar) {
+        draft.contentLines.push(unindentedLine);
+        continue;
+      }
+    }
+
+    if (/^#\s+/.test(line)) {
+      finalizeDraft();
+      continue;
+    }
+    const h2Match = /^##\s+(.+?)\s*$/.exec(line);
+    if (h2Match) {
+      finalizeDraft();
+      const sec = parseSectionHeader(h2Match[1] ?? '');
+      currentSection = { ...sec, sawH3: false };
+      continue;
+    }
+    const h3Match = /^###\s+(.+?)\s*$/.exec(line);
+    if (h3Match) {
+      finalizeDraft();
+      currentSection.sawH3 = true;
+      const head = parseEntryHeading(h3Match[1] ?? '');
+      draft = {
+        title: head.title,
+        sectionPinned: currentSection.isPinnedSection,
+        ...(currentSection.kind ? { sectionKind: currentSection.kind } : {}),
+        ...(head.bracketKind ? { bracketKind: head.bracketKind } : {}),
+        ...(head.bracketPinned !== undefined ? { bracketPinned: head.bracketPinned } : {}),
+        inContentMode: false,
+        usedContentPrefix: false,
+        contentLines: [],
+      };
+      continue;
+    }
+
+    const trimmed = line.trim();
+    if (PLACEHOLDER_LINE_RE.test(trimmed) || HTML_COMMENT_LINE_RE.test(trimmed)) {
+      continue;
+    }
+
+    if (!draft) {
+      // Allow top-level `- title: content` or `- note` bullets directly inside recognized H2 sections
+      if (!currentSection.sawH3 && (currentSection.isPinnedSection || currentSection.kind !== undefined)) {
+        const bulletMatch = /^[-*]\s+(.+?)\s*$/.exec(line);
+        if (bulletMatch) {
+          const body = (bulletMatch[1] ?? '').trim();
+          if (body && !/^(?:ID|内容|content|标签|tags?)\s*[:：]/i.test(body)) {
+            const head = parseEntryHeading(body);
+            const colonIdx = head.title.search(/[:：]\s+/);
+            const shortTitle =
+              colonIdx > 0 && colonIdx <= 60 ? head.title.slice(0, colonIdx).trim() : sliceChars(head.title, 80);
+            const fullContent =
+              colonIdx > 0 && colonIdx <= 60 ? head.title.slice(colonIdx + 1).trim() || head.title : head.title;
+            parsed.push({
+              ...(head.bracketKind
+                ? { kind: head.bracketKind, bracketKind: head.bracketKind }
+                : currentSection.kind
+                  ? { kind: currentSection.kind, sectionKind: currentSection.kind }
+                  : {}),
+              pinned: head.bracketPinned ?? currentSection.isPinnedSection,
+              title: shortTitle,
+              content: fullContent,
+            });
+          }
+        }
+      }
+      continue;
+    }
+
+    if (draft.inContentMode) {
+      // Support column-0 metadata bullets (`- 标签:`, `- 置顶:`, etc.) placed after `- 内容:` by humans
+      if (!/^\s/.test(line) && tryApplyMetadataLine(draft, line, false)) {
+        continue;
+      }
+      draft.contentLines.push(draft.usedContentPrefix && line.startsWith('  ') ? line.slice(2) : line);
+      continue;
+    }
+
+    if (!trimmed) {
+      continue;
+    }
+
+    if (tryApplyMetadataLine(draft, line, true)) {
+      continue;
+    }
+
+    const contentPrefixMatch = /^(?:[-*]\s+)?(?:内容|content)\s*[:：]\s?(.*)$/i.exec(line);
+    if (contentPrefixMatch) {
+      draft.inContentMode = true;
+      draft.usedContentPrefix = true;
+      draft.contentLines.push(contentPrefixMatch[1] ?? '');
+      continue;
+    }
+
+    draft.inContentMode = true;
+    draft.usedContentPrefix = false;
+    draft.contentLines.push(line);
+  }
+
+  finalizeDraft();
+  return parsed;
+}
+
+function attachVaultSyncFooter(mdCore: string, jsonlBody: string): string {
+  const cleanCore = `${mdCore.replace(VAULT_SYNC_FOOTER_RE, '').trimEnd()}\n`;
+  const mdHash = sha256Short(cleanCore);
+  const jsonlHash = sha256Short(jsonlBody);
+  return `${cleanCore}\n<!-- asi-sleep-vault md=${mdHash} jsonl=${jsonlHash} -->\n`;
+}
+
+function inspectVaultMarkdownSync(
+  rawMd: string,
+  rawJsonl?: string,
+): {
+  hasFooter: boolean;
+  mdMatchesFooter: boolean;
+  jsonlMatchesFooter: boolean;
+} {
+  const normalized = rawMd.replace(/\r\n/g, '\n');
+  const match = VAULT_SYNC_FOOTER_RE.exec(normalized);
+  if (!match) {
+    return { hasFooter: false, mdMatchesFooter: false, jsonlMatchesFooter: false };
+  }
+  const cleanCore = `${normalized.slice(0, match.index).trimEnd()}\n`;
+  const mdMatchesFooter = sha256Short(cleanCore) === match[1];
+  const jsonlMatchesFooter =
+    rawJsonl !== undefined && match[2] !== undefined ? sha256Short(rawJsonl) === match[2] : false;
+  return { hasFooter: true, mdMatchesFooter, jsonlMatchesFooter };
+}
+
 export function renderVaultMarkdown(entries: readonly MemoryEntry[], now: number, homeDir?: string): string {
   const lines: string[] = [
     '# ASI 记忆库 (Memory Vault)',
     '',
-    `> 本地结构化长期记忆（由 \`asi-sleep\` 自动维护并经 \`sanitizeForModel\` 脱敏） · 共 ${entries.length} 条`,
+    `> 本地结构化长期记忆（由 \`asi-sleep\` 自动维护并经 \`sanitizeForModel\` 脱敏，可直接编辑本文件增删改记忆） · 共 ${entries.length} 条`,
     '',
   ];
 
@@ -190,10 +641,12 @@ export function renderVaultMarkdown(entries: readonly MemoryEntry[], now: number
     lines.push('## 已置顶记忆 (Pinned · 永不衰减)', '');
     for (const item of pinned) {
       const safeTitle = sanitizeSleepText(item.title, MAX_TITLE_CHARS, homeDir);
-      const safeContent = sanitizeSleepText(item.content, MAX_CONTENT_CHARS, homeDir);
+      const safeContent = sanitizeSleepText(item.content, MAX_CONTENT_CHARS, homeDir).replace(/\r?\n/g, '\n  ');
       const tagText = item.tags.length > 0 ? ` · 标签: ${item.tags.map((t) => `\`${t}\``).join(', ')}` : '';
+      const linkText =
+        item.links && item.links.length > 0 ? ` · 关联: ${item.links.map((l) => `\`${l}\``).join(', ')}` : '';
       lines.push(`### [${MEMORY_KIND_LABELS[item.kind]}] ${safeTitle}`);
-      lines.push(`- ID: \`${item.id}\` · 保留率: **100% (已置顶)** · 回忆 ${item.recallCount} 次${tagText}`);
+      lines.push(`- ID: \`${item.id}\` · 保留率: **100% (已置顶)** · 回忆 ${item.recallCount} 次${tagText}${linkText}`);
       lines.push(`- 内容: ${safeContent}`, '');
     }
   }
@@ -208,7 +661,7 @@ export function renderVaultMarkdown(entries: readonly MemoryEntry[], now: number
     for (const item of group) {
       const retentionPct = Math.round(computeMemoryRetention(item.fsrs, false, now) * 100);
       const safeTitle = sanitizeSleepText(item.title, MAX_TITLE_CHARS, homeDir);
-      const safeContent = sanitizeSleepText(item.content, MAX_CONTENT_CHARS, homeDir);
+      const safeContent = sanitizeSleepText(item.content, MAX_CONTENT_CHARS, homeDir).replace(/\r?\n/g, '\n  ');
       const tagText = item.tags.length > 0 ? ` · 标签: ${item.tags.map((t) => `\`${t}\``).join(', ')}` : '';
       const linkText =
         item.links && item.links.length > 0 ? ` · 关联: ${item.links.map((l) => `\`${l}\``).join(', ')}` : '';
@@ -243,6 +696,10 @@ export class MemoryVault {
   private entries = new Map<string, MemoryEntry>();
   private journal: SleepConsolidationRecord[] = [];
   private writeChain: Promise<void> = Promise.resolve();
+  private lastFlushedMarkdown: string | undefined;
+  private lastObservedDiskMarkdown: string | undefined;
+  private pendingFlushMarkdown: string | undefined;
+  private needsFlushFromExternalMarkdown = false;
 
   constructor(
     readonly storageRoot: string,
@@ -254,14 +711,203 @@ export class MemoryVault {
     this.journalJsonlPath = join(this.vaultDir, 'sleep-journal.jsonl');
   }
 
+  private reconcileMarkdownIntoEntries(rawMarkdown: string, now: number): { redacted: boolean } {
+    const parsedItems = parseVaultMarkdown(rawMarkdown);
+    const nextMap = new Map<string, MemoryEntry>();
+    const claimedExistingIds = new Set<string>();
+    const rawLinksById = new Map<string, string[] | undefined>();
+    let redacted = false;
+
+    // Also inspect section lines inside rawMarkdown via parsed items for credential/home-path redaction
+    for (const item of parsedItems) {
+      if (
+        (item.id && wasTextRedacted(item.id, this.homeDir)) ||
+        wasTextRedacted(item.title, this.homeDir) ||
+        wasTextRedacted(item.content, this.homeDir) ||
+        (item.topicKey && wasTextRedacted(item.topicKey, this.homeDir)) ||
+        (item.tags?.some((t) => wasTextRedacted(t, this.homeDir)) ?? false) ||
+        (item.links?.some((l) => wasTextRedacted(l, this.homeDir)) ?? false)
+      ) {
+        redacted = true;
+      }
+
+      const candidateRawId = item.id ? sanitizeSleepText(item.id, 64, this.homeDir).replace(/\s+/g, '_') : undefined;
+      const existing =
+        candidateRawId && !claimedExistingIds.has(candidateRawId) ? this.entries.get(candidateRawId) : undefined;
+
+      if (existing && candidateRawId) {
+        claimedExistingIds.add(candidateRawId);
+
+        let nextKind = item.kind ?? existing.kind;
+        // If user dragged a previously pinned `[旧分类] Title` block into a different unpinned H2 kind section,
+        // the old `[旧分类]` prefix came from the pinned section badge while `sectionKind` reflects the target section.
+        if (
+          existing.pinned &&
+          item.pinned === false &&
+          item.bracketKind === existing.kind &&
+          item.sectionKind &&
+          item.sectionKind !== existing.kind
+        ) {
+          nextKind = item.sectionKind;
+        }
+        const nextPinned = item.pinned ?? existing.pinned;
+        const nextTitle = sanitizeSleepText(item.title, MAX_TITLE_CHARS, this.homeDir) || existing.title;
+        const nextContent = sanitizeSleepText(item.content || nextTitle, MAX_CONTENT_CHARS, this.homeDir) || nextTitle;
+
+        const provisional = sanitizeMemoryEntry(
+          {
+            ...existing,
+            kind: nextKind,
+            pinned: nextPinned,
+            title: nextTitle,
+            content: nextContent,
+            tags: item.tags !== undefined ? item.tags : existing.tags,
+            ...(item.topicKey !== undefined
+              ? item.topicKey.trim()
+                ? { topicKey: item.topicKey }
+                : {}
+              : existing.topicKey
+                ? { topicKey: existing.topicKey }
+                : {}),
+            updatedAt: existing.updatedAt,
+            fsrs: structuredClone(existing.fsrs),
+          },
+          this.homeDir,
+        );
+
+        const changed =
+          provisional.kind !== existing.kind ||
+          provisional.pinned !== existing.pinned ||
+          provisional.title !== existing.title ||
+          provisional.content !== existing.content ||
+          provisional.topicKey !== existing.topicKey ||
+          JSON.stringify(provisional.tags) !== JSON.stringify(existing.tags);
+
+        const mergedEntry: MemoryEntry = changed
+          ? {
+              ...provisional,
+              updatedAt: now,
+              fsrs: structuredClone(existing.fsrs),
+            }
+          : {
+              ...provisional,
+              updatedAt: existing.updatedAt,
+              fsrs: structuredClone(existing.fsrs),
+            };
+
+        nextMap.set(mergedEntry.id, mergedEntry);
+        rawLinksById.set(mergedEntry.id, item.links !== undefined ? item.links : existing.links);
+      } else {
+        const assignedId =
+          candidateRawId && !nextMap.has(candidateRawId) && !claimedExistingIds.has(candidateRawId)
+            ? candidateRawId
+            : `mem_${randomUUID().slice(0, 12)}`;
+        const nextKind: MemoryKind = item.kind ?? 'episode';
+        const nextPinned = Boolean(item.pinned);
+        const created = sanitizeMemoryEntry(
+          {
+            id: assignedId,
+            kind: nextKind,
+            title: item.title || '未命名记忆',
+            content: item.content || item.title || '未命名记忆',
+            tags: item.tags ?? [],
+            ...(item.topicKey?.trim() ? { topicKey: item.topicKey } : {}),
+            pinned: nextPinned,
+            confidence: 1,
+            sourceSessionIds: ['manual'],
+            evidenceCount: 1,
+            recallCount: 0,
+            createdAt: now,
+            updatedAt: now,
+            fsrs: createInitialFsrsState(nextKind, now),
+          },
+          this.homeDir,
+        );
+        nextMap.set(created.id, created);
+        rawLinksById.set(created.id, item.links);
+      }
+    }
+
+    // Filter associative links so deleted entries leave zero dangling references
+    const survivingIds = new Set(nextMap.keys());
+    for (const [entryId, entry] of nextMap) {
+      const candidateLinks = rawLinksById.get(entryId);
+      const validLinks = (candidateLinks ?? [])
+        .map((l) => sanitizeSleepText(l, 64, this.homeDir))
+        .filter((l) => Boolean(l) && l !== entryId && survivingIds.has(l));
+      const deduped = [...new Set(validLinks)].slice(0, 6);
+      const { links: _prev, ...rest } = entry;
+      nextMap.set(entryId, deduped.length > 0 ? { ...rest, links: deduped } : rest);
+    }
+
+    this.entries = nextMap;
+    return { redacted };
+  }
+
+  private checkAndReconcileDiskMarkdownRaw(rawMd: string, now: number): { reconciled: boolean; redacted: boolean } {
+    if (
+      rawMd === this.lastObservedDiskMarkdown ||
+      rawMd === this.lastFlushedMarkdown ||
+      rawMd === this.pendingFlushMarkdown
+    ) {
+      return { reconciled: false, redacted: false };
+    }
+    const { redacted } = this.reconcileMarkdownIntoEntries(rawMd, now);
+    this.lastObservedDiskMarkdown = rawMd;
+    this.needsFlushFromExternalMarkdown = true;
+    return { reconciled: true, redacted };
+  }
+
+  private reconcileFromDiskMarkdownSync(now: number = Date.now()): boolean {
+    let rawMd: string;
+    try {
+      rawMd = readFileSync(this.markdownPath, 'utf8');
+    } catch {
+      return false;
+    }
+    return this.checkAndReconcileDiskMarkdownRaw(rawMd, now).reconciled;
+  }
+
+  hasPendingExternalFlush(): boolean {
+    return this.needsFlushFromExternalMarkdown;
+  }
+
+  async syncExternalChanges(now: number = Date.now()): Promise<boolean> {
+    let rawMd: string | undefined;
+    try {
+      rawMd = await readFile(this.markdownPath, 'utf8');
+    } catch {
+      rawMd = undefined;
+    }
+    let reconciled = false;
+    if (rawMd !== undefined) {
+      reconciled = this.checkAndReconcileDiskMarkdownRaw(rawMd, now).reconciled;
+    }
+    if (reconciled || this.needsFlushFromExternalMarkdown) {
+      await this.flush(now);
+      return true;
+    }
+    return false;
+  }
+
+  waitForIdle(): Promise<void> {
+    return this.writeChain;
+  }
+
   async load(now: number = Date.now()): Promise<{ redactedOnLoad: boolean }> {
     await mkdir(this.vaultDir, { recursive: true });
     this.entries.clear();
     this.journal = [];
+    this.lastFlushedMarkdown = undefined;
+    this.lastObservedDiskMarkdown = undefined;
+    this.needsFlushFromExternalMarkdown = false;
     let redactedOnLoad = false;
+    let rawJsonl = '';
+    let hasJsonlFile = false;
 
     try {
-      const rawJsonl = await readFile(this.memoriesJsonlPath, 'utf8');
+      rawJsonl = await readFile(this.memoriesJsonlPath, 'utf8');
+      hasJsonlFile = true;
       for (const line of rawJsonl.split('\n')) {
         const trimmed = line.trim();
         if (!trimmed) continue;
@@ -286,7 +932,7 @@ export class MemoryVault {
         }
       }
     } catch {
-      // Vault does not exist yet
+      // Vault JSONL does not exist yet
     }
 
     try {
@@ -313,13 +959,62 @@ export class MemoryVault {
       // Journal does not exist yet
     }
 
-    if (redactedOnLoad) {
+    let rawMd: string | undefined;
+    try {
+      rawMd = await readFile(this.markdownPath, 'utf8');
+    } catch {
+      rawMd = undefined;
+    }
+
+    let shouldFlush = redactedOnLoad;
+
+    if (rawMd !== undefined) {
+      const syncInfo = inspectVaultMarkdownSync(rawMd, hasJsonlFile ? rawJsonl : undefined);
+      if (!syncInfo.hasFooter || !syncInfo.mdMatchesFooter) {
+        // Human created or edited MEMORY.md externally -> reconcile into entries while preserving FSRS for matched IDs
+        const rec = this.reconcileMarkdownIntoEntries(rawMd, now);
+        if (rec.redacted) redactedOnLoad = true;
+        this.lastObservedDiskMarkdown = rawMd;
+        shouldFlush = true;
+      } else if (syncInfo.jsonlMatchesFooter) {
+        this.lastFlushedMarkdown = rawMd;
+        this.lastObservedDiskMarkdown = rawMd;
+      } else {
+        // MEMORY.md matches its own asi-sleep footer, while memories.jsonl differs (or does not exist).
+        // Check if MEMORY.md was explicitly replaced more recently than memories.jsonl, or if memories.jsonl is absent.
+        let mdNewerThanJsonl = !hasJsonlFile;
+        if (hasJsonlFile) {
+          const [mdStat, jsonlStat] = await Promise.all([
+            stat(this.markdownPath).catch(() => undefined),
+            stat(this.memoriesJsonlPath).catch(() => undefined),
+          ]);
+          if (mdStat && jsonlStat && mdStat.mtimeMs > jsonlStat.mtimeMs + 10) {
+            mdNewerThanJsonl = true;
+          }
+        }
+        if (mdNewerThanJsonl) {
+          const rec = this.reconcileMarkdownIntoEntries(rawMd, now);
+          if (rec.redacted) redactedOnLoad = true;
+          this.lastObservedDiskMarkdown = rawMd;
+        } else {
+          // memories.jsonl was edited externally; mark lastObservedDiskMarkdown = rawMd so flush() won't overwrite jsonl with old md
+          this.lastFlushedMarkdown = rawMd;
+          this.lastObservedDiskMarkdown = rawMd;
+        }
+        shouldFlush = true;
+      }
+    } else if (hasJsonlFile && this.entries.size > 0) {
+      shouldFlush = true;
+    }
+
+    if (shouldFlush) {
       await this.flush(now);
     }
     return { redactedOnLoad };
   }
 
-  list(): MemoryEntry[] {
+  list(now: number = Date.now()): MemoryEntry[] {
+    this.reconcileFromDiskMarkdownSync(now);
     return [...this.entries.values()]
       .sort((a, b) => {
         if (a.pinned !== b.pinned) return a.pinned ? -1 : 1;
@@ -328,12 +1023,14 @@ export class MemoryVault {
       .map((e) => structuredClone(e));
   }
 
-  get(id: string): MemoryEntry | undefined {
+  get(id: string, now: number = Date.now()): MemoryEntry | undefined {
+    this.reconcileFromDiskMarkdownSync(now);
     const found = this.entries.get(id);
     return found ? structuredClone(found) : undefined;
   }
 
-  size(): number {
+  size(now: number = Date.now()): number {
+    this.reconcileFromDiskMarkdownSync(now);
     return this.entries.size;
   }
 
@@ -353,12 +1050,16 @@ export class MemoryVault {
   }
 
   upsert(entry: MemoryEntry): MemoryEntry {
+    this.reconcileFromDiskMarkdownSync(
+      Number.isFinite(entry.updatedAt) && entry.updatedAt > 0 ? Math.trunc(entry.updatedAt) : Date.now(),
+    );
     const clean = sanitizeMemoryEntry(entry, this.homeDir);
     this.entries.set(clean.id, clean);
     return structuredClone(clean);
   }
 
-  delete(id: string): boolean {
+  delete(id: string, now: number = Date.now()): boolean {
+    this.reconcileFromDiskMarkdownSync(now);
     const existed = this.entries.delete(id);
     if (existed) {
       for (const [entryId, item] of this.entries) {
@@ -384,23 +1085,37 @@ export class MemoryVault {
   flush(now: number = Date.now()): Promise<void> {
     const run = async () => {
       await mkdir(this.vaultDir, { recursive: true });
+      const diskMd = await readFile(this.markdownPath, 'utf8').catch(() => undefined);
+      if (diskMd !== undefined) {
+        this.checkAndReconcileDiskMarkdownRaw(diskMd, now);
+      }
+
       const sorted = [...this.entries.values()].map((e) => sanitizeMemoryEntry(e, this.homeDir));
       sorted.sort((a, b) => {
         if (a.pinned !== b.pinned) return a.pinned ? -1 : 1;
         return b.updatedAt - a.updatedAt || a.id.localeCompare(b.id);
       });
       const jsonlBody = sorted.length > 0 ? `${sorted.map((item) => JSON.stringify(item)).join('\n')}\n` : '';
-      const mdBody = renderVaultMarkdown(sorted, now, this.homeDir);
+      const mdCore = renderVaultMarkdown(sorted, now, this.homeDir);
+      const mdBody = attachVaultSyncFooter(mdCore, jsonlBody);
       const journalBody =
         this.journal.length > 0
           ? `${this.journal.map((r) => JSON.stringify(sanitizeConsolidationRecord(r, this.homeDir))).join('\n')}\n`
           : '';
 
-      await Promise.all([
-        atomicWriteText(this.memoriesJsonlPath, jsonlBody),
-        atomicWriteText(this.markdownPath, mdBody),
-        atomicWriteText(this.journalJsonlPath, journalBody),
-      ]);
+      this.pendingFlushMarkdown = mdBody;
+      try {
+        await Promise.all([
+          atomicWriteText(this.memoriesJsonlPath, jsonlBody),
+          atomicWriteText(this.markdownPath, mdBody),
+          atomicWriteText(this.journalJsonlPath, journalBody),
+        ]);
+        this.lastFlushedMarkdown = mdBody;
+        this.lastObservedDiskMarkdown = mdBody;
+        this.needsFlushFromExternalMarkdown = false;
+      } finally {
+        this.pendingFlushMarkdown = undefined;
+      }
     };
     const next = this.writeChain.then(run, run);
     this.writeChain = next.catch(() => undefined);

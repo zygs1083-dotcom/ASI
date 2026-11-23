@@ -1,4 +1,6 @@
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { spawnSync } from 'node:child_process';
+import { existsSync } from 'node:fs';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -407,11 +409,13 @@ describe('Cordis 全栈联合集成（asi-sense + asi-needs + asi-sleep）', () 
     }
   });
 
-  it('支持从冷持久化会话库 (ctx.sessionQuery) 启动回填未整合对话，且双侧栏客户端 bundle 样式选择器 100% 零冲突', async () => {
+  it('支持从冷持久化会话库 (ctx.sessionQuery) 启动回填未整合对话、多级路由回退与推理模型无 temperature 提取，且双侧栏客户端 bundle 样式选择器 100% 零冲突', {
+    timeout: 30_000,
+  }, async () => {
     const dir = await mkdtemp(join(tmpdir(), 'asi-sleep-cold-'));
     tempDirs.push(dir);
 
-    // 构造一个从未挂载进 ctx.sessions 的冷持久化普通会话
+    // 构造一个从未挂载进 ctx.sessions 的冷持久化普通会话，并在日志中携带 request/header（指向推理模型 deepseek-reasoner）
     const coldSession = Session.create(SessionId('cold-persisted-1'), [], {
       version: 4,
       id: SessionId('cold-persisted-1'),
@@ -419,7 +423,18 @@ describe('Cordis 全栈联合集成（asi-sense + asi-needs + asi-sleep）', () 
       cwd: join(dir, 'cold-repo'),
       isSeeded: false,
     });
+    coldSession.append('request/header', {
+      header: {
+        config: {
+          provider: 'deepseek',
+          model: 'deepseek-reasoner',
+        },
+      },
+      reason: 'initial',
+    });
     appendTurn(coldSession, 1, '架构决策：决定采用 ts-fsrs 计算遗忘曲线保留率。', '已完成 ts-fsrs 集成。');
+
+    const observedStreamCalls: Array<Record<string, unknown>> = [];
 
     const root = new Context();
     await root.plugin(SystemPrompt);
@@ -427,7 +442,46 @@ describe('Cordis 全栈联合集成（asi-sense + asi-needs + asi-sleep）', () 
     root.tools.setExecutor(new NativeToolExecutor(root));
     root.provide('agents', { list: () => [], get: () => undefined, withoutInitiator: <T>(fn: () => T) => fn() });
     root.provide('jobs', { list: () => [], kill: () => 'already-finished', events: { subscribe: () => () => {} } });
-    root.provide('llm', { listConfigurableProviders: () => [], resolveModelInfo: async () => undefined });
+    root.provide('llm', {
+      listConfigurableProviders: () => [],
+      listProviders: () => [{ id: 'deepseek', name: 'DeepSeek' }],
+      listModels: async () => [{ provider: 'deepseek', id: 'deepseek-reasoner', name: 'DeepSeek Reasoner' }],
+      resolveModelInfo: async () => undefined,
+      stream(opts: Record<string, unknown>) {
+        observedStreamCalls.push(opts);
+        return (async function* () {
+          // 模拟真实推理模型（如 DeepSeek Reasoner / o-series）：一旦携带 temperature 立即返回 error finish chunk！
+          if ('temperature' in opts && opts.temperature !== undefined) {
+            yield {
+              type: 'finish',
+              reason: {
+                kind: 'error',
+                failure: {
+                  code: 'INVALID_REQUEST',
+                  message: "Unsupported parameter: 'temperature' is not supported by reasoning model",
+                },
+              },
+            };
+            return;
+          }
+          yield { type: 'reasoning-delta', index: 0, text: '先思考冷会话中的架构决策要点……' };
+          yield {
+            type: 'text-delta',
+            index: 1,
+            text: JSON.stringify([
+              {
+                kind: 'decision',
+                title: '冷会话推理模型提炼：采用 ts-fsrs',
+                content: '在无活跃 Agent 场景下通过冷会话 request/header 路由与推理模型成功提炼记忆。',
+                tags: ['fsrs', 'reasoner'],
+                sessionId: 'cold-persisted-1',
+              },
+            ]),
+          };
+          yield { type: 'finish', reason: { kind: 'stop' } };
+        })();
+      },
+    });
     root.provide('sessionProjections', { snapshot: () => ({ values: {} }) });
     root.provide('sessions', { list: () => [], get: () => undefined });
     root.provide('tokenMeter', { contextPressure: () => ({}) });
@@ -472,6 +526,15 @@ describe('Cordis 全栈联合集成（asi-sense + asi-needs + asi-sleep）', () 
 
       const rec = await root.asiSleep.consolidateNow();
       expect(rec.turnsProcessed).toBe(1);
+      expect(observedStreamCalls).toHaveLength(1);
+      expect(observedStreamCalls[0]).toMatchObject({
+        provider: 'deepseek',
+        model: 'deepseek-reasoner',
+      });
+      expect(observedStreamCalls[0]?.temperature).toBeUndefined();
+
+      const reasonerHits = await root.asiSleep.searchMemories('冷会话推理模型提炼');
+      expect(reasonerHits.some((h) => h.title.includes('冷会话推理模型提炼'))).toBe(true);
       const hits = await root.asiSleep.searchMemories('昨日睡眠设计会话');
       expect(hits.length).toBeGreaterThanOrEqual(1);
     } finally {
@@ -481,29 +544,191 @@ describe('Cordis 全栈联合集成（asi-sense + asi-needs + asi-sleep）', () 
       await new Promise((r) => setTimeout(r, 25));
     }
 
-    // 校验 asi-needs/lib/client.js 与 asi-sleep/lib/client.js 的 CSS Module 类名零重叠
+    // 校验 asi-needs/lib/client.js 与 asi-sleep/lib/client.js 的 CSS Module 类名零重叠（绝不因 lib/ 缺失静默跳过！）
     const pkgDir = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-    const needsClientPath = resolve(pkgDir, '../asi-needs/lib/client.js');
-    const sleepClientPath = resolve(pkgDir, 'lib/client.js');
+    const needsPkgDir = resolve(pkgDir, '../asi-needs');
+    const needsClientPath = join(needsPkgDir, 'lib/client.js');
+    const sleepClientPath = join(pkgDir, 'lib/client.js');
+    if (!existsSync(needsClientPath)) {
+      const builtNeeds = spawnSync(process.execPath, ['scripts/build.mjs'], {
+        cwd: needsPkgDir,
+        encoding: 'utf8',
+      });
+      expect(builtNeeds.status, builtNeeds.stderr || builtNeeds.stdout).toBe(0);
+    }
+    if (!existsSync(sleepClientPath)) {
+      const builtSleep = spawnSync(process.execPath, ['scripts/build.mjs'], {
+        cwd: pkgDir,
+        encoding: 'utf8',
+      });
+      expect(builtSleep.status, builtSleep.stderr || builtSleep.stdout).toBe(0);
+    }
+
     const [needsBundle, sleepBundle] = await Promise.all([
-      readFile(needsClientPath, 'utf8').catch(() => ''),
-      readFile(sleepClientPath, 'utf8').catch(() => ''),
+      readFile(needsClientPath, 'utf8'),
+      readFile(sleepClientPath, 'utf8'),
     ]);
-    if (needsBundle && sleepBundle) {
-      const extractCssClasses = (bundle: string): Set<string> => {
-        const match = /const __asi(?:Needs|Sleep)Styles=("(?:\\.|[^"\\])*");/.exec(bundle);
-        const cssText = match?.[1] ? (JSON.parse(match[1]) as string) : '';
-        return new Set(
-          [...cssText.matchAll(/\.([A-Za-z_][A-Za-z0-9_-]*)/g)]
-            .map((m) => m[1] ?? '')
-            .filter((cls) => cls.includes('_')),
-        );
-      };
-      const needsClasses = extractCssClasses(needsBundle);
-      const sleepClasses = extractCssClasses(sleepBundle);
-      expect(sleepClasses.size).toBeGreaterThan(10);
-      const overlap = [...sleepClasses].filter((cls) => needsClasses.has(cls));
-      expect(overlap).toEqual([]);
+    const extractCssClasses = (bundle: string): Set<string> => {
+      const match = /const __asi(?:Needs|Sleep)Styles=("(?:\\.|[^"\\])*");/.exec(bundle);
+      const cssText = match?.[1] ? (JSON.parse(match[1]) as string) : '';
+      return new Set(
+        [...cssText.matchAll(/\.([A-Za-z_][A-Za-z0-9_-]*)/g)].map((m) => m[1] ?? '').filter((cls) => cls.includes('_')),
+      );
+    };
+    const needsClasses = extractCssClasses(needsBundle);
+    const sleepClasses = extractCssClasses(sleepBundle);
+    expect(needsClasses.size).toBeGreaterThan(10);
+    expect(sleepClasses.size).toBeGreaterThan(10);
+    const overlap = [...sleepClasses].filter((cls) => needsClasses.has(cls));
+    expect(overlap).toEqual([]);
+  });
+
+  it('路由回退链（sessionProjections.modelSelection 与 ctx.llm 目录）及运行时人类编辑 MEMORY.md 同步到只读工具', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'asi-sleep-route-md-'));
+    tempDirs.push(dir);
+
+    const passiveSession = Session.create(SessionId('passive-ordinary-1'), [], {
+      version: 4,
+      id: SessionId('passive-ordinary-1'),
+      createdAt: Date.now() - 60_000,
+      cwd: join(dir, 'workspace'),
+      isSeeded: false,
+    });
+    appendTurn(passiveSession, 1, '第 1 轮常规对话', '已记录');
+
+    let projectionSelection: { next: { provider: string; model: string } | null; lastUsed: null } | undefined = {
+      next: { provider: 'gateway-proj', model: 'o3-mini' },
+      lastUsed: null,
+    };
+    const seenRoutes: Array<{ provider: string; model: string }> = [];
+
+    const root = new Context();
+    await root.plugin(SystemPrompt);
+    await root.plugin(ToolsService);
+    root.tools.setExecutor(new NativeToolExecutor(root));
+    root.provide('agents', { list: () => [], get: () => undefined, withoutInitiator: <T>(fn: () => T) => fn() });
+    root.provide('jobs', { list: () => [], kill: () => 'already-finished', events: { subscribe: () => () => {} } });
+    root.provide('llm', {
+      listConfigurableProviders: () => [],
+      listProviders: () => [
+        { id: 'gateway-proj', name: 'Gateway Proj' },
+        { id: 'catalog-fallback', name: 'Catalog Fallback' },
+      ],
+      listModels: async (prov: string) =>
+        prov === 'catalog-fallback'
+          ? [{ provider: 'catalog-fallback', id: 'deepseek-chat', name: 'DeepSeek Chat' }]
+          : [],
+      resolveModelInfo: async () => undefined,
+      stream(opts: { provider: string; model: string }) {
+        seenRoutes.push({ provider: opts.provider, model: opts.model });
+        return (async function* () {
+          yield {
+            type: 'block-end' as const,
+            index: 0,
+            block: {
+              type: 'text' as const,
+              text: JSON.stringify([
+                {
+                  kind: 'preference',
+                  title: `路由验证 ${opts.provider}/${opts.model}`,
+                  content: `通过 ${opts.provider}/${opts.model} 完成 NREM 提取。`,
+                  tags: ['routing'],
+                },
+              ]),
+            },
+          };
+          yield { type: 'finish' as const, reason: { kind: 'stop' as const } };
+        })();
+      },
+    });
+    root.provide('sessionProjections', {
+      snapshot: () => ({
+        values: projectionSelection ? { modelSelection: projectionSelection } : {},
+      }),
+    });
+    root.provide('sessions', { list: () => [passiveSession], get: () => passiveSession });
+    root.provide('tokenMeter', { contextPressure: () => ({}) });
+    root.provide('profileContext', {
+      name: 'fixture',
+      dir,
+      patchPath: '',
+      installAnchor: '',
+      cwd: '',
+      home: '',
+      startedBundles: [],
+      overlays: [],
+      telemetryDisabledEnv: undefined,
+    });
+    root.provide('sessionController', {
+      create: async () => ({ sessionId: SessionId('asi-maint-1') }),
+      rename: async () => ({ title: 'ASI', seq: 1 }),
+      resolveAgent: async () => ({ error: new Error('none') }),
+    });
+
+    const senseFork = await root.plugin(AsiSensePlugin, {
+      storageRoot: join(dir, 'sense'),
+      helperPath: join(dir, 'nonexistent-helper'),
+      intervalMs: 10_000,
+    });
+    const needsFork = await root.plugin(AsiNeedsPlugin, { storageRoot: join(dir, 'needs') });
+    const sleepStorage = join(dir, 'sleep');
+    const sleepFork = await root.plugin(AsiSleepPlugin, { storageRoot: sleepStorage });
+
+    try {
+      // 1. 无 Agent 时命中 sessionProjections.modelSelection 回退 + block-end 文本块流式组装
+      await root.asiSleep.consolidateNow();
+      expect(seenRoutes[0]).toEqual({ provider: 'gateway-proj', model: 'o3-mini' });
+
+      // 2. 清空 sessionProjections 后自动落入 ctx.llm.listProviders/listModels 目录回退
+      projectionSelection = undefined;
+      appendTurn(passiveSession, 2, '第 2 轮目录路由回退测试', '已记录');
+      await root.asiSleep.consolidateNow();
+      expect(seenRoutes[1]).toEqual({ provider: 'catalog-fallback', model: 'deepseek-chat' });
+
+      // 3. 人类直接手工编辑 <sleepStorage>/vault/MEMORY.md 新增条目与误贴凭据，
+      //    通过 memory_profile 与 memory_recall 工具即时读出并回写干净 memories.jsonl
+      const mdPath = join(sleepStorage, 'vault', 'MEMORY.md');
+      const jsonlPath = join(sleepStorage, 'vault', 'memories.jsonl');
+      const rawMd = await readFile(mdPath, 'utf8');
+      const handTok = ['glpat', 'A1b2C3d4E5f6G7h8I9j0'].join('-');
+      const appendedMd = `${rawMd}\n## 决策 (decision)\n\n### 手写架构约定：存储层零原生依赖\n- 标签: storage, pure-ts\n- 内容: 插件律用纯 TS JSONL 与 Markdown，不绑定原生模块（测试凭据 ${handTok}）。\n`;
+      await writeFile(mdPath, appendedMd, 'utf8');
+
+      const dummyCaller = {
+        id: passiveSession.id,
+        status: 'idle' as const,
+        session: passiveSession,
+      } as unknown as Agent;
+
+      const profileTool = root.tools.get('memory_profile');
+      const recallTool = root.tools.get('memory_recall');
+      const profileRes = (await profileTool?.execute({}, {
+        agent: dummyCaller,
+        signal: new AbortController().signal,
+        callId: 'cp1' as never,
+      } as never)) as { profile: { decision?: Array<{ title: string; content: string }> } };
+
+      const handDecision = profileRes.profile.decision?.find((d) => d.title.includes('手写架构约定'));
+      expect(handDecision).toBeDefined();
+      expect(handDecision?.content).toContain('[redacted]');
+      expect(handDecision?.content).not.toContain(handTok);
+
+      const recallRes = (await recallTool?.execute({ query: '存储层零原生依赖' }, {
+        agent: dummyCaller,
+        signal: new AbortController().signal,
+        callId: 'cr1' as never,
+      } as never)) as { hits: Array<{ title: string; recallCount: number }> };
+      expect(recallRes.hits[0]?.title).toContain('手写架构约定');
+      expect(recallRes.hits[0]?.recallCount).toBe(1);
+
+      const syncedJsonl = await readFile(jsonlPath, 'utf8');
+      expect(syncedJsonl).toContain('手写架构约定:存储层零原生依赖');
+      expect(syncedJsonl).not.toContain(handTok);
+    } finally {
+      sleepFork.dispose();
+      needsFork.dispose();
+      senseFork.dispose();
+      await new Promise((r) => setTimeout(r, 25));
     }
   });
 });
