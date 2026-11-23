@@ -1,20 +1,66 @@
 import { describe, expect, it } from 'vitest';
-import type { BodyThresholdSample, TuningChange, TuningValue } from '../src/index.ts';
+import {
+  effectiveDisks,
+  factStatusAt,
+  NEED_KEYS,
+  type NeedEvaluation,
+  type SenseSettingsSnapshot,
+  sanitizeForModel,
+  THERMAL_ORDINAL,
+} from '../src/index.ts';
 
 describe('shared type exports', () => {
-  it('exposes tuning change types and required monotonic receipt time', () => {
-    const value: TuningValue = 2;
-    const change: TuningChange = {
-      id: 'example-1',
-      param: 'cpu.sigma',
-      from: 1,
-      to: value,
-      by: 'auto',
-      reason: 'fixture',
-      at: 0,
+  it('exposes survival need keys, thermal ordinals, freshness helpers and credential sanitization', () => {
+    expect(NEED_KEYS).toEqual(['energy', 'space', 'memory', 'mind', 'thermals']);
+    expect(THERMAL_ORDINAL.critical).toBe(3);
+
+    const settings: SenseSettingsSnapshot = {
+      paused: false,
+      sendTitles: true,
+      powerMode: 'normal',
     };
-    const receipt: Pick<BodyThresholdSample, 'monotonicAt'> = { monotonicAt: 10 };
-    expect(change.to).toBe(2);
-    expect(receipt.monotonicAt).toBe(10);
+    expect(settings.powerMode).toBe('normal');
+
+    const need: NeedEvaluation = {
+      key: 'energy',
+      label: '能量',
+      satisfaction: 85,
+      urgency: 15,
+      zone: 'comfortable',
+      driveActive: false,
+      summary: 'AC connected',
+      evidence: { charging: true },
+      updatedAt: 100,
+    };
+    expect(need.zone).toBe('comfortable');
+
+    expect(
+      factStatusAt(
+        {
+          value: 'idle',
+          status: 'ok',
+          source: { id: 'dsh', api: 'events', host: 'local' },
+          observedAt: 10,
+          ttlMs: 20,
+        },
+        30,
+      ),
+    ).toBe('stale');
+
+    const disks = effectiveDisks(
+      {
+        kind: 'disks',
+        value: [{ mount: '/', total: 100, free: 50 }],
+        status: 'ok',
+        source: { id: 'disks', api: 'statfs', host: 'local' },
+        observedAt: 10,
+        ttlMs: 50,
+      },
+      20,
+    );
+    expect(disks.status).toBe('ok');
+
+    const tokenPrefix = ['ghp', '_'].join('');
+    expect(sanitizeForModel(`title ${tokenPrefix}${'a'.repeat(36)}`)).toBe('title [redacted]');
   });
 });

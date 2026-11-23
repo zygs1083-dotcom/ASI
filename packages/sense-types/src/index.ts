@@ -1,16 +1,54 @@
 /**
- * Shared types for the asi-sense state model, signals, attention rules and
- * delivery payloads. Consumed by the host plugin, the sidebar client and
- * tests as raw TypeScript source (private workspace package).
+ * Shared types for the ASI sensory state model (`asi-sense`), survival needs
+ * model (`asi-needs`), and model-output credential redaction.
  */
 
 import type { Body } from './body.js';
 import { ttlStatusAt } from './freshness.js';
 
 export type { Body } from './body.js';
+export {
+  type CredentialSpan,
+  containsCredential,
+  normalizeForModel,
+  redactCredentials,
+  sanitizeForModel,
+  sanitizeModelId,
+  sanitizeSignalId,
+  scanCredentials,
+} from './credential-scan.js';
 export type { DisksFact, DiskVolume } from './disks.js';
 export { disksStatusAt, diskVolumeAt, effectiveDisks } from './disks.js';
 export { ttlStatusAt } from './freshness.js';
+export {
+  type BodyHistory,
+  type MetricKey,
+  type MetricPoint,
+  THERMAL_ORDINAL,
+  type ThermalState,
+} from './history.js';
+export {
+  type HelpActionKind,
+  type HelpCard,
+  type HelpCardStatus,
+  type InstinctState,
+  type MaintenanceActor,
+  type MaintenanceOutcome,
+  type MaintenanceRecord,
+  type MaintenanceSessionStatus,
+  type ModelConnectivity,
+  NEED_KEYS,
+  type NeedEvaluation,
+  type NeedKey,
+  type NeedsSnapshot,
+  type NeedZone,
+} from './needs.js';
+export type {
+  AsiSenseServiceApi,
+  PowerMode,
+  SenseSettingsSnapshot,
+  SenseSnapshot,
+} from './service.js';
 
 /** Identifies a signal/fact producer: which source, via which API, on which host. */
 export interface SourceRef {
@@ -41,22 +79,16 @@ export function factStatusAt(fact: Fact<unknown> & { kind?: never }, now: number
   return ttlStatusAt(fact, now);
 }
 
-/** Who caused a signal, for self-cause suppression. */
+/** Who caused a signal. */
 export type SignalCause = 'agent' | 'user' | 'unknown';
 
-/** A normalized observation event (DESIGN §2.1). */
+/** A normalized observation event. */
 export interface Signal {
   id: string;
   kind: string;
   at: number;
   source: SourceRef;
   subject: string;
-  /**
-   * Kind-specific payload. Sources that can attribute a process may add:
-   * `pid` (the process itself), `ppid` (its parent) and `ancestors` (its
-   * ancestor pid chain) — used by self-cause classification to link shell
-   * children and grandchildren back to the tool window that spawned them.
-   */
   data: Record<string, unknown> & {
     pid?: number;
     ppid?: number;
@@ -93,31 +125,6 @@ export interface EnvWhere {
   toolExec: Fact<{ host: string; cwd: string }>;
 }
 
-/** Status of the whole-disk file watcher. */
-export type GlobalFileWatchStatus =
-  | 'running'
-  | 'degraded'
-  | 'partial-denied'
-  | 'denied'
-  | 'disabled'
-  | 'unavailable'
-  | 'unsupported';
-
-/** Summary value for `env.globalFileWatch`. */
-export interface GlobalFileWatchValue {
-  enabled: boolean;
-  status: GlobalFileWatchStatus;
-  root: string;
-  windowMs: number;
-  eventsPerSec: number;
-  degraded: boolean;
-  countOnly: boolean;
-  deniedPaths: string[];
-  exclusions: string[];
-  reason?: string;
-  retryAt?: number;
-}
-
 /** System power/lock state tracked in `env.system`. */
 export interface SystemStateValue {
   locked: boolean;
@@ -131,76 +138,12 @@ export interface SystemEventData {
   durationMs?: number;
 }
 
-/** Metric names tracked by the in-memory body-metric timeline. */
-export type AwayMetricName = 'cpu' | 'load1' | 'load5' | 'load15' | 'memory' | 'swap' | 'disk' | 'battery';
-
-/** One metric's walk across an away episode (natural units, see `unit`). */
-export interface AwayMetricTrend {
-  metric: AwayMetricName;
-  unit: 'ratio' | 'load' | 'bytes' | 'percent';
-  start: number;
-  end: number;
-  min: number;
-  max: number;
-  /** 0..1 ratio at the episode start, only for disk/battery. */
-  ratioStart?: number;
-  /** 0..1 ratio of the minimum to capacity, only for disk/battery. */
-  ratioMin?: number;
-}
-
-/** Warning captured during an away episode. */
-export interface AwayAlert {
-  metric: string;
-  severity: 'warn' | 'critical';
-  count: number;
-}
-
-/** Failed job/process captured during an away episode. */
-export interface AwayFailedJob {
-  id: string;
-  kind: string;
-  exitCode?: number;
-}
-
-/** External bulk deletion captured during an away episode. */
-export interface AwayDeletion {
-  directory: string;
-  deleted: number;
-}
-
-/** Categories that make an away summary worth pushing (change 4). */
-export type AwayAnomaly = 'alerts' | 'metric-warning' | 'metric-growth' | 'failed-jobs' | 'external-deletion';
-
-/** Data payload for `away.summary` (one per away episode, only pushed when anomalous). */
-export interface AwaySummaryData {
-  [key: string]: unknown;
-  awayFrom: number;
-  returnAt: number;
-  durationMs: number;
-  sleepMs: number;
-  lockMs: number;
-  inactiveMs?: number;
-  hasAnomaly: boolean;
-  anomalies: AwayAnomaly[];
-  alerts: AwayAlert[];
-  metrics: AwayMetricTrend[];
-  failed: AwayFailedJob[];
-  bursts: AwayDeletion[];
-  alertCount: number;
-  failedCount: number;
-  deletedCount: number;
-  anomalyCount?: number;
-  omitted?: number;
-}
-
-/** Observed environment state. */
+/** Observed environment state (pure sensory snapshot). */
 export interface EnvState {
   where: EnvWhere;
   frontApp: Fact<{ name: string; bundleId: string; pid?: number; windowCount?: number }>;
   focusedWindow: Fact<{ title: string }>;
   activeJobs: Fact<JobSummary[]>;
-  watchedPaths: Fact<Record<string, { lastChange: number; changes: number }>>;
-  globalFileWatch?: Fact<GlobalFileWatchValue>;
   system?: Fact<SystemStateValue>;
 }
 
@@ -209,7 +152,6 @@ export interface SourceObservation {
   status: FactStatus;
   lastSignalAt: number;
   error?: string;
-  capped?: boolean;
 }
 
 /** Observation pipeline status. */
@@ -217,175 +159,9 @@ export interface ObservationState {
   sources: Record<string, SourceObservation>;
 }
 
-/** Full state model (DESIGN §2.2). */
+/** Full sensory state model. */
 export interface SenseState {
   self: SelfState;
   env: EnvState;
   observation: ObservationState;
 }
-
-/** Attention escalation level. */
-export type DeliveryLevel = 'record' | 'context' | 'wake';
-
-/** A merged environment change ready for delivery. */
-export interface EnvChange {
-  signal: Signal;
-  count: number;
-  level: DeliveryLevel;
-  ruleId?: string;
-  note?: string;
-  reason?: string;
-}
-
-/** An increment to deliver to the agent (DESIGN §2.4). */
-export interface EnvUpdate {
-  since: number;
-  at: number;
-  changes: EnvChange[];
-  suppressed: number;
-  /** Signals already injected this session from a split mixed bucket (sum of `count`s). */
-  alreadyInjected?: number;
-}
-
-/**
- * A watch rule (DESIGN §2.3). `approved` is required; use `createWatchRule`
- * (host rules module) to apply the default `input.approved ??
- * input.createdBy === 'user'` — user rules default approved, agent-proposed
- * `wake` rules stay pending until confirmed.
- */
-export interface WatchRule {
-  id: string;
-  match: {
-    kind: string;
-    /** Glob: `*` = any run of non-`/` chars, `**` = across `/`, `?` = one non-`/` char. */
-    subject?: string;
-    /** Literal equality (`v`) or comparison (`{'!=': 0}`, `{'>': n}`…). */
-    where?: Record<string, unknown>;
-  };
-  level: DeliveryLevel;
-  note?: string;
-  createdBy: 'user' | 'agent';
-  approved: boolean;
-  expiresAt?: number;
-}
-
-/** Severity carried in `body.threshold` signal data and latch state. */
-export type ThresholdSeverity = 'normal' | 'warn' | 'critical';
-
-/** Per-metric latch, carried between samples as `BodyThresholdSample.state`. */
-export type BodyThresholdState = Record<string, ThresholdSeverity>;
-
-/**
- * Two body samples to compare. `state` is the latch returned for `prev`.
- * `monotonicAt` is the sample's monotonic-clock stamp (ms), stamped by the
- * host/`BodyMonitor`; rate-of-change windows are measured on it, never on
- * wall `at`. Live callers always carry it — the `at` fallback exists only
- * for direct logical-replay callers and must never be fed live wall time.
- */
-export interface BodyThresholdSample {
-  body: Body;
-  at: number;
-  source: SourceRef;
-  monotonicAt: number;
-  state?: BodyThresholdState;
-}
-
-/** Configurable threshold table (ratios; lower is worse) plus hysteresis. */
-export interface BodyThresholds {
-  disk: { warn: number; critical: number };
-  context: { warn: number; critical: number };
-  battery: { warn: number; critical: number };
-  /** Recovery margin in ratio points (0.05 = 5 percentage points). */
-  hysteresis: number;
-}
-
-/** Result of a body-metric evaluation step. */
-export interface BodyEvaluation {
-  signals: Signal[];
-  state: BodyThresholdState;
-}
-
-/**
- * Extension contract for body evaluators (DESIGN §2.2c). Implementations
- * are pure: the caller owns the latch and feeds it back as `state`.
- */
-export interface BodyEvaluator {
-  evaluate(prev: BodyThresholdSample, next: BodyThresholdSample, state: BodyThresholdState): BodyEvaluation;
-}
-
-/**
- * Rate-of-change metric payload for `body.rate` signals (future evaluator;
- * M1 emits none). `delta` is in metric units, `slope` in units/second, and
- * `timeToFloorMs` is omitted when it cannot be estimated.
- */
-export type BodyRateData = {
-  metric: string;
-  windowMs: number;
-  delta: number;
-  slope: number;
-  timeToFloorMs?: number;
-  etaToFloorMs?: number;
-  direction: 'up' | 'down';
-};
-
-/**
- * Anomaly payload for `body.anomaly` signals (future evaluator; M1 emits
- * none). `deviation` is measured in sigma/MAD units from `baseline`.
- */
-export type BodyAnomalyData = {
-  metric: string;
-  value: number;
-  baseline: number;
-  deviation: number;
-  type?: 'rebaseline-suggestion';
-  suggestionId?: string;
-};
-
-/**
- * Burst payload for `file.burst` signals (future evaluator; M1 emits none).
- * `agentDeleted` is the subset of `deleted` attributable to the agent.
- */
-export type FileBurstData = {
-  directory: string;
-  windowMs: number;
-  created: number;
-  modified: number;
-  deleted: number;
-  agentDeleted: number;
-  externalDeleted?: number;
-  externalDeletionExceeded?: boolean;
-  rolledUp?: boolean;
-};
-
-/** Aggregated per-directory file activity signal payload (`file.activity`). */
-export type FileActivityData = {
-  directory: string;
-  windowMs: number;
-  created: number;
-  modified: number;
-  deleted: number;
-  files: string[];
-  degraded?: boolean;
-};
-
-/** Typed `data` contracts for signal kinds with a fixed schema. */
-export interface KnownSignalData {
-  'body.rate': BodyRateData;
-  'body.anomaly': BodyAnomalyData;
-  'file.burst': FileBurstData;
-  'file.activity': FileActivityData;
-  'system.sleep': SystemEventData;
-  'system.wake': SystemEventData;
-  'screen.locked': SystemEventData;
-  'screen.unlocked': SystemEventData;
-  'session.active': SystemEventData;
-  'session.inactive': SystemEventData;
-  'away.summary': AwaySummaryData;
-}
-
-/** A {@link Signal} narrowed to a kind with a known data schema. */
-export type TypedSignal<K extends keyof KnownSignalData> = K extends keyof KnownSignalData
-  ? Omit<Signal, 'kind' | 'data'> & { kind: K; data: KnownSignalData[K] }
-  : never;
-
-export type { TuningChange, TuningValue } from './tuning.ts';
