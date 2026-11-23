@@ -3,9 +3,17 @@ import { describe, expect, it } from 'vitest';
 import { Settings } from '../src/host/runtime/settings.ts';
 
 describe('quality gate and privacy documentation', () => {
-  it('includes both workspace packages in the Biome gate', () => {
+  it('includes all workspace packages and both plugins in the Biome gate', () => {
     const config = JSON.parse(readFileSync(new URL('../../../biome.json', import.meta.url), 'utf8'));
-    expect(config.files.includes).toEqual(expect.arrayContaining(['packages/body-probe/**', 'packages/sense-ui/**']));
+    expect(config.files.includes).toEqual(
+      expect.arrayContaining([
+        'packages/body-probe/**',
+        'packages/sense-types/**',
+        'packages/sense-ui/**',
+        'plugins/asi-sense/**',
+        'plugins/asi-needs/**',
+      ]),
+    );
   });
 
   it('documents the actual window-title sharing default and the opt-out', () => {

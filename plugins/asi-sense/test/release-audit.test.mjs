@@ -9,6 +9,7 @@ describe('release audit', () => {
       '../../../packages/body-probe/package.json',
       '../../../packages/sense-types/package.json',
       '../../../packages/sense-ui/package.json',
+      '../../asi-needs/package.json',
       '../package.json',
     ]) {
       expect(JSON.parse(readFileSync(new URL(path, import.meta.url))).private).toBe(true);
