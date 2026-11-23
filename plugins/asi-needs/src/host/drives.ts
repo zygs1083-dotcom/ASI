@@ -293,6 +293,7 @@ export class MaslowDriveArbiter {
           urgency: h.urgency,
           zone: h.zone,
           driveActive: h.driveActive,
+          ...(r.autoMaintain !== undefined ? { autoMaintain: Boolean(r.autoMaintain) } : {}),
           suppressed: higherOrderSuppressed,
           ...(higherOrderSuppressed && suppressionReason ? { suppressionReason } : {}),
           summary: cleanSummary,
@@ -332,7 +333,7 @@ export class MaslowDriveArbiter {
   actionableHigherOrderDrives(): DriveEvaluation[] {
     if (this.latestSnapshot.higherOrderSuppressed) return [];
     return this.latestSnapshot.drives
-      .filter((d) => d.tier >= 2 && d.driveActive && !d.suppressed)
+      .filter((d) => d.tier >= 2 && d.driveActive && !d.suppressed && d.autoMaintain !== false)
       .sort((a, b) => a.tier - b.tier || b.urgency - a.urgency)
       .map((d) => structuredClone(d));
   }
