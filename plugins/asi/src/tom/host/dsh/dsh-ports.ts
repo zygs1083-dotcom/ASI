@@ -11,8 +11,8 @@ import type { Context } from '@deepseek-ai/cordis';
 import type { Agent } from '@deepseek-ai/dsh-agent';
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session';
 import type { WorkspaceRegistry } from '@deepseek-ai/dsh-workspace';
-import { buildExcludedInternalRoots, isOrdinaryDshSession } from '../../../sleep/host/dsh/dsh-ports.js';
 import { ASI_INTERNAL_SESSION_ID_RE } from '../../../shared/internal-guards.js';
+import { buildExcludedInternalRoots, isOrdinaryDshSession } from '../../../sleep/host/dsh/dsh-ports.js';
 import type { OrdinaryApprovalSignal, OrdinaryPromptSignal, OrdinaryTurnSignal, TomHostPorts } from '../ports.js';
 
 export const TOM_INTERNAL_SESSION_RE = ASI_INTERNAL_SESSION_ID_RE;

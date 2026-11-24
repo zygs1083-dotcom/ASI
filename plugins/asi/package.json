@@ -1,8 +1,8 @@
 {
   "name": "asi",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "private": true,
-  "description": "Unified biomimetic homeostasis (L0 sense, L1 survival needs, L2 sleep memory vault, L3 workspace care, L4 skill synthesis) for DeepSeek Harness.",
+  "description": "Unified biomimetic homeostasis and L5 cognition (L0 sense, L1 survival needs, L2 sleep memory vault, L3 workspace care, L4 skill synthesis, prefrontal intuition, Theory of Mind, DMN dream insights) for DeepSeek Harness.",
   "license": "MIT",
   "repository": {
     "type": "git",

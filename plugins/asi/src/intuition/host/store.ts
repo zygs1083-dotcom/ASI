@@ -55,9 +55,7 @@ const VALID_SOURCE_KINDS: ReadonlySet<FlashbackSourceKind> = new Set([
 const VALID_FEEDBACK: ReadonlySet<FlashbackFeedback> = new Set(['helpful', 'dismissed', 'muted']);
 
 function trimFeedbackRecord(raw: Readonly<Record<string, FlashbackFeedback>>): Record<string, FlashbackFeedback> {
-  const entries = Object.entries(raw).filter(
-    ([k, v]) => Boolean(k.trim()) && VALID_FEEDBACK.has(v),
-  );
+  const entries = Object.entries(raw).filter(([k, v]) => Boolean(k.trim()) && VALID_FEEDBACK.has(v));
   const sliced = entries.length > MAX_STORED_FEEDBACK ? entries.slice(entries.length - MAX_STORED_FEEDBACK) : entries;
   const out: Record<string, FlashbackFeedback> = {};
   for (const [k, v] of sliced) {

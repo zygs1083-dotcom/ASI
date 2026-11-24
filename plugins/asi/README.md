@@ -1,8 +1,8 @@
 # asi
 
-`asi`（`0.6.0`）是面向 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（DSH `0.2.2-rc.3 || 0.2.2-rc.5`，macOS `arm64`）的**统一仿生稳态与自进化组合包插件**。
+`asi`（`0.7.0`）是面向 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（DSH `0.2.2-rc.3 || 0.2.2-rc.5`，macOS `arm64`）的**统一仿生稳态、自进化与 L5 高阶认知组合包插件**。
 
-它在内部保持清晰的 L0–L4 五层模块化架构，对外统一打包为单一发行包 `asi-0.6.0.tgz` 并在 DSH 左侧栏仅注册**唯一一个侧栏入口**（`id: 'asi'`，`order: 90`）：
+它在内部保持清晰的 L0–L5 八大仿生模块化架构，对外统一打包为单一发行包 `asi-0.7.0.tgz` 并在 DSH 左侧栏仅注册**唯一一个侧栏入口**（`id: 'asi'`，`order: 90`）：
 
 1. **L0 感官采集（`src/sense/`，`ctx.asiSense`）**：采集本机身体体征（CPU、内存、磁盘、电源、温控、网络、进程、Token）、环境快照与最近 5 分钟短期趋势环，向日常对话暴露只读工具 `env_state` / `env_detail`（零动态事件注入）。
 2. **L1 生存需求与马斯洛多层仲裁（`src/needs/`，`ctx.asiDrives`）**：连续评估五大基础生理需求（能量、空间、内存与进程、心智容量、体温负荷），驱动本能反射、后台自维护沙盒（`needs_sniff_causes` 等）、行动效果记忆与零收益静默熔断，并统一仲裁 L2–L4 高阶需求，向日常对话暴露只读工具 `needs_status`。
@@ -13,7 +13,7 @@
 7. **心智理论与协作眼力见（`src/tom/`，`ctx.asiTom`）**：零 Token 融合注意力拓扑与会话交互节律（个体 EWMA 基线归一化），实时推断搭档状态（`deep_focus` / `rapid_sprint` / `stuck_debugging` / `exploring` / `steady_flow` / `away_resting`）与四维指标，注册静默协作驱动 `asi-tom:social_tact`（`autoMaintain: false`）、静态提示词契约与按需只读工具 `partner_state`（100% 保护 Prompt Cache），并在统一侧栏提供透明一键校准闭环。
 8. **DMN 睡眠做梦与跨项目顿悟（`src/dream/`，`ctx.asiDream`）**：在 L1–L3 舒适且深静默（空闲 `>= 15 分钟` 或锁屏）时跨独立 Git 仓库融合长期记忆、排障轨迹与只读结构画像，自动合成跨仓避坑预警、同构架构迁移、范式收敛与约定张力顿悟，在「记忆库 → 做梦顿悟」与顶部焦点条支持采纳为记忆、转交 L4 技能草案与忽略降权，向日常对话暴露只读工具 `dream_insights`。
 
-## 无损数据自动迁移（`0.5.0` → `0.6.0`）
+## 无损数据自动迁移（`0.5.0` → `0.6.0+`）
 
 默认数据根目录为 `~/.dsh/data/asi`（`cordis.patch.yml`：`dshHomePath('data', 'asi')`）。首次启动时，插件会在加载各层状态与记忆库前自动将同级旧版目录 `../asi-sense`、`../asi-needs`、`../asi-sleep`（含 `vault/memories.jsonl`、`vault/MEMORY.md`、`vault/sleep-journal.jsonl` 及 `state.json` 已整合会话水位线）、`../asi-care` 与 `../asi-growth` 无损迁移至 `~/.dsh/data/asi/{sense,needs,sleep,care,growth}`，同时在磁盘上完整保留旧目录作为安全回退备份。
 

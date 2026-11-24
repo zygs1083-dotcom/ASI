@@ -1,9 +1,11 @@
 import { describe, expect, it } from 'vitest';
 import {
   type ActionOutcomeLedgerEntry,
+  type AsiDreamServiceApi,
   type AsiDrivesSnapshot,
   type AsiIntuitionServiceApi,
   type AsiSleepServiceApi,
+  type AsiTomServiceApi,
   effectiveDisks,
   factStatusAt,
   NEED_KEYS,
@@ -137,5 +139,16 @@ describe('shared type exports', () => {
       subscribe: () => () => {},
     };
     expect(intuitionSvc.snapshot().pendingCount).toBe(1);
+
+    const tomSvc: Pick<AsiTomServiceApi, 'shouldDeferProactiveWork'> = {
+      shouldDeferProactiveWork: () => false,
+    };
+    expect(tomSvc.shouldDeferProactiveWork()).toBe(false);
+
+    const dreamSvc: AsiDreamServiceApi = {
+      listInsights: () => [],
+      subscribe: () => () => {},
+    };
+    expect(dreamSvc.listInsights()).toEqual([]);
   });
 });

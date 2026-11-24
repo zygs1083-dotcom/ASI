@@ -2,12 +2,7 @@
  * Host Dependency-Injection Ports for `src/intuition` (`ports.ts`).
  */
 
-import type {
-  AsiDrivesServiceApi,
-  AsiSenseServiceApi,
-  AsiSleepServiceApi,
-  AsiTomServiceApi,
-} from '@asi/sense-types';
+import type { AsiDrivesServiceApi, AsiSenseServiceApi, AsiSleepServiceApi, AsiTomServiceApi } from '@asi/sense-types';
 
 export interface UserPreStepCue {
   sessionId: string;

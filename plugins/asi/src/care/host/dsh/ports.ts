@@ -64,8 +64,7 @@ export function createDshCarePorts(ctx: Context, storageRoot: string, options?: 
     return candidate === parent || candidate.startsWith(prefix);
   };
 
-  const collectInternalRoots = (): string[] =>
-    buildUnifiedExcludedInternalRoots(storageRoot, ctx.asiSense.storageRoot);
+  const collectInternalRoots = (): string[] => buildUnifiedExcludedInternalRoots(storageRoot, ctx.asiSense.storageRoot);
 
   const isInternalPath = (candidate: string): boolean => {
     if (ASI_INTERNAL_PATH_RE.test(candidate)) return true;

@@ -361,8 +361,7 @@ export function createDreamRuntime(ports: DreamHostPorts): DreamRuntime {
   function preemptAutoDreamIfNeeded(): void {
     if (!activeDreamAbort || (activeDreamTrigger !== 'auto' && activeDreamTrigger !== 'sandbox')) return;
     const block = detectDreamLowerTierBlock(latestSense, ports.drives.snapshot());
-    const baseAbort =
-      block.suppressed || block.lowerTierBlocked || latestSense.settings.paused || autoDreamPaused;
+    const baseAbort = block.suppressed || block.lowerTierBlocked || latestSense.settings.paused || autoDreamPaused;
     if (activeDreamTrigger === 'sandbox') {
       if (baseAbort) {
         activeDreamAbort.abort();
@@ -370,8 +369,7 @@ export function createDreamRuntime(ports: DreamHostPorts): DreamRuntime {
       return;
     }
     const now = clock.wall();
-    const tomDeferring =
-      !isDreamScreenLockedAt(latestSense, now) && Boolean(ports.tom?.shouldDeferProactiveWork());
+    const tomDeferring = !isDreamScreenLockedAt(latestSense, now) && Boolean(ports.tom?.shouldDeferProactiveWork());
     if (baseAbort || ports.conversations.anyOrdinarySessionRunning() || tomDeferring) {
       activeDreamAbort.abort();
     }
@@ -769,8 +767,7 @@ export function createDreamRuntime(ports: DreamHostPorts): DreamRuntime {
             parameters: {
               force: {
                 type: 'boolean',
-                description:
-                  'Bypass 15-minute deep quiet wait when explicitly requested inside maintenance sandbox.',
+                description: 'Bypass 15-minute deep quiet wait when explicitly requested inside maintenance sandbox.',
               },
             },
             execute: async (args, context) => {

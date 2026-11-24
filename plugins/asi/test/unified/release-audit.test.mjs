@@ -17,8 +17,8 @@ import {
 const pkgDir = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const REQUIRED_DSH = '0.2.2-rc.3 || 0.2.2-rc.5';
 
-describe('统一单插件 asi (0.6.0) 发布包审计与 Desktop Profile 迁移核对', () => {
-  it('全工作区源码包均保持 private=true、版本对齐 0.6.0，且 cordis.patch.yml 指向 dshHomePath("data", "asi")', async () => {
+describe('统一单插件 asi (0.7.0) 发布包审计与 Desktop Profile 迁移核对', () => {
+  it('全工作区源码包均保持 private=true、版本对齐 0.7.0，且 cordis.patch.yml 指向 dshHomePath("data", "asi")', async () => {
     for (const rel of [
       '../../../../package.json',
       '../../../../packages/body-probe/package.json',
@@ -29,7 +29,7 @@ describe('统一单插件 asi (0.6.0) 发布包审计与 Desktop Profile 迁移�
       const manifest = JSON.parse(readFileSync(new URL(rel, import.meta.url), 'utf8'));
       expect(manifest.private).toBe(true);
       if (rel !== '../../../../package.json') {
-        expect(manifest.version).toBe('0.6.0');
+        expect(manifest.version).toBe('0.7.0');
       }
     }
 
@@ -153,7 +153,7 @@ describe('统一单插件 asi (0.6.0) 发布包审计与 Desktop Profile 迁移�
     ).not.toThrow();
 
     expect(registryVersionAvailable(1, '{"error":{"code":"E404"}}')).toBe(true);
-    expect(registryVersionAvailable(0, '"0.6.0"')).toBe(false);
+    expect(registryVersionAvailable(0, '"0.7.0"')).toBe(false);
     expect(() => registryVersionAvailable(1, '{"error":{"code":"E403"}}')).toThrow();
     expect(registryUrl()).toBe('https://registry.npmjs.org/');
     expect(() => registryUrl('https://user:secret@example.com/')).toThrow();
@@ -176,7 +176,7 @@ describe('统一单插件 asi (0.6.0) 发布包审计与 Desktop Profile 迁移�
       const profileDir = join(dir, 'profile');
       const backupPath = join(dir, 'backup-package.json');
       await mkdir(join(profileDir, 'node_modules/asi'), { recursive: true });
-      await writeFile(join(profileDir, 'node_modules/asi/package.json'), '{"version":"0.6.0"}');
+      await writeFile(join(profileDir, 'node_modules/asi/package.json'), '{"version":"0.7.0"}');
 
       const runSyncDisabled = () =>
         spawnSync(process.execPath, ['-e', syncDisabledHelper, join(profileDir, 'package.json'), backupPath], {
@@ -186,7 +186,7 @@ describe('统一单插件 asi (0.6.0) 发布包审计与 Desktop Profile 迁移�
         spawnSync(process.execPath, ['-e', syncRollbackBundlesHelper, join(profileDir, 'package.json'), backupPath], {
           encoding: 'utf8',
         });
-      const runUpgrade = (ver = '0.6.0') =>
+      const runUpgrade = (ver = '0.7.0') =>
         spawnSync(process.execPath, ['-', profileDir, backupPath, ver], {
           input: verifyUpgradeScript,
           encoding: 'utf8',
@@ -197,7 +197,7 @@ describe('统一单插件 asi (0.6.0) 发布包审计与 Desktop Profile 迁移�
           encoding: 'utf8',
         });
 
-      // 1. 从 0.5.0 五插件迁移至单插件 asi@0.6.0（保留 dsh-context 与 dsh-superagent）
+      // 1. 从 0.5.0 五插件迁移至单插件 asi@0.7.0（保留 dsh-context 与 dsh-superagent）
       await writeFile(
         backupPath,
         JSON.stringify({
@@ -234,7 +234,7 @@ describe('统一单插件 asi (0.6.0) 发布包审计与 Desktop Profile 迁移�
             'dsh-context': '0.2.2-rc.3',
             'dsh-superagent': '0.2.2-rc.3',
             'asi-sleep': 'file:/old/asi-sleep-0.5.0.tgz',
-            asi: '0.6.0',
+            asi: '0.7.0',
           },
           dsh: { profile: { bundles: ['dsh-context', 'dsh-superagent', 'asi'] } },
         }),
@@ -247,21 +247,21 @@ describe('统一单插件 asi (0.6.0) 发布包审计与 Desktop Profile 迁移�
         JSON.stringify({
           dependencies: {
             'dsh-context': '0.2.2-rc.3',
-            asi: '0.6.0',
+            asi: '0.7.0',
           },
           dsh: { profile: { bundles: ['dsh-context', 'asi'] } },
         }),
       );
       expect(runUpgrade().status).not.toBe(0);
 
-      // 干净移除 5 个旧包、保留 dsh-context + dsh-superagent 并启用 asi@0.6.0 时通过
+      // 干净移除 5 个旧包、保留 dsh-context + dsh-superagent 并启用 asi@0.7.0 时通过
       await writeFile(
         join(profileDir, 'package.json'),
         JSON.stringify({
           dependencies: {
             'dsh-context': '0.2.2-rc.3',
             'dsh-superagent': '0.2.2-rc.3',
-            asi: '0.6.0',
+            asi: '0.7.0',
           },
           dsh: { profile: { bundles: ['dsh-context', 'dsh-superagent', 'asi'] } },
         }),
@@ -299,14 +299,14 @@ describe('统一单插件 asi (0.6.0) 发布包审计与 Desktop Profile 迁移�
       );
       expect(runRollback().status).toBe(0);
 
-      // 2. 后续单包 asi 0.6.0 tgz -> 0.6.1 registry 原位升级（保留中间位置与禁用态）及回退
-      await writeFile(join(profileDir, 'node_modules/asi/package.json'), '{"version":"0.6.1"}');
+      // 2. 后续单包 asi 0.7.0 tgz -> 0.7.1 registry 原位升级（保留中间位置与禁用态）及回退
+      await writeFile(join(profileDir, 'node_modules/asi/package.json'), '{"version":"0.7.1"}');
       await writeFile(
         backupPath,
         JSON.stringify({
           dependencies: {
             'dsh-context': '0.2.2-rc.3',
-            asi: 'file:/old/asi-0.6.0.tgz',
+            asi: 'file:/old/asi-0.7.0.tgz',
             'dsh-superagent': '0.2.2-rc.3',
           },
           dsh: { profile: { bundles: ['dsh-context', 'asi', 'dsh-superagent'] } },
@@ -317,20 +317,20 @@ describe('统一单插件 asi (0.6.0) 发布包审计与 Desktop Profile 迁移�
         JSON.stringify({
           dependencies: {
             'dsh-context': '0.2.2-rc.3',
-            asi: '0.6.1',
+            asi: '0.7.1',
             'dsh-superagent': '0.2.2-rc.3',
           },
           dsh: { profile: { bundles: ['dsh-context', 'asi', 'dsh-superagent'] } },
         }),
       );
-      expect(runUpgrade('0.6.1').status).toBe(0);
+      expect(runUpgrade('0.7.1').status).toBe(0);
 
       await writeFile(
         join(profileDir, 'package.json'),
         JSON.stringify({
           dependencies: {
             'dsh-context': '0.2.2-rc.3',
-            asi: 'file:/old/asi-0.6.0.tgz',
+            asi: 'file:/old/asi-0.7.0.tgz',
             'dsh-superagent': '0.2.2-rc.3',
           },
           dsh: { profile: { bundles: ['dsh-context', 'asi', 'dsh-superagent'] } },
@@ -340,7 +340,7 @@ describe('统一单插件 asi (0.6.0) 发布包审计与 Desktop Profile 迁移�
 
       // 3. 当升级前 5 个旧版 asi-* 全部处于手动禁用状态，且 dsh plugin add 默认将 asi 推入 bundles 时：
       //    内联同步脚本保持禁用态且核对脚本通过；回退时即使原 5 个包夹在 dsh-context 与 dsh-superagent 中间也能精确还原顺序
-      await writeFile(join(profileDir, 'node_modules/asi/package.json'), '{"version":"0.6.0"}');
+      await writeFile(join(profileDir, 'node_modules/asi/package.json'), '{"version":"0.7.0"}');
       await writeFile(
         backupPath,
         JSON.stringify({
@@ -362,13 +362,13 @@ describe('统一单插件 asi (0.6.0) 发布包审计与 Desktop Profile 迁移�
           dependencies: {
             'dsh-context': '0.2.2-rc.3',
             'dsh-superagent': '0.2.2-rc.3',
-            asi: '0.6.0',
+            asi: '0.7.0',
           },
           dsh: { profile: { bundles: ['dsh-context', 'dsh-superagent', 'asi'] } },
         }),
       );
       expect(runSyncDisabled().status).toBe(0);
-      expect(runUpgrade('0.6.0').status).toBe(0);
+      expect(runUpgrade('0.7.0').status).toBe(0);
 
       // 非末尾顺序 5 插件回退还原
       await writeFile(

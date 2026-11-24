@@ -1,6 +1,6 @@
-# ASI 设计文档（v0.6 · 单插件五层稳态、无损数据迁移与统一侧栏架构）
+# ASI 设计文档（v0.7 · 单插件 L0–L5 仿生稳态与高阶认知、无损迁移与统一侧栏架构）
 
-状态：v0.6 定稿（2026-11-24）。在 v0.5 五插件马斯洛体系基础上，将五个拆分组合包整合收敛为**单一 DSH 组合包 `asi`（`0.6.0`）**，内置从旧版 `../asi-*` 目录到 `~/.dsh/data/asi/{sense,needs,sleep,care,growth}` 的启动期无损非破坏性数据迁移，并将原有的三个独立侧栏图标统一重设计为**唯一侧栏入口「ASI 稳态」（`id: 'asi'`，`order: 90`）**。
+状态：v0.7 定稿（2026-11-24）。在单包 `asi` 马斯洛稳态体系基础上，合入 L5 三大仿生高阶认知模块（`intuition` 前额叶躯体标记与前瞻记忆、`tom` 心智理论搭档感知与协作眼力见、`dream` DMN 默认模式网络跨仓库睡眠做梦顿悟），对外发布为**单一 DSH 组合包 `asi`（`0.7.0`）**，保留从旧版 `../asi-*` 目录到 `~/.dsh/data/asi/{sense,needs,sleep,care,growth}` 的启动期无损非破坏性数据迁移，并在 DSH 左侧栏仅保留**唯一侧栏入口「ASI 稳态」（`id: 'asi'`，`order: 90`）**。
 
 ## 0. 兼容版本
 
@@ -9,13 +9,13 @@
 - **宿主已知约束**：
   - `ctx.llm.resolveModelInfo` 与 `sessionProjections` 在未显式携带来源时返回回退估值，Token 事实统一附带 `contextWindowSource: 'configured' | 'catalog' | 'fallback'`；`fallback` 在侧栏标注「容量未确认（回退估值）」，在心智需求评估中偏紧时仅进入 `uncomfortable` 后台静默整理，避免误报危急啼哭。
 
-## 1. 核心理念与单包五层总体架构
+## 1. 核心理念与单包 L0–L5 总体架构
 
-`asi`（`0.6.0`）对外是一个自包含 DSH 组合包（包含 `lib/index.js`、`lib/client.js`、`lib/typert.host.js`、`lib/asi-sense-helper`、`cordis.patch.yml`、`scripts/dsh.sh`、`LICENSE`、`package.json`），内部按 L0–L4 五层清晰解耦并通过 Cordis 服务（`ctx.asiSense`、`ctx.asiDrives`、`ctx.asiSleep`、`ctx.asi`）协作：
+`asi`（`0.7.0`）对外是一个自包含 DSH 组合包（包含 `lib/index.js`、`lib/client.js`、`lib/typert.host.js`、`lib/asi-sense-helper`、`cordis.patch.yml`、`scripts/dsh.sh`、`LICENSE`、`package.json`），内部按 L0–L5 八大仿生模块清晰解耦并通过 Cordis 服务（`ctx.asiSense`、`ctx.asiDrives`、`ctx.asiSleep`、`ctx.asiTom`、`ctx.asiIntuition`、`ctx.asiDream`、`ctx.asi`）协作：
 
 ```
 ┌────────────────────────────────────────────────────────────────────────────┐
-│ asi（0.6.0 · 单一 DSH 组合包 · storageRoot: ~/.dsh/data/asi）              │
+│ asi（0.7.0 · 单一 DSH 组合包 · storageRoot: ~/.dsh/data/asi）              │
 │  ├─ Step 0 启动迁移：migrateLegacyAsiData (../asi-* -> sense..growth)      │
 │  ├─ L0 src/sense（ctx.asiSense + env_state / env_detail）                  │
 │  │    └─ Swift AX helper + BodyProbe + 5m BodyHistory 短期趋势环           │
@@ -98,18 +98,18 @@
 
 ## 7. 统一侧栏界面（`id: 'asi'`，`order: 90`）
 
-通过单一 `AsiRemote`（`ctx.asi`）合并推送 `{ needs, sleep, growth }` 实时帧，采用统一 CSS Module 设计系统（消费宿主 `--dsw-*` 明暗令牌，`color-mix` 高对比度状态墨色，严格 `320px` 零水平溢出与 `axe-core` 零违规）：
+通过单一 `AsiRemote`（`ctx.asi`）合并推送 `{ needs, sleep, growth, intuition, tom, dream }` 六域实时帧，采用统一 CSS Module 设计系统（消费宿主 `--dsw-*` 明暗令牌，`color-mix` 高对比度状态墨色，严格 `320px` 零水平溢出与 `axe-core` 零违规）：
 
-1. **顶部全局状态胶囊**：展示整体稳态胶囊（`稳态舒适 / 存在不适 / 生存危急 / 恢复保持`）、`节能` / `已暂停` / `仅本机` 标签，以及一键展开的全局暂停与窗口标题隐私开关弹出层。
-2. **三段式 Tab 导航（`稳态看护` | `记忆库` | `技能工坊`）**：支持完整 WAI-ARIA `tablist` 键盘方向键切换与实时待办/计数角标。
-3. **跨 Tab 待批焦点条（Spotlight Strip）**：当存在未处理看护求助卡或待审 `SKILL.md` 新草案时，在非当前所属 Tab 顶部自动展示醒目操作条，支持原位一键批准或一键跳转审阅。
+1. **顶部全局状态胶囊**：展示整体稳态胶囊（`稳态舒适 / 存在不适 / 生存危急 / 恢复保持`）、搭档认知状态胶囊 `<TomCapsuleBadge />`（如 `搭档·心流`）、`节能` / `已暂停` / `仅本机` 标签，以及一键展开的全局暂停与窗口标题隐私开关弹出层。
+2. **三段式 Tab 导航（`稳态看护` | `记忆库` | `技能工坊`）**：支持完整 WAI-ARIA `tablist` 键盘方向键切换与精简角标（`记忆库` 有待办前瞻或待审顿悟时合并显示单一待办告警角标，无待办时显示记忆总数）。
+3. **跨 Tab 待批焦点条（Spotlight Strip）**：按马斯洛优先级顺序（看护求助卡 `spotlight-help-banner` -> 到期前瞻意图 `spotlight-prospective-banner` -> 待审技能草案 `spotlight-draft-banner` -> 跨仓做梦顿悟 `spotlight-insight-banner`）在非当前所属视图顶部展示操作条，支持原位一键处理或一键跳转审阅。
 4. **减法留白与低频抽屉收折**：
-   - `稳态看护` 主屏仅呈现未决求助卡、L1 五大需求紧凑进度行、L2–L4 仲裁摘要与自检入口；「维护账本与历史记录」、「原始身体体征与 5m 趋势」、「当前环境与信号源」全部默认折叠在底部抽屉中按需展开；
-   - `记忆库` 提供紧凑睡眠状态栏、搜索与分类胶囊筛选、整洁记忆卡片（FSRS 保留率、置顶标识、长文展开、内联增删改）及默认折叠的睡眠日志抽屉；
+   - `稳态看护` 主屏呈现未决求助卡、L1 五大需求紧凑进度行、`<TomCard />` 搭档状态与校准卡片、L2–L5 仲裁摘要与自检入口；「维护账本与历史记录」、「原始身体体征与 5m 趋势」、「当前环境与信号源」全部默认折叠在底部抽屉中按需展开；
+   - `记忆库` 为单一 `tabpanel`，顶部内置 `长期记忆 | 直觉与前瞻 | 做梦顿悟` 三枚胶囊子视图切换，整合长期记忆增删改查、前瞻意图与直觉闪回反馈以及 DMN 跨仓顿悟采纳/转交草案闭环；
    - `技能工坊` 提供紧凑 L4 状态栏、`待审草案 / 已启用 / 已归档` 筛选、`v1 → v2` 差异视图、`SKILL.md` 在线预览与校验编辑、作用域切换、一键导出至 `.agents/skills/` 及默认折叠的提炼日志抽屉。
 
 ## 8. 隐私与凭据安全
 
-- 所有观察数据、维护状态、动作收益账本、长期记忆库与技能文件仅保存在本机 `~/.dsh/data/asi/`（除用户显式点击导出技能至指定工作区 `.agents/skills/` 外，绝不写入用户项目目录）。
-- 所有暴露给模型的工具返回值、`ctx.skills` 技能内容、记忆与 `SKILL.md` 落盘前后、RPC 错误信息及 `<asi-cry>` 文本一律经过线性时间 $O(N)$ 的 `sanitizeForModel` 凭据打码器与主目录 `~` 化保护，并严格跳过所有 ASI 内部沙盒/记忆库/技能目录（含旧版 `data/asi-*` 目录）及子代理会话。
-- 单一发行包构建产物（`plugins/asi/dist/asi-0.6.0.tgz`）强制通过 `release-audit.mjs` 检查（校验文件白名单、零源码映射、零密钥/邮箱/本机用户名/敏感绝对路径残留）。
+- 所有观察数据、维护状态、动作收益账本、长期记忆库、前瞻意图、ToM 统计基线、DMN 顿悟与技能文件仅保存在本机 `~/.dsh/data/asi/`（除用户显式点击导出技能至指定工作区 `.agents/skills/` 外，绝不写入用户项目目录）。
+- 所有暴露给模型的工具返回值、`ctx.skills` 技能内容、记忆与 `SKILL.md` 落盘前后、RPC 错误信息、`<asi-intuition>` 与 `<asi-cry>` 文本一律经过线性时间 $O(N)$ 的 `sanitizeForModel` 凭据打码器与主目录 `~` 化保护，并严格跳过所有 ASI 内部 8 模块目录（`sense, needs, sleep, care, growth, intuition, tom, dream` 及旧版 `data/asi-*` 目录）与子代理会话。
+- 单一发行包构建产物（`plugins/asi/dist/asi-0.7.0.tgz`）强制通过 `release-audit.mjs` 检查（校验文件白名单、零源码映射、零密钥/邮箱/本机用户名/敏感绝对路径残留）。

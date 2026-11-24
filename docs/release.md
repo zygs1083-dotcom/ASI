@@ -1,6 +1,6 @@
 # 发布 ASI 插件（统一单包 `asi`）
 
-本文是负责人批准并亲自执行的操作；准备分支不会发布任何包。自 `0.6.0` 起，ASI 将原有的五个拆分插件合并收敛为**唯一 DSH 组合包 `asi`**（在左侧栏仅注册唯一入口 `id: 'asi'`，`order: 90`），对外分发时只需构建、审计并发布这一个包。
+本文是负责人批准并亲自执行的操作；准备分支不会发布任何包。自 `0.6.0` 起（当前版本 `0.7.0`），ASI 将原有的五个拆分插件合并收敛为**唯一 DSH 组合包 `asi`**（在左侧栏仅注册唯一入口 `id: 'asi'`，`order: 90`），对外分发时只需构建、审计并发布这一个包。
 
 先选定**一个**目标 registry：npm 公网或下文的自建 registry。发布前检查 `asi` 包名的归属、权限和版本；registry 的 404 不保证包名尚未被他人抢先注册。
 
@@ -45,13 +45,13 @@ npm view "asi@$ASI_VERSION" version --registry=https://registry.npmjs.org/
 
 ## 将用户 Desktop Profile 迁移/切到单包 `asi`（保留 `dsh-context` 与 `dsh-superagent`）
 
-仅在目标包已发布并验证后，由用户完全退出 Desktop；确认 CLI 与 Desktop 使用同一 `DSH_HOME`，并确保 Desktop profile 已初始化。以下流程同时兼容「从 `0.5.0` 五个拆分 `asi-*` 包迁移至单包 `asi@0.6.0`」与「后续 `asi` 原位版本升级」，且严格原样保留 profile 中既有的 `dsh-context`、`dsh-superagent` 等非 ASI 插件依赖与启用顺序。先备份 profile 文件并持久设置更新源：
+仅在目标包已发布并验证后，由用户完全退出 Desktop；确认 CLI 与 Desktop 使用同一 `DSH_HOME`，并确保 Desktop profile 已初始化。以下流程同时兼容「从 `0.5.0` 五个拆分 `asi-*` 包迁移至单包 `asi@0.7.0`」与「后续 `asi` 原位版本升级」，且严格原样保留 profile 中既有的 `dsh-context`、`dsh-superagent` 等非 ASI 插件依赖与启用顺序。先备份 profile 文件并持久设置更新源：
 
 ```sh
 DSH="/Applications/DeepSeek Harness.app/Contents/Resources/runtime/cli/bin/dsh"
 PROFILE="${DSH_HOME:-$HOME/.dsh}/profiles/desktop"
 REGISTRY=https://registry.npmjs.org/
-ASI_VERSION=0.6.0
+ASI_VERSION=0.7.0
 test -f "$PROFILE/package.json" || { echo "Desktop profile 未初始化" >&2; exit 1; }
 umask 077
 BACKUP=$(mktemp -d "${TMPDIR:-/tmp}/asi-profile-backup.XXXXXX")

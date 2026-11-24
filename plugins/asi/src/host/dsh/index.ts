@@ -225,16 +225,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     const tomRoot = join(config.storageRoot, 'tom');
     const intuitionRoot = join(config.storageRoot, 'intuition');
     const dreamRoot = join(config.storageRoot, 'dream');
-    const allInternalRoots = [
-      senseRoot,
-      needsRoot,
-      sleepRoot,
-      careRoot,
-      growthRoot,
-      tomRoot,
-      intuitionRoot,
-      dreamRoot,
-    ];
+    const allInternalRoots = [senseRoot, needsRoot, sleepRoot, careRoot, growthRoot, tomRoot, intuitionRoot, dreamRoot];
 
     // 1. L0 Pure Sensory Organ (`ctx.asiSense` + `env_state` / `env_detail`)
     const local = localPorts(ctx, senseRoot);

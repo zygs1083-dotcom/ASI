@@ -9,16 +9,7 @@
 import { realpathSync } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
 
-export const ASI_MODULE_NAMES = [
-  'sense',
-  'needs',
-  'sleep',
-  'care',
-  'growth',
-  'intuition',
-  'tom',
-  'dream',
-] as const;
+export const ASI_MODULE_NAMES = ['sense', 'needs', 'sleep', 'care', 'growth', 'intuition', 'tom', 'dream'] as const;
 
 export type AsiModuleName = (typeof ASI_MODULE_NAMES)[number];
 

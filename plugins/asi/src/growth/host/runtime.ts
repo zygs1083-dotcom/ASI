@@ -15,6 +15,7 @@ import { realpathSync } from 'node:fs';
 import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { dirname, join, resolve, sep } from 'node:path';
 import type { AsiDrivesSnapshot, DriveAbortSignal, SenseSnapshot } from '@asi/sense-types';
+import { ASI_INTERNAL_CWD_RE } from '../../shared/internal-guards.js';
 import {
   isValidSkillName,
   maskHomeDir,
@@ -39,7 +40,6 @@ import type {
   SkillViewItem,
   WorkspaceChoice,
 } from '../shared/types.js';
-import { ASI_INTERNAL_CWD_RE } from '../../shared/internal-guards.js';
 import {
   DAILY_AUTO_DRAFT_QUOTA,
   DEEP_QUIET_IDLE_THRESHOLD_MS,
