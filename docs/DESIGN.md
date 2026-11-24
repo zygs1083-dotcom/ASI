@@ -27,6 +27,8 @@
 │  │    └─ 多工作树发现 + 2h 活跃豁免 + 仓库卫生/孤儿端口/闲置产物三级护栏   │
 │  ├─ L4 src/growth（tier: 4 · ctx.skills.registerProvider + growth_status） │
 │  │    └─ L1-L3 舒适 + 20m 深静默 -> 纯文本 SKILL.md 草案 -> 人工批准热挂载 │
+│  ├─ DMN src/dream（tier: 4 · ctx.asiDream + dream_insights）               │
+│  │    └─ 跨 Git 仓库结构画像 + 15m 深静默远距联想 -> 避坑预警/同构顿悟闭环 │
 │  └─ 统一 TypeRT 服务 ctx.asi + 唯一侧栏面板（id: 'asi', order: 90）        │
 └────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -71,6 +73,12 @@
 1. **纯文本标准格式（MIT）**：改造自 `MineDojo/Voyager` 与 `agentskills/agentskills`，所有草案、已启用技能与归档技能均以纯文本 `SKILL.md` 存储在 `<storageRoot>/growth/skills/{drafts,active,archived}/`，强拦截任何可执行脚本生成引用与未授权工作区写入。
 2. **高证据阈值与 20 分钟深静默门控**：融合 `ctx.asiSleep` 高保留率（`>= 0.5` 或置顶）记忆与多步排障轨迹，仅当 L1–L3 全部舒适且全部普通会话空闲 `>= 20 分钟` 或锁屏时自动起草待审草案（`<= 2` 份/日，在途遇 L1–L3 激活立即抢占中断并回滚配额）。
 3. **人工批准热挂载与 60 天代谢**：新技能（`v1`）与增量修订（`v2+` 行级差异对比）一律须用户点击「批准启用」后才通过 `ctx.skills.registerProvider` 热挂载，支持 `global`/`workspace`（`cwd`）作用域在线切换、一键导出至 `.agents/skills/<name>/SKILL.md` 及连续 `60` 天零调用代谢归档建议；普通对话仅暴露只读工具 `growth_status`。
+
+## 6b. DMN 默认模式网络：睡眠做梦与跨项目顿悟（`src/dream/`）
+
+1. **多工作树归并与非源码只读结构画像**：通过读取 `.git` 目录或工作树 `commondir` 将同一仓库的兄弟 worktree 归一为单一 `repoKey`，并仅对 `package.json`、`AGENTS.md` / `README.md` 标题与非敏感顶层目录做只读边界扫描（`lstat` 禁符号链接、零业务源码读取、全量经 `sanitizeForModel` 脱敏）。
+2. **15 分钟深静默门控与跨仓远距同构合成**：在 L1–L3 全部舒适（确保 10m 的 L2 睡眠先完成记忆整合）且普通会话空闲 `>= 15 分钟` 或锁屏时运行 DMN 做梦周期（自动上限 `<= 3` 次/日，L1–L3 激活或 `eco` 模式立即抢占中断并回滚配额），结合离线确定性结构桥接器与在线流式 LLM 精炼生成 `preventive-warning`、`structural-analogy`、`pattern-unification`、`decision-tension` 四类顿悟，落盘至 `<storageRoot>/dream/vault/{insights.jsonl,INSIGHTS.md,dream-journal.jsonl}`。
+3. **零动态注入与记忆/技能双闭环**：日常对话仅注册按需只读工具 `dream_insights`（支持当前工作区亲和过滤，100% 保护 Prompt Cache）；侧栏在跨 Tab 焦点条与「记忆库 -> 做梦顿悟」子视图支持一键采纳固化为 L2 长期记忆、一键转化为 L4 待审 `SKILL.md` 草案或忽略降权（记录配对惩罚防止重复做梦）。
 
 ## 7. 统一侧栏界面（`id: 'asi'`，`order: 90`）
 

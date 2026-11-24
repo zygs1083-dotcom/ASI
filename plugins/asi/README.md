@@ -9,6 +9,7 @@
 3. **L2 睡眠与记忆整合（`src/sleep/`，`ctx.asiSleep`）**：在对话满 12 轮或满 6 小时产生困意，于 10 分钟空闲或锁屏且 L1 舒适时自动运行仿生 NREM+REM 双阶段睡眠整合（结合 `ts-fsrs` 遗忘衰减与 `MiniSearch` 中英检索，支持 `MEMORY.md` 双向对账），向日常对话暴露只读工具 `memory_recall` / `memory_profile`。
 4. **L3 工作区与项目看护（`src/care/`）**：零配置发现工作区并展开 Git 兄弟工作树，按 2 小时活跃豁免与三级安全护栏治理仓库卫生、孤儿开发端口与闲置构建产物，全程零 `<asi-cry>` 对话打断，向日常对话暴露只读工具 `care_status`。
 5. **L4 技能提炼与自进化（`src/growth/`，`ctx.skills.registerProvider`）**：在 L1–L3 舒适且深静默（空闲 `>= 20 分钟` 或锁屏）时从高保留率踩坑记忆与排障轨迹提炼标准纯文本 `agentskills` `SKILL.md` 草案（含 `v1 → v2+` 差异对比），经人工一键批准后热挂载至 `ctx.skills`（支持 `global`/`workspace` 作用域隔离、一键导出至 `.agents/skills/` 与 60 天代谢提醒），向日常对话暴露只读工具 `growth_status`。
+6. **DMN 睡眠做梦与跨项目顿悟（`src/dream/`，`ctx.asiDream`）**：在 L1–L3 舒适且深静默（空闲 `>= 15 分钟` 或锁屏）时跨独立 Git 仓库融合长期记忆、排障轨迹与只读结构画像，自动合成跨仓避坑预警、同构架构迁移、范式收敛与约定张力顿悟，在「记忆库 -> 做梦顿悟」与顶部焦点条支持采纳为记忆、转交 L4 技能草案与忽略降权，向日常对话暴露只读工具 `dream_insights`。
 
 ## 无损数据自动迁移（`0.5.0` → `0.6.0`）
 

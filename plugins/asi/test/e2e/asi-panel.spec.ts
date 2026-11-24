@@ -168,6 +168,40 @@ test.describe('ASI 统一侧栏面板 320px 响应式、明暗双主题与 axe �
     expect(errors).toEqual([]);
   });
 
+  test('DMN「做梦顿悟」子视图与跨 Tab 待批焦点条：跳转审阅、采纳固化记忆、转交技能草案与 320px axe 验证', async ({
+    page,
+  }) => {
+    const errors = watchErrors(page);
+    await page.setViewportSize({ width: 320, height: 940 });
+    await openUnifiedPanel(page, 'pending-approvals', 'dark', 'care');
+
+    // 1. 顶部跨 Tab 待批焦点条展示待审跨项目顿悟，点击「审阅顿悟」直达「记忆库 -> 做梦顿悟」
+    await expect(page.getByTestId('spotlight-insight-banner')).toContainText('orca-hub');
+    await page.getByTestId('spotlight-jump-insights').click();
+    await expect(page.getByTestId('dream-status-card')).toBeVisible();
+    await expectNoOverflow(page);
+    await axeCheck(page);
+
+    // 2. 将待审顿悟转交为 L4 技能草案并验证状态流转
+    await page.getByTestId('promote-insight-ins_mock_warn_01').click();
+    await expect(page.getByTestId('dream-feedback')).toContainText('已生成待审技能草案');
+
+    // 3. 手动触发「立即做梦联想」产生新顿悟并采纳固化进长期记忆
+    await page.getByTestId('dream-now-btn').click();
+    await expect(page.getByTestId('dream-feedback')).toContainText('新生成 1 条顿悟');
+    const firstAdoptBtn = page.locator('[data-testid^="adopt-insight-"]').first();
+    await firstAdoptBtn.click();
+    await expect(page.getByTestId('dream-feedback')).toContainText('已采纳顿悟并固化为长期记忆');
+
+    // 4. 展开底部做梦日志抽屉，复核 320px 零水平溢出与零 axe 违规
+    const dreamDrawer = page.getByTestId('drawer-dream-journal');
+    await dreamDrawer.locator('> summary').click();
+    await expect(dreamDrawer).toHaveAttribute('open', '');
+    await expectNoOverflow(page);
+    await axeCheck(page);
+    expect(errors).toEqual([]);
+  });
+
   test('「技能工坊」Tab v1->v2 差异、SKILL.md 编辑、作用域切换、批准/停用/代谢归档恢复、导出与手动新建验证', async ({
     page,
   }) => {
