@@ -13,11 +13,12 @@
  */
 
 import { randomUUID } from 'node:crypto';
-import { lstat, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
+import { chmod, lstat, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import type {
   DreamInsightQueryOptions,
   DreamInsightSummary,
+  DriveAbortSignal,
   ExternalDriveReading,
   SenseSnapshot,
 } from '@asi/sense-types';
@@ -42,10 +43,12 @@ import {
   DREAM_ROLLING_DAY_WINDOW_MS,
   detectDreamLowerTierBlock,
   evaluateDreamState,
+  isDreamScreenLockedAt,
 } from './evaluator.ts';
 import type { DreamHostPorts } from './ports.ts';
 import {
   collectRepoProfiles,
+  isExcludedDreamPath,
   type RepoStructuralProfile,
   resolveCanonicalRepoIdentity,
   sanitizeDreamText,
@@ -145,6 +148,7 @@ function deriveSkillSlugFromInsight(entry: DreamInsightEntry): string {
 export function createDreamRuntime(ports: DreamHostPorts): DreamRuntime {
   const clock = ports.clock ?? { wall: () => Date.now(), mono: () => performance.now() };
   const statePath = join(ports.storageRoot, 'state.json');
+  const excludedRoots = [ports.storageRoot, ...(ports.excludedInternalRoots ?? [])];
   const vault = new DreamVault(ports.storageRoot, ports.homeDir);
 
   let started = false;
@@ -178,6 +182,7 @@ export function createDreamRuntime(ports: DreamHostPorts): DreamRuntime {
   let offDriveSource: (() => void) | undefined;
   let offConversations: (() => void) | undefined;
   let offSleep: (() => void) | undefined;
+  let offTom: (() => void) | undefined;
 
   function notify(): void {
     if (stopped) return;
@@ -218,25 +223,47 @@ export function createDreamRuntime(ports: DreamHostPorts): DreamRuntime {
     return Object.fromEntries(entries.slice(entries.length - MAX_TRACKED_SIGNATURES));
   }
 
+  function trimPenaltyMap(map: Record<string, number>): Record<string, number> {
+    const entries = Object.entries(map);
+    if (entries.length <= MAX_TRACKED_SIGNATURES) return map;
+    return Object.fromEntries(entries.slice(entries.length - MAX_TRACKED_SIGNATURES));
+  }
+
+  async function ensureStorageRootSafe(): Promise<void> {
+    const preStat = await lstat(ports.storageRoot).catch(() => undefined);
+    if (preStat?.isSymbolicLink()) {
+      throw new Error('Refusing to use symlinked dream storageRoot');
+    }
+    await mkdir(ports.storageRoot, { recursive: true, mode: 0o700 });
+    const postStat = await lstat(ports.storageRoot);
+    if (!postStat.isDirectory() || postStat.isSymbolicLink()) {
+      throw new Error('Invalid dream storageRoot directory');
+    }
+    await chmod(ports.storageRoot, 0o700).catch(() => undefined);
+  }
+
   function persistState(): Promise<void> {
     const run = async () => {
-      await mkdir(ports.storageRoot, { recursive: true });
+      await ensureStorageRootSafe();
       const existing = await lstat(statePath).catch(() => undefined);
       if (existing?.isSymbolicLink()) {
         throw new Error('Refusing to write symlinked dream state.json');
       }
+      dreamedPairSignatures = trimSignatureMap(dreamedPairSignatures);
+      dismissedPairPenalties = trimPenaltyMap(dismissedPairPenalties);
       const payload: PersistedDreamState = {
         autoDreamPaused,
         lastDreamAt,
         lastOrdinaryActivityAt,
         autoRunTimestamps: [...autoRunTimestamps],
-        dreamedPairSignatures: trimSignatureMap(dreamedPairSignatures),
+        dreamedPairSignatures: { ...dreamedPairSignatures },
         dismissedPairPenalties: { ...dismissedPairPenalties },
       };
       const tmp = `${statePath}.${process.pid}.${randomUUID().slice(0, 8)}.tmp`;
       try {
-        await writeFile(tmp, `${JSON.stringify(payload, null, 2)}\n`, 'utf8');
+        await writeFile(tmp, `${JSON.stringify(payload, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
         await rename(tmp, statePath);
+        await chmod(statePath, 0o600).catch(() => undefined);
       } catch (err) {
         await rm(tmp, { force: true }).catch(() => undefined);
         throw err;
@@ -292,7 +319,7 @@ export function createDreamRuntime(ports: DreamHostPorts): DreamRuntime {
         const allPaths = [...known, ...sessionMap.values()];
         const collected = await collectRepoProfiles(allPaths, {
           homeDir: ports.homeDir,
-          excludedRoots: [ports.storageRoot, ...(ports.excludedInternalRoots ?? [])],
+          excludedRoots,
         });
         if (stopped) return;
         cachedProfiles = collected.profiles;
@@ -327,19 +354,25 @@ export function createDreamRuntime(ports: DreamHostPorts): DreamRuntime {
       anyOrdinarySessionRunning: ports.conversations.anyOrdinarySessionRunning(),
       autoDreamPaused,
       autoDreamTimestamps: autoRunTimestamps,
+      partnerDeferProactive: Boolean(ports.tom?.shouldDeferProactiveWork()),
     });
   }
 
   function preemptAutoDreamIfNeeded(): void {
-    if (!activeDreamAbort || activeDreamTrigger !== 'auto') return;
+    if (!activeDreamAbort || (activeDreamTrigger !== 'auto' && activeDreamTrigger !== 'sandbox')) return;
     const block = detectDreamLowerTierBlock(latestSense, ports.drives.snapshot());
-    if (
-      block.suppressed ||
-      block.lowerTierBlocked ||
-      latestSense.settings.paused ||
-      autoDreamPaused ||
-      ports.conversations.anyOrdinarySessionRunning()
-    ) {
+    const baseAbort =
+      block.suppressed || block.lowerTierBlocked || latestSense.settings.paused || autoDreamPaused;
+    if (activeDreamTrigger === 'sandbox') {
+      if (baseAbort) {
+        activeDreamAbort.abort();
+      }
+      return;
+    }
+    const now = clock.wall();
+    const tomDeferring =
+      !isDreamScreenLockedAt(latestSense, now) && Boolean(ports.tom?.shouldDeferProactiveWork());
+    if (baseAbort || ports.conversations.anyOrdinarySessionRunning() || tomDeferring) {
       activeDreamAbort.abort();
     }
   }
@@ -382,7 +415,7 @@ export function createDreamRuntime(ports: DreamHostPorts): DreamRuntime {
 
   async function executeDreamCycle(
     trigger: DreamCycleTrigger,
-    externalSignal?: AbortSignal,
+    externalSignal?: DriveAbortSignal | AbortSignal,
   ): Promise<DreamCycleRecord> {
     if (stopped) {
       throw new Error('Dream runtime is stopped');
@@ -398,12 +431,14 @@ export function createDreamRuntime(ports: DreamHostPorts): DreamRuntime {
 
     const abortController = new AbortController();
     const onExternalAbort = () => abortController.abort();
-    if (externalSignal) {
-      if (externalSignal.aborted) {
-        abortController.abort();
-      } else {
-        externalSignal.addEventListener('abort', onExternalAbort, { once: true });
-      }
+    const eventAbortSignal =
+      externalSignal && 'addEventListener' in externalSignal && typeof externalSignal.addEventListener === 'function'
+        ? externalSignal
+        : undefined;
+    if (externalSignal?.aborted) {
+      abortController.abort();
+    } else if (eventAbortSignal) {
+      eventAbortSignal.addEventListener('abort', onExternalAbort, { once: true });
     }
 
     const nowStart = clock.wall();
@@ -425,6 +460,7 @@ export function createDreamRuntime(ports: DreamHostPorts): DreamRuntime {
     const run = (async (): Promise<DreamCycleRecord> => {
       try {
         await refreshRepoProfiles(true);
+        if (externalSignal?.aborted) abortController.abort();
         if (abortController.signal.aborted) {
           const err = new Error('DMN dream cycle aborted');
           err.name = 'AbortError';
@@ -452,6 +488,7 @@ export function createDreamRuntime(ports: DreamHostPorts): DreamRuntime {
           ...(ports.llmDream ? { llmDream: ports.llmDream } : {}),
         });
 
+        if (externalSignal?.aborted) abortController.abort();
         if (abortController.signal.aborted) {
           const err = new Error('DMN dream cycle aborted');
           err.name = 'AbortError';
@@ -475,7 +512,7 @@ export function createDreamRuntime(ports: DreamHostPorts): DreamRuntime {
         }
         throw err;
       } finally {
-        externalSignal?.removeEventListener('abort', onExternalAbort);
+        eventAbortSignal?.removeEventListener('abort', onExternalAbort);
         if (activeDreamAbort === abortController) {
           activeDreamAbort = undefined;
           activeDreamTrigger = null;
@@ -616,6 +653,7 @@ export function createDreamRuntime(ports: DreamHostPorts): DreamRuntime {
 
       if (existing.pairSignature) {
         dismissedPairPenalties[existing.pairSignature] = (dismissedPairPenalties[existing.pairSignature] ?? 0) + 1;
+        dismissedPairPenalties = trimPenaltyMap(dismissedPairPenalties);
       }
       const updated = vault.upsert({
         ...existing,
@@ -653,7 +691,7 @@ export function createDreamRuntime(ports: DreamHostPorts): DreamRuntime {
       started = true;
       stopped = false;
 
-      await mkdir(ports.storageRoot, { recursive: true });
+      await ensureStorageRootSafe();
       await vault.load();
 
       try {
@@ -671,17 +709,21 @@ export function createDreamRuntime(ports: DreamHostPorts): DreamRuntime {
             );
           }
           if (raw.dreamedPairSignatures && typeof raw.dreamedPairSignatures === 'object') {
-            dreamedPairSignatures = Object.fromEntries(
-              Object.entries(raw.dreamedPairSignatures).filter(
-                (kv): kv is [string, string] => typeof kv[0] === 'string' && typeof kv[1] === 'string',
+            dreamedPairSignatures = trimSignatureMap(
+              Object.fromEntries(
+                Object.entries(raw.dreamedPairSignatures).filter(
+                  (kv): kv is [string, string] => typeof kv[0] === 'string' && typeof kv[1] === 'string',
+                ),
               ),
             );
           }
           if (raw.dismissedPairPenalties && typeof raw.dismissedPairPenalties === 'object') {
-            dismissedPairPenalties = Object.fromEntries(
-              Object.entries(raw.dismissedPairPenalties).filter(
-                (kv): kv is [string, number] =>
-                  typeof kv[0] === 'string' && typeof kv[1] === 'number' && Number.isFinite(kv[1]),
+            dismissedPairPenalties = trimPenaltyMap(
+              Object.fromEntries(
+                Object.entries(raw.dismissedPairPenalties).filter(
+                  (kv): kv is [string, number] =>
+                    typeof kv[0] === 'string' && typeof kv[1] === 'number' && Number.isFinite(kv[1]),
+                ),
               ),
             );
           }
@@ -724,25 +766,44 @@ export function createDreamRuntime(ports: DreamHostPorts): DreamRuntime {
             description:
               'Run a read-only Default Mode Network (DMN) cross-repository insight dream synthesis cycle inside ASI storage.',
             driveKey: 'asi-dream:cross_repo_insight',
-            execute: async (_args, context) => {
-              const ctrl = new AbortController();
-              const checkAbort = setInterval(() => {
-                if (context.signal.aborted) ctrl.abort();
-              }, 100);
-              checkAbort.unref?.();
-              try {
-                const rec = await executeDreamCycle('sandbox', ctrl.signal);
-                return {
-                  summary: rec.summary,
-                  data: {
-                    reposScanned: rec.reposScanned,
-                    bridgesEvaluated: rec.bridgesEvaluated,
-                    insightsCreated: rec.insightsCreated,
-                  },
-                };
-              } finally {
-                clearInterval(checkAbort);
+            parameters: {
+              force: {
+                type: 'boolean',
+                description:
+                  'Bypass 15-minute deep quiet wait when explicitly requested inside maintenance sandbox.',
+              },
+            },
+            execute: async (args, context) => {
+              const snap = ports.sense.snapshot();
+              latestSense = snap;
+              if (snap.settings.paused || autoDreamPaused) {
+                throw new Error('DMN cross-repo dream synthesis is paused');
               }
+              const ev = currentEvaluatedState(snap);
+              if (ev.driveView.suppressed || ev.driveView.lowerTierBlocked) {
+                throw new Error(
+                  ev.driveView.suppressionReason ??
+                    ev.driveView.lowerTierReason ??
+                    'DMN dream synthesis is suspended while L1-L3 drives are active',
+                );
+              }
+              const force = args?.force === true;
+              if (!force && !ev.driveView.deepQuietWindow) {
+                return {
+                  summary: ports.conversations.anyOrdinarySessionRunning()
+                    ? '普通对话运行中，等待回合结束并进入 15 分钟深静默窗口'
+                    : `等待 15 分钟深静默窗口（当前已空闲 ${Math.floor(ev.driveView.idleDurationMs / 60_000)}/15 分钟且未锁屏）`,
+                };
+              }
+              const rec = await executeDreamCycle('sandbox', context.signal);
+              return {
+                summary: rec.summary,
+                data: {
+                  reposScanned: rec.reposScanned,
+                  bridgesEvaluated: rec.bridgesEvaluated,
+                  insightsCreated: rec.insightsCreated,
+                },
+              };
             },
           },
         ],
@@ -764,6 +825,11 @@ export function createDreamRuntime(ports: DreamHostPorts): DreamRuntime {
       offConversations = ports.conversations.onOrdinaryActivity(() => {
         lastOrdinaryActivityAt = clock.wall();
         preemptAutoDreamIfNeeded();
+        if (latestSense.settings.paused || autoDreamPaused) {
+          ports.drives.notifySourceChanged('asi-dream');
+          notify();
+          return;
+        }
         void refreshRepoProfiles(false).then(() => {
           ports.drives.notifySourceChanged('asi-dream');
           scheduleQuietCheck();
@@ -774,6 +840,15 @@ export function createDreamRuntime(ports: DreamHostPorts): DreamRuntime {
       if (ports.onSleepChanged) {
         offSleep = ports.onSleepChanged(() => {
           recomputeCandidateCountSync();
+          ports.drives.notifySourceChanged('asi-dream');
+          scheduleQuietCheck();
+          notify();
+        });
+      }
+
+      if (ports.tom?.subscribe) {
+        offTom = ports.tom.subscribe(() => {
+          preemptAutoDreamIfNeeded();
           ports.drives.notifySourceChanged('asi-dream');
           scheduleQuietCheck();
           notify();
@@ -813,6 +888,8 @@ export function createDreamRuntime(ports: DreamHostPorts): DreamRuntime {
         autoRunTimestamps = autoRunTimestamps.filter((t) => t !== activeAutoTimestamp);
         activeAutoTimestamp = null;
       }
+      offTom?.();
+      offTom = undefined;
       offSleep?.();
       offSleep = undefined;
       offConversations?.();
@@ -906,10 +983,11 @@ export function createDreamRuntime(ports: DreamHostPorts): DreamRuntime {
 
       let callerRepoKey: string | undefined;
       let callerDisplay: string | undefined;
-      if (input.callerWorkspacePath?.trim()) {
-        callerRepoKey = cachedCwdToRepoKey.get(input.callerWorkspacePath.trim());
+      const trimmedCallerWs = input.callerWorkspacePath?.trim();
+      if (trimmedCallerWs && !isExcludedDreamPath(trimmedCallerWs, excludedRoots, ports.homeDir)) {
+        callerRepoKey = cachedCwdToRepoKey.get(trimmedCallerWs);
         if (!callerRepoKey) {
-          const resolved = await resolveCanonicalRepoIdentity(input.callerWorkspacePath.trim(), ports.homeDir);
+          const resolved = await resolveCanonicalRepoIdentity(trimmedCallerWs, ports.homeDir, excludedRoots);
           if (resolved) {
             callerRepoKey = resolved.repoKey;
             callerDisplay = resolved.displayPath;

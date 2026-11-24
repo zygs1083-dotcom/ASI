@@ -520,10 +520,26 @@ export function discoverCandidateCrossRepoBridges(input: {
           structuralSimilarity: structSim,
           confidence,
           salience,
-          deterministicTitle: `${profA.repoName} 与 ${profB.repoName} 在「${famLabel}」存在跨仓规范分叉`,
-          deterministicSummary: `${profA.displayPath} 倾向采用 ${a.positiveTools.join('/')}（${a.memory.title}），而 ${profB.displayPath} 采用 ${b.positiveTools.join('/')}（${b.memory.title}）。`,
-          deterministicMechanism: `两套独立项目围绕同一工程维度（${famLabel}）沉淀了互斥的全局偏好/决策记忆，若不隔离工作区作用域易引发跨项目召回串味。`,
-          deterministicHypothesis: `建议将各自工具链约定明确标注适用仓库边界，或提取为绑定对应工作区作用域（workspace）的专属技能。`,
+          deterministicTitle: sanitizeDreamText(
+            `${profA.repoName} 与 ${profB.repoName} 在「${famLabel}」存在跨仓规范分叉`,
+            110,
+            input.homeDir,
+          ),
+          deterministicSummary: sanitizeDreamText(
+            `${profA.displayPath} 倾向采用 ${a.positiveTools.join('/')}（${a.memory.title}），而 ${profB.displayPath} 采用 ${b.positiveTools.join('/')}（${b.memory.title}）。`,
+            240,
+            input.homeDir,
+          ),
+          deterministicMechanism: sanitizeDreamText(
+            `两套独立项目围绕同一工程维度（${famLabel}）沉淀了互斥的全局偏好/决策记忆，若不隔离工作区作用域易引发跨项目召回串味。`,
+            180,
+            input.homeDir,
+          ),
+          deterministicHypothesis: sanitizeDreamText(
+            `建议将各自工具链约定明确标注适用仓库边界，或提取为绑定对应工作区作用域（workspace）的专属技能。`,
+            240,
+            input.homeDir,
+          ),
         });
         continue;
       }

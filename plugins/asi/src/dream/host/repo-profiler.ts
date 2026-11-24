@@ -13,8 +13,10 @@
 import { createHash } from 'node:crypto';
 import { realpathSync } from 'node:fs';
 import { lstat, readdir, readFile } from 'node:fs/promises';
+import { homedir } from 'node:os';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { sanitizeForModel } from '@asi/sense-types';
+import { ASI_INTERNAL_CWD_RE } from '../../shared/internal-guards.js';
 
 const MAX_MANIFEST_BYTES = 32_768;
 const MAX_DOC_BYTES = 4_096;
@@ -22,11 +24,17 @@ const MAX_PARENT_WALK = 6;
 const MAX_TOP_ENTRIES = 40;
 const MAX_PROFILED_WORKSPACES = 24;
 
-const INTERNAL_DIR_SEGMENT_RE =
-  /(?:^|[\\/])(?:asi-(?:sense|needs|sleep|care|growth|dream)(?:[\\/]|$)|data[\\/]asi(?:[\\/]|$)|\.dsh[\\/]data[\\/]asi)/i;
+const INTERNAL_DIR_SEGMENT_RE = ASI_INTERNAL_CWD_RE;
+
+const HIDDEN_SENSITIVE_SEGMENT_RE =
+  /^\.(?:secrets?|ssh|aws|gnupg|kube|docker|config|local|Trash|npmrc|netrc|pypirc|env(?:\..+)?)$/i;
 
 const SENSITIVE_ENTRY_RE =
   /^(?:\.env(?:\..+)?|\.?secrets?|credentials?(?:\..+)?|.*\.(?:pem|key|p12|pfx|keystore|jks)|id_(?:rsa|ed25519|ecdsa))$/i;
+
+const EXACT_CONTAINER_ROOTS = ['/', '/Users', '/home', '/tmp', '/private/tmp', '/var', '/private/var', '/opt'] as const;
+
+const SUBTREE_SYSTEM_EXCLUSIONS = ['/etc', '/private/etc', '/System', '/Library'] as const;
 
 const IGNORED_TOP_ENTRIES = new Set([
   '.git',
@@ -78,22 +86,95 @@ function safeRealpath(target: string): string {
   }
 }
 
-export function isSameOrInsidePath(candidate: string, root: string | undefined): boolean {
+function deepSafeRealpath(target: string): string {
+  const abs = resolve(target);
+  const tail: string[] = [];
+  let cur = abs;
+  for (let i = 0; i < 32; i += 1) {
+    try {
+      const realBase = realpathSync(cur);
+      return tail.length > 0 ? resolve(realBase, ...[...tail].reverse()) : realBase;
+    } catch {
+      const base = basename(cur);
+      if (base) tail.push(base);
+      const parent = dirname(cur);
+      if (parent === cur) break;
+      cur = parent;
+    }
+  }
+  return abs;
+}
+
+function hasHiddenSensitiveSegment(targetPath: string): boolean {
+  for (const seg of targetPath.split(/[\\/]+/)) {
+    if (seg && HIDDEN_SENSITIVE_SEGMENT_RE.test(seg)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function buildExactContainerRootSet(homeDir?: string): Set<string> {
+  const out = new Set<string>();
+  const addRoot = (raw: string | undefined) => {
+    const clean = raw?.trim();
+    if (!clean) return;
+    const lex = resolve(clean);
+    out.add(lex);
+    out.add(safeRealpath(lex));
+  };
+  for (const r of EXACT_CONTAINER_ROOTS) addRoot(r);
+  addRoot(homeDir ?? homedir());
+  return out;
+}
+
+function isLexicalOrRealInside(candidate: string, root: string | undefined): boolean {
   if (!root || !root.trim()) return false;
-  const normCand = safeRealpath(candidate);
-  const normRoot = safeRealpath(root);
-  if (normCand === normRoot) return true;
-  const rel = relative(normRoot, normCand);
-  return Boolean(rel && !rel.startsWith('..') && !isAbsolute(rel));
+  const lexCand = resolve(candidate);
+  const lexRoot = resolve(root);
+  if (lexCand === lexRoot) return true;
+  const lexRel = relative(lexRoot, lexCand);
+  if (lexRel && !lexRel.startsWith('..') && !isAbsolute(lexRel)) return true;
+
+  const realCand = deepSafeRealpath(lexCand);
+  const realRoot = deepSafeRealpath(lexRoot);
+  if (realCand === realRoot) return true;
+  const realRel = relative(realRoot, realCand);
+  return Boolean(realRel && !realRel.startsWith('..') && !isAbsolute(realRel));
+}
+
+export function isSameOrInsidePath(candidate: string, root: string | undefined): boolean {
+  return isLexicalOrRealInside(candidate, root);
 }
 
 export function isExcludedDreamPath(
   candidate: string | undefined,
   excludedRoots: readonly (string | undefined)[] = [],
+  homeDir?: string,
 ): boolean {
   if (!candidate || !candidate.trim()) return true;
-  if (INTERNAL_DIR_SEGMENT_RE.test(candidate)) return true;
-  return excludedRoots.some((root) => isSameOrInsidePath(candidate, root));
+  const trimmed = candidate.trim();
+  const lexPath = resolve(trimmed);
+  const realPath = deepSafeRealpath(lexPath);
+
+  const exactContainers = buildExactContainerRootSet(homeDir);
+  if (exactContainers.has(lexPath) || exactContainers.has(realPath)) {
+    return true;
+  }
+
+  if (hasHiddenSensitiveSegment(lexPath) || hasHiddenSensitiveSegment(realPath)) {
+    return true;
+  }
+
+  if (INTERNAL_DIR_SEGMENT_RE.test(lexPath) || INTERNAL_DIR_SEGMENT_RE.test(realPath)) {
+    return true;
+  }
+
+  for (const sysRoot of SUBTREE_SYSTEM_EXCLUSIONS) {
+    if (isLexicalOrRealInside(lexPath, sysRoot)) return true;
+  }
+
+  return excludedRoots.some((root) => isLexicalOrRealInside(lexPath, root));
 }
 
 export function maskDreamHomePath(text: string, homeDir?: string): string {
@@ -134,50 +215,84 @@ async function readRegularFileBounded(filePath: string, maxBytes: number): Promi
 export async function resolveCanonicalRepoIdentity(
   rawPath: string,
   homeDir?: string,
+  excludedRoots: readonly (string | undefined)[] = [],
 ): Promise<CanonicalRepoIdentity | undefined> {
-  const trimmed = rawPath.trim();
+  const trimmed = rawPath?.trim();
   if (!trimmed) return undefined;
-  const startDir = safeRealpath(trimmed);
+  if (isExcludedDreamPath(trimmed, excludedRoots, homeDir)) return undefined;
 
-  let current = startDir;
+  let current = resolve(trimmed);
   let foundRepoRoot: string | undefined;
 
   for (let depth = 0; depth <= MAX_PARENT_WALK; depth += 1) {
+    if (isExcludedDreamPath(current, excludedRoots, homeDir)) {
+      break;
+    }
+
+    let curStat: Awaited<ReturnType<typeof lstat>> | undefined;
+    try {
+      curStat = await lstat(current);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException)?.code === 'ENOENT') {
+        const parent = dirname(current);
+        if (parent === current) break;
+        current = parent;
+        continue;
+      }
+      return undefined;
+    }
+
+    if (curStat.isSymbolicLink()) {
+      return undefined;
+    }
+    if (!curStat.isDirectory()) {
+      const parent = dirname(current);
+      if (parent === current) break;
+      current = parent;
+      continue;
+    }
+
     const dotGit = join(current, '.git');
     try {
       const st = await lstat(dotGit);
-      if (!st.isSymbolicLink()) {
-        if (st.isDirectory()) {
-          foundRepoRoot = current;
-          break;
-        }
-        if (st.isFile() && st.size > 0 && st.size <= 4_096) {
-          const content = await readFile(dotGit, 'utf8');
-          const gitDirLine = content
-            .split(/\r?\n/)
-            .map((l) => l.trim())
-            .find((l) => l.toLowerCase().startsWith('gitdir:'));
-          const gitDirPayload = gitDirLine ? gitDirLine.slice('gitdir:'.length).trim() : '';
-          if (gitDirPayload) {
-            const gitDir = safeRealpath(isAbsolute(gitDirPayload) ? gitDirPayload : resolve(current, gitDirPayload));
-            const commonDirFile = join(gitDir, 'commondir');
-            const commonRaw = await readRegularFileBounded(commonDirFile, 2_048);
-            if (commonRaw?.trim()) {
-              const commonDir = safeRealpath(
-                isAbsolute(commonRaw.trim()) ? commonRaw.trim() : resolve(gitDir, commonRaw.trim()),
-              );
-              if (basename(commonDir) === '.git') {
-                foundRepoRoot = dirname(commonDir);
-              } else {
-                foundRepoRoot = commonDir;
-              }
-            } else {
-              const worktreesSeg = `${sep}.git${sep}worktrees${sep}`;
-              const wtIdx = gitDir.indexOf(worktreesSeg);
-              foundRepoRoot = wtIdx > 0 ? gitDir.slice(0, wtIdx) : current;
-            }
-            break;
+      if (st.isSymbolicLink()) {
+        return undefined;
+      }
+      if (st.isDirectory()) {
+        foundRepoRoot = current;
+        break;
+      }
+      if (st.isFile() && st.size > 0 && st.size <= 4_096) {
+        const content = await readFile(dotGit, 'utf8');
+        const gitDirLine = content
+          .split(/\r?\n/)
+          .map((l) => l.trim())
+          .find((l) => l.toLowerCase().startsWith('gitdir:'));
+        const gitDirPayload = gitDirLine ? gitDirLine.slice('gitdir:'.length).trim() : '';
+        if (gitDirPayload) {
+          const rawGitDir = isAbsolute(gitDirPayload) ? resolve(gitDirPayload) : resolve(current, gitDirPayload);
+          if (isExcludedDreamPath(rawGitDir, excludedRoots, homeDir)) return undefined;
+          const gitDirStat = await lstat(rawGitDir).catch(() => undefined);
+          if (!gitDirStat || gitDirStat.isSymbolicLink()) return undefined;
+          const gitDir = safeRealpath(rawGitDir);
+          if (isExcludedDreamPath(gitDir, excludedRoots, homeDir)) return undefined;
+
+          const commonDirFile = join(gitDir, 'commondir');
+          const commonRaw = await readRegularFileBounded(commonDirFile, 2_048);
+          if (commonRaw?.trim()) {
+            const rawCommon = isAbsolute(commonRaw.trim())
+              ? resolve(commonRaw.trim())
+              : resolve(gitDir, commonRaw.trim());
+            const commonStat = await lstat(rawCommon).catch(() => undefined);
+            if (!commonStat || commonStat.isSymbolicLink()) return undefined;
+            const commonDir = safeRealpath(rawCommon);
+            foundRepoRoot = basename(commonDir) === '.git' ? dirname(commonDir) : commonDir;
+          } else {
+            const worktreesSeg = `${sep}.git${sep}worktrees${sep}`;
+            const wtIdx = gitDir.indexOf(worktreesSeg);
+            foundRepoRoot = wtIdx > 0 ? gitDir.slice(0, wtIdx) : current;
           }
+          break;
         }
       }
     } catch {
@@ -189,7 +304,25 @@ export async function resolveCanonicalRepoIdentity(
     current = parent;
   }
 
-  const canonicalRoot = safeRealpath(foundRepoRoot ?? startDir);
+  if (!foundRepoRoot) {
+    return undefined;
+  }
+  if (isExcludedDreamPath(foundRepoRoot, excludedRoots, homeDir)) {
+    return undefined;
+  }
+  const canonicalRoot = safeRealpath(foundRepoRoot);
+  if (isExcludedDreamPath(canonicalRoot, excludedRoots, homeDir)) {
+    return undefined;
+  }
+  const rootStat = await lstat(canonicalRoot).catch(() => undefined);
+  if (!rootStat?.isDirectory() || rootStat.isSymbolicLink()) {
+    return undefined;
+  }
+  const rootGitStat = await lstat(join(canonicalRoot, '.git')).catch(() => undefined);
+  if (!rootGitStat || rootGitStat.isSymbolicLink()) {
+    return undefined;
+  }
+
   const rawName = basename(canonicalRoot) || 'workspace';
   const repoName = sanitizeDreamText(rawName, 48, homeDir) || 'workspace';
   const displayPath = sanitizeDreamText(maskDreamHomePath(canonicalRoot, homeDir), 96, homeDir) || repoName;
@@ -336,7 +469,13 @@ export async function scanRepoStructuralProfile(
     const dirents = await readdir(root, { withFileTypes: true });
     for (const d of dirents) {
       if (d.isSymbolicLink()) continue;
-      if (IGNORED_TOP_ENTRIES.has(d.name) || SENSITIVE_ENTRY_RE.test(d.name)) continue;
+      if (
+        IGNORED_TOP_ENTRIES.has(d.name) ||
+        SENSITIVE_ENTRY_RE.test(d.name) ||
+        HIDDEN_SENSITIVE_SEGMENT_RE.test(d.name)
+      ) {
+        continue;
+      }
       if (d.name.startsWith('.') && d.name !== '.editorconfig' && d.name !== '.github') continue;
       topEntries.push(sanitizeDreamText(d.name, 48, homeDir));
       if (topEntries.length >= MAX_TOP_ENTRIES) break;
@@ -445,10 +584,10 @@ export async function collectRepoProfiles(
   );
 
   for (const rawPath of uniqueInputs) {
-    if (isExcludedDreamPath(rawPath, excluded)) continue;
-    const identity = await resolveCanonicalRepoIdentity(rawPath, options?.homeDir);
+    if (isExcludedDreamPath(rawPath, excluded, options?.homeDir)) continue;
+    const identity = await resolveCanonicalRepoIdentity(rawPath, options?.homeDir, excluded);
     if (!identity) continue;
-    if (isExcludedDreamPath(identity.canonicalRoot, excluded)) continue;
+    if (isExcludedDreamPath(identity.canonicalRoot, excluded, options?.homeDir)) continue;
 
     cwdToRepoKey.set(rawPath, identity.repoKey);
     cwdToRepoKey.set(safeRealpath(rawPath), identity.repoKey);

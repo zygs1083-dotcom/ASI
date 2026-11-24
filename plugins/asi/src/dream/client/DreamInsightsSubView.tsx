@@ -33,38 +33,6 @@ function formatRelativeAgo(at: number | null | undefined, now: number): string {
   return `${Math.floor(hrs / 24)}d 前`;
 }
 
-export function MemoryDreamSubTabBar(props: {
-  memorySubTab: 'vault' | 'insights';
-  totalMemories: number;
-  openCount: number;
-  totalInsights: number;
-  onSelect: (sub: 'vault' | 'insights') => void;
-}) {
-  return (
-    <fieldset className={css.pillRow}>
-      <legend className={css.srOnly}>记忆与顿悟子视图</legend>
-      <button
-        type="button"
-        data-testid="memory-subtab-vault"
-        className={`${css.filterPill} ${props.memorySubTab === 'vault' ? css.filterPillActive : ''}`}
-        aria-pressed={props.memorySubTab === 'vault'}
-        onClick={() => props.onSelect('vault')}
-      >
-        长期记忆 ({props.totalMemories})
-      </button>
-      <button
-        type="button"
-        data-testid="memory-subtab-insights"
-        className={`${css.filterPill} ${props.memorySubTab === 'insights' ? css.filterPillActive : ''}`}
-        aria-pressed={props.memorySubTab === 'insights'}
-        onClick={() => props.onSelect('insights')}
-      >
-        做梦顿悟 ({props.openCount > 0 ? `待审 ${props.openCount}` : props.totalInsights})
-      </button>
-    </fieldset>
-  );
-}
-
 export interface DreamInsightsSubViewProps {
   dreamModel: DreamPanelModel;
   onDreamNow?: () => Promise<DreamCycleRecord | undefined>;
@@ -85,6 +53,7 @@ export function DreamInsightsSubView(props: DreamInsightsSubViewProps) {
   const [busyDream, setBusyDream] = useState(false);
   const [busyInsightId, setBusyInsightId] = useState<string | null>(null);
   const [dreamFeedback, setDreamFeedback] = useState<string | null>(null);
+  const [dreamIsError, setDreamIsError] = useState(false);
 
   const filteredInsights = useMemo(() => {
     const statuses: readonly DreamInsightStatus[] | undefined =
@@ -113,10 +82,13 @@ export function DreamInsightsSubView(props: DreamInsightsSubViewProps) {
     if (!props.onDreamNow) return;
     setBusyDream(true);
     setDreamFeedback(null);
+    setDreamIsError(false);
     try {
       const rec = await props.onDreamNow();
+      setDreamIsError(false);
       setDreamFeedback(rec?.summary ?? '已完成跨项目做梦联想。');
     } catch (err) {
+      setDreamIsError(true);
       setDreamFeedback(err instanceof Error ? err.message : '立即做梦联想失败');
     } finally {
       setBusyDream(false);
@@ -127,8 +99,10 @@ export function DreamInsightsSubView(props: DreamInsightsSubViewProps) {
     if (!props.onToggleAutoDreamPaused) return;
     try {
       await props.onToggleAutoDreamPaused(paused);
+      setDreamIsError(false);
       setDreamFeedback(paused ? '已暂停自动做梦联想。' : '已恢复深静默自动做梦联想。');
     } catch (err) {
+      setDreamIsError(true);
       setDreamFeedback(err instanceof Error ? err.message : '切换自动做梦状态失败');
     }
   };
@@ -138,9 +112,11 @@ export function DreamInsightsSubView(props: DreamInsightsSubViewProps) {
     setBusyInsightId(insight.id);
     try {
       const res = await props.onAdoptDreamInsight({ insightId: insight.id, pinned: true });
+      setDreamIsError(false);
       setDreamFeedback(`已采纳顿悟并固化为长期记忆（${res?.memoryId ?? '已置顶'}）。`);
       props.onVaultMutated?.();
     } catch (err) {
+      setDreamIsError(true);
       setDreamFeedback(err instanceof Error ? err.message : '采纳顿悟失败');
     } finally {
       setBusyInsightId(null);
@@ -152,8 +128,10 @@ export function DreamInsightsSubView(props: DreamInsightsSubViewProps) {
     setBusyInsightId(insight.id);
     try {
       const res = await props.onPromoteDreamInsight(insight.id);
+      setDreamIsError(false);
       setDreamFeedback(`已生成待审技能草案 ${res?.skillName ?? ''}，可前往「技能工坊」批准启用。`);
     } catch (err) {
+      setDreamIsError(true);
       setDreamFeedback(err instanceof Error ? err.message : '转交技能草案失败');
     } finally {
       setBusyInsightId(null);
@@ -165,8 +143,10 @@ export function DreamInsightsSubView(props: DreamInsightsSubViewProps) {
     setBusyInsightId(insight.id);
     try {
       await props.onDismissDreamInsight(insight.id);
+      setDreamIsError(false);
       setDreamFeedback(`已忽略「${insight.title}」并降低同类跨仓桥接权重。`);
     } catch (err) {
+      setDreamIsError(true);
       setDreamFeedback(err instanceof Error ? err.message : '忽略顿悟失败');
     } finally {
       setBusyInsightId(null);
@@ -224,9 +204,20 @@ export function DreamInsightsSubView(props: DreamInsightsSubViewProps) {
         </div>
 
         {dreamFeedback && (
-          <div role="status" className={css.feedbackBanner} data-testid="dream-feedback">
+          <div
+            role={dreamIsError ? 'alert' : 'status'}
+            className={dreamIsError ? css.alertBanner : css.feedbackBanner}
+            data-testid="dream-feedback"
+          >
             <span>{dreamFeedback}</span>
-            <button type="button" className={css.textBtn} onClick={() => setDreamFeedback(null)}>
+            <button
+              type="button"
+              className={css.textBtn}
+              onClick={() => {
+                setDreamFeedback(null);
+                setDreamIsError(false);
+              }}
+            >
               关闭
             </button>
           </div>

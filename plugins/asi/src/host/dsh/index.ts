@@ -35,7 +35,8 @@ import { localPorts } from '../../sense/host/dsh/local-ports.ts';
 import { createDshPort } from '../../sense/host/dsh/port.ts';
 import { registerSenseTools } from '../../sense/host/dsh/tools.ts';
 import { createSenseRuntime } from '../../sense/host/runtime/index.ts';
-import { buildExcludedInternalRoots, createDshSleepPorts } from '../../sleep/host/dsh/dsh-ports.ts';
+import { buildUnifiedExcludedInternalRoots } from '../../shared/internal-guards.ts';
+import { createDshSleepPorts } from '../../sleep/host/dsh/dsh-ports.ts';
 import { AsiSleepService } from '../../sleep/host/dsh/sleep-service.ts';
 import { registerSleepTools } from '../../sleep/host/dsh/tools.ts';
 import { createSleepRuntime } from '../../sleep/host/runtime.ts';
@@ -224,6 +225,16 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     const tomRoot = join(config.storageRoot, 'tom');
     const intuitionRoot = join(config.storageRoot, 'intuition');
     const dreamRoot = join(config.storageRoot, 'dream');
+    const allInternalRoots = [
+      senseRoot,
+      needsRoot,
+      sleepRoot,
+      careRoot,
+      growthRoot,
+      tomRoot,
+      intuitionRoot,
+      dreamRoot,
+    ];
 
     // 1. L0 Pure Sensory Organ (`ctx.asiSense` + `env_state` / `env_detail`)
     const local = localPorts(ctx, senseRoot);
@@ -277,7 +288,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     // 3. L2 Biological NREM+REM Sleep Consolidation & Memory Vault (`ctx.asiSleep` + `memory_recall` / `memory_profile`)
     const sleepPorts = createDshSleepPorts(ctx, sleepRoot);
     sleepRuntime = createSleepRuntime(sleepPorts);
-    offSleepTools = registerSleepTools(ctx, sleepRuntime, buildExcludedInternalRoots(sleepRoot, senseRoot));
+    offSleepTools = registerSleepTools(ctx, sleepRuntime, buildUnifiedExcludedInternalRoots(...allInternalRoots));
     await sleepRuntime.start();
     if (disposed) {
       await dispose();
@@ -314,7 +325,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     // 6. Theory of Mind — Partner State & Collaborative Tact (`ctx.asiTom` + `partner_state`)
     const tomPorts = createDshTomPorts(ctx, tomRoot);
     tomRuntime = createTomRuntime(tomPorts);
-    offTomTools = registerTomTools(ctx, tomRuntime);
+    offTomTools = registerTomTools(ctx, tomRuntime, allInternalRoots);
     await tomRuntime.start();
     if (disposed) {
       await dispose();
@@ -324,11 +335,12 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
 
     // 7. Prefrontal Gut-Feeling Somatic Markers & Prospective Memory (`ctx.asiIntuition` + `intuition_status` / `prospective_*`)
     const intuitionPorts = createDshIntuitionPorts(ctx, intuitionRoot, {
-      excludedRoots: [needsRoot, sleepRoot, careRoot, senseRoot, growthRoot, tomRoot, dreamRoot],
+      excludedRoots: allInternalRoots,
       sleepRuntime,
+      tom: ctx.asiTom,
     });
     intuitionRuntime = createIntuitionRuntime(intuitionPorts);
-    offIntuitionTools = registerIntuitionTools(ctx, intuitionRuntime);
+    offIntuitionTools = registerIntuitionTools(ctx, intuitionRuntime, allInternalRoots);
     await intuitionRuntime.start();
     if (disposed) {
       await dispose();
@@ -340,9 +352,10 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     const dreamPorts = createDshDreamPorts(ctx, dreamRoot, {
       memoryAdoption: sleepRuntime.actions,
       skillDrafts: growthRuntime.actions,
+      tom: ctx.asiTom,
     });
     dreamRuntime = createDreamRuntime(dreamPorts);
-    offDreamTools = registerDreamTools(ctx, dreamRuntime);
+    offDreamTools = registerDreamTools(ctx, dreamRuntime, allInternalRoots);
     await dreamRuntime.start();
     if (disposed) {
       await dispose();

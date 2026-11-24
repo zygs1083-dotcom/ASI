@@ -10,9 +10,12 @@
 import type { Context } from '@deepseek-ai/cordis';
 import type { Agent } from '@deepseek-ai/dsh-agent';
 import { defineTool, ToolArgsError, ToolContextUnavailableError, type ToolRunContext } from '@deepseek-ai/dsh-tools';
+import type { WorkspaceRegistry } from '@deepseek-ai/dsh-workspace';
+import { ASI_INTERNAL_SESSION_ID_RE, buildUnifiedExcludedInternalRoots } from '../../../shared/internal-guards.js';
 import { sanitizeValueForModel } from '../../../sleep/host/dsh/tools.ts';
 import { DREAM_INSIGHT_KINDS, type DreamInsightKind, type DreamInsightStatus } from '../../shared/types.js';
 import type { DreamRuntime } from '../runtime.ts';
+import { isOrdinaryDreamSession } from './dsh-ports.ts';
 
 const output = {
   schema: { type: 'json' } as const,
@@ -21,9 +24,22 @@ const output = {
 
 const ALLOWED_STATUSES: readonly (DreamInsightStatus | 'all')[] = ['open', 'adopted', 'promoted', 'dismissed', 'all'];
 
-function requireAgent(exec: ToolRunContext): Agent {
-  if (!exec.agent) throw new ToolContextUnavailableError('dream_insights tool requires an active agent');
-  return exec.agent;
+export interface DreamToolGuardOptions {
+  excludedRoots?: readonly (string | undefined)[];
+  isArchived?: (sessionId: string) => boolean;
+}
+
+function requireOrdinaryAgent(exec: ToolRunContext, guard?: DreamToolGuardOptions): Agent {
+  const agent = exec.agent;
+  if (!agent) throw new ToolContextUnavailableError('dream_insights tool requires an active agent');
+  const sid = String(agent.id ?? agent.session?.id ?? '');
+  if (!sid || ASI_INTERNAL_SESSION_ID_RE.test(sid) || guard?.isArchived?.(sid)) {
+    throw new ToolContextUnavailableError('dream_insights is restricted to ordinary user sessions');
+  }
+  if (agent.session && !isOrdinaryDreamSession(agent.session, guard?.excludedRoots ?? [])) {
+    throw new ToolContextUnavailableError('dream_insights is restricted to ordinary user sessions');
+  }
+  return agent;
 }
 
 function bounded(args: unknown): void {
@@ -40,7 +56,7 @@ function isStatusArg(value: unknown): value is DreamInsightStatus | 'all' {
   return typeof value === 'string' && (ALLOWED_STATUSES as readonly string[]).includes(value);
 }
 
-export function createDreamInsightsTool(runtime: DreamRuntime) {
+export function createDreamInsightsTool(runtime: DreamRuntime, guard?: DreamToolGuardOptions) {
   return defineTool({
     name: 'dream_insights',
     description:
@@ -73,7 +89,7 @@ export function createDreamInsightsTool(runtime: DreamRuntime) {
     },
     output,
     async execute(args, exec) {
-      const agent = requireAgent(exec);
+      const agent = requireOrdinaryAgent(exec, guard);
       bounded(args);
       if (args.query !== undefined && typeof args.query !== 'string') {
         throw new ToolArgsError(['query must be a string']);
@@ -108,6 +124,24 @@ export function createDreamInsightsTool(runtime: DreamRuntime) {
   });
 }
 
-export function registerDreamTools(ctx: Context, runtime: DreamRuntime): () => void {
-  return ctx.tools.register(createDreamInsightsTool(runtime));
+export function registerDreamTools(
+  ctx: Context,
+  runtime: DreamRuntime,
+  excludedRoots?: readonly (string | undefined)[],
+): () => void {
+  const effectiveExcluded = buildUnifiedExcludedInternalRoots(ctx.asiSense?.storageRoot, ...(excludedRoots ?? []));
+  const guard: DreamToolGuardOptions = {
+    excludedRoots: effectiveExcluded,
+    isArchived: (sessionId: string) => {
+      try {
+        const wr = (ctx as Context & { get(name: 'workspaceRegistry'): WorkspaceRegistry | undefined }).get(
+          'workspaceRegistry',
+        );
+        return Boolean(wr?.archivedSessionIds.some((id) => String(id) === sessionId));
+      } catch {
+        return false;
+      }
+    },
+  };
+  return ctx.tools.register(createDreamInsightsTool(runtime, guard));
 }

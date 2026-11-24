@@ -11,8 +11,8 @@
  */
 
 import { randomUUID } from 'node:crypto';
-import { lstat, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { chmod, lstat, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
+import { join, resolve } from 'node:path';
 import { sortDreamInsights } from '../shared/search.js';
 import {
   DREAM_INSIGHT_KIND_LABELS,
@@ -130,19 +130,23 @@ export function renderInsightsMarkdown(entries: readonly DreamInsightEntry[]): s
   return lines.join('\n');
 }
 
+async function assertNotSymlinkDir(dirPath: string): Promise<void> {
+  const st = await lstat(dirPath).catch(() => undefined);
+  if (st?.isSymbolicLink()) {
+    throw new Error('Dream vault directory must not be a symlink');
+  }
+}
+
 async function atomicWriteFile(filePath: string, content: string): Promise<void> {
-  try {
-    const existing = await lstat(filePath).catch(() => undefined);
-    if (existing?.isSymbolicLink()) {
-      throw new Error('Refusing to overwrite symlink in dream vault');
-    }
-  } catch (err) {
-    if (err instanceof Error && err.message.includes('symlink')) throw err;
+  const existing = await lstat(filePath).catch(() => undefined);
+  if (existing?.isSymbolicLink()) {
+    throw new Error('Refusing to overwrite symlink in dream vault');
   }
   const tmp = `${filePath}.${process.pid}.${randomUUID().slice(0, 8)}.tmp`;
   try {
-    await writeFile(tmp, content, 'utf8');
+    await writeFile(tmp, content, { encoding: 'utf8', mode: 0o600 });
     await rename(tmp, filePath);
+    await chmod(filePath, 0o600).catch(() => undefined);
   } catch (err) {
     await rm(tmp, { force: true }).catch(() => undefined);
     throw err;
@@ -160,6 +164,7 @@ async function readNonSymlinkText(filePath: string): Promise<string | undefined>
 }
 
 export class DreamVault {
+  private readonly storageRoot: string;
   private readonly vaultDir: string;
   private readonly insightsPath: string;
   private readonly markdownPath: string;
@@ -172,18 +177,21 @@ export class DreamVault {
     storageRoot: string,
     private readonly homeDir?: string,
   ) {
-    this.vaultDir = join(storageRoot, 'vault');
+    this.storageRoot = resolve(storageRoot);
+    this.vaultDir = join(this.storageRoot, 'vault');
     this.insightsPath = join(this.vaultDir, 'insights.jsonl');
     this.markdownPath = join(this.vaultDir, 'INSIGHTS.md');
     this.journalPath = join(this.vaultDir, 'dream-journal.jsonl');
   }
 
   async load(): Promise<void> {
-    await mkdir(this.vaultDir, { recursive: true });
-    const dirStat = await lstat(this.vaultDir);
-    if (dirStat.isSymbolicLink()) {
-      throw new Error('Dream vault directory must not be a symlink');
-    }
+    await assertNotSymlinkDir(this.storageRoot);
+    await assertNotSymlinkDir(this.vaultDir);
+    await mkdir(this.storageRoot, { recursive: true, mode: 0o700 });
+    await chmod(this.storageRoot, 0o700).catch(() => undefined);
+    await mkdir(this.vaultDir, { recursive: true, mode: 0o700 });
+    await chmod(this.vaultDir, 0o700).catch(() => undefined);
+    await assertNotSymlinkDir(this.vaultDir);
 
     this.entries.clear();
     const rawInsights = await readNonSymlinkText(this.insightsPath);
@@ -262,7 +270,13 @@ export class DreamVault {
 
   flush(): Promise<void> {
     const run = async () => {
-      await mkdir(this.vaultDir, { recursive: true });
+      await assertNotSymlinkDir(this.storageRoot);
+      await assertNotSymlinkDir(this.vaultDir);
+      await mkdir(this.storageRoot, { recursive: true, mode: 0o700 });
+      await chmod(this.storageRoot, 0o700).catch(() => undefined);
+      await mkdir(this.vaultDir, { recursive: true, mode: 0o700 });
+      await chmod(this.vaultDir, 0o700).catch(() => undefined);
+      await assertNotSymlinkDir(this.vaultDir);
       const ordered = sortDreamInsights([...this.entries.values()]);
       const jsonl = ordered.map((e) => JSON.stringify(e)).join('\n');
       const md = renderInsightsMarkdown(ordered);

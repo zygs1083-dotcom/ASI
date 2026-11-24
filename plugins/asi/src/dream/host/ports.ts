@@ -1,4 +1,9 @@
-import type { AsiDrivesServiceApi, AsiSenseServiceApi, AsiSleepServiceApi } from '@asi/sense-types';
+import type {
+  AsiDrivesServiceApi,
+  AsiSenseServiceApi,
+  AsiSleepServiceApi,
+  AsiTomServiceApi,
+} from '@asi/sense-types';
 import type { SkillCreateDraftInput, SkillDraftViewItem } from '../../growth/shared/types.js';
 import type { MemoryCreateInput, MemoryViewItem } from '../../sleep/shared/types.js';
 
@@ -51,6 +56,7 @@ export interface DreamHostPorts {
   drives: AsiDrivesServiceApi;
   getSleep: () => AsiSleepServiceApi | undefined;
   onSleepChanged?: (listener: () => void) => () => void;
+  tom?: Pick<AsiTomServiceApi, 'shouldDeferProactiveWork' | 'subscribe'>;
   conversations: DreamConversationPort;
   memoryAdoption?: DreamMemoryAdoptionBridge;
   skillDrafts?: DreamSkillDraftBridge;

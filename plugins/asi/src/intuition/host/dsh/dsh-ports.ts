@@ -115,7 +115,7 @@ export function createDshIntuitionPorts(
     return true;
   };
 
-  const isOrdinaryAgent = (agent: Agent | undefined): agent is Agent =>
+  const isOrdinaryAgent = (agent: Agent | undefined): boolean =>
     Boolean(agent && isOrdinarySession(agent.session, String(agent.id ?? '')));
 
   // Track latest parked next-step message ID per session so we can replace/coalesce or remove cleanly
@@ -153,7 +153,7 @@ export function createDshIntuitionPorts(
         return false;
       }
 
-      if (!isOrdinaryAgent(agent)) {
+      if (!agent || !isOrdinaryAgent(agent)) {
         parkedNextStepMsgId.delete(sessionId);
         if (prevMsgId && typeof agent?.inbox?.remove === 'function') {
           try {
@@ -200,7 +200,7 @@ export function createDshIntuitionPorts(
 
     injectNextStep(sessionId: string, content: string): boolean {
       const agent = ctx.agents.get(SessionId(sessionId));
-      if (!isOrdinaryAgent(agent)) return false;
+      if (!agent || !isOrdinaryAgent(agent)) return false;
 
       const msg = freezeMessage({
         id: MessageId(`asi-intuition-step:${randomUUID()}`),

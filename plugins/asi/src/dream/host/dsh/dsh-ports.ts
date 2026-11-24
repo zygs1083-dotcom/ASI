@@ -9,14 +9,19 @@
 
 import { realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
-import type { AsiSleepServiceApi } from '@asi/sense-types';
+import { isAbsolute, relative, resolve } from 'node:path';
+import type { AsiSleepServiceApi, AsiTomServiceApi } from '@asi/sense-types';
 import type { Context } from '@deepseek-ai/cordis';
 import type { Agent } from '@deepseek-ai/dsh-agent';
 import type { Session, SessionEvent, SessionId } from '@deepseek-ai/dsh-session';
 import type { SessionQueryEngine } from '@deepseek-ai/dsh-session-query';
 import type { WorkspaceRegistry } from '@deepseek-ai/dsh-workspace';
-import { extractRouteFromEvents, INTERNAL_SESSION_ID_RE } from '../../../sleep/host/dsh/dsh-ports.ts';
+import {
+  ASI_INTERNAL_CWD_RE,
+  ASI_INTERNAL_SESSION_ID_RE,
+  buildUnifiedExcludedInternalRoots,
+} from '../../../shared/internal-guards.js';
+import { extractRouteFromEvents } from '../../../sleep/host/dsh/dsh-ports.ts';
 import type {
   DreamConversationPort,
   DreamHostPorts,
@@ -25,7 +30,8 @@ import type {
   DreamTurnTrajectoryInput,
 } from '../ports.ts';
 
-const INTERNAL_CWD_RE = /(?:^|[\\/])asi-(?:sense|needs|sleep|care|growth|dream)(?:[\\/]|$)/i;
+const INTERNAL_CWD_RE = ASI_INTERNAL_CWD_RE;
+const INTERNAL_SESSION_ID_RE = ASI_INTERNAL_SESSION_ID_RE;
 
 function safeRealpath(target: string): string {
   try {
@@ -45,36 +51,20 @@ function isSameOrInsideRoot(candidate: string, root: string | undefined): boolea
 }
 
 export function buildExcludedDreamRoots(dreamStorageRoot: string, senseStorageRoot?: string): string[] {
-  const roots = new Set<string>();
-  const addWithSiblings = (base: string | undefined) => {
-    if (!base || !base.trim()) return;
-    const resolved = safeRealpath(base);
-    roots.add(resolved);
-    const parent = dirname(resolved);
-    if (parent && parent !== resolved) {
-      for (const mod of ['sense', 'needs', 'sleep', 'care', 'growth', 'dream']) {
-        roots.add(join(parent, mod));
-        roots.add(join(parent, `asi-${mod}`));
-      }
-      const grandParent = dirname(parent);
-      if (grandParent && grandParent !== parent) {
-        for (const legacy of ['asi-sense', 'asi-needs', 'asi-sleep', 'asi-care', 'asi-growth', 'asi-dream']) {
-          roots.add(join(grandParent, legacy));
-        }
-      }
-    }
-  };
-  addWithSiblings(dreamStorageRoot);
-  addWithSiblings(senseStorageRoot);
-  return [...roots];
+  return buildUnifiedExcludedInternalRoots(dreamStorageRoot, senseStorageRoot);
 }
 
 export function isOrdinaryDreamSession(
-  session: { id: unknown; header?: { cwd?: string; parentId?: unknown; isSeeded?: boolean } },
+  session: {
+    id: unknown;
+    header?: { cwd?: string; parentId?: unknown; isSeeded?: boolean; origin?: string; delegationDepth?: number };
+  },
   excludedRoots: readonly (string | undefined)[] = [],
 ): boolean {
   const sid = String(session.id ?? '');
   if (!sid || INTERNAL_SESSION_ID_RE.test(sid)) return false;
+  if (session.header?.origin === 'subagent') return false;
+  if (typeof session.header?.delegationDepth === 'number' && session.header.delegationDepth > 0) return false;
   if (session.header?.parentId !== undefined && session.header?.parentId !== null) return false;
   if (session.header?.isSeeded) return false;
   const cwd = session.header?.cwd;
@@ -131,7 +121,7 @@ export function extractDreamTurnsFromOwnEvents(
     }
 
     if (raw.type === 'user/message') {
-      if (raw.surfaceOp && raw.surfaceOp !== 'append') continue;
+      if (raw.surfaceOp !== 'append') continue;
       const msg = raw.data as {
         source?: { kind?: string; form?: string };
         content?: ReadonlyArray<{ type?: string; text?: string }>;
@@ -162,6 +152,7 @@ export function extractDreamTurnsFromOwnEvents(
     if (!current) continue;
 
     if (raw.type === 'assistant/message') {
+      if (raw.surfaceOp !== 'append') continue;
       const message = (raw.data?.message ?? raw.data) as {
         content?: ReadonlyArray<{ type?: string; text?: string; name?: string }>;
       };
@@ -243,6 +234,7 @@ export function createDshDreamPorts(
     homeDir?: string;
     memoryAdoption?: DreamMemoryAdoptionBridge;
     skillDrafts?: DreamSkillDraftBridge;
+    tom?: Pick<AsiTomServiceApi, 'shouldDeferProactiveWork' | 'subscribe'>;
   },
 ): DreamHostPorts {
   const excludedRoots = buildExcludedDreamRoots(storageRoot, ctx.asiSense?.storageRoot);
@@ -288,8 +280,9 @@ export function createDshDreamPorts(
   };
 
   const isOrdinaryAgent = (agent: Agent): boolean => {
-    if (!agent?.session) return !INTERNAL_SESSION_ID_RE.test(String(agent?.id ?? ''));
-    if (isArchived(String(agent.id))) return false;
+    const sid = String(agent?.id ?? '');
+    if (!sid || INTERNAL_SESSION_ID_RE.test(sid) || isArchived(sid)) return false;
+    if (!agent?.session) return true;
     return isOrdinaryDreamSession(agent.session, excludedRoots);
   };
 
@@ -411,7 +404,12 @@ export function createDshDreamPorts(
             if (src?.kind === 'user' && src.form === undefined) listener();
             return;
           }
-          if (event.type === 'assistant/message' || event.type === 'turn/start' || event.type === 'turn/end') {
+          if (event.type === 'assistant/message') {
+            if (event.surfaceOp !== 'append') return;
+            listener();
+            return;
+          }
+          if (event.type === 'turn/start' || event.type === 'turn/end') {
             listener();
           }
         },
@@ -597,6 +595,27 @@ export function createDshDreamPorts(
     return undefined;
   };
 
+  const getTom = (): Pick<AsiTomServiceApi, 'shouldDeferProactiveWork' | 'subscribe'> | undefined =>
+    options?.tom ??
+    (ctx as Context & { asiTom?: AsiTomServiceApi; get?(name: 'asiTom'): AsiTomServiceApi | undefined }).asiTom ??
+    (ctx as Context & { get?(name: 'asiTom'): AsiTomServiceApi | undefined }).get?.('asiTom');
+
+  const tomProxy: DreamHostPorts['tom'] = {
+    shouldDeferProactiveWork: () => Boolean(getTom()?.shouldDeferProactiveWork()),
+    subscribe: (listener) => {
+      const direct = getTom();
+      if (direct?.subscribe) return direct.subscribe(listener);
+      const fiber = ctx.inject(['asiTom'], (sub) => {
+        const svc = (sub as Context & { asiTom?: AsiTomServiceApi }).asiTom;
+        if (svc?.subscribe) {
+          const off = svc.subscribe(listener);
+          sub.effect(() => off, 'asi-dream tom subscription');
+        }
+      });
+      return () => fiber.dispose();
+    },
+  };
+
   return {
     storageRoot,
     homeDir: options?.homeDir ?? getProfileHome() ?? homedir(),
@@ -626,6 +645,7 @@ export function createDshDreamPorts(
         injectFiber.dispose();
       };
     },
+    tom: tomProxy,
     conversations,
     ...(options?.memoryAdoption ? { memoryAdoption: options.memoryAdoption } : {}),
     ...(options?.skillDrafts ? { skillDrafts: options.skillDrafts } : {}),
