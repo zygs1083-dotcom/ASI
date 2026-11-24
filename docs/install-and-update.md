@@ -1,18 +1,16 @@
-# 安装和更新 ASI 插件（asi-sense + asi-needs + asi-sleep + asi-care + asi-growth）
+# 安装、迁移与更新 ASI 插件（统一单包 `asi`）
 
 ## 支持版本
 
-ASI 采用模块化五插件设计（当前版本 **`0.5.0`**），支持的 DeepSeek Harness（DSH）宿主版本恰好为 **`0.2.2-rc.3`** 和 **`0.2.2-rc.5`**（`engines.dsh: "0.2.2-rc.3 || 0.2.2-rc.5"`）：
+自 **`0.6.0`** 起，ASI 整合为**单一 DeepSeek Harness（DSH）组合包 `asi`**，支持的 DSH 宿主版本恰好为 **`0.2.2-rc.3`** 和 **`0.2.2-rc.5`**（`engines.dsh: "0.2.2-rc.3 || 0.2.2-rc.5"`）：
 
-- `asi-sense`：纯后台感官服务（无侧栏图标），暴露 `ctx.asiSense` 与只读工具 `env_state` / `env_detail`；
-- `asi-needs`：L1 五大生存需求评估、全景病因嗅探、行动效果记忆、`ctx.asiDrives` 马斯洛多层仲裁服务，注册 **生存需求**（`id: 'asi-needs'`，`order: 90`）侧栏与只读工具 `needs_status`；
-- `asi-sleep`：L2 仿生 NREM+REM 睡眠记忆整合、FSRS 衰减、MiniSearch 中英检索与 `MEMORY.md` 双向对账，暴露只读 `ctx.asiSleep` 服务，注册独立 **记忆库**（`id: 'asi-sleep'`，`order: 91`）侧栏与只读工具 `memory_recall` / `memory_profile`；
-- `asi-care`：L3 本地工作区、Git 多工作树卫生、孤儿开发端口与闲置构建产物看护（无独立侧栏图标，复用「生存需求」侧栏静默求助卡与动作收益账本），仅向普通对话暴露只读工具 `care_status`；
-- `asi-growth`：L4 程序性技能提炼与自进化，在 L1–L3 舒适且深静默（空闲 `>= 20m` 或锁屏）时从高保留率踩坑记忆与排障轨迹自动起草标准纯文本 `SKILL.md`，经人工一键批准后通过 `ctx.skills.registerProvider` 动态热挂载（支持 `global`/`workspace` 作用域切换、60 天零调用代谢提醒与一键导出至 `.agents/skills/`），注册独立 **技能工坊**（`id: 'asi-growth'`，`order: 92`）侧栏与只读工具 `growth_status`。
+- 仅需安装一个包 `asi-0.6.0.tgz`，在 DSH 左侧栏仅注册**唯一一个侧栏图标**「ASI 稳态」（`id: 'asi'`，`order: 90`，英文 **ASI Homeostasis**）；
+- 内部完整包含 L0 感官服务（`ctx.asiSense`、`env_state` / `env_detail`）、L1 生存稳态与马斯洛多层仲裁（`ctx.asiDrives`、`needs_status`）、L2 仿生睡眠记忆库（`ctx.asiSleep`、`memory_recall` / `memory_profile`）、L3 多工作树与孤儿运行时看护（`care_status`）以及 L4 程序性技能提炼与热挂载（`ctx.skills.registerProvider`、`growth_status`）；
+- 启动时自动将旧版 `0.5.0` 五个拆分插件的数据目录（`~/.dsh/data/asi-{sense,needs,sleep,care,growth}`）**无损迁移**至 `~/.dsh/data/asi/{sense,needs,sleep,care,growth}`，并在磁盘上完整保留旧目录作为回退备份。
 
-## 安装（Desktop Profile）
+## 全新安装（Desktop Profile）
 
-默认数据目录为 `~/.dsh`，Desktop 使用的 profile 为 `~/.dsh/profiles/desktop`（若自定义了 `DSH_HOME`，请保持终端与 Desktop 一致）。`dsh plugin add` 仅原位覆盖同名依赖或向末尾追加新插件，**完整保留 Desktop profile 中已安装的 `dsh-context`、`dsh-superagent` 等其他插件及其启用顺序**（切勿对其他插件执行 `remove` 或直接覆盖 `~/.dsh/profiles/desktop/package.json`）。
+默认数据目录为 `~/.dsh`，Desktop 使用的 profile 为 `~/.dsh/profiles/desktop`（若自定义了 `DSH_HOME`，请保持终端与 Desktop 一致）。`dsh plugin add` 仅原位覆盖同名依赖或追加 `asi`，**完整保留 Desktop profile 中已安装的 `dsh-context`、`dsh-superagent` 等其他插件及其启用顺序**。
 
 1. 检查 Desktop 自带 CLI 版本（输出须为 `0.2.2-rc.3` 或 `0.2.2-rc.5`）：
 
@@ -20,49 +18,62 @@ ASI 采用模块化五插件设计（当前版本 **`0.5.0`**），支持的 Dee
 "/Applications/DeepSeek Harness.app/Contents/Resources/runtime/cli/bin/dsh" --version
 ```
 
-2. 完全退出 DeepSeek Harness Desktop（含后台进程），依次安装五个插件包：
+2. 完全退出 DeepSeek Harness Desktop（含后台进程），安装单一 `asi` 插件包：
 
 ```sh
-"/Applications/DeepSeek Harness.app/Contents/Resources/runtime/cli/bin/dsh" plugin --profile desktop add "$HOME/Downloads/asi-sense-0.5.0.tgz"
-"/Applications/DeepSeek Harness.app/Contents/Resources/runtime/cli/bin/dsh" plugin --profile desktop add "$HOME/Downloads/asi-needs-0.5.0.tgz"
-"/Applications/DeepSeek Harness.app/Contents/Resources/runtime/cli/bin/dsh" plugin --profile desktop add "$HOME/Downloads/asi-sleep-0.5.0.tgz"
-"/Applications/DeepSeek Harness.app/Contents/Resources/runtime/cli/bin/dsh" plugin --profile desktop add "$HOME/Downloads/asi-care-0.5.0.tgz"
-"/Applications/DeepSeek Harness.app/Contents/Resources/runtime/cli/bin/dsh" plugin --profile desktop add "$HOME/Downloads/asi-growth-0.5.0.tgz"
+"/Applications/DeepSeek Harness.app/Contents/Resources/runtime/cli/bin/dsh" plugin --profile desktop add "$HOME/Downloads/asi-0.6.0.tgz"
 ```
 
-3. 重新打开 Desktop：
-   - `asi-sense` 与 `asi-care` 作为无侧栏图标的后台服务自动运行；
-   - 左侧栏依次出现 **生存需求**（`asi-needs`，英文 **Survival needs**）、**记忆库**（`asi-sleep`，英文 **Memory vault**）与 **技能工坊**（`asi-growth`，英文 **Skill studio**）三个面板图标：分别用于查看 L1–L4 稳态与静默求助卡、管理长期记忆与睡眠整合，以及审阅批准/编辑/导出纯文本 `SKILL.md` 技能；
-   - 原有 `dsh-context`、`dsh-superagent` 等插件保持原有配置与启用状态不变。
+3. 重新打开 Desktop：左侧栏出现唯一 **ASI 稳态**（`asi`）图标，内含顶部全局状态胶囊、跨 Tab 待批焦点条以及「稳态看护 | 记忆库 | 技能工坊」三段导航；原有 `dsh-context`、`dsh-superagent` 等插件保持不变。
+
+## 从旧版五插件（`0.5.0` `asi-*`）无损迁移至单插件 `asi@0.6.0`
+
+若当前 Desktop profile 已安装旧版拆分包（`asi-sense`、`asi-needs`、`asi-sleep`、`asi-care`、`asi-growth`）：
+
+1. 完全退出 Desktop，先备份 profile 配置（切勿触碰 `dsh-context` 与 `dsh-superagent`）：
+
+```sh
+DSH="/Applications/DeepSeek Harness.app/Contents/Resources/runtime/cli/bin/dsh"
+PROFILE="${DSH_HOME:-$HOME/.dsh}/profiles/desktop"
+BACKUP=$(mktemp -d "${TMPDIR:-/tmp}/asi-060-backup.XXXXXX")
+cp -p "$PROFILE/package.json" "$BACKUP/package.json"
+test ! -f "$PROFILE/pnpm-lock.yaml" || cp -p "$PROFILE/pnpm-lock.yaml" "$BACKUP/pnpm-lock.yaml"
+```
+
+2. 卸载五个旧版拆分插件包并安装单一 `asi-0.6.0.tgz`：
+
+```sh
+for old_pkg in asi-growth asi-care asi-sleep asi-needs asi-sense; do
+  "$DSH" plugin --profile desktop remove "$old_pkg" || true
+done
+"$DSH" plugin --profile desktop add "$HOME/Downloads/asi-0.6.0.tgz"
+```
+
+3. 启动 Desktop：
+   - `asi@0.6.0` 启动时自动把 `~/.dsh/data/asi-sleep/vault/{memories.jsonl,MEMORY.md,sleep-journal.jsonl}`、`state.json` 已整合会话水位线以及其余模块配置与已启用技能 100% 无损复制到 `~/.dsh/data/asi/{sense,needs,sleep,care,growth}`，历史会话不会重复触发睡眠整合；
+   - 原有 `~/.dsh/data/asi-*` 目录完整保留在磁盘上不作任何修改或删除；
+   - `dsh-context`、`dsh-superagent` 等非 ASI 插件原样保留。
 
 ## 隔离 Web Profile 本地验证
 
-在仓库根目录构建发行包并在独立临时 `DSH_HOME` 中验证（不触碰现有 Desktop 数据）：
+在仓库根目录（macOS `arm64`）构建发行包并在独立临时 `DSH_HOME` 中验证：
 
 ```sh
 export ASI_ROOT="$PWD"
 pnpm install --frozen-lockfile
-pnpm --filter asi-sense pack:dist
-pnpm --filter asi-needs pack:dist
-pnpm --filter asi-sleep pack:dist
-pnpm --filter asi-care pack:dist
-pnpm --filter asi-growth pack:dist
+pnpm --filter asi pack:dist
 
-export DSH_LAUNCHER="$ASI_ROOT/plugins/asi-needs/scripts/dsh.sh"
+export DSH_LAUNCHER="$ASI_ROOT/plugins/asi/scripts/dsh.sh"
 export DSH_HOME="$(mktemp -d "${TMPDIR:-/tmp}/asi-dsh.XXXXXX")"
 node -e 'require("node:fs").writeFileSync(process.env.DSH_HOME + "/workspace.json", JSON.stringify([{id:"workspace-controller",config:{documentsDirectory:process.env.DSH_HOME}}]))'
 
 "$DSH_LAUNCHER" --profile asi-dev --from-default-profile web --dump-config
-"$DSH_LAUNCHER" plugin --profile asi-dev add "$ASI_ROOT/plugins/asi-sense/dist/asi-sense-0.5.0.tgz"
-"$DSH_LAUNCHER" plugin --profile asi-dev add "$ASI_ROOT/plugins/asi-needs/dist/asi-needs-0.5.0.tgz"
-"$DSH_LAUNCHER" plugin --profile asi-dev add "$ASI_ROOT/plugins/asi-sleep/dist/asi-sleep-0.5.0.tgz"
-"$DSH_LAUNCHER" plugin --profile asi-dev add "$ASI_ROOT/plugins/asi-care/dist/asi-care-0.5.0.tgz"
-"$DSH_LAUNCHER" plugin --profile asi-dev add "$ASI_ROOT/plugins/asi-growth/dist/asi-growth-0.5.0.tgz"
+"$DSH_LAUNCHER" plugin --profile asi-dev add "$ASI_ROOT/plugins/asi/dist/asi-0.6.0.tgz"
 "$DSH_LAUNCHER" --profile asi-dev --patch "$DSH_HOME/workspace.json" --no-open --host 127.0.0.1 --port 0
 ```
 
 ## 更新、回退与卸载
 
-- **本地 tgz 升级（如从 `0.4.0` 升级至 `0.5.0`）**：继续保留上一版 `0.4.0` tgz 包作即时回退备份，完全退出 Desktop，先备份 `~/.dsh/profiles/desktop/package.json` 与 `pnpm-lock.yaml`，再依次执行 `dsh plugin --profile desktop add` 安装五个 `0.5.0` tgz 包（版本号递增至 `0.5.0` 可避免 `pnpm-lock.yaml` tarball 缓存冲突；`dsh-context` 与 `dsh-superagent` 自动原样保留，本地状态、记忆库与技能目录不会被重置）。
-- **快速回退至 `0.4.0`**：停止 Desktop 后执行 `dsh plugin --profile desktop remove asi-growth`，再重新执行 `dsh plugin --profile desktop add` 装回四个 `0.4.0` tgz 包。
-- **卸载**：停止 DSH 后依次执行 `dsh plugin --profile desktop remove asi-growth`、`dsh plugin --profile desktop remove asi-care`、`dsh plugin --profile desktop remove asi-sleep`、`dsh plugin --profile desktop remove asi-needs` 与 `dsh plugin --profile desktop remove asi-sense`。
+- **后续单包升级（如 `0.6.0` → `0.6.1`）**：保留上一版 `asi-0.6.0.tgz` 备份，退出 Desktop 后直接执行 `dsh plugin --profile desktop add "$HOME/Downloads/asi-0.6.1.tgz"` 原位更新，`~/.dsh/data/asi` 数据与既有非 ASI 插件自动保留。
+- **快速回退至 `0.5.0` 五插件**：退出 Desktop 后执行 `dsh plugin --profile desktop remove asi`，再用备份的五个 `0.5.0` tgz 包依次执行 `dsh plugin --profile desktop add`（由于 `~/.dsh/data/asi-*` 原目录未受改动，可直接无缝回退）。
+- **卸载**：停止 DSH 后执行 `dsh plugin --profile desktop remove asi`。
