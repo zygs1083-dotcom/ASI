@@ -94,30 +94,41 @@ function hasHiddenSensitiveSegment(targetPath: string): boolean {
   return false;
 }
 
-function buildExactContainerRootSet(homeDir?: string): Set<string> {
+function buildLexicalExactContainerRootSet(homeDir?: string): Set<string> {
   const out = new Set<string>();
-  const addRoot = (raw: string | undefined) => {
+  const addLexicalRoot = (raw: string | undefined) => {
     const clean = raw?.trim();
     if (!clean) return;
-    const lex = resolve(clean);
-    out.add(lex);
-    out.add(safeRealpath(lex));
+    out.add(resolve(clean));
   };
-  for (const r of EXACT_CONTAINER_ROOTS) addRoot(r);
-  addRoot(homeDir ?? homedir());
+  for (const r of EXACT_CONTAINER_ROOTS) addLexicalRoot(r);
+  addLexicalRoot(homeDir ?? homedir());
   return out;
 }
 
-function isLexicalOrRealInside(candidate: string, root: string | undefined): boolean {
-  if (!root || !root.trim()) return false;
+function buildExactContainerRootSet(homeDir?: string): Set<string> {
+  const out = buildLexicalExactContainerRootSet(homeDir);
+  for (const lex of [...out]) {
+    out.add(safeRealpath(lex));
+  }
+  return out;
+}
+
+function isLexicalInside(candidate: string, root: string | undefined): boolean {
+  if (!root?.trim()) return false;
   const lexCand = resolve(candidate);
   const lexRoot = resolve(root);
   if (lexCand === lexRoot) return true;
   const lexRel = relative(lexRoot, lexCand);
-  if (lexRel && !lexRel.startsWith('..') && !isAbsolute(lexRel)) return true;
+  return Boolean(lexRel && !lexRel.startsWith('..') && !isAbsolute(lexRel));
+}
 
-  const realCand = deepSafeRealpath(lexCand);
-  const realRoot = deepSafeRealpath(lexRoot);
+function isLexicalOrRealInside(candidate: string, root: string | undefined): boolean {
+  if (!root?.trim()) return false;
+  if (isLexicalInside(candidate, root)) return true;
+
+  const realCand = deepSafeRealpath(resolve(candidate));
+  const realRoot = deepSafeRealpath(resolve(root));
   if (realCand === realRoot) return true;
   const realRel = relative(realRoot, realCand);
   return Boolean(realRel && !realRel.startsWith('..') && !isAbsolute(realRel));
@@ -132,29 +143,57 @@ export function isExcludedDreamPath(
   excludedRoots: readonly (string | undefined)[] = [],
   homeDir?: string,
 ): boolean {
-  if (!candidate || !candidate.trim()) return true;
+  if (!candidate?.trim()) return true;
   const trimmed = candidate.trim();
   const lexPath = resolve(trimmed);
-  const realPath = deepSafeRealpath(lexPath);
 
-  const exactContainers = buildExactContainerRootSet(homeDir);
-  if (exactContainers.has(lexPath) || exactContainers.has(realPath)) {
+  // Pure lexical checks first so sensitive paths (e.g. ~/.secrets) never trigger FS syscalls.
+  const lexExactContainers = buildLexicalExactContainerRootSet(homeDir);
+  if (lexExactContainers.has(lexPath)) {
     return true;
   }
-
-  if (hasHiddenSensitiveSegment(lexPath) || hasHiddenSensitiveSegment(realPath)) {
+  if (hasHiddenSensitiveSegment(lexPath) || INTERNAL_DIR_SEGMENT_RE.test(lexPath)) {
     return true;
   }
-
-  if (INTERNAL_DIR_SEGMENT_RE.test(lexPath) || INTERNAL_DIR_SEGMENT_RE.test(realPath)) {
-    return true;
-  }
-
   for (const sysRoot of SUBTREE_SYSTEM_EXCLUSIONS) {
-    if (isLexicalOrRealInside(lexPath, sysRoot)) return true;
+    if (isLexicalInside(lexPath, sysRoot)) return true;
+  }
+  if (excludedRoots.some((root) => isLexicalInside(lexPath, root))) {
+    return true;
   }
 
-  return excludedRoots.some((root) => isLexicalOrRealInside(lexPath, root));
+  const realPath = deepSafeRealpath(lexPath);
+  const exactContainers = buildExactContainerRootSet(homeDir);
+  if (exactContainers.has(realPath)) {
+    return true;
+  }
+  if (hasHiddenSensitiveSegment(realPath) || INTERNAL_DIR_SEGMENT_RE.test(realPath)) {
+    return true;
+  }
+  for (const sysRoot of SUBTREE_SYSTEM_EXCLUSIONS) {
+    if (isLexicalOrRealInside(realPath, sysRoot)) return true;
+  }
+  return excludedRoots.some((root) => isLexicalOrRealInside(realPath, root));
+}
+
+async function hasSymlinkBelowContainerRoot(targetPath: string, homeDir?: string): Promise<boolean> {
+  const stopRoots = buildExactContainerRootSet(homeDir);
+  let cur = resolve(targetPath);
+  for (let i = 0; i < 64; i += 1) {
+    if (stopRoots.has(cur)) return false;
+    try {
+      const st = await lstat(cur);
+      if (st.isSymbolicLink()) return true;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException)?.code !== 'ENOENT') {
+        return true;
+      }
+    }
+    const parent = dirname(cur);
+    if (parent === cur) break;
+    cur = parent;
+  }
+  return false;
 }
 
 export function maskDreamHomePath(text: string, homeDir?: string): string {
@@ -200,6 +239,7 @@ export async function resolveCanonicalRepoIdentity(
   const trimmed = rawPath?.trim();
   if (!trimmed) return undefined;
   if (isExcludedDreamPath(trimmed, excludedRoots, homeDir)) return undefined;
+  if (await hasSymlinkBelowContainerRoot(trimmed, homeDir)) return undefined;
 
   let current = resolve(trimmed);
   let foundRepoRoot: string | undefined;
@@ -252,6 +292,7 @@ export async function resolveCanonicalRepoIdentity(
         if (gitDirPayload) {
           const rawGitDir = isAbsolute(gitDirPayload) ? resolve(gitDirPayload) : resolve(current, gitDirPayload);
           if (isExcludedDreamPath(rawGitDir, excludedRoots, homeDir)) return undefined;
+          if (await hasSymlinkBelowContainerRoot(rawGitDir, homeDir)) return undefined;
           const gitDirStat = await lstat(rawGitDir).catch(() => undefined);
           if (!gitDirStat || gitDirStat.isSymbolicLink()) return undefined;
           const gitDir = safeRealpath(rawGitDir);
@@ -263,9 +304,12 @@ export async function resolveCanonicalRepoIdentity(
             const rawCommon = isAbsolute(commonRaw.trim())
               ? resolve(commonRaw.trim())
               : resolve(gitDir, commonRaw.trim());
+            if (isExcludedDreamPath(rawCommon, excludedRoots, homeDir)) return undefined;
+            if (await hasSymlinkBelowContainerRoot(rawCommon, homeDir)) return undefined;
             const commonStat = await lstat(rawCommon).catch(() => undefined);
             if (!commonStat || commonStat.isSymbolicLink()) return undefined;
             const commonDir = safeRealpath(rawCommon);
+            if (isExcludedDreamPath(commonDir, excludedRoots, homeDir)) return undefined;
             foundRepoRoot = basename(commonDir) === '.git' ? dirname(commonDir) : commonDir;
           } else {
             const worktreesSeg = `${sep}.git${sep}worktrees${sep}`;
@@ -288,6 +332,9 @@ export async function resolveCanonicalRepoIdentity(
     return undefined;
   }
   if (isExcludedDreamPath(foundRepoRoot, excludedRoots, homeDir)) {
+    return undefined;
+  }
+  if (await hasSymlinkBelowContainerRoot(foundRepoRoot, homeDir)) {
     return undefined;
   }
   const canonicalRoot = safeRealpath(foundRepoRoot);

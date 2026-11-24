@@ -36,10 +36,13 @@ export interface TomToolGuardOptions {
   isArchived?: (sessionId: string) => boolean;
 }
 
-export function isInternalOrSubagent(agent: Agent | undefined, guard?: TomToolGuardOptions): boolean {
+export function isInternalOrSubagent(
+  agent: Agent | undefined,
+  guard?: Pick<TomToolGuardOptions, 'excludedRoots'>,
+): boolean {
   if (!agent) return false;
   const sid = String(agent.id ?? agent.session?.id ?? '');
-  if (!sid || ASI_INTERNAL_SESSION_ID_RE.test(sid) || guard?.isArchived?.(sid)) return true;
+  if (!sid || ASI_INTERNAL_SESSION_ID_RE.test(sid)) return true;
   const header = agent.session?.header as
     | { origin?: string; delegationDepth?: number; parentId?: unknown; cwd?: string }
     | undefined;
@@ -61,7 +64,8 @@ export function isInternalOrSubagent(agent: Agent | undefined, guard?: TomToolGu
 
 function requireOrdinaryAgent(exec: ToolRunContext, guard?: TomToolGuardOptions): Agent {
   if (!exec.agent) throw new ToolContextUnavailableError('partner_state requires an active agent');
-  if (isInternalOrSubagent(exec.agent, guard)) {
+  const sid = String(exec.agent.id ?? exec.agent.session?.id ?? '');
+  if (isInternalOrSubagent(exec.agent, guard) || guard?.isArchived?.(sid)) {
     throw new ToolContextUnavailableError('partner_state is restricted to ordinary user sessions');
   }
   return exec.agent;
@@ -153,8 +157,12 @@ export function registerTomTools(
       ctx.systemPrompt.section({
         name: 'asi-tom',
         order: 2705,
-        text: (assembleCtx) =>
-          isInternalOrSubagent((assembleCtx as { agent?: Agent }).agent, guard) ? '' : ASI_TOM_SYSTEM_PROMPT_TEXT,
+        text: (assembleCtx) => {
+          const candidateAgent =
+            (assembleCtx as { agent?: Agent }).agent ??
+            (assembleCtx.scope && typeof assembleCtx.scope === 'object' ? (assembleCtx.scope as Agent) : undefined);
+          return isInternalOrSubagent(candidateAgent, guard) ? '' : ASI_TOM_SYSTEM_PROMPT_TEXT;
+        },
       }),
     );
   } catch (error) {

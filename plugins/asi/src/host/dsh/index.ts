@@ -305,7 +305,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     // 5. L4 Procedural Skill Synthesis & Hot Mounting (`ctx.skills.registerProvider` + `growth_status`)
     const growthPorts = createDshGrowthPorts(ctx, growthRoot);
     growthRuntime = createGrowthRuntime(growthPorts);
-    offGrowthTools = registerGrowthTools(ctx, growthRuntime);
+    offGrowthTools = registerGrowthTools(ctx, growthRuntime, allInternalRoots);
     offGrowthSkills = registerDshSkillBridge(ctx, growthRuntime.skillBridge, growthRoot);
     await growthRuntime.start();
     if (disposed) {

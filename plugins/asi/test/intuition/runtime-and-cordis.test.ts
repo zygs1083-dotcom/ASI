@@ -397,9 +397,42 @@ describe('前额叶直觉与前瞻记忆（src/intuition）全链路 Cordis / DS
       expect(root.asiIntuition.snapshot().surfacedCount).toBeGreaterThanOrEqual(1);
       await root.waterfall('tools/pre-execute', fakeExec, async () => ({ kind: 'allow' as const }));
       expect(injectedNextStep.length).toBeGreaterThanOrEqual(1);
-      const latestInjected = injectedNextStep.at(-1);
-      if (!latestInjected) throw new Error('expected injected step warning');
-      expect(extractTextFromMessage(latestInjected)).toContain('本轮重复报错疤痕');
+      const stepWarnMsg = injectedNextStep.at(-1);
+      if (!stepWarnMsg) throw new Error('expected injected step warning');
+      expect(extractTextFromMessage(stepWarnMsg)).toContain('本轮重复报错疤痕');
+
+      // 并发竞态回归验证：当同轮中途 injectNextStep (asi-intuition-step:*) 与异步驻留前瞻 (asi-intuition-ns:*) 并存时，
+      // 消费掉中途 step 警告绝不能误删驻留前瞻的 MessageId，随后 cancel 仍能通过 inbox.remove 精准撤回驻留消息！
+      const raceRem = (await rememberDef?.execute(
+        {
+          title: '并发队列隔离验证提醒',
+          instruction: '验证中途 step 消息消费不会令驻留 next-step 失联',
+          triggerKind: 'event',
+          eventKind: 'job_finished',
+          targetPattern: 'race-build',
+        },
+        {
+          callId: 'call-rem-race' as never,
+          agent: userAgent,
+          signal: new AbortController().signal,
+        } as never,
+      )) as { intention: { id: string } };
+      jobSubscriber?.({
+        type: 'settled',
+        job: { id: 'job-race', owner: String(userAgent.id), label: 'pnpm run race-build', status: 'completed' },
+      });
+      expect(injectedNextStep).toHaveLength(2);
+      // 模拟 DSH 引擎消费掉第一条中途疤痕消息 (stepWarnMsg)
+      injectedNextStep.shift();
+      emitAgentEvent(root, userAgent, 'agent/inbox/claimed', { message: stepWarnMsg, turn: 3 });
+      expect(injectedNextStep).toHaveLength(1);
+      // 取消并发驻留的前瞻提醒 -> 仍必须精确调用 inbox.remove 将其从队列撤回！
+      await resolveForRetract?.execute({ id: raceRem.intention.id, action: 'cancel' }, {
+        callId: 'call-cancel-race' as never,
+        agent: userAgent,
+        signal: new AbortController().signal,
+      } as never);
+      expect(injectedNextStep).toHaveLength(0);
 
       // 子代理、内部自维护会话与已归档会话调用全部 3 个 intuition 工具均被严格拦截
       const statusToolGuard = root.tools.executable('intuition_status', userAgent);

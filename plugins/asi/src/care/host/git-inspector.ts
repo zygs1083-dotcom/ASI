@@ -269,7 +269,7 @@ export async function checkLockFileHolders(
   exec: CareExecFn,
   signal?: AbortSignal,
 ): Promise<'free' | 'held' | 'unknown'> {
-  const res = await exec('lsof', ['-w', '-F', 'p', '--', lockReal], { timeoutMs: 4_000, signal });
+  const res = await exec('lsof', ['-w', '-nP', '-F', 'p', '--', lockReal], { timeoutMs: 8_000, signal });
   if (res.timedOut || res.errorCode === 'ENOENT' || res.errorCode === 'ABORT_ERR') {
     return 'unknown';
   }

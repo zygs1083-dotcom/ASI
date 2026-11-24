@@ -217,27 +217,26 @@ export function createDshIntuitionPorts(
 
     onSessionTurnClaimed(cb) {
       claimedListeners.add(cb);
-      const notifyClaimed = (sid: string) => {
-        for (const fn of [...claimedListeners]) fn(sid);
-      };
       const offClaim = ctx.on('agent/inbox/claimed', ({ agent, message }) => {
         const sid = String(agent.id);
-        if (parkedNextStepMsgId.get(sid) === message.id || message.source?.kind === 'asi-intuition') {
+        if (parkedNextStepMsgId.get(sid) === message.id) {
           parkedNextStepMsgId.delete(sid);
-          notifyClaimed(sid);
+          for (const fn of [...claimedListeners]) fn(sid);
+        } else if (!parkedNextStepMsgId.has(sid) && message.source?.kind === 'asi-intuition') {
+          cb(sid);
         }
       });
       const offDiscard = ctx.on('agent/inbox/discarded', ({ agent, message }) => {
         const sid = String(agent.id);
         if (parkedNextStepMsgId.get(sid) === message.id) {
           parkedNextStepMsgId.delete(sid);
-          notifyClaimed(sid);
+          for (const fn of [...claimedListeners]) fn(sid);
         }
       });
       const offDisposed = ctx.on('agent/disposed', ({ agent }) => {
         const sid = String(agent.id);
         parkedNextStepMsgId.delete(sid);
-        notifyClaimed(sid);
+        cb(sid);
       });
       return () => {
         claimedListeners.delete(cb);
@@ -260,12 +259,7 @@ export function createDshIntuitionPorts(
         try {
           const sid = String(payload.agent.id);
           const existingParkedId = parkedNextStepMsgId.get(sid);
-          if (
-            existingParkedId &&
-            decision.messages.some(
-              (m) => (m as { id?: unknown }).id === existingParkedId || m.source?.kind === 'asi-intuition',
-            )
-          ) {
+          if (existingParkedId && decision.messages.some((m) => (m as { id?: unknown }).id === existingParkedId)) {
             parkedNextStepMsgId.delete(sid);
             for (const fn of [...claimedListeners]) fn(sid);
           }

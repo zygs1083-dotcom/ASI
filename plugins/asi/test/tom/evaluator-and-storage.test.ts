@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -289,11 +289,33 @@ describe('方向 B · 心智理论 (ToM) 确定性推断引擎与个体节律基
     const rawDiskText = await readFile(join(dir, 'state.json'), 'utf8');
     expect(rawDiskText).not.toContain('userText');
 
+    // 验证目录 0o700 与文件 0o600 严格权限
+    const dirMode = (await lstat(dir)).mode & 0o777;
+    const fileMode = (await lstat(join(dir, 'state.json'))).mode & 0o777;
+    expect(dirMode).toBe(0o700);
+    expect(fileMode).toBe(0o600);
+
     // 写入损坏文件后 load 安全回退默认状态不抛错
     await mkdir(dir, { recursive: true });
     await writeFile(join(dir, 'state.json'), '{corrupted-json');
     const recovered = await store.load(now);
     expect(recovered.enabled).toBe(true);
     expect(recovered.baseline.sampleCount).toBe(0);
+
+    // 验证符号链接目录与符号链接 state.json 在读写两端均被 lstat 严格拒绝
+    const outsideFile = join(dir, 'outside-target.json');
+    await writeFile(outsideFile, '{}');
+    const symRoot = join(dir, 'sym-tom-root');
+    await symlink(dir, symRoot);
+    const symRootStore = new TomStateStore(symRoot);
+    await expect(symRootStore.load(now)).rejects.toThrow(/symbolic link/);
+    await expect(symRootStore.save(recovered)).rejects.toThrow(/symbolic link/);
+
+    const fileLinkDir = join(dir, 'file-link-tom');
+    await mkdir(fileLinkDir, { recursive: true });
+    await symlink(outsideFile, join(fileLinkDir, 'state.json'));
+    const symFileStore = new TomStateStore(fileLinkDir);
+    await expect(symFileStore.load(now)).rejects.toThrow(/symbolic link/);
+    await expect(symFileStore.save(recovered)).rejects.toThrow(/symbolic link/);
   });
 });

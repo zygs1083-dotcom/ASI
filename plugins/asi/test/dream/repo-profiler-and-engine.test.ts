@@ -1,10 +1,15 @@
+import fs from 'node:fs';
 import { mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { SleepMemorySummary } from '@asi/sense-types';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { discoverCandidateCrossRepoBridges, runDmnDreamCycle } from '../../src/dream/host/dream-engine.ts';
-import { collectRepoProfiles, resolveCanonicalRepoIdentity } from '../../src/dream/host/repo-profiler.ts';
+import {
+  collectRepoProfiles,
+  isExcludedDreamPath,
+  resolveCanonicalRepoIdentity,
+} from '../../src/dream/host/repo-profiler.ts';
 import { searchDreamInsights } from '../../src/dream/shared/search.ts';
 
 const tempDirs: string[] = [];
@@ -330,6 +335,31 @@ describe('DMN 仓库身份归一化、只读非源码画像与跨项目做梦引
     const sneakyLinkToSecrets = join(fakeHome, 'projects', 'sneaky-secrets-link');
     await symlink(secretsDir, sneakyLinkToSecrets);
 
+    // 额外红队边界 A：父目录为符号链接、子目录拥有真实 .git（防止 lstat 仅查叶子漏放符号链接祖先）
+    const outsideContainer = join(fakeHome, 'outside-real');
+    const outsideNestedRepo = join(outsideContainer, 'nested-repo');
+    await mkdir(join(outsideNestedRepo, '.git'), { recursive: true });
+    await writeFile(join(outsideNestedRepo, 'package.json'), JSON.stringify({ name: 'should-not-cross-sym-parent' }));
+    const symParent = join(fakeHome, 'projects', 'sym-parent');
+    await symlink(outsideContainer, symParent);
+
+    // 额外红队边界 B：恶意 worktree .git -> gitdir 下的 commondir 指向 ~/.secrets/.git
+    const evilWt = join(fakeHome, 'projects', 'evil-worktree');
+    const evilGitDir = join(evilWt, '.gitdir');
+    await mkdir(evilGitDir, { recursive: true });
+    await writeFile(join(evilWt, '.git'), `gitdir: ${evilGitDir}\n`, 'utf8');
+    await writeFile(join(evilGitDir, 'commondir'), `${join(secretsDir, '.git')}\n`, 'utf8');
+
+    // 词法短路验证：对 ~/.secrets 路径的排除检查必须在纯内存词法层直接拦截，零 existsSync 系统调用触碰 .secrets
+    const existsSpy = vi.spyOn(fs, 'existsSync');
+    try {
+      expect(isExcludedDreamPath(join(secretsDir, 'credential.json'), [], fakeHome)).toBe(true);
+      const touchedSecrets = existsSpy.mock.calls.some(([arg]) => String(arg).includes('.secrets'));
+      expect(touchedSecrets).toBe(false);
+    } finally {
+      existsSpy.mockRestore();
+    }
+
     // 1. 容器根本身（$HOME、/tmp、/）与无 .git 普通目录必须返回 undefined
     expect(await resolveCanonicalRepoIdentity(fakeHome, fakeHome)).toBeUndefined();
     expect(await resolveCanonicalRepoIdentity('/tmp', fakeHome)).toBeUndefined();
@@ -337,13 +367,16 @@ describe('DMN 仓库身份归一化、只读非源码画像与跨项目做梦引
     expect(await resolveCanonicalRepoIdentity(plainNonGitDir, fakeHome)).toBeUndefined();
     expect(await resolveCanonicalRepoIdentity(join(plainNonGitDir, 'missing', 'leaf'), fakeHome)).toBeUndefined();
 
-    // 2. ~/.secrets 及其符号链接（含深层不存在子路径与符号链接 .git）全部拦截
+    // 2. ~/.secrets、指向 .secrets 的符号链接、符号链接祖先目录与恶意 commondir 全部严格拦截
     expect(await resolveCanonicalRepoIdentity(secretsDir, fakeHome)).toBeUndefined();
     expect(await resolveCanonicalRepoIdentity(sneakyLinkToSecrets, fakeHome)).toBeUndefined();
     expect(
       await resolveCanonicalRepoIdentity(join(sneakyLinkToSecrets, 'deep', 'missing', 'sub'), fakeHome),
     ).toBeUndefined();
     expect(await resolveCanonicalRepoIdentity(repoWithSymlinkGit, fakeHome)).toBeUndefined();
+    expect(await resolveCanonicalRepoIdentity(join(symParent, 'nested-repo'), fakeHome)).toBeUndefined();
+    expect(await resolveCanonicalRepoIdentity(join(symParent, 'nested-repo', 'src', 'leaf'), fakeHome)).toBeUndefined();
+    expect(await resolveCanonicalRepoIdentity(evilWt, fakeHome)).toBeUndefined();
 
     // 3. 合法 /tmp 子目录 Git 仓库及不存在的深层子路径 join(repo, 'src', 'sub') 正常解析到 .git 根
     const resolvedValid = await resolveCanonicalRepoIdentity(validTmpRepo, fakeHome);
