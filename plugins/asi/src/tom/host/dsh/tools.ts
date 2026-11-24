@@ -8,14 +8,21 @@
  * - Every returned string passes through `sanitizeForModel`.
  */
 
+import { realpathSync } from 'node:fs';
+import { resolve, sep } from 'node:path';
 import { sanitizeForModel } from '@asi/sense-types';
 import type { Context } from '@deepseek-ai/cordis';
 import type { Agent } from '@deepseek-ai/dsh-agent';
 import type {} from '@deepseek-ai/dsh-system-prompt';
 import { defineTool, ToolArgsError, ToolContextUnavailableError, type ToolRunContext } from '@deepseek-ai/dsh-tools';
 import type { JsonValue } from '@deepseek-ai/dsh-util-values';
+import type { WorkspaceRegistry } from '@deepseek-ai/dsh-workspace';
+import {
+  ASI_INTERNAL_CWD_RE,
+  ASI_INTERNAL_SESSION_ID_RE,
+  buildUnifiedExcludedInternalRoots,
+} from '../../../shared/internal-guards.js';
 import type { TomRuntime } from '../runtime.js';
-import { TOM_INTERNAL_SESSION_RE } from './dsh-ports.js';
 
 export const ASI_TOM_SYSTEM_PROMPT_TEXT =
   'For ambiguous brief prompts, repeated interruptions or command failures, or multi-option trade-offs, call `partner_state` on demand to inspect the user partner state and collaboration tact guidance; adapt brevity, verification rigor, and question budget tacitly without announcing inferred mood.';
@@ -25,14 +32,58 @@ const output = {
   render: (_args: unknown, value: unknown) => [{ type: 'text' as const, text: JSON.stringify(value) }],
 };
 
-function requireOrdinaryAgent(exec: ToolRunContext): Agent {
-  if (!exec.agent) throw new ToolContextUnavailableError('partner_state requires an active agent');
-  const sid = String(exec.agent.id ?? exec.agent.session?.id ?? '');
+function safeRealpath(p: string): string {
+  try {
+    return realpathSync(p);
+  } catch {
+    return resolve(p);
+  }
+}
+
+function isInsideRoot(candidate: string, root: string): boolean {
+  const normRoot = root.endsWith(sep) ? root : `${root}${sep}`;
+  return candidate === root || candidate.startsWith(normRoot);
+}
+
+export interface TomToolGuardOptions {
+  excludedRoots?: readonly (string | undefined)[];
+  isArchived?: (sessionId: string) => boolean;
+}
+
+export function isInternalOrSubagent(agent: Agent | undefined, guard?: TomToolGuardOptions): boolean {
+  if (!agent) return false;
+  const sid = String(agent.id ?? agent.session?.id ?? '');
+  if (!sid || ASI_INTERNAL_SESSION_ID_RE.test(sid) || guard?.isArchived?.(sid)) return true;
+  const header = agent.session?.header as
+    | { origin?: string; delegationDepth?: number; parentId?: unknown; cwd?: string }
+    | undefined;
   if (
-    TOM_INTERNAL_SESSION_RE.test(sid) ||
-    exec.agent.session?.header?.origin === 'subagent' ||
-    (typeof exec.agent.session?.header?.delegationDepth === 'number' && exec.agent.session.header.delegationDepth > 0)
+    header?.origin === 'subagent' ||
+    (typeof header?.delegationDepth === 'number' && header.delegationDepth > 0) ||
+    (header?.parentId !== undefined && header?.parentId !== null)
   ) {
+    return true;
+  }
+  const cwd = header?.cwd;
+  if (typeof cwd === 'string' && cwd.trim()) {
+    if (ASI_INTERNAL_CWD_RE.test(cwd)) return true;
+    const normCwd = resolve(cwd);
+    const realCwd = safeRealpath(normCwd);
+    for (const rawEx of guard?.excludedRoots ?? []) {
+      if (!rawEx?.trim()) continue;
+      const normEx = resolve(rawEx);
+      const realEx = safeRealpath(normEx);
+      if (isInsideRoot(normCwd, normEx) || isInsideRoot(realCwd, realEx)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+function requireOrdinaryAgent(exec: ToolRunContext, guard?: TomToolGuardOptions): Agent {
+  if (!exec.agent) throw new ToolContextUnavailableError('partner_state requires an active agent');
+  if (isInternalOrSubagent(exec.agent, guard)) {
     throw new ToolContextUnavailableError('partner_state is restricted to ordinary user sessions');
   }
   return exec.agent;
@@ -62,7 +113,7 @@ export function sanitizeTomValueForModel(value: unknown): JsonValue {
   return null;
 }
 
-export function createPartnerStateTool(runtime: Pick<TomRuntime, 'toolReport'>) {
+export function createPartnerStateTool(runtime: Pick<TomRuntime, 'toolReport'>, guard?: TomToolGuardOptions) {
   return defineTool({
     name: 'partner_state',
     description:
@@ -81,7 +132,7 @@ export function createPartnerStateTool(runtime: Pick<TomRuntime, 'toolReport'>) 
     },
     output,
     async execute(args, exec) {
-      requireOrdinaryAgent(exec);
+      requireOrdinaryAgent(exec, guard);
       bounded(args);
       if (args.includePreferences !== undefined && typeof args.includePreferences !== 'boolean') {
         throw new ToolArgsError(['includePreferences must be a boolean']);
@@ -98,15 +149,34 @@ export function createPartnerStateTool(runtime: Pick<TomRuntime, 'toolReport'>) 
   });
 }
 
-export function registerTomTools(ctx: Context, runtime: Pick<TomRuntime, 'toolReport'>): () => void {
+export function registerTomTools(
+  ctx: Context,
+  runtime: Pick<TomRuntime, 'toolReport'>,
+  excludedRoots?: readonly (string | undefined)[],
+): () => void {
+  const effectiveExcluded = buildUnifiedExcludedInternalRoots(ctx.asiSense?.storageRoot, ...(excludedRoots ?? []));
+  const guard: TomToolGuardOptions = {
+    excludedRoots: effectiveExcluded,
+    isArchived: (sessionId: string) => {
+      try {
+        const wr = (ctx as Context & { get(name: 'workspaceRegistry'): WorkspaceRegistry | undefined }).get(
+          'workspaceRegistry',
+        );
+        return Boolean(wr?.archivedSessionIds.some((id) => String(id) === sessionId));
+      } catch {
+        return false;
+      }
+    },
+  };
   const disposers: (() => void)[] = [];
   try {
-    disposers.push(ctx.tools.register(createPartnerStateTool(runtime)));
+    disposers.push(ctx.tools.register(createPartnerStateTool(runtime, guard)));
     disposers.push(
       ctx.systemPrompt.section({
         name: 'asi-tom',
         order: 2705,
-        text: ASI_TOM_SYSTEM_PROMPT_TEXT,
+        text: (assembleCtx) =>
+          isInternalOrSubagent((assembleCtx as { agent?: Agent }).agent, guard) ? '' : ASI_TOM_SYSTEM_PROMPT_TEXT,
       }),
     );
   } catch (error) {

@@ -9,6 +9,7 @@
 
 import type { PartnerStateSnapshot, SenseSnapshot } from '@asi/sense-types';
 import { factStatusAt } from '@asi/sense-types';
+import { ASI_INTERNAL_SESSION_ID_RE } from '../../shared/internal-guards.js';
 import {
   PARTNER_STATE_KINDS,
   type PartnerOverrideInput,
@@ -38,6 +39,7 @@ import { createDefaultPersistedTomState, type PersistedTomState, TomStateStore }
 
 const MAX_EVENT_WINDOW = 64;
 const MAX_SEEN_SIGNAL_IDS = 512;
+const MAX_SESSION_PROMPT_TRACKERS = 256;
 const EVENT_RETENTION_MS = 30 * 60_000;
 const DEFAULT_OVERRIDE_MINUTES = 60;
 const DEFAULT_TICK_MS = 30_000;
@@ -148,7 +150,8 @@ export function createTomRuntime(ports: TomHostPorts, options?: TomRuntimeOption
     await store.save(persisted);
   }
 
-  function ingestRecentSignals(currentNow: number): boolean {
+  function ingestRecentSignals(currentNow: number, sensePaused = ports.sense.snapshot().settings.paused): boolean {
+    if (!persisted.enabled || sensePaused) return false;
     let mutated = false;
     const signals = ports.sense.recentSignals();
     for (const sig of signals) {
@@ -168,8 +171,7 @@ export function createTomRuntime(ports: TomHostPorts, options?: TomRuntimeOption
       } else if (sig.kind === 'job.exited') {
         const exitCode = typeof sig.data?.exitCode === 'number' ? sig.data.exitCode : undefined;
         const owner = typeof sig.data?.sessionId === 'string' ? sig.data.sessionId : sig.subject;
-        const isInternal =
-          typeof owner === 'string' && /^asi-(?:maint|sleep|care|sense|growth|tom|internal)/i.test(owner);
+        const isInternal = typeof owner === 'string' && ASI_INTERNAL_SESSION_ID_RE.test(owner);
         if (!isInternal && exitCode !== undefined) {
           if (exitCode !== 0) {
             frictions.push({ at, kind: 'command_failed' });
@@ -186,7 +188,7 @@ export function createTomRuntime(ports: TomHostPorts, options?: TomRuntimeOption
   function computeEvaluation(senseSnap?: SenseSnapshot): TomEvaluationResult {
     const snap = senseSnap ?? ports.sense.snapshot();
     const currentNow = nowFn();
-    ingestRecentSignals(currentNow);
+    ingestRecentSignals(currentNow, snap.settings.paused);
     pruneAllWindows(currentNow);
 
     // Clear expired manual override automatically
@@ -299,16 +301,23 @@ export function createTomRuntime(ports: TomHostPorts, options?: TomRuntimeOption
     };
   }
 
+  function emitToListeners(snap: PartnerStateSnapshot): void {
+    for (const listener of [...listeners]) {
+      try {
+        listener(snap);
+      } catch {
+        // Isolate subscriber error
+      }
+    }
+  }
+
   function notifyAll(reconcileDrives = true): void {
     if (stopped) return;
     const res = computeEvaluation();
     if (reconcileDrives) {
       ports.drives?.notifySourceChanged('asi-tom');
     }
-    const snap = toSnapshot(res);
-    for (const listener of [...listeners]) {
-      listener(snap);
-    }
+    emitToListeners(toSnapshot(res));
   }
 
   const actions: TomActionsApi = {
@@ -399,8 +408,7 @@ export function createTomRuntime(ports: TomHostPorts, options?: TomRuntimeOption
         );
         disposers.push(
           ports.drives.subscribe(() => {
-            const snap = toSnapshot(cachedEval);
-            for (const listener of [...listeners]) listener(snap);
+            emitToListeners(toSnapshot(cachedEval));
           }),
         );
       }
@@ -419,18 +427,25 @@ export function createTomRuntime(ports: TomHostPorts, options?: TomRuntimeOption
             Math.abs(next.dimensions.focus - prevFocus) >= 5;
           if (meaningfulChange) {
             ports.drives?.notifySourceChanged('asi-tom');
-            const out = toSnapshot(next);
-            for (const listener of [...listeners]) listener(out);
+            emitToListeners(toSnapshot(next));
           }
         }),
       );
 
       disposers.push(
         ports.sessions.onUserPrompt((sig) => {
-          if (!persisted.enabled) return;
+          if (!persisted.enabled || ports.sense.snapshot().settings.paused) return;
           const prevAt = lastPromptAtBySession.get(sig.sessionId);
           const interMessageMs = prevAt !== undefined && sig.at >= prevAt ? sig.at - prevAt : undefined;
+          if (lastPromptAtBySession.has(sig.sessionId)) {
+            lastPromptAtBySession.delete(sig.sessionId);
+          }
           lastPromptAtBySession.set(sig.sessionId, sig.at);
+          while (lastPromptAtBySession.size > MAX_SESSION_PROMPT_TRACKERS) {
+            const oldest = lastPromptAtBySession.keys().next().value;
+            if (oldest === undefined) break;
+            lastPromptAtBySession.delete(oldest);
+          }
 
           prompts.push({
             at: sig.at,
@@ -451,7 +466,7 @@ export function createTomRuntime(ports: TomHostPorts, options?: TomRuntimeOption
 
       disposers.push(
         ports.sessions.onTurnSettled((sig) => {
-          if (!persisted.enabled) return;
+          if (!persisted.enabled || ports.sense.snapshot().settings.paused) return;
           if (sig.outcome === 'interrupted') {
             frictions.push({ at: sig.at, kind: 'user_interrupt' });
           } else if (sig.outcome === 'aborted') {
@@ -467,7 +482,7 @@ export function createTomRuntime(ports: TomHostPorts, options?: TomRuntimeOption
 
       disposers.push(
         ports.sessions.onApprovalResolved((sig) => {
-          if (!persisted.enabled) return;
+          if (!persisted.enabled || ports.sense.snapshot().settings.paused) return;
           approvals.push({ at: sig.at, latencyMs: sig.latencyMs });
           persisted = {
             ...persisted,
@@ -481,8 +496,7 @@ export function createTomRuntime(ports: TomHostPorts, options?: TomRuntimeOption
       if (ports.sleep) {
         disposers.push(
           ports.sleep.subscribe(() => {
-            const snap = toSnapshot(cachedEval);
-            for (const listener of [...listeners]) listener(snap);
+            emitToListeners(toSnapshot(cachedEval));
           }),
         );
       }
@@ -507,9 +521,16 @@ export function createTomRuntime(ports: TomHostPorts, options?: TomRuntimeOption
         saveTimer = undefined;
       }
       for (const off of disposers.splice(0).reverse()) {
-        off();
+        try {
+          off();
+        } catch {
+          // ignore
+        }
       }
       listeners.clear();
+      lastPromptAtBySession.clear();
+      seenSignalSet.clear();
+      seenSignalQueue.length = 0;
       if (started && hadPendingSave) {
         await store.save({ ...persisted, lastUpdatedAt: nowFn() }).catch(() => undefined);
       }
@@ -526,7 +547,7 @@ export function createTomRuntime(ports: TomHostPorts, options?: TomRuntimeOption
 
     shouldDeferProactiveWork(): boolean {
       const snap = toSnapshot();
-      return !snap.paused && snap.guidance.deferNonCriticalInterruptions;
+      return !snap.paused && (snap.state === 'deep_focus' || snap.state === 'rapid_sprint');
     },
 
     panelModel(): TomPanelModel {

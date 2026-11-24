@@ -7,8 +7,8 @@
  */
 
 import { randomUUID } from 'node:crypto';
-import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
-import { dirname, join } from 'node:path';
+import { chmod, lstat, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
+import { dirname, join, resolve } from 'node:path';
 import { PARTNER_STATE_KINDS, type PartnerManualOverride, type PartnerStateKind } from '../shared/types.js';
 import {
   type CalibrationBiases,
@@ -112,15 +112,26 @@ export function normalizePersistedTomState(raw: unknown, now = Date.now()): Pers
   };
 }
 
+async function assertNotSymlink(targetPath: string): Promise<void> {
+  const st = await lstat(targetPath).catch(() => undefined);
+  if (st?.isSymbolicLink()) {
+    throw new Error('Refusing to read or write through symbolic link in ToM storage');
+  }
+}
+
 export class TomStateStore {
+  private readonly rootDir: string;
   private readonly filePath: string;
   private writeChain: Promise<void> = Promise.resolve();
 
   constructor(storageRoot: string) {
-    this.filePath = join(storageRoot, 'state.json');
+    this.rootDir = resolve(storageRoot);
+    this.filePath = join(this.rootDir, 'state.json');
   }
 
   async load(now = Date.now()): Promise<PersistedTomState> {
+    await assertNotSymlink(this.rootDir);
+    await assertNotSymlink(this.filePath);
     try {
       const text = await readFile(this.filePath, 'utf8');
       return normalizePersistedTomState(JSON.parse(text), now);
@@ -132,11 +143,17 @@ export class TomStateStore {
   save(state: PersistedTomState): Promise<void> {
     const payload = `${JSON.stringify(state, null, 2)}\n`;
     const run = async () => {
-      await mkdir(dirname(this.filePath), { recursive: true });
+      const dir = dirname(this.filePath);
+      await assertNotSymlink(dir);
+      await mkdir(dir, { recursive: true, mode: 0o700 });
+      await chmod(dir, 0o700).catch(() => undefined);
+      await assertNotSymlink(dir);
+      await assertNotSymlink(this.filePath);
       const tmp = `${this.filePath}.${process.pid}.${randomUUID().slice(0, 8)}.tmp`;
       try {
-        await writeFile(tmp, payload, 'utf8');
+        await writeFile(tmp, payload, { encoding: 'utf8', mode: 0o600 });
         await rename(tmp, this.filePath);
+        await chmod(this.filePath, 0o600).catch(() => undefined);
       } catch (err) {
         await rm(tmp, { force: true }).catch(() => undefined);
         throw err;
