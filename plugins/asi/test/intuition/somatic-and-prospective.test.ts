@@ -227,12 +227,26 @@ describe('前额叶躯体标记匹配器（SomaticMatcher）与前瞻记忆评�
         updatedAt: now - 120_000,
         surfacedCount: 0,
       },
+      {
+        id: 'pm_surfaced_expiring',
+        title: '已触发但逾期的未确认项',
+        instruction: '超过截止时间后自动转为 expired 不再滞留队列',
+        trigger: { kind: 'time', dueAt: now - 60_000 },
+        triggerSummary: '定时',
+        priority: 'normal',
+        status: 'surfaced',
+        expiresAt: now - 1,
+        createdAt: now - 120_000,
+        updatedAt: now - 60_000,
+        surfacedCount: 1,
+      },
     ];
 
     const reconciled = reconcileProspectiveLifecycle(items, now);
     expect(reconciled.changed).toBe(true);
     expect(reconciled.updated.find((i) => i.id === 'pm_snoozed')?.status).toBe('pending');
     expect(reconciled.updated.find((i) => i.id === 'pm_expiring')?.status).toBe('expired');
+    expect(reconciled.updated.find((i) => i.id === 'pm_surfaced_expiring')?.status).toBe('expired');
 
     // 匹配情境 + 已到期定时项
     const ctxMatched = evaluateProspectiveCues(reconciled.updated, {

@@ -227,12 +227,30 @@ describe('方向 B · ToM 全栈 Cordis 集成、100% Prompt Cache 恒定保护�
           callId: 'call_maint' as never,
         } as never),
       ).rejects.toThrow(/restricted to ordinary user sessions/);
+      // 仅传 scope 不传 agent 时（如诊断组装），asi-maint-* 与 subagent 同样被隔离为空串
+      const scopeOnlyMaint = await root.systemPrompt.assemble({ scope: maintAgent });
+      const scopeOnlySub = await root.systemPrompt.assemble({ scope: subAgent });
+      expect(scopeOnlyMaint.sections.find((s) => s.name === 'asi-tom')?.text).toBe('');
+      expect(scopeOnlySub.sections.find((s) => s.name === 'asi-tom')?.text).toBe('');
+
       archivedSessionIds.push(String(secondChatSession.id));
+      // 即使会话被标记归档，其静态 systemPrompt 依然与普通会话 100% 字节恒定（不破坏归档恢复后的 Prompt Cache），
+      // 而实时工具调用 partner_state 与 growth_status 均严格拦截已归档会话！
+      const promptWhileArchived = await root.systemPrompt.assemble({ agent: secondUserAgent, scope: secondUserAgent });
+      expect(promptWhileArchived.sections.find((s) => s.name === 'asi-tom')?.text).toBe(tomSectionBefore?.text);
       await expect(
         partnerTool?.execute({}, {
           agent: secondUserAgent,
           signal: new AbortController().signal,
           callId: 'call_archived' as never,
+        } as never),
+      ).rejects.toThrow(/restricted to ordinary user sessions/);
+      const growthTool = root.tools.executable('growth_status', secondUserAgent);
+      await expect(
+        growthTool?.execute({}, {
+          agent: secondUserAgent,
+          signal: new AbortController().signal,
+          callId: 'call_growth_archived' as never,
         } as never),
       ).rejects.toThrow(/restricted to ordinary user sessions/);
       archivedSessionIds.length = 0;
