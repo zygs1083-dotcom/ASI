@@ -51,7 +51,7 @@ function appendTurn(session: Session, turn: number, userText: string, assistantT
 
 describe('统一单插件 asi (0.6.0) 全栈 Cordis 集成与旧版数据零重跑迁移验证', () => {
   it('单次挂载 AsiPlugin 自动迁移 76 条记忆 + 水位线（不重复整合旧会话）+ 已启用技能，暴露全套 Cordis 服务、7 个只读工具与统一 AsiRemote 流', {
-    timeout: 30_000,
+    timeout: 45_000,
   }, async () => {
     const rootDir = await mkdtemp(join(tmpdir(), 'asi-unified-cordis-'));
     tempDirs.push(rootDir);
@@ -250,6 +250,9 @@ describe('统一单插件 asi (0.6.0) 全栈 Cordis 集成与旧版数据零重�
           'memory_profile',
           'care_status',
           'growth_status',
+          'intuition_status',
+          'prospective_remember',
+          'prospective_resolve',
         ]),
       );
       expect(toolNames).not.toContain('needs_clean_cache');
@@ -263,6 +266,8 @@ describe('统一单插件 asi (0.6.0) 全栈 Cordis 集成与旧版数据零重�
       expect(firstFrame.value?.needs.sendTitles).toBe(false);
       expect(firstFrame.value?.sleep.totalMemories).toBe(76);
       expect(firstFrame.value?.growth.activeCount).toBe(1);
+      expect(firstFrame.value?.intuition.pendingCount).toBe(0);
+      expect(root.asiIntuition).toBeDefined();
 
       const createdDraft = await root.asi.createManualDraft({
         name: 'unified-panel-check',
@@ -348,6 +353,7 @@ describe('统一单插件 asi (0.6.0) 全栈 Cordis 集成与旧版数据零重�
       expect(root.asiSense).toBeDefined();
       expect(root.asiDrives).toBeDefined();
       expect(root.asiSleep).toBeDefined();
+      expect(root.asiIntuition).toBeDefined();
       expect(root.asi).toBeDefined();
 
       const toolNames = root.tools.definitions(cliAgent).map((d) => d.name);

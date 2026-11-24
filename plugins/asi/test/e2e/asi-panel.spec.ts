@@ -305,4 +305,57 @@ test.describe('ASI 统一侧栏面板 320px 响应式、明暗双主题与 axe �
 
     expect(errors).toEqual([]);
   });
+
+  test('「记忆库 -> 直觉与前瞻」子分区、跨页前瞻焦点条、即时躯体标记嗅探与前瞻 CRUD 全链路验证', async ({ page }) => {
+    const errors = watchErrors(page);
+    await page.setViewportSize({ width: 320, height: 940 });
+    await openUnifiedPanel(page, 'pending-approvals', 'dark', 'care');
+
+    // 1. 跨页焦点条展示已触发前瞻提醒，点击「查看前瞻」一键进入「记忆库 -> 直觉与前瞻」
+    await expect(page.getByTestId('spotlight-prospective-banner')).toContainText('核对发布前兼容版本与包审计');
+    await page.getByTestId('spotlight-jump-intuition').click();
+    await expect(page.getByTestId('tabpanel-memory')).toBeVisible();
+    await expect(page.getByTestId('memory-subtab-intuition')).toHaveAttribute('aria-pressed', 'true');
+    // 已进入直觉与前瞻页时，跨页前瞻焦点条自动隐退不重复占屏
+    await expect(page.getByTestId('spotlight-prospective-banner')).toHaveCount(0);
+
+    // 2. 320px 零水平溢出与 axe 无障碍检查（含展开新建表单与底部直觉闪回抽屉）
+    await expectNoOverflow(page);
+    await axeCheck(page);
+
+    // 3. 即时躯体标记风险嗅探
+    await page.getByTestId('intuition-scan-input').fill('修改侧栏 css 对比度 axe 检查');
+    await page.getByTestId('intuition-scan-btn').click();
+    await expect(page.getByTestId('intuition-scan-results')).toContainText('侧栏小字禁用裸绿/裸橙状态色');
+
+    // 4. 新建前瞻提醒、完成、延后与历史记录删除
+    await page.getByTestId('new-prospective-btn').click();
+    await expectNoOverflow(page);
+    await axeCheck(page);
+    const pmForm = page.getByTestId('create-prospective-form');
+    await pmForm.getByLabel('提醒标题').fill('合流前复核三分支契约');
+    await pmForm.getByLabel('触发执行指令').fill('检查 wire-types 与 release-audit 无冲突。');
+    await pmForm.getByLabel('工作区匹配词').fill('asi');
+    await pmForm.getByRole('button', { name: '保存前瞻' }).click();
+    await expect(page.getByRole('heading', { name: '合流前复核三分支契约' })).toBeVisible();
+
+    await page.getByRole('button', { name: '完成 核对发布前兼容版本与包审计' }).click();
+    await expect(page.getByTestId('intuition-feedback')).toContainText('已完成前瞻提醒');
+
+    await page.getByTestId('prospective-filter-history').click();
+    await expect(page.getByRole('heading', { name: '核对发布前兼容版本与包审计' })).toBeVisible();
+    await axeCheck(page);
+    await page.getByRole('button', { name: '删除记录 确认旧版目录迁移幂等标记' }).click();
+    await expect(page.getByRole('heading', { name: '确认旧版目录迁移幂等标记' })).toHaveCount(0);
+
+    // 5. 展开近期直觉闪回抽屉并提交反馈调节
+    const fbDrawer = page.getByTestId('drawer-intuition-flashbacks');
+    await fbDrawer.locator('> summary').click();
+    await expectNoOverflow(page);
+    await axeCheck(page);
+    await fbDrawer.getByRole('button', { name: '有帮助' }).click();
+    await expect(page.getByTestId('intuition-feedback')).toContainText('已标记有帮助');
+
+    expect(errors).toEqual([]);
+  });
 });

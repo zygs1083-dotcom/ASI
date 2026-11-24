@@ -27,6 +27,8 @@
 │  │    └─ 多工作树发现 + 2h 活跃豁免 + 仓库卫生/孤儿端口/闲置产物三级护栏   │
 │  ├─ L4 src/growth（tier: 4 · ctx.skills.registerProvider + growth_status） │
 │  │    └─ L1-L3 舒适 + 20m 深静默 -> 纯文本 SKILL.md 草案 -> 人工批准热挂载 │
+│  ├─ PFC src/intuition（tier: 3 · ctx.asiIntuition + intuition_status 等）  │
+│  │    └─ <10ms 本地躯体标记闪回 + 定时/情境/事件前瞻记忆 -> 尾部静默入队   │
 │  └─ 统一 TypeRT 服务 ctx.asi + 唯一侧栏面板（id: 'asi', order: 90）        │
 └────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -71,6 +73,12 @@
 1. **纯文本标准格式（MIT）**：改造自 `MineDojo/Voyager` 与 `agentskills/agentskills`，所有草案、已启用技能与归档技能均以纯文本 `SKILL.md` 存储在 `<storageRoot>/growth/skills/{drafts,active,archived}/`，强拦截任何可执行脚本生成引用与未授权工作区写入。
 2. **高证据阈值与 20 分钟深静默门控**：融合 `ctx.asiSleep` 高保留率（`>= 0.5` 或置顶）记忆与多步排障轨迹，仅当 L1–L3 全部舒适且全部普通会话空闲 `>= 20 分钟` 或锁屏时自动起草待审草案（`<= 2` 份/日，在途遇 L1–L3 激活立即抢占中断并回滚配额）。
 3. **人工批准热挂载与 60 天代谢**：新技能（`v1`）与增量修订（`v2+` 行级差异对比）一律须用户点击「批准启用」后才通过 `ctx.skills.registerProvider` 热挂载，支持 `global`/`workspace`（`cwd`）作用域在线切换、一键导出至 `.agents/skills/<name>/SKILL.md` 及连续 `60` 天零调用代谢归档建议；普通对话仅暴露只读工具 `growth_status`。
+
+## 6A. 前额叶直觉闪回与前瞻记忆（`src/intuition/`）
+
+1. **腹内侧前额叶躯体标记闪回（vmPFC Gut-Feeling）**：复用 `MiniSearch` 指纹索引与 FSRS 保留率权重，在 `<10ms` 纯本地零 Token 扫描 consolidated `pitfall`/`decision`/`preference` 记忆与本轮重复报错疤痕（`SomaticScar`），支持 `helpful` / `dismissed` / `muted` 反馈调节与同会话 30 分钟冷却防刷屏。
+2. **极前额叶前瞻记忆（BA10 Prospective Memory）**：支持 `time`（定时到期）、`context`（工作区/关键词/前台应用，严守 `sendTitles` 隐私门控）与 `event`（`next_session` / `tool_call` / `sleep_completed` / `job_finished` / `network_online`）三类触发器及 `pending -> surfaced -> fulfilled/snoozed/canceled/expired` 完整生命周期，持久化于 `<storageRoot>/intuition/`。
+3. **100% 保护前缀 Prompt Cache 的尾部触达与闭环工具**：绝不动态修改 `systemPrompt` 或唤醒空闲会话；空闲触发经 `agent.send(..., 'next-turn', false)` 与 `inbox.replace` 原位合并入队，新轮次入口经 `agent/pre-step`（`step === 1`）尾部追加 `<asi-intuition>`，向日常对话暴露 `intuition_status`、`prospective_remember`、`prospective_resolve` 并暴露 `ctx.asiIntuition` 服务。
 
 ## 7. 统一侧栏界面（`id: 'asi'`，`order: 90`）
 
