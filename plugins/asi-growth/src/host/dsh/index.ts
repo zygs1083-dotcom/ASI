@@ -62,7 +62,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
 
   try {
     offTools = registerGrowthTools(ctx, runtime);
-    offSkills = registerDshSkillBridge(ctx, runtime.skillBridge);
+    offSkills = registerDshSkillBridge(ctx, runtime.skillBridge, config.storageRoot);
     await runtime.start();
     if (disposed) {
       await dispose();

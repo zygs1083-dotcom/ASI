@@ -7,9 +7,19 @@ import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { Context } from '@deepseek-ai/cordis';
 import { type Agent, emitAgentEvent } from '@deepseek-ai/dsh-agent';
-import { createAssistantMessage, createUserMessage } from '@deepseek-ai/dsh-llm';
+import {
+  createAssistantMessage,
+  createUserMessage,
+  type GenerateOptions,
+  LlmAdapter,
+  type LlmModelInfo,
+  type LlmProviderInfo,
+  type LlmResolvedModelInfo,
+  LlmRuntime,
+  type StreamChunk,
+} from '@deepseek-ai/dsh-llm';
 import { createScope } from '@deepseek-ai/dsh-scope';
-import SessionStore, { type Session, SessionId } from '@deepseek-ai/dsh-session';
+import SessionStore, { Session, SessionId } from '@deepseek-ai/dsh-session';
 import SkillRegistry from '@deepseek-ai/dsh-skill';
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt';
 import { NativeToolExecutor } from '@deepseek-ai/dsh-tool-executor-native';
@@ -331,13 +341,26 @@ describe('五插件全栈 Cordis 联合集成（asi-sense + asi-needs + asi-slee
       const approved = await root.asiGrowth.approveDraft(draftId);
       expect(approved.status).toBe('active');
 
-      // 全局作用域下 wsAlpha 与 wsBeta 均可见
+      // 全局作用域下 wsAlpha 与 wsBeta 均可见，但 ASI 内部目录与子代理/内部会话严格不可见！
       const alphaCatalogGlobal = await root.skills.list({ cwd: wsAlpha });
       expect(alphaCatalogGlobal.map((s) => s.name)).toContain(approved.name);
+      expect(await root.skills.list({ cwd: join(dir, 'needs', 'sandbox') })).toEqual([]);
+      expect(await root.skills.list({ cwd: join(dir, 'sleep') })).toEqual([]);
+      const subagentScope = { id: subagentSession.id, session: subagentSession } as never;
+      expect(await root.skills.list({ cwd: wsBeta, scope: subagentScope })).toEqual([]);
       const loadedDef = await root.skills.get(approved.name, { cwd: wsAlpha });
       expect(loadedDef?.provider).toBe('asi-growth');
       expect(loadedDef?.content).toContain('Cordis');
       expect(loadedDef?.content).not.toContain(fakeSecret);
+
+      // 子代理与 asi-* 内部会话调用 growth_status 也被严格拒绝
+      await expect(
+        statusTool?.execute({}, {
+          agent: { id: subagentSession.id, session: subagentSession } as never,
+          signal: new AbortController().signal,
+          callId: 'gs-sub-deny' as never,
+        } as never),
+      ).rejects.toThrow(/ordinary user sessions/);
 
       // 切换为 wsAlpha 工作区专属作用域 -> wsAlpha 可见，wsBeta 与无 cwd 立即不可见（热重载生效）！
       await root.asiGrowth.setSkillScope(approved.name, { scope: 'workspace', workspacePath: wsAlpha });
@@ -346,8 +369,7 @@ describe('五插件全栈 Cordis 联合集成（asi-sense + asi-needs + asi-slee
       expect((await root.skills.list({})).map((s) => s.name)).not.toContain(approved.name);
       expect(await root.skills.get(approved.name, { cwd: wsBeta })).toBeUndefined();
 
-      // 6. 模拟真实会话调用该技能并正常完成回合 -> turnCompletionRate 自动记录为 1 (100%)
-      userSession.append('turn/start', { turn: 50 });
+      // 6. 模拟真实会话在 turn/start 之前先投递 user/message (skill-invocation) 并正常完成回合 -> turnCompletionRate 仍精确记录为 1 (100%)
       userSession.append(
         'user/message',
         createUserMessage({
@@ -356,6 +378,7 @@ describe('五插件全栈 Cordis 联合集成（asi-sense + asi-needs + asi-slee
         }),
         { surfaceOp: 'append' },
       );
+      userSession.append('turn/start', { turn: 50 });
       userSession.append('turn/end', { turn: 50, reason: { kind: 'completed' } });
 
       const statusAfterTurn = (await statusTool?.execute({ status: 'active' }, {
@@ -441,5 +464,174 @@ describe('五插件全栈 Cordis 联合集成（asi-sense + asi-needs + asi-slee
     expect([...growthClasses].filter((c) => needsClasses.has(c))).toEqual([]);
     expect([...growthClasses].filter((c) => sleepClasses.has(c))).toEqual([]);
     expect([...sleepClasses].filter((c) => needsClasses.has(c))).toEqual([]);
+  });
+
+  it('真实挂载 LlmRuntime + sessionQuery 冷会话水合：从冷会话复现轨迹触发 L4 并通过流式 LLM 提炼 SKILL.md', {
+    timeout: 25_000,
+  }, async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'asi-growth-cold-llm-'));
+    tempDirs.push(dir);
+    const wsCold = join(dir, 'work', 'cold-repo');
+    await mkdir(wsCold, { recursive: true });
+
+    // 构造 2 个不驻留在 ctx.sessions 的离线持久化冷会话（相同排障主题复现 >=2 次）
+    const coldS1 = Session.create(SessionId('cold-sess-1'), undefined, {
+      version: 4,
+      id: SessionId('cold-sess-1'),
+      createdAt: Date.now() - 3_600_000,
+      cwd: wsCold,
+      isSeeded: false,
+    });
+    const coldS2 = Session.create(SessionId('cold-sess-2'), undefined, {
+      version: 4,
+      id: SessionId('cold-sess-2'),
+      createdAt: Date.now() - 1_800_000,
+      cwd: wsCold,
+      isSeeded: false,
+    });
+
+    for (const [idx, cs] of [coldS1, coldS2].entries()) {
+      cs.append('model/selection', { provider: 'mock-llm', model: 'synth-v1' });
+      cs.append('turn/start', { turn: 1 });
+      cs.append('step/start', { turn: 1, step: 1 });
+      cs.append(
+        'user/message',
+        createUserMessage({
+          source: { kind: 'user' },
+          content: [{ type: 'text', text: `排查 SQLite BUSY_TIMEOUT 锁表失败问题 #${idx + 1}` }],
+        }),
+        { surfaceOp: 'append' },
+      );
+      cs.append('tool/call', { callId: `c-${idx}-1` as never, name: 'read_file', input: {} } as never);
+      cs.append('tool/call', { callId: `c-${idx}-2` as never, name: 'edit_file', input: {} } as never);
+      cs.append(
+        'assistant/message',
+        {
+          turn: 1,
+          step: 1,
+          message: createAssistantMessage({
+            source: { provider: 'mock-llm', model: 'synth-v1' },
+            content: [{ type: 'text', text: '开启 WAL 模式与 busy_timeout=5000 后恢复正常。' }],
+          }),
+          stream: [],
+        },
+        { surfaceOp: 'append' },
+      );
+      cs.append('step/end', { turn: 1, step: 1 });
+      cs.append('turn/end', { turn: 1, reason: { kind: 'completed' } });
+    }
+
+    let capturedPrompt = '';
+    class MockSynthAdapter extends LlmAdapter {
+      override providerInfo(provider: string): LlmProviderInfo {
+        return { id: provider, name: 'Mock Synth' };
+      }
+      override async listModels(provider: string): Promise<readonly LlmModelInfo[]> {
+        return [{ id: 'synth-v1', name: 'Synth V1', provider }];
+      }
+      override async resolveModel(provider: string, model: string): Promise<LlmResolvedModelInfo> {
+        return { id: model, name: model, provider };
+      }
+      override async *stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
+        const firstBlock = options.messages[0]?.content[0];
+        if (firstBlock?.type === 'text') capturedPrompt = firstBlock.text;
+        const jsonPayload = JSON.stringify({
+          description: 'Configure SQLite WAL mode and busy_timeout to eliminate lock contention failures.',
+          whenToUse: 'Use when diagnosing SQLite SQLITE_BUSY or database lock timeouts.',
+          body: '# SQLite Lock Contention Guard\n\n## Standard Procedure\n1. Enable PRAGMA journal_mode=WAL.\n2. Set PRAGMA busy_timeout=5000.',
+        });
+        yield { type: 'text-delta', index: 0, text: jsonPayload.slice(0, 40) };
+        yield { type: 'text-delta', index: 0, text: jsonPayload.slice(40) };
+        yield { type: 'finish', reason: { kind: 'stop' } };
+      }
+    }
+
+    const root = new Context();
+    await root.plugin(SystemPrompt);
+    await root.plugin(ToolsService);
+    await root.plugin(SessionStore);
+    await root.plugin(SkillRegistry);
+    await root.plugin(LlmRuntime);
+    root.llm.registerAdapter(['mock-llm'], new MockSynthAdapter());
+    root.tools.setExecutor(new NativeToolExecutor(root));
+
+    root.provide('agents', { list: () => [], get: () => undefined, withoutInitiator: <T>(fn: () => T) => fn() });
+    root.provide('jobs', { list: () => [], kill: () => 'already-finished', events: { subscribe: () => () => {} } });
+    root.provide('sessionProjections', { snapshot: () => ({ values: {} }) });
+    root.provide('tokenMeter', { contextPressure: () => ({}) });
+    root.provide('workspaceRegistry', { archivedSessionIds: [], create: async () => ({}), list: () => [] });
+    root.provide('profileContext', {
+      name: 'profile-cold',
+      dir,
+      patchPath: '',
+      installAnchor: '',
+      cwd: '',
+      home: dir,
+      startedBundles: ['asi-sense', 'asi-needs', 'asi-growth'],
+      overlays: [],
+      telemetryDisabledEnv: undefined,
+    });
+    root.provide('sessionController', {
+      create: async () => ({ sessionId: SessionId('unused') }),
+      rename: async () => ({ title: '', seq: 1 }),
+      resolveAgent: async () => ({ error: new Error('none') }),
+    });
+    root.provide('sessionQuery', {
+      listSessions: async () => [
+        { header: coldS1.header, live: false },
+        { header: coldS2.header, live: false },
+      ],
+      readTitle: async (id: string) => ({ title: `Cold SQLite #${id}`, seq: 1 }),
+      readSession: async (id: string) => {
+        const target = String(id) === 'cold-sess-1' ? coldS1 : coldS2;
+        return {
+          session: target.header,
+          events: target.ownEvents(),
+          inheritedEventCount: 0,
+        };
+      },
+    });
+
+    const senseFork = await root.plugin(AsiSensePlugin, {
+      storageRoot: join(dir, 'sense'),
+      helperPath: join(dir, 'nonexistent-helper'),
+      intervalMs: 10_000,
+    });
+    const needsFork = await root.plugin(AsiNeedsPlugin, { storageRoot: join(dir, 'needs') });
+    const growthFork = await root.plugin(AsiGrowthPlugin, { storageRoot: join(dir, 'growth') });
+
+    try {
+      await vi.waitFor(
+        () => {
+          const d = root.asiDrives.snapshot().drives.find((x) => x.key === 'asi-growth:skill_synthesis');
+          expect(d?.satisfaction).toBeLessThan(60);
+        },
+        { timeout: 5_000 },
+      );
+
+      const rec = await root.asiGrowth.synthesizeNow();
+      expect(rec.draftsCreated).toBe(1);
+      expect(capturedPrompt).toContain('BUSY_TIMEOUT');
+
+      const userSession = root.sessions.create(SessionId('verify-cold-user'), {
+        meta: { cwd: wsCold, isSeeded: false },
+      });
+      const userAgent = { id: userSession.id, status: 'idle', session: userSession } as unknown as Agent;
+      const statusTool = root.tools.executable('growth_status', userAgent);
+      const snap = (await statusTool?.execute({ status: 'draft' }, {
+        agent: userAgent,
+        signal: new AbortController().signal,
+        callId: 'gs-cold' as never,
+      } as never)) as { drafts: Array<{ id: string; description: string; scope: string }> };
+
+      expect(snap.drafts).toHaveLength(1);
+      expect(snap.drafts[0]?.description).toContain('SQLite WAL mode');
+      expect(snap.drafts[0]?.scope).toBe('workspace');
+    } finally {
+      growthFork.dispose();
+      needsFork.dispose();
+      senseFork.dispose();
+      await new Promise((r) => setTimeout(r, 25));
+    }
   });
 });

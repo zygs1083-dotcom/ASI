@@ -77,11 +77,71 @@ describe('agentskills SKILL.md parser, validator, sanitizer, and line diff', () 
     });
     expect(withExecutableScript.valid).toBe(false);
     expect(withExecutableScript.errors.join(' ')).toContain('scripts/*');
+
+    const withNestedScript = validateSkillDocument({
+      name: 'bad-nested-script',
+      description: 'Valid description for testing nested bundled script rejection.',
+      body: '# Steps\n1. Execute [helper](../scripts/nested/exfiltrate.ts) to mutate files.',
+    });
+    expect(withNestedScript.valid).toBe(false);
+
+    const withFrontmatterScript = validateSkillDocument({
+      name: 'bad-fm-script',
+      description: 'Valid description for testing frontmatter script rejection.',
+      whenToUse: 'Run ./scripts/sub/deploy.bash before release.',
+      body: '# Safe Body\n1. Check types.',
+    });
+    expect(withFrontmatterScript.valid).toBe(false);
+
+    const overlongWhenRaw = [
+      '---',
+      'name: overlong-when-skill',
+      'description: Valid description for testing overlong when-to-use rejection.',
+      `when-to-use: ${'x'.repeat(510)}`,
+      '---',
+      '',
+      '# Body',
+    ].join('\n');
+    const overlongWhenParsed = parseSkillMarkdown(overlongWhenRaw);
+    expect(overlongWhenParsed.valid).toBe(false);
+    expect(overlongWhenParsed.errors.join(' ')).toContain('when-to-use');
+
+    const dirtyMetaKeyTok = ['ghp', 'A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6'].join('_');
+    const dirtyMetaRaw = [
+      '---',
+      'name: dirty-meta-key',
+      'description: Valid description for testing credential metadata key rejection.',
+      'metadata:',
+      `  ${dirtyMetaKeyTok}: secret`,
+      '---',
+      '',
+      '# Body',
+    ].join('\n');
+    expect(parseSkillMarkdown(dirtyMetaRaw).valid).toBe(false);
+
+    const specialYamlValues = renderSkillMarkdown({
+      name: 'yaml-edge-scalars',
+      description: 'Valid description for testing YAML special scalar quoting.',
+      metadata: {
+        tilde: '~',
+        hyphen: '- leading-item',
+        [dirtyMetaKeyTok]: 'dropped-key',
+      },
+      body: '# Body\n1. Verify round-trip.',
+    });
+    const reparsedSpecial = parseSkillMarkdown(specialYamlValues);
+    expect(reparsedSpecial.valid).toBe(true);
+    expect(reparsedSpecial.document?.metadata?.tilde).toBe('~');
+    expect(reparsedSpecial.document?.metadata?.hyphen).toBe('- leading-item');
   });
 
-  it('redacts single-line and cross-line credentials and masks homeDir while preserving Markdown newlines', () => {
-    const fakeGhp = ['ghp', 'A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6'].join('_');
+  it('redacts single-line, blank-line cross-line, Unicode zero-width, and multi-line PEM credentials while preserving Markdown newlines', () => {
+    const fakeGhp = ['ghp', '\u200bA1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6'].join('_');
+    const rawGhpAscii = 'A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6';
     const fakeCrossSecret = ['SuperSecret99', 'TokenValue8877'].join('_');
+    const pemHeader = ['-----', 'BEGIN OPENSSH PRIVATE KEY', '-----'].join('');
+    const pemTailShort = 'ShortKeyTail9876==';
+    const pemFooter = ['-----', 'END OPENSSH PRIVATE KEY', '-----'].join('');
     const fakeHome = ['', 'Users', 'inventedtester'].join('/');
 
     const dirtyMd = [
@@ -93,9 +153,15 @@ describe('agentskills SKILL.md parser, validator, sanitizer, and line diff', () 
       '# Redaction Guard',
       '',
       `- Config path: ${fakeHome}/.config/demo.json`,
-      '- Cross-line auth header:',
+      '- Blank-line separated auth header:',
       'Authorization:',
+      '',
       `  ${fakeCrossSecret}`,
+      '- Embedded PEM block:',
+      pemHeader,
+      'b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMw==',
+      pemTailShort,
+      pemFooter,
       '- Keep normal step formatting intact.',
     ].join('\n');
 
@@ -103,8 +169,9 @@ describe('agentskills SKILL.md parser, validator, sanitizer, and line diff', () 
     expect(parsed.valid).toBe(true);
     if (!parsed.document) throw new Error('expected parsed document');
     const out = renderSkillMarkdown(parsed.document, fakeHome);
-    expect(out).not.toContain(fakeGhp);
+    expect(out).not.toContain(rawGhpAscii);
     expect(out).not.toContain(fakeCrossSecret);
+    expect(out).not.toContain(pemTailShort);
     expect(out).not.toContain(fakeHome);
     expect(out).toContain('~/proj');
     expect(out).toContain('~/.config/demo.json');

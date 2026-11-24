@@ -1,6 +1,6 @@
 import { realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { dirname, join, resolve, sep } from 'node:path';
+import { basename, dirname, join, resolve, sep } from 'node:path';
 import type { AsiSleepServiceApi } from '@asi/sense-types';
 import type { Context } from '@deepseek-ai/cordis';
 import type { Agent } from '@deepseek-ai/dsh-agent';
@@ -44,10 +44,12 @@ function isSameOrInsideRoot(candidate: string | undefined, root: string | undefi
 
 export function buildExcludedInternalRoots(storageRoot: string, senseStorageRoot?: string): string[] {
   const roots = new Set<string>([storageRoot]);
+  const shortSiblingNames = new Set(['sense', 'needs', 'sleep', 'care', 'growth']);
   for (const anchor of [storageRoot, senseStorageRoot]) {
     if (!anchor) continue;
     roots.add(anchor);
     const parent = dirname(anchor);
+    const anchorBase = basename(anchor).toLowerCase();
     if (parent && parent !== '/' && parent !== '.') {
       roots.add(join(parent, 'asi-sense'));
       roots.add(join(parent, 'asi-needs'));
@@ -56,9 +58,15 @@ export function buildExcludedInternalRoots(storageRoot: string, senseStorageRoot
       roots.add(join(parent, 'asi-growth'));
       roots.add(join(parent, 'needs', 'sandbox'));
       roots.add(join(parent, 'sleep', 'vault'));
+      roots.add(join(parent, 'sleep', 'memories'));
       roots.add(join(parent, 'care', 'sandbox'));
       roots.add(join(parent, 'growth', 'skills'));
       roots.add(join(parent, 'growth', 'sandbox'));
+      if (shortSiblingNames.has(anchorBase)) {
+        for (const sib of shortSiblingNames) {
+          roots.add(join(parent, sib));
+        }
+      }
     }
   }
   return [...roots];
@@ -113,6 +121,16 @@ export function extractTrajectoryTurnsFromOwnEvents(
     if (event.type === 'turn/start') {
       sawTurnLifecycle = true;
       activeTurnNumber = event.data.turn;
+      if (
+        current &&
+        current.turnNumber === undefined &&
+        current.assistantTexts.length === 0 &&
+        current.toolNames.length === 0
+      ) {
+        current.turnNumber = event.data.turn;
+        current.closedStatus = 'open';
+        current.stepCount = Math.max(current.stepCount, 1);
+      }
       continue;
     }
 
@@ -424,8 +442,29 @@ export function createDshGrowthPorts(
           const sid = String(session.id);
           if (!isOrdinaryDshSession(session, excludedRoots) || isArchived(sid)) return;
 
-          if (event.type === 'turn/start') {
-            activeTurnSkillsBySession.set(sid, new Set<string>());
+          if (event.type === 'agent/inbox/spliced') {
+            const spliceData = event.data as {
+              outcome?: unknown;
+              inserted?: ReadonlyArray<{ source?: { kind?: unknown; name?: unknown } }>;
+            };
+            if (spliceData?.outcome === 'canceled' && (!spliceData.inserted || spliceData.inserted.length === 0)) {
+              activeTurnSkillsBySession.delete(sid);
+              return;
+            }
+            for (const msg of spliceData?.inserted ?? []) {
+              if (
+                msg?.source?.kind === 'skill-invocation' &&
+                typeof msg.source.name === 'string' &&
+                isValidSkillName(msg.source.name)
+              ) {
+                let set = activeTurnSkillsBySession.get(sid);
+                if (!set) {
+                  set = new Set<string>();
+                  activeTurnSkillsBySession.set(sid, set);
+                }
+                set.add(msg.source.name);
+              }
+            }
             return;
           }
 
@@ -714,7 +753,27 @@ export function createDshGrowthPorts(
  * via `ctx.skills.registerProvider`, supporting instant hot-reload (`control.invalidate()`)
  * and `global` vs `workspace` (`options.cwd`) scope isolation.
  */
-export function registerDshSkillBridge(ctx: Context, bridge: GrowthSkillCatalogBridge): () => void {
+export function registerDshSkillBridge(
+  ctx: Context,
+  bridge: GrowthSkillCatalogBridge,
+  storageRoot?: string,
+): () => void {
+  const excludedRoots = storageRoot ? buildExcludedInternalRoots(storageRoot, ctx.asiSense?.storageRoot) : [];
+
+  const isExcludedSkillLookup = (options: SkillLookupOptions): boolean => {
+    if (options.cwd) {
+      if (INTERNAL_CWD_RE.test(options.cwd)) return true;
+      if (excludedRoots.some((r) => isSameOrInsideRoot(options.cwd, r))) return true;
+    }
+    const rawScope = (options as { scope?: { id?: unknown; session?: Session } }).scope;
+    if (rawScope && typeof rawScope === 'object') {
+      const sid = typeof rawScope.id === 'string' ? rawScope.id : String(rawScope.session?.id ?? '');
+      if (sid && INTERNAL_SESSION_ID_RE.test(sid)) return true;
+      if (rawScope.session && !isOrdinaryDshSession(rawScope.session, excludedRoots)) return true;
+    }
+    return false;
+  };
+
   const mountOnRegistry = (registry: Context['skills']): (() => void) => {
     let offInvalidate: (() => void) | undefined;
     const offProvider = registry.registerProvider((control): SkillProvider => {
@@ -729,6 +788,7 @@ export function registerDshSkillBridge(ctx: Context, bridge: GrowthSkillCatalogB
           if (options.signal?.aborted) {
             throw options.signal.reason ?? new Error('Aborted');
           }
+          if (isExcludedSkillLookup(options)) return [];
           const items = bridge.listCandidates(options.cwd);
           return items.map(
             (item): SkillCandidate => ({
@@ -749,6 +809,7 @@ export function registerDshSkillBridge(ctx: Context, bridge: GrowthSkillCatalogB
           if (options.signal?.aborted) {
             throw options.signal.reason ?? new Error('Aborted');
           }
+          if (isExcludedSkillLookup(options)) return undefined;
           const loaded = await bridge.loadDefinition(candidate.name, options.cwd);
           if (!loaded) return undefined;
           return {

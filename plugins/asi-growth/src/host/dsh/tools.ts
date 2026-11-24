@@ -13,6 +13,7 @@ import { defineTool, ToolArgsError, ToolContextUnavailableError, type ToolRunCon
 import type { JsonValue } from '@deepseek-ai/dsh-util-values';
 import type { SkillScope } from '../../shared/types.js';
 import type { GrowthRuntime } from '../runtime.js';
+import { INTERNAL_SESSION_ID_RE } from './dsh-ports.js';
 
 const STATUS_FILTERS = ['draft', 'active', 'disabled', 'archived', 'stale'] as const;
 const SCOPE_FILTERS: readonly SkillScope[] = ['global', 'workspace'];
@@ -24,6 +25,14 @@ const output = {
 
 function requireAgent(exec: ToolRunContext): Agent {
   if (!exec.agent) throw new ToolContextUnavailableError('asi-growth tools require an active agent');
+  const sid = String(exec.agent.id ?? exec.agent.session?.id ?? '');
+  if (
+    INTERNAL_SESSION_ID_RE.test(sid) ||
+    exec.agent.session?.header?.origin === 'subagent' ||
+    (typeof exec.agent.session?.header?.delegationDepth === 'number' && exec.agent.session.header.delegationDepth > 0)
+  ) {
+    throw new ToolContextUnavailableError('growth_status is restricted to ordinary user sessions');
+  }
   return exec.agent;
 }
 

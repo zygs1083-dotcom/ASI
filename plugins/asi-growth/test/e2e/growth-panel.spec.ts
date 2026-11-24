@@ -91,11 +91,13 @@ test.describe('GrowthPanel「技能工坊」320px 响应式布局与 axe 无障�
       '.agents/skills/playwright-contrast-guard/SKILL.md',
     );
 
-    // 4. 停用再重新启用
+    // 4. 停用时标签徽标精确展示 1/2，再重新启用恢复为 2
     await page.getByRole('button', { name: '停用 playwright-contrast-guard' }).click();
     await expect(page.locator('[data-skill-name="playwright-contrast-guard"]')).toContainText('已停用');
+    await expect(page.getByTestId('tab-active')).toContainText('已启用 (1/2)');
     await page.getByRole('button', { name: '启用 playwright-contrast-guard' }).click();
     await expect(page.locator('[data-skill-name="playwright-contrast-guard"]')).toContainText('已启用 · 热挂载');
+    await expect(page.getByTestId('tab-active')).toContainText('已启用 (2)');
 
     // 5. 识别 60+ 天零调用陈旧技能并一键归档，随后在「已归档」页恢复启用
     await expect(page.getByTestId('stale-skill-badge')).toContainText('68天零调用 · 建议归档');
@@ -122,6 +124,16 @@ test.describe('GrowthPanel「技能工坊」320px 响应式布局与 axe 无障�
 
     await page.getByTestId('synthesize-now-btn').click();
     await expect(page.getByTestId('growth-feedback')).toContainText('提炼 1 份待审 SKILL.md 草案');
+
+    // 7. 自定义工作区导出路径输入分支同样通过 320px/340px 与 axe 扫描
+    await page.getByTestId('tab-active').click();
+    await page.getByLabel('导出目标工作区 playwright-contrast-guard').selectOption({ value: '__custom__' });
+    await page.getByLabel('自定义导出工作区路径 playwright-contrast-guard').fill('/tmp/custom-target-repo');
+    await axeCheck(page);
+    await page.getByRole('button', { name: '导出至 .agents/skills playwright-contrast-guard' }).click();
+    await expect(page.getByTestId('growth-feedback')).toContainText(
+      '/tmp/custom-target-repo/.agents/skills/playwright-contrast-guard/SKILL.md',
+    );
 
     await expectNoOverflow(page);
     await axeCheck(page);

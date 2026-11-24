@@ -335,17 +335,34 @@ describe('asi-growth high-evidence threshold, 20m deep quiet gate, L1-L3 preempt
         makeMem('m_ep3', 'episode', 'esbuild-css', '进展 3', '完成三版'),
         makeMem('m_low', 'pitfall', 'esbuild-css', '已遗忘旧条目', '保留率过低', 0.25),
       );
-      // 仅 1 次排障轨迹 -> 也不触发！
-      h.turns.push({
-        turnId: 't1',
-        sessionId: 's1',
-        at: h.getNow(),
-        stepCount: 3,
-        toolNames: ['read_file', 'edit_file'],
-        hadToolError: true,
-        userText: '排查端口 EADDRINUSE 启动失败报错',
-        assistantText: '已定位残留进程并改用独立端口解决。',
-      });
+      // 仅 1 次排障轨迹 + 另 1 次共享相同工具名 (read_file/edit_file) 但主题完全无关的排障轨迹 -> 绝不跨主题误合并触发！
+      h.turns.push(
+        {
+          turnId: 't1',
+          sessionId: 's1',
+          at: h.getNow(),
+          stepCount: 3,
+          toolNames: ['read_file', 'edit_file'],
+          hadToolError: true,
+          userText: '排查端口 EADDRINUSE 启动失败报错',
+          assistantText: '已定位残留进程并改用独立端口解决。',
+        },
+        {
+          turnId: 't_unrelated',
+          sessionId: 's_other',
+          at: h.getNow(),
+          stepCount: 3,
+          toolNames: ['read_file', 'edit_file'],
+          hadToolError: true,
+          userText: 'Fix Safari flexbox overflow clipping bug on header toolbar',
+          assistantText: 'Added min-width: 0 to flex child container.',
+        },
+      );
+      // 不同显式 topicKey 但共享通用标签的记忆也绝不误合并
+      h.memories.push(
+        { ...makeMem('m_other_1', 'pitfall', 'unrelated-sql', 'SQL 索引踩坑', '避免全表扫描'), tags: ['typescript'] },
+        { ...makeMem('m_other_2', 'decision', 'unrelated-auth', '鉴权会话策略', '严格校验签名'), tags: ['typescript'] },
+      );
       h.emitSleepChange();
       expect(runtime.panelModel().drive.satisfaction).toBe(100);
       expect(runtime.panelModel().drive.readyClusters).toBe(0);
@@ -553,7 +570,7 @@ describe('asi-growth high-evidence threshold, 20m deep quiet gate, L1-L3 preempt
       expect(loadedAfterHandEdit?.content).not.toContain(leakedTok);
       expect(await readFile(diskPath, 'utf8')).not.toContain(leakedTok);
 
-      // 4. 推进 61 天零调用 -> 自动标记 stale = true（建议归档），一键归档卸载并可恢复！
+      // 4. 推进 61 天零调用 -> 自动标记 stale = true（建议归档），一键归档卸载且绝不将已归档旧证据重复提炼为僵尸新草案！
       h.advanceMs(61 * 86_400_000);
       const staleView = runtime.panelModel().skills.find((s) => s.name === v2Skill.name);
       expect(staleView?.stale).toBe(true);
@@ -562,19 +579,57 @@ describe('asi-growth high-evidence threshold, 20m deep quiet gate, L1-L3 preempt
       await runtime.actions.archiveSkill(v2Skill.name);
       expect(runtime.skillBridge.listCandidates()).toHaveLength(0);
       expect(runtime.panelModel().archivedCount).toBe(1);
+      // 归档后旧记忆（p1..p4）虽仍在记忆库中，但绝不能反弹触发 L4 不适或重复起草 pnpm-pack-2！
+      expect(runtime.panelModel().drive.readyClusters).toBe(0);
+      expect(runtime.panelModel().drive.satisfaction).toBe(100);
+      const noDupAfterArchive = await runtime.actions.synthesizeNow();
+      expect(noDupAfterArchive.draftsCreated + noDupAfterArchive.revisionsCreated).toBe(0);
 
+      // 若归档技能对应主题后续又出现全新踩坑 p5 -> 应起草同名 v3 修订草案（而非新建 -2 技能），批准后恢复挂载为 v3 并清理 archived 目录
+      h.memories.push(
+        makeMem('p5', 'pitfall', 'pnpm-pack', '发布包必须包含 LICENSE', 'pack-dist 阶段需拷贝根目录 LICENSE'),
+      );
+      const v3Syn = await runtime.actions.synthesizeNow();
+      expect(v3Syn.revisionsCreated).toBe(1);
+      const v3Draft = runtime.panelModel().drafts[0];
+      expect(v3Draft?.name).toBe(v2Skill.name);
+      expect(v3Draft?.isRevision).toBe(true);
+      expect(v3Draft?.targetVersion).toBe(3);
+
+      const v3RestoredViaApprove = await runtime.actions.approveDraft(v3Draft?.id ?? '');
+      expect(v3RestoredViaApprove.version).toBe(3);
+      expect(v3RestoredViaApprove.status).toBe('active');
+      expect(runtime.panelModel().archivedCount).toBe(0);
+      expect(existsSync(runtime.vault.archivedSkillFilePath(v2Skill.name))).toBe(false);
+      expect(runtime.skillBridge.listCandidates()).toHaveLength(1);
+
+      // 再次归档并测试直接一键恢复
+      await runtime.actions.archiveSkill(v2Skill.name);
       const restored = await runtime.actions.restoreSkill(v2Skill.name);
       expect(restored.status).toBe('active');
       expect(runtime.skillBridge.listCandidates()).toHaveLength(1);
 
-      // 5. 安全导出至目标工作区 `.agents/skills/<name>/SKILL.md` 及符号链接/敏感目录拦截
+      // 5. 安全导出至目标工作区 `.agents/skills/<name>/SKILL.md` 及符号链接/敏感目录/作用域边界拦截
       const exported = await runtime.actions.exportSkillToWorkspace(v2Skill.name, wsGood);
       expect(existsSync(exported.exportedPath)).toBe(true);
       expect(await readFile(exported.exportedPath, 'utf8')).toContain(`name: ${v2Skill.name}`);
 
-      // 拦截导出至 ASI 内部 storageRoot、根目录及符号链接越界目录
+      // 拦截导出与 workspace 作用域绑定至 ASI 内部 storageRoot、根目录、相对路径及主目录根
       await expect(runtime.actions.exportSkillToWorkspace(v2Skill.name, rootDir)).rejects.toThrow(/internal ASI/);
       await expect(runtime.actions.exportSkillToWorkspace(v2Skill.name, '/')).rejects.toThrow(/root/);
+      await expect(
+        runtime.actions.setSkillScope(v2Skill.name, { scope: 'workspace', workspacePath: '/' }),
+      ).rejects.toThrow(/root/);
+      await expect(
+        runtime.actions.setSkillScope(v2Skill.name, { scope: 'workspace', workspacePath: 'relative/path' }),
+      ).rejects.toThrow(/absolute/);
+      await expect(
+        runtime.actions.setSkillScope(v2Skill.name, { scope: 'workspace', workspacePath: rootDir }),
+      ).rejects.toThrow(/internal ASI/);
+
+      // 校验内部目录 cwd 在 skillBridge 下严格返回空，不暴露全局技能
+      expect(runtime.skillBridge.listCandidates(rootDir)).toEqual([]);
+      expect(await runtime.skillBridge.loadDefinition(v2Skill.name, rootDir)).toBeUndefined();
 
       const wsWithSymlink = await mkdtemp(join(tmpdir(), 'asi-growth-ws-sym-'));
       tempDirs.push(wsWithSymlink);
@@ -621,6 +676,97 @@ describe('asi-growth high-evidence threshold, 20m deep quiet gate, L1-L3 preempt
       expect(draft).toBeDefined();
       expect(draft?.markdown).not.toContain('exfiltrate.sh');
       expect(draft?.markdown).toContain('[script:build.mjs]');
+    } finally {
+      await runtime.stop();
+    }
+  });
+
+  it('serializes concurrent syncExternalDiskEdits vs archiveSkill, deduplicates in-flight synthesis vs manual drafts, and avoids >2m turn double-counting', async () => {
+    const rootDir = await mkdtemp(join(tmpdir(), 'asi-growth-race-'));
+    const wsTarget = await mkdtemp(join(tmpdir(), 'asi-growth-race-ws-'));
+    tempDirs.push(rootDir, wsTarget);
+
+    const h = createHarness();
+    let releaseLlm: (() => void) | undefined;
+    let skillTurnListener:
+      | ((ev: { sessionId: string; skillNames: readonly string[]; completed: boolean; at: number }) => void)
+      | undefined;
+
+    const runtime = createGrowthRuntime({
+      storageRoot: rootDir,
+      clock: h.clock,
+      sense: h.sense,
+      drives: h.drives,
+      getSleep: () => h.sleepSvc,
+      onSleepChanged: h.sleepSvc.subscribe,
+      conversations: {
+        ...h.conversations,
+        onSkillTurnCompleted: (fn) => {
+          skillTurnListener = fn;
+          return () => {
+            skillTurnListener = undefined;
+          };
+        },
+      },
+      llmSynthesize: async () => {
+        if (releaseLlm) {
+          await new Promise<void>((resolve) => {
+            releaseLlm = resolve;
+          });
+        }
+        return undefined;
+      },
+    });
+    await runtime.start();
+
+    try {
+      h.memories.push(
+        makeMem('r1', 'pitfall', 'race-topic', '并发竞态踩坑 1', '异步读写必须串行化'),
+        makeMem('r2', 'decision', 'race-topic', '并发竞态决策 2', '提交前重验最新状态'),
+        makeMem('r3', 'preference', 'race-topic', '并发竞态偏好 3', '保持原子落盘'),
+      );
+
+      // 1. 在途提炼期间用户并发手动新建同主题草案 -> 绝不产生重复草案
+      releaseLlm = () => {};
+      const inflight = runtime.actions.synthesizeNow();
+      await vi.waitFor(() => expect(runtime.panelModel().synthesizing).toBe(true));
+
+      const manualDraft = await runtime.actions.createManualDraft({
+        name: 'race-topic',
+        description: 'Manual draft created concurrently while background synthesis is awaiting LLM.',
+        body: '# Race Topic\n\n1. Serialize vault operations.',
+      });
+      releaseLlm?.();
+      releaseLlm = undefined;
+      await inflight;
+      expect(runtime.panelModel().drafts).toHaveLength(1);
+      expect(runtime.panelModel().drafts[0]?.id).toBe(manualDraft.id);
+
+      // 2. 批准后验证：超长 5 分钟 (300_000ms) 回合绝不将单次 loadDefinition 重复计为 2 次调用
+      const approved = await runtime.actions.approveDraft(manualDraft.id);
+      await runtime.skillBridge.loadDefinition(approved.name);
+      h.advanceMs(300_000);
+      skillTurnListener?.({
+        sessionId: 's-long',
+        skillNames: [approved.name],
+        completed: true,
+        at: h.getNow(),
+      });
+      const afterLongTurn = runtime.panelModel().skills.find((s) => s.name === approved.name);
+      expect(afterLongTurn?.invocationCount).toBe(1);
+      expect(afterLongTurn?.evaluatedTurns).toBe(1);
+      expect(afterLongTurn?.turnCompletionRate).toBe(1);
+
+      // 3. 并发发起 syncExternalDiskEdits + exportSkillToWorkspace + archiveSkill -> 归档后磁盘 active 文件绝不复活
+      const [, , archived] = await Promise.all([
+        runtime.vault.syncExternalDiskEdits(),
+        runtime.actions.exportSkillToWorkspace(approved.name, wsTarget),
+        runtime.actions.archiveSkill(approved.name),
+      ]);
+      expect(archived.name).toBe(approved.name);
+      expect(runtime.panelModel().skills).toHaveLength(0);
+      expect(runtime.panelModel().archivedCount).toBe(1);
+      expect(existsSync(runtime.vault.activeSkillFilePath(approved.name))).toBe(false);
     } finally {
       await runtime.stop();
     }

@@ -20,7 +20,15 @@ export const MAX_WHEN_TO_USE_LENGTH = 500;
 export const MAX_COMPATIBILITY_LENGTH = 500;
 export const MAX_SKILL_BODY_LENGTH = 16_000;
 
-const BUNDLED_EXECUTABLE_REF_RE = /(?:^|[\s"'`(])(?:\.\/)?scripts\/[A-Za-z0-9_.-]+\.(?:sh|mjs|cjs|js|py|rb|pl)\b/i;
+const BUNDLED_EXECUTABLE_REF_RE =
+  /(?:^|[\s"'`([<])(?:(?:\.\.?\/)+)?scripts\/(?:[A-Za-z0-9_.-]+\/)*[A-Za-z0-9_.-]+\.(?:sh|bash|zsh|fish|mjs|cjs|js|ts|mts|cts|py|rb|pl|ps1|php)\b/i;
+
+const PEM_BEGIN_MARK = ['-----', 'BEGIN'].join('');
+const PEM_END_MARK = ['-----', 'END'].join('');
+const PEM_BLOCK_RE = new RegExp(
+  `${PEM_BEGIN_MARK} [A-Za-z0-9 _-]+-----[\\s\\S]*?(?:${PEM_END_MARK} [A-Za-z0-9 _-]+-----|$)`,
+  'g',
+);
 
 const CJK_SLUG_HINTS: ReadonlyArray<readonly [RegExp, string]> = [
   [/对比度|配色|深色|浅色|主题/, 'contrast-theme'],
@@ -85,7 +93,8 @@ export function sanitizeSkillText(input: string, maxChars: number, homeDir?: str
 
 export function sanitizeSkillMarkdownBody(input: string, maxChars = MAX_SKILL_BODY_LENGTH, homeDir?: string): string {
   if (!input) return '';
-  const normalizedNewlines = maskHomeDir(input.replace(/\r\n?/g, '\n'), homeDir);
+  const withoutPemBlocks = input.replace(/\r\n?/g, '\n').replace(PEM_BLOCK_RE, '[redacted]');
+  const normalizedNewlines = maskHomeDir(withoutPemBlocks, homeDir);
   const rawLines = normalizedNewlines.split('\n');
   const sanitizedLines: string[] = [];
 
@@ -101,13 +110,22 @@ export function sanitizeSkillMarkdownBody(input: string, maxChars = MAX_SKILL_BO
     sanitizedLines.push(`${indent}${cleanLine}`);
   }
 
-  // Catch cross-line credential pairs (e.g. `Authorization:` on line N + secret on line N+1)
-  for (let i = 0; i + 1 < sanitizedLines.length; i += 1) {
-    const pair = `${sanitizedLines[i]}\n${sanitizedLines[i + 1]}`;
+  // Catch cross-line credential pairs across adjacent non-empty lines (including up to 2 blank lines between key and secret)
+  for (let i = 0; i < sanitizedLines.length; i += 1) {
+    if (!sanitizedLines[i]?.trim()) continue;
+    let nextIdx = -1;
+    for (let step = 1; step <= 3 && i + step < sanitizedLines.length; step += 1) {
+      if (sanitizedLines[i + step]?.trim()) {
+        nextIdx = i + step;
+        break;
+      }
+    }
+    if (nextIdx < 0) continue;
+    const pair = `${sanitizedLines[i]}\n${sanitizedLines[nextIdx]}`;
     if (containsCredential(normalizeForModel(pair))) {
       const merged = maskHomeDir(sanitizeForModel(pair), homeDir);
       sanitizedLines[i] = merged;
-      sanitizedLines[i + 1] = '';
+      sanitizedLines[nextIdx] = '';
     }
   }
 
@@ -196,7 +214,8 @@ function quoteYamlScalarIfNeeded(value: string): string {
   if (!value) return '""';
   if (
     /^[\w./~ -]+$/.test(value) &&
-    !/^(?:true|false|null|yes|no|\d+(?:\.\d+)?)$/i.test(value) &&
+    !/^(?:true|false|null|yes|no|~|\d+(?:\.\d+)?)$/i.test(value) &&
+    !value.startsWith('-') &&
     value === value.trim()
   ) {
     return value;
@@ -252,9 +271,13 @@ export function parseSkillMarkdown(rawMarkdown: string, homeDir?: string): Skill
         }
         const subMatch = /^[ ]{2,}([A-Za-z0-9_.-]+)\s*:\s*(.*)$/.exec(sub);
         if (!subMatch) break;
-        const mk = sanitizeSkillText(subMatch[1] ?? '', 48, homeDir);
+        const rawMk = (subMatch[1] ?? '').trim();
+        const mk = sanitizeSkillText(rawMk, 48, homeDir);
+        if (!mk || mk !== rawMk || !/^[A-Za-z0-9_.-]+$/.test(mk)) {
+          return { valid: false, errors: ['metadata key contains disallowed or redacted characters'] };
+        }
         const mv = sanitizeSkillText(unquoteYamlScalar(subMatch[2] ?? ''), 200, homeDir);
-        if (mk) metadata[mk] = mv;
+        metadata[mk] = mv;
         i += 1;
       }
       continue;
@@ -299,7 +322,9 @@ export function parseSkillMarkdown(rawMarkdown: string, homeDir?: string): Skill
   const doc: ParsedSkillDocument = {
     name: sanitizeSkillText(rawName, MAX_SKILL_NAME_LENGTH + 16, homeDir),
     description: sanitizeSkillText(rawDescription, MAX_SKILL_DESCRIPTION_LENGTH + 32, homeDir),
-    ...(rawWhenToUse?.trim() ? { whenToUse: sanitizeSkillText(rawWhenToUse, MAX_WHEN_TO_USE_LENGTH, homeDir) } : {}),
+    ...(rawWhenToUse?.trim()
+      ? { whenToUse: sanitizeSkillText(rawWhenToUse, MAX_WHEN_TO_USE_LENGTH + 32, homeDir) }
+      : {}),
     ...(rawLicense?.trim() ? { license: sanitizeSkillText(rawLicense, 64, homeDir) } : {}),
     ...(rawCompatibility?.trim()
       ? { compatibility: sanitizeSkillText(rawCompatibility, MAX_COMPATIBILITY_LENGTH, homeDir) }
@@ -357,9 +382,14 @@ export function validateSkillDocument(
     errors.push(`when-to-use must be at most ${MAX_WHEN_TO_USE_LENGTH} characters`);
   }
 
-  if (!doc.body || !doc.body.trim()) {
+  if (!doc.body?.trim()) {
     errors.push('SKILL.md instruction body cannot be empty');
-  } else if (BUNDLED_EXECUTABLE_REF_RE.test(doc.body)) {
+  } else if (
+    BUNDLED_EXECUTABLE_REF_RE.test(doc.body) ||
+    BUNDLED_EXECUTABLE_REF_RE.test(doc.description) ||
+    (doc.whenToUse !== undefined && BUNDLED_EXECUTABLE_REF_RE.test(doc.whenToUse)) ||
+    (doc.compatibility !== undefined && BUNDLED_EXECUTABLE_REF_RE.test(doc.compatibility))
+  ) {
     errors.push('SKILL.md must remain plain-text procedural guidance without bundled scripts/* executables');
   }
 
@@ -401,7 +431,7 @@ export function renderSkillMarkdown(doc: ParsedSkillDocument, homeDir?: string):
   if (doc.metadata && Object.keys(doc.metadata).length > 0) {
     const entries = Object.entries(doc.metadata)
       .map(([k, v]) => [sanitizeSkillText(k, 48, homeDir), sanitizeSkillText(v, 200, homeDir)] as const)
-      .filter(([k, v]) => Boolean(k && v));
+      .filter(([k, v]) => Boolean(k && /^[A-Za-z0-9_.-]+$/.test(k) && v));
     if (entries.length > 0) {
       fmLines.push('metadata:');
       for (const [k, v] of entries) {

@@ -89,6 +89,8 @@ export function GrowthPanel(props: GrowthPanelProps) {
   const [editMarkdown, setEditMarkdown] = useState('');
   const [openDiffDraftId, setOpenDiffDraftId] = useState<string | null>(null);
   const [exportTargetBySkill, setExportTargetBySkill] = useState<Record<string, string>>({});
+  const [customExportPathBySkill, setCustomExportPathBySkill] = useState<Record<string, string>>({});
+  const [customScopeInputByKey, setCustomScopeInputByKey] = useState<Record<string, string>>({});
 
   const [busySynthesize, setBusySynthesize] = useState(false);
   const [feedback, setFeedback] = useState<string | null>(null);
@@ -220,6 +222,16 @@ export function GrowthPanel(props: GrowthPanelProps) {
   };
 
   const handleDraftScopeChange = async (draft: SkillDraftViewItem, selectValue: string) => {
+    const scopeKey = `draft:${draft.id}`;
+    if (selectValue === '__custom__') {
+      setCustomScopeInputByKey((prev) => ({ ...prev, [scopeKey]: draft.workspacePath ?? '' }));
+      return;
+    }
+    setCustomScopeInputByKey((prev) => {
+      const next = { ...prev };
+      delete next[scopeKey];
+      return next;
+    });
     try {
       if (selectValue === 'global') {
         await props.onUpdateDraft(draft.id, { markdown: draft.markdown, scope: 'global' });
@@ -234,7 +246,37 @@ export function GrowthPanel(props: GrowthPanelProps) {
     }
   };
 
+  const handleApplyCustomDraftScope = async (draft: SkillDraftViewItem) => {
+    const scopeKey = `draft:${draft.id}`;
+    const customWs = (customScopeInputByKey[scopeKey] ?? '').trim();
+    if (!customWs) {
+      setFeedback('请输入目标工作区绝对路径。');
+      return;
+    }
+    try {
+      await props.onUpdateDraft(draft.id, { markdown: draft.markdown, scope: 'workspace', workspacePath: customWs });
+      setCustomScopeInputByKey((prev) => {
+        const next = { ...prev };
+        delete next[scopeKey];
+        return next;
+      });
+      setFeedback(`已将草案 ${draft.name} 绑定至目标工作区。`);
+    } catch (err) {
+      setFeedback(err instanceof Error ? err.message : '切换草案作用域失败');
+    }
+  };
+
   const handleSkillScopeChange = async (skill: SkillViewItem, selectValue: string) => {
+    const scopeKey = `skill:${skill.name}`;
+    if (selectValue === '__custom__') {
+      setCustomScopeInputByKey((prev) => ({ ...prev, [scopeKey]: skill.workspacePath ?? '' }));
+      return;
+    }
+    setCustomScopeInputByKey((prev) => {
+      const next = { ...prev };
+      delete next[scopeKey];
+      return next;
+    });
     try {
       if (selectValue === 'global') {
         await props.onSetSkillScope(skill.name, { scope: 'global' });
@@ -244,6 +286,26 @@ export function GrowthPanel(props: GrowthPanelProps) {
         await props.onSetSkillScope(skill.name, { scope: 'workspace', workspacePath: wsPath });
         setFeedback(`已将技能 ${skill.name} 限定至工作区生效并热刷新 ctx.skills。`);
       }
+    } catch (err) {
+      setFeedback(err instanceof Error ? err.message : '切换技能作用域失败');
+    }
+  };
+
+  const handleApplyCustomSkillScope = async (skill: SkillViewItem) => {
+    const scopeKey = `skill:${skill.name}`;
+    const customWs = (customScopeInputByKey[scopeKey] ?? '').trim();
+    if (!customWs) {
+      setFeedback('请输入目标工作区绝对路径。');
+      return;
+    }
+    try {
+      await props.onSetSkillScope(skill.name, { scope: 'workspace', workspacePath: customWs });
+      setCustomScopeInputByKey((prev) => {
+        const next = { ...prev };
+        delete next[scopeKey];
+        return next;
+      });
+      setFeedback(`已将技能 ${skill.name} 限定至工作区生效并热刷新 ctx.skills。`);
     } catch (err) {
       setFeedback(err instanceof Error ? err.message : '切换技能作用域失败');
     }
@@ -312,8 +374,13 @@ export function GrowthPanel(props: GrowthPanelProps) {
     }
   };
 
-  const handleExportSkill = async (skill: SkillViewItem) => {
-    const selectedWs = exportTargetBySkill[skill.name] ?? skill.workspacePath ?? model.knownWorkspaces[0]?.path ?? '';
+  const handleExportSkill = async (skill: SkillViewItem, hasWsDropdown: boolean) => {
+    const rawSelect = exportTargetBySkill[skill.name];
+    const selectedWs = !hasWsDropdown
+      ? (customExportPathBySkill[skill.name] ?? '')
+      : rawSelect === '__custom__'
+        ? (customExportPathBySkill[skill.name] ?? '')
+        : (rawSelect ?? skill.workspacePath ?? model.knownWorkspaces[0]?.path ?? '');
     if (!selectedWs.trim()) {
       setFeedback('请先选择或输入要导出的目标工作区路径。');
       return;
@@ -494,7 +561,7 @@ export function GrowthPanel(props: GrowthPanelProps) {
               aria-pressed={tab === 'active'}
               onClick={() => setTab('active')}
             >
-              已启用 ({model.skills.length})
+              已启用 ({model.disabledCount > 0 ? `${model.activeCount}/${model.skills.length}` : model.activeCount})
             </button>
             <button
               type="button"
@@ -647,7 +714,11 @@ export function GrowthPanel(props: GrowthPanelProps) {
                       <select
                         className={css.gwFieldSelect}
                         aria-label={`生效作用域切换 ${draft.name}`}
-                        value={encodeScopeSelectValue(draft.scope, draft.workspacePath)}
+                        value={
+                          customScopeInputByKey[editKey] !== undefined
+                            ? '__custom__'
+                            : encodeScopeSelectValue(draft.scope, draft.workspacePath)
+                        }
                         onChange={(e) => void handleDraftScopeChange(draft, e.currentTarget.value)}
                       >
                         <option value="global">全局（所有工作区生效）</option>
@@ -656,8 +727,27 @@ export function GrowthPanel(props: GrowthPanelProps) {
                             工作区：{wsDisplay}
                           </option>
                         ))}
+                        <option value="__custom__">工作区：自定义路径…</option>
                       </select>
                     </label>
+                    {customScopeInputByKey[editKey] !== undefined && (
+                      <div className={css.gwInlineFieldRow}>
+                        <input
+                          type="text"
+                          className={css.gwFieldInput}
+                          aria-label={`自定义作用域路径 ${draft.name}`}
+                          placeholder="工作区绝对路径"
+                          value={customScopeInputByKey[editKey] ?? ''}
+                          onChange={(e) => {
+                            const val = e.currentTarget.value;
+                            setCustomScopeInputByKey((prev) => ({ ...prev, [editKey]: val }));
+                          }}
+                        />
+                        <button type="button" onClick={() => void handleApplyCustomDraftScope(draft)}>
+                          应用工作区
+                        </button>
+                      </div>
+                    )}
 
                     {isDiffOpen && draft.baseMarkdown && (
                       <section className={css.gwDiffBox} data-testid="skill-diff-view" aria-label="版本差异对比">
@@ -814,7 +904,11 @@ export function GrowthPanel(props: GrowthPanelProps) {
                       <select
                         className={css.gwFieldSelect}
                         aria-label={`生效作用域切换 ${skill.name}`}
-                        value={encodeScopeSelectValue(skill.scope, skill.workspacePath)}
+                        value={
+                          customScopeInputByKey[editKey] !== undefined
+                            ? '__custom__'
+                            : encodeScopeSelectValue(skill.scope, skill.workspacePath)
+                        }
                         onChange={(e) => void handleSkillScopeChange(skill, e.currentTarget.value)}
                       >
                         <option value="global">全局（所有工作区生效）</option>
@@ -823,34 +917,80 @@ export function GrowthPanel(props: GrowthPanelProps) {
                             工作区：{wsDisplay}
                           </option>
                         ))}
+                        <option value="__custom__">工作区：自定义路径…</option>
                       </select>
                     </label>
-
-                    {wsOptions.length > 0 && (
+                    {customScopeInputByKey[editKey] !== undefined && (
                       <div className={css.gwInlineFieldRow}>
+                        <input
+                          type="text"
+                          className={css.gwFieldInput}
+                          aria-label={`自定义作用域路径 ${skill.name}`}
+                          placeholder="工作区绝对路径"
+                          value={customScopeInputByKey[editKey] ?? ''}
+                          onChange={(e) => {
+                            const val = e.currentTarget.value;
+                            setCustomScopeInputByKey((prev) => ({ ...prev, [editKey]: val }));
+                          }}
+                        />
+                        <button type="button" onClick={() => void handleApplyCustomSkillScope(skill)}>
+                          应用工作区
+                        </button>
+                      </div>
+                    )}
+
+                    <div className={css.gwInlineFieldRow}>
+                      {wsOptions.length > 0 ? (
                         <select
                           className={css.gwFieldSelect}
                           aria-label={`导出目标工作区 ${skill.name}`}
                           value={selectedExportWs}
-                          onChange={(e) =>
-                            setExportTargetBySkill((prev) => ({ ...prev, [skill.name]: e.currentTarget.value }))
-                          }
+                          onChange={(e) => {
+                            const val = e.currentTarget.value;
+                            setExportTargetBySkill((prev) => ({ ...prev, [skill.name]: val }));
+                          }}
                         >
                           {wsOptions.map(([wsPath, wsDisplay]) => (
                             <option key={wsPath} value={wsPath}>
                               {wsDisplay}
                             </option>
                           ))}
+                          <option value="__custom__">自定义工作区路径…</option>
                         </select>
-                        <button
-                          type="button"
-                          aria-label={`导出至 .agents/skills ${skill.name}`}
-                          onClick={() => void handleExportSkill(skill)}
-                        >
-                          导出至 .agents/skills
-                        </button>
-                      </div>
-                    )}
+                      ) : (
+                        <input
+                          type="text"
+                          className={css.gwFieldInput}
+                          aria-label={`导出目标工作区 ${skill.name}`}
+                          placeholder="输入导出目标工作区绝对路径…"
+                          value={customExportPathBySkill[skill.name] ?? ''}
+                          onChange={(e) => {
+                            const val = e.currentTarget.value;
+                            setCustomExportPathBySkill((prev) => ({ ...prev, [skill.name]: val }));
+                          }}
+                        />
+                      )}
+                      {wsOptions.length > 0 && selectedExportWs === '__custom__' && (
+                        <input
+                          type="text"
+                          className={css.gwFieldInput}
+                          aria-label={`自定义导出工作区路径 ${skill.name}`}
+                          placeholder="输入导出目标工作区绝对路径…"
+                          value={customExportPathBySkill[skill.name] ?? ''}
+                          onChange={(e) => {
+                            const val = e.currentTarget.value;
+                            setCustomExportPathBySkill((prev) => ({ ...prev, [skill.name]: val }));
+                          }}
+                        />
+                      )}
+                      <button
+                        type="button"
+                        aria-label={`导出至 .agents/skills ${skill.name}`}
+                        onClick={() => void handleExportSkill(skill, wsOptions.length > 0)}
+                      >
+                        导出至 .agents/skills
+                      </button>
+                    </div>
 
                     {isPreviewing && !isEditing && (
                       <pre className={css.gwCodePreview} data-testid="skill-markdown-preview">

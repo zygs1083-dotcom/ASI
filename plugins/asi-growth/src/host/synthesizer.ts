@@ -63,7 +63,7 @@ function ensureDescriptionBounds(raw: string, topicKey: string, homeDir?: string
 
 function neutralizeBundledScriptRef(text: string): string {
   return text.replace(
-    /((?:^|[\s"'`(]))(?:\.\/)?scripts\/([A-Za-z0-9_.-]+\.(?:sh|mjs|cjs|js|py|rb|pl))\b/gi,
+    /((?:^|[\s"'`([<]))(?:(?:\.\.?\/)+)?scripts\/((?:[A-Za-z0-9_.-]+\/)*[A-Za-z0-9_.-]+\.(?:sh|bash|zsh|fish|mjs|cjs|js|ts|mts|cts|py|rb|pl|ps1|php))\b/gi,
     '$1[script:$2]',
   );
 }
@@ -82,15 +82,19 @@ function buildDeterministicSkillDocument(
     pitfalls[0]?.title ?? decisions[0]?.title ?? preferences[0]?.title ?? trajectories[0]?.title ?? cluster.topicKey;
 
   const description = ensureDescriptionBounds(
-    `Reusable workflow and pitfall checklist for ${cluster.topicKey} (${leadHeadline}). Use when working on ${cluster.topicKey} tasks or diagnosing related failures.`,
+    neutralizeBundledScriptRef(
+      `Reusable workflow and pitfall checklist for ${cluster.topicKey} (${leadHeadline}). Use when working on ${cluster.topicKey} tasks or diagnosing related failures.`,
+    ),
     cluster.topicKey,
     homeDir,
   );
 
-  const whenToUse = sanitizeSkillText(
-    `Invoke when implementing changes, reviewing code, or troubleshooting issues involving ${cluster.topicKey}.`,
-    320,
-    homeDir,
+  const whenToUse = neutralizeBundledScriptRef(
+    sanitizeSkillText(
+      `Invoke when implementing changes, reviewing code, or troubleshooting issues involving ${cluster.topicKey}.`,
+      320,
+      homeDir,
+    ),
   );
 
   const sections: string[] = [];

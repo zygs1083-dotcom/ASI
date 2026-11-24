@@ -52,6 +52,8 @@ import { synthesizeSkillDraftForCluster } from './synthesizer.js';
 import { SkillVault } from './vault.js';
 
 const MAX_REJECTED_SIGNATURES = 500;
+const INTERNAL_RUNTIME_CWD_RE =
+  /(?:^|[\\/])(?:(?:asi[-_])?(?:needs|sleep|care|sense|growth)[\\/](?:sandbox|vault|skills)|data[\\/]asi-(?:needs|sleep|care|sense|growth))(?:[\\/]|$)/i;
 
 interface PersistedGrowthState {
   autoGrowthPaused?: boolean;
@@ -149,7 +151,17 @@ export function createGrowthRuntime(ports: GrowthHostPorts): GrowthRuntime {
   let autoDraftTimestamps: number[] = [];
   const rejectedSignatures: string[] = [];
   const rejectedSignatureSet = new Set<string>();
-  const recentTurnInvocationAt = new Map<string, number>();
+  const unclaimedSkillLoads = new Map<string, number>();
+
+  function isExcludedInternalCwd(cwd: string | undefined): boolean {
+    if (!cwd?.trim()) return false;
+    if (INTERNAL_RUNTIME_CWD_RE.test(cwd)) return true;
+    if (matchesWorkspaceScope(cwd, ports.storageRoot)) return true;
+    for (const root of ports.excludedInternalRoots ?? []) {
+      if (matchesWorkspaceScope(cwd, root)) return true;
+    }
+    return false;
+  }
 
   let latestSense: SenseSnapshot = ports.sense.snapshot();
   let latestDrives: AsiDrivesSnapshot | undefined;
@@ -263,15 +275,41 @@ export function createGrowthRuntime(ports: GrowthHostPorts): GrowthRuntime {
     }
     const trajectories = extractTroubleshootingTrajectories(rawTurns, ports.homeDir);
 
-    const existingSkills = vault.listSkillRecords().map((s) => ({
-      name: s.name,
-      version: s.version,
-      topicKey: s.topicKey,
-      markdown: s.markdown,
-      scope: s.scope,
-      ...(s.workspacePath ? { workspacePath: s.workspacePath } : {}),
-      evidenceIds: s.evidenceIds,
-    }));
+    const existingSkillMap = new Map<
+      string,
+      {
+        name: string;
+        version: number;
+        topicKey: string;
+        markdown: string;
+        scope: SkillScope;
+        workspacePath?: string;
+        evidenceIds: string[];
+      }
+    >();
+    for (const a of vault.listArchivedRecords()) {
+      existingSkillMap.set(a.name, {
+        name: a.name,
+        version: a.version,
+        topicKey: a.topicKey,
+        markdown: a.markdown,
+        scope: a.scope,
+        ...(a.workspacePath ? { workspacePath: a.workspacePath } : {}),
+        evidenceIds: a.evidenceIds,
+      });
+    }
+    for (const s of vault.listSkillRecords()) {
+      existingSkillMap.set(s.name, {
+        name: s.name,
+        version: s.version,
+        topicKey: s.topicKey,
+        markdown: s.markdown,
+        scope: s.scope,
+        ...(s.workspacePath ? { workspacePath: s.workspacePath } : {}),
+        evidenceIds: s.evidenceIds,
+      });
+    }
+    const existingSkills = [...existingSkillMap.values()];
 
     const existingDrafts = vault.listDraftRecords().map((d) => ({
       id: d.id,
@@ -478,21 +516,69 @@ export function createGrowthRuntime(ports: GrowthHostPorts): GrowthRuntime {
         let revisionsCreated = 0;
 
         for (const { cluster, draft } of synthesizedBatch) {
+          const openDraftsNow = vault.listDraftRecords();
+          const duplicateOpenDraft = openDraftsNow.some(
+            (d) =>
+              d.topicKey === cluster.topicKey ||
+              (draft.revisesSkillName !== undefined && d.revisesSkillName === draft.revisesSkillName),
+          );
+          if (duplicateOpenDraft) continue;
+
+          let finalName = draft.name;
+          let finalMarkdown = draft.markdown;
+          let finalTargetVersion = draft.targetVersion;
+          let finalBaseVersion = draft.baseVersion;
+          let finalBaseMarkdown = draft.baseMarkdown;
+
+          if (draft.isRevision && draft.revisesSkillName) {
+            const latestTarget =
+              vault.getInstalledSkill(draft.revisesSkillName) ??
+              vault.listArchivedRecords().find((a) => a.name === draft.revisesSkillName);
+            if (latestTarget) {
+              finalBaseVersion = latestTarget.version;
+              finalBaseMarkdown = latestTarget.markdown;
+              finalTargetVersion = Math.max(finalTargetVersion, latestTarget.version + 1);
+            }
+          } else {
+            const freshTaken = vault.takenSkillNames();
+            if (freshTaken.has(finalName)) {
+              for (let suffix = 2; suffix <= 99; suffix += 1) {
+                const suffixStr = `-${suffix}`;
+                const candidate = `${finalName.slice(0, Math.max(3, 64 - suffixStr.length)).replace(/-+$/g, '')}${suffixStr}`;
+                if (!freshTaken.has(candidate)) {
+                  finalName = candidate;
+                  break;
+                }
+              }
+              const reparsed = parseSkillMarkdown(finalMarkdown, ports.homeDir);
+              if (reparsed.valid && reparsed.document) {
+                finalMarkdown = renderSkillMarkdown({ ...reparsed.document, name: finalName }, ports.homeDir);
+              }
+            }
+          }
+
+          const safeRecommendedScope =
+            cluster.recommendedScope === 'workspace' &&
+            cluster.recommendedWorkspace &&
+            !isExcludedInternalCwd(cluster.recommendedWorkspace)
+              ? 'workspace'
+              : 'global';
+
           await vault.saveDraft({
             id: `draft_${randomUUID().slice(0, 12)}`,
-            name: draft.name,
+            name: finalName,
             description: draft.description,
             whenToUse: draft.whenToUse,
-            markdown: draft.markdown,
-            scope: cluster.recommendedScope,
-            ...(cluster.recommendedScope === 'workspace' && cluster.recommendedWorkspace
+            markdown: finalMarkdown,
+            scope: safeRecommendedScope,
+            ...(safeRecommendedScope === 'workspace' && cluster.recommendedWorkspace
               ? { workspacePath: cluster.recommendedWorkspace }
               : {}),
-            targetVersion: draft.targetVersion,
+            targetVersion: finalTargetVersion,
             isRevision: draft.isRevision,
             ...(draft.revisesSkillName ? { revisesSkillName: draft.revisesSkillName } : {}),
-            ...(draft.baseVersion !== undefined ? { baseVersion: draft.baseVersion } : {}),
-            ...(draft.baseMarkdown ? { baseMarkdown: draft.baseMarkdown } : {}),
+            ...(finalBaseVersion !== undefined ? { baseVersion: finalBaseVersion } : {}),
+            ...(finalBaseMarkdown ? { baseMarkdown: finalBaseMarkdown } : {}),
             topicKey: cluster.topicKey,
             evidenceIds: cluster.allEvidenceIds,
             memoryCount: cluster.memories.length,
@@ -637,6 +723,7 @@ export function createGrowthRuntime(ports: GrowthHostPorts): GrowthRuntime {
 
   const skillBridge: GrowthSkillCatalogBridge = {
     listCandidates(cwd?: string): MountableSkillCandidate[] {
+      if (cwd && isExcludedInternalCwd(cwd)) return [];
       const mountable = vault.listActiveMountableSkills();
       const out: MountableSkillCandidate[] = [];
       for (const s of mountable) {
@@ -660,6 +747,7 @@ export function createGrowthRuntime(ports: GrowthHostPorts): GrowthRuntime {
 
     async loadDefinition(name: string, cwd?: string): Promise<MountableSkillDefinition | undefined> {
       if (!isValidSkillName(name)) return undefined;
+      if (cwd && isExcludedInternalCwd(cwd)) return undefined;
       const diskChanged = await vault.syncExternalDiskEdits();
       if (diskChanged) {
         invalidateSkillRegistry();
@@ -674,12 +762,9 @@ export function createGrowthRuntime(ports: GrowthHostPorts): GrowthRuntime {
       if (!parsed.valid || !parsed.document) return undefined;
 
       const now = clock.wall();
-      const recentEventAt = recentTurnInvocationAt.get(name);
-      if (recentEventAt === undefined || now - recentEventAt > 2_000) {
-        vault.recordInvocation(name, now);
-        recentTurnInvocationAt.set(name, now);
-        notify();
-      }
+      vault.recordInvocation(name, now);
+      unclaimedSkillLoads.set(name, (unclaimedSkillLoads.get(name) ?? 0) + 1);
+      notify();
 
       const filePath = vault.activeSkillFilePath(name);
       return {
@@ -742,14 +827,16 @@ export function createGrowthRuntime(ports: GrowthHostPorts): GrowthRuntime {
       }
 
       const scope: SkillScope = input.scope === 'workspace' ? 'workspace' : 'global';
-      const workspacePath = scope === 'workspace' ? input.workspacePath?.trim() : undefined;
-      if (scope === 'workspace' && !workspacePath) {
+      const rawWorkspacePath = scope === 'workspace' ? input.workspacePath?.trim() : undefined;
+      if (scope === 'workspace' && !rawWorkspacePath) {
         throw new Error('工作区作用域必须提供目标工作区路径');
       }
+      const workspacePath = rawWorkspacePath ? vault.validateScopeWorkspace(rawWorkspacePath) : undefined;
 
-      const existingInstalled = vault.getInstalledSkill(cleanName);
-      const isRevision = Boolean(existingInstalled);
-      const targetVersion = existingInstalled ? existingInstalled.version + 1 : 1;
+      const existingSkillOrArchived =
+        vault.getInstalledSkill(cleanName) ?? vault.listArchivedRecords().find((a) => a.name === cleanName);
+      const isRevision = Boolean(existingSkillOrArchived);
+      const targetVersion = existingSkillOrArchived ? existingSkillOrArchived.version + 1 : 1;
 
       const docCandidate = {
         name: cleanName,
@@ -786,19 +873,19 @@ export function createGrowthRuntime(ports: GrowthHostPorts): GrowthRuntime {
         ...(workspacePath ? { workspacePath } : {}),
         targetVersion,
         isRevision,
-        ...(existingInstalled
+        ...(existingSkillOrArchived
           ? {
-              revisesSkillName: existingInstalled.name,
-              baseVersion: existingInstalled.version,
-              baseMarkdown: existingInstalled.markdown,
+              revisesSkillName: existingSkillOrArchived.name,
+              baseVersion: existingSkillOrArchived.version,
+              baseMarkdown: existingSkillOrArchived.markdown,
             }
           : {}),
-        topicKey: existingInstalled?.topicKey ?? cleanName,
+        topicKey: existingSkillOrArchived?.topicKey ?? cleanName,
         evidenceIds: ['manual'],
         memoryCount: 0,
         trajectoryCount: 0,
         evidenceSummary: isRevision
-          ? `手动编写 v${existingInstalled?.version ?? 1} → v${targetVersion} 修订草案`
+          ? `手动编写 v${existingSkillOrArchived?.version ?? 1} → v${targetVersion} 修订草案`
           : '手动新建待审技能草案',
         evidenceSignature: `manual_${randomUUID().slice(0, 8)}`,
         createdAt: now,
@@ -1090,10 +1177,14 @@ export function createGrowthRuntime(ports: GrowthHostPorts): GrowthRuntime {
 
       offSkillTurns = ports.conversations.onSkillTurnCompleted?.((ev) => {
         for (const name of ev.skillNames) {
-          const prevAt = recentTurnInvocationAt.get(name);
-          const alreadyCountedLoad = prevAt !== undefined && Math.abs(ev.at - prevAt) <= 120_000;
-          recentTurnInvocationAt.set(name, ev.at);
-          vault.recordTurnOutcome(name, ev.completed, ev.at, !alreadyCountedLoad);
+          const pendingLoads = unclaimedSkillLoads.get(name) ?? 0;
+          if (pendingLoads > 0) {
+            if (pendingLoads === 1) unclaimedSkillLoads.delete(name);
+            else unclaimedSkillLoads.set(name, pendingLoads - 1);
+            vault.recordTurnOutcome(name, ev.completed, ev.at, false);
+          } else {
+            vault.recordTurnOutcome(name, ev.completed, ev.at, true);
+          }
         }
         notify();
       });

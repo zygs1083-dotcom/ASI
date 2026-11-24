@@ -19,6 +19,7 @@
  */
 
 import { createHash } from 'node:crypto';
+import { basename } from 'node:path';
 import type { SleepMemorySummary } from '@asi/sense-types';
 import { sanitizeSkillText, toValidSkillSlug } from '../shared/skill-spec.js';
 import type { SkillScope } from '../shared/types.js';
@@ -180,7 +181,12 @@ export function extractTroubleshootingTrajectories(
     if (!cleanUser || !cleanAssistant) continue;
 
     const titleSeed = turn.sessionTitle?.trim() ? `${turn.sessionTitle}: ${cleanUser}` : cleanUser;
-    const topicKey = normalizeTopicAnchor(undefined, undefined, `${cleanUser} ${distinctTools.join(' ')}`);
+    const cwdBase = turn.cwd?.trim() ? basename(turn.cwd.trim()) : '';
+    const baseTopicKey = normalizeTopicAnchor(undefined, undefined, cleanUser);
+    const topicKey =
+      baseTopicKey.startsWith('topic-') && cwdBase.length >= 2
+        ? toValidSkillSlug(`${cwdBase}-${baseTopicKey}`, 'topic')
+        : baseTopicKey;
 
     out.push({
       id: `traj_${turn.sessionId}_${turn.turnId}`,
@@ -209,6 +215,7 @@ export function computeEvidenceSignature(topicKey: string, evidenceIds: readonly
 
 interface RawTopicBucket {
   anchor: string;
+  hasExplicitTopic: boolean;
   tokens: Set<string>;
   tags: Set<string>;
   memories: SleepMemorySummary[];
@@ -245,20 +252,27 @@ export function clusterHighEvidenceTopics(input: {
         ? toValidSkillSlug(explicitTopicKey.trim().split(/[:/]/)[0] ?? explicitTopicKey, 'topic')
         : undefined;
 
-    // 1. Match existing skill topicKey first if explicit slug or tag matches
-    for (const b of buckets) {
-      if (explicitSlug && b.anchor === explicitSlug) return b;
-      if (cleanTags.some((t) => b.tags.has(t) || b.anchor === toValidSkillSlug(t, 'topic'))) return b;
-      if (!explicitSlug && jaccardSimilarity(b.tokens, itemTokens) >= 0.28) return b;
+    // 1. Exact explicit topic match always wins before any fuzzy/tag fallback
+    if (explicitSlug) {
+      const exactBucket = buckets.find((b) => b.anchor === explicitSlug);
+      if (exactBucket) return exactBucket;
     }
 
-    // Also align anchor with an existing skill if tokens/tags match that skill's topicKey
+    // 2. Tag / similarity matching only when explicit topic keys do not conflict
+    for (const b of buckets) {
+      if (explicitSlug && b.hasExplicitTopic) continue;
+      if (cleanTags.some((t) => b.tags.has(t) || b.anchor === toValidSkillSlug(t, 'topic'))) return b;
+      if (!explicitSlug && (b.anchor === fallbackAnchor || jaccardSimilarity(b.tokens, itemTokens) >= 0.28)) return b;
+    }
+
+    // 3. Align anchor with an existing skill if tokens/tags match that skill's topicKey
     let resolvedAnchor = explicitSlug ?? fallbackAnchor;
     for (const skill of input.existingSkills) {
+      if (explicitSlug && skill.topicKey !== explicitSlug) continue;
       if (
         skill.topicKey === resolvedAnchor ||
         cleanTags.some((t) => toValidSkillSlug(t, 'topic') === skill.topicKey) ||
-        jaccardSimilarity(tokenizeTopicText(`${skill.name} ${skill.topicKey}`), itemTokens) >= 0.34
+        (!explicitSlug && jaccardSimilarity(tokenizeTopicText(`${skill.name} ${skill.topicKey}`), itemTokens) >= 0.34)
       ) {
         resolvedAnchor = skill.topicKey;
         const existingBucket = buckets.find((b) => b.anchor === resolvedAnchor);
@@ -273,6 +287,7 @@ export function clusterHighEvidenceTopics(input: {
 
     const created: RawTopicBucket = {
       anchor: resolvedAnchor,
+      hasExplicitTopic: Boolean(explicitSlug),
       tokens: new Set(itemTokens),
       tags: new Set(cleanTags),
       memories: [],
@@ -294,7 +309,8 @@ export function clusterHighEvidenceTopics(input: {
   }
 
   for (const traj of input.trajectories) {
-    const bucket = findOrCreateBucket(undefined, traj.toolNames, `${traj.title} ${traj.problemSummary}`, traj.topicKey);
+    // Never pass generic toolNames (read_file, shell, etc.) as semantic topic tags
+    const bucket = findOrCreateBucket(undefined, [], `${traj.title} ${traj.problemSummary}`, traj.topicKey);
     for (const tok of tokenizeTopicText(traj.title)) bucket.tokens.add(tok);
     bucket.trajectories.push(traj);
   }
