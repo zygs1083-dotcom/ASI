@@ -305,4 +305,43 @@ test.describe('ASI 统一侧栏面板 320px 响应式、明暗双主题与 axe �
 
     expect(errors).toEqual([]);
   });
+
+  test('方向 B「搭档状态与协作眼力见」顶部徽标跳转、一键校准锁定、基线抽屉与 320px axe 合规验证', async ({ page }) => {
+    const errors = watchErrors(page);
+    await page.setViewportSize({ width: 320, height: 920 });
+    await openUnifiedPanel(page, 'pending-approvals', 'dark', 'memory');
+
+    // 在「记忆库」页点击顶部胶囊的「搭档·攻坚」徽标，一键跳回「稳态看护」页查看眼力见卡片
+    const badge = page.getByTestId('tom-capsule-badge');
+    await expect(badge).toContainText('搭档·攻坚');
+    await badge.click();
+    await expect(page.getByTestId('tabpanel-care')).toBeVisible();
+
+    const tomCard = page.getByTestId('tom-partner-card');
+    await expect(tomCard).toBeVisible();
+    await expect(page.getByTestId('tom-state-pill')).toContainText('排障攻坚');
+
+    // 一键手动校准为「深度心流」，验证处方实时切换并记录校准计数
+    await page.getByTestId('tom-override-deep_focus').click();
+    await expect(page.getByTestId('tom-state-pill')).toContainText('手动锁定 · 深度心流');
+    await expect(page.getByTestId('tom-tact-headline')).toContainText('沉浸心流护航');
+    await expect(badge).toContainText('搭档·心流');
+
+    // 展开个体节律基线抽屉并验证重置与开关切换
+    const tomDrawer = page.getByTestId('drawer-tom');
+    await tomDrawer.locator('> summary').click();
+    await expect(tomDrawer).toHaveAttribute('open', '');
+    await page.getByTestId('tom-reset-baseline-btn').click();
+    await expect(page.getByTestId('tom-feedback')).toContainText('已重置个人交互节律基线');
+
+    await page.getByTestId('tom-enabled-toggle').uncheck();
+    await expect(page.getByTestId('tom-state-pill')).toContainText('已关闭');
+    await expect(badge).toHaveCount(0);
+    await page.getByTestId('tom-enabled-toggle').check();
+    await expect(badge).toBeVisible();
+
+    await expectNoOverflow(page);
+    await axeCheck(page);
+    expect(errors).toEqual([]);
+  });
 });

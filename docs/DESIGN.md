@@ -72,6 +72,12 @@
 2. **高证据阈值与 20 分钟深静默门控**：融合 `ctx.asiSleep` 高保留率（`>= 0.5` 或置顶）记忆与多步排障轨迹，仅当 L1–L3 全部舒适且全部普通会话空闲 `>= 20 分钟` 或锁屏时自动起草待审草案（`<= 2` 份/日，在途遇 L1–L3 激活立即抢占中断并回滚配额）。
 3. **人工批准热挂载与 60 天代谢**：新技能（`v1`）与增量修订（`v2+` 行级差异对比）一律须用户点击「批准启用」后才通过 `ctx.skills.registerProvider` 热挂载，支持 `global`/`workspace`（`cwd`）作用域在线切换、一键导出至 `.agents/skills/<name>/SKILL.md` 及连续 `60` 天零调用代谢归档建议；普通对话仅暴露只读工具 `growth_status`。
 
+## 6B. 方向 B：心智理论——搭档状态感知与协作眼力见（`src/tom/`）
+
+1. **零 Token 确定性推断与个体节律 EWMA 基线**：纯本机融合 `ctx.asiSense` 注意力拓扑（应用类别驻留、5 分钟切换熵、锁屏/休眠）与普通会话交互动力学（发信间隔、指令精炼度、主动打断 `interrupted`、回合/命令非零退出、审批延迟），按个体 EWMA 节律基线归一化推断六种搭档认知状态（`deep_focus`、`rapid_sprint`、`stuck_debugging`、`exploring`、`steady_flow`、`away_resting`）及四维连续指标（`focus`、`friction`、`pace`、`presence`）；持久化于 `<storageRoot>/tom/state.json`，绝不存储对话原文、窗口标题或路径历史。
+2. **100% Prompt Cache 保护与默契适应处方（`TactGuidance`）**：注册字节恒定的静态 `systemPrompt` 引导段（`asi-tom`）与按需只读工具 `partner_state`（可选只读联动 `ctx.asiSleep` 高保留率协作偏好，全链路经 `sanitizeForModel` 脱敏），指导模型默契调整回复详略度、验证姿态与澄清问题预算，严禁生硬点破推断情绪。
+3. **静默马斯洛协同与透明一键校准**：暴露 `ctx.asiTom` 服务（含 `shouldDeferProactiveWork()` 免扰避让信号），并向 `ctx.asiDrives` 注册 `tier: 3` 静默社交驱动 `asi-tom:social_tact`（`autoMaintain: false`，零后台 LLM 唤醒、零 `<asi-cry>`）；在侧栏顶部状态胶囊与「稳态看护」独立卡片 `<TomCard />` 中支持 60 分钟手动覆写与在线校准偏置学习。
+
 ## 7. 统一侧栏界面（`id: 'asi'`，`order: 90`）
 
 通过单一 `AsiRemote`（`ctx.asi`）合并推送 `{ needs, sleep, growth }` 实时帧，采用统一 CSS Module 设计系统（消费宿主 `--dsw-*` 明暗令牌，`color-mix` 高对比度状态墨色，严格 `320px` 零水平溢出与 `axe-core` 零违规）：
