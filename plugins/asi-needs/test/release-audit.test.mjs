@@ -11,7 +11,7 @@ const pkgDir = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 describe('asi-needs 发布包卫生审计', () => {
   it('package.json 保持 private=true 且声明兼容 0.2.2-rc.3 || 0.2.2-rc.5', async () => {
     const manifest = JSON.parse(await readFile(join(pkgDir, 'package.json'), 'utf8'));
-    expect(manifest.version).toBe('0.4.0');
+    expect(manifest.version).toBe('0.5.0');
     expect(manifest.private).toBe(true);
     expect(manifest.engines.dsh).toBe('0.2.2-rc.3 || 0.2.2-rc.5');
     for (const dep of [
@@ -273,6 +273,65 @@ describe('asi-needs 发布包卫生审计', () => {
             'asi-needs': 'file:/old/asi-needs-0.3.0.tgz',
           },
           dsh: { profile: { bundles: ['dsh-context', 'dsh-superagent', 'asi-sense', 'asi-needs'] } },
+        }),
+      );
+      expect(runRollbackCheck().status).toBe(0);
+
+      // 4. 从 0.4.0 四插件升级至 0.5.0 五插件（追加 asi-growth）及回退至 0.4.0 tgz
+      for (const pkg of ['asi-sense', 'asi-needs', 'asi-sleep', 'asi-care', 'asi-growth']) {
+        await mkdir(join(profileDir, 'node_modules', pkg), { recursive: true });
+        await writeFile(join(profileDir, 'node_modules', pkg, 'package.json'), '{"version":"0.5.0"}');
+      }
+      const runUpgrade050 = () =>
+        spawnSync(process.execPath, ['-', profileDir, backupPath, '0.5.0', '0.5.0', '0.5.0', '0.5.0', '0.5.0'], {
+          input: verifyUpgradeScript,
+          encoding: 'utf8',
+        });
+
+      await writeFile(
+        backupPath,
+        JSON.stringify({
+          dependencies: {
+            'dsh-context': '0.2.2-rc.3',
+            'asi-sense': 'file:/old/asi-sense-0.4.0.tgz',
+            'asi-needs': 'file:/old/asi-needs-0.4.0.tgz',
+            'asi-sleep': 'file:/old/asi-sleep-0.4.0.tgz',
+            'asi-care': 'file:/old/asi-care-0.4.0.tgz',
+          },
+          dsh: { profile: { bundles: ['dsh-context', 'asi-sense', 'asi-needs', 'asi-sleep', 'asi-care'] } },
+        }),
+      );
+      await writeFile(
+        join(profileDir, 'package.json'),
+        JSON.stringify({
+          dependencies: {
+            'dsh-context': '0.2.2-rc.3',
+            'asi-sense': '0.5.0',
+            'asi-needs': '0.5.0',
+            'asi-sleep': '0.5.0',
+            'asi-care': '0.5.0',
+            'asi-growth': '0.5.0',
+          },
+          dsh: {
+            profile: {
+              bundles: ['dsh-context', 'asi-sense', 'asi-needs', 'asi-sleep', 'asi-care', 'asi-growth'],
+            },
+          },
+        }),
+      );
+      expect(runUpgrade050().status).toBe(0);
+
+      await writeFile(
+        join(profileDir, 'package.json'),
+        JSON.stringify({
+          dependencies: {
+            'dsh-context': '0.2.2-rc.3',
+            'asi-sense': 'file:/old/asi-sense-0.4.0.tgz',
+            'asi-needs': 'file:/old/asi-needs-0.4.0.tgz',
+            'asi-sleep': 'file:/old/asi-sleep-0.4.0.tgz',
+            'asi-care': 'file:/old/asi-care-0.4.0.tgz',
+          },
+          dsh: { profile: { bundles: ['dsh-context', 'asi-sense', 'asi-needs', 'asi-sleep', 'asi-care'] } },
         }),
       );
       expect(runRollbackCheck().status).toBe(0);

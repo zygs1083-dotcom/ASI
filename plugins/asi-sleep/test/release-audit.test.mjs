@@ -61,12 +61,12 @@ describe('asi-sleep release-audit 安全门禁测试', () => {
     ).toThrow(/Local username/);
   });
 
-  it('校验 package.json 版本为 0.4.0、npm registry 地址规范与 E404 可发布判定', async () => {
+  it('校验 package.json 版本为 0.5.0、npm registry 地址规范与 E404 可发布判定', async () => {
     const manifest = JSON.parse(await readFile(join(pkgDir, 'package.json'), 'utf8'));
-    expect(manifest.version).toBe('0.4.0');
+    expect(manifest.version).toBe('0.5.0');
     expect(registryUrl('https://registry.npmjs.org')).toBe('https://registry.npmjs.org/');
     expect(() => registryUrl('https://user:pass@registry.npmjs.org/')).toThrow(/without credentials/);
-    expect(registryVersionAvailable(0, '"0.4.0"')).toBe(false);
+    expect(registryVersionAvailable(0, '"0.5.0"')).toBe(false);
     expect(registryVersionAvailable(1, JSON.stringify({ error: { code: 'E404' } }))).toBe(true);
   });
 });

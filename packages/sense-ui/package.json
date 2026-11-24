@@ -1,7 +1,7 @@
 {
   "name": "@asi/sense-ui",
   "private": true,
-  "version": "0.4.0",
+  "version": "0.5.0",
   "type": "module",
   "description": "asi-needs 统一侧栏面板：生存需求、核心体征、自维护与求助卡（React 纯 props 组件 + Vite 预览）",
   "engines": {

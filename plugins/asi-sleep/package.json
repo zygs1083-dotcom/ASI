@@ -1,6 +1,6 @@
 {
   "name": "asi-sleep",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "private": true,
   "description": "L2 biological NREM/REM sleep memory consolidation, FSRS spaced retention, and local memory vault for DeepSeek Harness.",
   "license": "MIT",

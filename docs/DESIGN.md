@@ -1,6 +1,6 @@
-# ASI 设计文档（v0.4 · 四插件稳态、睡眠记忆巩固与本地工作区看护架构）
+# ASI 设计文档（v0.5 · 五插件稳态、睡眠记忆巩固、本地工作区看护与程序性技能自进化架构）
 
-状态：v0.4 定稿（2026-11-23）。在 v0.3 全景病因嗅探、行动效果记忆与 `ctx.asiDrives` 马斯洛多层需求仲裁服务基础上，正式集成 **L2 仿生双阶段睡眠与记忆整合插件 `asi-sleep`**（独立「记忆库」侧栏）与 **L3 本地工作区与多工作树看护插件 `asi-care`**（无侧栏图标，复用「生存需求」静默求助卡与收益账本）。
+状态：v0.5 定稿（2026-11-24）。在 v0.4 四插件基础上，正式集成 **L4 技能提炼与自进化插件 `asi-growth`**（独立「技能工坊」侧栏，`order: 92`）并在 `asi-sleep` 上暴露只读 Cordis 服务 `ctx.asiSleep`，完成从感官、生理稳态（L1）、长期记忆巩固（L2）、工作区看护（L3）到程序性技能自进化（L4）的完整马斯洛五插件体系。
 
 ## 0. 兼容版本
 
@@ -11,46 +11,43 @@
 
 ## 1. 核心理念与总体分工
 
-ASI 由 `asi-sense`、`asi-needs`、`asi-sleep` 与 `asi-care` 四个独立组合包构成，插件之间仅通过 Cordis 服务（`ctx.asiSense`、`ctx.asiDrives`）与 `@asi/sense-types` 共享契约通信，不互相引用内部源码：
+ASI 由 `asi-sense`、`asi-needs`、`asi-sleep`、`asi-care` 与 `asi-growth` 五个独立组合包构成，插件之间仅通过 Cordis 服务（`ctx.asiSense`、`ctx.asiDrives`、`ctx.asiSleep`）与 `@asi/sense-types` 共享契约通信，不互相引用内部源码：
 
  ```
- ┌──────────────────────────────────────────────────────────────────────┐
- │ asi-sense（0.4.0 · 纯感官模块 · 无侧栏 UI · 后台 Cordis 服务）        │
- │  ├─ 信号源：macOS Swift helper / BodyProbe / DSH 活动与任务           │
- │  ├─ 状态库：SenseState（每条事实含来源、时间、TTL 与权限状态）         │
- │  ├─ 短期趋势环：BodyHistory（内存保留最近 5 分钟体征曲线）             │
- │  ├─ Cordis 服务：ctx.asiSense（快照、订阅、normal/eco 采样）          │
- │  └─ 全局只读工具：env_state / env_detail（绝不主动注入消息）           │
- └──────────────────────────────────┬───────────────────────────────────┘
-                                    │ ctx.asiSense.subscribe / setPowerMode
-                                    ▼
- ┌──────────────────────────────────────────────────────────────────────┐
- │ asi-needs（0.4.0 · 生存需求、行动记忆与多层需求仲裁 · 生存需求侧栏）  │
- │  ├─ L1 五大生理需求稳态评估（0..100% 满足度/紧迫度 + 回滞锁）：       │
- │  │    ① 能量 energy  ② 空间 space  ③ 内存与进程 memory               │
- │  │    ④ 心智容量 mind ⑤ 体温负荷 thermals                             │
- │  ├─ Cordis 跨插件仲裁服务：ctx.asiDrives（马斯洛 L1–L4 仲裁器）       │
- │  │    - 供高阶插件（L2 asi-sleep、L3 asi-care）注册需求、工具与回调  │
- │  │    - L1 生理不适或 eco 节能模式时自动压制挂起全部 L2–L4 高阶需求   │
- │  ├─ 三层自救与交互机制：                                             │
- │  │    Tier 1 零 Token 本能反射（自动 eco 降频 + 静默网关探活）         │
- │  │    Tier 2 独立后台自维护会话（全景只读嗅探 + 白名单安全沙盒工具）   │
- │  │    Tier 3 按需啼哭求助（受控一键批准求助卡 + L1 单次 <asi-cry>）   │
- │  ├─ 行动效果记忆（Action-Outcome Memory）与零收益静默熔断             │
- │  ├─ 普通对话只读工具：needs_status（日常对话零打扰、零越权工具）       │
- │  └─ 侧栏面板（id: 'asi-needs'）：生存需求/高阶仲裁/自发维护/体征/环境 │
- └────────────────┬──────────────────────────────────┬──────────────────┘
-                  │ ctx.asiDrives (tier: 2)          │ ctx.asiDrives (tier: 3)
-                  ▼                                  ▼
- ┌───────────────────────────────────┐ ┌────────────────────────────────┐
- │ asi-sleep（0.4.0 · L2 睡眠整合）  │ │ asi-care（0.4.0 · L3 项目看护）│
- │  ├─ >=12 轮或 >=6h 困意；10m/锁屏 │ │  ├─ 零配置发现 + 兄弟 worktree │
- │  ├─ NREM+REM 双阶段聚类/冲突/修剪 │ │  ├─ 3m/30m 探针 + 2h 活跃豁免  │
- │  ├─ ts-fsrs + MiniSearch 中英检索 │ │  ├─ 三分驱动：仓库/端口/产物   │
- │  ├─ MEMORY.md 双向对账 + JSONL    │ │  ├─ 一级零损/二级批准/三级只读 │
- │  ├─ 只读：memory_recall/_profile  │ │  ├─ 只读：care_status（零啼哭）│
- │  └─ 独立侧栏：记忆库（asi-sleep） │ │  └─ 复用「生存需求」侧栏求助卡 │
- └───────────────────────────────────┘ └────────────────────────────────┘
+ ┌──────────────────────────────────────────────────────────────────────────┐
+ │ asi-sense（0.5.0 · 纯感官模块 · 无侧栏 UI · 后台 Cordis 服务）            │
+ │  ├─ 信号源：macOS Swift helper / BodyProbe / DSH 活动与任务               │
+ │  ├─ 状态库：SenseState（每条事实含来源、时间、TTL 与权限状态）             │
+ │  ├─ 短期趋势环：BodyHistory（内存保留最近 5 分钟体征曲线）                 │
+ │  ├─ Cordis 服务：ctx.asiSense（快照、订阅、normal/eco 采样）              │
+ │  └─ 全局只读工具：env_state / env_detail（绝不主动注入消息）               │
+ └────────────────────────────────────┬─────────────────────────────────────┘
+                                      │ ctx.asiSense.subscribe / setPowerMode
+                                      ▼
+ ┌──────────────────────────────────────────────────────────────────────────┐
+ │ asi-needs（0.5.0 · L1 生存需求、行动记忆与多层需求仲裁 · 生存需求侧栏）    │
+ │  ├─ L1 五大生理需求稳态评估（0..100% 满足度/紧迫度 + 回滞锁）：           │
+ │  │    ① 能量 energy  ② 空间 space  ③ 内存与进程 memory                   │
+ │  │    ④ 心智容量 mind ⑤ 体温负荷 thermals                                 │
+ │  ├─ Cordis 跨插件仲裁服务：ctx.asiDrives（马斯洛 L1–L4 仲裁器）           │
+ │  │    - 供高阶插件（L2 asi-sleep、L3 asi-care、L4 asi-growth）注册需求源  │
+ │  │    - L1 生理不适或 eco 节能模式时自动压制挂起全部 L2–L4 高阶需求       │
+ │  ├─ 三层自救与交互机制：本能反射 / 独立自维护沙盒 / 按需啼哭与批准求助卡   │
+ │  ├─ 行动效果记忆（Action-Outcome Memory）与零收益静默熔断                 │
+ │  ├─ 普通对话只读工具：needs_status                                        │
+ │  └─ 侧栏面板（id: 'asi-needs', order: 90）：生存需求/高阶仲裁/自维护/环境 │
+ └────────────┬───────────────────────────┬──────────────────────────┬──────┘
+              │ tier: 2                   │ tier: 3                  │ tier: 4 (+ ctx.asiSleep)
+              ▼                           ▼                          ▼
+ ┌──────────────────────────┐ ┌─────────────────────────┐ ┌─────────────────────────────┐
+ │ asi-sleep（0.5.0 · L2）  │ │ asi-care（0.5.0 · L3）  │ │ asi-growth（0.5.0 · L4）    │
+ │  ├─ >=12 轮或 >=6h 困意  │ │  ├─ 零配置 + 兄弟工作树 │ │  ├─ >=3 高保留记忆或 >=2 轨迹│
+ │  ├─ 10m 空闲/锁屏静默窗  │ │  ├─ 3m/30m 探针+2h豁免  │ │  ├─ L1-L3 全舒适 + 20m/锁屏 │
+ │  ├─ NREM+REM + ts-fsrs   │ │  ├─ 仓库/端口/产物三分  │ │  ├─ 纯文本 SKILL.md (<=2/日)│
+ │  ├─ 暴露只读 ctx.asiSleep│ │  ├─ 一级零损/二级静默卡 │ │  ├─ 人工批准 -> ctx.skills  │
+ │  ├─ memory_recall/_profile│ │  ├─ 只读：care_status  │ │  ├─ 60天代谢 + 导出 .agents │
+ │  └─ 记忆库（order: 91）  │ │  └─ 复用生存需求求助卡  │ │  └─ 技能工坊（order: 92）   │
+ └──────────────────────────┘ └─────────────────────────┘ └─────────────────────────────┘
  ```
 
 ### 已移除的旧版复杂度（0.2.0 起延续）
@@ -58,8 +55,6 @@ ASI 由 `asi-sense`、`asi-needs`、`asi-sleep` 与 `asi-care` 四个独立组�
 为保持纯粹的感官与需求分层，不包含：`WatchRule` / `env_watch` / `<env-update>` 动态消息推送、`Tuner` / `body_tune` 周桶基线学习、全盘 FSEvents 文件监视、30 天 JSONL 事件明细报告及插件源码自打包修改投递箱。
 
 ## 2. `asi-sense`：纯感官模块
-
-### 2.1 采集范围与 Cordis 契约（`ctx.asiSense`）
 
 1. **身体体征（`self.body`）**：`cpu`、`memory`、`disks`（含卷级新鲜度 `status`/`observedAt`/`ttlMs`）、`battery`、`thermal`、`network`、`harnessProcess`、`tokens`（含 `contextWindowSource`）。
 2. **当前环境快照（`self` / `env` / `observation`）**：四节点位置链 `env.where`、前台应用、焦点窗口、DSH 活动任务、系统锁屏/休眠状态、辅助功能权限与信号源健康度。
@@ -71,78 +66,55 @@ ASI 由 `asi-sense`、`asi-needs`、`asi-sleep` 与 `asi-care` 四个独立组�
 
 ### 3.1 L1 五大生存需求与连续稳态回滞模型
 
-每项需求实时计算整数 `satisfaction`（`0..100`）与 `urgency = 100 - satisfaction`，采用施密特触发器回滞（`<25` 为 `critical`，`<60` 为 `uncomfortable`，一旦 `driveActive` 激活须回升至 `>= 70` 才恢复 `comfortable` 并归档未决求助卡）：
-- `energy`（能量）：电池电量/续航与模型网关连通性；
-- `space`（空间）：新鲜磁盘卷剩余空间/占比与 5 分钟骤降斜率；
-- `memory`（内存与进程）：系统内存压力、DSH RSS 与超时/无主 DSH 任务数；
-- `mind`（心智容量）：上下文窗口余量与容量来源（区分已确认与 `fallback`）；
-- `thermals`（体温负荷）：macOS `thermal` 档位与 2 分钟持续 CPU 负荷。
+每项需求实时计算整数 `satisfaction`（`0..100`）与 `urgency = 100 - satisfaction`，采用施密特触发器回滞（`<25` 为 `critical`，`<60` 为 `uncomfortable`，一旦 `driveActive` 激活须回升至 `>= 70` 才恢复 `comfortable` 并归档未决求助卡）：`energy`、`space`、`memory`、`mind`、`thermals`。
 
 ### 3.2 MIT 开源内化改造：全景病因嗅探与 1 小时保护期外部缓存批准清理
 
-为实现零外部 CLI 依赖且天然通过沙盒与 `release-audit.mjs` 发布包审计，`asi-needs` 以源码级裁剪内化改造了以下 MIT 开源项目的核心规则与防护设计（详见 `LICENSE`）：
-- **`bysiber/cleardisk`（MIT）**：macOS 开发者缓存目标分类字典与 `safe / caution / risky` 风险分级模型；
-- **`guhcostan/mac-cleaner-cli`（MIT）**：构建/包管理缓存发现规则、符号链接零跟随与近期活跃修改保护策略；
-- **`tw93/Mole`（MIT）**：集中式删除根路径校验器（`validateProtectedTargetRoot`），硬性拦截系统根、主目录根、用户文档/下载/凭据目录及废纸篓路径；
-- **`sindresorhus/ps-list` & `soyuka/pidusage`（MIT）**：零第三方二进制依赖的 POSIX `ps` 进程表解析核心（仅提取可执行程序基名，不读取命令行参数明文，避免泄露敏感 token）。
+源码级内化改造 `bysiber/cleardisk`、`guhcostan/mac-cleaner-cli`、`tw93/Mole`、`sindresorhus/ps-list` 与 `soyuka/pidusage`（均 MIT，详见 `LICENSE`）。无人值守仅清理 ASI 自有沙盒目录（`needs_clean_cache`）；外部 `safe/caution` 开发者缓存须由用户点击求助卡批准后清理修改时间 `>= 1 小时` 的陈旧项（保护最近 1 小时活跃子项与原子工程/包束）；废纸篓、用户文件与外部进程永远只读提示。
 
-工作流与安全边界：
-1. **全景只读嗅探工具 `needs_sniff_causes`（仅挂载于后台自维护会话）**：
-   - 按规则独立配额扫描受控字典内的外部开发者缓存（Xcode `DerivedData` / `Archives`、Homebrew、pnpm、npm、pip、uv、Cargo、Go Build/Mod、Gradle、Playwright 浏览器），防止大型包缓存目录耗尽配额饥饿后序规则，精确区分**总体积（`totalBytes`）**与**修改时间超过 1 小时的可清理体积（`reclaimableBytes`）**；
-   - 只读统计系统废纸篓（`~/.Trash`）体积与项目数（独立配额、固定 `risk: 'risky'`、`cleanable: false`，仅作提示）；
-   - 采样当前 Top CPU / Top RSS 进程摘要（仅供负载归因参考，绝不强杀外部进程）；
-   - 全部输出统一经 `sanitizeForModel` 脱敏与 `~` 路径归一化，普通用户日常对话不挂载该工具。
-2. **无人值守 vs 求助卡一键批准清理**：
-   - 无人值守时，后台会话**仅自动清理 ASI 自身沙盒临时目录**（`needs_clean_cache`）；
-   - 当检测到外部 `safe/caution` 缓存大户时，生成携带精确体积与**受控白名单 `actionTarget` 标识**（`actionKind: 'clean-external-cache'`，严格拒绝任意路径、`macos-trash` 或无超 1h 可清理字节的目标入参）的求助卡；多缓存大户场景下批准清理首项后若空间仍紧，自动顺延提议下一未忽略的可清理大户；
-   - 用户在侧栏点击「批准清理外部缓存」时，宿主执行 `lstat`（防符号链接）+ `realpath` 包含校验 + `validateProtectedTargetRoot` 防护，**直接清除该目标内修改时间 `>= 1 小时`（`3,600,000 ms`）的陈旧缓存项以立即释放磁盘空间，并自动跳过最近 1 小时内刚修改过的活跃子项**（对 Xcode 工程工作区、`.xcarchive` / `.app` 包束、Playwright 浏览器目录与 `.cargo/git/db` 裸仓库按原子子项整体保护，防止半删损坏活跃编译或包束）。废纸篓、用户文件与外部进程永远只提示不代动。
+### 3.3 行动效果记忆（`ActionOutcomeLedger`）与零收益静默熔断
 
-### 3.3 行动效果记忆（Action-Outcome Memory）与零收益静默熔断
-
-1. **宿主自动实测前后增益（`ActionMeasurement`）**：
-   - 每次执行自维护工具、高阶需求沙盒工具或用户批准求助卡动作前后，宿主自动刷新感官并实测真实增益（`freedBytes`、`stoppedJobs`、`tokensSaved`、`satisfactionBefore -> satisfactionAfter` 提升 `satisfactionDelta`），写入维护记录与持久化 `state.json`。
-2. **零收益静默熔断（`EpisodeCircuitBreaker`，省 Token）**：
-   - 同一异常剧集内，若安全自救动作已试过但无实际收益（`!effective` 且满足度未提升）并且已挂出或已处理求助卡（或用户主动点击「忽略」），宿主自动对该需求启动**静默熔断**，不再每过 120 秒重复唤醒大模型空转；
-   - 仅当出现以下任一事件时自动解除熔断：① 环境发生实质变化（如磁盘余量较熔断基线变化 `>= 512 MiB`、新增卡死任务/空闲可压缩会话、高阶需求 `evidence` 变更、满足度变化 `>= 10%`）；② 严重度从 `uncomfortable` 恶化升级至 `critical`；③ 用户点击求助卡「批准 / 我已处理」（触发单轮复核，若仍零收益则重新闭合熔断）；④ 需求恢复至 `comfortable` 舒适区。
-3. **持久化动作收益账本（`ActionOutcomeLedger`）**：
-   - 长期累计每个 `(需求 × 动作)` 的尝试次数、有效次数、有效率（`successRate`）与累计释放空间/节省 Token/满足度总增益；
-   - 唤醒后台自维护会话时自动注入历史有效率推荐（优先推荐高收益动作、警示历史及近期零收益动作），并在统一侧栏「自发维护」面板实时展示。
+自动实测动作前后真实增益并持久化 `(需求 × 动作)` 有效率账本；同一异常剧集内安全自救零收益且已挂出求助卡时启动静默熔断，仅在环境实质变化、升级至 `critical`、用户批准处理或恢复舒适时解除。
 
 ### 3.4 跨插件统一需求仲裁服务（`ctx.asiDrives`）
 
-`asi-needs` 直接向 Cordis 暴露 `ctx.asiDrives`（`AsiDrivesService`），内置马斯洛多层需求仲裁器（`MaslowDriveArbiter`）：
-- **L1（生理生存层，内置）**：`asi-needs` 自身五大生存需求（`energy`、`space`、`memory`、`mind`、`thermals`）；
-- **L2–L4（高阶需求层，开放扩展）**：支持独立组合包插件（如 L2 `asi-sleep` 离线记忆巩固、L3 `asi-care` 工作区与项目看护）调用 `ctx.asiDrives.registerSource({ id, tier: 2 | 3 | 4, label, evaluate, sandboxTools, executeHelpAction, onHelpDismissed })` 动态注册需求源、专属沙盒工具与受控求助卡批准回调（评估入参深拷贝隔离并在 `sendTitles=false` 时自动遮蔽窗口标题），并通过 `proposeHelpCard` / `resolveHelpCards` 在统一侧栏挂载静默求助卡（`silent: true`，严禁触发 `<asi-cry>` 对话注入），用户批准后自动计量真实收益写入 `ActionOutcomeLedger`；
-- **生理优先、在途抢占与节能自动压制**：只要任一 L1 生理需求处于不适/危急/回滞恢复期，或 `asi-sense` 处于 `'eco'` 节能降频模式，所有 `L2–L4` 高阶需求均自动标记 `suppressed = true` 挂起——不仅阻止高阶后台唤醒、在 `agent.ctx.tools.guard` 层即时拦截高阶沙盒工具，还会通过专属 `AbortSignal` 立即抢占中断在途高阶维护回合（不误记高阶熔断、不挤占 L1 自救冷却）；待 L1 彻底恢复舒适且回到 `'normal'` 模式后，高阶需求按层级优先序共享同一后台自维护会话与每小时轮次预算，并自动接入统一侧栏与动作收益账本。
+内置马斯洛多层仲裁器（`MaslowDriveArbiter`），统一纳管 L1 生理生存需求与高阶插件（L2 `asi-sleep`、L3 `asi-care`、L4 `asi-growth`）：只要任一 L1 生理需求处于不适/危急/回滞恢复期或处于 `'eco'` 模式，所有 `L2–L4` 高阶需求均自动标记 `suppressed = true` 挂起并抢占中断在途高阶回合。
 
 ## 4. `asi-sleep`：L2 睡眠与长期记忆巩固
 
-1. **开源算法复用与内化（MIT，零原生 C++ / 外部 CLI 依赖）**：
-   - 改造自 `Fozikio/cortex-engine`（MIT）的双阶段睡眠整合流水线：**NREM 阶段**增量提炼并同批聚类四类记忆（`preference` 偏好、`decision` 决策、`pitfall` 踩坑、`episode` 近期进展）；**REM 阶段**跨会话去重强化、消解偏好/决策立场反转冲突、建立跨会话关联链接并按遗忘曲线修剪过期记忆。
-   - 集成 `open-spaced-repetition/ts-fsrs`（MIT）计算连续时间幂律保留率 $R(t)$，命中 `memory_recall` 自动强化稳定度 $S$；手动置顶（`pinned: true`）条目恒定锁定 `100%` 保留率且永不衰减修剪。
-   - 集成 `lucaong/minisearch`（MIT）并扩展中英双语二元词组 + 驼峰/代码标识符分词器，支持毫秒级本地 BM25 + 前缀 + 拼写容错检索。
-   - 本地落盘为人类可直接查看并**双向编辑**的 `vault/MEMORY.md` + 结构化 `vault/memories.jsonl` + `vault/sleep-journal.jsonl`（外部手工编辑 `MEMORY.md` 在启动与读写/落盘前自动对账同步回 `memories.jsonl`，保留原有 FSRS 状态并强制脱敏）。
-2. **困意曲线、静默窗口与生理抢占仲裁**：
-   - 注册至 `ctx.asiDrives`（`id: 'asi-sleep', tier: 2`，`autoMaintain: false`），当普通对话未整合轮次 `>= 12`（或有新轮次且距上次睡眠 `>= 6 小时`）时进入不适区（`satisfaction < 60`）；
-   - 严格跳过后台自维护沙盒与子代理（`subagent`）会话；
-   - 自动睡眠仅在「全部普通会话空闲 `>= 10 分钟` 或 `env.system.locked === true`」且 L1 生理需求全部舒适（非 `eco` 模式）时启动，每日自动配额 `<= 6` 次；一旦在途出现 L1 生理不适或进入 `eco` 模式，立即通过 `AbortController` 抢占中断并回滚配额。
-3. **零 Prompt Cache 污染的按需工具**：
-   - 日常对话仅注册只读工具 `memory_recall` 与 `memory_profile`，绝不动态注入消息或改写系统提示词。
+1. **开源算法复用与内化（MIT）**：改造自 `Fozikio/cortex-engine`（NREM+REM 双阶段整合）、`open-spaced-repetition/ts-fsrs`（FSRS 保留率衰减与回忆强化）与 `lucaong/minisearch`（中英双语全文检索），本地持久化为支持双向编辑对账的 `vault/MEMORY.md` + `vault/memories.jsonl` + `vault/sleep-journal.jsonl`。
+2. **困意曲线、静默窗口与只读 Cordis 服务（`ctx.asiSleep`）**：
+   - 注册至 `ctx.asiDrives`（`id: 'asi-sleep', tier: 2, autoMaintain: false`），普通对话未整合轮次 `>= 12` 或有新轮次且距上次睡眠 `>= 6 小时` 时产生困意，仅在全部普通会话空闲 `>= 10 分钟` 或锁屏且 L1 舒适时自动整合（`<= 6` 次/天）；
+   - 向同进程上层插件（如 `asi-growth`）暴露只读 `AsiSleepServiceApi`（`ctx.asiSleep.listMemories` / `subscribe`，零 FSRS 状态副作用、全字段脱敏隔离），向日常对话仅注册按需只读工具 `memory_recall` 与 `memory_profile`。
 
 ## 5. `asi-care`：L3 本地工作区与项目看护
 
-`asi-care` 作为独立无侧栏图标的组合包接入 `ctx.asiDrives`（`tier: 3`），与监听外部远端工单的 `dsh-superagent` 及单会话 `dsh-context` 互补，专注本机工作区与多工作树卫生：
-1. **零配置发现 + Git 兄弟工作树展开 + 2h 活跃豁免**：自动聚合 DSH `workspaceRegistry`、普通会话 `cwd` 与可选 `extraRoots`（排除 `ignorePaths`、ASI 内部目录及 `~/.secrets` / `~/.Trash`），通过 `git worktree list --porcelain` 自动展开全部兄弟工作树；凡有活跃 DSH 会话或 `2 小时` 内存在文件变动的工作树自动豁免扣分与清理。
-2. **快慢双速探针与正交三分驱动**：快探针每 `3 分钟` 巡检 Git 状态/锁（带 `--no-optional-locks` / `GIT_OPTIONAL_LOCKS=0`）与 `lsof` 监听端口，慢探针每 `30 分钟` 按配额遍历非活跃工作树构建产物；输出 `repo_hygiene`、`orphan_runtime`、`workspace_bloat` 三条独立熔断的 L3 驱动。
-3. **MIT 开源裁剪内化与三级自治护栏**：源码级内化改造 `npkill`、`simple-git`、`git-cleaner`、`fkill` / `pid-port` 解析与校验规则（零第三方运行时依赖）；一级无人值守仅执行 `git worktree prune`、经 `lsof` 复核零进程占用的超时 `.git/*.lock` 与无主 DSH 任务；二级清理 `>=7d` 闲置构建产物（`>=1 GiB` 不适）、移除 `>=3d` 干净已合入 worktree（不带 `--force`）及向 `>2h` 本地孤儿开发端口发送 `SIGTERM` 一律须用户点击侧栏静默求助卡批准；三级未提交改动（`>24h`）、未推送提交与冲突残留（`>2h`）永远只读提示。普通对话仅暴露只读工具 `care_status`，全程零 `<asi-cry>` 前台打扰。
+无独立侧栏图标的组合包接入 `ctx.asiDrives`（`tier: 3`），源码级内化改造 `npkill`、`simple-git`、`git-cleaner`、`fkill` / `pid-port`（均 MIT）：零配置发现工作区并展开 Git 兄弟工作树，2h 活跃工作树自动豁免，按 3m/30m 双速探针输出 `repo_hygiene`、`orphan_runtime`、`workspace_bloat` 三条正交驱动；一级零损无人值守（`git worktree prune`、零占用超时 `.git/*.lock`、无主 DSH 任务），二级（闲置构建产物、干净已合入 worktree、孤儿开发端口 `SIGTERM`）复用「生存需求」静默求助卡由用户批准，三级未提交改动/冲突永远只读提示；普通对话仅暴露只读工具 `care_status`。
 
-## 6. 侧栏界面（`生存需求` + `记忆库`）
+## 6. `asi-growth`：L4 程序性技能提炼与自进化
 
-- **生存需求**（`id: 'asi-needs'`，`order: 90`）：置顶求助区（承载 L1 啼哭求助卡与 L3 `asi-care` 静默一键批准求助卡）、L1 五大生理需求与 `ctx.asiDrives` 高阶需求仲裁区（同步展示 L2 `asi-sleep` 与 L3 `asi-care` 满足度及挂起状态）、自发维护与动作收益账本、核心体征、当前环境、控制与隐私开关。
-- **记忆库**（`id: 'asi-sleep'`，`order: 91`）：L2 睡眠稳态与配额卡片、「立即睡眠整合」与「暂停自动睡眠整合」开关、图形化中英搜索与四类记忆筛选、FSRS 保留率进度条，以及完整的记忆增删改与置顶（永不衰减）管理。
+1. **MIT 开源复用改造与纯文本标准格式（零原生 C++ / 外部 CLI 依赖）**：
+   - 改造自 `MineDojo/Voyager`（MIT）的程序性技能库闭环（`高证据聚类 -> 技能起草 -> 验证评论家 Critic -> v1->v2+ 增量迭代精炼`）；
+   - 改造自 `agentskills/agentskills`（MIT）的开放标准 `SKILL.md` YAML Frontmatter + Markdown 解析、序列化与规范校验器（强校验 kebab-case `name` `1..64` 字符、`description` `10..1024` 字符，硬性拦截任何 `scripts/*.sh|*.mjs|*.py` 可执行脚本生成引用）。
+   - 所有草案、已启用技能与归档技能均以纯文本 `SKILL.md` 存储在 `<storageRoot>/skills/{drafts,active,archived}/`，**零可执行脚本生成、零未获用户点击导出的 Git 工作区写入**。
+2. **高证据阈值、20 分钟深静默门控与跨层抢占（`ctx.asiDrives` L4）**：
+   - 注册 `id: 'asi-growth', tier: 4`（`autoMaintain: false`）与沙盒工具 `growth_synthesize`；
+   - 融合 `ctx.asiSleep` 高保留率（`retention >= 0.5` 或置顶）记忆（仅计 `pitfall`/`decision`/`preference`，`episode` 永不触发）与已完成的普通会话多步排障轨迹（`>= 2` 步或工具调用且解决报错）：仅当同一主题累积 `>= 3` 条高保留率记忆（含至少 1 条 `pitfall`）**或**多步排障轨迹重复出现 `>= 2` 次（或已启用技能主题出现新踩坑触发 `v2+` 修订）时才进入不适区（`satisfaction < 60`）；
+   - **深静默自动起草门控**：仅当 **L1（`asi-needs`）、L2（`asi-sleep`）与 L3（`asi-care`）全部处于舒适区**（非 `eco` 模式）**且**全部普通会话空闲 `>= 20 分钟` 或屏幕已锁定时自动起草待审草案（每日自动上限 `<= 2` 份）；在途若任一 L1–L3 驱动激活或进入 `eco` 模式，立即通过 `AbortController` 抢占中断并回滚当日自动配额。
+3. **严格人工批准门禁、`@deepseek-ai/dsh-skill` 动态热挂载与 60 天代谢**：
+   - 新技能（`v1`）与增量修订（`v2+`，侧栏内置行级 `+`/`-` 差异对比器）一律先落入「待审草案」，绝不自动生效；
+   - 用户一键点击「批准启用」后，通过 DSH 公开接口 `ctx.skills.registerProvider` 即时调用 `control.invalidate()` 热挂载/热更新至宿主技能目录，支持 `global`（全局）与 `workspace`（按 `options.cwd` 严格隔离）作用域在线切换，以及由用户一键安全导出至目标工作区 `.agents/skills/<name>/SKILL.md`（含 `lstat` 符号链接拦截与受保护根路径校验）；
+   - 自动统计每项技能的调用次数、最近调用时间与关联回合完成率；对连续 `60` 天零调用的已启用技能自动标记「建议归档」，一键归档即从 `ctx.skills` 卸载并保留文件供随时恢复。普通对话仅注册只读工具 `growth_status`（零动态提示词或消息注入）。
 
-## 7. 隐私与凭据安全
+## 7. 侧栏界面（`生存需求` + `记忆库` + `技能工坊`）
 
-- 所有观察数据、维护状态、动作收益账本与长期记忆库仅保存在本机 DSH 数据目录。
-- 所有暴露给模型的工具返回值（`env_state`、`env_detail`、`needs_status`、`needs_sniff_causes`、`memory_recall`、`memory_profile`、`care_status`、维护工具及 `ctx.asiDrives` 扩展工具）、记忆落盘写入前与磁盘读取后，以及 `<asi-cry>` 文本一律经过线性时间 $O(N)$ 的 `sanitizeForModel` 凭据打码器与主目录 `~` 化保护；关闭「窗口标题发给模型」时，窗口标题既不发给模型也不渲染进侧栏 DOM。
-- 发行包构建产物（`asi-sense`、`asi-needs`、`asi-sleep`、`asi-care`）均强制通过 `release-audit.mjs` 检查（校验文件白名单、零源码映射、零密钥/邮箱/本机用户名/敏感绝对路径残留）。
+三个客户端面板均采用独立 CSS Module 文件与类名前缀隔离（`asi-needs`、`asi-sleep`、`asi-growth` 样式选择器 100% 零重叠）：
+- **生存需求**（`id: 'asi-needs'`，`order: 90`）：置顶求助区（承载 L1 啼哭求助卡与 L3 `asi-care` 静默批准卡）、L1 五大生理需求与 `ctx.asiDrives` 高阶需求仲裁区（实时同步展示 L2 `asi-sleep`、L3 `asi-care` 与 L4 `asi-growth` 满足度及挂起状态）、自发维护与动作收益账本、核心体征、当前环境、控制与隐私开关。
+- **记忆库**（`id: 'asi-sleep'`，`order: 91`）：L2 睡眠稳态与配额卡片、「立即睡眠整合」与「暂停自动睡眠整合」开关、图形化中英搜索与四类记忆筛选、FSRS 保留率进度条，以及完整的记忆增删改与置顶管理。
+- **技能工坊**（`id: 'asi-growth'`，`order: 92`）：L4 自进化与 20m 深静默门控卡片、「立即提炼技能」与「暂停自动技能提炼」开关、`待审草案 / 已启用 / 已归档` 三视图切换、`SKILL.md` 在线预览与实时规范校验编辑、`v1 → v2` 增量修订差异检查、`global` 与 `workspace`（`cwd`）作用域切换、批准/驳回/停用/归档/恢复、手动新建草案，以及一键导出至 `.agents/skills/`。
+
+## 8. 隐私与凭据安全
+
+- 所有观察数据、维护状态、动作收益账本、长期记忆库与技能工坊文件仅保存在本机 DSH 数据目录（除用户显式点击导出技能至指定工作区 `.agents/skills/` 外，绝不写入用户项目目录）。
+- 所有暴露给模型的工具返回值（`env_state`、`env_detail`、`needs_status`、`needs_sniff_causes`、`memory_recall`、`memory_profile`、`care_status`、`growth_status`、维护工具及 `ctx.asiDrives` 扩展工具）、`ctx.skills` 返回的技能描述与正文、记忆与 `SKILL.md` 落盘前后、RPC 错误信息及 `<asi-cry>` 文本一律经过线性时间 $O(N)$ 的 `sanitizeForModel` 凭据打码器与主目录 `~` 化保护，并严格跳过所有 ASI 内部沙盒/记忆库/技能目录及子代理会话。
+- 五个发行包构建产物（`asi-sense`、`asi-needs`、`asi-sleep`、`asi-care`、`asi-growth`）均强制通过 `release-audit.mjs` 检查（校验文件白名单、零源码映射、零密钥/邮箱/本机用户名/敏感绝对路径残留）。
