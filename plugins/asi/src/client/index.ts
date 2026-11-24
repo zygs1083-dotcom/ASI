@@ -10,6 +10,7 @@ import { createElement as h } from 'react';
 import type { AsiPanelModel } from '../host/dsh/wire-types.ts';
 import { AsiPanel } from './AsiPanel.tsx';
 import { createAsiActions } from './actions.ts';
+import css from './asi-panel.module.css';
 import { createFrameState, staleAsiPanelModel } from './frame-state.ts';
 import { asiPanelModel } from './panel-model.ts';
 
@@ -62,17 +63,24 @@ function Panel(props: PanelProps) {
     'div',
     {
       'data-testid': 'asi-slot',
-      style: { display: 'flex', flexDirection: 'column', flex: 1, minWidth: 0, minHeight: 0 },
+      className: css.slotWrap,
     },
     snapshot.status === 'live'
       ? null
-      : h('div', { role: snapshot.status === 'failed' ? 'alert' : 'status' }, props.t(snapshot.status)),
-    failed
+      : h(
+          'div',
+          {
+            role: snapshot.status === 'failed' ? 'alert' : 'status',
+            className: snapshot.status === 'failed' ? css.slotAlertBanner : css.slotStatusBanner,
+          },
+          props.t(snapshot.status),
+        ),
+    failed && !model
       ? h(
           'div',
-          { role: 'alert' },
-          props.t('actionFailed'),
-          h('button', { type: 'button', onClick: props.clearError }, props.t('dismiss')),
+          { role: 'alert', className: css.slotAlertBanner },
+          h('span', null, props.t('actionFailed')),
+          h('button', { type: 'button', className: css.textBtn, onClick: props.clearError }, props.t('dismiss')),
         )
       : null,
     model

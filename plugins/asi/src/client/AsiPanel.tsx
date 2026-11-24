@@ -17,7 +17,7 @@ import {
   NowSection,
   useFreshModel,
 } from '@asi/sense-ui';
-import { type FormEvent, type KeyboardEvent, useEffect, useMemo, useState } from 'react';
+import { type FormEvent, type KeyboardEvent, useEffect, useMemo, useRef, useState } from 'react';
 import { computeLineDiff } from '../growth/shared/diff.ts';
 import { parseSkillMarkdown } from '../growth/shared/skill-spec.ts';
 import type {
@@ -232,6 +232,7 @@ export function AsiPanel(props: AsiPanelProps) {
   const [activeTab, setActiveTab] = useState<AsiMainTab>(props.initialTab ?? 'care');
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [spotlightFeedback, setSpotlightFeedback] = useState<string | null>(null);
+  const [spotlightIsError, setSpotlightIsError] = useState(false);
   const [spotlightBusy, setSpotlightBusy] = useState(false);
 
   // ---- Tab 1 (稳态看护) State ----
@@ -260,11 +261,13 @@ export function AsiPanel(props: AsiPanelProps) {
   const [busyConsolidate, setBusyConsolidate] = useState(false);
   const [sleepFeedback, setSleepFeedback] = useState<string | null>(null);
   const [remoteSearchResults, setRemoteSearchResults] = useState<MemoryViewItem[] | null>(null);
+  const [vaultMutationSeq, setVaultMutationSeq] = useState(0);
 
   // ---- Tab 3 (技能工坊) State ----
   const [skillSubTab, setSkillSubTab] = useState<SkillTabView>(() =>
     growthModel.draftCount > 0 ? 'drafts' : 'active',
   );
+  const prevDraftCountRef = useRef(growthModel.draftCount);
   const [skillQuery, setSkillQuery] = useState('');
   const [creatingSkill, setCreatingSkill] = useState(false);
   const [createSkillName, setCreateSkillName] = useState('');
@@ -298,16 +301,19 @@ export function AsiPanel(props: AsiPanelProps) {
   // ---- Memory Search & Filtering ----
   const hasOverflowVault = sleepModel.totalMemories > sleepModel.memories.length;
   const onSearchMemories = props.onSearchMemories;
+  const headMem = sleepModel.memories[0];
+  const vaultSearchWatermark = `${sleepModel.totalMemories}:${headMem?.id ?? ''}:${headMem?.updatedAt ?? 0}:${headMem?.pinned ? 1 : 0}:${vaultMutationSeq}`;
 
   useEffect(() => {
     if (!hasOverflowVault || !onSearchMemories || (!memQuery.trim() && kindFilter === 'all')) {
       setRemoteSearchResults(null);
       return;
     }
+    const activeWatermark = vaultSearchWatermark;
     let cancelled = false;
     void onSearchMemories(memQuery, kindFilter === 'all' ? undefined : kindFilter)
       .then((items) => {
-        if (!cancelled) setRemoteSearchResults(items);
+        if (!cancelled && activeWatermark) setRemoteSearchResults(items);
       })
       .catch(() => {
         if (!cancelled) setRemoteSearchResults(null);
@@ -315,7 +321,21 @@ export function AsiPanel(props: AsiPanelProps) {
     return () => {
       cancelled = true;
     };
-  }, [hasOverflowVault, onSearchMemories, memQuery, kindFilter]);
+  }, [hasOverflowVault, onSearchMemories, memQuery, kindFilter, vaultSearchWatermark]);
+
+  useEffect(() => {
+    if (prevDraftCountRef.current === 0 && growthModel.draftCount > 0) {
+      setSkillSubTab('drafts');
+    }
+    prevDraftCountRef.current = growthModel.draftCount;
+  }, [growthModel.draftCount]);
+
+  const firstKnownWorkspacePath = growthModel.knownWorkspaces[0]?.path ?? '';
+  useEffect(() => {
+    if (!createSkillWorkspace && firstKnownWorkspacePath) {
+      setCreateSkillWorkspace(firstKnownWorkspacePath);
+    }
+  }, [createSkillWorkspace, firstKnownWorkspacePath]);
 
   const filteredMemories = useMemo(() => {
     if (remoteSearchResults !== null) return remoteSearchResults;
@@ -374,6 +394,13 @@ export function AsiPanel(props: AsiPanelProps) {
     return [...map.entries()];
   };
 
+  const selectMainTab = (target: AsiMainTab) => {
+    if (target === 'skills' && activeTab !== 'skills' && growthModel.draftCount > 0) {
+      setSkillSubTab('drafts');
+    }
+    setActiveTab(target);
+  };
+
   // ---- Keyboard Tab Switcher ----
   const handleMainTabKeyDown = (e: KeyboardEvent<HTMLButtonElement>, idx: number) => {
     let nextIdx: number | null = null;
@@ -384,7 +411,7 @@ export function AsiPanel(props: AsiPanelProps) {
     if (nextIdx !== null) {
       e.preventDefault();
       const target = MAIN_TABS[nextIdx] ?? 'care';
-      setActiveTab(target);
+      selectMainTab(target);
       document.getElementById(`asi-tab-${target}`)?.focus();
     }
   };
@@ -394,6 +421,7 @@ export function AsiPanel(props: AsiPanelProps) {
     try {
       await props.onPause(paused);
     } catch (err) {
+      setSpotlightIsError(true);
       setSpotlightFeedback(err instanceof Error ? err.message : '切换暂停状态失败');
     }
   };
@@ -402,7 +430,17 @@ export function AsiPanel(props: AsiPanelProps) {
     try {
       await props.onToggleTitles(enabled);
     } catch (err) {
+      setSpotlightIsError(true);
       setSpotlightFeedback(err instanceof Error ? err.message : '更新窗口标题设置失败');
+    }
+  };
+
+  const handleOpenPermissionSettings = async () => {
+    setCareFeedback(null);
+    try {
+      await props.onOpenPermissionSettings();
+    } catch (err) {
+      setCareFeedback(err instanceof Error ? err.message : '打开权限设置失败，请稍后重试');
     }
   };
 
@@ -416,15 +454,21 @@ export function AsiPanel(props: AsiPanelProps) {
     setCareBusyId(cardId);
     setCareFeedback(null);
     setSpotlightFeedback(null);
+    setSpotlightIsError(false);
     try {
       await fn(cardId);
       if (fromSpotlight) {
+        setSpotlightIsError(false);
         setSpotlightFeedback(`已完成：${label}`);
       }
     } catch (err) {
       const msg = err instanceof Error ? err.message : `${label}失败，请重试`;
-      if (fromSpotlight) setSpotlightFeedback(msg);
-      else setCareFeedback(msg);
+      if (fromSpotlight) {
+        setSpotlightIsError(true);
+        setSpotlightFeedback(msg);
+      } else {
+        setCareFeedback(msg);
+      }
     } finally {
       setCareBusyId(null);
       if (fromSpotlight) setSpotlightBusy(false);
@@ -449,6 +493,7 @@ export function AsiPanel(props: AsiPanelProps) {
     setSleepFeedback(null);
     try {
       const rec = await props.onConsolidateNow();
+      setVaultMutationSeq((n) => n + 1);
       setSleepFeedback(rec?.summary || '已完成立即睡眠整合。');
     } catch (err) {
       setSleepFeedback(err instanceof Error ? err.message : '睡眠整合执行失败');
@@ -481,6 +526,7 @@ export function AsiPanel(props: AsiPanelProps) {
       setCreateTags('');
       setCreatePinned(false);
       setCreatingMemory(false);
+      setVaultMutationSeq((n) => n + 1);
       setSleepFeedback('已新建记忆条目。');
     } catch (err) {
       setSleepFeedback(err instanceof Error ? err.message : '新建记忆失败');
@@ -508,6 +554,7 @@ export function AsiPanel(props: AsiPanelProps) {
         pinned: editPinned,
       });
       setEditingMemoryId(null);
+      setVaultMutationSeq((n) => n + 1);
       setSleepFeedback('已保存记忆修改。');
     } catch (err) {
       setSleepFeedback(err instanceof Error ? err.message : '更新记忆失败');
@@ -517,6 +564,7 @@ export function AsiPanel(props: AsiPanelProps) {
   const handleTogglePin = async (id: string, nextPinned: boolean) => {
     try {
       await props.onTogglePin(id, nextPinned);
+      setVaultMutationSeq((n) => n + 1);
     } catch (err) {
       setSleepFeedback(err instanceof Error ? err.message : '更新置顶状态失败');
     }
@@ -526,6 +574,7 @@ export function AsiPanel(props: AsiPanelProps) {
     try {
       await props.onDeleteMemory(id);
       if (editingMemoryId === id) setEditingMemoryId(null);
+      setVaultMutationSeq((n) => n + 1);
     } catch (err) {
       setSleepFeedback(err instanceof Error ? err.message : '删除记忆失败');
     }
@@ -591,14 +640,19 @@ export function AsiPanel(props: AsiPanelProps) {
       const msg = `已批准启用 ${approved?.name ?? draft.name} (v${approved?.version ?? draft.targetVersion}) · 已热挂载至 ctx.skills。`;
       setGrowthFeedback(msg);
       if (fromSpotlight) {
+        setSpotlightIsError(false);
         setSpotlightFeedback(msg);
       } else {
         setSkillSubTab('active');
       }
     } catch (err) {
       const msg = err instanceof Error ? err.message : '批准草案失败';
-      if (fromSpotlight) setSpotlightFeedback(msg);
-      else setGrowthFeedback(msg);
+      if (fromSpotlight) {
+        setSpotlightIsError(true);
+        setSpotlightFeedback(msg);
+      } else {
+        setGrowthFeedback(msg);
+      }
     } finally {
       if (fromSpotlight) setSpotlightBusy(false);
     }
@@ -804,7 +858,7 @@ export function AsiPanel(props: AsiPanelProps) {
 
   // ---- Cross-Tab Spotlight Items ----
   const topCrossHelp = activeTab !== 'care' ? openHelpCards[0] : undefined;
-  const topCrossDraft = activeTab !== 'skills' ? growthModel.drafts[0] : undefined;
+  const topCrossDraft = activeTab !== 'skills' || skillSubTab !== 'drafts' ? growthModel.drafts[0] : undefined;
   const showSpotlight = Boolean(topCrossHelp || topCrossDraft || spotlightFeedback);
 
   // ---- Sleep & Growth Compact Status Strings ----
@@ -905,7 +959,7 @@ export function AsiPanel(props: AsiPanelProps) {
           aria-controls="asi-tabpanel-care"
           tabIndex={activeTab === 'care' ? 0 : -1}
           className={`${css.tabBtn} ${activeTab === 'care' ? css.tabBtnActive : ''}`}
-          onClick={() => setActiveTab('care')}
+          onClick={() => selectMainTab('care')}
           onKeyDown={(e) => handleMainTabKeyDown(e, 0)}
         >
           <span>稳态看护</span>
@@ -923,7 +977,7 @@ export function AsiPanel(props: AsiPanelProps) {
           aria-controls="asi-tabpanel-memory"
           tabIndex={activeTab === 'memory' ? 0 : -1}
           className={`${css.tabBtn} ${activeTab === 'memory' ? css.tabBtnActive : ''}`}
-          onClick={() => setActiveTab('memory')}
+          onClick={() => selectMainTab('memory')}
           onKeyDown={(e) => handleMainTabKeyDown(e, 1)}
         >
           <span>记忆库</span>
@@ -939,7 +993,7 @@ export function AsiPanel(props: AsiPanelProps) {
           aria-controls="asi-tabpanel-skills"
           tabIndex={activeTab === 'skills' ? 0 : -1}
           className={`${css.tabBtn} ${activeTab === 'skills' ? css.tabBtnActive : ''}`}
-          onClick={() => setActiveTab('skills')}
+          onClick={() => selectMainTab('skills')}
           onKeyDown={(e) => handleMainTabKeyDown(e, 2)}
         >
           <span>技能工坊</span>
@@ -955,9 +1009,20 @@ export function AsiPanel(props: AsiPanelProps) {
       {showSpotlight && (
         <section className={css.spotlightStrip} data-testid="cross-tab-spotlight" aria-label="跨页待处理事项">
           {spotlightFeedback && (
-            <div role="status" className={css.feedbackBanner} data-testid="spotlight-feedback">
+            <div
+              role={spotlightIsError ? 'alert' : 'status'}
+              className={spotlightIsError ? css.alertBanner : css.feedbackBanner}
+              data-testid="spotlight-feedback"
+            >
               <span>{spotlightFeedback}</span>
-              <button type="button" className={css.textBtn} onClick={() => setSpotlightFeedback(null)}>
+              <button
+                type="button"
+                className={css.textBtn}
+                onClick={() => {
+                  setSpotlightFeedback(null);
+                  setSpotlightIsError(false);
+                }}
+              >
                 关闭
               </button>
             </div>
@@ -1295,7 +1360,7 @@ export function AsiPanel(props: AsiPanelProps) {
                 </span>
               </summary>
               <div className={css.drawerBody}>
-                <BodySection model={needsModel} onOpenPermissionSettings={props.onOpenPermissionSettings} />
+                <BodySection model={needsModel} onOpenPermissionSettings={handleOpenPermissionSettings} />
               </div>
             </details>
 
@@ -1307,7 +1372,7 @@ export function AsiPanel(props: AsiPanelProps) {
                 </span>
               </summary>
               <div className={css.drawerBody}>
-                <NowSection model={needsModel} onOpenPermissionSettings={props.onOpenPermissionSettings} />
+                <NowSection model={needsModel} onOpenPermissionSettings={handleOpenPermissionSettings} />
               </div>
             </details>
           </div>
@@ -1885,7 +1950,13 @@ export function AsiPanel(props: AsiPanelProps) {
                 <select
                   className={css.fieldSelect}
                   value={createSkillScope}
-                  onChange={(e) => setCreateSkillScope(e.currentTarget.value as SkillScope)}
+                  onChange={(e) => {
+                    const nextScope = e.currentTarget.value as SkillScope;
+                    setCreateSkillScope(nextScope);
+                    if (nextScope === 'workspace' && !createSkillWorkspace.trim() && firstKnownWorkspacePath) {
+                      setCreateSkillWorkspace(firstKnownWorkspacePath);
+                    }
+                  }}
                 >
                   <option value="global">全局（所有工作区可用）</option>
                   <option value="workspace">仅指定工作区（cwd 隔离）</option>
@@ -1897,11 +1968,19 @@ export function AsiPanel(props: AsiPanelProps) {
                   <input
                     type="text"
                     className={css.fieldInput}
+                    list="asi-known-workspaces"
                     required
                     value={createSkillWorkspace}
                     onChange={(e) => setCreateSkillWorkspace(e.currentTarget.value)}
                     placeholder="工作区绝对路径"
                   />
+                  {growthModel.knownWorkspaces.length > 0 && (
+                    <datalist id="asi-known-workspaces">
+                      {growthModel.knownWorkspaces.map((ws) => (
+                        <option key={ws.path} value={ws.path} label={ws.display} />
+                      ))}
+                    </datalist>
+                  )}
                 </label>
               )}
               <label className={css.fieldLabel}>
@@ -2168,6 +2247,9 @@ export function AsiPanel(props: AsiPanelProps) {
                       {skill.lastInvokedAt ? formatRelativeAgo(skill.lastInvokedAt, growthModel.now) : '从未调用'} ·{' '}
                       {completionText}
                     </p>
+                    {skill.exportedWorkspaces.length > 0 && (
+                      <p className={css.mutedText}>已导出：{skill.exportedWorkspaces.join('、')}</p>
+                    )}
 
                     <label className={css.fieldLabel}>
                       生效作用域切换

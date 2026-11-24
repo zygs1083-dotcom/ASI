@@ -71,6 +71,21 @@ for legacy_pkg in asi-growth asi-care asi-sleep asi-needs asi-sense; do
   fi
 done
 "$DSH" plugin --profile desktop add "asi@$ASI_VERSION"
+node -e '
+const fs = require("node:fs");
+const [pkgPath, bakPath] = process.argv.slice(1);
+const cur = JSON.parse(fs.readFileSync(pkgPath, "utf8"));
+const bak = JSON.parse(fs.readFileSync(bakPath, "utf8"));
+const leg = ["asi-sense", "asi-needs", "asi-sleep", "asi-care", "asi-growth"];
+const nameOf = (b) => (typeof b === "string" ? b : b?.name);
+const hadAsi = Object.hasOwn(bak.dependencies ?? {}, "asi");
+const hadLeg = leg.some((n) => Object.hasOwn(bak.dependencies ?? {}, n));
+const anyEnabledLeg = (bak.dsh?.profile?.bundles ?? []).some((b) => leg.includes(nameOf(b)));
+if (!hadAsi && hadLeg && !anyEnabledLeg && Array.isArray(cur.dsh?.profile?.bundles)) {
+  cur.dsh.profile.bundles = cur.dsh.profile.bundles.filter((b) => nameOf(b) !== "asi");
+  fs.writeFileSync(pkgPath, JSON.stringify(cur, null, 2) + "\n");
+}
+' "$PROFILE/package.json" "$BACKUP/package.json"
 node - "$PROFILE" "$BACKUP/package.json" "$ASI_VERSION" <<'NODE'
 const fs = require('node:fs');
 const path = require('node:path');
@@ -148,6 +163,16 @@ else
     fi
   done
 fi
+node -e '
+const fs = require("node:fs");
+const [pkgPath, bakPath] = process.argv.slice(1);
+const cur = JSON.parse(fs.readFileSync(pkgPath, "utf8"));
+const bak = JSON.parse(fs.readFileSync(bakPath, "utf8"));
+if (bak.dsh?.profile?.bundles) {
+  cur.dsh = { ...cur.dsh, profile: { ...cur.dsh?.profile, bundles: bak.dsh.profile.bundles } };
+  fs.writeFileSync(pkgPath, JSON.stringify(cur, null, 2) + "\n");
+}
+' "$PROFILE/package.json" "$BACKUP/package.json"
 
 node - "$PROFILE/package.json" "$BACKUP/package.json" <<'NODE'
 const fs = require('node:fs');

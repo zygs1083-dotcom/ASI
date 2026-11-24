@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { type AsiMainTab, AsiPanel } from '../client/AsiPanel.tsx';
 import { ASI_UNIFIED_SCENARIOS, type AsiUnifiedScenarioName, makeUnifiedScenario } from '../client/mock-scenarios.ts';
 import { parseSkillMarkdown, renderSkillMarkdown, toValidSkillSlug } from '../growth/shared/skill-spec.ts';
@@ -10,6 +10,7 @@ import type {
   SkillViewItem,
 } from '../growth/shared/types.ts';
 import type { AsiPanelModel } from '../host/dsh/wire-types.ts';
+import { searchMemoryItems } from '../sleep/shared/search.ts';
 import {
   MEMORY_KINDS,
   type MemoryKind,
@@ -25,6 +26,7 @@ function readQuery(): {
   theme: Theme;
   tab: AsiMainTab;
   failActions: boolean;
+  overflowVault: boolean;
 } {
   const q = new URLSearchParams(location.search);
   const s = q.get('scenario');
@@ -37,6 +39,7 @@ function readQuery(): {
     theme: t === 'dark' ? 'dark' : 'light',
     tab: tab === 'memory' || tab === 'skills' ? tab : 'care',
     failActions: q.get('failActions') === '1',
+    overflowVault: q.get('overflowVault') === '1',
   };
 }
 
@@ -65,7 +68,8 @@ function withGrowthRecount(model: GrowthPanelModel): GrowthPanelModel {
   };
 }
 
-function withSleepRecount(model: SleepPanelModel): SleepPanelModel {
+function withSleepRecount(model: SleepPanelModel, backingMemories?: readonly MemoryViewItem[]): SleepPanelModel {
+  const all = backingMemories ?? model.memories;
   const countsByKind: Record<MemoryKind, number> = {
     preference: 0,
     decision: 0,
@@ -74,30 +78,80 @@ function withSleepRecount(model: SleepPanelModel): SleepPanelModel {
   };
   for (const k of MEMORY_KINDS) countsByKind[k] = 0;
   let pinnedCount = 0;
-  for (const m of model.memories) {
+  for (const m of all) {
     countsByKind[m.kind] += 1;
     if (m.pinned) pinnedCount += 1;
   }
   return {
     ...model,
     countsByKind,
-    totalMemories: model.memories.length,
+    totalMemories: all.length,
     pinnedCount,
+    memories: backingMemories ? all.slice(0, 4) : model.memories,
   };
+}
+
+function buildOverflowMemories(base: readonly MemoryViewItem[], now: number): MemoryViewItem[] {
+  const extra: MemoryViewItem[] = Array.from({ length: 12 }, (_, idx) => ({
+    id: `mem_overflow_${idx + 1}`,
+    kind: idx === 0 ? 'pitfall' : idx % 2 === 0 ? 'decision' : 'episode',
+    title: idx === 0 ? '溢出一页的深层记忆条目' : `归档长尾记忆 #${idx + 1}`,
+    content:
+      idx === 0
+        ? '用于验证 totalMemories > memories.length 时远端检索后执行置顶/编辑/删除实时刷新。 keyword=overflow-vault-hit'
+        : `长尾记忆正文 #${idx + 1}`,
+    tags: idx === 0 ? ['overflow'] : ['tail'],
+    pinned: false,
+    confidence: 0.9,
+    sourceSessionIds: ['sess-overflow'],
+    evidenceCount: 1,
+    recallCount: 0,
+    createdAt: now - (idx + 5) * 60_000,
+    updatedAt: now - (idx + 5) * 60_000,
+    retention: 0.72,
+    fsrs: {
+      stability: 10,
+      difficulty: 3.5,
+      elapsedDays: 2,
+      scheduledDays: 10,
+      learningSteps: 0,
+      reps: 1,
+      lapses: 0,
+      state: 2,
+      due: now + 8 * 86_400_000,
+      lastReview: now - 2 * 86_400_000,
+    },
+  }));
+  return [...base, ...extra];
 }
 
 export function App() {
   const initial = readQuery();
   const [scenario, setScenario] = useState<AsiUnifiedScenarioName>(initial.scenario);
   const [theme, setTheme] = useState<Theme>(initial.theme);
-  const [model, setModel] = useState<AsiPanelModel>(() => makeUnifiedScenario(initial.scenario));
+  const initialModel = makeUnifiedScenario(initial.scenario);
+  const initialOverflow = initial.overflowVault
+    ? buildOverflowMemories(initialModel.sleep.memories, initialModel.sleep.now)
+    : null;
+  const overflowVaultRef = useRef<MemoryViewItem[] | null>(initialOverflow);
+  const [model, setModel] = useState<AsiPanelModel>(() =>
+    initialOverflow ? { ...initialModel, sleep: withSleepRecount(initialModel.sleep, initialOverflow) } : initialModel,
+  );
   const [lastAction, setLastAction] = useState('');
 
   useEffect(() => applyTheme(theme), [theme]);
 
   const switchScenario = (name: AsiUnifiedScenarioName) => {
     setScenario(name);
-    setModel(makeUnifiedScenario(name));
+    const next = makeUnifiedScenario(name);
+    if (initial.overflowVault) {
+      const all = buildOverflowMemories(next.sleep.memories, next.sleep.now);
+      overflowVaultRef.current = all;
+      setModel({ ...next, sleep: withSleepRecount(next.sleep, all) });
+    } else {
+      overflowVaultRef.current = null;
+      setModel(next);
+    }
   };
 
   return (
@@ -137,6 +191,7 @@ export function App() {
             setLastAction(enabled ? '已开启窗口标题发给模型' : '已隐藏窗口标题');
           }}
           onOpenPermissionSettings={async () => {
+            if (initial.failActions) throw new Error('模拟连接中断：打开权限设置失败');
             setLastAction('已请求打开辅助功能权限设置');
           }}
           onApproveHelp={async (cardId) => {
@@ -166,6 +221,7 @@ export function App() {
             setLastAction(`已忽略求助卡 ${cardId}`);
           }}
           onOpenMaintenanceSession={async () => {
+            if (initial.failActions) throw new Error('模拟连接中断：打开自维护会话失败');
             setLastAction('已打开自维护会话');
           }}
           onTriggerCheck={async () => {
@@ -243,35 +299,46 @@ export function App() {
                 lastReview: model.sleep.now,
               },
             };
-            setModel((prev) => ({
-              ...prev,
-              sleep: withSleepRecount({
-                ...prev.sleep,
-                memories: [created, ...prev.sleep.memories],
-              }),
-            }));
+            setModel((prev) => {
+              if (overflowVaultRef.current) {
+                overflowVaultRef.current = [created, ...overflowVaultRef.current];
+                return { ...prev, sleep: withSleepRecount(prev.sleep, overflowVaultRef.current) };
+              }
+              return {
+                ...prev,
+                sleep: withSleepRecount({
+                  ...prev.sleep,
+                  memories: [created, ...prev.sleep.memories],
+                }),
+              };
+            });
             setLastAction(`新建记忆 ${created.title}`);
             return created;
           }}
           onUpdateMemory={async (id, patch) => {
             let updatedOut: MemoryViewItem | undefined;
+            const applyPatch = (m: MemoryViewItem, now: number): MemoryViewItem => {
+              if (m.id !== id) return m;
+              const next: MemoryViewItem = {
+                ...m,
+                ...(patch.kind !== undefined ? { kind: patch.kind } : {}),
+                ...(patch.title !== undefined ? { title: patch.title } : {}),
+                ...(patch.content !== undefined ? { content: patch.content } : {}),
+                ...(patch.tags !== undefined ? { tags: patch.tags } : {}),
+                ...(patch.pinned !== undefined
+                  ? { pinned: patch.pinned, retention: patch.pinned ? 1 : m.retention }
+                  : {}),
+                updatedAt: now,
+              };
+              updatedOut = next;
+              return next;
+            };
             setModel((prev) => {
-              const nextMemories = prev.sleep.memories.map((m) => {
-                if (m.id !== id) return m;
-                const next: MemoryViewItem = {
-                  ...m,
-                  ...(patch.kind !== undefined ? { kind: patch.kind } : {}),
-                  ...(patch.title !== undefined ? { title: patch.title } : {}),
-                  ...(patch.content !== undefined ? { content: patch.content } : {}),
-                  ...(patch.tags !== undefined ? { tags: patch.tags } : {}),
-                  ...(patch.pinned !== undefined
-                    ? { pinned: patch.pinned, retention: patch.pinned ? 1 : m.retention }
-                    : {}),
-                  updatedAt: prev.sleep.now,
-                };
-                updatedOut = next;
-                return next;
-              });
+              if (overflowVaultRef.current) {
+                overflowVaultRef.current = overflowVaultRef.current.map((m) => applyPatch(m, prev.sleep.now));
+                return { ...prev, sleep: withSleepRecount(prev.sleep, overflowVaultRef.current) };
+              }
+              const nextMemories = prev.sleep.memories.map((m) => applyPatch(m, prev.sleep.now));
               return { ...prev, sleep: withSleepRecount({ ...prev.sleep, memories: nextMemories }) };
             });
             setLastAction(`编辑记忆 ${id}`);
@@ -280,18 +347,23 @@ export function App() {
           onTogglePin={async (id, pinned) => {
             if (initial.failActions) throw new Error('模拟连接中断：置顶切换失败');
             let updatedOut: MemoryViewItem | undefined;
+            const applyPin = (m: MemoryViewItem, now: number): MemoryViewItem => {
+              if (m.id !== id) return m;
+              const next: MemoryViewItem = {
+                ...m,
+                pinned,
+                retention: pinned ? 1 : 0.88,
+                updatedAt: now,
+              };
+              updatedOut = next;
+              return next;
+            };
             setModel((prev) => {
-              const nextMemories = prev.sleep.memories.map((m) => {
-                if (m.id !== id) return m;
-                const next: MemoryViewItem = {
-                  ...m,
-                  pinned,
-                  retention: pinned ? 1 : 0.88,
-                  updatedAt: prev.sleep.now,
-                };
-                updatedOut = next;
-                return next;
-              });
+              if (overflowVaultRef.current) {
+                overflowVaultRef.current = overflowVaultRef.current.map((m) => applyPin(m, prev.sleep.now));
+                return { ...prev, sleep: withSleepRecount(prev.sleep, overflowVaultRef.current) };
+              }
+              const nextMemories = prev.sleep.memories.map((m) => applyPin(m, prev.sleep.now));
               return { ...prev, sleep: withSleepRecount({ ...prev.sleep, memories: nextMemories }) };
             });
             setLastAction(`${pinned ? '置顶' : '取消置顶'} ${id}`);
@@ -299,14 +371,28 @@ export function App() {
           }}
           onDeleteMemory={async (id) => {
             if (initial.failActions) throw new Error('模拟连接中断：删除记忆失败');
-            setModel((prev) => ({
-              ...prev,
-              sleep: withSleepRecount({
-                ...prev.sleep,
-                memories: prev.sleep.memories.filter((m) => m.id !== id),
-              }),
-            }));
+            setModel((prev) => {
+              if (overflowVaultRef.current) {
+                overflowVaultRef.current = overflowVaultRef.current.filter((m) => m.id !== id);
+                return { ...prev, sleep: withSleepRecount(prev.sleep, overflowVaultRef.current) };
+              }
+              return {
+                ...prev,
+                sleep: withSleepRecount({
+                  ...prev.sleep,
+                  memories: prev.sleep.memories.filter((m) => m.id !== id),
+                }),
+              };
+            });
             setLastAction(`删除记忆 ${id}`);
+          }}
+          onSearchMemories={async (query, kind) => {
+            const source = overflowVaultRef.current ?? model.sleep.memories;
+            return searchMemoryItems(source, query, {
+              ...(kind ? { kind } : {}),
+              includeLowRetention: true,
+              limit: 200,
+            });
           }}
           onSynthesizeNow={async () => {
             if (initial.failActions) throw new Error('模拟连接中断：立即提炼失败');

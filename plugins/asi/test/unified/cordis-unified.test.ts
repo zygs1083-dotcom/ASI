@@ -13,6 +13,7 @@ import ToolsService from '@deepseek-ai/dsh-tools';
 import { afterEach, describe, expect, it } from 'vitest';
 import { renderSkillMarkdown } from '../../src/growth/shared/skill-spec.ts';
 import * as AsiPlugin from '../../src/host/dsh/index.ts';
+import { formatCryMessage } from '../../src/needs/host/cry.ts';
 
 const tempDirs: string[] = [];
 
@@ -273,7 +274,94 @@ describe('统一单插件 asi (0.6.0) 全栈 Cordis 集成与旧版数据零重�
       expect(approved.status).toBe('active');
       expect((await root.skills.list({ cwd: wsProject })).map((s) => s.name)).toContain('unified-panel-check');
 
+      const cryText = formatCryMessage({
+        id: 'help_cry_check',
+        need: 'space',
+        severity: 'critical',
+        title: '磁盘余量不足',
+        summary: '主卷剩余低于 3%。',
+        actionKind: 'acknowledge',
+        status: 'open',
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      });
+      expect(cryText).toContain('左侧「ASI 稳态」面板');
+      expect(cryText).not.toContain('「生存需求」面板');
+
       abort.abort();
+    } finally {
+      asiFork.dispose();
+      await new Promise((r) => setTimeout(r, 25));
+    }
+  });
+
+  it('在无 sessionController 的纯 CLI / 精简宿主上下文中仍能完整激活 AsiPlugin 并暴露全部 7 个只读工具与记忆/技能服务', async () => {
+    const rootDir = await mkdtemp(join(tmpdir(), 'asi-cli-headless-'));
+    tempDirs.push(rootDir);
+
+    const root = new Context();
+    await root.plugin(SystemPrompt);
+    await root.plugin(ToolsService);
+    await root.plugin(SessionStore);
+    await root.plugin(SkillRegistry);
+    root.tools.setExecutor(new NativeToolExecutor(root));
+
+    const cliSession = root.sessions.create(SessionId('sess-cli-only'), {
+      meta: { cwd: rootDir, isSeeded: false },
+    });
+    const cliAgent = {
+      id: cliSession.id,
+      status: 'idle' as const,
+      session: cliSession,
+    } as unknown as Agent & { ctx: Context };
+    cliAgent.ctx = createScope(root, cliAgent).ctx;
+
+    root.provide('agents', {
+      list: () => [cliAgent],
+      get: (id: string) => (id === cliAgent.id ? cliAgent : undefined),
+      withoutInitiator: <T>(fn: () => T) => fn(),
+    });
+    root.provide('jobs', { list: () => [], kill: () => 'already-finished', events: { subscribe: () => () => {} } });
+    root.provide('llm', { listConfigurableProviders: () => [], resolveModelInfo: async () => undefined });
+    root.provide('sessionProjections', { snapshot: () => ({ values: {} }) });
+    root.provide('tokenMeter', { contextPressure: () => ({}) });
+    root.provide('profileContext', {
+      name: 'cli',
+      dir: rootDir,
+      patchPath: '',
+      installAnchor: '',
+      cwd: rootDir,
+      home: rootDir,
+      startedBundles: ['asi'],
+      overlays: [],
+      telemetryDisabledEnv: undefined,
+    });
+    // 故意不注册 sessionController！验证 fiber 不会挂起在 FIBER_PENDING
+
+    const asiFork = await root.plugin(AsiPlugin, {
+      storageRoot: join(rootDir, 'data', 'asi'),
+      helperPath: join(rootDir, 'nonexistent-helper'),
+      intervalMs: 15_000,
+    });
+    try {
+      await asiFork.await();
+      expect(root.asiSense).toBeDefined();
+      expect(root.asiDrives).toBeDefined();
+      expect(root.asiSleep).toBeDefined();
+      expect(root.asi).toBeDefined();
+
+      const toolNames = root.tools.definitions(cliAgent).map((d) => d.name);
+      expect(toolNames).toEqual(
+        expect.arrayContaining([
+          'env_state',
+          'env_detail',
+          'needs_status',
+          'memory_recall',
+          'memory_profile',
+          'care_status',
+          'growth_status',
+        ]),
+      );
     } finally {
       asiFork.dispose();
       await new Promise((r) => setTimeout(r, 25));

@@ -1,9 +1,10 @@
 import { existsSync } from 'node:fs';
-import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, rm, stat, symlink, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { migrateLegacyAsiData } from '../../src/migration/legacy-migration.ts';
+import { MemoryVault } from '../../src/sleep/host/vault.ts';
 
 const tempDirs: string[] = [];
 
@@ -173,5 +174,145 @@ describe('migrateLegacyAsiData 无损旧版五插件数据自动迁移', () => {
     expect(report.modules.sleep).toBe('target-exists');
     expect(existsSync(join(unifiedRoot, 'sense', 'settings.json'))).toBe(false);
     expect(await readFile(join(unifiedRoot, 'sleep', 'vault', 'memories.jsonl'), 'utf8')).toBe('{"id":"newer-live"}\n');
+  });
+
+  it('容忍残损半行 JSONL、不可读锁文件与残留 .mig-*.tmp 暂存目录，并严格保留源文件 mtime 防止旧 MEMORY.md 倒灌覆盖新 memories.jsonl', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'asi-legacy-resilience-'));
+    tempDirs.push(root);
+    const dataDir = join(root, 'data');
+    const unifiedRoot = join(dataDir, 'asi');
+
+    // 模拟上次迁移崩溃遗留的半截 .mig-sleep-*.tmp 暂存目录（未落入正式 sleep 目录）
+    const crashedStage = join(unifiedRoot, '.mig-sleep-99999-deadbeef.tmp');
+    await mkdir(crashedStage, { recursive: true });
+    await writeFile(join(crashedStage, 'state.json'), '{"corrupt":true}');
+
+    // 构造不可读权限文件（非 root 下触发 EACCES），不应中断后续 sleep 模块迁移
+    await mkdir(join(dataDir, 'asi-needs'), { recursive: true });
+    await writeFile(join(dataDir, 'asi-needs', 'state.json'), '{"maintTotalTurns":2}');
+    const unreadableFile = join(dataDir, 'asi-needs', 'locked.bak');
+    await writeFile(unreadableFile, 'locked');
+    await chmod(unreadableFile, 0o000);
+
+    // 构造旧版 asi-sleep：先用 MemoryVault 生成带合法 sync footer 的旧版 MEMORY.md（仅 1 条旧记忆，mtime 较早），
+    // 再写入 mtime 更新的 memories.jsonl（含 2 条有效记忆 + 末尾半行残损 JSONL）
+    const legacySleepDir = join(dataDir, 'asi-sleep');
+    const seedVault = new MemoryVault(legacySleepDir);
+    await seedVault.load(1_760_050_000_000);
+    seedVault.upsert({
+      id: 'mem_keep_1',
+      kind: 'preference',
+      title: '旧标题',
+      content: '旧正文内容。',
+      tags: ['legacy'],
+      pinned: false,
+      confidence: 0.8,
+      sourceSessionIds: ['sess-1'],
+      evidenceCount: 1,
+      recallCount: 0,
+      createdAt: 1_760_000_000_000,
+      updatedAt: 1_760_050_000_000,
+      fsrs: {
+        stability: 10,
+        difficulty: 3,
+        elapsedDays: 0,
+        scheduledDays: 10,
+        learningSteps: 0,
+        reps: 1,
+        lapses: 0,
+        state: 2,
+        due: 1_780_000_000_000,
+        lastReview: 1_760_050_000_000,
+      },
+    });
+    await seedVault.flush(1_760_050_000_000);
+
+    const newerEntry1 = JSON.stringify({
+      id: 'mem_keep_1',
+      kind: 'preference',
+      title: '外部更新后的新标题',
+      content: '保留更新后的 memories.jsonl 条目 #1。',
+      tags: ['fresh'],
+      pinned: true,
+      confidence: 0.95,
+      sourceSessionIds: ['sess-1'],
+      evidenceCount: 1,
+      recallCount: 0,
+      createdAt: 1_760_000_000_000,
+      updatedAt: 1_760_500_000_000,
+      fsrs: {
+        stability: 15,
+        difficulty: 3,
+        elapsedDays: 0,
+        scheduledDays: 15,
+        learningSteps: 0,
+        reps: 1,
+        lapses: 0,
+        state: 2,
+        due: 1_780_000_000_000,
+        lastReview: 1_760_500_000_000,
+      },
+    });
+    const newerEntry2 = JSON.stringify({
+      id: 'mem_keep_2',
+      kind: 'pitfall',
+      title: '第二条有效踩坑记忆',
+      content: '即使文件末尾存在截断半行也必须无损加载。',
+      tags: ['resilience'],
+      pinned: false,
+      confidence: 0.9,
+      sourceSessionIds: ['sess-1'],
+      evidenceCount: 2,
+      recallCount: 1,
+      createdAt: 1_760_000_000_000,
+      updatedAt: 1_760_600_000_000,
+      fsrs: {
+        stability: 12,
+        difficulty: 3.2,
+        elapsedDays: 0,
+        scheduledDays: 12,
+        learningSteps: 0,
+        reps: 1,
+        lapses: 0,
+        state: 2,
+        due: 1_780_000_000_000,
+        lastReview: 1_760_600_000_000,
+      },
+    });
+    const truncatedJsonl = `${newerEntry1}\n${newerEntry2}\n{"id":"mem_truncated_half","kind":"pit`;
+
+    const legacyMdPath = join(dataDir, 'asi-sleep', 'vault', 'MEMORY.md');
+    const legacyJsonlPath = join(dataDir, 'asi-sleep', 'vault', 'memories.jsonl');
+    await writeFile(legacyJsonlPath, truncatedJsonl);
+
+    const oldTime = new Date(1_760_100_000_000);
+    const newerTime = new Date(1_760_800_000_000);
+    await utimes(legacyMdPath, oldTime, oldTime);
+    await utimes(legacyJsonlPath, newerTime, newerTime);
+
+    try {
+      const report = await migrateLegacyAsiData(unifiedRoot);
+      expect(report.status).toBe('migrated');
+      expect(report.modules.needs).toBe('migrated');
+      expect(report.modules.sleep).toBe('migrated');
+      expect(existsSync(crashedStage)).toBe(false);
+      if (typeof process.getuid === 'function' && process.getuid() !== 0) {
+        expect(report.skippedUnreadable).toBe(1);
+      }
+
+      const migMdStat = await stat(join(unifiedRoot, 'sleep', 'vault', 'MEMORY.md'));
+      const migJsonlStat = await stat(join(unifiedRoot, 'sleep', 'vault', 'memories.jsonl'));
+      expect(migJsonlStat.mtimeMs).toBeGreaterThan(migMdStat.mtimeMs);
+
+      // 启动真实 MemoryVault，验证保留较新的 2 条有效 JSONL 记忆且忽略末尾半行残损记录
+      const vault = new MemoryVault(join(unifiedRoot, 'sleep'));
+      await vault.load(1_760_900_000_000);
+      const loaded = vault.list(1_760_900_000_000);
+      expect(loaded).toHaveLength(2);
+      expect(loaded.find((m) => m.id === 'mem_keep_1')?.title).toBe('外部更新后的新标题');
+      expect(loaded.find((m) => m.id === 'mem_keep_2')?.title).toBe('第二条有效踩坑记忆');
+    } finally {
+      await chmod(unreadableFile, 0o600).catch(() => undefined);
+    }
   });
 });

@@ -161,6 +161,12 @@ describe('统一单插件 asi (0.6.0) 发布包审计与 Desktop Profile 迁移�
 
   it('docs/release.md 内嵌的 Desktop profile 五合一迁移与回退核对脚本真实可执行且严格保护 dsh-context / dsh-superagent', async () => {
     const releaseDoc = await readFile(join(pkgDir, '../../docs/release.md'), 'utf8');
+    const inlineHelpers = [
+      ...releaseDoc.matchAll(/node -e '\n([\s\S]*?)\n' "\$PROFILE\/package\.json" "\$BACKUP\/package\.json"/g),
+    ].map((m) => m[1]);
+    expect(inlineHelpers).toHaveLength(2);
+    const [syncDisabledHelper, syncRollbackBundlesHelper] = inlineHelpers;
+
     const snippets = [...releaseDoc.matchAll(/node - ([^\n]+) <<'NODE'\n([\s\S]*?)\nNODE/g)].map((m) => m[2]);
     expect(snippets).toHaveLength(2);
     const [verifyUpgradeScript, verifyRollbackScript] = snippets;
@@ -172,6 +178,14 @@ describe('统一单插件 asi (0.6.0) 发布包审计与 Desktop Profile 迁移�
       await mkdir(join(profileDir, 'node_modules/asi'), { recursive: true });
       await writeFile(join(profileDir, 'node_modules/asi/package.json'), '{"version":"0.6.0"}');
 
+      const runSyncDisabled = () =>
+        spawnSync(process.execPath, ['-e', syncDisabledHelper, join(profileDir, 'package.json'), backupPath], {
+          encoding: 'utf8',
+        });
+      const runSyncRollbackBundles = () =>
+        spawnSync(process.execPath, ['-e', syncRollbackBundlesHelper, join(profileDir, 'package.json'), backupPath], {
+          encoding: 'utf8',
+        });
       const runUpgrade = (ver = '0.6.0') =>
         spawnSync(process.execPath, ['-', profileDir, backupPath, ver], {
           input: verifyUpgradeScript,
@@ -322,6 +336,96 @@ describe('统一单插件 asi (0.6.0) 发布包审计与 Desktop Profile 迁移�
           dsh: { profile: { bundles: ['dsh-context', 'asi', 'dsh-superagent'] } },
         }),
       );
+      expect(runRollback().status).toBe(0);
+
+      // 3. 当升级前 5 个旧版 asi-* 全部处于手动禁用状态，且 dsh plugin add 默认将 asi 推入 bundles 时：
+      //    内联同步脚本保持禁用态且核对脚本通过；回退时即使原 5 个包夹在 dsh-context 与 dsh-superagent 中间也能精确还原顺序
+      await writeFile(join(profileDir, 'node_modules/asi/package.json'), '{"version":"0.6.0"}');
+      await writeFile(
+        backupPath,
+        JSON.stringify({
+          dependencies: {
+            'dsh-context': '0.2.2-rc.3',
+            'asi-sense': 'file:/old/asi-sense-0.5.0.tgz',
+            'asi-needs': 'file:/old/asi-needs-0.5.0.tgz',
+            'asi-sleep': 'file:/old/asi-sleep-0.5.0.tgz',
+            'asi-care': 'file:/old/asi-care-0.5.0.tgz',
+            'asi-growth': 'file:/old/asi-growth-0.5.0.tgz',
+            'dsh-superagent': '0.2.2-rc.3',
+          },
+          dsh: { profile: { bundles: ['dsh-context', 'dsh-superagent'] } },
+        }),
+      );
+      await writeFile(
+        join(profileDir, 'package.json'),
+        JSON.stringify({
+          dependencies: {
+            'dsh-context': '0.2.2-rc.3',
+            'dsh-superagent': '0.2.2-rc.3',
+            asi: '0.6.0',
+          },
+          dsh: { profile: { bundles: ['dsh-context', 'dsh-superagent', 'asi'] } },
+        }),
+      );
+      expect(runSyncDisabled().status).toBe(0);
+      expect(runUpgrade('0.6.0').status).toBe(0);
+
+      // 非末尾顺序 5 插件回退还原
+      await writeFile(
+        backupPath,
+        JSON.stringify({
+          dependencies: {
+            'dsh-context': '0.2.2-rc.3',
+            'asi-sense': 'file:/old/asi-sense-0.5.0.tgz',
+            'asi-needs': 'file:/old/asi-needs-0.5.0.tgz',
+            'asi-sleep': 'file:/old/asi-sleep-0.5.0.tgz',
+            'asi-care': 'file:/old/asi-care-0.5.0.tgz',
+            'asi-growth': 'file:/old/asi-growth-0.5.0.tgz',
+            'dsh-superagent': '0.2.2-rc.3',
+          },
+          dsh: {
+            profile: {
+              bundles: [
+                'dsh-context',
+                'asi-sense',
+                'asi-needs',
+                'asi-sleep',
+                'asi-care',
+                'asi-growth',
+                'dsh-superagent',
+              ],
+            },
+          },
+        }),
+      );
+      await writeFile(
+        join(profileDir, 'package.json'),
+        JSON.stringify({
+          dependencies: {
+            'dsh-context': '0.2.2-rc.3',
+            'dsh-superagent': '0.2.2-rc.3',
+            'asi-sense': 'file:/old/asi-sense-0.5.0.tgz',
+            'asi-needs': 'file:/old/asi-needs-0.5.0.tgz',
+            'asi-sleep': 'file:/old/asi-sleep-0.5.0.tgz',
+            'asi-care': 'file:/old/asi-care-0.5.0.tgz',
+            'asi-growth': 'file:/old/asi-growth-0.5.0.tgz',
+          },
+          dsh: {
+            profile: {
+              bundles: [
+                'dsh-context',
+                'dsh-superagent',
+                'asi-sense',
+                'asi-needs',
+                'asi-sleep',
+                'asi-care',
+                'asi-growth',
+              ],
+            },
+          },
+        }),
+      );
+      expect(runSyncRollbackBundles().status).toBe(0);
       expect(runRollback().status).toBe(0);
     } finally {
       await rm(dir, { recursive: true, force: true });

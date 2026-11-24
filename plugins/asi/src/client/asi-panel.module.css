@@ -1,4 +1,5 @@
 /* Unified ASI Sidebar Design System (Light & Dark via DSH `--dsw-*` tokens). */
+.slotWrap,
 .asiPanel {
   --asi-pad-x: var(--dsh-sidebar-inline-padding, 12px);
   --asi-fg: var(--dsw-alias-label-primary, #0f1115);
@@ -19,7 +20,43 @@
   --asi-ink-warn: color-mix(in srgb, var(--asi-warn) 28%, var(--asi-fg));
   --asi-ink-crit: color-mix(in srgb, var(--asi-crit) 60%, var(--asi-fg));
   --asi-ink-accent: color-mix(in srgb, var(--asi-accent) 45%, var(--asi-fg));
+}
 
+.slotWrap {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 0%;
+  min-width: 0;
+  min-height: 0;
+  background: var(--asi-bg);
+  color: var(--asi-fg);
+  font-family: var(--dsw-font-family, -apple-system, BlinkMacSystemFont, "PingFang SC", "Segoe UI", sans-serif);
+  font-size: 13px;
+  line-height: 1.48;
+}
+
+.slotStatusBanner,
+.slotAlertBanner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin: 8px var(--asi-pad-x) 0;
+  padding: 7px 10px;
+  border-radius: 8px;
+  font-size: 12px;
+  background: var(--asi-surface);
+  border: 0.5px solid var(--asi-border-subtle);
+  color: var(--asi-fg-muted);
+}
+
+.slotAlertBanner {
+  background: color-mix(in srgb, var(--asi-crit) 11%, var(--asi-surface));
+  border-color: color-mix(in srgb, var(--asi-crit) 36%, var(--asi-border-subtle));
+  color: var(--asi-ink-crit);
+}
+
+.asiPanel {
   /* Bridge variables for embedded @asi/sense-ui BodySection & NowSection drawers */
   --sense-pad-inline: var(--asi-pad-x);
   --sense-pad-row: 8px;

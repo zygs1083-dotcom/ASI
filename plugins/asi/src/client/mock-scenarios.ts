@@ -15,6 +15,10 @@ export type AsiUnifiedScenarioName = (typeof ASI_UNIFIED_SCENARIOS)[number];
 export function makeUnifiedScenario(name: AsiUnifiedScenarioName): AsiPanelModel {
   if (name === 'pending-approvals') {
     const needs = makeScenario('external-cache-arbitration');
+    needs.state.self.permissions = {
+      ...needs.state.self.permissions,
+      value: { 辅助功能: 'denied' },
+    };
     const sleep = makeSleepScenario('sleepy-waiting');
     const growth = makeGrowthScenario('deep-quiet-waiting');
     return { needs, sleep, growth };

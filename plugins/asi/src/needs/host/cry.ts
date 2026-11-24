@@ -28,7 +28,7 @@ export function formatCryMessage(card: HelpCard): string {
     `【生存求助 · ${needLabel}】${safeTitle}`,
     safeSummary,
     ...(safeAction ? [`建议操作：${safeAction}`] : []),
-    '（详细体征与一键处理见左侧「生存需求」面板；此消息仅在危急或自救受阻时发送一次。）',
+    '（详细体征与一键处理见左侧「ASI 稳态」面板；此消息仅在危急或自救受阻时发送一次。）',
     '</asi-cry>',
   ];
   return lines.join('\n');

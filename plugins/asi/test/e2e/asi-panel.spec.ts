@@ -37,8 +37,7 @@ async function axeCheck(page: Page) {
     ).axe;
     return axe.run({ resultTypes: ['violations'] });
   });
-  const bad = results.violations.filter((v) => v.impact === 'serious' || v.impact === 'critical' || v.id === 'region');
-  expect(bad, JSON.stringify(bad.map((v) => v.id))).toEqual([]);
+  expect(results.violations, JSON.stringify(results.violations.map((v) => `${v.id}:${v.impact}`))).toEqual([]);
 }
 
 test.describe('ASI 统一侧栏面板 320px 响应式、明暗双主题与 axe 无障碍矩阵验证', () => {
@@ -202,6 +201,9 @@ test.describe('ASI 统一侧栏面板 320px 响应式、明暗双主题与 axe �
     await expect(page.getByTestId('growth-feedback')).toContainText(
       '.agents/skills/playwright-contrast-guard/SKILL.md',
     );
+    await expect(page.locator('[data-skill-name="playwright-contrast-guard"]')).toContainText(
+      '已导出：~/work/demo-web',
+    );
 
     // 4. 停用/启用与 60 天代谢归档、恢复
     await page.getByRole('button', { name: '停用 playwright-contrast-guard' }).click();
@@ -231,12 +233,50 @@ test.describe('ASI 统一侧栏面板 320px 响应式、明暗双主题与 axe �
     await page.getByTestId('synthesize-now-btn').click();
     await expect(page.getByTestId('growth-feedback')).toContainText('提炼 1 份待审 SKILL.md 草案');
 
+    // 在「已启用」子视图下若仍存在待审草案，顶部焦点条依然清晰提示；切到其他 Tab 再点「技能工坊」角标自动落回「待审草案」
+    await page.getByTestId('tab-active').click();
+    await expect(page.getByTestId('spotlight-draft-banner')).toBeVisible();
+    await page.getByTestId('asi-main-tab-care').click();
+    await page.getByTestId('asi-main-tab-skills').click();
+    await expect(page.getByRole('heading', { name: 'vitest-cordis-lifecycle' })).toBeVisible();
+
     await expectNoOverflow(page);
     await axeCheck(page);
     expect(errors).toEqual([]);
   });
 
-  test('RPC 动作异常时在三大分栏与焦点条均优雅捕获展示反馈横幅，零 pageerror', async ({ page }) => {
+  test('超大记忆库（totalMemories > memories.length）远端搜索期间执行置顶、编辑、删除实时刷新无陈旧残留', async ({
+    page,
+  }) => {
+    const errors = watchErrors(page);
+    await page.setViewportSize({ width: 340, height: 920 });
+    await page.goto('/?scenario=pending-approvals&theme=light&tab=memory&overflowVault=1');
+    await page.getByTestId('asi-unified-panel').waitFor();
+
+    const searchInput = page.getByTestId('memory-search-input');
+    await searchInput.fill('overflow-vault-hit');
+    await expect(page.getByRole('heading', { name: '溢出一页的深层记忆条目' })).toBeVisible();
+
+    await page.getByRole('button', { name: '置顶 溢出一页的深层记忆条目' }).click();
+    await expect(page.getByRole('button', { name: '取消置顶 溢出一页的深层记忆条目' })).toBeVisible();
+
+    await page.getByRole('button', { name: '编辑 溢出一页的深层记忆条目' }).click();
+    const editForm = page.getByTestId('edit-memory-form');
+    await editForm.getByLabel('标题').fill('溢出一页的深层记忆条目（已编辑）');
+    await editForm.getByRole('button', { name: '保存修改' }).click();
+    await expect(page.getByRole('heading', { name: '溢出一页的深层记忆条目（已编辑）' })).toBeVisible();
+
+    await page.getByRole('button', { name: '删除 溢出一页的深层记忆条目（已编辑）' }).click();
+    await expect(page.getByRole('heading', { name: '溢出一页的深层记忆条目（已编辑）' })).toHaveCount(0);
+    await expect(page.getByTestId('empty-memories-hint')).toBeVisible();
+
+    await axeCheck(page);
+    expect(errors).toEqual([]);
+  });
+
+  test('RPC 动作异常时在三大分栏、焦点条与低频环境抽屉权限授权按钮均优雅捕获展示告警横幅，零 pageerror', async ({
+    page,
+  }) => {
     const errors = watchErrors(page);
     await page.setViewportSize({ width: 340, height: 920 });
     await page.goto('/?scenario=pending-approvals&theme=light&tab=care&failActions=1');
@@ -245,8 +285,15 @@ test.describe('ASI 统一侧栏面板 320px 响应式、明暗双主题与 axe �
     await page.getByTestId('trigger-check-btn').click();
     await expect(page.getByTestId('care-feedback')).toContainText('立即自检失败');
 
+    // 展开底部环境抽屉点击「授权」按钮，验证异常被捕获进 care-feedback 而绝不抛出未处理 Promise 拒绝
+    await page.getByTestId('drawer-env').locator('> summary').click();
+    await page.getByTestId('drawer-env').getByRole('button', { name: '授权' }).click();
+    await expect(page.getByTestId('care-feedback')).toContainText('打开权限设置失败');
+
     await page.getByTestId('spotlight-approve-draft').click();
-    await expect(page.getByTestId('spotlight-feedback')).toContainText('批准草案失败');
+    const spotlightAlert = page.getByTestId('spotlight-feedback');
+    await expect(spotlightAlert).toContainText('批准草案失败');
+    await expect(spotlightAlert).toHaveAttribute('role', 'alert');
 
     await page.getByTestId('asi-main-tab-memory').click();
     await page.getByTestId('consolidate-now-btn').click();

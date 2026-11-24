@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
-import { lstat, mkdir, readdir, readFile, realpath, rename, rm, writeFile } from 'node:fs/promises';
+import type { Stats } from 'node:fs';
+import { lstat, mkdir, readdir, readFile, realpath, rename, rm, utimes, writeFile } from 'node:fs/promises';
 import { dirname, isAbsolute, join, resolve, sep } from 'node:path';
 
 export type LegacyModuleKey = 'sense' | 'needs' | 'sleep' | 'care' | 'growth';
@@ -13,6 +14,7 @@ export interface LegacyMigrationReport {
   filesCopied: number;
   bytesCopied: number;
   skippedSymlinks: number;
+  skippedUnreadable: number;
 }
 
 interface PersistedMigrationMarker {
@@ -23,6 +25,7 @@ interface PersistedMigrationMarker {
   filesCopied: number;
   bytesCopied: number;
   skippedSymlinks: number;
+  skippedUnreadable: number;
 }
 
 interface ModuleMigrationSpec {
@@ -87,21 +90,28 @@ async function pathExistsNoFollow(target: string): Promise<boolean> {
 
 async function atomicCopyFileIfMissing(
   sourceReal: string,
+  sourceStat: Stats,
   destPath: string,
-): Promise<{ copied: boolean; bytes: number }> {
+): Promise<{ copied: boolean; bytes: number; unreadable: boolean }> {
   if (await pathExistsNoFollow(destPath)) {
-    return { copied: false, bytes: 0 };
+    return { copied: false, bytes: 0, unreadable: false };
   }
-  const bytes = await readFile(sourceReal);
+  let bytes: Buffer;
+  try {
+    bytes = await readFile(sourceReal);
+  } catch {
+    return { copied: false, bytes: 0, unreadable: true };
+  }
   await mkdir(dirname(destPath), { recursive: true, mode: 0o700 });
   if (await pathExistsNoFollow(destPath)) {
-    return { copied: false, bytes: 0 };
+    return { copied: false, bytes: 0, unreadable: false };
   }
   const tmp = `${destPath}.${process.pid}.${randomUUID().slice(0, 8)}.tmp`;
   try {
     await writeFile(tmp, bytes, { mode: 0o600 });
+    await utimes(tmp, sourceStat.atime, sourceStat.mtime).catch(() => undefined);
     await rename(tmp, destPath);
-    return { copied: true, bytes: bytes.byteLength };
+    return { copied: true, bytes: bytes.byteLength, unreadable: false };
   } catch (err) {
     await rm(tmp, { force: true }).catch(() => undefined);
     throw err;
@@ -114,13 +124,14 @@ async function copyDirectoryTreeSafe(options: {
   currentTargetDir: string;
   skipTopDirs: ReadonlySet<string>;
   depth: number;
-}): Promise<{ filesCopied: number; bytesCopied: number; skippedSymlinks: number }> {
+}): Promise<{ filesCopied: number; bytesCopied: number; skippedSymlinks: number; skippedUnreadable: number }> {
   let filesCopied = 0;
   let bytesCopied = 0;
   let skippedSymlinks = 0;
+  let skippedUnreadable = 0;
 
   if (options.depth > MAX_COPY_DEPTH) {
-    return { filesCopied, bytesCopied, skippedSymlinks };
+    return { filesCopied, bytesCopied, skippedSymlinks, skippedUnreadable };
   }
 
   const entries = await readdir(options.currentLegacyReal, { withFileTypes: true }).catch(() => []);
@@ -154,16 +165,37 @@ async function copyDirectoryTreeSafe(options: {
       filesCopied += sub.filesCopied;
       bytesCopied += sub.bytesCopied;
       skippedSymlinks += sub.skippedSymlinks;
+      skippedUnreadable += sub.skippedUnreadable;
     } else if (st.isFile()) {
-      const copied = await atomicCopyFileIfMissing(childReal, fullTarget);
-      if (copied.copied) {
+      const copied = await atomicCopyFileIfMissing(childReal, st, fullTarget);
+      if (copied.unreadable) {
+        skippedUnreadable += 1;
+      } else if (copied.copied) {
         filesCopied += 1;
         bytesCopied += copied.bytes;
       }
     }
   }
 
-  return { filesCopied, bytesCopied, skippedSymlinks };
+  return { filesCopied, bytesCopied, skippedSymlinks, skippedUnreadable };
+}
+
+async function mergeStagedTreeIntoExistingDir(stageDir: string, targetDir: string): Promise<void> {
+  await mkdir(targetDir, { recursive: true, mode: 0o700 });
+  const entries = await readdir(stageDir, { withFileTypes: true });
+  for (const entry of entries) {
+    const src = join(stageDir, entry.name);
+    const dst = join(targetDir, entry.name);
+    if (entry.isDirectory()) {
+      if (!(await pathExistsNoFollow(dst))) {
+        await rename(src, dst);
+      } else {
+        await mergeStagedTreeIntoExistingDir(src, dst);
+      }
+    } else if (entry.isFile() && !(await pathExistsNoFollow(dst))) {
+      await rename(src, dst);
+    }
+  }
 }
 
 /**
@@ -192,10 +224,18 @@ export async function migrateLegacyAsiData(storageRoot: string): Promise<LegacyM
         filesCopied: typeof parsed.filesCopied === 'number' ? parsed.filesCopied : 0,
         bytesCopied: typeof parsed.bytesCopied === 'number' ? parsed.bytesCopied : 0,
         skippedSymlinks: typeof parsed.skippedSymlinks === 'number' ? parsed.skippedSymlinks : 0,
+        skippedUnreadable: typeof parsed.skippedUnreadable === 'number' ? parsed.skippedUnreadable : 0,
       };
     }
   } catch {
     // Marker absent or invalid; proceed with safe idempotent check.
+  }
+
+  const existingRootEntries = await readdir(normRoot, { withFileTypes: true }).catch(() => []);
+  for (const entry of existingRootEntries) {
+    if (entry.name.startsWith('.mig-') && entry.name.endsWith('.tmp')) {
+      await rm(join(normRoot, entry.name), { recursive: true, force: true }).catch(() => undefined);
+    }
   }
 
   const dataParent = dirname(normRoot);
@@ -209,6 +249,7 @@ export async function migrateLegacyAsiData(storageRoot: string): Promise<LegacyM
   let filesCopied = 0;
   let bytesCopied = 0;
   let skippedSymlinks = 0;
+  let skippedUnreadable = 0;
 
   if (dataParent && dataParent !== normRoot) {
     for (const spec of MIGRATION_SPECS) {
@@ -247,17 +288,33 @@ export async function migrateLegacyAsiData(storageRoot: string): Promise<LegacyM
         continue;
       }
 
-      const res = await copyDirectoryTreeSafe({
-        legacyRootReal,
-        currentLegacyReal: legacyRootReal,
-        currentTargetDir: targetDir,
-        skipTopDirs: spec.skipTopDirs,
-        depth: 0,
-      });
-      filesCopied += res.filesCopied;
-      bytesCopied += res.bytesCopied;
-      skippedSymlinks += res.skippedSymlinks;
-      modules[spec.module] = res.filesCopied > 0 ? 'migrated' : 'empty';
+      await mkdir(normRoot, { recursive: true, mode: 0o700 });
+      const stageDir = join(normRoot, `.mig-${spec.module}-${process.pid}-${randomUUID().slice(0, 8)}.tmp`);
+      try {
+        const res = await copyDirectoryTreeSafe({
+          legacyRootReal,
+          currentLegacyReal: legacyRootReal,
+          currentTargetDir: stageDir,
+          skipTopDirs: spec.skipTopDirs,
+          depth: 0,
+        });
+        if (res.filesCopied > 0) {
+          if (!(await pathExistsNoFollow(targetDir))) {
+            await rename(stageDir, targetDir);
+          } else {
+            await mergeStagedTreeIntoExistingDir(stageDir, targetDir);
+          }
+          modules[spec.module] = 'migrated';
+        } else {
+          modules[spec.module] = 'empty';
+        }
+        filesCopied += res.filesCopied;
+        bytesCopied += res.bytesCopied;
+        skippedSymlinks += res.skippedSymlinks;
+        skippedUnreadable += res.skippedUnreadable;
+      } finally {
+        await rm(stageDir, { recursive: true, force: true }).catch(() => undefined);
+      }
     }
   }
 
@@ -271,6 +328,7 @@ export async function migrateLegacyAsiData(storageRoot: string): Promise<LegacyM
     filesCopied,
     bytesCopied,
     skippedSymlinks,
+    skippedUnreadable,
   };
 
   await mkdir(normRoot, { recursive: true, mode: 0o700 });
@@ -290,5 +348,6 @@ export async function migrateLegacyAsiData(storageRoot: string): Promise<LegacyM
     filesCopied,
     bytesCopied,
     skippedSymlinks,
+    skippedUnreadable,
   };
 }

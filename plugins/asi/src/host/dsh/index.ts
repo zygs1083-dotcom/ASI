@@ -71,7 +71,6 @@ export const inject = [
   'jobs',
   'llm',
   'profileContext',
-  'sessionController',
   'sessionProjections',
   'sessions',
   'systemPrompt',

@@ -25,6 +25,10 @@ export function createDshNeedsPorts(ctx: Context, storageRoot: string, options?:
   const resolveAgent = (id: string): Agent | undefined => ctx.agents.get(SessionId(id));
   const getWorkspaceRegistry = (): WorkspaceRegistry | undefined =>
     (ctx as Context & { get(name: 'workspaceRegistry'): WorkspaceRegistry | undefined }).get('workspaceRegistry');
+  const getSessionController = (): Context['sessionController'] | undefined =>
+    (ctx as Context & { get(name: 'sessionController'): Context['sessionController'] | undefined }).get(
+      'sessionController',
+    );
 
   const sandboxRoot = resolve(join(storageRoot, 'sandbox'));
   const safeRealpath = (p: string): string => {
@@ -130,16 +134,18 @@ export function createDshNeedsPorts(ctx: Context, storageRoot: string, options?:
 
   const sessions: NeedsHostPorts['sessions'] = {
     async createMaintenanceSession(requestedId: string, cwd: string, title: string): Promise<string> {
+      const sc = getSessionController();
+      if (!sc) {
+        throw new Error('sessionController is not available in this DSH profile');
+      }
       await mkdir(cwd, { recursive: true });
       const sid = SessionId(requestedId);
       const wr = getWorkspaceRegistry();
       const ws = wr ? await wr.create(cwd, title).catch(() => undefined) : undefined;
-      const created = await ctx.sessionController.create(
-        ws ? { workspaceId: ws.id, sessionId: sid } : { cwd, sessionId: sid },
-      );
+      const created = await sc.create(ws ? { workspaceId: ws.id, sessionId: sid } : { cwd, sessionId: sid });
       const actualId = created.sessionId;
-      await ctx.sessionController.rename({ sessionId: actualId, title }).catch(() => undefined);
-      const resolved = await ctx.sessionController.resolveAgent(actualId);
+      await sc.rename({ sessionId: actualId, title }).catch(() => undefined);
+      const resolved = await sc.resolveAgent(actualId);
       if ('error' in resolved) throw resolved.error;
       return actualId;
     },
@@ -149,7 +155,11 @@ export function createDshNeedsPorts(ctx: Context, storageRoot: string, options?:
     },
 
     async runMaintenanceTurn(sessionId: string, prompt: string, signal: AbortSignal): Promise<void> {
-      const resolved = await ctx.sessionController.resolveAgent(SessionId(sessionId));
+      const sc = getSessionController();
+      if (!sc) {
+        throw new Error('sessionController is not available in this DSH profile');
+      }
+      const resolved = await sc.resolveAgent(SessionId(sessionId));
       if ('error' in resolved) throw resolved.error;
       const agent = resolved.agent;
       if (signal.aborted) return;
@@ -201,7 +211,8 @@ export function createDshNeedsPorts(ctx: Context, storageRoot: string, options?:
         if (candidate && isUserOrdinaryAgent(candidate)) {
           agent = candidate;
         } else if (!candidate) {
-          const resolved = await ctx.sessionController.resolveAgent(SessionId(targetSessionId)).catch(() => undefined);
+          const sc = getSessionController();
+          const resolved = sc ? await sc.resolveAgent(SessionId(targetSessionId)).catch(() => undefined) : undefined;
           if (resolved && 'agent' in resolved && isUserOrdinaryAgent(resolved.agent)) {
             agent = resolved.agent;
           }
