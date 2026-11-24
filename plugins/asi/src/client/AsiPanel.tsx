@@ -18,6 +18,17 @@ import {
   useFreshModel,
 } from '@asi/sense-ui';
 import { type FormEvent, type KeyboardEvent, useEffect, useMemo, useRef, useState } from 'react';
+import { DreamInsightsSubView } from '../dream/client/DreamInsightsSubView.tsx';
+import type {
+  DreamAdoptMemoryInput,
+  DreamAdoptResult,
+  DreamCycleRecord,
+  DreamInsightKind,
+  DreamInsightStatus,
+  DreamInsightViewItem,
+  DreamPanelModel,
+  DreamPromoteResult,
+} from '../dream/shared/types.ts';
 import { computeLineDiff } from '../growth/shared/diff.ts';
 import { parseSkillMarkdown } from '../growth/shared/skill-spec.ts';
 import type {
@@ -110,6 +121,18 @@ export interface AsiPanelActions {
   onSetTomEnabled?: (enabled: boolean) => Promise<void> | undefined;
   onSetPartnerOverride?: (input: PartnerOverrideInput) => Promise<TomPanelModel | undefined> | undefined;
   onResetTomBaseline?: () => Promise<TomPanelModel | undefined> | undefined;
+
+  // DMN Cross-Repo Insight Dreaming
+  onDreamNow?: () => Promise<DreamCycleRecord | undefined>;
+  onToggleAutoDreamPaused?: (paused: boolean) => Promise<void>;
+  onAdoptDreamInsight?: (input: DreamAdoptMemoryInput) => Promise<DreamAdoptResult | undefined>;
+  onPromoteDreamInsight?: (insightId: string) => Promise<DreamPromoteResult | undefined>;
+  onDismissDreamInsight?: (insightId: string) => Promise<DreamInsightViewItem | undefined>;
+  onSearchDreamInsights?: (
+    query: string,
+    kind?: DreamInsightKind,
+    status?: DreamInsightStatus | 'all',
+  ) => Promise<DreamInsightViewItem[]>;
 }
 
 export interface AsiPanelProps extends AsiPanelActions {
@@ -175,6 +198,39 @@ const HIGHER_DRIVE_LABEL: Record<string, string> = {
   'asi-intuition:prospective_sentinel': 'L3 前额叶直觉与前瞻',
   'asi-tom:social_tact': 'L3 搭档协作默契',
   'asi-growth:skill_synthesis': 'L4 技能提炼与自进化',
+  'asi-dream:cross_repo_insight': 'DMN 跨项目睡眠做梦',
+};
+
+const EMPTY_DREAM_PANEL_MODEL: DreamPanelModel = {
+  now: 0,
+  autoDreamPaused: false,
+  dreaming: false,
+  drive: {
+    satisfaction: 100,
+    urgency: 0,
+    zone: 'comfortable',
+    readyToDream: false,
+    suppressed: false,
+    lowerTierBlocked: false,
+    discoveredRepoCount: 0,
+    candidateBridgeCount: 0,
+    openInsightCount: 0,
+    deepQuietWindow: false,
+    screenLocked: false,
+    idleDurationMs: 0,
+    idleThresholdMs: 900_000,
+    autoDreamsToday: 0,
+    dailyAutoQuota: 3,
+    lastDreamAt: null,
+    summary: '暂无跨项目做梦联想数据',
+  },
+  openCount: 0,
+  adoptedCount: 0,
+  promotedCount: 0,
+  dismissedCount: 0,
+  totalInsights: 0,
+  insights: [],
+  recentDreams: [],
 };
 
 const PROSPECTIVE_STATUS_LABEL: Record<ProspectiveStatus, string> = {
@@ -269,7 +325,14 @@ export function AsiPanel(props: AsiPanelProps) {
   const growthModel = props.model.growth;
   const intuitionModel = props.model.intuition;
   const tomModel = props.model.tom;
-  const isStale = Boolean(sleepModel.stale || growthModel.stale || intuitionModel.stale || tomModel?.stale);
+  const dreamModel = props.model.dream ?? EMPTY_DREAM_PANEL_MODEL;
+  const isStale = Boolean(
+    sleepModel.stale || growthModel.stale || intuitionModel.stale || tomModel?.stale || dreamModel.stale,
+  );
+  const effectiveTomModel = useMemo(
+    () => (tomModel ? { ...tomModel, sensePaused: Boolean(tomModel.sensePaused || needsModel.paused) } : undefined),
+    [tomModel, needsModel.paused],
+  );
 
   // ---- Global Navigation & Settings State ----
   const [activeTab, setActiveTab] = useState<AsiMainTab>(props.initialTab ?? 'care');
@@ -283,8 +346,8 @@ export function AsiPanel(props: AsiPanelProps) {
   const [careFeedback, setCareFeedback] = useState<string | null>(null);
   const [maintBusy, setMaintBusy] = useState(false);
 
-  // ---- Tab 2 (记忆库 & 直觉前瞻) State ----
-  const [memorySubTab, setMemorySubTab] = useState<'vault' | 'intuition'>('vault');
+  // ---- Tab 2 (记忆库 · 直觉前瞻 · 做梦顿悟) State ----
+  const [memorySubTab, setMemorySubTab] = useState<'vault' | 'intuition' | 'insights'>('vault');
   const [prospectiveFilter, setProspectiveFilter] = useState<'active' | 'history'>('active');
   const [creatingProspective, setCreatingProspective] = useState(false);
   const [pmTitle, setPmTitle] = useState('');
@@ -405,6 +468,11 @@ export function AsiPanel(props: AsiPanelProps) {
       limit: 500,
     });
   }, [sleepModel.memories, memQuery, kindFilter, remoteSearchResults]);
+
+  const openInsights = useMemo(
+    () => dreamModel.insights.filter((item) => item.status === 'open'),
+    [dreamModel.insights],
+  );
 
   // ---- Skill Search & Validation ----
   const normSkillQuery = skillQuery.trim().toLowerCase();
@@ -1059,11 +1127,31 @@ export function AsiPanel(props: AsiPanelProps) {
     }
   };
 
+  const handleSpotlightAdoptInsight = async (insight: DreamInsightViewItem) => {
+    if (!props.onAdoptDreamInsight) return;
+    setSpotlightBusy(true);
+    try {
+      const res = await props.onAdoptDreamInsight({ insightId: insight.id, pinned: true });
+      setSpotlightIsError(false);
+      setSpotlightFeedback(`已采纳顿悟并固化为长期记忆（${res?.memoryId ?? '已置顶'}）。`);
+      setVaultMutationSeq((s) => s + 1);
+    } catch (err) {
+      setSpotlightIsError(true);
+      setSpotlightFeedback(err instanceof Error ? err.message : '采纳顿悟失败');
+    } finally {
+      setSpotlightBusy(false);
+    }
+  };
+
+  const memoryActionCount = surfacedIntentions.length + dreamModel.openCount;
   const topCrossHelp = activeTab !== 'care' ? openHelpCards[0] : undefined;
-  const topCrossDraft = activeTab !== 'skills' || skillSubTab !== 'drafts' ? growthModel.drafts[0] : undefined;
   const topCrossProspective =
     activeTab !== 'memory' || memorySubTab !== 'intuition' ? surfacedIntentions[0] : undefined;
-  const showSpotlight = Boolean(topCrossHelp || topCrossDraft || topCrossProspective || spotlightFeedback);
+  const topCrossDraft = activeTab !== 'skills' || skillSubTab !== 'drafts' ? growthModel.drafts[0] : undefined;
+  const topCrossInsight = activeTab !== 'memory' || memorySubTab !== 'insights' ? openInsights[0] : undefined;
+  const showSpotlight = Boolean(
+    topCrossHelp || topCrossProspective || topCrossDraft || topCrossInsight || spotlightFeedback,
+  );
 
   // ---- Sleep & Growth Compact Status Strings ----
   const sleepIdleMins = Math.floor(sleepModel.drive.idleDurationMs / 60_000);
@@ -1094,7 +1182,9 @@ export function AsiPanel(props: AsiPanelProps) {
           </span>
         </div>
         <div className={css.capsuleRight}>
-          {tomModel && <TomCapsuleBadge tom={tomModel} onSelectCareTab={() => selectMainTab('care')} />}
+          {effectiveTomModel && (
+            <TomCapsuleBadge tom={effectiveTomModel} onSelectCareTab={() => selectMainTab('care')} />
+          )}
           {needsModel.instinct.powerMode === 'eco' && <span className={`${css.metaChip} ${css.warnChip}`}>节能</span>}
           {needsModel.paused && <span className={`${css.metaChip} ${css.warnChip}`}>已暂停</span>}
           <span className={css.metaChip} title="观察、记忆与技能数据经脱敏仅留在本机">
@@ -1186,7 +1276,16 @@ export function AsiPanel(props: AsiPanelProps) {
           onKeyDown={(e) => handleMainTabKeyDown(e, 1)}
         >
           <span>记忆库</span>
-          {sleepModel.totalMemories > 0 && <span className={css.tabBadge}>{sleepModel.totalMemories}</span>}
+          {memoryActionCount > 0 ? (
+            <span
+              className={`${css.tabBadge} ${css.tabBadgeAlert}`}
+              title={`待办前瞻 ${surfacedIntentions.length} · 待审顿悟 ${dreamModel.openCount}（长期记忆 ${sleepModel.totalMemories}）`}
+            >
+              {memoryActionCount}
+            </span>
+          ) : (
+            sleepModel.totalMemories > 0 && <span className={css.tabBadge}>{sleepModel.totalMemories}</span>
+          )}
         </button>
 
         <button
@@ -1276,6 +1375,45 @@ export function AsiPanel(props: AsiPanelProps) {
             </div>
           )}
 
+          {topCrossProspective && (
+            <div
+              className={css.spotlightItem}
+              data-tone={topCrossProspective.priority === 'high' ? 'warn' : undefined}
+              data-testid="spotlight-prospective-banner"
+            >
+              <div className={css.spotlightBody}>
+                <div>
+                  <div className={css.spotlightTitle}>
+                    前瞻提醒待办 ({surfacedIntentions.length})：{topCrossProspective.title}
+                  </div>
+                  <div className={css.spotlightSub}>{topCrossProspective.instruction}</div>
+                </div>
+              </div>
+              <div className={css.actionRow}>
+                <button
+                  type="button"
+                  className={css.primaryBtn}
+                  data-testid="spotlight-fulfill-prospective"
+                  disabled={spotlightBusy}
+                  onClick={() => void handleResolveProspective({ id: topCrossProspective.id, action: 'fulfill' }, true)}
+                >
+                  标记完成
+                </button>
+                <button
+                  type="button"
+                  className={css.btn}
+                  data-testid="spotlight-jump-intuition"
+                  onClick={() => {
+                    setActiveTab('memory');
+                    setMemorySubTab('intuition');
+                  }}
+                >
+                  查看前瞻
+                </button>
+              </div>
+            </div>
+          )}
+
           {topCrossDraft && (
             <div className={css.spotlightItem} data-testid="spotlight-draft-banner">
               <div className={css.spotlightBody}>
@@ -1311,40 +1449,40 @@ export function AsiPanel(props: AsiPanelProps) {
             </div>
           )}
 
-          {topCrossProspective && (
-            <div
-              className={css.spotlightItem}
-              data-tone={topCrossProspective.priority === 'high' ? 'warn' : undefined}
-              data-testid="spotlight-prospective-banner"
-            >
+          {topCrossInsight && (
+            <div className={css.spotlightItem} data-testid="spotlight-insight-banner">
               <div className={css.spotlightBody}>
                 <div>
                   <div className={css.spotlightTitle}>
-                    前瞻提醒待办 ({surfacedIntentions.length})：{topCrossProspective.title}
+                    跨项目新顿悟 ({openInsights.length})：{topCrossInsight.title}
                   </div>
-                  <div className={css.spotlightSub}>{topCrossProspective.instruction}</div>
+                  <div className={css.spotlightSub}>
+                    {topCrossInsight.sourceRepos.join(' ↔ ')} · {topCrossInsight.summary}
+                  </div>
                 </div>
               </div>
               <div className={css.actionRow}>
-                <button
-                  type="button"
-                  className={css.primaryBtn}
-                  data-testid="spotlight-fulfill-prospective"
-                  disabled={spotlightBusy}
-                  onClick={() => void handleResolveProspective({ id: topCrossProspective.id, action: 'fulfill' }, true)}
-                >
-                  标记完成
-                </button>
+                {props.onAdoptDreamInsight && (
+                  <button
+                    type="button"
+                    className={css.primaryBtn}
+                    data-testid="spotlight-adopt-insight"
+                    disabled={spotlightBusy}
+                    onClick={() => void handleSpotlightAdoptInsight(topCrossInsight)}
+                  >
+                    采纳为记忆
+                  </button>
+                )}
                 <button
                   type="button"
                   className={css.btn}
-                  data-testid="spotlight-jump-intuition"
+                  data-testid="spotlight-jump-insights"
                   onClick={() => {
                     setActiveTab('memory');
-                    setMemorySubTab('intuition');
+                    setMemorySubTab('insights');
                   }}
                 >
-                  查看前瞻
+                  审阅顿悟
                 </button>
               </div>
             </div>
@@ -1463,19 +1601,19 @@ export function AsiPanel(props: AsiPanelProps) {
           </section>
 
           {/* Direction B: Theory of Mind — Partner State & Collaborative Tact */}
-          {tomModel && (
+          {effectiveTomModel && (
             <TomCard
-              tom={tomModel}
+              tom={effectiveTomModel}
               onSetTomEnabled={props.onSetTomEnabled}
               onSetPartnerOverride={props.onSetPartnerOverride}
               onResetTomBaseline={props.onResetTomBaseline}
             />
           )}
 
-          {/* Maslow L2-L4 Status Summary & Compact Self-Maintenance Controls */}
+          {/* Maslow L2-L5 Status Summary & Compact Self-Maintenance Controls */}
           <section className={css.card} data-higher-drives aria-label="高阶需求仲裁与自维护">
             <div className={css.cardHeader}>
-              <h2 className={css.sectionHeading}>L2–L4 高阶仲裁与自维护</h2>
+              <h2 className={css.sectionHeading}>L2–L5 高阶仲裁与自维护</h2>
               {needsModel.higherOrderSuppressed && (
                 <span className={css.tagPill} data-zone="uncomfortable">
                   已挂起（优先 L1 稳态）
@@ -1633,7 +1771,7 @@ export function AsiPanel(props: AsiPanelProps) {
         </div>
       )}
 
-      {/* 4B. Tab 2: 记忆库 & 直觉前瞻 */}
+      {/* 4B. Tab 2: 记忆库 · 直觉与前瞻 · 做梦顿悟 */}
       {activeTab === 'memory' && (
         <div
           role="tabpanel"
@@ -1643,7 +1781,7 @@ export function AsiPanel(props: AsiPanelProps) {
           data-testid="tabpanel-memory"
         >
           <fieldset className={css.pillRow}>
-            <legend className={css.srOnly}>记忆与前瞻分区</legend>
+            <legend className={css.srOnly}>记忆库子视图</legend>
             <button
               type="button"
               data-testid="memory-subtab-vault"
@@ -1661,6 +1799,15 @@ export function AsiPanel(props: AsiPanelProps) {
               onClick={() => setMemorySubTab('intuition')}
             >
               直觉与前瞻 ({intuitionModel.surfacedCount + intuitionModel.pendingCount})
+            </button>
+            <button
+              type="button"
+              data-testid="memory-subtab-insights"
+              className={`${css.filterPill} ${memorySubTab === 'insights' ? css.filterPillActive : ''}`}
+              aria-pressed={memorySubTab === 'insights'}
+              onClick={() => setMemorySubTab('insights')}
+            >
+              做梦顿悟 ({dreamModel.openCount > 0 ? `待审 ${dreamModel.openCount}` : dreamModel.totalInsights})
             </button>
           </fieldset>
 
@@ -2063,6 +2210,21 @@ export function AsiPanel(props: AsiPanelProps) {
                 </div>
               </details>
             </>
+          ) : memorySubTab === 'insights' ? (
+            <DreamInsightsSubView
+              dreamModel={dreamModel}
+              onDreamNow={props.onDreamNow}
+              onToggleAutoDreamPaused={props.onToggleAutoDreamPaused}
+              onAdoptDreamInsight={props.onAdoptDreamInsight}
+              onPromoteDreamInsight={props.onPromoteDreamInsight}
+              onDismissDreamInsight={props.onDismissDreamInsight}
+              onVaultMutated={() => setVaultMutationSeq((s) => s + 1)}
+              onNavigateVault={() => setMemorySubTab('vault')}
+              onNavigateSkillDrafts={() => {
+                setActiveTab('skills');
+                setSkillSubTab('drafts');
+              }}
+            />
           ) : (
             <>
               {/* Compact Sleep Readiness Bar */}

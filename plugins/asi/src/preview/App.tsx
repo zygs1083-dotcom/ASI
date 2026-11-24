@@ -1,6 +1,14 @@
 import { useEffect, useRef, useState } from 'react';
 import { type AsiMainTab, AsiPanel } from '../client/AsiPanel.tsx';
 import { ASI_UNIFIED_SCENARIOS, type AsiUnifiedScenarioName, makeUnifiedScenario } from '../client/mock-scenarios.ts';
+import { makeDreamScenario } from '../dream/mock-scenarios.ts';
+import { searchDreamInsights } from '../dream/shared/search.ts';
+import {
+  DREAM_INSIGHT_KIND_LABELS,
+  type DreamCycleRecord,
+  type DreamInsightViewItem,
+  type DreamPanelModel,
+} from '../dream/shared/types.ts';
 import { parseSkillMarkdown, renderSkillMarkdown, toValidSkillSlug } from '../growth/shared/skill-spec.ts';
 import type {
   ArchivedSkillViewItem,
@@ -75,6 +83,31 @@ function withGrowthRecount(model: GrowthPanelModel): GrowthPanelModel {
     disabledCount,
     archivedCount: model.archivedSkills.length,
     staleCount,
+  };
+}
+
+function withDreamRecount(model: DreamPanelModel): DreamPanelModel {
+  let openCount = 0;
+  let adoptedCount = 0;
+  let promotedCount = 0;
+  let dismissedCount = 0;
+  for (const item of model.insights) {
+    if (item.status === 'open') openCount += 1;
+    else if (item.status === 'adopted') adoptedCount += 1;
+    else if (item.status === 'promoted') promotedCount += 1;
+    else if (item.status === 'dismissed') dismissedCount += 1;
+  }
+  return {
+    ...model,
+    openCount,
+    adoptedCount,
+    promotedCount,
+    dismissedCount,
+    totalInsights: model.insights.length,
+    drive: {
+      ...model.drive,
+      openInsightCount: openCount,
+    },
   };
 }
 
@@ -216,7 +249,11 @@ export function App() {
           initialTab={initial.tab}
           onPause={async (paused) => {
             if (initial.failActions) throw new Error('模拟连接中断：暂停切换失败');
-            setModel((prev) => ({ ...prev, needs: { ...prev.needs, paused } }));
+            setModel((prev) => ({
+              ...prev,
+              needs: { ...prev.needs, paused },
+              tom: { ...prev.tom, sensePaused: paused },
+            }));
             setLastAction(paused ? '已暂停感知与自维护' : '已恢复感知与自维护');
           }}
           onToggleTitles={async (enabled) => {
@@ -985,6 +1022,207 @@ export function App() {
             });
             setLastAction('已重置搭档交互基线');
             return nextTom;
+          }}
+          onDreamNow={async () => {
+            if (initial.failActions) throw new Error('模拟连接中断：立即做梦联想失败');
+            const baseDream = model.dream ?? makeDreamScenario('empty-dream', model.sleep.now);
+            const newIns: DreamInsightViewItem = {
+              id: `ins_manual_${Date.now()}`,
+              kind: 'structural-analogy',
+              status: 'open',
+              title: '同构迁移：asi-plugin 的「流式传输背压与中断清理」决策可迁移至 orca-hub',
+              summary: 'asi-plugin 已通过 AbortSignal 与帧节流避免订阅句柄泄漏，与 orca-hub 当前长连接流推送结构同构。',
+              bridgeMechanism: '跨项目共享流式推送机制与 TypeScript 异步迭代器生命周期契约。',
+              actionableHypothesis: '建议在 orca-hub 的流式生成器 finally 块中统一回收事件监听与节流定时器。',
+              repoKeys: ['asi-plugin#1122', 'orca-hub#3344'],
+              sourceRepos: [['~', 'work', 'asi-plugin'].join('/'), ['~', 'work', 'orca-hub'].join('/')],
+              targetRepo: ['~', 'work', 'orca-hub'].join('/'),
+              sourceMemoryIds: ['mem_stream_abort'],
+              sourceSessionIds: ['sess_stream_1'],
+              tags: ['stream-abort-lifecycle', 'typescript', 'cross-repo'],
+              topicKey: 'dmn:stream-abort-lifecycle',
+              pairSignature: `manual-${Date.now()}`,
+              noveltyScore: 0.84,
+              structuralSimilarity: 0.8,
+              confidence: 0.89,
+              createdAt: baseDream.now,
+              updatedAt: baseDream.now,
+            };
+            const rec: DreamCycleRecord = {
+              id: `drm_${Date.now()}`,
+              at: baseDream.now,
+              trigger: 'manual',
+              reposScanned: Math.max(2, baseDream.drive.discoveredRepoCount),
+              bridgesEvaluated: 1,
+              insightsCreated: 1,
+              insightsReinforced: 0,
+              durationMs: 24,
+              summary: '扫描 3 个仓库、评估 1 条远距桥接，新生成 1 条顿悟',
+            };
+            setModel((prev) => {
+              const cur = prev.dream ?? baseDream;
+              return {
+                ...prev,
+                dream: withDreamRecount({
+                  ...cur,
+                  drive: {
+                    ...cur.drive,
+                    satisfaction: 100,
+                    urgency: 0,
+                    zone: 'comfortable',
+                    readyToDream: false,
+                    candidateBridgeCount: 0,
+                    lastDreamAt: cur.now,
+                    summary: '已完成手动做梦联想，跨仓顿悟待审阅',
+                  },
+                  insights: [newIns, ...cur.insights],
+                  recentDreams: [rec, ...cur.recentDreams],
+                }),
+              };
+            });
+            setLastAction('已完成立即做梦联想');
+            return rec;
+          }}
+          onToggleAutoDreamPaused={async (paused) => {
+            if (initial.failActions) throw new Error('模拟连接中断：暂停自动做梦失败');
+            setModel((prev) => {
+              const cur = prev.dream ?? makeDreamScenario('empty-dream', prev.sleep.now);
+              return { ...prev, dream: { ...cur, autoDreamPaused: paused } };
+            });
+            setLastAction(paused ? '已暂停自动做梦' : '已恢复自动做梦');
+          }}
+          onAdoptDreamInsight={async (input) => {
+            if (initial.failActions) throw new Error('模拟连接中断：采纳顿悟失败');
+            const curDream = model.dream ?? makeDreamScenario('empty-dream', model.sleep.now);
+            const target = curDream.insights.find((i) => i.id === input.insightId);
+            if (!target) throw new Error('未找到顿悟记录');
+            const memoryId = `mem_dmn_${Date.now()}`;
+            const createdMem: MemoryViewItem = {
+              id: memoryId,
+              kind: target.kind === 'preventive-warning' ? 'pitfall' : 'decision',
+              title: target.title,
+              content: `${target.summary}\n同构机制：${target.bridgeMechanism}\n迁移行动：${target.actionableHypothesis}`,
+              tags: [...new Set([...target.tags, 'dmn-insight'])],
+              topicKey: target.topicKey,
+              pinned: input.pinned ?? true,
+              confidence: target.confidence,
+              sourceSessionIds: target.sourceSessionIds,
+              evidenceCount: 1,
+              recallCount: 0,
+              createdAt: model.sleep.now,
+              updatedAt: model.sleep.now,
+              retention: 1,
+              fsrs: {
+                stability: 20,
+                difficulty: 3.2,
+                elapsedDays: 0,
+                scheduledDays: 20,
+                learningSteps: 0,
+                reps: 1,
+                lapses: 0,
+                state: 2,
+                due: model.sleep.now + 20 * 86_400_000,
+                lastReview: model.sleep.now,
+              },
+            };
+            const updatedInsight: DreamInsightViewItem = {
+              ...target,
+              status: 'adopted',
+              adoptedMemoryId: memoryId,
+              updatedAt: curDream.now,
+            };
+            setModel((prev) => {
+              const prevDream = prev.dream ?? curDream;
+              const nextInsights = prevDream.insights.map((i) => (i.id === target.id ? updatedInsight : i));
+              const nextSleep = overflowVaultRef.current
+                ? (() => {
+                    overflowVaultRef.current = [createdMem, ...overflowVaultRef.current];
+                    return withSleepRecount(prev.sleep, overflowVaultRef.current);
+                  })()
+                : withSleepRecount({ ...prev.sleep, memories: [createdMem, ...prev.sleep.memories] });
+              return {
+                ...prev,
+                sleep: nextSleep,
+                dream: withDreamRecount({ ...prevDream, insights: nextInsights }),
+              };
+            });
+            setLastAction(`采纳顿悟 ${target.id}`);
+            return { insight: updatedInsight, memoryId };
+          }}
+          onPromoteDreamInsight={async (insightId) => {
+            if (initial.failActions) throw new Error('模拟连接中断：转交技能草案失败');
+            const curDream = model.dream ?? makeDreamScenario('empty-dream', model.sleep.now);
+            const target = curDream.insights.find((i) => i.id === insightId);
+            if (!target) throw new Error('未找到顿悟记录');
+            const slug = toValidSkillSlug(`dmn-${target.topicKey.replace(/[:]/g, '-')}`, 'dmn-insight');
+            const draftId = `draft_dmn_${Date.now()}`;
+            const md = renderSkillMarkdown({
+              name: slug,
+              description: `${DREAM_INSIGHT_KIND_LABELS[target.kind]}：${target.title}`,
+              license: 'MIT',
+              body: `# ${target.title}\n\n${target.summary}\n\n1. ${target.actionableHypothesis}`,
+            });
+            const draft: SkillDraftViewItem = {
+              id: draftId,
+              name: slug,
+              description: `${DREAM_INSIGHT_KIND_LABELS[target.kind]}：${target.title}`,
+              markdown: md,
+              scope: 'global',
+              targetVersion: 1,
+              isRevision: false,
+              topicKey: target.topicKey,
+              evidenceIds: [target.id],
+              memoryCount: target.sourceMemoryIds.length,
+              trajectoryCount: 0,
+              evidenceSummary: `由跨项目顿悟 ${target.sourceRepos.join(' ↔ ')} 转化`,
+              createdAt: model.growth.now,
+              updatedAt: model.growth.now,
+              trigger: 'manual',
+            };
+            const updatedInsight: DreamInsightViewItem = {
+              ...target,
+              status: 'promoted',
+              promotedDraftId: draftId,
+              updatedAt: curDream.now,
+            };
+            setModel((prev) => {
+              const prevDream = prev.dream ?? curDream;
+              return {
+                ...prev,
+                growth: withGrowthRecount({ ...prev.growth, drafts: [draft, ...prev.growth.drafts] }),
+                dream: withDreamRecount({
+                  ...prevDream,
+                  insights: prevDream.insights.map((i) => (i.id === target.id ? updatedInsight : i)),
+                }),
+              };
+            });
+            setLastAction(`顿悟转草案 ${slug}`);
+            return { insight: updatedInsight, draftId, skillName: slug };
+          }}
+          onDismissDreamInsight={async (insightId) => {
+            if (initial.failActions) throw new Error('模拟连接中断：忽略顿悟失败');
+            let out: DreamInsightViewItem | undefined;
+            setModel((prev) => {
+              const cur = prev.dream ?? makeDreamScenario('empty-dream', prev.sleep.now);
+              const nextInsights = cur.insights.map((i) => {
+                if (i.id !== insightId) return i;
+                const d: DreamInsightViewItem = { ...i, status: 'dismissed', updatedAt: cur.now };
+                out = d;
+                return d;
+              });
+              return { ...prev, dream: withDreamRecount({ ...cur, insights: nextInsights }) };
+            });
+            setLastAction(`忽略顿悟 ${insightId}`);
+            return out;
+          }}
+          onSearchDreamInsights={async (query, kind, status) => {
+            const cur = model.dream ?? makeDreamScenario('empty-dream', model.sleep.now);
+            const statuses = !status || status === 'all' ? undefined : [status];
+            return searchDreamInsights(cur.insights, query, {
+              ...(kind ? { kind } : {}),
+              ...(statuses ? { statuses } : {}),
+              limit: 100,
+            });
           }}
         />
       </main>

@@ -76,6 +76,13 @@ export function createAsiActions(api: Api, onNavigateSession?: (sessionId: strin
     onSetTomEnabled: (enabled) => complete(() => api.setTomEnabled(enabled)),
     onSetPartnerOverride: (input) => complete(() => api.setPartnerOverride(input)),
     onResetTomBaseline: () => complete(() => api.resetTomBaseline()),
+
+    onDreamNow: () => complete(() => api.dreamNow()),
+    onToggleAutoDreamPaused: (paused) => complete(() => api.setAutoDreamPaused(paused)),
+    onAdoptDreamInsight: (input) => complete(() => api.adoptDreamInsight(input)),
+    onPromoteDreamInsight: (insightId) => complete(() => api.promoteDreamInsight(insightId)),
+    onDismissDreamInsight: (insightId) => complete(() => api.dismissDreamInsight(insightId)),
+    onSearchDreamInsights: (query, kind, status) => complete(() => api.searchDreamInsights(query, kind, status)),
   };
 
   return {

@@ -20,6 +20,13 @@ export {
 export type { DisksFact, DiskVolume } from './disks.js';
 export { disksStatusAt, diskVolumeAt, effectiveDisks } from './disks.js';
 export type {
+  AsiDreamServiceApi,
+  DreamInsightKind,
+  DreamInsightQueryOptions,
+  DreamInsightStatus,
+  DreamInsightSummary,
+} from './dream.js';
+export type {
   AsiDrivesServiceApi,
   AsiDrivesSnapshot,
   DriveAbortSignal,

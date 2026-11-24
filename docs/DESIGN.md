@@ -29,6 +29,10 @@
 │  │    └─ L1-L3 舒适 + 20m 深静默 -> 纯文本 SKILL.md 草案 -> 人工批准热挂载 │
 │  ├─ PFC src/intuition（tier: 3 · ctx.asiIntuition + intuition_status 等）  │
 │  │    └─ <10ms 本地躯体标记闪回 + 定时/情境/事件前瞻记忆 -> 尾部静默入队   │
+│  ├─ ToM src/tom（tier: 3 · ctx.asiTom + partner_state）                    │
+│  │    └─ 零 Token 注意力与交互节律 EWMA -> 协作眼力见处方 + 免扰避让信号   │
+│  ├─ DMN src/dream（tier: 4 · ctx.asiDream + dream_insights）               │
+│  │    └─ 跨 Git 仓库结构画像 + 15m 深静默远距联想 -> 避坑预警/同构顿悟闭环 │
 │  └─ 统一 TypeRT 服务 ctx.asi + 唯一侧栏面板（id: 'asi', order: 90）        │
 └────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -85,6 +89,12 @@
 1. **零 Token 确定性推断与个体节律 EWMA 基线**：纯本机融合 `ctx.asiSense` 注意力拓扑（应用类别驻留、5 分钟切换熵、锁屏/休眠）与普通会话交互动力学（发信间隔、指令精炼度、主动打断 `interrupted`、回合/命令非零退出、审批延迟），按个体 EWMA 节律基线归一化推断六种搭档认知状态（`deep_focus`、`rapid_sprint`、`stuck_debugging`、`exploring`、`steady_flow`、`away_resting`）及四维连续指标（`focus`、`friction`、`pace`、`presence`）；持久化于 `<storageRoot>/tom/state.json`，绝不存储对话原文、窗口标题或路径历史。
 2. **100% Prompt Cache 保护与默契适应处方（`TactGuidance`）**：对普通对话会话注册字节恒定的静态 `systemPrompt` 引导段（`asi-tom`，内部自维护会话与子代理返回空串隔离）与按需只读工具 `partner_state`（可选只读联动 `ctx.asiSleep` 高保留率协作偏好，全链路经 `sanitizeForModel` 脱敏），指导模型默契调整回复详略度、验证姿态与澄清问题预算，严禁生硬点破推断情绪。
 3. **静默马斯洛协同与透明一键校准**：暴露 `ctx.asiTom` 服务（含 `shouldDeferProactiveWork()` 免扰避让信号），并向 `ctx.asiDrives` 注册 `tier: 3` 静默社交驱动 `asi-tom:social_tact`（`autoMaintain: false`，零后台 LLM 唤醒、零 `<asi-cry>`）；在侧栏顶部状态胶囊与「稳态看护」独立卡片 `<TomCard />` 中支持 60 分钟手动覆写与在线校准偏置学习。
+
+## 6C. DMN 默认模式网络——睡眠做梦与跨项目顿悟（`src/dream/`）
+
+1. **多工作树归并与非源码只读结构画像**：通过读取 `.git` 目录或工作树 `commondir` 将同一仓库的兄弟 worktree 归一为单一 `repoKey`，并仅对 `package.json`、`AGENTS.md` / `README.md` 标题与非敏感顶层目录做只读边界扫描（`lstat` 禁符号链接、零业务源码读取、全量经 `sanitizeForModel` 脱敏）。
+2. **15 分钟深静默门控与跨仓远距同构合成**：在 L1–L3 全部舒适（确保 10m 的 L2 睡眠先完成记忆整合，且豁免观察型 L3 驱动防饥饿）且普通会话空闲 `>= 15 分钟` 或锁屏时运行 DMN 做梦周期（自动上限 `<= 3` 次/日，L1 激活或 `eco` 模式立即抢占中断并回滚配额），结合离线确定性结构桥接器与在线流式 LLM 精炼生成 `preventive-warning`、`structural-analogy`、`pattern-unification`、`decision-tension` 四类顿悟，落盘至 `<storageRoot>/dream/vault/{insights.jsonl,INSIGHTS.md,dream-journal.jsonl}`。
+3. **零动态注入与记忆/技能双闭环**：日常对话仅注册按需只读工具 `dream_insights`（支持当前工作区亲和过滤，100% 保护 Prompt Cache）；侧栏在跨 Tab 焦点条与「记忆库 -> 做梦顿悟」子视图支持一键采纳固化为 L2 长期记忆、一键转化为 L4 待审 `SKILL.md` 草案或忽略降权（记录配对惩罚防止重复做梦）。
 
 ## 7. 统一侧栏界面（`id: 'asi'`，`order: 90`）
 

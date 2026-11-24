@@ -30,5 +30,6 @@ export function asiPanelModel(frame: WireAsiPanelModel): AsiPanelModel {
     growth: frame.growth,
     intuition: frame.intuition,
     tom: frame.tom,
+    dream: frame.dream,
   };
 }

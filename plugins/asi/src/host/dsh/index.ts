@@ -1,6 +1,7 @@
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type {
+  AsiDreamServiceApi,
   AsiDrivesServiceApi,
   AsiIntuitionServiceApi,
   AsiSenseServiceApi,
@@ -13,6 +14,10 @@ import z from '@deepseek-ai/schemastery';
 import { createDshCarePorts } from '../../care/host/dsh/ports.ts';
 import { registerCareTools } from '../../care/host/dsh/tools.ts';
 import { createCareRuntime } from '../../care/host/runtime.ts';
+import { AsiDreamService } from '../../dream/host/dsh/dream-service.ts';
+import { createDshDreamPorts } from '../../dream/host/dsh/dsh-ports.ts';
+import { registerDreamTools } from '../../dream/host/dsh/tools.ts';
+import { createDreamRuntime } from '../../dream/host/runtime.ts';
 import { createDshGrowthPorts, registerDshSkillBridge } from '../../growth/host/dsh/dsh-ports.ts';
 import { registerGrowthTools } from '../../growth/host/dsh/tools.ts';
 import { createGrowthRuntime } from '../../growth/host/runtime.ts';
@@ -48,10 +53,12 @@ declare module '@deepseek-ai/cordis' {
     asiSleep: AsiSleepServiceApi;
     asiIntuition: AsiIntuitionServiceApi;
     asiTom: AsiTomServiceApi;
+    asiDream: AsiDreamServiceApi;
     asi: AsiRemote;
   }
 }
 
+export { AsiDreamService } from '../../dream/host/dsh/dream-service.ts';
 export { AsiIntuitionService } from '../../intuition/host/dsh/intuition-service.ts';
 export { type LegacyMigrationReport, migrateLegacyAsiData } from '../../migration/legacy-migration.ts';
 export { AsiDrivesService } from '../../needs/host/dsh/drives-service.ts';
@@ -65,6 +72,14 @@ export type {
   JsonValue,
   WireArchivedSkillViewItem,
   WireAsiPanelModel,
+  WireDreamAdoptMemoryInput,
+  WireDreamAdoptResult,
+  WireDreamCycleRecord,
+  WireDreamInsightKind,
+  WireDreamInsightStatus,
+  WireDreamInsightViewItem,
+  WireDreamPanelModel,
+  WireDreamPromoteResult,
   WireFlashbackFeedback,
   WireFlashbackMatch,
   WireFlashbackRecord,
@@ -138,6 +153,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   let growthRuntime: ReturnType<typeof createGrowthRuntime> | undefined;
   let tomRuntime: ReturnType<typeof createTomRuntime> | undefined;
   let intuitionRuntime: ReturnType<typeof createIntuitionRuntime> | undefined;
+  let dreamRuntime: ReturnType<typeof createDreamRuntime> | undefined;
 
   let offSenseTools: (() => void) | undefined;
   let offNeedsTools: (() => void) | undefined;
@@ -149,10 +165,13 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   let offGrowthSkills: (() => void) | undefined;
   let offTomTools: (() => void) | undefined;
   let offIntuitionTools: (() => void) | undefined;
+  let offDreamTools: (() => void) | undefined;
 
   const dispose = async () => {
     disposed = true;
 
+    offDreamTools?.();
+    offDreamTools = undefined;
     offIntuitionTools?.();
     offIntuitionTools = undefined;
     offTomTools?.();
@@ -169,6 +188,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     // Kick off higher-order runtime stops synchronously in the same tick so all
     // `stopped` flags & probe aborts take effect before Cordis tears down `ctx` proxies.
     await Promise.allSettled([
+      dreamRuntime?.stop(),
       intuitionRuntime?.stop(),
       tomRuntime?.stop(),
       growthRuntime?.stop(),
@@ -203,6 +223,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     const growthRoot = join(config.storageRoot, 'growth');
     const tomRoot = join(config.storageRoot, 'tom');
     const intuitionRoot = join(config.storageRoot, 'intuition');
+    const dreamRoot = join(config.storageRoot, 'dream');
 
     // 1. L0 Pure Sensory Organ (`ctx.asiSense` + `env_state` / `env_detail`)
     const local = localPorts(ctx, senseRoot);
@@ -290,7 +311,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       return;
     }
 
-    // 6. Direction B: Theory of Mind — Partner State & Collaborative Tact (`ctx.asiTom` + `partner_state`)
+    // 6. Theory of Mind — Partner State & Collaborative Tact (`ctx.asiTom` + `partner_state`)
     const tomPorts = createDshTomPorts(ctx, tomRoot);
     tomRuntime = createTomRuntime(tomPorts);
     offTomTools = registerTomTools(ctx, tomRuntime);
@@ -303,7 +324,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
 
     // 7. Prefrontal Gut-Feeling Somatic Markers & Prospective Memory (`ctx.asiIntuition` + `intuition_status` / `prospective_*`)
     const intuitionPorts = createDshIntuitionPorts(ctx, intuitionRoot, {
-      excludedRoots: [needsRoot, sleepRoot, careRoot, senseRoot, growthRoot, tomRoot],
+      excludedRoots: [needsRoot, sleepRoot, careRoot, senseRoot, growthRoot, tomRoot, dreamRoot],
       sleepRuntime,
     });
     intuitionRuntime = createIntuitionRuntime(intuitionPorts);
@@ -315,19 +336,35 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     }
     new AsiIntuitionService(ctx, intuitionRuntime);
 
-    // 7. Unified TypeRT Remote Service (`ctx.asi`) for the single unified sidebar panel
+    // 8. DMN Default Mode Network Cross-Repo Insight Dreaming (`ctx.asiDream` + `dream_insights`)
+    const dreamPorts = createDshDreamPorts(ctx, dreamRoot, {
+      memoryAdoption: sleepRuntime.actions,
+      skillDrafts: growthRuntime.actions,
+    });
+    dreamRuntime = createDreamRuntime(dreamPorts);
+    offDreamTools = registerDreamTools(ctx, dreamRuntime);
+    await dreamRuntime.start();
+    if (disposed) {
+      await dispose();
+      return;
+    }
+    new AsiDreamService(ctx, dreamRuntime);
+
+    // 9. Unified TypeRT Remote Service (`ctx.asi`) for the single unified sidebar panel
     new AsiRemote(ctx, {
       needsActions: needsRuntime.actions,
       sleepActions: sleepRuntime.actions,
       growthActions: growthRuntime.actions,
       intuitionActions: intuitionRuntime.actions,
       tomActions: tomRuntime.actions,
+      dreamActions: dreamRuntime.actions,
       framesSource: createAsiFramesSource({
         needs: needsRuntime,
         sleep: sleepRuntime,
         growth: growthRuntime,
         intuition: intuitionRuntime,
         tom: tomRuntime,
+        dream: dreamRuntime,
       }),
     });
   } catch (error) {

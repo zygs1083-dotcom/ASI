@@ -20,5 +20,6 @@ export function toWireAsiPanelModel(model: AsiPanelModel): WireAsiPanelModel {
     growth: structuredClone(model.growth),
     intuition: structuredClone(model.intuition),
     tom: structuredClone(model.tom),
+    dream: structuredClone(model.dream),
   };
 }

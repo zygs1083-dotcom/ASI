@@ -31,6 +31,7 @@ export function staleAsiPanelModel(model: AsiPanelModel): AsiPanelModel {
     growth: { ...model.growth, stale: true },
     intuition: { ...model.intuition, stale: true },
     tom: { ...model.tom, stale: true },
+    dream: { ...model.dream, stale: true },
   };
 }
 

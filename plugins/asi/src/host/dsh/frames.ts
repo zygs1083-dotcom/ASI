@@ -1,3 +1,5 @@
+import type { DreamRuntime } from '../../dream/host/runtime.ts';
+import type { DreamPanelModel } from '../../dream/shared/types.ts';
 import type { GrowthRuntime } from '../../growth/host/runtime.ts';
 import type { IntuitionRuntime } from '../../intuition/host/runtime.ts';
 import { buildPanelModel } from '../../needs/host/dsh/frames.ts';
@@ -21,6 +23,7 @@ export interface AsiFramesRuntimes {
   growth: Pick<GrowthRuntime, 'panelModel' | 'subscribe'>;
   intuition: Pick<IntuitionRuntime, 'panelModel' | 'subscribe'>;
   tom?: Pick<TomRuntime, 'panelModel' | 'subscribe'>;
+  dream?: Pick<DreamRuntime, 'panelModel' | 'subscribe'>;
 }
 
 function buildFallbackTomPanelModel(now: number): TomPanelModel {
@@ -52,6 +55,40 @@ function buildFallbackTomPanelModel(now: number): TomPanelModel {
   };
 }
 
+function buildFallbackDreamPanelModel(now: number): DreamPanelModel {
+  return {
+    now,
+    autoDreamPaused: false,
+    dreaming: false,
+    drive: {
+      satisfaction: 100,
+      urgency: 0,
+      zone: 'comfortable',
+      readyToDream: false,
+      suppressed: false,
+      lowerTierBlocked: false,
+      discoveredRepoCount: 0,
+      candidateBridgeCount: 0,
+      openInsightCount: 0,
+      deepQuietWindow: false,
+      screenLocked: false,
+      idleDurationMs: 0,
+      idleThresholdMs: 900_000,
+      autoDreamsToday: 0,
+      dailyAutoQuota: 3,
+      lastDreamAt: null,
+      summary: '暂无跨项目做梦联想数据',
+    },
+    openCount: 0,
+    adoptedCount: 0,
+    promotedCount: 0,
+    dismissedCount: 0,
+    totalInsights: 0,
+    insights: [],
+    recentDreams: [],
+  };
+}
+
 export function buildAsiPanelModel(runtimes: AsiFramesRuntimes): AsiPanelModel {
   const needs = buildPanelModel(runtimes.needs);
   return {
@@ -60,6 +97,7 @@ export function buildAsiPanelModel(runtimes: AsiFramesRuntimes): AsiPanelModel {
     growth: runtimes.growth.panelModel(),
     intuition: runtimes.intuition.panelModel(),
     tom: runtimes.tom ? runtimes.tom.panelModel() : buildFallbackTomPanelModel(needs.now),
+    dream: runtimes.dream ? runtimes.dream.panelModel() : buildFallbackDreamPanelModel(needs.now),
   };
 }
 
@@ -142,6 +180,7 @@ export function createAsiFramesSource(
     let offGrowth: (() => void) | undefined = runtimes.growth.subscribe(onRuntimeChange);
     let offIntuition: (() => void) | undefined = runtimes.intuition.subscribe(onRuntimeChange);
     let offTom: (() => void) | undefined = runtimes.tom?.subscribe(onRuntimeChange);
+    let offDream: (() => void) | undefined = runtimes.dream?.subscribe(onRuntimeChange);
 
     const cleanup = () => {
       if (cleanedUp) return;
@@ -154,16 +193,19 @@ export function createAsiFramesSource(
       const uGrowth = offGrowth;
       const uIntuition = offIntuition;
       const uTom = offTom;
+      const uDream = offDream;
       offNeeds = undefined;
       offSleep = undefined;
       offGrowth = undefined;
       offIntuition = undefined;
       offTom = undefined;
+      offDream = undefined;
       uNeeds?.();
       uSleep?.();
       uGrowth?.();
       uIntuition?.();
       uTom?.();
+      uDream?.();
     };
 
     function onAbort(): void {
