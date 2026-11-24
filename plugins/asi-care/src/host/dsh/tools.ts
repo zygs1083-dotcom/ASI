@@ -1,5 +1,5 @@
 /**
- * Global Read-Only Tool Registration for `asi-care` (`0.4.0`).
+ * Global Read-Only Tool Registration for `asi-care` (`0.5.0`).
  *
  * - Ordinary user conversations ONLY see `care_status` (strictly read-only,
  *   sanitized via `sanitizeForModel`).

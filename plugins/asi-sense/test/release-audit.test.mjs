@@ -9,7 +9,7 @@ import { auditFiles, registryUrl, registryVersionAvailable } from '../scripts/re
 const pkgDir = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 
 describe('release audit', () => {
-  it('keeps every source workspace private and aligned at 0.4.0', () => {
+  it('keeps every source workspace private and aligned at 0.5.0', () => {
     for (const path of [
       '../../../package.json',
       '../../../packages/body-probe/package.json',
@@ -18,12 +18,13 @@ describe('release audit', () => {
       '../../asi-needs/package.json',
       '../../asi-sleep/package.json',
       '../../asi-care/package.json',
+      '../../asi-growth/package.json',
       '../package.json',
     ]) {
       const manifest = JSON.parse(readFileSync(new URL(path, import.meta.url)));
       expect(manifest.private).toBe(true);
       if (path !== '../../../package.json') {
-        expect(manifest.version).toBe('0.4.0');
+        expect(manifest.version).toBe('0.5.0');
       }
     }
   });

@@ -1,8 +1,13 @@
-import { sanitizeForModel } from '@asi/sense-types';
+import {
+  type AsiSleepServiceApi,
+  type SleepMemoryQueryOptions,
+  type SleepMemorySummary,
+  sanitizeForModel,
+} from '@asi/sense-types';
 import type { Context } from '@deepseek-ai/cordis';
 import { principalOf, Remote, RemoteError, TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol';
 import { MEMORY_KINDS, type MemoryKind } from '../../shared/types.ts';
-import type { SleepActionsApi } from '../runtime.ts';
+import type { SleepActionsApi, SleepRuntime } from '../runtime.ts';
 import type { SleepFramesSource } from './frames.ts';
 import { toWireSleepPanelModel } from './wire.ts';
 import type {
@@ -28,13 +33,22 @@ function isPlainRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value && typeof value === 'object' && !Array.isArray(value));
 }
 
-export class AsiSleepRemote extends TypertRemoteService {
+export class AsiSleepRemote extends TypertRemoteService implements AsiSleepServiceApi {
   constructor(
     ctx: Context,
     private readonly actions: SleepActionsApi,
     private readonly framesSource: SleepFramesSource,
+    private readonly readOnlyRuntime?: Pick<SleepRuntime, 'listMemories' | 'subscribeVault'>,
   ) {
     super(ctx, 'asiSleep');
+  }
+
+  listMemories(options?: SleepMemoryQueryOptions): SleepMemorySummary[] {
+    return this.readOnlyRuntime?.listMemories(options) ?? [];
+  }
+
+  subscribe(listener: () => void): () => void {
+    return this.readOnlyRuntime?.subscribeVault(listener) ?? (() => {});
   }
 
   private checkUser(): void {

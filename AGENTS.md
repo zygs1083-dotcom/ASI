@@ -7,12 +7,13 @@
 
 ASI 是一组模块化 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（下称 DSH）插件。每个插件都是一个独立的 DSH 组合包（bundle），用 `dsh plugin add` 安装，插件之间仅通过 Cordis 服务（`ctx.*`）与 `packages/` 共享类型协作，合起来构成一套围绕生存需求与自发维护的 ASI 系统。
 
-当前包含四个核心插件（详细设计见 `docs/DESIGN.md`）：
+当前包含五个核心插件（详细设计见 `docs/DESIGN.md`）：
 
 1. **`asi-sense`（纯感官模块）**：无侧栏 UI 的纯后台 Cordis 服务（`ctx.asiSense`），专注采集本机身体体征（电源、内存、磁盘、CPU、温控、网络、进程、Token）、当前环境快照（位置链、前台应用窗口、活动任务、系统/权限状态）与最近 5 分钟短期趋势环，并向对话暴露只读工具 `env_state` / `env_detail`（含脱敏与隐私开关保护），绝不主动向对话注入动态事件消息。
-2. **`asi-needs`（婴儿期生存需求、自发维护与跨插件驱动仲裁）**：订阅 `ctx.asiSense`，按连续稳态张力与回滞模型实时评估五大基础生理需求（能量、空间、内存与进程、心智容量、体温负荷）；通过「零 Token 本能反射 + 独立后台自维护会话（含全景只读病因嗅探 `needs_sniff_causes` 与白名单安全沙盒工具） + 行动效果记忆与零收益静默熔断 + 按需啼哭求助（`<asi-cry>` 与支持 1 小时活跃保护的一键外部缓存批准求助卡）」自主维护运行环境；同时直接暴露 `ctx.asiDrives` 马斯洛多层需求仲裁服务（L1 生理不适或 `eco` 模式自动压制挂起 L2–L4 高阶需求，支持高阶受控静默求助卡回调与账本记账），并注册侧栏面板「生存需求」（`asi-needs`）及全局只读工具 `needs_status`。
-3. **`asi-sleep`（L2 睡眠与记忆整合模块）**：接入 `ctx.asiSense` 与 `ctx.asiDrives`（`tier: 2`），在普通对话累计 `>= 12` 轮或间隔 `>= 6h`（有新轮次）时产生睡眠困意，仅在会话空闲 `>= 10 分钟` 或锁屏且 L1 生理需求全部舒适时自动执行仿生 NREM+REM 双阶段睡眠记忆整合（自动上限 `<= 6` 次/天，L1 不适或 `eco` 模式即时压制/抢占中断）；结合 `ts-fsrs` 遗忘衰减与 `MiniSearch` 中英检索维护偏好（`preference`）、决策（`decision`）、踩坑（`pitfall`）、近期进展（`episode`）四类本地可读 Markdown/JSONL 记忆库（支持 `MEMORY.md` 双向编辑对账），向日常对话仅暴露按需只读工具 `memory_recall` / `memory_profile`（零动态注入、100% 保护 Prompt Cache），并注册独立第 2 侧栏面板「记忆库」（`asi-sleep`）。
-4. **`asi-care`（L3 本地工作区与项目看护）**：无独立侧栏图标的后台组合包，零配置发现 DSH `workspaceRegistry` 与会话 `cwd` 并自动展开 Git 兄弟工作树；通过 `ctx.asiDrives`（`tier: 3`）注册三条正交 L3 驱动（`repo_hygiene` / `orphan_runtime` / `workspace_bloat`，独立熔断，2h 活跃工作树自动豁免）；按三级护栏自治（一级无人值守仅做 `git worktree prune`、经 `lsof` 复核零进程占用的陈旧 Git 锁与无主 DSH 任务；二级闲置构建产物、干净已合入 worktree 与本地孤儿开发端口 `SIGTERM` 一律复用「生存需求」侧栏静默求助卡由用户一键批准；三级未提交改动/未推送/冲突永远只读提示），全程禁用 `<asi-cry>` 对话打断，普通对话仅暴露只读工具 `care_status`。
+2. **`asi-needs`（婴儿期生存需求、自发维护与跨插件驱动仲裁）**：订阅 `ctx.asiSense`，按连续稳态张力与回滞模型实时评估五大基础生理需求（能量、空间、内存与进程、心智容量、体温负荷）；通过「零 Token 本能反射 + 独立后台自维护会话（含全景只读病因嗅探 `needs_sniff_causes` 与白名单安全沙盒工具） + 行动效果记忆与零收益静默熔断 + 按需啼哭求助（`<asi-cry>` 与支持 1 小时活跃保护的一键外部缓存批准求助卡）」自主维护运行环境；同时直接暴露 `ctx.asiDrives` 马斯洛多层需求仲裁服务（L1 生理不适或 `eco` 模式自动压制挂起 L2–L4 高阶需求，支持高阶受控静默求助卡回调与账本记账），并注册侧栏面板「生存需求」（`asi-needs`，`order: 90`）及全局只读工具 `needs_status`。
+3. **`asi-sleep`（L2 睡眠与记忆整合模块）**：接入 `ctx.asiSense` 与 `ctx.asiDrives`（`tier: 2`），在普通对话累计 `>= 12` 轮或间隔 `>= 6h`（有新轮次）时产生睡眠困意，仅在会话空闲 `>= 10 分钟` 或锁屏且 L1 生理需求全部舒适时自动执行仿生 NREM+REM 双阶段睡眠记忆整合（自动上限 `<= 6` 次/天，L1 不适或 `eco` 模式即时压制/抢占中断）；结合 `ts-fsrs` 遗忘衰减与 `MiniSearch` 中英检索维护偏好（`preference`）、决策（`decision`）、踩坑（`pitfall`）、近期进展（`episode`）四类本地可读 Markdown/JSONL 记忆库（支持 `MEMORY.md` 双向编辑对账），对外暴露只读 Cordis 服务 `ctx.asiSleep`，向日常对话仅暴露按需只读工具 `memory_recall` / `memory_profile`（零动态注入、100% 保护 Prompt Cache），并注册独立第 2 侧栏面板「记忆库」（`asi-sleep`，`order: 91`）。
+4. **`asi-care`（L3 本地工作区与项目看护）**：无独立侧栏图标的后台组合包，零配置发现 DSH `workspaceRegistry` 与会话 `cwd` 并自动展开 Git 兄弟工作树；通过 `ctx.asiDrives`（`tier: 3`）注册三条正交 L3 驱动（`repo_hygiene` / `orphan_runtime` / `workspace_bloat`，独立熔断，2h 活跃豁免）；按三级护栏自治（一级无人值守仅做 `git worktree prune`、经 `lsof` 复核零进程占用的陈旧 Git 锁与无主 DSH 任务；二级闲置构建产物、干净已合入 worktree 与本地孤儿开发端口 `SIGTERM` 一律复用「生存需求」侧栏静默求助卡由用户一键批准；三级未提交改动/未推送/冲突永远只读提示），全程禁用 `<asi-cry>` 对话打断，普通对话仅暴露只读工具 `care_status`。
+5. **`asi-growth`（L4 技能提炼与自进化模块）**：接入 `ctx.asiSense`、`ctx.asiDrives`（`tier: 4`）与只读 `ctx.asiSleep`，融合高保留率踩坑/决策/偏好记忆（同主题 `>= 3` 条且含踩坑）与重复多步排障轨迹（`>= 2` 次），仅当 L1–L3 需求全部舒适（非 `eco` 模式）且会话空闲 `>= 20 分钟` 或锁屏时自动起草标准纯文本 `agentskills` `SKILL.md`（上限 `<= 2` 份/天，零可执行脚本生成、零未授权工作区写入，L1–L3 激活即时抢占中断并回滚配额）；严守「先起草（含 `v2+` 增量修订差异对比）→ 人工一键批准 → 通过 `@deepseek-ai/dsh-skill` `ctx.skills.registerProvider` 热挂载（支持 `global` 与 `workspace` `cwd` 作用域隔离及一键导出至 `.agents/skills/<name>/SKILL.md`）」，追踪调用次数、最近调用时间与回合完成率并标记 `60` 天零调用陈旧技能建议归档，向普通对话仅暴露只读工具 `growth_status`，并注册独立第 3 侧栏面板「技能工坊」（`asi-growth`，`order: 92`）。
 
 新增插件或扩大范围，须由协调端写进本文件和设计文档。
 
@@ -61,7 +62,7 @@ ASI 是一组模块化 [DeepSeek Harness](https://github.com/deepseek-ai/deepsee
 
 ## 6. 安全与隐私
 
-- 观察数据（应用名、窗口标题、文件路径、进程信息）只留在本机。普通对话不主动注入环境动态，仅在按需调用只读工具（`env_state` / `env_detail` / `needs_status` / `memory_recall` / `memory_profile` / `care_status`）或触发后台自维护时读取，且经过 `sanitizeForModel` 脱敏；用户可以在 `asi-needs` 侧栏随时暂停自发维护或关掉「窗口标题发给模型」。
+- 观察数据（应用名、窗口标题、文件路径、进程信息）只留在本机。普通对话不主动注入环境动态，仅在按需调用只读工具（`env_state` / `env_detail` / `needs_status` / `memory_recall` / `memory_profile` / `care_status` / `growth_status`）或触发后台自维护时读取，且经过 `sanitizeForModel` 脱敏；用户可以在 `asi-needs` 侧栏随时暂停自发维护或关掉「窗口标题发给模型」。
 - 默认不截图、不录屏、不读窗口内容。需要细节时调用 DSH 现有的 computer-use 能力，并遵守它的授权流程。
 - 原生 helper 只申请必需的权限（辅助功能）。没有权限时降级为 `denied` 状态并在侧栏引导用户授权，不弹系统对话框轰炸用户。
 - 测试不使用任何真实 API Key，不读 `~/.secrets/`，不连公司生产环境（192.168.0.34/.35）。需要真实模型时，只用 MacPro 本机的 magpie 网关 `http://127.0.0.1:3425/v1`（不需要 key），每个任务说明里写清楚允许发多少条请求。

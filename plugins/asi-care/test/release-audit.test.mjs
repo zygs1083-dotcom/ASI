@@ -11,7 +11,7 @@ const pkgDir = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 describe('asi-care 发布包卫生审计', () => {
   it('package.json 保持 private=true、零第三方运行时依赖且声明兼容 Node 与 DSH 0.2.2-rc.3 || 0.2.2-rc.5', async () => {
     const manifest = JSON.parse(await readFile(join(pkgDir, 'package.json'), 'utf8'));
-    expect(manifest.version).toBe('0.4.0');
+    expect(manifest.version).toBe('0.5.0');
     expect(manifest.private).toBe(true);
     expect(manifest.engines.node).toBe('^22.12.0 || ^24.0.0 || >=26.0.0');
     expect(manifest.engines.dsh).toBe('0.2.2-rc.3 || 0.2.2-rc.5');
@@ -61,7 +61,7 @@ describe('asi-care 发布包卫生审计', () => {
     }
 
     expect(registryVersionAvailable(1, '{"error":{"code":"E404"}}')).toBe(true);
-    expect(registryVersionAvailable(0, '"0.4.0"')).toBe(false);
+    expect(registryVersionAvailable(0, '"0.5.0"')).toBe(false);
     expect(registryUrl()).toBe('https://registry.npmjs.org/');
   });
 });

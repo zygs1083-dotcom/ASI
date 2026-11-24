@@ -1,6 +1,6 @@
 import { realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { dirname, join, resolve, sep } from 'node:path';
+import { basename, dirname, join, resolve, sep } from 'node:path';
 import type { Context } from '@deepseek-ai/cordis';
 import type { Agent } from '@deepseek-ai/dsh-agent';
 import { JobId } from '@deepseek-ai/dsh-jobs';
@@ -44,8 +44,8 @@ export function createDshCarePorts(ctx: Context, storageRoot: string, options?: 
   };
 
   const ASI_INTERNAL_PATH_RE =
-    /(?:^|[\\/])(?:asi-(?:needs|sense|care|sleep)|(?:needs|sense|care|sleep)[\\/](?:sandbox|vault))(?:[\\/]|$)/i;
-  const INTERNAL_SESSION_ID_RE = /^asi-(?:maint|sleep|care|sense|internal)(?:[-_:]|$)/i;
+    /(?:^|[\\/])(?:asi-(?:needs|sense|care|sleep|growth)|(?:needs|sense|care|sleep|growth)[\\/](?:sandbox|vault|skills))(?:[\\/]|$)/i;
+  const INTERNAL_SESSION_ID_RE = /^asi-(?:maint|sleep|care|sense|growth|internal)(?:[-_:]|$)/i;
 
   const safeRealpath = (p: string): string => {
     try {
@@ -65,16 +65,25 @@ export function createDshCarePorts(ctx: Context, storageRoot: string, options?: 
     if (ctx.asiSense.storageRoot) {
       roots.add(ctx.asiSense.storageRoot);
     }
+    const shortSiblingNames = new Set(['sense', 'needs', 'sleep', 'care', 'growth']);
     for (const anchor of [storageRoot, ctx.asiSense.storageRoot]) {
       if (!anchor) continue;
       const dataParent = dirname(anchor);
+      const anchorBase = basename(anchor).toLowerCase();
       if (dataParent && dataParent !== '/' && dataParent !== '.') {
         roots.add(join(dataParent, 'asi-needs'));
         roots.add(join(dataParent, 'asi-sense'));
         roots.add(join(dataParent, 'asi-sleep'));
         roots.add(join(dataParent, 'asi-care'));
+        roots.add(join(dataParent, 'asi-growth'));
         roots.add(join(dataParent, 'needs', 'sandbox'));
         roots.add(join(dataParent, 'sleep', 'vault'));
+        roots.add(join(dataParent, 'growth', 'skills'));
+        if (shortSiblingNames.has(anchorBase)) {
+          for (const sib of shortSiblingNames) {
+            roots.add(join(dataParent, sib));
+          }
+        }
       }
     }
     return [...roots];

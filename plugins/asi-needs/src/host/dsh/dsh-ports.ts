@@ -34,9 +34,9 @@ export function createDshNeedsPorts(ctx: Context, storageRoot: string, options?:
       return resolve(p);
     }
   };
-  const INTERNAL_SESSION_ID_RE = /^asi-(?:maint|sleep|care|sense|internal)(?:[-_:]|$)/i;
+  const INTERNAL_SESSION_ID_RE = /^asi-(?:maint|sleep|care|sense|growth|internal)(?:[-_:]|$)/i;
   const INTERNAL_SANDBOX_CWD_RE =
-    /(?:^|[\\/])(?:(?:asi[-_])?(?:needs|sleep|care|sense)[\\/]sandbox|data[\\/]asi-(?:needs|sleep|care|sense))(?:[\\/]|$)/i;
+    /(?:^|[\\/])(?:(?:asi[-_])?(?:needs|sleep|care|sense|growth)[\\/](?:sandbox|vault|skills)|data[\\/]asi-(?:needs|sleep|care|sense|growth))(?:[\\/]|$)/i;
 
   const isInsideDir = (candidate: string, parent: string): boolean => {
     const normParent = parent.endsWith(sep) ? parent : `${parent}${sep}`;

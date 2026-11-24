@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { cp, mkdir, mkdtemp, readFile, rename, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -80,14 +81,14 @@ try {
   writeWorkspaceArtifacts(root, artifacts);
   await mkdir(join(pkg, 'lib'), { recursive: true });
   for (const file of [
-    'typert.host.js',
     'typert.host.d.ts',
     'typert.remote-client.js',
     'typert.remote-client.d.ts',
     'typert.remote-client.d.ts.map',
+    'typert.host.js',
   ]) {
     const dest = join(pkg, 'lib', file);
-    const tmp = `${dest}.${process.pid}.tmp`;
+    const tmp = `${dest}.${process.pid}.${randomUUID().slice(0, 8)}.tmp`;
     await cp(join(staged, 'lib', file), tmp);
     await rename(tmp, dest);
   }
