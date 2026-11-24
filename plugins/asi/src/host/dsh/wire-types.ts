@@ -1,5 +1,15 @@
 import type { NeedsPanelModel } from '@asi/sense-ui';
 import type {
+  DreamAdoptMemoryInput,
+  DreamAdoptResult,
+  DreamCycleRecord,
+  DreamInsightKind,
+  DreamInsightStatus,
+  DreamInsightViewItem,
+  DreamPanelModel,
+  DreamPromoteResult,
+} from '../../dream/shared/types.ts';
+import type {
   ArchivedSkillViewItem,
   GrowthPanelModel,
   GrowthSynthesisRecord,
@@ -47,14 +57,25 @@ export type WireSkillExportResult = SkillExportResult;
 export type WireGrowthSynthesisRecord = GrowthSynthesisRecord;
 export type WireGrowthPanelModel = GrowthPanelModel;
 
+export type WireDreamInsightKind = DreamInsightKind;
+export type WireDreamInsightStatus = DreamInsightStatus;
+export type WireDreamInsightViewItem = DreamInsightViewItem;
+export type WireDreamAdoptMemoryInput = DreamAdoptMemoryInput;
+export type WireDreamAdoptResult = DreamAdoptResult;
+export type WireDreamPromoteResult = DreamPromoteResult;
+export type WireDreamCycleRecord = DreamCycleRecord;
+export type WireDreamPanelModel = DreamPanelModel;
+
 export interface AsiPanelModel {
   needs: NeedsPanelModel;
   sleep: SleepPanelModel;
   growth: GrowthPanelModel;
+  dream?: DreamPanelModel;
 }
 
 export interface WireAsiPanelModel {
   needs: WireNeedsPanelModel;
   sleep: WireSleepPanelModel;
   growth: WireGrowthPanelModel;
+  dream?: WireDreamPanelModel;
 }

@@ -1,6 +1,8 @@
 import { sanitizeForModel } from '@asi/sense-types';
 import type { Context } from '@deepseek-ai/cordis';
 import { principalOf, Remote, RemoteError, TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol';
+import type { DreamActionsApi } from '../../dream/host/runtime.ts';
+import { DREAM_INSIGHT_KINDS, type DreamInsightKind, type DreamInsightStatus } from '../../dream/shared/types.ts';
 import type { GrowthActionsApi } from '../../growth/host/runtime.ts';
 import type { SkillScope } from '../../growth/shared/types.ts';
 import type { NeedsActions } from '../../needs/host/runtime.ts';
@@ -11,6 +13,13 @@ import { toWireAsiPanelModel } from './wire.ts';
 import type {
   WireArchivedSkillViewItem,
   WireAsiPanelModel,
+  WireDreamAdoptMemoryInput,
+  WireDreamAdoptResult,
+  WireDreamCycleRecord,
+  WireDreamInsightKind,
+  WireDreamInsightStatus,
+  WireDreamInsightViewItem,
+  WireDreamPromoteResult,
   WireGrowthSynthesisRecord,
   WireMemoryCreateInput,
   WireMemoryKind,
@@ -43,10 +52,19 @@ function isSkillScope(value: unknown): value is SkillScope {
   return value === 'global' || value === 'workspace';
 }
 
+function isDreamKind(value: unknown): value is DreamInsightKind {
+  return typeof value === 'string' && (DREAM_INSIGHT_KINDS as readonly string[]).includes(value);
+}
+
+function isDreamStatusOrAll(value: unknown): value is DreamInsightStatus | 'all' {
+  return value === 'open' || value === 'adopted' || value === 'promoted' || value === 'dismissed' || value === 'all';
+}
+
 export interface AsiRemoteDeps {
   needsActions?: NeedsActions;
   sleepActions?: SleepActionsApi;
   growthActions?: GrowthActionsApi;
+  dreamActions?: DreamActionsApi;
   framesSource?: AsiFramesSource;
 }
 
@@ -68,6 +86,10 @@ export class AsiRemote extends TypertRemoteService {
 
   bindGrowthActions(actions: GrowthActionsApi | undefined): void {
     this.deps.growthActions = actions;
+  }
+
+  bindDreamActions(actions: DreamActionsApi | undefined): void {
+    this.deps.dreamActions = actions;
   }
 
   private checkUser(): void {
@@ -95,6 +117,13 @@ export class AsiRemote extends TypertRemoteService {
       throw new RemoteError('gateway/bad-request', 'Growth actions unavailable', {});
     }
     return this.deps.growthActions;
+  }
+
+  private requireDream(): DreamActionsApi {
+    if (!this.deps.dreamActions) {
+      throw new RemoteError('gateway/bad-request', 'Dream actions unavailable', {});
+    }
+    return this.deps.dreamActions;
   }
 
   private async userAction<T>(action: () => Promise<T>): Promise<T> {
@@ -436,6 +465,72 @@ export class AsiRemote extends TypertRemoteService {
       throw new RemoteError('gateway/bad-request', 'name and workspacePath are required', {});
     }
     return await this.userAction(() => this.requireGrowth().exportSkillToWorkspace(name, workspacePath));
+  }
+
+  // ---- DMN Cross-Repo Insight Dreaming Actions ----
+
+  @Remote
+  async dreamNow(): Promise<WireDreamCycleRecord> {
+    this.checkUser();
+    return await this.userAction(() => this.requireDream().dreamNow());
+  }
+
+  @Remote
+  async setAutoDreamPaused(paused: boolean): Promise<void> {
+    this.checkUser();
+    if (typeof paused !== 'boolean') {
+      throw new RemoteError('gateway/bad-request', 'paused must be a boolean', {});
+    }
+    await this.userAction(() => this.requireDream().setAutoDreamPaused(paused));
+  }
+
+  @Remote
+  async adoptDreamInsight(input: WireDreamAdoptMemoryInput): Promise<WireDreamAdoptResult> {
+    this.checkUser();
+    if (!isPlainRecord(input) || typeof input.insightId !== 'string' || !input.insightId.trim()) {
+      throw new RemoteError('gateway/bad-request', 'insightId is required', {});
+    }
+    if (input.pinned !== undefined && typeof input.pinned !== 'boolean') {
+      throw new RemoteError('gateway/bad-request', 'pinned must be a boolean', {});
+    }
+    return await this.userAction(() => this.requireDream().adoptInsightAsMemory(input));
+  }
+
+  @Remote
+  async promoteDreamInsight(insightId: string): Promise<WireDreamPromoteResult> {
+    this.checkUser();
+    if (typeof insightId !== 'string' || !insightId.trim()) {
+      throw new RemoteError('gateway/bad-request', 'insightId is required', {});
+    }
+    return await this.userAction(() => this.requireDream().promoteInsightToSkillDraft(insightId));
+  }
+
+  @Remote
+  async dismissDreamInsight(insightId: string): Promise<WireDreamInsightViewItem> {
+    this.checkUser();
+    if (typeof insightId !== 'string' || !insightId.trim()) {
+      throw new RemoteError('gateway/bad-request', 'insightId is required', {});
+    }
+    return await this.userAction(() => this.requireDream().dismissInsight(insightId));
+  }
+
+  @Remote
+  async searchDreamInsights(
+    query: string,
+    kind?: WireDreamInsightKind,
+    status?: WireDreamInsightStatus | 'all',
+  ): Promise<WireDreamInsightViewItem[]> {
+    this.checkUser();
+    if (typeof query !== 'string') {
+      throw new RemoteError('gateway/bad-request', 'query must be a string', {});
+    }
+    if (kind !== undefined && !isDreamKind(kind)) {
+      throw new RemoteError('gateway/bad-request', 'invalid dream insight kind', {});
+    }
+    if (status !== undefined && !isDreamStatusOrAll(status)) {
+      throw new RemoteError('gateway/bad-request', 'invalid dream insight status', {});
+    }
+    return await this.requireDream().searchInsights(query, kind, status);
   }
 }
 

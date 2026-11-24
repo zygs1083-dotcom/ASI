@@ -65,6 +65,13 @@ export function createAsiActions(api: Api, onNavigateSession?: (sessionId: strin
     onRestoreSkill: (name) => complete(() => api.restoreSkill(name)),
     onDeleteArchivedSkill: (name) => complete(() => api.deleteArchivedSkill(name)),
     onExportSkillToWorkspace: (name, ws) => complete(() => api.exportSkillToWorkspace(name, ws)),
+
+    onDreamNow: () => complete(() => api.dreamNow()),
+    onToggleAutoDreamPaused: (paused) => complete(() => api.setAutoDreamPaused(paused)),
+    onAdoptDreamInsight: (input) => complete(() => api.adoptDreamInsight(input)),
+    onPromoteDreamInsight: (insightId) => complete(() => api.promoteDreamInsight(insightId)),
+    onDismissDreamInsight: (insightId) => complete(() => api.dismissDreamInsight(insightId)),
+    onSearchDreamInsights: (query, kind, status) => complete(() => api.searchDreamInsights(query, kind, status)),
   };
 
   return {

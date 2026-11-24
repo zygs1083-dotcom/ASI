@@ -1,12 +1,16 @@
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import type { AsiDrivesServiceApi, AsiSenseServiceApi, AsiSleepServiceApi } from '@asi/sense-types';
+import type { AsiDreamServiceApi, AsiDrivesServiceApi, AsiSenseServiceApi, AsiSleepServiceApi } from '@asi/sense-types';
 import type { Context } from '@deepseek-ai/cordis';
 import type {} from '@deepseek-ai/dsh-app-boot';
 import z from '@deepseek-ai/schemastery';
 import { createDshCarePorts } from '../../care/host/dsh/ports.ts';
 import { registerCareTools } from '../../care/host/dsh/tools.ts';
 import { createCareRuntime } from '../../care/host/runtime.ts';
+import { AsiDreamService } from '../../dream/host/dsh/dream-service.ts';
+import { createDshDreamPorts } from '../../dream/host/dsh/dsh-ports.ts';
+import { registerDreamTools } from '../../dream/host/dsh/tools.ts';
+import { createDreamRuntime } from '../../dream/host/runtime.ts';
 import { createDshGrowthPorts, registerDshSkillBridge } from '../../growth/host/dsh/dsh-ports.ts';
 import { registerGrowthTools } from '../../growth/host/dsh/tools.ts';
 import { createGrowthRuntime } from '../../growth/host/runtime.ts';
@@ -32,10 +36,12 @@ declare module '@deepseek-ai/cordis' {
     asiSense: AsiSenseServiceApi;
     asiDrives: AsiDrivesServiceApi;
     asiSleep: AsiSleepServiceApi;
+    asiDream: AsiDreamServiceApi;
     asi: AsiRemote;
   }
 }
 
+export { AsiDreamService } from '../../dream/host/dsh/dream-service.ts';
 export { type LegacyMigrationReport, migrateLegacyAsiData } from '../../migration/legacy-migration.ts';
 export { AsiDrivesService } from '../../needs/host/dsh/drives-service.ts';
 export { AsiSenseService } from '../../sense/host/dsh/index.ts';
@@ -47,6 +53,14 @@ export type {
   JsonValue,
   WireArchivedSkillViewItem,
   WireAsiPanelModel,
+  WireDreamAdoptMemoryInput,
+  WireDreamAdoptResult,
+  WireDreamCycleRecord,
+  WireDreamInsightKind,
+  WireDreamInsightStatus,
+  WireDreamInsightViewItem,
+  WireDreamPanelModel,
+  WireDreamPromoteResult,
   WireGrowthPanelModel,
   WireGrowthSynthesisRecord,
   WireMemoryCreateInput,
@@ -108,6 +122,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   let sleepRuntime: ReturnType<typeof createSleepRuntime> | undefined;
   let careRuntime: ReturnType<typeof createCareRuntime> | undefined;
   let growthRuntime: ReturnType<typeof createGrowthRuntime> | undefined;
+  let dreamRuntime: ReturnType<typeof createDreamRuntime> | undefined;
 
   let offSenseTools: (() => void) | undefined;
   let offNeedsTools: (() => void) | undefined;
@@ -117,9 +132,14 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   let offCareTools: (() => void) | undefined;
   let offGrowthTools: (() => void) | undefined;
   let offGrowthSkills: (() => void) | undefined;
+  let offDreamTools: (() => void) | undefined;
 
   const dispose = async () => {
     disposed = true;
+
+    offDreamTools?.();
+    offDreamTools = undefined;
+    await dreamRuntime?.stop();
 
     offGrowthSkills?.();
     offGrowthSkills = undefined;
@@ -160,6 +180,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     const sleepRoot = join(config.storageRoot, 'sleep');
     const careRoot = join(config.storageRoot, 'care');
     const growthRoot = join(config.storageRoot, 'growth');
+    const dreamRoot = join(config.storageRoot, 'dream');
 
     // 1. L0 Pure Sensory Organ (`ctx.asiSense` + `env_state` / `env_detail`)
     const local = localPorts(ctx, senseRoot);
@@ -247,15 +268,31 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       return;
     }
 
+    // 5b. DMN Default Mode Network Cross-Repo Insight Dreaming (`ctx.asiDream` + `dream_insights`)
+    const dreamPorts = createDshDreamPorts(ctx, dreamRoot, {
+      memoryAdoption: sleepRuntime.actions,
+      skillDrafts: growthRuntime.actions,
+    });
+    dreamRuntime = createDreamRuntime(dreamPorts);
+    offDreamTools = registerDreamTools(ctx, dreamRuntime);
+    await dreamRuntime.start();
+    if (disposed) {
+      await dispose();
+      return;
+    }
+    new AsiDreamService(ctx, dreamRuntime);
+
     // 6. Unified TypeRT Remote Service (`ctx.asi`) for the single unified sidebar panel
     new AsiRemote(ctx, {
       needsActions: needsRuntime.actions,
       sleepActions: sleepRuntime.actions,
       growthActions: growthRuntime.actions,
+      dreamActions: dreamRuntime.actions,
       framesSource: createAsiFramesSource({
         needs: needsRuntime,
         sleep: sleepRuntime,
         growth: growthRuntime,
+        dream: dreamRuntime,
       }),
     });
   } catch (error) {

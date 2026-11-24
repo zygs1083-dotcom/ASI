@@ -1,4 +1,5 @@
 import { makeScenario } from '@asi/sense-ui';
+import { makeDreamScenario } from '../dream/mock-scenarios.ts';
 import { makeGrowthScenario } from '../growth/mock-scenarios.ts';
 import type { AsiPanelModel } from '../host/dsh/wire-types.ts';
 import { makeSleepScenario } from '../sleep/mock-scenarios.ts';
@@ -21,14 +22,16 @@ export function makeUnifiedScenario(name: AsiUnifiedScenarioName): AsiPanelModel
     };
     const sleep = makeSleepScenario('sleepy-waiting');
     const growth = makeGrowthScenario('deep-quiet-waiting');
-    return { needs, sleep, growth };
+    const dream = makeDreamScenario('dream-quiet-waiting');
+    return { needs, sleep, growth, dream };
   }
 
   if (name === 'critical-suppressed') {
     const needs = makeScenario('low-energy');
     const sleep = makeSleepScenario('suppressed-l1');
     const growth = makeGrowthScenario('suppressed-lower-tier');
-    return { needs, sleep, growth };
+    const dream = makeDreamScenario('suppressed-lower-tier');
+    return { needs, sleep, growth, dream };
   }
 
   if (name === 'empty-clean') {
@@ -38,7 +41,8 @@ export function makeUnifiedScenario(name: AsiUnifiedScenarioName): AsiPanelModel
     needs.actionLedger = [];
     const sleep = makeSleepScenario('empty-vault');
     const growth = makeGrowthScenario('empty-workshop');
-    return { needs, sleep, growth };
+    const dream = makeDreamScenario('empty-dream');
+    return { needs, sleep, growth, dream };
   }
 
   const needs = makeScenario('healthy');
@@ -46,5 +50,6 @@ export function makeUnifiedScenario(name: AsiUnifiedScenarioName): AsiPanelModel
   const growth = makeGrowthScenario('workshop-ready');
   growth.drafts = [];
   growth.draftCount = 0;
-  return { needs, sleep, growth };
+  const dream = makeDreamScenario('cross-repo-insights');
+  return { needs, sleep, growth, dream };
 }

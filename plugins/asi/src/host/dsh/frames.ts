@@ -1,3 +1,4 @@
+import type { DreamRuntime } from '../../dream/host/runtime.ts';
 import type { GrowthRuntime } from '../../growth/host/runtime.ts';
 import { buildPanelModel } from '../../needs/host/dsh/frames.ts';
 import type { NeedsRuntime } from '../../needs/host/runtime.ts';
@@ -15,6 +16,7 @@ export interface AsiFramesRuntimes {
   needs: NeedsRuntime;
   sleep: Pick<SleepRuntime, 'panelModel' | 'subscribe'>;
   growth: Pick<GrowthRuntime, 'panelModel' | 'subscribe'>;
+  dream?: Pick<DreamRuntime, 'panelModel' | 'subscribe'>;
 }
 
 export function buildAsiPanelModel(runtimes: AsiFramesRuntimes): AsiPanelModel {
@@ -22,6 +24,7 @@ export function buildAsiPanelModel(runtimes: AsiFramesRuntimes): AsiPanelModel {
     needs: buildPanelModel(runtimes.needs),
     sleep: runtimes.sleep.panelModel(),
     growth: runtimes.growth.panelModel(),
+    ...(runtimes.dream ? { dream: runtimes.dream.panelModel() } : {}),
   };
 }
 
@@ -102,6 +105,7 @@ export function createAsiFramesSource(
     let offNeeds: (() => void) | undefined = runtimes.needs.subscribe(onRuntimeChange);
     let offSleep: (() => void) | undefined = runtimes.sleep.subscribe(onRuntimeChange);
     let offGrowth: (() => void) | undefined = runtimes.growth.subscribe(onRuntimeChange);
+    let offDream: (() => void) | undefined = runtimes.dream?.subscribe(onRuntimeChange);
 
     const cleanup = () => {
       if (cleanedUp) return;
@@ -112,12 +116,15 @@ export function createAsiFramesSource(
       const uNeeds = offNeeds;
       const uSleep = offSleep;
       const uGrowth = offGrowth;
+      const uDream = offDream;
       offNeeds = undefined;
       offSleep = undefined;
       offGrowth = undefined;
+      offDream = undefined;
       uNeeds?.();
       uSleep?.();
       uGrowth?.();
+      uDream?.();
     };
 
     function onAbort(): void {
