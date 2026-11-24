@@ -1,8 +1,7 @@
 import { randomUUID } from 'node:crypto';
-import { realpathSync } from 'node:fs';
 import { mkdir } from 'node:fs/promises';
 import { homedir } from 'node:os';
-import { join, resolve, sep } from 'node:path';
+import { join, resolve } from 'node:path';
 import type { Context } from '@deepseek-ai/cordis';
 import type { Agent } from '@deepseek-ai/dsh-agent';
 import type {} from '@deepseek-ai/dsh-api-session-controller';
@@ -15,6 +14,8 @@ import {
   ASI_INTERNAL_CWD_RE,
   ASI_INTERNAL_SESSION_ID_RE,
   buildUnifiedExcludedInternalRoots,
+  fastSafeRealpath,
+  isInsideExcludedRoots,
 } from '../../../shared/internal-guards.js';
 import type { CryDeliveryMode } from '../cry.js';
 import type { NeedsHostPorts } from '../ports.js';
@@ -36,21 +37,10 @@ export function createDshNeedsPorts(ctx: Context, storageRoot: string, options?:
     );
 
   const sandboxRoot = resolve(join(storageRoot, 'sandbox'));
-  const safeRealpath = (p: string): string => {
-    try {
-      return realpathSync(p);
-    } catch {
-      return resolve(p);
-    }
-  };
+  const safeRealpath = fastSafeRealpath;
   const INTERNAL_SESSION_ID_RE = ASI_INTERNAL_SESSION_ID_RE;
   const INTERNAL_SANDBOX_CWD_RE = ASI_INTERNAL_CWD_RE;
-  const excludedRoots = buildUnifiedExcludedInternalRoots(storageRoot, ctx.asiSense.storageRoot);
-
-  const isInsideDir = (candidate: string, parent: string): boolean => {
-    const normParent = parent.endsWith(sep) ? parent : `${parent}${sep}`;
-    return candidate === parent || candidate.startsWith(normParent);
-  };
+  const excludedRoots = [sandboxRoot, ...buildUnifiedExcludedInternalRoots(storageRoot, ctx.asiSense.storageRoot)];
 
   const isUserOrdinaryAgent = (agent: Agent): boolean => {
     const id = String(agent.id ?? '');
@@ -61,16 +51,7 @@ export function createDshNeedsPorts(ctx: Context, storageRoot: string, options?:
     const cwd = header?.cwd;
     if (typeof cwd === 'string' && cwd.trim()) {
       if (INTERNAL_SANDBOX_CWD_RE.test(cwd)) return false;
-      const normCwd = resolve(cwd);
-      const realCwd = safeRealpath(normCwd);
-      if (isInsideDir(normCwd, sandboxRoot) || isInsideDir(realCwd, safeRealpath(sandboxRoot))) {
-        return false;
-      }
-      for (const root of excludedRoots) {
-        if (isInsideDir(normCwd, resolve(root)) || isInsideDir(realCwd, safeRealpath(root))) {
-          return false;
-        }
-      }
+      if (isInsideExcludedRoots(cwd, excludedRoots)) return false;
     }
     const wr = getWorkspaceRegistry();
     if (wr?.archivedSessionIds.includes(agent.id)) return false;

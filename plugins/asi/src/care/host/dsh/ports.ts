@@ -1,6 +1,4 @@
-import { realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { resolve, sep } from 'node:path';
 import type { Context } from '@deepseek-ai/cordis';
 import type { Agent } from '@deepseek-ai/dsh-agent';
 import { JobId } from '@deepseek-ai/dsh-jobs';
@@ -10,6 +8,7 @@ import {
   ASI_INTERNAL_CWD_RE,
   ASI_INTERNAL_SESSION_ID_RE,
   buildUnifiedExcludedInternalRoots,
+  isInsideExcludedRoots,
 } from '../../../shared/internal-guards.js';
 import type { CareSessionBrief } from '../discovery.js';
 import type { CareDshJobsPort, CareHostPorts, CareOrphanJobInfo } from '../ports.js';
@@ -51,32 +50,20 @@ export function createDshCarePorts(ctx: Context, storageRoot: string, options?: 
   const ASI_INTERNAL_PATH_RE = ASI_INTERNAL_CWD_RE;
   const INTERNAL_SESSION_ID_RE = ASI_INTERNAL_SESSION_ID_RE;
 
-  const safeRealpath = (p: string): string => {
-    try {
-      return realpathSync(p);
-    } catch {
-      return resolve(p);
+  let cachedSenseRoot: string | undefined;
+  let cachedInternalRoots: string[] | undefined;
+  const collectInternalRoots = (): string[] => {
+    const curSenseRoot = ctx.asiSense?.storageRoot;
+    if (!cachedInternalRoots || curSenseRoot !== cachedSenseRoot) {
+      cachedSenseRoot = curSenseRoot;
+      cachedInternalRoots = buildUnifiedExcludedInternalRoots(storageRoot, curSenseRoot);
     }
+    return cachedInternalRoots;
   };
-
-  const isSameOrInsideSync = (parent: string, candidate: string): boolean => {
-    const prefix = parent.endsWith(sep) ? parent : `${parent}${sep}`;
-    return candidate === parent || candidate.startsWith(prefix);
-  };
-
-  const collectInternalRoots = (): string[] => buildUnifiedExcludedInternalRoots(storageRoot, ctx.asiSense.storageRoot);
 
   const isInternalPath = (candidate: string): boolean => {
     if (ASI_INTERNAL_PATH_RE.test(candidate)) return true;
-    const normCandidate = resolve(candidate);
-    const realCandidate = safeRealpath(normCandidate);
-    for (const root of collectInternalRoots()) {
-      const normRoot = resolve(root);
-      if (isSameOrInsideSync(normRoot, normCandidate) || isSameOrInsideSync(safeRealpath(normRoot), realCandidate)) {
-        return true;
-      }
-    }
-    return false;
+    return isInsideExcludedRoots(candidate, collectInternalRoots());
   };
 
   const isInternalSession = (id: string, cwd?: string, origin?: string, delegationDepth?: number): boolean => {

@@ -16,7 +16,6 @@
  *      distress or `'eco'` mode is active.
  */
 
-import { realpathSync } from 'node:fs';
 import { type HelpActionKind, NEED_KEYS, type NeedKey, sanitizeForModel } from '@asi/sense-types';
 import type { Context } from '@deepseek-ai/cordis';
 import type { Agent } from '@deepseek-ai/dsh-agent';
@@ -29,6 +28,7 @@ import {
   type ToolRunContext,
 } from '@deepseek-ai/dsh-tools';
 import type { JsonValue } from '@deepseek-ai/dsh-util-values';
+import { fastSafeRealpath } from '../../../shared/internal-guards.js';
 import { CLEANABLE_EXTERNAL_CACHE_IDS } from '../cache-catalog.js';
 import type { RegisteredSandboxTool } from '../drives.js';
 import { type NeedsRuntime, validateHelpActionTarget } from '../runtime.js';
@@ -319,11 +319,7 @@ function createExternalDriveTool(registered: RegisteredSandboxTool, runtime: Nee
 }
 
 function tryRealpath(p: string): string {
-  try {
-    return realpathSync(p);
-  } catch {
-    return p;
-  }
+  return fastSafeRealpath(p);
 }
 
 function ensureMaintainerRegistered(agent: Agent, runtime: NeedsRuntime): boolean {

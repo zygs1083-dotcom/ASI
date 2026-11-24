@@ -1,6 +1,4 @@
 import { randomUUID } from 'node:crypto';
-import { realpathSync } from 'node:fs';
-import { resolve, sep } from 'node:path';
 import type { AsiTomServiceApi } from '@asi/sense-types';
 import type { Context } from '@deepseek-ai/cordis';
 import type { Agent } from '@deepseek-ai/dsh-agent';
@@ -12,6 +10,7 @@ import {
   ASI_INTERNAL_CWD_RE,
   ASI_INTERNAL_SESSION_ID_RE,
   buildUnifiedExcludedInternalRoots,
+  isInsideExcludedRoots,
 } from '../../../shared/internal-guards.js';
 import type { SleepRuntime } from '../../../sleep/host/runtime.js';
 import type { IntuitionHostPorts } from '../ports.js';
@@ -24,19 +23,6 @@ declare module '@deepseek-ai/dsh-llm' {
 
 const INTERNAL_SESSION_ID_RE = ASI_INTERNAL_SESSION_ID_RE;
 const INTERNAL_SANDBOX_CWD_RE = ASI_INTERNAL_CWD_RE;
-
-function safeRealpath(p: string): string {
-  try {
-    return realpathSync(p);
-  } catch {
-    return resolve(p);
-  }
-}
-
-function isInsideRoot(candidate: string, root: string): boolean {
-  const normRoot = root.endsWith(sep) ? root : `${root}${sep}`;
-  return candidate === root || candidate.startsWith(normRoot);
-}
 
 function extractToolTargetText(exec: Readonly<ToolExecution>): { targetText: string; cwd?: string } {
   const args =
@@ -106,11 +92,7 @@ export function createDshIntuitionPorts(
     const cwd = header?.cwd;
     if (typeof cwd === 'string' && cwd.trim()) {
       if (INTERNAL_SANDBOX_CWD_RE.test(cwd)) return false;
-      const normCwd = resolve(cwd);
-      const realCwd = safeRealpath(normCwd);
-      for (const ex of normExcluded) {
-        if (isInsideRoot(normCwd, ex) || isInsideRoot(realCwd, ex)) return false;
-      }
+      if (isInsideExcludedRoots(cwd, normExcluded)) return false;
     }
     return true;
   };

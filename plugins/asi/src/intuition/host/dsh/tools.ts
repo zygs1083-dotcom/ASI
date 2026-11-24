@@ -6,8 +6,6 @@
  *   project workspaces, and scrubs every output through `sanitizeForModel`.
  */
 
-import { realpathSync } from 'node:fs';
-import { resolve, sep } from 'node:path';
 import { sanitizeForModel } from '@asi/sense-types';
 import type { Context } from '@deepseek-ai/cordis';
 import type { Agent } from '@deepseek-ai/dsh-agent';
@@ -18,6 +16,7 @@ import {
   ASI_INTERNAL_CWD_RE,
   ASI_INTERNAL_SESSION_ID_RE,
   buildUnifiedExcludedInternalRoots,
+  isInsideExcludedRoots,
 } from '../../../shared/internal-guards.js';
 import {
   PROSPECTIVE_EVENT_KINDS,
@@ -32,19 +31,6 @@ const output = {
   schema: { type: 'json' } as const,
   render: (_args: unknown, value: unknown) => [{ type: 'text' as const, text: JSON.stringify(value) }],
 };
-
-function safeRealpath(p: string): string {
-  try {
-    return realpathSync(p);
-  } catch {
-    return resolve(p);
-  }
-}
-
-function isInsideRoot(candidate: string, root: string): boolean {
-  const normRoot = root.endsWith(sep) ? root : `${root}${sep}`;
-  return candidate === root || candidate.startsWith(normRoot);
-}
 
 export interface IntuitionToolGuardOptions {
   excludedRoots?: readonly (string | undefined)[];
@@ -70,18 +56,8 @@ function requireOrdinaryAgent(exec: ToolRunContext, guard?: IntuitionToolGuardOp
   }
   const cwd = header?.cwd;
   if (typeof cwd === 'string' && cwd.trim()) {
-    if (ASI_INTERNAL_CWD_RE.test(cwd)) {
+    if (ASI_INTERNAL_CWD_RE.test(cwd) || isInsideExcludedRoots(cwd, guard?.excludedRoots ?? [])) {
       throw new ToolContextUnavailableError('asi-intuition tools are restricted to ordinary user sessions');
-    }
-    const normCwd = resolve(cwd);
-    const realCwd = safeRealpath(normCwd);
-    for (const rawEx of guard?.excludedRoots ?? []) {
-      if (!rawEx?.trim()) continue;
-      const normEx = resolve(rawEx);
-      const realEx = safeRealpath(normEx);
-      if (isInsideRoot(normCwd, normEx) || isInsideRoot(realCwd, realEx)) {
-        throw new ToolContextUnavailableError('asi-intuition tools are restricted to ordinary user sessions');
-      }
     }
   }
   return agent;

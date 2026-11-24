@@ -7,9 +7,8 @@
  * - Connects LLM streaming synthesis with automatic route fallback and `AbortSignal`.
  */
 
-import { realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { isAbsolute, relative, resolve } from 'node:path';
+import { resolve } from 'node:path';
 import type { AsiSleepServiceApi, AsiTomServiceApi } from '@asi/sense-types';
 import type { Context } from '@deepseek-ai/cordis';
 import type { Agent } from '@deepseek-ai/dsh-agent';
@@ -20,6 +19,8 @@ import {
   ASI_INTERNAL_CWD_RE,
   ASI_INTERNAL_SESSION_ID_RE,
   buildUnifiedExcludedInternalRoots,
+  fastSafeRealpath,
+  isInsideExcludedRoots,
 } from '../../../shared/internal-guards.js';
 import { extractRouteFromEvents } from '../../../sleep/host/dsh/dsh-ports.ts';
 import type {
@@ -34,20 +35,11 @@ const INTERNAL_CWD_RE = ASI_INTERNAL_CWD_RE;
 const INTERNAL_SESSION_ID_RE = ASI_INTERNAL_SESSION_ID_RE;
 
 function safeRealpath(target: string): string {
-  try {
-    return realpathSync(target);
-  } catch {
-    return resolve(target);
-  }
+  return fastSafeRealpath(target);
 }
 
 function isSameOrInsideRoot(candidate: string, root: string | undefined): boolean {
-  if (!root || !root.trim()) return false;
-  const normCand = safeRealpath(candidate);
-  const normRoot = safeRealpath(root);
-  if (normCand === normRoot) return true;
-  const rel = relative(normRoot, normCand);
-  return Boolean(rel && !rel.startsWith('..') && !isAbsolute(rel));
+  return isInsideExcludedRoots(candidate, [root]);
 }
 
 export function buildExcludedDreamRoots(dreamStorageRoot: string, senseStorageRoot?: string): string[] {
@@ -70,7 +62,7 @@ export function isOrdinaryDreamSession(
   const cwd = session.header?.cwd;
   if (cwd) {
     if (INTERNAL_CWD_RE.test(cwd)) return false;
-    if (excludedRoots.some((r) => isSameOrInsideRoot(cwd, r))) return false;
+    if (isInsideExcludedRoots(cwd, excludedRoots)) return false;
   }
   return true;
 }

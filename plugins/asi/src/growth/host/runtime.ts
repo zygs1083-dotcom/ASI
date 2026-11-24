@@ -11,11 +11,10 @@
  */
 
 import { randomUUID } from 'node:crypto';
-import { realpathSync } from 'node:fs';
 import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { dirname, join, resolve, sep } from 'node:path';
 import type { AsiDrivesSnapshot, DriveAbortSignal, SenseSnapshot } from '@asi/sense-types';
-import { ASI_INTERNAL_CWD_RE } from '../../shared/internal-guards.js';
+import { ASI_INTERNAL_CWD_RE, fastSafeRealpath } from '../../shared/internal-guards.js';
 import {
   isValidSkillName,
   maskHomeDir,
@@ -119,11 +118,7 @@ export interface GrowthRuntime {
 }
 
 function safeRealpath(target: string): string {
-  try {
-    return realpathSync(target);
-  } catch {
-    return resolve(target);
-  }
+  return fastSafeRealpath(target);
 }
 
 export function matchesWorkspaceScope(lookupCwd: string | undefined, skillWorkspace: string | undefined): boolean {

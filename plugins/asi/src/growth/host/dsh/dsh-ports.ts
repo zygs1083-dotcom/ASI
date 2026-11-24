@@ -1,4 +1,3 @@
-import { realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { resolve, sep } from 'node:path';
 import type { AsiSleepServiceApi } from '@asi/sense-types';
@@ -13,6 +12,8 @@ import {
   ASI_INTERNAL_CWD_RE,
   ASI_INTERNAL_SESSION_ID_RE,
   buildUnifiedExcludedInternalRoots,
+  fastSafeRealpath,
+  isInsideExcludedRoots,
 } from '../../../shared/internal-guards.js';
 import { isValidSkillName } from '../../shared/skill-spec.js';
 import type { OrdinaryTurnTrajectoryInput } from '../evidence.js';
@@ -26,24 +27,11 @@ const WORKSPACE_SKILL_RANK = 200;
 const GLOBAL_SKILL_RANK = 400;
 
 function safeRealpath(target: string): string {
-  try {
-    return realpathSync(target);
-  } catch {
-    return resolve(target);
-  }
+  return fastSafeRealpath(target);
 }
 
 function isSameOrInsideRoot(candidate: string | undefined, root: string | undefined): boolean {
-  if (!candidate || !root) return false;
-  const normCand = resolve(candidate);
-  const normRoot = resolve(root);
-  const prefix = normRoot.endsWith(sep) ? normRoot : `${normRoot}${sep}`;
-  if (normCand === normRoot || normCand.startsWith(prefix)) return true;
-
-  const rc = safeRealpath(normCand);
-  const rr = safeRealpath(normRoot);
-  const rPrefix = rr.endsWith(sep) ? rr : `${rr}${sep}`;
-  return rc === rr || rc.startsWith(rPrefix);
+  return isInsideExcludedRoots(candidate, [root]);
 }
 
 export function buildExcludedInternalRoots(storageRoot: string, senseStorageRoot?: string): string[] {
@@ -62,9 +50,7 @@ export function isOrdinaryDshSession(
   const cwd = header?.cwd;
   if (cwd) {
     if (INTERNAL_CWD_RE.test(cwd)) return false;
-    for (const root of excludedRoots) {
-      if (isSameOrInsideRoot(cwd, root)) return false;
-    }
+    if (isInsideExcludedRoots(cwd, excludedRoots)) return false;
   }
   return true;
 }

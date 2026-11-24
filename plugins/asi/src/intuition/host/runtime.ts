@@ -937,9 +937,13 @@ export function createIntuitionRuntime(ports: IntuitionHostPorts, options?: Intu
       }
 
       if (ports.tom?.subscribe) {
+        let lastTomDefer = Boolean(ports.tom.shouldDeferProactiveWork());
         disposers.push(
           ports.tom.subscribe(() => {
-            if (!stopped && !ports.tom?.shouldDeferProactiveWork()) {
+            const nextDefer = Boolean(ports.tom?.shouldDeferProactiveWork());
+            if (nextDefer === lastTomDefer) return;
+            lastTomDefer = nextDefer;
+            if (!stopped && !nextDefer) {
               runCueEvaluationAndPark({
                 now: nowFn(),
                 reason: 'tick',

@@ -406,8 +406,13 @@ export function createTomRuntime(ports: TomHostPorts, options?: TomRuntimeOption
             evaluate: (senseSnap) => [computeEvaluation(senseSnap).driveReading],
           }),
         );
+        let lastTomDriveKey = '';
         disposers.push(
-          ports.drives.subscribe(() => {
+          ports.drives.subscribe((drivesSnap) => {
+            const d = drivesSnap.drives.find((item) => item.key === 'asi-tom:social_tact');
+            const nextKey = `${d?.satisfaction ?? ''}|${d?.zone ?? ''}|${d?.suppressed ? 1 : 0}|${drivesSnap.higherOrderSuppressed ? 1 : 0}`;
+            if (nextKey === lastTomDriveKey) return;
+            lastTomDriveKey = nextKey;
             emitToListeners(toSnapshot(cachedEval));
           }),
         );

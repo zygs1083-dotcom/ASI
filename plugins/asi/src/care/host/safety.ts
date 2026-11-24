@@ -9,6 +9,7 @@
  */
 
 import { createHash } from 'node:crypto';
+import { existsSync } from 'node:fs';
 import { realpath } from 'node:fs/promises';
 import { join, resolve, sep } from 'node:path';
 import { sanitizeForModel } from '@asi/sense-types';
@@ -67,7 +68,7 @@ export function isSameOrInside(parentReal: string, candidateReal: string): boole
 }
 
 export async function tryRealpath(targetPath: string): Promise<string | undefined> {
-  if (!targetPath?.trim()) return undefined;
+  if (!targetPath?.trim() || !existsSync(targetPath)) return undefined;
   try {
     return await realpath(targetPath);
   } catch {

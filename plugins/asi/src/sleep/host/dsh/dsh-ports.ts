@@ -1,4 +1,3 @@
-import { realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
 import type { Context } from '@deepseek-ai/cordis';
 import type { Agent } from '@deepseek-ai/dsh-agent';
@@ -10,6 +9,8 @@ import {
   ASI_INTERNAL_CWD_RE,
   ASI_INTERNAL_SESSION_ID_RE,
   buildUnifiedExcludedInternalRoots,
+  fastSafeRealpath,
+  isInsideExcludedRoots,
 } from '../../../shared/internal-guards.js';
 import type { ConversationTurnInput } from '../consolidator.js';
 import type { SleepConversationPort, SleepHostPorts } from '../ports.js';
@@ -18,19 +19,11 @@ export const INTERNAL_SESSION_ID_RE = ASI_INTERNAL_SESSION_ID_RE;
 const INTERNAL_CWD_RE = ASI_INTERNAL_CWD_RE;
 
 function safeRealpath(p: string): string {
-  try {
-    return realpathSync(p);
-  } catch {
-    return p;
-  }
+  return fastSafeRealpath(p);
 }
 
 function isInsideRoot(candidate: string | undefined, root: string | undefined): boolean {
-  if (!candidate || !root) return false;
-  if (candidate === root || candidate.startsWith(`${root}/`)) return true;
-  const rc = safeRealpath(candidate);
-  const rr = safeRealpath(root);
-  return rc === rr || rc.startsWith(`${rr}/`);
+  return isInsideExcludedRoots(candidate, [root]);
 }
 
 export function buildExcludedInternalRoots(storageRoot: string, senseStorageRoot?: string): string[] {
@@ -49,9 +42,7 @@ export function isOrdinaryDshSession(
   const cwd = header?.cwd;
   if (cwd) {
     if (INTERNAL_CWD_RE.test(cwd)) return false;
-    for (const root of excludedRoots) {
-      if (isInsideRoot(cwd, root)) return false;
-    }
+    if (isInsideExcludedRoots(cwd, excludedRoots)) return false;
   }
   return true;
 }

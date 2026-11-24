@@ -844,7 +844,11 @@ export function createDreamRuntime(ports: DreamHostPorts): DreamRuntime {
       }
 
       if (ports.tom?.subscribe) {
+        let lastTomDefer = Boolean(ports.tom.shouldDeferProactiveWork());
         offTom = ports.tom.subscribe(() => {
+          const nextDefer = Boolean(ports.tom?.shouldDeferProactiveWork());
+          if (nextDefer === lastTomDefer) return;
+          lastTomDefer = nextDefer;
           preemptAutoDreamIfNeeded();
           ports.drives.notifySourceChanged('asi-dream');
           scheduleQuietCheck();

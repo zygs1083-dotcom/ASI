@@ -15,9 +15,10 @@
  */
 
 import { randomUUID } from 'node:crypto';
-import { existsSync, lstatSync, realpathSync } from 'node:fs';
+import { existsSync, lstatSync } from 'node:fs';
 import { lstat, mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { dirname, isAbsolute, join, resolve, sep } from 'node:path';
+import { fastSafeRealpath } from '../../shared/internal-guards.js';
 import {
   isValidSkillName,
   maskHomeDir,
@@ -113,11 +114,7 @@ interface PersistedCatalogFile {
 }
 
 function safeRealpath(target: string): string {
-  try {
-    return realpathSync(target);
-  } catch {
-    return resolve(target);
-  }
+  return fastSafeRealpath(target);
 }
 
 function isSameOrInside(parent: string, candidate: string): boolean {

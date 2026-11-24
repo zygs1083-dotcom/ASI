@@ -11,12 +11,11 @@
  */
 
 import { createHash } from 'node:crypto';
-import { realpathSync } from 'node:fs';
 import { lstat, readdir, readFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { sanitizeForModel } from '@asi/sense-types';
-import { ASI_INTERNAL_CWD_RE } from '../../shared/internal-guards.js';
+import { ASI_INTERNAL_CWD_RE, fastSafeRealpath } from '../../shared/internal-guards.js';
 
 const MAX_MANIFEST_BYTES = 32_768;
 const MAX_DOC_BYTES = 4_096;
@@ -79,30 +78,11 @@ export interface RepoStructuralProfile extends CanonicalRepoIdentity {
 }
 
 function safeRealpath(target: string): string {
-  try {
-    return realpathSync(target);
-  } catch {
-    return resolve(target);
-  }
+  return fastSafeRealpath(target);
 }
 
 function deepSafeRealpath(target: string): string {
-  const abs = resolve(target);
-  const tail: string[] = [];
-  let cur = abs;
-  for (let i = 0; i < 32; i += 1) {
-    try {
-      const realBase = realpathSync(cur);
-      return tail.length > 0 ? resolve(realBase, ...[...tail].reverse()) : realBase;
-    } catch {
-      const base = basename(cur);
-      if (base) tail.push(base);
-      const parent = dirname(cur);
-      if (parent === cur) break;
-      cur = parent;
-    }
-  }
-  return abs;
+  return fastSafeRealpath(target);
 }
 
 function hasHiddenSensitiveSegment(targetPath: string): boolean {
