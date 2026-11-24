@@ -43,6 +43,17 @@ export {
   THERMAL_ORDINAL,
   type ThermalState,
 } from './history.js';
+export type {
+  AsiIntuitionServiceApi,
+  FlashbackHitSummary,
+  IntuitionScanOptions,
+  IntuitionSnapshot,
+  ProspectiveEventKind,
+  ProspectiveIntentionSummary,
+  ProspectivePriority,
+  ProspectiveStatus,
+  ProspectiveTriggerKind,
+} from './intuition.js';
 export {
   type ActionMeasurement,
   type ActionOutcomeLedgerEntry,

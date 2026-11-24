@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   type ActionOutcomeLedgerEntry,
   type AsiDrivesSnapshot,
+  type AsiIntuitionServiceApi,
   type AsiSleepServiceApi,
   effectiveDisks,
   factStatusAt,
@@ -110,5 +111,22 @@ describe('shared type exports', () => {
       subscribe: () => () => {},
     };
     expect(sleepSvc.listMemories()[0]?.retention).toBeCloseTo(0.92);
+
+    const intuitionSvc: AsiIntuitionServiceApi = {
+      snapshot: () => ({
+        now: 200,
+        autoIntuitionPaused: false,
+        suppressed: false,
+        pendingCount: 1,
+        surfacedCount: 0,
+        fulfilledCount: 0,
+        recentFlashbackCount: 0,
+        intentions: [],
+      }),
+      scanFlashbacks: () => [],
+      listIntentions: () => [],
+      subscribe: () => () => {},
+    };
+    expect(intuitionSvc.snapshot().pendingCount).toBe(1);
   });
 });
