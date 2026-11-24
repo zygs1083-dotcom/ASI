@@ -1,0 +1,5 @@
+- insert:
+    - id: asi-growth
+      name: asi-growth
+      config:
+        storageRoot: !!js dshHomePath('data', 'asi-growth')

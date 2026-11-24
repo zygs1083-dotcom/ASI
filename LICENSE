@@ -49,3 +49,7 @@ Third-Party Open-Source Adaptations (MIT License):
   (MIT License, Copyright (c) Ferran Basora).
 - Local TCP listening port & dev runtime inspection adapted from sindresorhus/fkill and sindresorhus/pid-port
   (MIT License, Copyright (c) Sindre Sorhus).
+- Standard plain-text SKILL.md frontmatter specification & validator adapted from agentskills/agentskills
+  (MIT License, Copyright (c) Agent Skills Contributors / Anthropic).
+- Closed-loop procedural skill synthesis, verification critic, and iterative skill library refinement adapted from MineDojo/Voyager
+  (MIT License, Copyright (c) 2023 MineDojo Team).
