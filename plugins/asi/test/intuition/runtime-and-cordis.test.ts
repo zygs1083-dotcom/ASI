@@ -30,7 +30,7 @@ function extractTextFromMessage(msg: UserMessage): string {
 }
 
 describe('前额叶直觉与前瞻记忆（src/intuition）全链路 Cordis / DSH 集成验证', () => {
-  it('严格保持零动态系统提示词（100% 保护前缀 Prompt Cache），支持 pre-step 同轮尾部闪回、空闲 next-turn 合并入队、重复报错疤痕学习与读写闭环工具', {
+  it('严格保持零动态系统提示词（100% 保护前缀 Prompt Cache），支持 pre-step 同轮尾部闪回、空闲 next-step 合并/撤回入队、重复报错疤痕学习与读写闭环工具', {
     timeout: 60_000,
   }, async () => {
     const rootDir = await mkdtemp(join(tmpdir(), 'asi-intuition-cordis-'));
@@ -68,13 +68,34 @@ describe('前额叶直觉与前瞻记忆（src/intuition）全链路 Cordis / DS
           return injectedNextStep;
         },
         replace(msgId: LlmMessageId, newMsg: UserMessage) {
-          const idx = nextTurnQueue.findIndex((m) => m.id === msgId);
-          if (idx < 0) return false;
-          nextTurnQueue[idx] = newMsg;
-          return true;
+          const stepIdx = injectedNextStep.findIndex((m) => m.id === msgId);
+          if (stepIdx >= 0) {
+            injectedNextStep[stepIdx] = newMsg;
+            return true;
+          }
+          const turnIdx = nextTurnQueue.findIndex((m) => m.id === msgId);
+          if (turnIdx >= 0) {
+            nextTurnQueue[turnIdx] = newMsg;
+            return true;
+          }
+          return false;
         },
-        append(_target: string, msg: UserMessage) {
-          nextTurnQueue.push(msg);
+        remove(msgId: LlmMessageId) {
+          const stepIdx = injectedNextStep.findIndex((m) => m.id === msgId);
+          if (stepIdx >= 0) {
+            injectedNextStep.splice(stepIdx, 1);
+            return true;
+          }
+          const turnIdx = nextTurnQueue.findIndex((m) => m.id === msgId);
+          if (turnIdx >= 0) {
+            nextTurnQueue.splice(turnIdx, 1);
+            return true;
+          }
+          return false;
+        },
+        append(target: string, msg: UserMessage) {
+          if (target === 'next-turn') nextTurnQueue.push(msg);
+          else injectedNextStep.push(msg);
         },
       },
       send(msg: UserMessage, target: 'next-turn' | 'next-step', wakeup: boolean) {
@@ -268,9 +289,10 @@ describe('前额叶直觉与前瞻记忆（src/intuition）全链路 Cordis / DS
       emitAgentEvent(root, subAgent, 'agent/created', { source: 'startup' });
 
       expect(subAgentQueue).toHaveLength(0);
-      expect(nextTurnQueue).toHaveLength(1);
-      const firstQueued = nextTurnQueue[0];
-      if (!firstQueued) throw new Error('expected queued next-turn message');
+      expect(nextTurnQueue).toHaveLength(0);
+      expect(injectedNextStep).toHaveLength(1);
+      const firstQueued = injectedNextStep[0];
+      if (!firstQueued) throw new Error('expected parked next-step message');
       const coalescedText = extractTextFromMessage(firstQueued);
       expect(coalescedText).toContain('长构建任务结束后检查产物大小');
       expect(coalescedText).toContain('新会话启动对齐分支状态');
@@ -298,10 +320,10 @@ describe('前额叶直觉与前瞻记忆（src/intuition）全链路 Cordis / DS
 
       expect(root.asiIntuition.snapshot().surfacedCount).toBeGreaterThanOrEqual(2);
       await root.waterfall('tools/pre-execute', fakeExec, async () => ({ kind: 'allow' as const }));
-      expect(injectedNextStep.length).toBeGreaterThanOrEqual(1);
-      const firstInjected = injectedNextStep[0];
-      if (!firstInjected) throw new Error('expected injected step warning');
-      expect(extractTextFromMessage(firstInjected)).toContain('本轮重复报错疤痕');
+      expect(injectedNextStep.length).toBeGreaterThanOrEqual(2);
+      const latestInjected = injectedNextStep.at(-1);
+      if (!latestInjected) throw new Error('expected injected step warning');
+      expect(extractTextFromMessage(latestInjected)).toContain('本轮重复报错疤痕');
 
       // 6. 调用 prospective_resolve 完成前瞻提醒并通过 intuition_status 自检核验
       const resolveDef = root.tools.executable('prospective_resolve', userAgent);

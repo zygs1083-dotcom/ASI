@@ -99,6 +99,7 @@ export interface SomaticScanInput {
   toolName?: string;
   memories: readonly SleepMemorySummary[];
   scars: readonly SomaticScar[];
+  allowedKinds?: readonly FlashbackSourceKind[];
   feedbackBySourceId?: Readonly<Record<string, FlashbackFeedback>>;
   minScore?: number;
   limit?: number;
@@ -141,10 +142,17 @@ function computeCorpusFingerprint(memories: readonly SleepMemorySummary[], scars
   const memHead = memories[0];
   const memTail = memories.at(-1);
   const scarHead = scars[0];
-  let sumUpdated = 0;
-  for (const m of memories) sumUpdated = (sumUpdated + Math.trunc(m.updatedAt)) % 1_000_000_007;
-  for (const s of scars) sumUpdated = (sumUpdated + Math.trunc(s.updatedAt) + s.failureCount * 31) % 1_000_000_007;
-  return `${memories.length}:${memHead?.id ?? ''}:${memTail?.id ?? ''}:${scars.length}:${scarHead?.id ?? ''}:${sumUpdated}`;
+  let hashAcc = 0;
+  for (const m of memories) {
+    const retPct = Math.round(m.retention * 100);
+    const pinBit = m.pinned ? 1 : 0;
+    hashAcc =
+      (hashAcc * 31 + Math.trunc(m.updatedAt) + retPct * 97 + pinBit * 389 + m.content.length * 17) % 1_000_000_007;
+  }
+  for (const s of scars) {
+    hashAcc = (hashAcc * 31 + Math.trunc(s.updatedAt) + s.failureCount * 31 + s.caution.length * 13) % 1_000_000_007;
+  }
+  return `${memories.length}:${memHead?.id ?? ''}:${memTail?.id ?? ''}:${scars.length}:${scarHead?.id ?? ''}:${hashAcc}`;
 }
 
 export class SomaticMatcher {
@@ -252,11 +260,13 @@ export class SomaticMatcher {
     const minScore = Math.max(0.25, Math.min(0.95, input.minScore ?? 0.58));
     const maxItems = Math.max(1, Math.min(10, Math.trunc(input.limit ?? 3)));
     const feedbackMap = input.feedbackBySourceId ?? {};
+    const allowedKindsSet = input.allowedKinds ? new Set<FlashbackSourceKind>(input.allowedKinds) : null;
 
     const scored: FlashbackMatch[] = [];
     for (const hit of rawHits) {
       const doc = this.docsById.get(String(hit.id));
       if (!doc) continue;
+      if (allowedKindsSet && !allowedKindsSet.has(doc.sourceKind)) continue;
 
       const feedback = feedbackMap[doc.id];
       if (feedback === 'muted') continue;

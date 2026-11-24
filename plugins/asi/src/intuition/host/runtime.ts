@@ -45,6 +45,7 @@ import {
 import { extractConcreteCues, SomaticMatcher } from './somatic-matcher.js';
 import {
   IntuitionStore,
+  MAX_STORED_FEEDBACK,
   MAX_STORED_FLASHBACKS,
   MAX_STORED_SCARS,
   type PersistedIntuitionState,
@@ -56,6 +57,18 @@ import {
 export const DEFAULT_FLASHBACK_COOLDOWN_MS = 30 * 60_000;
 export const DEFAULT_INTUITION_TICK_MS = 30_000;
 const SCAR_WINDOW_MS = 2 * 3_600_000;
+const MAX_SESSION_FLASHBACK_HISTORY = 512;
+const MAX_TRANSIENT_FAILURES = 256;
+
+function setBoundedMap<K, V>(map: Map<K, V>, key: K, value: V, maxEntries: number): void {
+  if (map.has(key)) map.delete(key);
+  map.set(key, value);
+  while (map.size > maxEntries) {
+    const oldest = map.keys().next().value;
+    if (oldest === undefined) break;
+    map.delete(oldest);
+  }
+}
 
 export interface IntuitionActionsApi {
   setAutoIntuitionPaused(paused: boolean): Promise<void>;
@@ -171,12 +184,12 @@ export function createIntuitionRuntime(ports: IntuitionHostPorts, options?: Intu
 
   let saveChain: Promise<void> = Promise.resolve();
   const enqueueSave = (kind: 'state' | 'intentions' | 'both'): Promise<void> => {
+    if (stopped) return saveChain;
     const snapState: PersistedIntuitionState = structuredClone(state);
     const snapIntentions: ProspectiveIntention[] = structuredClone(intentions);
     saveChain = saveChain
       .catch(() => undefined)
       .then(async () => {
-        if (stopped) return;
         if (kind === 'state' || kind === 'both') {
           await store.saveState(snapState);
         }
@@ -302,7 +315,7 @@ export function createIntuitionRuntime(ports: IntuitionHostPorts, options?: Intu
 
   const markFlashbacksDelivered = (sessionId: string, delivered: readonly FlashbackMatch[], now: number): void => {
     for (const item of delivered) {
-      sessionFlashbackHistory.set(`${sessionId}:${item.sourceId}`, now);
+      setBoundedMap(sessionFlashbackHistory, `${sessionId}:${item.sourceId}`, now, MAX_SESSION_FLASHBACK_HISTORY);
     }
   };
 
@@ -325,7 +338,56 @@ export function createIntuitionRuntime(ports: IntuitionHostPorts, options?: Intu
     return surfacedNow;
   };
 
-  const parkToNextTurnCoalesced = (
+  const syncSessionBucket = (sessionId: string): boolean => {
+    const bucket = pendingBySession.get(sessionId);
+    if (!bucket || isSuppressed().suppressed) {
+      pendingBySession.delete(sessionId);
+      ports.sessions.syncParkedMessage(sessionId, null);
+      return false;
+    }
+    const formatted = formatIntuitionMessage({
+      intentions: [...bucket.intentions.values()],
+      flashbacks: [...bucket.flashbacks.values()],
+    });
+    if (!formatted) {
+      pendingBySession.delete(sessionId);
+      ports.sessions.syncParkedMessage(sessionId, null);
+      return false;
+    }
+    return ports.sessions.syncParkedMessage(sessionId, formatted);
+  };
+
+  const retractAllParkedBuckets = (): void => {
+    for (const sid of [...pendingBySession.keys()]) {
+      pendingBySession.delete(sid);
+      ports.sessions.syncParkedMessage(sid, null);
+    }
+  };
+
+  const pruneInactiveFromPendingBuckets = (): void => {
+    if (pendingBySession.size === 0) return;
+    const activeSurfaced = new Map<string, ProspectiveIntention>();
+    for (const item of intentions) {
+      if (item.status === 'surfaced') activeSurfaced.set(item.id, item);
+    }
+    for (const [sid, bucket] of [...pendingBySession.entries()]) {
+      let changed = false;
+      for (const id of [...bucket.intentions.keys()]) {
+        const live = activeSurfaced.get(id);
+        if (!live) {
+          bucket.intentions.delete(id);
+          changed = true;
+        } else {
+          bucket.intentions.set(id, live);
+        }
+      }
+      if (changed) {
+        syncSessionBucket(sid);
+      }
+    }
+  };
+
+  const parkToNextStepCoalesced = (
     targetSessionId: string | undefined,
     newIntentions: readonly ProspectiveIntention[],
     newFlashbacks: readonly FlashbackMatch[],
@@ -342,13 +404,7 @@ export function createIntuitionRuntime(ports: IntuitionHostPorts, options?: Intu
     for (const i of newIntentions) bucket.intentions.set(i.id, i);
     for (const f of newFlashbacks) bucket.flashbacks.set(f.sourceId, f);
 
-    const formatted = formatIntuitionMessage({
-      intentions: [...bucket.intentions.values()],
-      flashbacks: [...bucket.flashbacks.values()],
-    });
-    if (!formatted) return false;
-
-    return ports.sessions.enqueueNextTurn(resolvedSid, formatted);
+    return syncSessionBucket(resolvedSid);
   };
 
   const runCueEvaluationAndPark = (cue: ProspectiveCueContext, preferredSessionId?: string): void => {
@@ -357,10 +413,12 @@ export function createIntuitionRuntime(ports: IntuitionHostPorts, options?: Intu
     let dirtyIntentions = rec.changed;
     if (rec.changed) {
       intentions = rec.updated;
+      pruneInactiveFromPendingBuckets();
     }
 
     const sup = isSuppressed();
     if (sup.suppressed) {
+      retractAllParkedBuckets();
       if (dirtyIntentions) {
         void enqueueSave('intentions');
         notifyAll();
@@ -368,7 +426,9 @@ export function createIntuitionRuntime(ports: IntuitionHostPorts, options?: Intu
       return;
     }
 
-    const matched = evaluateProspectiveCues(intentions, cue);
+    const deferProactive = Boolean(ports.tom?.shouldDeferProactiveWork());
+    const rawMatched = evaluateProspectiveCues(intentions, cue);
+    const matched = deferProactive ? rawMatched.filter((m) => m.priority === 'high') : rawMatched;
     if (matched.length > 0) {
       const matchedIds = new Set(matched.map((m) => m.id));
       const surfacedItems = markIntentionsSurfaced(matchedIds, now);
@@ -384,7 +444,7 @@ export function createIntuitionRuntime(ports: IntuitionHostPorts, options?: Intu
       }
       for (const [sid, group] of bySession) {
         if (sid) {
-          parkToNextTurnCoalesced(sid, group, []);
+          parkToNextStepCoalesced(sid, group, []);
         }
       }
     }
@@ -401,10 +461,12 @@ export function createIntuitionRuntime(ports: IntuitionHostPorts, options?: Intu
     let dirtyIntentions = rec.changed;
     if (rec.changed) {
       intentions = rec.updated;
+      pruneInactiveFromPendingBuckets();
     }
 
     const sup = isSuppressed();
     if (sup.suppressed) {
+      retractAllParkedBuckets();
       if (dirtyIntentions) {
         void enqueueSave('intentions');
         notifyAll();
@@ -412,11 +474,12 @@ export function createIntuitionRuntime(ports: IntuitionHostPorts, options?: Intu
       return null;
     }
 
+    const deferProactive = Boolean(ports.tom?.shouldDeferProactiveWork());
     const senseSnap = ports.sense.snapshot(cue.sessionId);
     const winTitle = allowedWindowTitle(senseSnap);
     const frontApp = senseSnap.state.env.frontApp.value;
 
-    const matchedTimeOrCtx = evaluateProspectiveCues(intentions, {
+    const rawMatchedTimeOrCtx = evaluateProspectiveCues(intentions, {
       now,
       reason: 'pre-step',
       ...(cue.cwd ? { cwd: cue.cwd } : {}),
@@ -425,6 +488,9 @@ export function createIntuitionRuntime(ports: IntuitionHostPorts, options?: Intu
       ...(frontApp?.name ? { frontAppName: frontApp.name } : {}),
       ...(frontApp?.bundleId ? { frontAppBundleId: frontApp.bundleId } : {}),
     });
+    const matchedTimeOrCtx = deferProactive
+      ? rawMatchedTimeOrCtx.filter((i) => i.priority === 'high')
+      : rawMatchedTimeOrCtx;
 
     const bucket = pendingBySession.get(cue.sessionId);
     const newlyMatched = matchedTimeOrCtx.filter((i) => !bucket?.intentions.has(i.id));
@@ -441,7 +507,7 @@ export function createIntuitionRuntime(ports: IntuitionHostPorts, options?: Intu
       memories: listEligibleMemories(),
       scars: state.scars,
       feedbackBySourceId: state.feedbackBySourceId,
-      minScore: 0.6,
+      minScore: deferProactive ? 0.68 : 0.6,
       limit: 2,
     });
     const freshFlashbacks = filterFreshFlashbacksForSession(cue.sessionId, rawFlashbacks, now).filter(
@@ -455,8 +521,14 @@ export function createIntuitionRuntime(ports: IntuitionHostPorts, options?: Intu
       dirtyState = true;
     }
 
-    // Any previously parked next-turn bucket is being claimed by this user turn too; clear bucket tracking.
-    pendingBySession.delete(cue.sessionId);
+    // If a parked next-step message was not yet claimed before pre-step, retract it from inbox
+    // and coalesce its items into this single step-1 tail note so nothing is delivered twice.
+    const carriedIntentions = bucket ? [...bucket.intentions.values()] : [];
+    const carriedFlashbacks = bucket ? [...bucket.flashbacks.values()] : [];
+    if (bucket) {
+      pendingBySession.delete(cue.sessionId);
+      ports.sessions.syncParkedMessage(cue.sessionId, null);
+    }
 
     if (dirtyIntentions || dirtyState) {
       void enqueueSave(dirtyIntentions && dirtyState ? 'both' : dirtyIntentions ? 'intentions' : 'state');
@@ -464,17 +536,32 @@ export function createIntuitionRuntime(ports: IntuitionHostPorts, options?: Intu
     }
 
     return formatIntuitionMessage({
-      intentions: surfacedNow,
-      flashbacks: freshFlashbacks,
+      intentions: [...carriedIntentions, ...surfacedNow],
+      flashbacks: [...carriedFlashbacks, ...freshFlashbacks],
     });
   };
 
   const handleToolPreExecute = (cue: ToolPreExecuteCue): void => {
     const now = nowFn();
-    const sup = isSuppressed();
-    if (sup.suppressed) return;
+    const rec = reconcileProspectiveLifecycle(intentions, now);
+    let dirtyIntentions = rec.changed;
+    if (rec.changed) {
+      intentions = rec.updated;
+      pruneInactiveFromPendingBuckets();
+    }
 
-    const matchedTools = evaluateProspectiveCues(intentions, {
+    const sup = isSuppressed();
+    if (sup.suppressed) {
+      retractAllParkedBuckets();
+      if (dirtyIntentions) {
+        void enqueueSave('intentions');
+        notifyAll();
+      }
+      return;
+    }
+
+    const deferProactive = Boolean(ports.tom?.shouldDeferProactiveWork());
+    const rawMatchedTools = evaluateProspectiveCues(intentions, {
       now,
       reason: 'tool',
       eventKind: 'tool_call',
@@ -482,23 +569,25 @@ export function createIntuitionRuntime(ports: IntuitionHostPorts, options?: Intu
       targetText: cue.targetText,
       ...(cue.cwd ? { cwd: cue.cwd } : {}),
     });
+    const matchedTools = deferProactive ? rawMatchedTools.filter((i) => i.priority === 'high') : rawMatchedTools;
 
     let surfacedNow: ProspectiveIntention[] = [];
-    let dirtyIntentions = false;
     if (matchedTools.length > 0) {
       surfacedNow = markIntentionsSurfaced(new Set(matchedTools.map((i) => i.id)), now);
       dirtyIntentions = true;
     }
 
-    // Higher threshold on mid-turn tool execution so only strong pitfalls/scars fire
+    // Higher threshold on mid-turn tool execution so only strong pitfalls/scars fire;
+    // pass unified listEligibleMemories() + allowedKinds so MiniSearch index never thrashes!
     const rawFlashbacks = matcher.scan({
       cueText: cue.targetText,
       ...(cue.cwd ? { cwd: cue.cwd } : {}),
       toolName: cue.toolName,
-      memories: listEligibleMemories().filter((m) => m.kind === 'pitfall' || m.kind === 'decision'),
+      memories: listEligibleMemories(),
       scars: state.scars,
+      allowedKinds: ['scar', 'pitfall', 'decision'],
       feedbackBySourceId: state.feedbackBySourceId,
-      minScore: 0.66,
+      minScore: deferProactive ? 0.74 : 0.66,
       limit: 1,
     });
     const freshFlashbacks = filterFreshFlashbacksForSession(cue.sessionId, rawFlashbacks, now);
@@ -525,6 +614,7 @@ export function createIntuitionRuntime(ports: IntuitionHostPorts, options?: Intu
   };
 
   const handleToolResult = (cue: ToolResultCue): void => {
+    if (isSuppressed().suppressed) return;
     const now = nowFn();
     const sig = normalizeFailureSignature(cue.toolName, cue.targetText);
 
@@ -536,12 +626,17 @@ export function createIntuitionRuntime(ports: IntuitionHostPorts, options?: Intu
     const prev = transientFailures.get(sig);
     const errText = sanitizeForModel(cue.errorSummary ?? '工具调用执行失败').slice(0, 260);
     if (!prev || now - prev.firstAt > SCAR_WINDOW_MS) {
-      transientFailures.set(sig, { count: 1, firstAt: now, lastError: errText });
+      setBoundedMap(transientFailures, sig, { count: 1, firstAt: now, lastError: errText }, MAX_TRANSIENT_FAILURES);
       return;
     }
 
     const nextCount = prev.count + 1;
-    transientFailures.set(sig, { count: nextCount, firstAt: prev.firstAt, lastError: errText });
+    setBoundedMap(
+      transientFailures,
+      sig,
+      { count: nextCount, firstAt: prev.firstAt, lastError: errText },
+      MAX_TRANSIENT_FAILURES,
+    );
     if (nextCount < 2) return;
 
     const existingIdx = state.scars.findIndex((s) => s.signature === sig);
@@ -623,6 +718,9 @@ export function createIntuitionRuntime(ports: IntuitionHostPorts, options?: Intu
   const actions: IntuitionActionsApi = {
     async setAutoIntuitionPaused(paused: boolean): Promise<void> {
       state = { ...state, autoIntuitionPaused: Boolean(paused) };
+      if (state.autoIntuitionPaused) {
+        retractAllParkedBuckets();
+      }
       await enqueueSave('state');
       notifyAll();
     },
@@ -710,8 +808,10 @@ export function createIntuitionRuntime(ports: IntuitionHostPorts, options?: Intu
       }
 
       intentions = intentions.map((item, i) => (i === idx ? next : item));
-      for (const bucket of pendingBySession.values()) {
-        bucket.intentions.delete(id);
+      for (const [sid, bucket] of [...pendingBySession.entries()]) {
+        if (bucket.intentions.delete(id)) {
+          syncSessionBucket(sid);
+        }
       }
       await enqueueSave('intentions');
       notifyAll();
@@ -724,8 +824,10 @@ export function createIntuitionRuntime(ports: IntuitionHostPorts, options?: Intu
       const beforeLen = intentions.length;
       intentions = intentions.filter((i) => i.id !== cleanId);
       if (intentions.length === beforeLen) return;
-      for (const bucket of pendingBySession.values()) {
-        bucket.intentions.delete(cleanId);
+      for (const [sid, bucket] of [...pendingBySession.entries()]) {
+        if (bucket.intentions.delete(cleanId)) {
+          syncSessionBucket(sid);
+        }
       }
       await enqueueSave('intentions');
       notifyAll();
@@ -737,12 +839,16 @@ export function createIntuitionRuntime(ports: IntuitionHostPorts, options?: Intu
       if (feedback !== 'helpful' && feedback !== 'dismissed' && feedback !== 'muted') {
         throw new Error('feedback 必须为 helpful、dismissed 或 muted');
       }
+      const nextEntries = Object.entries(state.feedbackBySourceId).filter(([k]) => k !== cleanSource);
+      nextEntries.push([cleanSource, feedback]);
+      const cappedFeedback = Object.fromEntries(
+        nextEntries.length > MAX_STORED_FEEDBACK
+          ? nextEntries.slice(nextEntries.length - MAX_STORED_FEEDBACK)
+          : nextEntries,
+      );
       state = {
         ...state,
-        feedbackBySourceId: {
-          ...state.feedbackBySourceId,
-          [cleanSource]: feedback,
-        },
+        feedbackBySourceId: cappedFeedback,
         recentFlashbacks: state.recentFlashbacks.map((r) => (r.sourceId === cleanSource ? { ...r, feedback } : r)),
       };
       await enqueueSave('state');
@@ -815,13 +921,29 @@ export function createIntuitionRuntime(ports: IntuitionHostPorts, options?: Intu
           }),
         );
         disposers.push(
-          ports.drives.subscribe(() => {
+          ports.drives.subscribe((drivesSnap) => {
+            if (drivesSnap.higherOrderSuppressed) {
+              retractAllParkedBuckets();
+            }
             for (const fn of [...listeners]) {
               try {
                 fn();
               } catch {
                 // ignore
               }
+            }
+          }),
+        );
+      }
+
+      if (ports.tom?.subscribe) {
+        disposers.push(
+          ports.tom.subscribe(() => {
+            if (!stopped && !ports.tom?.shouldDeferProactiveWork()) {
+              runCueEvaluationAndPark({
+                now: nowFn(),
+                reason: 'tick',
+              });
             }
           }),
         );
@@ -835,6 +957,9 @@ export function createIntuitionRuntime(ports: IntuitionHostPorts, options?: Intu
 
       disposers.push(
         ports.sense.subscribe((snap) => {
+          if (snap.settings.paused || snap.settings.powerMode === 'eco') {
+            retractAllParkedBuckets();
+          }
           const ts = nowFn();
           const front = snap.state.env.frontApp.value;
           const nextBundle = front?.bundleId ?? '';
@@ -958,6 +1083,7 @@ export function createIntuitionRuntime(ports: IntuitionHostPorts, options?: Intu
         clearInterval(timer);
         timer = undefined;
       }
+      retractAllParkedBuckets();
       for (const off of disposers.splice(0).reverse()) {
         try {
           off();
@@ -966,6 +1092,8 @@ export function createIntuitionRuntime(ports: IntuitionHostPorts, options?: Intu
         }
       }
       pendingBySession.clear();
+      sessionFlashbackHistory.clear();
+      transientFailures.clear();
       await saveChain.catch(() => undefined);
     },
 

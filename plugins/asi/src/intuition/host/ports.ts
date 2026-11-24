@@ -2,7 +2,12 @@
  * Host Dependency-Injection Ports for `src/intuition` (`ports.ts`).
  */
 
-import type { AsiDrivesServiceApi, AsiSenseServiceApi, AsiSleepServiceApi } from '@asi/sense-types';
+import type {
+  AsiDrivesServiceApi,
+  AsiSenseServiceApi,
+  AsiSleepServiceApi,
+  AsiTomServiceApi,
+} from '@asi/sense-types';
 
 export interface UserPreStepCue {
   sessionId: string;
@@ -39,10 +44,11 @@ export interface IntuitionSessionsPort {
   /** Return validated working directory for an ordinary user session, if known. */
   getSessionCwd(sessionId: string): string | undefined;
   /**
-   * Park or coalesce a message at the tail of an ordinary session's `next-turn` inbox
+   * Synchronize or retract a parked message in an ordinary session's `next-step` inbox
    * WITHOUT waking an idle agent (`wakeup = false`), preserving 100% prefix Prompt Cache.
+   * Passing `content = null` removes any unconsumed parked message via `inbox.remove`.
    */
-  enqueueNextTurn(sessionId: string | undefined, content: string): boolean;
+  syncParkedMessage(sessionId: string, content: string | null): boolean;
   /**
    * Queue model-facing context for the nearest next step boundary (`agent.inject`)
    * during an active multi-step tool loop, without waking idle drivers.
@@ -66,6 +72,7 @@ export interface IntuitionHostPorts {
   sense: AsiSenseServiceApi;
   drives?: AsiDrivesServiceApi;
   sleep?: AsiSleepServiceApi;
+  tom?: Pick<AsiTomServiceApi, 'shouldDeferProactiveWork' | 'subscribe'>;
   sessions: IntuitionSessionsPort;
   events: IntuitionEventsPort;
 }

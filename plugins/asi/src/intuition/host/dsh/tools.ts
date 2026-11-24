@@ -6,11 +6,19 @@
  *   project workspaces, and scrubs every output through `sanitizeForModel`.
  */
 
+import { realpathSync } from 'node:fs';
+import { resolve, sep } from 'node:path';
 import { sanitizeForModel } from '@asi/sense-types';
 import type { Context } from '@deepseek-ai/cordis';
 import type { Agent } from '@deepseek-ai/dsh-agent';
 import { defineTool, ToolArgsError, ToolContextUnavailableError, type ToolRunContext } from '@deepseek-ai/dsh-tools';
 import type { JsonValue } from '@deepseek-ai/dsh-util-values';
+import type { WorkspaceRegistry } from '@deepseek-ai/dsh-workspace';
+import {
+  ASI_INTERNAL_CWD_RE,
+  ASI_INTERNAL_SESSION_ID_RE,
+  buildUnifiedExcludedInternalRoots,
+} from '../../../shared/internal-guards.js';
 import {
   PROSPECTIVE_EVENT_KINDS,
   PROSPECTIVE_TRIGGER_KINDS,
@@ -25,9 +33,58 @@ const output = {
   render: (_args: unknown, value: unknown) => [{ type: 'text' as const, text: JSON.stringify(value) }],
 };
 
-function requireAgent(exec: ToolRunContext): Agent {
-  if (!exec.agent) throw new ToolContextUnavailableError('asi-intuition tools require an active agent');
-  return exec.agent;
+function safeRealpath(p: string): string {
+  try {
+    return realpathSync(p);
+  } catch {
+    return resolve(p);
+  }
+}
+
+function isInsideRoot(candidate: string, root: string): boolean {
+  const normRoot = root.endsWith(sep) ? root : `${root}${sep}`;
+  return candidate === root || candidate.startsWith(normRoot);
+}
+
+export interface IntuitionToolGuardOptions {
+  excludedRoots?: readonly (string | undefined)[];
+  isArchived?: (sessionId: string) => boolean;
+}
+
+function requireOrdinaryAgent(exec: ToolRunContext, guard?: IntuitionToolGuardOptions): Agent {
+  const agent = exec.agent;
+  if (!agent) throw new ToolContextUnavailableError('asi-intuition tools require an active agent');
+  const sid = String(agent.id ?? agent.session?.id ?? '');
+  if (!sid || ASI_INTERNAL_SESSION_ID_RE.test(sid) || guard?.isArchived?.(sid)) {
+    throw new ToolContextUnavailableError('asi-intuition tools are restricted to ordinary user sessions');
+  }
+  const header = agent.session?.header as
+    | { origin?: string; delegationDepth?: number; parentId?: unknown; cwd?: string }
+    | undefined;
+  if (
+    header?.origin === 'subagent' ||
+    (typeof header?.delegationDepth === 'number' && header.delegationDepth > 0) ||
+    (header?.parentId !== undefined && header?.parentId !== null)
+  ) {
+    throw new ToolContextUnavailableError('asi-intuition tools are restricted to ordinary user sessions');
+  }
+  const cwd = header?.cwd;
+  if (typeof cwd === 'string' && cwd.trim()) {
+    if (ASI_INTERNAL_CWD_RE.test(cwd)) {
+      throw new ToolContextUnavailableError('asi-intuition tools are restricted to ordinary user sessions');
+    }
+    const normCwd = resolve(cwd);
+    const realCwd = safeRealpath(normCwd);
+    for (const rawEx of guard?.excludedRoots ?? []) {
+      if (!rawEx?.trim()) continue;
+      const normEx = resolve(rawEx);
+      const realEx = safeRealpath(normEx);
+      if (isInsideRoot(normCwd, normEx) || isInsideRoot(realCwd, realEx)) {
+        throw new ToolContextUnavailableError('asi-intuition tools are restricted to ordinary user sessions');
+      }
+    }
+  }
+  return agent;
 }
 
 function bounded(args: unknown): void {
@@ -66,7 +123,7 @@ function isResolveAction(val: unknown): val is ProspectiveResolveAction {
   return val === 'fulfill' || val === 'snooze' || val === 'cancel';
 }
 
-export function createIntuitionStatusTool(runtime: IntuitionRuntime) {
+export function createIntuitionStatusTool(runtime: IntuitionRuntime, guard?: IntuitionToolGuardOptions) {
   return defineTool({
     name: 'intuition_status',
     description:
@@ -88,7 +145,7 @@ export function createIntuitionStatusTool(runtime: IntuitionRuntime) {
     },
     output,
     async execute(args, exec) {
-      const agent = requireAgent(exec);
+      const agent = requireOrdinaryAgent(exec, guard);
       bounded(args);
       if (args.contextQuery !== undefined && typeof args.contextQuery !== 'string') {
         throw new ToolArgsError(['contextQuery must be a string']);
@@ -136,7 +193,7 @@ export function createIntuitionStatusTool(runtime: IntuitionRuntime) {
   });
 }
 
-export function createProspectiveRememberTool(runtime: IntuitionRuntime) {
+export function createProspectiveRememberTool(runtime: IntuitionRuntime, guard?: IntuitionToolGuardOptions) {
   return defineTool({
     name: 'prospective_remember',
     description:
@@ -199,7 +256,7 @@ export function createProspectiveRememberTool(runtime: IntuitionRuntime) {
     },
     output,
     async execute(args, exec) {
-      const agent = requireAgent(exec);
+      const agent = requireOrdinaryAgent(exec, guard);
       bounded(args);
       if (typeof args.title !== 'string' || !args.title.trim()) {
         throw new ToolArgsError(['title must be a non-empty string']);
@@ -259,7 +316,7 @@ export function createProspectiveRememberTool(runtime: IntuitionRuntime) {
   });
 }
 
-export function createProspectiveResolveTool(runtime: IntuitionRuntime) {
+export function createProspectiveResolveTool(runtime: IntuitionRuntime, guard?: IntuitionToolGuardOptions) {
   return defineTool({
     name: 'prospective_resolve',
     description:
@@ -287,7 +344,7 @@ export function createProspectiveResolveTool(runtime: IntuitionRuntime) {
     },
     output,
     async execute(args, exec) {
-      requireAgent(exec);
+      requireOrdinaryAgent(exec, guard);
       bounded(args);
       if (typeof args.id !== 'string' || !args.id.trim()) {
         throw new ToolArgsError(['id must be a non-empty string']);
@@ -324,10 +381,28 @@ export function createProspectiveResolveTool(runtime: IntuitionRuntime) {
   });
 }
 
-export function registerIntuitionTools(ctx: Context, runtime: IntuitionRuntime): () => void {
-  const offStatus = ctx.tools.register(createIntuitionStatusTool(runtime));
-  const offRemember = ctx.tools.register(createProspectiveRememberTool(runtime));
-  const offResolve = ctx.tools.register(createProspectiveResolveTool(runtime));
+export function registerIntuitionTools(
+  ctx: Context,
+  runtime: IntuitionRuntime,
+  excludedRoots?: readonly (string | undefined)[],
+): () => void {
+  const effectiveExcluded = buildUnifiedExcludedInternalRoots(ctx.asiSense?.storageRoot, ...(excludedRoots ?? []));
+  const guard: IntuitionToolGuardOptions = {
+    excludedRoots: effectiveExcluded,
+    isArchived: (sessionId: string) => {
+      try {
+        const wr = (ctx as Context & { get(name: 'workspaceRegistry'): WorkspaceRegistry | undefined }).get(
+          'workspaceRegistry',
+        );
+        return Boolean(wr?.archivedSessionIds.some((id) => String(id) === sessionId));
+      } catch {
+        return false;
+      }
+    },
+  };
+  const offStatus = ctx.tools.register(createIntuitionStatusTool(runtime, guard));
+  const offRemember = ctx.tools.register(createProspectiveRememberTool(runtime, guard));
+  const offResolve = ctx.tools.register(createProspectiveResolveTool(runtime, guard));
   return () => {
     offResolve();
     offRemember();

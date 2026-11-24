@@ -1,12 +1,18 @@
 import { randomUUID } from 'node:crypto';
 import { realpathSync } from 'node:fs';
 import { resolve, sep } from 'node:path';
+import type { AsiTomServiceApi } from '@asi/sense-types';
 import type { Context } from '@deepseek-ai/cordis';
 import type { Agent } from '@deepseek-ai/dsh-agent';
 import { freezeMessage, type MessageId as LlmMessageId, MessageId } from '@deepseek-ai/dsh-llm';
 import { type Session, SessionId } from '@deepseek-ai/dsh-session';
 import type { ToolExecution } from '@deepseek-ai/dsh-tools';
 import type { WorkspaceRegistry } from '@deepseek-ai/dsh-workspace';
+import {
+  ASI_INTERNAL_CWD_RE,
+  ASI_INTERNAL_SESSION_ID_RE,
+  buildUnifiedExcludedInternalRoots,
+} from '../../../shared/internal-guards.js';
 import type { SleepRuntime } from '../../../sleep/host/runtime.js';
 import type { IntuitionHostPorts } from '../ports.js';
 
@@ -16,9 +22,8 @@ declare module '@deepseek-ai/dsh-llm' {
   }
 }
 
-const INTERNAL_SESSION_ID_RE = /^asi-(?:maint|sleep|care|sense|growth|intuition|internal)(?:[-_:]|$)/i;
-const INTERNAL_SANDBOX_CWD_RE =
-  /(?:^|[\\/])(?:(?:asi[-_])?(?:needs|sleep|care|sense|growth|intuition)[\\/](?:sandbox|vault|skills)|data[\\/]asi(?:-(?:needs|sleep|care|sense|growth|intuition))?)(?:[\\/]|$)/i;
+const INTERNAL_SESSION_ID_RE = ASI_INTERNAL_SESSION_ID_RE;
+const INTERNAL_SANDBOX_CWD_RE = ASI_INTERNAL_CWD_RE;
 
 function safeRealpath(p: string): string {
   try {
@@ -77,15 +82,14 @@ export function createDshIntuitionPorts(
   options?: {
     excludedRoots?: readonly (string | undefined)[];
     sleepRuntime?: Pick<SleepRuntime, 'panelModel' | 'subscribe' | 'listMemories' | 'subscribeVault'>;
+    tom?: Pick<AsiTomServiceApi, 'shouldDeferProactiveWork' | 'subscribe'>;
   },
 ): IntuitionHostPorts {
-  const normExcluded = [storageRoot, ...(options?.excludedRoots ?? [])]
-    .filter((r): r is string => Boolean(r?.trim()))
-    .flatMap((r) => {
-      const resolved = resolve(r);
-      const real = safeRealpath(resolved);
-      return resolved === real ? [resolved] : [resolved, real];
-    });
+  const normExcluded = buildUnifiedExcludedInternalRoots(
+    storageRoot,
+    ctx.asiSense?.storageRoot,
+    ...(options?.excludedRoots ?? []),
+  );
 
   const getWorkspaceRegistry = (): WorkspaceRegistry | undefined =>
     (ctx as Context & { get(name: 'workspaceRegistry'): WorkspaceRegistry | undefined }).get('workspaceRegistry');
@@ -114,8 +118,9 @@ export function createDshIntuitionPorts(
   const isOrdinaryAgent = (agent: Agent | undefined): agent is Agent =>
     Boolean(agent && isOrdinarySession(agent.session, String(agent.id ?? '')));
 
-  // Track latest queued next-turn message ID per session so we can replace/coalesce in place
-  const queuedNextTurnMsgId = new Map<string, LlmMessageId>();
+  // Track latest parked next-step message ID per session so we can replace/coalesce or remove cleanly
+  const parkedNextStepMsgId = new Map<string, LlmMessageId>();
+  const claimedListeners = new Set<(sessionId: string) => void>();
 
   const sessions: IntuitionHostPorts['sessions'] = {
     listOrdinarySessionIds(): string[] {
@@ -132,13 +137,36 @@ export function createDshIntuitionPorts(
       return sess?.header?.cwd;
     },
 
-    enqueueNextTurn(sessionId: string | undefined, content: string): boolean {
-      const candidates = ctx.agents.list().filter((a) => isOrdinaryAgent(a));
-      const agent = sessionId ? candidates.find((a) => String(a.id) === sessionId) : candidates.at(-1);
-      if (!agent) return false;
+    syncParkedMessage(sessionId: string, content: string | null): boolean {
+      const agent = ctx.agents.get(SessionId(sessionId));
+      const prevMsgId = parkedNextStepMsgId.get(sessionId);
+
+      if (content === null || !content.trim()) {
+        parkedNextStepMsgId.delete(sessionId);
+        if (prevMsgId && typeof agent?.inbox?.remove === 'function') {
+          try {
+            return Boolean(agent.inbox.remove(prevMsgId));
+          } catch {
+            return false;
+          }
+        }
+        return false;
+      }
+
+      if (!isOrdinaryAgent(agent)) {
+        parkedNextStepMsgId.delete(sessionId);
+        if (prevMsgId && typeof agent?.inbox?.remove === 'function') {
+          try {
+            agent.inbox.remove(prevMsgId);
+          } catch {
+            // ignore
+          }
+        }
+        return false;
+      }
 
       const sid = String(agent.id);
-      const msgId = MessageId(`asi-intuition-nt:${randomUUID()}`);
+      const msgId = MessageId(`asi-intuition-ns:${randomUUID()}`);
       const msg = freezeMessage({
         id: msgId,
         role: 'user',
@@ -146,26 +174,25 @@ export function createDshIntuitionPorts(
         content: [{ type: 'text', text: content }],
       });
 
-      const prevMsgId = queuedNextTurnMsgId.get(sid);
       if (prevMsgId && typeof agent.inbox?.replace === 'function') {
         try {
           if (agent.inbox.replace(prevMsgId, msg)) {
-            queuedNextTurnMsgId.set(sid, msgId);
+            parkedNextStepMsgId.set(sid, msgId);
             return true;
           }
         } catch {
-          // Fall back to send(..., 'next-turn', false)
+          // Fall back to send(..., 'next-step', false)
         }
       }
 
       if (typeof agent.send === 'function') {
-        agent.send(msg, 'next-turn', false);
-        queuedNextTurnMsgId.set(sid, msgId);
+        agent.send(msg, 'next-step', false);
+        parkedNextStepMsgId.set(sid, msgId);
         return true;
       }
       if (typeof agent.inbox?.append === 'function') {
-        agent.inbox.append('next-turn', msg);
-        queuedNextTurnMsgId.set(sid, msgId);
+        agent.inbox.append('next-step', msg);
+        parkedNextStepMsgId.set(sid, msgId);
         return true;
       }
       return false;
@@ -187,7 +214,7 @@ export function createDshIntuitionPorts(
         return true;
       }
       if (typeof agent.send === 'function') {
-        agent.send(msg, 'next-turn', false);
+        agent.send(msg, 'next-step', false);
         return true;
       }
       return false;
@@ -207,26 +234,31 @@ export function createDshIntuitionPorts(
     },
 
     onSessionTurnClaimed(cb) {
+      claimedListeners.add(cb);
+      const notifyClaimed = (sid: string) => {
+        for (const fn of [...claimedListeners]) fn(sid);
+      };
       const offClaim = ctx.on('agent/inbox/claimed', ({ agent, message }) => {
         const sid = String(agent.id);
-        if (queuedNextTurnMsgId.get(sid) === message.id || message.source?.kind === 'asi-intuition') {
-          queuedNextTurnMsgId.delete(sid);
-          cb(sid);
+        if (parkedNextStepMsgId.get(sid) === message.id || message.source?.kind === 'asi-intuition') {
+          parkedNextStepMsgId.delete(sid);
+          notifyClaimed(sid);
         }
       });
       const offDiscard = ctx.on('agent/inbox/discarded', ({ agent, message }) => {
         const sid = String(agent.id);
-        if (queuedNextTurnMsgId.get(sid) === message.id) {
-          queuedNextTurnMsgId.delete(sid);
-          cb(sid);
+        if (parkedNextStepMsgId.get(sid) === message.id) {
+          parkedNextStepMsgId.delete(sid);
+          notifyClaimed(sid);
         }
       });
       const offDisposed = ctx.on('agent/disposed', ({ agent }) => {
         const sid = String(agent.id);
-        queuedNextTurnMsgId.delete(sid);
-        cb(sid);
+        parkedNextStepMsgId.delete(sid);
+        notifyClaimed(sid);
       });
       return () => {
+        claimedListeners.delete(cb);
         offClaim();
         offDiscard();
         offDisposed();
@@ -245,7 +277,16 @@ export function createDshIntuitionPorts(
 
         try {
           const sid = String(payload.agent.id);
-          queuedNextTurnMsgId.delete(sid);
+          const existingParkedId = parkedNextStepMsgId.get(sid);
+          if (
+            existingParkedId &&
+            decision.messages.some(
+              (m) => (m as { id?: unknown }).id === existingParkedId || m.source?.kind === 'asi-intuition',
+            )
+          ) {
+            parkedNextStepMsgId.delete(sid);
+            for (const fn of [...claimedListeners]) fn(sid);
+          }
           const tailNote = await cb({
             sessionId: sid,
             ...(payload.agent.session?.header?.cwd ? { cwd: payload.agent.session.header.cwd } : {}),
@@ -438,11 +479,33 @@ export function createDshIntuitionPorts(
     },
   };
 
+  const getTom = (): Pick<AsiTomServiceApi, 'shouldDeferProactiveWork' | 'subscribe'> | undefined =>
+    options?.tom ??
+    (ctx as Context & { asiTom?: AsiTomServiceApi; get?(name: 'asiTom'): AsiTomServiceApi | undefined }).asiTom ??
+    (ctx as Context & { get?(name: 'asiTom'): AsiTomServiceApi | undefined }).get?.('asiTom');
+
+  const tomProxy: IntuitionHostPorts['tom'] = {
+    shouldDeferProactiveWork: () => Boolean(getTom()?.shouldDeferProactiveWork()),
+    subscribe: (listener) => {
+      const direct = getTom();
+      if (direct?.subscribe) return direct.subscribe(listener);
+      const fiber = ctx.inject(['asiTom'], (sub) => {
+        const svc = (sub as Context & { asiTom?: AsiTomServiceApi }).asiTom;
+        if (svc?.subscribe) {
+          const off = svc.subscribe(listener);
+          sub.effect(() => off, 'asi-intuition tom sub');
+        }
+      });
+      return () => fiber.dispose();
+    },
+  };
+
   return {
     storageRoot,
     sense: ctx.asiSense,
     drives: drivesProxy,
     sleep: sleepProxy,
+    tom: tomProxy,
     sessions,
     events,
   };

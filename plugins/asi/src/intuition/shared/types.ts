@@ -133,7 +133,7 @@ export interface FlashbackMatch {
 export interface FlashbackRecord {
   id: string;
   at: number;
-  channel: 'pre-step' | 'tool-guard' | 'next-turn' | 'manual';
+  channel: 'pre-step' | 'tool-guard' | 'next-step' | 'next-turn' | 'manual';
   sourceId: string;
   sourceKind: FlashbackSourceKind;
   title: string;

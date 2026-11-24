@@ -560,6 +560,29 @@ export class AsiRemote extends TypertRemoteService {
     if (input.eventKind !== undefined && !isProspectiveEventKind(input.eventKind)) {
       throw new RemoteError('gateway/bad-request', 'invalid eventKind', {});
     }
+    if (
+      input.delayMinutes !== undefined &&
+      (typeof input.delayMinutes !== 'number' || !Number.isFinite(input.delayMinutes) || input.delayMinutes <= 0)
+    ) {
+      throw new RemoteError('gateway/bad-request', 'delayMinutes must be a positive finite number', {});
+    }
+    if (
+      input.dueAt !== undefined &&
+      (typeof input.dueAt !== 'number' || !Number.isFinite(input.dueAt) || input.dueAt <= 0)
+    ) {
+      throw new RemoteError('gateway/bad-request', 'dueAt must be a positive finite number', {});
+    }
+    if (
+      input.expiresInHours !== undefined &&
+      (typeof input.expiresInHours !== 'number' || !Number.isFinite(input.expiresInHours) || input.expiresInHours <= 0)
+    ) {
+      throw new RemoteError('gateway/bad-request', 'expiresInHours must be a positive finite number', {});
+    }
+    for (const strKey of ['workspaceMatch', 'keywordMatch', 'appMatch', 'toolName', 'targetPattern'] as const) {
+      if (input[strKey] !== undefined && typeof input[strKey] !== 'string') {
+        throw new RemoteError('gateway/bad-request', `${strKey} must be a string`, {});
+      }
+    }
     return await this.userAction(() => this.requireIntuition().createIntention(input));
   }
 
@@ -573,6 +596,15 @@ export class AsiRemote extends TypertRemoteService {
       !isProspectiveResolveAction(input.action)
     ) {
       throw new RemoteError('gateway/bad-request', 'id and valid action are required', {});
+    }
+    if (
+      input.snoozeMinutes !== undefined &&
+      (typeof input.snoozeMinutes !== 'number' || !Number.isFinite(input.snoozeMinutes) || input.snoozeMinutes <= 0)
+    ) {
+      throw new RemoteError('gateway/bad-request', 'snoozeMinutes must be a positive finite number', {});
+    }
+    if (input.note !== undefined && typeof input.note !== 'string') {
+      throw new RemoteError('gateway/bad-request', 'note must be a string', {});
     }
     return await this.userAction(() => this.requireIntuition().resolveIntention(input));
   }

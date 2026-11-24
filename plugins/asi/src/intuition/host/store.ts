@@ -11,17 +11,60 @@ import { randomUUID } from 'node:crypto';
 import { lstat, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { sanitizeForModel } from '@asi/sense-types';
-import type {
-  FlashbackFeedback,
-  FlashbackRecord,
-  ProspectiveIntention,
-  ProspectiveTriggerSpec,
-  SomaticScar,
+import {
+  type FlashbackFeedback,
+  type FlashbackRecord,
+  type FlashbackSourceKind,
+  PROSPECTIVE_EVENT_KINDS,
+  PROSPECTIVE_TRIGGER_KINDS,
+  type ProspectiveEventKind,
+  type ProspectiveIntention,
+  type ProspectiveStatus,
+  type ProspectiveTriggerKind,
+  type ProspectiveTriggerSpec,
+  type SomaticScar,
 } from '../shared/types.js';
 
 export const MAX_STORED_INTENTIONS = 200;
 export const MAX_STORED_SCARS = 80;
 export const MAX_STORED_FLASHBACKS = 60;
+export const MAX_STORED_FEEDBACK = 500;
+
+const VALID_INTENTION_STATUSES: ReadonlySet<ProspectiveStatus> = new Set([
+  'pending',
+  'surfaced',
+  'fulfilled',
+  'snoozed',
+  'canceled',
+  'expired',
+]);
+const VALID_FLASHBACK_CHANNELS: ReadonlySet<FlashbackRecord['channel']> = new Set([
+  'pre-step',
+  'tool-guard',
+  'next-step',
+  'next-turn',
+  'manual',
+]);
+const VALID_SOURCE_KINDS: ReadonlySet<FlashbackSourceKind> = new Set([
+  'scar',
+  'pitfall',
+  'decision',
+  'preference',
+  'episode',
+]);
+const VALID_FEEDBACK: ReadonlySet<FlashbackFeedback> = new Set(['helpful', 'dismissed', 'muted']);
+
+function trimFeedbackRecord(raw: Readonly<Record<string, FlashbackFeedback>>): Record<string, FlashbackFeedback> {
+  const entries = Object.entries(raw).filter(
+    ([k, v]) => Boolean(k.trim()) && VALID_FEEDBACK.has(v),
+  );
+  const sliced = entries.length > MAX_STORED_FEEDBACK ? entries.slice(entries.length - MAX_STORED_FEEDBACK) : entries;
+  const out: Record<string, FlashbackFeedback> = {};
+  for (const [k, v] of sliced) {
+    out[sanitizeForModel(k).slice(0, 120)] = v;
+  }
+  return out;
+}
 
 export interface PersistedIntuitionState {
   version: 1;
@@ -61,7 +104,10 @@ async function atomicWriteJson(filePath: string, data: unknown): Promise<void> {
 }
 
 function sanitizeTrigger(trig: ProspectiveTriggerSpec): ProspectiveTriggerSpec {
-  const clean: ProspectiveTriggerSpec = { kind: trig.kind };
+  const kind: ProspectiveTriggerKind = (PROSPECTIVE_TRIGGER_KINDS as readonly string[]).includes(trig.kind)
+    ? trig.kind
+    : 'context';
+  const clean: ProspectiveTriggerSpec = { kind };
   if (typeof trig.dueAt === 'number' && Number.isFinite(trig.dueAt)) clean.dueAt = Math.trunc(trig.dueAt);
   if (typeof trig.workspaceMatch === 'string' && trig.workspaceMatch.trim()) {
     clean.workspaceMatch = sanitizeForModel(trig.workspaceMatch.trim()).slice(0, 240);
@@ -72,7 +118,9 @@ function sanitizeTrigger(trig: ProspectiveTriggerSpec): ProspectiveTriggerSpec {
   if (typeof trig.appMatch === 'string' && trig.appMatch.trim()) {
     clean.appMatch = sanitizeForModel(trig.appMatch.trim()).slice(0, 160);
   }
-  if (trig.eventKind) clean.eventKind = trig.eventKind;
+  if (trig.eventKind && (PROSPECTIVE_EVENT_KINDS as readonly string[]).includes(trig.eventKind)) {
+    clean.eventKind = trig.eventKind as ProspectiveEventKind;
+  }
   if (typeof trig.toolName === 'string' && trig.toolName.trim()) {
     clean.toolName = sanitizeForModel(trig.toolName.trim()).slice(0, 80);
   }
@@ -83,17 +131,18 @@ function sanitizeTrigger(trig: ProspectiveTriggerSpec): ProspectiveTriggerSpec {
 }
 
 export function sanitizeIntention(item: ProspectiveIntention): ProspectiveIntention {
+  const status: ProspectiveStatus = VALID_INTENTION_STATUSES.has(item.status) ? item.status : 'pending';
   const out: ProspectiveIntention = {
-    id: sanitizeForModel(item.id).slice(0, 80),
-    title: sanitizeForModel(item.title.trim()).slice(0, 160),
-    instruction: sanitizeForModel(item.instruction.trim()).slice(0, 1_000),
-    trigger: sanitizeTrigger(item.trigger),
-    triggerSummary: sanitizeForModel(item.triggerSummary.trim()).slice(0, 240),
+    id: sanitizeForModel(String(item.id ?? '')).slice(0, 80),
+    title: sanitizeForModel(String(item.title ?? '').trim()).slice(0, 160),
+    instruction: sanitizeForModel(String(item.instruction ?? '').trim()).slice(0, 1_000),
+    trigger: sanitizeTrigger(item.trigger ?? { kind: 'context' }),
+    triggerSummary: sanitizeForModel(String(item.triggerSummary ?? '').trim()).slice(0, 240),
     priority: item.priority === 'high' ? 'high' : 'normal',
-    status: item.status,
-    createdAt: Math.trunc(item.createdAt),
-    updatedAt: Math.trunc(item.updatedAt),
-    surfacedCount: Math.max(0, Math.trunc(item.surfacedCount)),
+    status,
+    createdAt: Math.trunc(Number(item.createdAt) || 0),
+    updatedAt: Math.trunc(Number(item.updatedAt) || 0),
+    surfacedCount: Math.max(0, Math.trunc(Number(item.surfacedCount) || 0)),
   };
   if (item.sourceSessionId) out.sourceSessionId = sanitizeForModel(item.sourceSessionId).slice(0, 120);
   if (typeof item.expiresAt === 'number' && Number.isFinite(item.expiresAt)) out.expiresAt = Math.trunc(item.expiresAt);
@@ -134,22 +183,28 @@ export function sanitizeScar(scar: SomaticScar): SomaticScar {
 }
 
 export function sanitizeFlashbackRecord(rec: FlashbackRecord): FlashbackRecord {
+  const channel: FlashbackRecord['channel'] = VALID_FLASHBACK_CHANNELS.has(rec.channel) ? rec.channel : 'pre-step';
+  const sourceKind: FlashbackSourceKind = VALID_SOURCE_KINDS.has(rec.sourceKind) ? rec.sourceKind : 'pitfall';
   const out: FlashbackRecord = {
-    id: sanitizeForModel(rec.id).slice(0, 80),
-    at: Math.trunc(rec.at),
-    channel: rec.channel,
-    sourceId: sanitizeForModel(rec.sourceId).slice(0, 120),
-    sourceKind: rec.sourceKind,
-    title: sanitizeForModel(rec.title.trim()).slice(0, 160),
-    caution: sanitizeForModel(rec.caution.trim()).slice(0, 600),
-    score: Math.round(Math.max(0, Math.min(1, rec.score)) * 1000) / 1000,
-    matchedCues: rec.matchedCues
-      .map((c) => sanitizeForModel(String(c).trim()).slice(0, 48))
-      .filter(Boolean)
-      .slice(0, 8),
+    id: sanitizeForModel(String(rec.id ?? '')).slice(0, 80),
+    at: Math.trunc(Number(rec.at) || 0),
+    channel,
+    sourceId: sanitizeForModel(String(rec.sourceId ?? '')).slice(0, 120),
+    sourceKind,
+    title: sanitizeForModel(String(rec.title ?? '').trim()).slice(0, 160),
+    caution: sanitizeForModel(String(rec.caution ?? '').trim()).slice(0, 600),
+    score: Math.round(Math.max(0, Math.min(1, Number(rec.score) || 0)) * 1000) / 1000,
+    matchedCues: Array.isArray(rec.matchedCues)
+      ? rec.matchedCues
+          .map((c) => sanitizeForModel(String(c).trim()).slice(0, 48))
+          .filter(Boolean)
+          .slice(0, 8)
+      : [],
   };
-  if (rec.sessionId) out.sessionId = sanitizeForModel(rec.sessionId).slice(0, 120);
-  if (rec.feedback) out.feedback = rec.feedback;
+  if (typeof rec.sessionId === 'string' && rec.sessionId.trim()) {
+    out.sessionId = sanitizeForModel(rec.sessionId).slice(0, 120);
+  }
+  if (rec.feedback && VALID_FEEDBACK.has(rec.feedback)) out.feedback = rec.feedback;
   return out;
 }
 
@@ -200,14 +255,10 @@ export class IntuitionStore {
       await assertNotSymlink(this.statePath);
       const rawState = JSON.parse(await readFile(this.statePath, 'utf8')) as Partial<PersistedIntuitionState>;
       if (rawState && typeof rawState === 'object') {
-        const cleanFeedback: Record<string, FlashbackFeedback> = {};
-        if (rawState.feedbackBySourceId && typeof rawState.feedbackBySourceId === 'object') {
-          for (const [k, v] of Object.entries(rawState.feedbackBySourceId)) {
-            if (v === 'helpful' || v === 'dismissed' || v === 'muted') {
-              cleanFeedback[sanitizeForModel(k).slice(0, 120)] = v;
-            }
-          }
-        }
+        const cleanFeedback =
+          rawState.feedbackBySourceId && typeof rawState.feedbackBySourceId === 'object'
+            ? trimFeedbackRecord(rawState.feedbackBySourceId as Record<string, FlashbackFeedback>)
+            : {};
         state = {
           version: 1,
           autoIntuitionPaused: Boolean(rawState.autoIntuitionPaused),
@@ -240,7 +291,7 @@ export class IntuitionStore {
     const clean: PersistedIntuitionState = {
       version: 1,
       autoIntuitionPaused: Boolean(state.autoIntuitionPaused),
-      feedbackBySourceId: { ...state.feedbackBySourceId },
+      feedbackBySourceId: trimFeedbackRecord(state.feedbackBySourceId),
       scars: state.scars.slice(0, MAX_STORED_SCARS).map(sanitizeScar),
       recentFlashbacks: state.recentFlashbacks.slice(0, MAX_STORED_FLASHBACKS).map(sanitizeFlashbackRecord),
     };
