@@ -1,7 +1,13 @@
+import type { DreamRuntime } from '../../dream/host/runtime.ts';
+import type { DreamPanelModel } from '../../dream/shared/types.ts';
 import type { GrowthRuntime } from '../../growth/host/runtime.ts';
+import type { IntuitionRuntime } from '../../intuition/host/runtime.ts';
 import { buildPanelModel } from '../../needs/host/dsh/frames.ts';
 import type { NeedsRuntime } from '../../needs/host/runtime.ts';
 import type { SleepRuntime } from '../../sleep/host/runtime.ts';
+import { buildTactGuidance, SILENT_ADAPTATION_RULE } from '../../tom/host/evaluator.ts';
+import type { TomRuntime } from '../../tom/host/runtime.ts';
+import type { TomPanelModel } from '../../tom/shared/types.ts';
 import type { AsiPanelModel } from './wire-types.ts';
 
 export type AsiFramesSource = ((signal: AbortSignal) => AsyncIterable<AsiPanelModel>) & {
@@ -15,13 +21,83 @@ export interface AsiFramesRuntimes {
   needs: NeedsRuntime;
   sleep: Pick<SleepRuntime, 'panelModel' | 'subscribe'>;
   growth: Pick<GrowthRuntime, 'panelModel' | 'subscribe'>;
+  intuition: Pick<IntuitionRuntime, 'panelModel' | 'subscribe'>;
+  tom?: Pick<TomRuntime, 'panelModel' | 'subscribe'>;
+  dream?: Pick<DreamRuntime, 'panelModel' | 'subscribe'>;
+}
+
+function buildFallbackTomPanelModel(now: number): TomPanelModel {
+  const dimensions = { focus: 65, friction: 0, pace: 50, presence: 75 };
+  return {
+    now,
+    enabled: true,
+    sensePaused: false,
+    state: 'steady_flow',
+    source: 'inferred',
+    confidence: 0.6,
+    dimensions,
+    guidance: {
+      ...buildTactGuidance('steady_flow', dimensions),
+      silentAdaptationRule: SILENT_ADAPTATION_RULE,
+    },
+    reasons: ['交互节奏与环境信号平稳。'],
+    manualOverride: null,
+    baseline: {
+      sampleCount: 0,
+      avgCadenceSec: 65,
+      avgPromptChars: 140,
+      avgSwitchesPer5m: 4,
+      calibrationCount: 0,
+    },
+    driveSatisfaction: 95,
+    driveZone: 'comfortable',
+    suppressed: false,
+  };
+}
+
+function buildFallbackDreamPanelModel(now: number): DreamPanelModel {
+  return {
+    now,
+    autoDreamPaused: false,
+    dreaming: false,
+    drive: {
+      satisfaction: 100,
+      urgency: 0,
+      zone: 'comfortable',
+      readyToDream: false,
+      suppressed: false,
+      lowerTierBlocked: false,
+      discoveredRepoCount: 0,
+      candidateBridgeCount: 0,
+      openInsightCount: 0,
+      deepQuietWindow: false,
+      screenLocked: false,
+      idleDurationMs: 0,
+      idleThresholdMs: 900_000,
+      autoDreamsToday: 0,
+      dailyAutoQuota: 3,
+      lastDreamAt: null,
+      summary: '暂无跨项目做梦联想数据',
+    },
+    openCount: 0,
+    adoptedCount: 0,
+    promotedCount: 0,
+    dismissedCount: 0,
+    totalInsights: 0,
+    insights: [],
+    recentDreams: [],
+  };
 }
 
 export function buildAsiPanelModel(runtimes: AsiFramesRuntimes): AsiPanelModel {
+  const needs = buildPanelModel(runtimes.needs);
   return {
-    needs: buildPanelModel(runtimes.needs),
+    needs,
     sleep: runtimes.sleep.panelModel(),
     growth: runtimes.growth.panelModel(),
+    intuition: runtimes.intuition.panelModel(),
+    tom: runtimes.tom ? runtimes.tom.panelModel() : buildFallbackTomPanelModel(needs.now),
+    dream: runtimes.dream ? runtimes.dream.panelModel() : buildFallbackDreamPanelModel(needs.now),
   };
 }
 
@@ -102,6 +178,9 @@ export function createAsiFramesSource(
     let offNeeds: (() => void) | undefined = runtimes.needs.subscribe(onRuntimeChange);
     let offSleep: (() => void) | undefined = runtimes.sleep.subscribe(onRuntimeChange);
     let offGrowth: (() => void) | undefined = runtimes.growth.subscribe(onRuntimeChange);
+    let offIntuition: (() => void) | undefined = runtimes.intuition.subscribe(onRuntimeChange);
+    let offTom: (() => void) | undefined = runtimes.tom?.subscribe(onRuntimeChange);
+    let offDream: (() => void) | undefined = runtimes.dream?.subscribe(onRuntimeChange);
 
     const cleanup = () => {
       if (cleanedUp) return;
@@ -112,12 +191,21 @@ export function createAsiFramesSource(
       const uNeeds = offNeeds;
       const uSleep = offSleep;
       const uGrowth = offGrowth;
+      const uIntuition = offIntuition;
+      const uTom = offTom;
+      const uDream = offDream;
       offNeeds = undefined;
       offSleep = undefined;
       offGrowth = undefined;
+      offIntuition = undefined;
+      offTom = undefined;
+      offDream = undefined;
       uNeeds?.();
       uSleep?.();
       uGrowth?.();
+      uIntuition?.();
+      uTom?.();
+      uDream?.();
     };
 
     function onAbort(): void {

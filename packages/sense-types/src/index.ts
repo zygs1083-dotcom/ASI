@@ -20,6 +20,13 @@ export {
 export type { DisksFact, DiskVolume } from './disks.js';
 export { disksStatusAt, diskVolumeAt, effectiveDisks } from './disks.js';
 export type {
+  AsiDreamServiceApi,
+  DreamInsightKind,
+  DreamInsightQueryOptions,
+  DreamInsightStatus,
+  DreamInsightSummary,
+} from './dream.js';
+export type {
   AsiDrivesServiceApi,
   AsiDrivesSnapshot,
   DriveAbortSignal,
@@ -43,6 +50,17 @@ export {
   THERMAL_ORDINAL,
   type ThermalState,
 } from './history.js';
+export type {
+  AsiIntuitionServiceApi,
+  FlashbackHitSummary,
+  IntuitionScanOptions,
+  IntuitionSnapshot,
+  ProspectiveEventKind,
+  ProspectiveIntentionSummary,
+  ProspectivePriority,
+  ProspectiveStatus,
+  ProspectiveTriggerKind,
+} from './intuition.js';
 export {
   type ActionMeasurement,
   type ActionOutcomeLedgerEntry,
@@ -74,6 +92,19 @@ export type {
   SleepMemoryQueryOptions,
   SleepMemorySummary,
 } from './sleep.js';
+export {
+  type AsiTomServiceApi,
+  PARTNER_STATE_KINDS,
+  type PartnerBaselineSummary,
+  type PartnerDimensions,
+  type PartnerManualOverride,
+  type PartnerStateKind,
+  type PartnerStateSnapshot,
+  type PartnerStateSource,
+  type TactAutonomy,
+  type TactGuidance,
+  type TactVerbosity,
+} from './tom.js';
 
 /** Identifies a signal/fact producer: which source, via which API, on which host. */
 export interface SourceRef {

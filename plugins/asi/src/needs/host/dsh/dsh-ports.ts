@@ -1,8 +1,7 @@
 import { randomUUID } from 'node:crypto';
-import { realpathSync } from 'node:fs';
 import { mkdir } from 'node:fs/promises';
 import { homedir } from 'node:os';
-import { join, resolve, sep } from 'node:path';
+import { join, resolve } from 'node:path';
 import type { Context } from '@deepseek-ai/cordis';
 import type { Agent } from '@deepseek-ai/dsh-agent';
 import type {} from '@deepseek-ai/dsh-api-session-controller';
@@ -11,6 +10,13 @@ import { JobId } from '@deepseek-ai/dsh-jobs';
 import { freezeMessage, MessageId } from '@deepseek-ai/dsh-llm';
 import { SessionId } from '@deepseek-ai/dsh-session';
 import type { WorkspaceRegistry } from '@deepseek-ai/dsh-workspace';
+import {
+  ASI_INTERNAL_CWD_RE,
+  ASI_INTERNAL_SESSION_ID_RE,
+  buildUnifiedExcludedInternalRoots,
+  fastSafeRealpath,
+  isInsideExcludedRoots,
+} from '../../../shared/internal-guards.js';
 import type { CryDeliveryMode } from '../cry.js';
 import type { NeedsHostPorts } from '../ports.js';
 import type { CompactionPort, JobsPort, ManagedJobInfo } from '../sandbox.js';
@@ -31,21 +37,10 @@ export function createDshNeedsPorts(ctx: Context, storageRoot: string, options?:
     );
 
   const sandboxRoot = resolve(join(storageRoot, 'sandbox'));
-  const safeRealpath = (p: string): string => {
-    try {
-      return realpathSync(p);
-    } catch {
-      return resolve(p);
-    }
-  };
-  const INTERNAL_SESSION_ID_RE = /^asi-(?:maint|sleep|care|sense|growth|internal)(?:[-_:]|$)/i;
-  const INTERNAL_SANDBOX_CWD_RE =
-    /(?:^|[\\/])(?:(?:asi[-_])?(?:needs|sleep|care|sense|growth)[\\/](?:sandbox|vault|skills)|data[\\/]asi(?:-(?:needs|sleep|care|sense|growth))?)(?:[\\/]|$)/i;
-
-  const isInsideDir = (candidate: string, parent: string): boolean => {
-    const normParent = parent.endsWith(sep) ? parent : `${parent}${sep}`;
-    return candidate === parent || candidate.startsWith(normParent);
-  };
+  const safeRealpath = fastSafeRealpath;
+  const INTERNAL_SESSION_ID_RE = ASI_INTERNAL_SESSION_ID_RE;
+  const INTERNAL_SANDBOX_CWD_RE = ASI_INTERNAL_CWD_RE;
+  const excludedRoots = [sandboxRoot, ...buildUnifiedExcludedInternalRoots(storageRoot, ctx.asiSense.storageRoot)];
 
   const isUserOrdinaryAgent = (agent: Agent): boolean => {
     const id = String(agent.id ?? '');
@@ -56,10 +51,7 @@ export function createDshNeedsPorts(ctx: Context, storageRoot: string, options?:
     const cwd = header?.cwd;
     if (typeof cwd === 'string' && cwd.trim()) {
       if (INTERNAL_SANDBOX_CWD_RE.test(cwd)) return false;
-      const normCwd = resolve(cwd);
-      if (isInsideDir(normCwd, sandboxRoot) || isInsideDir(safeRealpath(normCwd), safeRealpath(sandboxRoot))) {
-        return false;
-      }
+      if (isInsideExcludedRoots(cwd, excludedRoots)) return false;
     }
     const wr = getWorkspaceRegistry();
     if (wr?.archivedSessionIds.includes(agent.id)) return false;

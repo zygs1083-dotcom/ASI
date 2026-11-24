@@ -53,11 +53,19 @@ test.describe('ASI 统一侧栏面板 320px 响应式、明暗双主题与 axe �
           await expect(page.getByTestId(`tabpanel-${tab}`)).toBeVisible();
           await expectNoOverflow(page);
           await axeCheck(page);
+
+          if (tab === 'memory') {
+            for (const subId of ['memory-subtab-intuition', 'memory-subtab-insights', 'memory-subtab-vault']) {
+              await page.getByTestId(subId).click();
+              await expectNoOverflow(page);
+              await axeCheck(page);
+            }
+          }
         }
 
-        // 切回「稳态看护」验证默认收起的三个低频抽屉展开后在 320px 下同样零溢出、零 axe 违规
+        // 切回「稳态看护」验证默认收起的四个折叠抽屉展开后在 320px 下同样零溢出、零 axe 违规
         await page.getByTestId('asi-main-tab-care').click();
-        for (const drawerId of ['drawer-ledger', 'drawer-body', 'drawer-env']) {
+        for (const drawerId of ['drawer-tom', 'drawer-ledger', 'drawer-body', 'drawer-env']) {
           const drawer = page.getByTestId(drawerId);
           await expect(drawer).not.toHaveAttribute('open', '');
           await drawer.locator('> summary').click();
@@ -75,8 +83,10 @@ test.describe('ASI 统一侧栏面板 320px 响应式、明暗双主题与 axe �
     await page.setViewportSize({ width: 340, height: 940 });
     await openUnifiedPanel(page, 'pending-approvals', 'dark', 'care');
 
-    // 1. 顶部全局状态胶囊与快捷设置弹出层
+    // 1. 顶部全局状态胶囊与快捷设置弹出层（含记忆库单数字角标防拥挤与全局暂停联动 ToM 徽章）
     await expect(page.getByTestId('global-status-capsule')).toBeVisible();
+    await expect(page.getByTestId('asi-main-tab-memory')).not.toContainText('+');
+    await expect(page.getByTestId('tom-capsule-badge')).toBeVisible();
     await page.getByTestId('quick-settings-btn').click();
     const popover = page.getByTestId('quick-settings-popover');
     await expect(popover).toBeVisible();
@@ -84,9 +94,21 @@ test.describe('ASI 统一侧栏面板 320px 响应式、明暗双主题与 axe �
 
     await page.getByTestId('global-pause-toggle').check();
     await expect(page.getByTestId('global-status-capsule')).toContainText('已暂停');
+    await expect(page.getByTestId('tom-capsule-badge')).toHaveCount(0);
+    await expect(page.getByTestId('tom-state-pill')).toContainText('随全局暂停');
     await page.getByTestId('global-pause-toggle').uncheck();
+    await expect(page.getByTestId('tom-capsule-badge')).toBeVisible();
 
-    // 2. 在「稳态看护」页：顶部焦点条自动提示跨 Tab 的「新技能草案待审」
+    // 2. 在「稳态看护」页：顶部焦点条按马斯洛优先级顺序呈现前瞻 -> 技能草案 -> 顿悟
+    const careSpotlightOrder = await page
+      .getByTestId('cross-tab-spotlight')
+      .locator('> div[data-testid]')
+      .evaluateAll((els) => els.map((el) => el.getAttribute('data-testid')));
+    expect(careSpotlightOrder).toEqual([
+      'spotlight-prospective-banner',
+      'spotlight-draft-banner',
+      'spotlight-insight-banner',
+    ]);
     await expect(page.getByTestId('spotlight-draft-banner')).toContainText('playwright-contrast-guard');
 
     // 3. 键盘方向键切换 Tab：care -> ArrowRight -> memory
@@ -163,6 +185,40 @@ test.describe('ASI 统一侧栏面板 320px 响应式、明暗双主题与 axe �
     await page.getByTestId('consolidate-now-btn').click();
     await expect(page.getByTestId('sleep-feedback')).toContainText('整合 15 轮对话');
 
+    await expectNoOverflow(page);
+    await axeCheck(page);
+    expect(errors).toEqual([]);
+  });
+
+  test('DMN「做梦顿悟」子视图与跨 Tab 待批焦点条：跳转审阅、采纳固化记忆、转交技能草案与 320px axe 验证', async ({
+    page,
+  }) => {
+    const errors = watchErrors(page);
+    await page.setViewportSize({ width: 320, height: 940 });
+    await openUnifiedPanel(page, 'pending-approvals', 'dark', 'care');
+
+    // 1. 顶部跨 Tab 待批焦点条展示待审跨项目顿悟，点击「审阅顿悟」直达「记忆库 -> 做梦顿悟」
+    await expect(page.getByTestId('spotlight-insight-banner')).toContainText('orca-hub');
+    await page.getByTestId('spotlight-jump-insights').click();
+    await expect(page.getByTestId('dream-status-card')).toBeVisible();
+    await expectNoOverflow(page);
+    await axeCheck(page);
+
+    // 2. 将待审顿悟转交为 L4 技能草案并验证状态流转
+    await page.getByTestId('promote-insight-ins_mock_warn_01').click();
+    await expect(page.getByTestId('dream-feedback')).toContainText('已生成待审技能草案');
+
+    // 3. 手动触发「立即做梦联想」产生新顿悟并采纳固化进长期记忆
+    await page.getByTestId('dream-now-btn').click();
+    await expect(page.getByTestId('dream-feedback')).toContainText('新生成 1 条顿悟');
+    const firstAdoptBtn = page.locator('[data-testid^="adopt-insight-"]').first();
+    await firstAdoptBtn.click();
+    await expect(page.getByTestId('dream-feedback')).toContainText('已采纳顿悟并固化为长期记忆');
+
+    // 4. 展开底部做梦日志抽屉，复核 320px 零水平溢出与零 axe 违规
+    const dreamDrawer = page.getByTestId('drawer-dream-journal');
+    await dreamDrawer.locator('> summary').click();
+    await expect(dreamDrawer).toHaveAttribute('open', '');
     await expectNoOverflow(page);
     await axeCheck(page);
     expect(errors).toEqual([]);
@@ -299,10 +355,108 @@ test.describe('ASI 统一侧栏面板 320px 响应式、明暗双主题与 axe �
     await page.getByTestId('consolidate-now-btn').click();
     await expect(page.getByTestId('sleep-feedback')).toContainText('立即睡眠整合失败');
 
+    await page.getByTestId('memory-subtab-insights').click();
+    await page.getByTestId('dream-now-btn').click();
+    const dreamAlert = page.getByTestId('dream-feedback');
+    await expect(dreamAlert).toContainText('立即做梦联想失败');
+    await expect(dreamAlert).toHaveAttribute('role', 'alert');
+
     await page.getByTestId('asi-main-tab-skills').click();
     await page.getByTestId('synthesize-now-btn').click();
     await expect(page.getByTestId('growth-feedback')).toContainText('立即提炼失败');
 
+    expect(errors).toEqual([]);
+  });
+
+  test('「记忆库 -> 直觉与前瞻」子分区、跨页前瞻焦点条、即时躯体标记嗅探与前瞻 CRUD 全链路验证', async ({ page }) => {
+    const errors = watchErrors(page);
+    await page.setViewportSize({ width: 320, height: 940 });
+    await openUnifiedPanel(page, 'pending-approvals', 'dark', 'care');
+
+    // 1. 跨页焦点条展示已触发前瞻提醒，点击「查看前瞻」一键进入「记忆库 -> 直觉与前瞻」
+    await expect(page.getByTestId('spotlight-prospective-banner')).toContainText('核对发布前兼容版本与包审计');
+    await page.getByTestId('spotlight-jump-intuition').click();
+    await expect(page.getByTestId('tabpanel-memory')).toBeVisible();
+    await expect(page.getByTestId('memory-subtab-intuition')).toHaveAttribute('aria-pressed', 'true');
+    // 已进入直觉与前瞻页时，跨页前瞻焦点条自动隐退不重复占屏
+    await expect(page.getByTestId('spotlight-prospective-banner')).toHaveCount(0);
+
+    // 2. 320px 零水平溢出与 axe 无障碍检查（含展开新建表单与底部直觉闪回抽屉）
+    await expectNoOverflow(page);
+    await axeCheck(page);
+
+    // 3. 即时躯体标记风险嗅探
+    await page.getByTestId('intuition-scan-input').fill('修改侧栏 css 对比度 axe 检查');
+    await page.getByTestId('intuition-scan-btn').click();
+    await expect(page.getByTestId('intuition-scan-results')).toContainText('侧栏小字禁用裸绿/裸橙状态色');
+
+    // 4. 新建前瞻提醒、完成、延后与历史记录删除
+    await page.getByTestId('new-prospective-btn').click();
+    await expectNoOverflow(page);
+    await axeCheck(page);
+    const pmForm = page.getByTestId('create-prospective-form');
+    await pmForm.getByLabel('提醒标题').fill('合流前复核三分支契约');
+    await pmForm.getByLabel('触发执行指令').fill('检查 wire-types 与 release-audit 无冲突。');
+    await pmForm.getByLabel('工作区匹配词').fill('asi');
+    await pmForm.getByRole('button', { name: '保存前瞻' }).click();
+    await expect(page.getByRole('heading', { name: '合流前复核三分支契约' })).toBeVisible();
+
+    await page.getByRole('button', { name: '完成 核对发布前兼容版本与包审计' }).click();
+    await expect(page.getByTestId('intuition-feedback')).toContainText('已完成前瞻提醒');
+
+    await page.getByTestId('prospective-filter-history').click();
+    await expect(page.getByRole('heading', { name: '核对发布前兼容版本与包审计' })).toBeVisible();
+    await axeCheck(page);
+    await page.getByRole('button', { name: '删除记录 确认旧版目录迁移幂等标记' }).click();
+    await expect(page.getByRole('heading', { name: '确认旧版目录迁移幂等标记' })).toHaveCount(0);
+
+    // 5. 展开近期直觉闪回抽屉并提交反馈调节
+    const fbDrawer = page.getByTestId('drawer-intuition-flashbacks');
+    await fbDrawer.locator('> summary').click();
+    await expectNoOverflow(page);
+    await axeCheck(page);
+    await fbDrawer.getByRole('button', { name: '有帮助' }).click();
+    await expect(page.getByTestId('intuition-feedback')).toContainText('已标记有帮助');
+
+    expect(errors).toEqual([]);
+  });
+
+  test('方向 B「搭档状态与协作眼力见」顶部徽标跳转、一键校准锁定、基线抽屉与 320px axe 合规验证', async ({ page }) => {
+    const errors = watchErrors(page);
+    await page.setViewportSize({ width: 320, height: 920 });
+    await openUnifiedPanel(page, 'pending-approvals', 'dark', 'memory');
+
+    // 在「记忆库」页点击顶部胶囊的「搭档·攻坚」徽标，一键跳回「稳态看护」页查看眼力见卡片
+    const badge = page.getByTestId('tom-capsule-badge');
+    await expect(badge).toContainText('搭档·攻坚');
+    await badge.click();
+    await expect(page.getByTestId('tabpanel-care')).toBeVisible();
+
+    const tomCard = page.getByTestId('tom-partner-card');
+    await expect(tomCard).toBeVisible();
+    await expect(page.getByTestId('tom-state-pill')).toContainText('排障攻坚');
+
+    // 一键手动校准为「深度心流」，验证处方实时切换并记录校准计数
+    await page.getByTestId('tom-override-deep_focus').click();
+    await expect(page.getByTestId('tom-state-pill')).toContainText('手动锁定 · 深度心流');
+    await expect(page.getByTestId('tom-tact-headline')).toContainText('沉浸心流护航');
+    await expect(badge).toContainText('搭档·心流');
+
+    // 展开个体节律基线抽屉并验证重置与开关切换
+    const tomDrawer = page.getByTestId('drawer-tom');
+    await tomDrawer.locator('> summary').click();
+    await expect(tomDrawer).toHaveAttribute('open', '');
+    await page.getByTestId('tom-reset-baseline-btn').click();
+    await expect(page.getByTestId('tom-feedback')).toContainText('已重置个人交互节律基线');
+
+    await page.getByTestId('tom-enabled-toggle').uncheck();
+    await expect(page.getByTestId('tom-state-pill')).toContainText('已关闭');
+    await expect(badge).toHaveCount(0);
+    await page.getByTestId('tom-enabled-toggle').check();
+    await expect(badge).toBeVisible();
+
+    await expectNoOverflow(page);
+    await axeCheck(page);
     expect(errors).toEqual([]);
   });
 });

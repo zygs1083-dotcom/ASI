@@ -65,6 +65,24 @@ export function createAsiActions(api: Api, onNavigateSession?: (sessionId: strin
     onRestoreSkill: (name) => complete(() => api.restoreSkill(name)),
     onDeleteArchivedSkill: (name) => complete(() => api.deleteArchivedSkill(name)),
     onExportSkillToWorkspace: (name, ws) => complete(() => api.exportSkillToWorkspace(name, ws)),
+
+    onToggleAutoIntuitionPaused: (paused) => complete(() => api.setAutoIntuitionPaused(paused)),
+    onCreateProspectiveIntention: (input) => complete(() => api.createProspectiveIntention(input)),
+    onResolveProspectiveIntention: (input) => complete(() => api.resolveProspectiveIntention(input)),
+    onDeleteProspectiveIntention: (id) => complete(() => api.deleteProspectiveIntention(id)),
+    onRecordFlashbackFeedback: (sourceId, feedback) => complete(() => api.recordFlashbackFeedback(sourceId, feedback)),
+    onScanIntuitionFlashbacks: (cueText) => complete(() => api.scanIntuitionFlashbacks(cueText)),
+
+    onSetTomEnabled: (enabled) => complete(() => api.setTomEnabled(enabled)),
+    onSetPartnerOverride: (input) => complete(() => api.setPartnerOverride(input)),
+    onResetTomBaseline: () => complete(() => api.resetTomBaseline()),
+
+    onDreamNow: () => complete(() => api.dreamNow()),
+    onToggleAutoDreamPaused: (paused) => complete(() => api.setAutoDreamPaused(paused)),
+    onAdoptDreamInsight: (input) => complete(() => api.adoptDreamInsight(input)),
+    onPromoteDreamInsight: (insightId) => complete(() => api.promoteDreamInsight(insightId)),
+    onDismissDreamInsight: (insightId) => complete(() => api.dismissDreamInsight(insightId)),
+    onSearchDreamInsights: (query, kind, status) => complete(() => api.searchDreamInsights(query, kind, status)),
   };
 
   return {

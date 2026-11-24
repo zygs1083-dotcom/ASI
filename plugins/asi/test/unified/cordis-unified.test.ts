@@ -49,9 +49,9 @@ function appendTurn(session: Session, turn: number, userText: string, assistantT
   session.append('turn/end', { turn, reason: { kind: 'completed' } });
 }
 
-describe('统一单插件 asi (0.6.0) 全栈 Cordis 集成与旧版数据零重跑迁移验证', () => {
+describe('统一单插件 asi (0.7.0) 全栈 Cordis 集成与旧版数据零重跑迁移验证', () => {
   it('单次挂载 AsiPlugin 自动迁移 76 条记忆 + 水位线（不重复整合旧会话）+ 已启用技能，暴露全套 Cordis 服务、7 个只读工具与统一 AsiRemote 流', {
-    timeout: 30_000,
+    timeout: 45_000,
   }, async () => {
     const rootDir = await mkdtemp(join(tmpdir(), 'asi-unified-cordis-'));
     tempDirs.push(rootDir);
@@ -250,19 +250,31 @@ describe('统一单插件 asi (0.6.0) 全栈 Cordis 集成与旧版数据零重�
           'memory_profile',
           'care_status',
           'growth_status',
+          'intuition_status',
+          'prospective_remember',
+          'prospective_resolve',
+          'partner_state',
+          'dream_insights',
         ]),
       );
       expect(toolNames).not.toContain('needs_clean_cache');
       expect(toolNames).not.toContain('sleep_consolidate');
       expect(toolNames).not.toContain('growth_synthesize');
+      expect(toolNames).not.toContain('dream_synthesize_cross_repo');
 
-      // D. 验证统一 AsiRemote 流 (frames) 同时返回 needs / sleep / growth 三域实时快照且支持跨层交互
+      // D. 验证统一 AsiRemote 流 (frames) 同时返回 needs / sleep / growth / intuition / tom / dream 六域实时快照且支持跨层交互
       const abort = new AbortController();
       const iter = root.asi.frames(abort.signal)[Symbol.asyncIterator]();
       const firstFrame = await iter.next();
       expect(firstFrame.value?.needs.sendTitles).toBe(false);
       expect(firstFrame.value?.sleep.totalMemories).toBe(76);
       expect(firstFrame.value?.growth.activeCount).toBe(1);
+      expect(firstFrame.value?.intuition.pendingCount).toBe(0);
+      expect(root.asiIntuition).toBeDefined();
+      expect(firstFrame.value?.tom.enabled).toBe(true);
+      expect(root.asiTom.snapshot().state).toBeDefined();
+      expect(firstFrame.value?.dream.totalInsights).toBe(0);
+      expect(root.asiDream.listInsights()).toEqual([]);
 
       const createdDraft = await root.asi.createManualDraft({
         name: 'unified-panel-check',
@@ -348,6 +360,9 @@ describe('统一单插件 asi (0.6.0) 全栈 Cordis 集成与旧版数据零重�
       expect(root.asiSense).toBeDefined();
       expect(root.asiDrives).toBeDefined();
       expect(root.asiSleep).toBeDefined();
+      expect(root.asiTom).toBeDefined();
+      expect(root.asiIntuition).toBeDefined();
+      expect(root.asiDream).toBeDefined();
       expect(root.asi).toBeDefined();
 
       const toolNames = root.tools.definitions(cliAgent).map((d) => d.name);
@@ -360,6 +375,11 @@ describe('统一单插件 asi (0.6.0) 全栈 Cordis 集成与旧版数据零重�
           'memory_profile',
           'care_status',
           'growth_status',
+          'intuition_status',
+          'prospective_remember',
+          'prospective_resolve',
+          'partner_state',
+          'dream_insights',
         ]),
       );
     } finally {

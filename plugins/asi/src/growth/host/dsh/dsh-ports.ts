@@ -1,6 +1,5 @@
-import { realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { basename, dirname, join, resolve, sep } from 'node:path';
+import { resolve, sep } from 'node:path';
 import type { AsiSleepServiceApi } from '@asi/sense-types';
 import type { Context } from '@deepseek-ai/cordis';
 import type { Agent } from '@deepseek-ai/dsh-agent';
@@ -9,78 +8,34 @@ import type { Session, SessionEvent, SessionId } from '@deepseek-ai/dsh-session'
 import type { SessionQueryEngine } from '@deepseek-ai/dsh-session-query';
 import type { SkillCandidate, SkillDefinition, SkillLookupOptions, SkillProvider } from '@deepseek-ai/dsh-skill';
 import type { WorkspaceRegistry } from '@deepseek-ai/dsh-workspace';
+import {
+  ASI_INTERNAL_CWD_RE,
+  ASI_INTERNAL_SESSION_ID_RE,
+  buildUnifiedExcludedInternalRoots,
+  fastSafeRealpath,
+  isInsideExcludedRoots,
+} from '../../../shared/internal-guards.js';
 import { isValidSkillName } from '../../shared/skill-spec.js';
 import type { OrdinaryTurnTrajectoryInput } from '../evidence.js';
 import type { GrowthConversationPort, GrowthHostPorts, SkillTurnLifecycleEvent } from '../ports.js';
 import type { GrowthSkillCatalogBridge } from '../runtime.js';
 
-export const INTERNAL_SESSION_ID_RE = /^asi-(?:maint|sleep|care|sense|growth|internal)(?:[-_:]|$)/i;
-const INTERNAL_CWD_RE =
-  /(?:^|[\\/])(?:(?:asi[-_])?(?:needs|sleep|care|sense|growth)[\\/](?:sandbox|vault|skills)|data[\\/]asi(?:-(?:needs|sleep|care|sense|growth))?)(?:[\\/]|$)/i;
+export const INTERNAL_SESSION_ID_RE = ASI_INTERNAL_SESSION_ID_RE;
+const INTERNAL_CWD_RE = ASI_INTERNAL_CWD_RE;
 
 const WORKSPACE_SKILL_RANK = 200;
 const GLOBAL_SKILL_RANK = 400;
 
 function safeRealpath(target: string): string {
-  try {
-    return realpathSync(target);
-  } catch {
-    return resolve(target);
-  }
+  return fastSafeRealpath(target);
 }
 
 function isSameOrInsideRoot(candidate: string | undefined, root: string | undefined): boolean {
-  if (!candidate || !root) return false;
-  const normCand = resolve(candidate);
-  const normRoot = resolve(root);
-  const prefix = normRoot.endsWith(sep) ? normRoot : `${normRoot}${sep}`;
-  if (normCand === normRoot || normCand.startsWith(prefix)) return true;
-
-  const rc = safeRealpath(normCand);
-  const rr = safeRealpath(normRoot);
-  const rPrefix = rr.endsWith(sep) ? rr : `${rr}${sep}`;
-  return rc === rr || rc.startsWith(rPrefix);
+  return isInsideExcludedRoots(candidate, [root]);
 }
 
 export function buildExcludedInternalRoots(storageRoot: string, senseStorageRoot?: string): string[] {
-  const roots = new Set<string>([storageRoot]);
-  const shortSiblingNames = new Set(['sense', 'needs', 'sleep', 'care', 'growth']);
-  for (const anchor of [storageRoot, senseStorageRoot]) {
-    if (!anchor) continue;
-    roots.add(anchor);
-    const parent = dirname(anchor);
-    const anchorBase = basename(anchor).toLowerCase();
-    if (parent && parent !== '/' && parent !== '.') {
-      roots.add(join(parent, 'asi-sense'));
-      roots.add(join(parent, 'asi-needs'));
-      roots.add(join(parent, 'asi-sleep'));
-      roots.add(join(parent, 'asi-care'));
-      roots.add(join(parent, 'asi-growth'));
-      roots.add(join(parent, 'needs', 'sandbox'));
-      roots.add(join(parent, 'sleep', 'vault'));
-      roots.add(join(parent, 'sleep', 'memories'));
-      roots.add(join(parent, 'care', 'sandbox'));
-      roots.add(join(parent, 'growth', 'skills'));
-      roots.add(join(parent, 'growth', 'sandbox'));
-      if (shortSiblingNames.has(anchorBase)) {
-        for (const sib of shortSiblingNames) {
-          roots.add(join(parent, sib));
-        }
-        if (basename(parent).toLowerCase() === 'asi') {
-          roots.add(parent);
-          const grandParent = dirname(parent);
-          if (grandParent && grandParent !== '/' && grandParent !== '.' && grandParent !== parent) {
-            roots.add(join(grandParent, 'asi-sense'));
-            roots.add(join(grandParent, 'asi-needs'));
-            roots.add(join(grandParent, 'asi-sleep'));
-            roots.add(join(grandParent, 'asi-care'));
-            roots.add(join(grandParent, 'asi-growth'));
-          }
-        }
-      }
-    }
-  }
-  return [...roots];
+  return buildUnifiedExcludedInternalRoots(storageRoot, senseStorageRoot);
 }
 
 export function isOrdinaryDshSession(
@@ -95,9 +50,7 @@ export function isOrdinaryDshSession(
   const cwd = header?.cwd;
   if (cwd) {
     if (INTERNAL_CWD_RE.test(cwd)) return false;
-    for (const root of excludedRoots) {
-      if (isSameOrInsideRoot(cwd, root)) return false;
-    }
+    if (isInsideExcludedRoots(cwd, excludedRoots)) return false;
   }
   return true;
 }

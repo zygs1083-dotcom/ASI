@@ -1,12 +1,17 @@
 import { describe, expect, it } from 'vitest';
 import {
   type ActionOutcomeLedgerEntry,
+  type AsiDreamServiceApi,
   type AsiDrivesSnapshot,
+  type AsiIntuitionServiceApi,
   type AsiSleepServiceApi,
+  type AsiTomServiceApi,
   effectiveDisks,
   factStatusAt,
   NEED_KEYS,
   type NeedEvaluation,
+  PARTNER_STATE_KINDS,
+  type PartnerStateSnapshot,
   type SenseSettingsSnapshot,
   type SleepMemorySummary,
   sanitizeForModel,
@@ -16,6 +21,13 @@ import {
 describe('shared type exports', () => {
   it('exposes survival need keys, thermal ordinals, freshness helpers and credential sanitization', () => {
     expect(NEED_KEYS).toEqual(['energy', 'space', 'memory', 'mind', 'thermals']);
+    expect(PARTNER_STATE_KINDS).toContain('deep_focus');
+    expect(PARTNER_STATE_KINDS).toContain('stuck_debugging');
+    const tomCheck: Pick<PartnerStateSnapshot, 'state' | 'source'> = {
+      state: 'steady_flow',
+      source: 'inferred',
+    };
+    expect(tomCheck.state).toBe('steady_flow');
     expect(THERMAL_ORDINAL.critical).toBe(3);
 
     const settings: SenseSettingsSnapshot = {
@@ -110,5 +122,33 @@ describe('shared type exports', () => {
       subscribe: () => () => {},
     };
     expect(sleepSvc.listMemories()[0]?.retention).toBeCloseTo(0.92);
+
+    const intuitionSvc: AsiIntuitionServiceApi = {
+      snapshot: () => ({
+        now: 200,
+        autoIntuitionPaused: false,
+        suppressed: false,
+        pendingCount: 1,
+        surfacedCount: 0,
+        fulfilledCount: 0,
+        recentFlashbackCount: 0,
+        intentions: [],
+      }),
+      scanFlashbacks: () => [],
+      listIntentions: () => [],
+      subscribe: () => () => {},
+    };
+    expect(intuitionSvc.snapshot().pendingCount).toBe(1);
+
+    const tomSvc: Pick<AsiTomServiceApi, 'shouldDeferProactiveWork'> = {
+      shouldDeferProactiveWork: () => false,
+    };
+    expect(tomSvc.shouldDeferProactiveWork()).toBe(false);
+
+    const dreamSvc: AsiDreamServiceApi = {
+      listInsights: () => [],
+      subscribe: () => () => {},
+    };
+    expect(dreamSvc.listInsights()).toEqual([]);
   });
 });

@@ -11,10 +11,10 @@
  */
 
 import { randomUUID } from 'node:crypto';
-import { realpathSync } from 'node:fs';
 import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { dirname, join, resolve, sep } from 'node:path';
 import type { AsiDrivesSnapshot, DriveAbortSignal, SenseSnapshot } from '@asi/sense-types';
+import { ASI_INTERNAL_CWD_RE, fastSafeRealpath } from '../../shared/internal-guards.js';
 import {
   isValidSkillName,
   maskHomeDir,
@@ -53,8 +53,7 @@ import { synthesizeSkillDraftForCluster } from './synthesizer.js';
 import { SkillVault } from './vault.js';
 
 const MAX_REJECTED_SIGNATURES = 500;
-const INTERNAL_RUNTIME_CWD_RE =
-  /(?:^|[\\/])(?:(?:asi[-_])?(?:needs|sleep|care|sense|growth)[\\/](?:sandbox|vault|skills)|data[\\/]asi-(?:needs|sleep|care|sense|growth))(?:[\\/]|$)/i;
+const INTERNAL_RUNTIME_CWD_RE = ASI_INTERNAL_CWD_RE;
 
 interface PersistedGrowthState {
   autoGrowthPaused?: boolean;
@@ -119,11 +118,7 @@ export interface GrowthRuntime {
 }
 
 function safeRealpath(target: string): string {
-  try {
-    return realpathSync(target);
-  } catch {
-    return resolve(target);
-  }
+  return fastSafeRealpath(target);
 }
 
 export function matchesWorkspaceScope(lookupCwd: string | undefined, skillWorkspace: string | undefined): boolean {

@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { makeGrowthScenario } from '../../src/growth/mock-scenarios.js';
 import { createAsiFramesSource } from '../../src/host/dsh/frames.js';
 import { AsiRemote } from '../../src/host/dsh/remote.js';
+import { makeIntuitionScenario } from '../../src/intuition/mock-scenarios.js';
 import { createFramesSource, DEFAULT_FRAME_THROTTLE_MS } from '../../src/needs/host/dsh/frames.js';
 import type { NeedsRuntime } from '../../src/needs/host/runtime.js';
 import { makeSleepScenario } from '../../src/sleep/mock-scenarios.js';
@@ -392,6 +393,7 @@ describe('createFramesSource 侧栏帧流节流合并与资源清理', () => {
         needs: stub.runtime,
         sleep: { panelModel: () => makeSleepScenario('healthy-vault'), subscribe: () => () => {} },
         growth: { panelModel: () => makeGrowthScenario('workshop-ready'), subscribe: () => () => {} },
+        intuition: { panelModel: () => makeIntuitionScenario('intuition-healthy'), subscribe: () => () => {} },
       },
       { throttleMs: 200 },
     );
