@@ -1176,6 +1176,29 @@ describe('Cordis 全栈联合集成（asi-sense + asi-needs + asi-sleep）', () 
       } as never)) as { discovery: { worktreeCount: number; worktrees: Array<{ displayPath: string }> } };
       expect(careSnap.discovery.worktreeCount).toBe(2);
       expect(JSON.stringify(careSnap.discovery.worktrees)).not.toContain('sandbox');
+
+      // 校验 AsiSleepServiceApi 只读契约（listMemories 过滤脱敏 + subscribe 仅在记忆库变更时触发、不在 drives tick 空转触发）
+      let vaultNotifyCount = 0;
+      const offVaultSub = root.asiSleep.subscribe(() => {
+        vaultNotifyCount += 1;
+      });
+      root.asiDrives.notifySourceChanged('asi-care');
+      expect(vaultNotifyCount).toBe(0);
+
+      const sleepSecret = ['ghp', 'SleepReadApiToken1234567890abcdef'].join('_');
+      const createdMem = await root.asiSleep.createMemory({
+        kind: 'pitfall',
+        topicKey: 'sleep-service-api',
+        title: '只读记忆订阅仅随账本实体变更触发',
+        content: `防止跨插件重入环路（附测试密钥 ${sleepSecret}）。`,
+        tags: ['cordis'],
+        pinned: true,
+      });
+      expect(vaultNotifyCount).toBe(1);
+      const queried = root.asiSleep.listMemories({ kinds: ['pitfall'], minRetention: 0.5, limit: 10 });
+      expect(queried.some((m) => m.id === createdMem.id && m.topicKey === 'sleep-service-api')).toBe(true);
+      expect(JSON.stringify(queried)).not.toContain(sleepSecret);
+      offVaultSub();
     } finally {
       careFork.dispose();
       sleepFork.dispose();

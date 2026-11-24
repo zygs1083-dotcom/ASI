@@ -44,8 +44,8 @@ export function createDshCarePorts(ctx: Context, storageRoot: string, options?: 
   };
 
   const ASI_INTERNAL_PATH_RE =
-    /(?:^|[\\/])(?:asi-(?:needs|sense|care|sleep)|(?:needs|sense|care|sleep)[\\/](?:sandbox|vault))(?:[\\/]|$)/i;
-  const INTERNAL_SESSION_ID_RE = /^asi-(?:maint|sleep|care|sense|internal)(?:[-_:]|$)/i;
+    /(?:^|[\\/])(?:asi-(?:needs|sense|care|sleep|growth)|(?:needs|sense|care|sleep|growth)[\\/](?:sandbox|vault|skills))(?:[\\/]|$)/i;
+  const INTERNAL_SESSION_ID_RE = /^asi-(?:maint|sleep|care|sense|growth|internal)(?:[-_:]|$)/i;
 
   const safeRealpath = (p: string): string => {
     try {
@@ -73,8 +73,10 @@ export function createDshCarePorts(ctx: Context, storageRoot: string, options?: 
         roots.add(join(dataParent, 'asi-sense'));
         roots.add(join(dataParent, 'asi-sleep'));
         roots.add(join(dataParent, 'asi-care'));
+        roots.add(join(dataParent, 'asi-growth'));
         roots.add(join(dataParent, 'needs', 'sandbox'));
         roots.add(join(dataParent, 'sleep', 'vault'));
+        roots.add(join(dataParent, 'growth', 'skills'));
       }
     }
     return [...roots];

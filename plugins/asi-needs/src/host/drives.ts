@@ -46,6 +46,7 @@ const RESERVED_TOOL_NAMES = new Set([
   'memory_recall',
   'memory_profile',
   'care_status',
+  'growth_status',
   'needs_sniff_causes',
   'needs_clean_cache',
   'needs_stop_job',
@@ -75,6 +76,7 @@ export class MaslowDriveArbiter {
   private readonly listeners = new Set<(snapshot: AsiDrivesSnapshot) => void>();
   private readonly structureListeners = new Set<() => void>();
 
+  private latestSense?: SenseSnapshot;
   private latestSnapshot: AsiDrivesSnapshot = {
     now: 0,
     powerMode: 'normal',
@@ -270,13 +272,33 @@ export class MaslowDriveArbiter {
         const targetKey = this.resolveTargetDriveKey(regTool);
         const targetDrive = targetKey ? this.latestSnapshot.drives.find((d) => d.key === targetKey) : undefined;
         const sourceDrives = this.latestSnapshot.drives.filter((d) => d.sourceId === src.id);
-        const autoMaintainDisabled =
+        let autoMaintainDisabled =
           targetDrive?.autoMaintain === false ||
           (!targetDrive && sourceDrives.length > 0 && sourceDrives.every((d) => d.autoMaintain === false));
+        if (!autoMaintainDisabled && !targetDrive && sourceDrives.length === 0) {
+          if (!this.latestSense) {
+            autoMaintainDisabled = true;
+          } else {
+            try {
+              const cloned = structuredClone(this.latestSense);
+              if (!cloned.settings.sendTitles) cloned.state.env.focusedWindow.value = null;
+              const liveReadings = src.evaluate(cloned) ?? [];
+              const matchedReading = regTool.qualifiedDriveKey
+                ? liveReadings.find((r) => this.qualifyKey(src.id, r.key) === regTool.qualifiedDriveKey)
+                : undefined;
+              autoMaintainDisabled =
+                liveReadings.length === 0 ||
+                matchedReading?.autoMaintain === false ||
+                (!matchedReading && liveReadings.every((r) => r.autoMaintain === false));
+            } catch {
+              autoMaintainDisabled = true;
+            }
+          }
+        }
         if (autoMaintainDisabled) {
           return {
             allowed: false,
-            reason: `Higher-order drive "${targetDrive?.key ?? src.id}" has autoMaintain=false and is deferred during autonomous maintenance turns`,
+            reason: `Higher-order drive "${targetDrive?.key ?? targetKey ?? src.id}" has autoMaintain=false and is deferred during autonomous maintenance turns`,
           };
         }
       }
@@ -289,6 +311,7 @@ export class MaslowDriveArbiter {
     higherOrderDrives: DriveEvaluation[];
   } {
     const { sense, l1Needs, powerMode } = input;
+    this.latestSense = structuredClone(sense);
     const l1Distressed = NEED_KEYS.some((k) => l1Needs[k].driveActive || l1Needs[k].zone !== 'comfortable');
     const ecoActive = powerMode === 'eco';
     const higherOrderSuppressed = l1Distressed || ecoActive;

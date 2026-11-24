@@ -68,6 +68,12 @@ export type {
   SenseSettingsSnapshot,
   SenseSnapshot,
 } from './service.js';
+export type {
+  AsiSleepServiceApi,
+  SleepMemoryKind,
+  SleepMemoryQueryOptions,
+  SleepMemorySummary,
+} from './sleep.js';
 
 /** Identifies a signal/fact producer: which source, via which API, on which host. */
 export interface SourceRef {

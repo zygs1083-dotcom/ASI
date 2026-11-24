@@ -10,9 +10,9 @@ import type { WorkspaceRegistry } from '@deepseek-ai/dsh-workspace';
 import type { ConversationTurnInput } from '../consolidator.js';
 import type { SleepConversationPort, SleepHostPorts } from '../ports.js';
 
-export const INTERNAL_SESSION_ID_RE = /^asi-(?:maint|sleep|care|sense|internal)(?:[-_:]|$)/i;
+export const INTERNAL_SESSION_ID_RE = /^asi-(?:maint|sleep|care|sense|growth|internal)(?:[-_:]|$)/i;
 const INTERNAL_CWD_RE =
-  /(?:^|[\\/])(?:(?:asi[-_])?(?:needs|sleep|care|sense)[\\/]sandbox|data[\\/]asi-(?:needs|sleep|care|sense))(?:[\\/]|$)/i;
+  /(?:^|[\\/])(?:(?:asi[-_])?(?:needs|sleep|care|sense|growth)[\\/](?:sandbox|vault|skills)|data[\\/]asi-(?:needs|sleep|care|sense|growth))(?:[\\/]|$)/i;
 
 function safeRealpath(p: string): string {
   try {
@@ -38,16 +38,22 @@ export function buildExcludedInternalRoots(storageRoot: string, senseStorageRoot
     if (parent && parent !== '/') {
       roots.add(join(parent, 'asi-needs'));
       roots.add(join(parent, 'asi-care'));
+      roots.add(join(parent, 'asi-growth'));
       roots.add(join(parent, 'needs', 'sandbox'));
       roots.add(join(parent, 'care', 'sandbox'));
+      roots.add(join(parent, 'growth', 'skills'));
+      roots.add(join(parent, 'growth', 'sandbox'));
     }
   }
   const sleepParent = dirname(storageRoot);
   if (sleepParent && sleepParent !== '/') {
     roots.add(join(sleepParent, 'asi-needs'));
     roots.add(join(sleepParent, 'asi-care'));
+    roots.add(join(sleepParent, 'asi-growth'));
     roots.add(join(sleepParent, 'needs', 'sandbox'));
     roots.add(join(sleepParent, 'care', 'sandbox'));
+    roots.add(join(sleepParent, 'growth', 'skills'));
+    roots.add(join(sleepParent, 'growth', 'sandbox'));
   }
   return [...roots];
 }

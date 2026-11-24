@@ -60,7 +60,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     );
     await runtime.start();
     if (disposed) return;
-    new AsiSleepRemote(ctx, runtime.actions, createSleepFramesSource(runtime));
+    new AsiSleepRemote(ctx, runtime.actions, createSleepFramesSource(runtime), runtime);
   } catch (err) {
     await dispose();
     throw err;

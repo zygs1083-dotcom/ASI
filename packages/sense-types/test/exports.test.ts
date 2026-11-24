@@ -2,11 +2,13 @@ import { describe, expect, it } from 'vitest';
 import {
   type ActionOutcomeLedgerEntry,
   type AsiDrivesSnapshot,
+  type AsiSleepServiceApi,
   effectiveDisks,
   factStatusAt,
   NEED_KEYS,
   type NeedEvaluation,
   type SenseSettingsSnapshot,
+  type SleepMemorySummary,
   sanitizeForModel,
   THERMAL_ORDINAL,
 } from '../src/index.ts';
@@ -87,5 +89,26 @@ describe('shared type exports', () => {
     };
     expect(ledgerEntry.successRate).toBe(1);
     expect(drivesSnap.higherOrderSuppressed).toBe(false);
+
+    const sleepMem: SleepMemorySummary = {
+      id: 'mem_1',
+      kind: 'pitfall',
+      title: 'Avoid symlink traversal',
+      content: 'Always verify lstat before removing directories.',
+      tags: ['security'],
+      pinned: false,
+      confidence: 0.9,
+      retention: 0.92,
+      evidenceCount: 2,
+      recallCount: 1,
+      sourceSessionIds: ['s1'],
+      createdAt: 100,
+      updatedAt: 150,
+    };
+    const sleepSvc: AsiSleepServiceApi = {
+      listMemories: () => [sleepMem],
+      subscribe: () => () => {},
+    };
+    expect(sleepSvc.listMemories()[0]?.retention).toBeCloseTo(0.92);
   });
 });

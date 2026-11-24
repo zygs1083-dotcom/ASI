@@ -10,7 +10,7 @@
 import { randomUUID } from 'node:crypto';
 import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import type { DriveAbortSignal, SenseSnapshot } from '@asi/sense-types';
+import type { DriveAbortSignal, SenseSnapshot, SleepMemoryQueryOptions, SleepMemorySummary } from '@asi/sense-types';
 import { searchMemoryItems } from '../shared/search.js';
 import {
   MEMORY_KINDS,
@@ -109,6 +109,8 @@ export interface SleepRuntime {
   stop(): Promise<void>;
   panelModel(): SleepPanelModel;
   subscribe(listener: () => void): () => void;
+  subscribeVault(listener: () => void): () => void;
+  listMemories(options?: SleepMemoryQueryOptions): SleepMemorySummary[];
   recall(input: RecallQueryInput): Promise<RecallQueryResult>;
   profile(input?: ProfileQueryInput): ProfileQueryResult;
 }
@@ -152,6 +154,7 @@ export function createSleepRuntime(ports: SleepHostPorts): SleepRuntime {
   let stateWriteChain: Promise<void> = Promise.resolve();
 
   const subscribers = new Set<() => void>();
+  const vaultSubscribers = new Set<() => void>();
   let offSense: (() => void) | undefined;
   let offDrives: (() => void) | undefined;
   let offDriveSource: (() => void) | undefined;
@@ -160,6 +163,17 @@ export function createSleepRuntime(ports: SleepHostPorts): SleepRuntime {
   function notify(): void {
     if (stopped) return;
     for (const fn of [...subscribers]) {
+      try {
+        fn();
+      } catch {
+        // Isolate listener error
+      }
+    }
+  }
+
+  function notifyVaultChanged(): void {
+    if (stopped) return;
+    for (const fn of [...vaultSubscribers]) {
       try {
         fn();
       } catch {
@@ -479,6 +493,7 @@ export function createSleepRuntime(ports: SleepHostPorts): SleepRuntime {
         pendingOrdinaryTurns(commitNow);
 
         await Promise.all([vault.flush(commitNow), persistState()]);
+        notifyVaultChanged();
         return savedRecord;
       } catch (err) {
         if (reservedAutoSlot) {
@@ -592,6 +607,7 @@ export function createSleepRuntime(ports: SleepHostPorts): SleepRuntime {
       });
       await vault.flush(now);
       ports.drives.notifySourceChanged('asi-sleep');
+      notifyVaultChanged();
       notify();
       return toViewItem(created, now);
     },
@@ -647,6 +663,7 @@ export function createSleepRuntime(ports: SleepHostPorts): SleepRuntime {
         fsrs: nextFsrs,
       });
       await vault.flush(now);
+      notifyVaultChanged();
       notify();
       return toViewItem(updated, now);
     },
@@ -663,6 +680,7 @@ export function createSleepRuntime(ports: SleepHostPorts): SleepRuntime {
       if (!existed) throw new Error(`Memory not found: ${safeId || 'unknown'}`);
       await vault.flush(now);
       ports.drives.notifySourceChanged('asi-sleep');
+      notifyVaultChanged();
       notify();
     },
 
@@ -671,6 +689,7 @@ export function createSleepRuntime(ports: SleepHostPorts): SleepRuntime {
       const synced = await vault.syncExternalChanges(now);
       if (synced) {
         ports.drives.notifySourceChanged('asi-sleep');
+        notifyVaultChanged();
         notify();
       }
       const all = vault.list(now).map((e) => toViewItem(e, now));
@@ -861,6 +880,7 @@ export function createSleepRuntime(ports: SleepHostPorts): SleepRuntime {
       }
       await Promise.allSettled([activeConsolidationPromise ?? Promise.resolve(), stateWriteChain, vault.waitForIdle()]);
       subscribers.clear();
+      vaultSubscribers.clear();
     },
 
     panelModel(): SleepPanelModel {
@@ -908,6 +928,59 @@ export function createSleepRuntime(ports: SleepHostPorts): SleepRuntime {
       return () => {
         subscribers.delete(listener);
       };
+    },
+
+    subscribeVault(listener: () => void): () => void {
+      if (!stopped) vaultSubscribers.add(listener);
+      return () => {
+        vaultSubscribers.delete(listener);
+      };
+    },
+
+    listMemories(options?: SleepMemoryQueryOptions): SleepMemorySummary[] {
+      const now = clock.wall();
+      const allEntries = vault.list(now);
+      if (!stopped && vault.hasPendingExternalFlush()) {
+        void vault.flush(now);
+      }
+      const kindFilter = options?.kinds && options.kinds.length > 0 ? new Set(options.kinds) : undefined;
+      const minRetention =
+        typeof options?.minRetention === 'number' && Number.isFinite(options.minRetention)
+          ? Math.max(0, Math.min(1, options.minRetention))
+          : 0;
+      const limit =
+        typeof options?.limit === 'number' && Number.isFinite(options.limit) && options.limit >= 1
+          ? Math.min(1_000, Math.trunc(options.limit))
+          : MAX_PANEL_MEMORIES;
+
+      const out: SleepMemorySummary[] = [];
+      for (const entry of allEntries) {
+        if (kindFilter && !kindFilter.has(entry.kind)) continue;
+        const view = toViewItem(entry, now);
+        if (!view.pinned && view.retention < minRetention) continue;
+        out.push({
+          id: view.id,
+          kind: view.kind,
+          title: view.title,
+          content: view.content,
+          tags: [...view.tags],
+          ...(view.topicKey ? { topicKey: view.topicKey } : {}),
+          pinned: view.pinned,
+          confidence: view.confidence,
+          retention: view.retention,
+          evidenceCount: view.evidenceCount,
+          recallCount: view.recallCount,
+          sourceSessionIds: [...view.sourceSessionIds],
+          createdAt: view.createdAt,
+          updatedAt: view.updatedAt,
+        });
+      }
+      out.sort((a, b) => {
+        if (a.pinned !== b.pinned) return a.pinned ? -1 : 1;
+        if (Math.abs(b.retention - a.retention) > 1e-4) return b.retention - a.retention;
+        return b.updatedAt - a.updatedAt;
+      });
+      return out.slice(0, limit);
     },
 
     async recall(input: RecallQueryInput): Promise<RecallQueryResult> {
@@ -960,6 +1033,7 @@ export function createSleepRuntime(ports: SleepHostPorts): SleepRuntime {
 
       if (shouldStrengthen) {
         await vault.flush(now);
+        notifyVaultChanged();
         notify();
       }
 
