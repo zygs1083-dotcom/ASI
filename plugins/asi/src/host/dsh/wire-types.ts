@@ -10,16 +10,6 @@ import type {
   DreamPromoteResult,
 } from '../../dream/shared/types.ts';
 import type {
-  DreamAdoptMemoryInput,
-  DreamAdoptResult,
-  DreamCycleRecord,
-  DreamInsightKind,
-  DreamInsightStatus,
-  DreamInsightViewItem,
-  DreamPanelModel,
-  DreamPromoteResult,
-} from '../../dream/shared/types.ts';
-import type {
   ArchivedSkillViewItem,
   GrowthPanelModel,
   GrowthSynthesisRecord,

@@ -11,6 +11,11 @@ import { JobId } from '@deepseek-ai/dsh-jobs';
 import { freezeMessage, MessageId } from '@deepseek-ai/dsh-llm';
 import { SessionId } from '@deepseek-ai/dsh-session';
 import type { WorkspaceRegistry } from '@deepseek-ai/dsh-workspace';
+import {
+  ASI_INTERNAL_CWD_RE,
+  ASI_INTERNAL_SESSION_ID_RE,
+  buildUnifiedExcludedInternalRoots,
+} from '../../../shared/internal-guards.js';
 import type { CryDeliveryMode } from '../cry.js';
 import type { NeedsHostPorts } from '../ports.js';
 import type { CompactionPort, JobsPort, ManagedJobInfo } from '../sandbox.js';
@@ -38,9 +43,9 @@ export function createDshNeedsPorts(ctx: Context, storageRoot: string, options?:
       return resolve(p);
     }
   };
-  const INTERNAL_SESSION_ID_RE = /^asi-(?:maint|sleep|care|sense|growth|internal)(?:[-_:]|$)/i;
-  const INTERNAL_SANDBOX_CWD_RE =
-    /(?:^|[\\/])(?:(?:asi[-_])?(?:needs|sleep|care|sense|growth)[\\/](?:sandbox|vault|skills)|data[\\/]asi(?:-(?:needs|sleep|care|sense|growth))?)(?:[\\/]|$)/i;
+  const INTERNAL_SESSION_ID_RE = ASI_INTERNAL_SESSION_ID_RE;
+  const INTERNAL_SANDBOX_CWD_RE = ASI_INTERNAL_CWD_RE;
+  const excludedRoots = buildUnifiedExcludedInternalRoots(storageRoot, ctx.asiSense.storageRoot);
 
   const isInsideDir = (candidate: string, parent: string): boolean => {
     const normParent = parent.endsWith(sep) ? parent : `${parent}${sep}`;
@@ -57,8 +62,14 @@ export function createDshNeedsPorts(ctx: Context, storageRoot: string, options?:
     if (typeof cwd === 'string' && cwd.trim()) {
       if (INTERNAL_SANDBOX_CWD_RE.test(cwd)) return false;
       const normCwd = resolve(cwd);
-      if (isInsideDir(normCwd, sandboxRoot) || isInsideDir(safeRealpath(normCwd), safeRealpath(sandboxRoot))) {
+      const realCwd = safeRealpath(normCwd);
+      if (isInsideDir(normCwd, sandboxRoot) || isInsideDir(realCwd, safeRealpath(sandboxRoot))) {
         return false;
+      }
+      for (const root of excludedRoots) {
+        if (isInsideDir(normCwd, resolve(root)) || isInsideDir(realCwd, safeRealpath(root))) {
+          return false;
+        }
       }
     }
     const wr = getWorkspaceRegistry();

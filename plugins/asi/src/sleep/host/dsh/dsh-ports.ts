@@ -1,18 +1,21 @@
 import { realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { basename, dirname, join } from 'node:path';
 import type { Context } from '@deepseek-ai/cordis';
 import type { Agent } from '@deepseek-ai/dsh-agent';
 import type {} from '@deepseek-ai/dsh-llm';
 import type { Session, SessionEvent, SessionId } from '@deepseek-ai/dsh-session';
 import type { SessionQueryEngine } from '@deepseek-ai/dsh-session-query';
 import type { WorkspaceRegistry } from '@deepseek-ai/dsh-workspace';
+import {
+  ASI_INTERNAL_CWD_RE,
+  ASI_INTERNAL_SESSION_ID_RE,
+  buildUnifiedExcludedInternalRoots,
+} from '../../../shared/internal-guards.js';
 import type { ConversationTurnInput } from '../consolidator.js';
 import type { SleepConversationPort, SleepHostPorts } from '../ports.js';
 
-export const INTERNAL_SESSION_ID_RE = /^asi-(?:maint|sleep|care|sense|growth|internal)(?:[-_:]|$)/i;
-const INTERNAL_CWD_RE =
-  /(?:^|[\\/])(?:(?:asi[-_])?(?:needs|sleep|care|sense|growth)[\\/](?:sandbox|vault|skills)|data[\\/]asi(?:-(?:needs|sleep|care|sense|growth))?)(?:[\\/]|$)/i;
+export const INTERNAL_SESSION_ID_RE = ASI_INTERNAL_SESSION_ID_RE;
+const INTERNAL_CWD_RE = ASI_INTERNAL_CWD_RE;
 
 function safeRealpath(p: string): string {
   try {
@@ -31,42 +34,7 @@ function isInsideRoot(candidate: string | undefined, root: string | undefined): 
 }
 
 export function buildExcludedInternalRoots(storageRoot: string, senseStorageRoot?: string): string[] {
-  const roots = new Set<string>([storageRoot]);
-  const shortSiblingNames = new Set(['sense', 'needs', 'sleep', 'care', 'growth']);
-  for (const anchor of [storageRoot, senseStorageRoot]) {
-    if (!anchor) continue;
-    roots.add(anchor);
-    const parent = dirname(anchor);
-    const anchorBase = basename(anchor).toLowerCase();
-    if (parent && parent !== '/' && parent !== '.') {
-      roots.add(join(parent, 'asi-sense'));
-      roots.add(join(parent, 'asi-needs'));
-      roots.add(join(parent, 'asi-sleep'));
-      roots.add(join(parent, 'asi-care'));
-      roots.add(join(parent, 'asi-growth'));
-      roots.add(join(parent, 'needs', 'sandbox'));
-      roots.add(join(parent, 'care', 'sandbox'));
-      roots.add(join(parent, 'growth', 'skills'));
-      roots.add(join(parent, 'growth', 'sandbox'));
-      if (shortSiblingNames.has(anchorBase)) {
-        for (const sib of shortSiblingNames) {
-          roots.add(join(parent, sib));
-        }
-        if (basename(parent).toLowerCase() === 'asi') {
-          roots.add(parent);
-          const grandParent = dirname(parent);
-          if (grandParent && grandParent !== '/' && grandParent !== '.' && grandParent !== parent) {
-            roots.add(join(grandParent, 'asi-sense'));
-            roots.add(join(grandParent, 'asi-needs'));
-            roots.add(join(grandParent, 'asi-sleep'));
-            roots.add(join(grandParent, 'asi-care'));
-            roots.add(join(grandParent, 'asi-growth'));
-          }
-        }
-      }
-    }
-  }
-  return [...roots];
+  return buildUnifiedExcludedInternalRoots(storageRoot, senseStorageRoot);
 }
 
 export function isOrdinaryDshSession(

@@ -18,6 +18,7 @@ export const DEEP_QUIET_IDLE_THRESHOLD_MS = 20 * 60_000;
 export const DAILY_AUTO_DRAFT_QUOTA = 2;
 export const ROLLING_DAY_WINDOW_MS = 24 * 3_600_000;
 export const STALE_SKILL_ZERO_USAGE_MS = 60 * 86_400_000;
+export const NON_BLOCKING_TIER3_SOURCES: ReadonlySet<string> = new Set(['asi-intuition', 'asi-tom']);
 
 export interface EvaluateGrowthInput {
   now: number;
@@ -58,7 +59,7 @@ export function detectLowerTierBlock(
   }
 
   const blockingLowerDrives = (drivesSnap?.drives ?? []).filter(
-    (d) => d.tier < 4 && (d.driveActive || d.zone !== 'comfortable'),
+    (d) => d.tier < 4 && !NON_BLOCKING_TIER3_SOURCES.has(d.sourceId) && (d.driveActive || d.zone !== 'comfortable'),
   );
   if (blockingLowerDrives.length > 0) {
     const labels = blockingLowerDrives.slice(0, 2).map((d) => `L${d.tier} ${d.label}`);

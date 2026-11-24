@@ -41,7 +41,7 @@ import { STALE_SKILL_ZERO_USAGE_MS } from './evaluator.js';
 const MAX_JOURNAL_ENTRIES = 100;
 
 const FORBIDDEN_EXPORT_PATH_RE =
-  /(?:^|[\\/])(?:\.secrets|\.ssh|\.gnupg|\.aws|\.Trash|asi-(?:sense|needs|sleep|care|growth)|(?:needs|sleep|care|growth)[\\/](?:sandbox|vault|skills))(?:[\\/]|$)/i;
+  /(?:^|[\\/])(?:\.secrets|\.ssh|\.gnupg|\.aws|\.Trash|asi-(?:sense|needs|sleep|care|growth|intuition|tom|dream)|(?:sense|needs|sleep|care|growth|intuition|tom|dream)[\\/](?:sandbox|vault|skills))(?:[\\/]|$)/i;
 
 export interface StoredDraftRecord {
   id: string;

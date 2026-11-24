@@ -39,6 +39,7 @@ import type {
   SkillViewItem,
   WorkspaceChoice,
 } from '../shared/types.js';
+import { ASI_INTERNAL_CWD_RE } from '../../shared/internal-guards.js';
 import {
   DAILY_AUTO_DRAFT_QUOTA,
   DEEP_QUIET_IDLE_THRESHOLD_MS,
@@ -53,8 +54,7 @@ import { synthesizeSkillDraftForCluster } from './synthesizer.js';
 import { SkillVault } from './vault.js';
 
 const MAX_REJECTED_SIGNATURES = 500;
-const INTERNAL_RUNTIME_CWD_RE =
-  /(?:^|[\\/])(?:(?:asi[-_])?(?:needs|sleep|care|sense|growth)[\\/](?:sandbox|vault|skills)|data[\\/]asi-(?:needs|sleep|care|sense|growth))(?:[\\/]|$)/i;
+const INTERNAL_RUNTIME_CWD_RE = ASI_INTERNAL_CWD_RE;
 
 interface PersistedGrowthState {
   autoGrowthPaused?: boolean;

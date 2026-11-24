@@ -17,6 +17,7 @@ import type { DreamDriveView } from '../shared/types.js';
 export const DMN_QUIET_IDLE_THRESHOLD_MS = 15 * 60_000;
 export const DAILY_AUTO_DREAM_QUOTA = 3;
 export const DREAM_ROLLING_DAY_WINDOW_MS = 24 * 3_600_000;
+export const NON_BLOCKING_TIER3_SOURCES: ReadonlySet<string> = new Set(['asi-intuition', 'asi-tom']);
 
 export interface EvaluateDreamInput {
   now: number;
@@ -30,6 +31,7 @@ export interface EvaluateDreamInput {
   anyOrdinarySessionRunning: boolean;
   autoDreamPaused: boolean;
   autoDreamTimestamps: readonly number[];
+  partnerDeferProactive?: boolean;
 }
 
 export interface EvaluatedDreamState {
@@ -57,7 +59,7 @@ export function detectDreamLowerTierBlock(
   }
 
   const blockingLowerDrives = (drivesSnap?.drives ?? []).filter(
-    (d) => d.tier < 4 && (d.driveActive || d.zone !== 'comfortable'),
+    (d) => d.tier < 4 && !NON_BLOCKING_TIER3_SOURCES.has(d.sourceId) && (d.driveActive || d.zone !== 'comfortable'),
   );
   if (blockingLowerDrives.length > 0) {
     const labels = blockingLowerDrives.slice(0, 2).map((d) => `L${d.tier} ${d.label}`);
@@ -91,6 +93,7 @@ export function evaluateDreamState(input: EvaluateDreamInput): EvaluatedDreamSta
 
   const block = detectDreamLowerTierBlock(input.sense, input.drivesSnapshot);
   const readyToDream = input.discoveredRepoCount >= 2 && input.candidateBridgeCount > 0;
+  const tomDeferring = !screenLocked && Boolean(input.partnerDeferProactive);
 
   let satisfaction = 100;
   if (readyToDream) {
@@ -105,12 +108,15 @@ export function evaluateDreamState(input: EvaluateDreamInput): EvaluatedDreamSta
     !input.sense.settings.paused &&
     !block.suppressed &&
     !block.lowerTierBlocked &&
+    !tomDeferring &&
     deepQuietWindow &&
     remainingAutoQuota > 0;
 
   let summary: string;
   if (block.suppressed) {
     summary = block.suppressionReason ?? '优先保障 L1 生理稳态，DMN 睡眠做梦已挂起';
+  } else if (input.sense.settings.paused) {
+    summary = '全局感知与自维护已暂停，DMN 睡眠做梦已挂起';
   } else if (input.discoveredRepoCount < 2) {
     summary = `已感知 ${input.discoveredRepoCount} 个项目工作区（需 >=2 个独立 Git 仓库方可触发跨仓顿悟）`;
   } else if (!readyToDream) {
@@ -119,6 +125,8 @@ export function evaluateDreamState(input: EvaluateDreamInput): EvaluatedDreamSta
     summary = `发现 ${input.candidateBridgeCount} 条跨仓潜在桥接 · 自动做梦已暂停（可手动触发）`;
   } else if (block.lowerTierBlocked) {
     summary = block.lowerTierReason ?? '等待 L1–L3 需求全部恢复舒适后再自动做梦';
+  } else if (tomDeferring) {
+    summary = `待探索 ${input.candidateBridgeCount} 条跨仓桥接 · 搭档心流专注中，自动做梦静默避让（锁屏或节奏平缓后恢复）`;
   } else if (remainingAutoQuota <= 0) {
     summary = `今日自动做梦配额已满（${autoDreamsToday}/${DAILY_AUTO_DREAM_QUOTA} 次），明日自动恢复`;
   } else if (!deepQuietWindow) {
