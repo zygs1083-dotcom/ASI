@@ -3,6 +3,15 @@ import type { Context } from '@deepseek-ai/cordis';
 import { principalOf, Remote, RemoteError, TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol';
 import type { GrowthActionsApi } from '../../growth/host/runtime.ts';
 import type { SkillScope } from '../../growth/shared/types.ts';
+import type { IntuitionActionsApi } from '../../intuition/host/runtime.ts';
+import {
+  type FlashbackFeedback,
+  PROSPECTIVE_EVENT_KINDS,
+  PROSPECTIVE_TRIGGER_KINDS,
+  type ProspectiveEventKind,
+  type ProspectiveResolveAction,
+  type ProspectiveTriggerKind,
+} from '../../intuition/shared/types.ts';
 import type { NeedsActions } from '../../needs/host/runtime.ts';
 import type { SleepActionsApi } from '../../sleep/host/runtime.ts';
 import { MEMORY_KINDS, type MemoryKind } from '../../sleep/shared/types.ts';
@@ -11,11 +20,16 @@ import { toWireAsiPanelModel } from './wire.ts';
 import type {
   WireArchivedSkillViewItem,
   WireAsiPanelModel,
+  WireFlashbackFeedback,
+  WireFlashbackMatch,
   WireGrowthSynthesisRecord,
   WireMemoryCreateInput,
   WireMemoryKind,
   WireMemoryUpdateInput,
   WireMemoryViewItem,
+  WireProspectiveCreateInput,
+  WireProspectiveIntention,
+  WireProspectiveResolveInput,
   WireSkillCreateDraftInput,
   WireSkillDraftViewItem,
   WireSkillExportResult,
@@ -43,10 +57,27 @@ function isSkillScope(value: unknown): value is SkillScope {
   return value === 'global' || value === 'workspace';
 }
 
+function isProspectiveTriggerKind(value: unknown): value is ProspectiveTriggerKind {
+  return typeof value === 'string' && (PROSPECTIVE_TRIGGER_KINDS as readonly string[]).includes(value);
+}
+
+function isProspectiveEventKind(value: unknown): value is ProspectiveEventKind {
+  return typeof value === 'string' && (PROSPECTIVE_EVENT_KINDS as readonly string[]).includes(value);
+}
+
+function isProspectiveResolveAction(value: unknown): value is ProspectiveResolveAction {
+  return value === 'fulfill' || value === 'snooze' || value === 'cancel';
+}
+
+function isFlashbackFeedback(value: unknown): value is FlashbackFeedback {
+  return value === 'helpful' || value === 'dismissed' || value === 'muted';
+}
+
 export interface AsiRemoteDeps {
   needsActions?: NeedsActions;
   sleepActions?: SleepActionsApi;
   growthActions?: GrowthActionsApi;
+  intuitionActions?: IntuitionActionsApi;
   framesSource?: AsiFramesSource;
 }
 
@@ -68,6 +99,10 @@ export class AsiRemote extends TypertRemoteService {
 
   bindGrowthActions(actions: GrowthActionsApi | undefined): void {
     this.deps.growthActions = actions;
+  }
+
+  bindIntuitionActions(actions: IntuitionActionsApi | undefined): void {
+    this.deps.intuitionActions = actions;
   }
 
   private checkUser(): void {
@@ -95,6 +130,13 @@ export class AsiRemote extends TypertRemoteService {
       throw new RemoteError('gateway/bad-request', 'Growth actions unavailable', {});
     }
     return this.deps.growthActions;
+  }
+
+  private requireIntuition(): IntuitionActionsApi {
+    if (!this.deps.intuitionActions) {
+      throw new RemoteError('gateway/bad-request', 'Intuition actions unavailable', {});
+    }
+    return this.deps.intuitionActions;
   }
 
   private async userAction<T>(action: () => Promise<T>): Promise<T> {
@@ -436,6 +478,81 @@ export class AsiRemote extends TypertRemoteService {
       throw new RemoteError('gateway/bad-request', 'name and workspacePath are required', {});
     }
     return await this.userAction(() => this.requireGrowth().exportSkillToWorkspace(name, workspacePath));
+  }
+
+  // ---- Prefrontal Intuition & Prospective Memory Actions ----
+
+  @Remote
+  async setAutoIntuitionPaused(paused: boolean): Promise<void> {
+    this.checkUser();
+    if (typeof paused !== 'boolean') {
+      throw new RemoteError('gateway/bad-request', 'paused must be a boolean', {});
+    }
+    await this.userAction(() => this.requireIntuition().setAutoIntuitionPaused(paused));
+  }
+
+  @Remote
+  async createProspectiveIntention(input: WireProspectiveCreateInput): Promise<WireProspectiveIntention> {
+    this.checkUser();
+    if (!isPlainRecord(input) || !isProspectiveTriggerKind(input.triggerKind)) {
+      throw new RemoteError('gateway/bad-request', 'valid triggerKind is required', {});
+    }
+    if (
+      typeof input.title !== 'string' ||
+      !input.title.trim() ||
+      typeof input.instruction !== 'string' ||
+      !input.instruction.trim()
+    ) {
+      throw new RemoteError('gateway/bad-request', 'title and instruction are required', {});
+    }
+    if (input.priority !== undefined && input.priority !== 'normal' && input.priority !== 'high') {
+      throw new RemoteError('gateway/bad-request', 'invalid priority', {});
+    }
+    if (input.eventKind !== undefined && !isProspectiveEventKind(input.eventKind)) {
+      throw new RemoteError('gateway/bad-request', 'invalid eventKind', {});
+    }
+    return await this.userAction(() => this.requireIntuition().createIntention(input));
+  }
+
+  @Remote
+  async resolveProspectiveIntention(input: WireProspectiveResolveInput): Promise<WireProspectiveIntention> {
+    this.checkUser();
+    if (
+      !isPlainRecord(input) ||
+      typeof input.id !== 'string' ||
+      !input.id.trim() ||
+      !isProspectiveResolveAction(input.action)
+    ) {
+      throw new RemoteError('gateway/bad-request', 'id and valid action are required', {});
+    }
+    return await this.userAction(() => this.requireIntuition().resolveIntention(input));
+  }
+
+  @Remote
+  async deleteProspectiveIntention(id: string): Promise<void> {
+    this.checkUser();
+    if (typeof id !== 'string' || !id.trim()) {
+      throw new RemoteError('gateway/bad-request', 'id is required', {});
+    }
+    await this.userAction(() => this.requireIntuition().deleteIntention(id));
+  }
+
+  @Remote
+  async recordFlashbackFeedback(sourceId: string, feedback: WireFlashbackFeedback): Promise<void> {
+    this.checkUser();
+    if (typeof sourceId !== 'string' || !sourceId.trim() || !isFlashbackFeedback(feedback)) {
+      throw new RemoteError('gateway/bad-request', 'sourceId and valid feedback are required', {});
+    }
+    await this.userAction(() => this.requireIntuition().recordFlashbackFeedback(sourceId, feedback));
+  }
+
+  @Remote
+  async scanIntuitionFlashbacks(cueText: string): Promise<WireFlashbackMatch[]> {
+    this.checkUser();
+    if (typeof cueText !== 'string') {
+      throw new RemoteError('gateway/bad-request', 'cueText must be a string', {});
+    }
+    return await this.requireIntuition().scanNow(cueText);
   }
 }
 

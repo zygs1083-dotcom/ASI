@@ -10,6 +10,14 @@ import type {
   SkillViewItem,
 } from '../growth/shared/types.ts';
 import type { AsiPanelModel } from '../host/dsh/wire-types.ts';
+import { formatTriggerSummary } from '../intuition/host/prospective-evaluator.ts';
+import { SomaticMatcher } from '../intuition/host/somatic-matcher.ts';
+import {
+  type IntuitionPanelModel,
+  PROSPECTIVE_EVENT_KINDS,
+  type ProspectiveIntention,
+  type ProspectiveTriggerSpec,
+} from '../intuition/shared/types.ts';
 import { searchMemoryItems } from '../sleep/shared/search.ts';
 import {
   MEMORY_KINDS,
@@ -90,6 +98,30 @@ function withSleepRecount(model: SleepPanelModel, backingMemories?: readonly Mem
     memories: backingMemories ? all.slice(0, 4) : model.memories,
   };
 }
+
+function withIntuitionRecount(model: IntuitionPanelModel): IntuitionPanelModel {
+  let pendingCount = 0;
+  let surfacedCount = 0;
+  let fulfilledCount = 0;
+  for (const item of model.intentions) {
+    if (item.status === 'pending' || item.status === 'snoozed') pendingCount += 1;
+    else if (item.status === 'surfaced') surfacedCount += 1;
+    else if (item.status === 'fulfilled') fulfilledCount += 1;
+  }
+  return {
+    ...model,
+    pendingCount,
+    surfacedCount,
+    fulfilledCount,
+    drive: {
+      ...model.drive,
+      pendingCount,
+      surfacedCount,
+    },
+  };
+}
+
+const previewMatcher = new SomaticMatcher();
 
 function buildOverflowMemories(base: readonly MemoryViewItem[], now: number): MemoryViewItem[] {
   const extra: MemoryViewItem[] = Array.from({ length: 12 }, (_, idx) => ({
@@ -748,6 +780,138 @@ export function App() {
               displayPath,
               at: model.growth.now,
             };
+          }}
+          onToggleAutoIntuitionPaused={async (paused) => {
+            if (initial.failActions) throw new Error('模拟连接中断：暂停直觉入队切换失败');
+            setModel((prev) => ({
+              ...prev,
+              intuition: { ...prev.intuition, autoIntuitionPaused: paused },
+            }));
+            setLastAction(paused ? '已暂停自动直觉入队' : '已恢复自动直觉入队');
+          }}
+          onCreateProspectiveIntention={async (input) => {
+            if (initial.failActions) throw new Error('模拟连接中断：新建前瞻提醒失败');
+            const now = model.intuition.now;
+            const trigger: ProspectiveTriggerSpec =
+              input.triggerKind === 'time'
+                ? { kind: 'time', dueAt: now + (input.delayMinutes ?? 30) * 60_000 }
+                : input.triggerKind === 'context'
+                  ? {
+                      kind: 'context',
+                      ...(input.workspaceMatch ? { workspaceMatch: input.workspaceMatch } : {}),
+                      ...(input.keywordMatch ? { keywordMatch: input.keywordMatch } : {}),
+                    }
+                  : {
+                      kind: 'event',
+                      eventKind:
+                        input.eventKind && PROSPECTIVE_EVENT_KINDS.includes(input.eventKind)
+                          ? input.eventKind
+                          : 'next_session',
+                      ...(input.targetPattern ? { targetPattern: input.targetPattern } : {}),
+                    };
+            const created: ProspectiveIntention = {
+              id: `pm_preview_${Date.now()}`,
+              title: input.title,
+              instruction: input.instruction,
+              trigger,
+              triggerSummary: formatTriggerSummary(trigger, now),
+              priority: input.priority ?? 'normal',
+              status: 'pending',
+              createdAt: now,
+              updatedAt: now,
+              surfacedCount: 0,
+            };
+            setModel((prev) => ({
+              ...prev,
+              intuition: withIntuitionRecount({
+                ...prev.intuition,
+                intentions: [created, ...prev.intuition.intentions],
+              }),
+            }));
+            setLastAction(`新建前瞻提醒 ${created.title}`);
+            return created;
+          }}
+          onResolveProspectiveIntention={async (input) => {
+            if (initial.failActions) throw new Error('模拟连接中断：处理前瞻提醒失败');
+            let updatedOut: ProspectiveIntention | undefined;
+            setModel((prev) => {
+              const now = prev.intuition.now;
+              const nextIntentions = prev.intuition.intentions.map((item) => {
+                if (item.id !== input.id) return item;
+                const nextStatus =
+                  input.action === 'fulfill' ? 'fulfilled' : input.action === 'snooze' ? 'snoozed' : 'canceled';
+                const updated: ProspectiveIntention = {
+                  ...item,
+                  status: nextStatus,
+                  updatedAt: now,
+                  ...(nextStatus === 'fulfilled' ? { fulfilledAt: now } : {}),
+                  ...(nextStatus === 'snoozed' ? { snoozedUntil: now + (input.snoozeMinutes ?? 30) * 60_000 } : {}),
+                };
+                updatedOut = updated;
+                return updated;
+              });
+              return {
+                ...prev,
+                intuition: withIntuitionRecount({
+                  ...prev.intuition,
+                  intentions: nextIntentions,
+                }),
+              };
+            });
+            setLastAction(`处理前瞻提醒 ${input.id} -> ${input.action}`);
+            return updatedOut;
+          }}
+          onDeleteProspectiveIntention={async (id) => {
+            if (initial.failActions) throw new Error('模拟连接中断：删除前瞻记录失败');
+            setModel((prev) => ({
+              ...prev,
+              intuition: withIntuitionRecount({
+                ...prev.intuition,
+                intentions: prev.intuition.intentions.filter((i) => i.id !== id),
+              }),
+            }));
+            setLastAction(`删除前瞻记录 ${id}`);
+          }}
+          onRecordFlashbackFeedback={async (sourceId, feedback) => {
+            if (initial.failActions) throw new Error('模拟连接中断：记录闪回反馈失败');
+            setModel((prev) => ({
+              ...prev,
+              intuition: {
+                ...prev.intuition,
+                mutedSourceCount:
+                  feedback === 'muted' ? prev.intuition.mutedSourceCount + 1 : prev.intuition.mutedSourceCount,
+                recentFlashbacks: prev.intuition.recentFlashbacks.map((f) =>
+                  f.sourceId === sourceId ? { ...f, feedback } : f,
+                ),
+              },
+            }));
+            setLastAction(`闪回反馈 ${sourceId} -> ${feedback}`);
+          }}
+          onScanIntuitionFlashbacks={async (cueText) => {
+            if (initial.failActions) throw new Error('模拟连接中断：直觉嗅探失败');
+            const sourceMems = (overflowVaultRef.current ?? model.sleep.memories).map((m) => ({
+              id: m.id,
+              kind: m.kind,
+              title: m.title,
+              content: m.content,
+              tags: m.tags,
+              ...(m.topicKey ? { topicKey: m.topicKey } : {}),
+              pinned: m.pinned,
+              confidence: m.confidence,
+              retention: m.retention,
+              evidenceCount: m.evidenceCount,
+              recallCount: m.recallCount,
+              sourceSessionIds: m.sourceSessionIds,
+              createdAt: m.createdAt,
+              updatedAt: m.updatedAt,
+            }));
+            return previewMatcher.scan({
+              cueText,
+              memories: sourceMems,
+              scars: [],
+              minScore: 0.45,
+              limit: 4,
+            });
           }}
         />
       </main>

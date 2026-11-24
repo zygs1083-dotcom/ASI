@@ -29,6 +29,7 @@ export function staleAsiPanelModel(model: AsiPanelModel): AsiPanelModel {
     needs: stalePanelModel(model.needs),
     sleep: { ...model.sleep, stale: true },
     growth: { ...model.growth, stale: true },
+    intuition: { ...model.intuition, stale: true },
   };
 }
 

@@ -18,5 +18,6 @@ export function toWireAsiPanelModel(model: AsiPanelModel): WireAsiPanelModel {
     needs: toWireNeedsPanelModel(model.needs),
     sleep: structuredClone(model.sleep),
     growth: structuredClone(model.growth),
+    intuition: structuredClone(model.intuition),
   };
 }

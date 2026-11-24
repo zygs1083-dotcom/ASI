@@ -65,6 +65,13 @@ export function createAsiActions(api: Api, onNavigateSession?: (sessionId: strin
     onRestoreSkill: (name) => complete(() => api.restoreSkill(name)),
     onDeleteArchivedSkill: (name) => complete(() => api.deleteArchivedSkill(name)),
     onExportSkillToWorkspace: (name, ws) => complete(() => api.exportSkillToWorkspace(name, ws)),
+
+    onToggleAutoIntuitionPaused: (paused) => complete(() => api.setAutoIntuitionPaused(paused)),
+    onCreateProspectiveIntention: (input) => complete(() => api.createProspectiveIntention(input)),
+    onResolveProspectiveIntention: (input) => complete(() => api.resolveProspectiveIntention(input)),
+    onDeleteProspectiveIntention: (id) => complete(() => api.deleteProspectiveIntention(id)),
+    onRecordFlashbackFeedback: (sourceId, feedback) => complete(() => api.recordFlashbackFeedback(sourceId, feedback)),
+    onScanIntuitionFlashbacks: (cueText) => complete(() => api.scanIntuitionFlashbacks(cueText)),
   };
 
   return {

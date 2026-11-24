@@ -33,6 +33,21 @@ import type {
   SkillViewItem,
 } from '../growth/shared/types.ts';
 import type { AsiPanelModel } from '../host/dsh/wire-types.ts';
+import {
+  type FlashbackFeedback,
+  type FlashbackMatch,
+  PROSPECTIVE_EVENT_KINDS,
+  PROSPECTIVE_EVENT_LABELS,
+  PROSPECTIVE_TRIGGER_KINDS,
+  PROSPECTIVE_TRIGGER_LABELS,
+  type ProspectiveCreateInput,
+  type ProspectiveEventKind,
+  type ProspectiveIntention,
+  type ProspectivePriority,
+  type ProspectiveResolveInput,
+  type ProspectiveStatus,
+  type ProspectiveTriggerKind,
+} from '../intuition/shared/types.ts';
 import { searchMemoryItems } from '../sleep/shared/search.ts';
 import {
   MEMORY_KIND_LABELS,
@@ -80,6 +95,14 @@ export interface AsiPanelActions {
   onRestoreSkill: (name: string) => Promise<SkillViewItem | undefined>;
   onDeleteArchivedSkill: (name: string) => Promise<void>;
   onExportSkillToWorkspace: (name: string, workspacePath: string) => Promise<SkillExportResult | undefined>;
+
+  // Prefrontal Intuition & Prospective Memory
+  onToggleAutoIntuitionPaused?: (paused: boolean) => Promise<void>;
+  onCreateProspectiveIntention?: (input: ProspectiveCreateInput) => Promise<ProspectiveIntention | undefined>;
+  onResolveProspectiveIntention?: (input: ProspectiveResolveInput) => Promise<ProspectiveIntention | undefined>;
+  onDeleteProspectiveIntention?: (id: string) => Promise<void>;
+  onRecordFlashbackFeedback?: (sourceId: string, feedback: FlashbackFeedback) => Promise<void>;
+  onScanIntuitionFlashbacks?: (cueText: string) => Promise<FlashbackMatch[]>;
 }
 
 export interface AsiPanelProps extends AsiPanelActions {
@@ -142,7 +165,17 @@ const HIGHER_DRIVE_LABEL: Record<string, string> = {
   'asi-care:repo_hygiene': 'L3 仓库与工作树卫生',
   'asi-care:orphan_runtime': 'L3 僵尸进程与孤儿端口',
   'asi-care:workspace_bloat': 'L3 闲置工作树产物膨胀',
+  'asi-intuition:prospective_sentinel': 'L3 前额叶直觉与前瞻',
   'asi-growth:skill_synthesis': 'L4 技能提炼与自进化',
+};
+
+const PROSPECTIVE_STATUS_LABEL: Record<ProspectiveStatus, string> = {
+  surfaced: '已触发待办',
+  pending: '守候中',
+  snoozed: '已延后',
+  fulfilled: '已完成',
+  canceled: '已取消',
+  expired: '已过期',
 };
 
 const MAIN_TABS: readonly AsiMainTab[] = ['care', 'memory', 'skills'];
@@ -226,7 +259,8 @@ export function AsiPanel(props: AsiPanelProps) {
   const needsModel = useFreshModel(props.model.needs);
   const sleepModel = props.model.sleep;
   const growthModel = props.model.growth;
-  const isStale = Boolean(sleepModel.stale || growthModel.stale);
+  const intuitionModel = props.model.intuition;
+  const isStale = Boolean(sleepModel.stale || growthModel.stale || intuitionModel.stale);
 
   // ---- Global Navigation & Settings State ----
   const [activeTab, setActiveTab] = useState<AsiMainTab>(props.initialTab ?? 'care');
@@ -240,7 +274,24 @@ export function AsiPanel(props: AsiPanelProps) {
   const [careFeedback, setCareFeedback] = useState<string | null>(null);
   const [maintBusy, setMaintBusy] = useState(false);
 
-  // ---- Tab 2 (记忆库) State ----
+  // ---- Tab 2 (记忆库 & 直觉前瞻) State ----
+  const [memorySubTab, setMemorySubTab] = useState<'vault' | 'intuition'>('vault');
+  const [prospectiveFilter, setProspectiveFilter] = useState<'active' | 'history'>('active');
+  const [creatingProspective, setCreatingProspective] = useState(false);
+  const [pmTitle, setPmTitle] = useState('');
+  const [pmInstruction, setPmInstruction] = useState('');
+  const [pmTriggerKind, setPmTriggerKind] = useState<ProspectiveTriggerKind>('context');
+  const [pmPriority, setPmPriority] = useState<ProspectivePriority>('normal');
+  const [pmDelayMins, setPmDelayMins] = useState('30');
+  const [pmWorkspaceMatch, setPmWorkspaceMatch] = useState('');
+  const [pmKeywordMatch, setPmKeywordMatch] = useState('');
+  const [pmEventKind, setPmEventKind] = useState<ProspectiveEventKind>('next_session');
+  const [pmTargetPattern, setPmTargetPattern] = useState('');
+  const [scanCueInput, setScanCueInput] = useState('');
+  const [scanHits, setScanHits] = useState<FlashbackMatch[] | null>(null);
+  const [intuitionFeedback, setIntuitionFeedback] = useState<string | null>(null);
+  const [intuitionIsError, setIntuitionIsError] = useState(false);
+
   const [memQuery, setMemQuery] = useState('');
   const [kindFilter, setKindFilter] = useState<MemoryKind | 'all'>('all');
   const [creatingMemory, setCreatingMemory] = useState(false);
@@ -857,9 +908,153 @@ export function AsiPanel(props: AsiPanelProps) {
   };
 
   // ---- Cross-Tab Spotlight Items ----
+  const surfacedIntentions = useMemo(
+    () => intuitionModel.intentions.filter((i) => i.status === 'surfaced'),
+    [intuitionModel.intentions],
+  );
+  const activeIntentions = useMemo(
+    () =>
+      intuitionModel.intentions.filter(
+        (i) => i.status === 'surfaced' || i.status === 'pending' || i.status === 'snoozed',
+      ),
+    [intuitionModel.intentions],
+  );
+  const historyIntentions = useMemo(
+    () =>
+      intuitionModel.intentions.filter(
+        (i) => i.status === 'fulfilled' || i.status === 'canceled' || i.status === 'expired',
+      ),
+    [intuitionModel.intentions],
+  );
+
+  const handleToggleAutoIntuition = async (paused: boolean) => {
+    if (!props.onToggleAutoIntuitionPaused) return;
+    setIntuitionFeedback(null);
+    setIntuitionIsError(false);
+    try {
+      await props.onToggleAutoIntuitionPaused(paused);
+    } catch (err) {
+      setIntuitionIsError(true);
+      setIntuitionFeedback(err instanceof Error ? err.message : '切换直觉入队状态失败');
+    }
+  };
+
+  const handleCreateProspectiveSubmit = async (e: FormEvent) => {
+    e.preventDefault();
+    if (!props.onCreateProspectiveIntention || !pmTitle.trim() || !pmInstruction.trim()) return;
+    setIntuitionFeedback(null);
+    setIntuitionIsError(false);
+    try {
+      const delayNum = Number(pmDelayMins);
+      const created = await props.onCreateProspectiveIntention({
+        title: pmTitle.trim(),
+        instruction: pmInstruction.trim(),
+        triggerKind: pmTriggerKind,
+        priority: pmPriority,
+        ...(pmTriggerKind === 'time'
+          ? { delayMinutes: Number.isFinite(delayNum) && delayNum > 0 ? delayNum : 30 }
+          : {}),
+        ...(pmTriggerKind === 'context' && pmWorkspaceMatch.trim() ? { workspaceMatch: pmWorkspaceMatch.trim() } : {}),
+        ...(pmTriggerKind === 'context' && pmKeywordMatch.trim() ? { keywordMatch: pmKeywordMatch.trim() } : {}),
+        ...(pmTriggerKind === 'event' ? { eventKind: pmEventKind } : {}),
+        ...(pmTriggerKind === 'event' && pmTargetPattern.trim() ? { targetPattern: pmTargetPattern.trim() } : {}),
+      });
+      setPmTitle('');
+      setPmInstruction('');
+      setPmWorkspaceMatch('');
+      setPmKeywordMatch('');
+      setPmTargetPattern('');
+      setCreatingProspective(false);
+      setProspectiveFilter('active');
+      if (created) {
+        setIntuitionFeedback(`已登记前瞻提醒「${created.title}」`);
+      }
+    } catch (err) {
+      setIntuitionIsError(true);
+      setIntuitionFeedback(err instanceof Error ? err.message : '新建前瞻提醒失败');
+    }
+  };
+
+  const handleResolveProspective = async (input: ProspectiveResolveInput, fromSpotlight = false) => {
+    if (!props.onResolveProspectiveIntention) return;
+    if (fromSpotlight) setSpotlightBusy(true);
+    setIntuitionFeedback(null);
+    setIntuitionIsError(false);
+    setSpotlightFeedback(null);
+    setSpotlightIsError(false);
+    try {
+      const res = await props.onResolveProspectiveIntention(input);
+      const actionWord =
+        input.action === 'fulfill' ? '已完成前瞻提醒' : input.action === 'snooze' ? '已延后提醒' : '已取消提醒';
+      if (fromSpotlight) {
+        setSpotlightFeedback(`${actionWord}：${res?.title ?? input.id}`);
+      } else {
+        setIntuitionFeedback(`${actionWord}：${res?.title ?? input.id}`);
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : '更新前瞻提醒失败';
+      if (fromSpotlight) {
+        setSpotlightIsError(true);
+        setSpotlightFeedback(msg);
+      } else {
+        setIntuitionIsError(true);
+        setIntuitionFeedback(msg);
+      }
+    } finally {
+      if (fromSpotlight) setSpotlightBusy(false);
+    }
+  };
+
+  const handleDeleteProspective = async (id: string) => {
+    if (!props.onDeleteProspectiveIntention) return;
+    setIntuitionFeedback(null);
+    setIntuitionIsError(false);
+    try {
+      await props.onDeleteProspectiveIntention(id);
+      setIntuitionFeedback('已移除前瞻历史记录。');
+    } catch (err) {
+      setIntuitionIsError(true);
+      setIntuitionFeedback(err instanceof Error ? err.message : '删除前瞻记录失败');
+    }
+  };
+
+  const handleFlashbackFeedback = async (sourceId: string, feedback: FlashbackFeedback) => {
+    if (!props.onRecordFlashbackFeedback) return;
+    setIntuitionFeedback(null);
+    setIntuitionIsError(false);
+    try {
+      await props.onRecordFlashbackFeedback(sourceId, feedback);
+      const word = feedback === 'helpful' ? '已标记有帮助' : feedback === 'dismissed' ? '已降权该闪回' : '已静默该来源';
+      setIntuitionFeedback(`${word}（${sourceId}）`);
+    } catch (err) {
+      setIntuitionIsError(true);
+      setIntuitionFeedback(err instanceof Error ? err.message : '记录闪回反馈失败');
+    }
+  };
+
+  const handleScanFlashbacksSubmit = async (e: FormEvent) => {
+    e.preventDefault();
+    if (!scanCueInput.trim()) {
+      setScanHits(null);
+      return;
+    }
+    if (!props.onScanIntuitionFlashbacks) return;
+    setIntuitionFeedback(null);
+    setIntuitionIsError(false);
+    try {
+      const hits = await props.onScanIntuitionFlashbacks(scanCueInput.trim());
+      setScanHits(hits);
+    } catch (err) {
+      setIntuitionIsError(true);
+      setIntuitionFeedback(err instanceof Error ? err.message : '直觉风险嗅探失败');
+    }
+  };
+
   const topCrossHelp = activeTab !== 'care' ? openHelpCards[0] : undefined;
   const topCrossDraft = activeTab !== 'skills' || skillSubTab !== 'drafts' ? growthModel.drafts[0] : undefined;
-  const showSpotlight = Boolean(topCrossHelp || topCrossDraft || spotlightFeedback);
+  const topCrossProspective =
+    activeTab !== 'memory' || memorySubTab !== 'intuition' ? surfacedIntentions[0] : undefined;
+  const showSpotlight = Boolean(topCrossHelp || topCrossDraft || topCrossProspective || spotlightFeedback);
 
   // ---- Sleep & Growth Compact Status Strings ----
   const sleepIdleMins = Math.floor(sleepModel.drive.idleDurationMs / 60_000);
@@ -1101,6 +1296,45 @@ export function AsiPanel(props: AsiPanelProps) {
                   }}
                 >
                   审阅草案
+                </button>
+              </div>
+            </div>
+          )}
+
+          {topCrossProspective && (
+            <div
+              className={css.spotlightItem}
+              data-tone={topCrossProspective.priority === 'high' ? 'warn' : undefined}
+              data-testid="spotlight-prospective-banner"
+            >
+              <div className={css.spotlightBody}>
+                <div>
+                  <div className={css.spotlightTitle}>
+                    前瞻提醒待办 ({surfacedIntentions.length})：{topCrossProspective.title}
+                  </div>
+                  <div className={css.spotlightSub}>{topCrossProspective.instruction}</div>
+                </div>
+              </div>
+              <div className={css.actionRow}>
+                <button
+                  type="button"
+                  className={css.primaryBtn}
+                  data-testid="spotlight-fulfill-prospective"
+                  disabled={spotlightBusy}
+                  onClick={() => void handleResolveProspective({ id: topCrossProspective.id, action: 'fulfill' }, true)}
+                >
+                  标记完成
+                </button>
+                <button
+                  type="button"
+                  className={css.btn}
+                  data-testid="spotlight-jump-intuition"
+                  onClick={() => {
+                    setActiveTab('memory');
+                    setMemorySubTab('intuition');
+                  }}
+                >
+                  查看前瞻
                 </button>
               </div>
             </div>
@@ -1379,7 +1613,7 @@ export function AsiPanel(props: AsiPanelProps) {
         </div>
       )}
 
-      {/* 4B. Tab 2: 记忆库 */}
+      {/* 4B. Tab 2: 记忆库 & 直觉前瞻 */}
       {activeTab === 'memory' && (
         <div
           role="tabpanel"
@@ -1388,383 +1622,810 @@ export function AsiPanel(props: AsiPanelProps) {
           className={css.tabPanel}
           data-testid="tabpanel-memory"
         >
-          {/* Compact Sleep Readiness Bar */}
-          <section className={css.card} aria-label="L2 睡眠整合状态">
-            <div className={css.cardHeader}>
-              <span className={css.badgeGroup}>
-                <span className={css.tierPill}>L2</span>
-                <h2 className={css.sectionHeading}>睡眠记忆整合</h2>
-                <span className={css.tagPill} data-zone={sleepModel.drive.zone}>
-                  {sleepModel.drive.suppressed ? '已挂起' : ZONE_WORD[sleepModel.drive.zone]}
-                </span>
-                {sleepModel.autoSleepPaused && (
-                  <span className={css.tagPill} data-zone="uncomfortable">
-                    自动睡眠已暂停
-                  </span>
-                )}
-              </span>
-              <span className={css.scoreNum}>满足 {Math.round(sleepModel.drive.satisfaction)}%</span>
-            </div>
-
-            <p className={css.mutedText}>
-              待整合 {sleepModel.drive.unconsolidatedTurns}/{sleepModel.drive.turnThreshold} 轮 · {sleepQuietText} ·
-              今日自动 {sleepModel.drive.autoRunsToday}/{sleepModel.drive.dailyAutoQuota} 次 · 上次{' '}
-              {formatRelativeAgo(sleepModel.drive.lastSleepAt, sleepModel.now)}
-            </p>
-
-            <div className={css.actionRow}>
-              <button
-                type="button"
-                className={css.primaryBtn}
-                data-testid="consolidate-now-btn"
-                disabled={busyConsolidate || sleepModel.consolidating}
-                onClick={() => void handleConsolidateNow()}
-              >
-                {busyConsolidate || sleepModel.consolidating ? '睡眠整合中…' : '立即睡眠整合'}
-              </button>
-
-              <button
-                type="button"
-                className={css.btn}
-                data-testid="new-memory-btn"
-                onClick={() => {
-                  setCreatingMemory((prev) => !prev);
-                  setEditingMemoryId(null);
-                }}
-              >
-                {creatingMemory ? '收起新建' : '+ 新建记忆'}
-              </button>
-
-              <label className={css.toggleRow}>
-                <input
-                  type="checkbox"
-                  data-testid="auto-sleep-pause-toggle"
-                  checked={sleepModel.autoSleepPaused}
-                  onChange={(e) => void handleToggleAutoSleepPaused(e.currentTarget.checked)}
-                />
-                暂停自动睡眠
-              </label>
-            </div>
-
-            {sleepFeedback && (
-              <div role="status" className={css.feedbackBanner} data-testid="sleep-feedback">
-                <span>{sleepFeedback}</span>
-                <button type="button" className={css.textBtn} onClick={() => setSleepFeedback(null)}>
-                  关闭
-                </button>
-              </div>
-            )}
-          </section>
-
-          {/* Search Input & Pill Filter Bar */}
-          <section className={css.card} aria-label="记忆检索与筛选">
-            <div className={css.searchBar}>
-              <input
-                type="search"
-                className={css.fieldInput}
-                aria-label="搜索记忆库"
-                data-testid="memory-search-input"
-                placeholder="搜索偏好、决策、踩坑、进展…"
-                value={memQuery}
-                onChange={(e) => setMemQuery(e.currentTarget.value)}
-              />
-              {memQuery && (
-                <button type="button" className={css.btn} onClick={() => setMemQuery('')} aria-label="清空搜索词">
-                  清空
-                </button>
-              )}
-            </div>
-
-            <fieldset className={css.pillRow}>
-              <legend className={css.srOnly}>记忆类型筛选</legend>
-              <button
-                type="button"
-                className={`${css.filterPill} ${kindFilter === 'all' ? css.filterPillActive : ''}`}
-                aria-pressed={kindFilter === 'all'}
-                onClick={() => setKindFilter('all')}
-              >
-                全部 ({sleepModel.totalMemories})
-              </button>
-              {MEMORY_KINDS.map((k) => (
-                <button
-                  key={k}
-                  type="button"
-                  className={`${css.filterPill} ${kindFilter === k ? css.filterPillActive : ''}`}
-                  aria-pressed={kindFilter === k}
-                  onClick={() => setKindFilter(k)}
-                >
-                  {MEMORY_KIND_LABELS[k]} ({sleepModel.countsByKind[k] ?? 0})
-                </button>
-              ))}
-            </fieldset>
-          </section>
-
-          {creatingMemory && (
-            <form
-              className={css.card}
-              onSubmit={(e) => void handleCreateMemorySubmit(e)}
-              data-testid="create-memory-form"
+          <fieldset className={css.pillRow}>
+            <legend className={css.srOnly}>记忆与前瞻分区</legend>
+            <button
+              type="button"
+              data-testid="memory-subtab-vault"
+              className={`${css.filterPill} ${memorySubTab === 'vault' ? css.filterPillActive : ''}`}
+              aria-pressed={memorySubTab === 'vault'}
+              onClick={() => setMemorySubTab('vault')}
             >
-              <label className={css.fieldLabel}>
-                记忆类型
-                <select
-                  className={css.fieldSelect}
-                  value={createKind}
-                  onChange={(e) => setCreateKind(e.currentTarget.value as MemoryKind)}
-                >
-                  {MEMORY_KINDS.map((k) => (
-                    <option key={k} value={k}>
-                      {MEMORY_KIND_LABELS[k]} ({k})
-                    </option>
-                  ))}
-                </select>
-              </label>
-              <label className={css.fieldLabel}>
-                标题
-                <input
-                  type="text"
-                  className={css.fieldInput}
-                  required
-                  value={createTitle}
-                  onChange={(e) => setCreateTitle(e.currentTarget.value)}
-                  placeholder="简要概括记忆要点"
-                />
-              </label>
-              <label className={css.fieldLabel}>
-                详细内容
-                <textarea
-                  className={css.fieldTextarea}
-                  required
-                  value={createContent}
-                  onChange={(e) => setCreateContent(e.currentTarget.value)}
-                  placeholder="结构化描述背景、结论或避坑细节"
-                />
-              </label>
-              <label className={css.fieldLabel}>
-                标签（逗号分隔）
-                <input
-                  type="text"
-                  className={css.fieldInput}
-                  value={createTags}
-                  onChange={(e) => setCreateTags(e.currentTarget.value)}
-                  placeholder="例如 pnpm, typescript"
-                />
-              </label>
-              <label className={css.toggleRow}>
-                <input
-                  type="checkbox"
-                  checked={createPinned}
-                  onChange={(e) => setCreatePinned(e.currentTarget.checked)}
-                />
-                置顶（锁定保留率 100%，永不衰减）
-              </label>
-              <div className={css.actionRow}>
-                <button type="submit" className={css.primaryBtn}>
-                  保存记忆
-                </button>
-                <button type="button" className={css.btn} onClick={() => setCreatingMemory(false)}>
-                  取消
-                </button>
-              </div>
-            </form>
-          )}
+              长期记忆 ({sleepModel.totalMemories})
+            </button>
+            <button
+              type="button"
+              data-testid="memory-subtab-intuition"
+              className={`${css.filterPill} ${memorySubTab === 'intuition' ? css.filterPillActive : ''}`}
+              aria-pressed={memorySubTab === 'intuition'}
+              onClick={() => setMemorySubTab('intuition')}
+            >
+              直觉与前瞻 ({intuitionModel.surfacedCount + intuitionModel.pendingCount})
+            </button>
+          </fieldset>
 
-          {/* Scannable Memory Cards */}
-          {filteredMemories.length === 0 ? (
-            <div className={css.card}>
-              <p className={css.mutedText} data-testid="empty-memories-hint">
-                {memQuery || kindFilter !== 'all'
-                  ? '没有匹配的记忆条目。'
-                  : '当前记忆库为空，可通过对话睡眠整合自动沉淀或手动新建。'}
-              </p>
-            </div>
-          ) : (
-            filteredMemories.map((item) => {
-              const retentionPct = Math.round(Math.max(0, Math.min(1, item.retention)) * 100);
-              const isEditing = editingMemoryId === item.id;
-              const isLong = item.content.length > 160;
-              const expanded = Boolean(expandedMemoryIds[item.id]);
-              const shownContent = isLong && !expanded ? `${item.content.slice(0, 158)}…` : item.content;
+          {memorySubTab === 'intuition' ? (
+            <>
+              <section className={css.card} aria-label="L3 前额叶直觉与前瞻状态">
+                <div className={css.cardHeader}>
+                  <span className={css.badgeGroup}>
+                    <span className={css.tierPill}>L3</span>
+                    <h2 className={css.sectionHeading}>直觉闪回与前瞻记忆</h2>
+                    <span className={css.tagPill} data-zone={intuitionModel.drive.zone}>
+                      {intuitionModel.drive.suppressed ? '已挂起' : ZONE_WORD[intuitionModel.drive.zone]}
+                    </span>
+                    {intuitionModel.autoIntuitionPaused && (
+                      <span className={css.tagPill} data-zone="uncomfortable">
+                        自动直觉已暂停
+                      </span>
+                    )}
+                  </span>
+                  <span className={css.scoreNum}>满足 {Math.round(intuitionModel.drive.satisfaction)}%</span>
+                </div>
 
-              return (
-                <article
-                  key={item.id}
+                <p className={css.mutedText}>
+                  已触发 {intuitionModel.surfacedCount} · 守候中 {intuitionModel.pendingCount} · 已完成{' '}
+                  {intuitionModel.fulfilledCount} · 近期闪回 {intuitionModel.recentFlashbacks.length} 次（零 Token
+                  本地）
+                </p>
+
+                <div className={css.actionRow}>
+                  <button
+                    type="button"
+                    className={css.primaryBtn}
+                    data-testid="new-prospective-btn"
+                    onClick={() => setCreatingProspective((v) => !v)}
+                  >
+                    {creatingProspective ? '收起新建' : '+ 新建前瞻提醒'}
+                  </button>
+
+                  <label className={css.toggleRow}>
+                    <input
+                      type="checkbox"
+                      data-testid="auto-intuition-pause-toggle"
+                      checked={intuitionModel.autoIntuitionPaused}
+                      onChange={(e) => void handleToggleAutoIntuition(e.currentTarget.checked)}
+                    />
+                    暂停自动直觉入队
+                  </label>
+                </div>
+
+                {intuitionFeedback && (
+                  <div
+                    role={intuitionIsError ? 'alert' : 'status'}
+                    className={intuitionIsError ? css.alertBanner : css.feedbackBanner}
+                    data-testid="intuition-feedback"
+                  >
+                    <span>{intuitionFeedback}</span>
+                    <button
+                      type="button"
+                      className={css.textBtn}
+                      onClick={() => {
+                        setIntuitionFeedback(null);
+                        setIntuitionIsError(false);
+                      }}
+                    >
+                      关闭
+                    </button>
+                  </div>
+                )}
+              </section>
+
+              <section className={css.card} aria-label="即时直觉风险嗅探">
+                <form className={css.searchBar} onSubmit={(e) => void handleScanFlashbacksSubmit(e)}>
+                  <input
+                    type="search"
+                    className={css.fieldInput}
+                    aria-label="输入操作线索嗅探历史陷阱"
+                    data-testid="intuition-scan-input"
+                    placeholder="输入命令、模块或想法嗅探踩坑闪回…"
+                    value={scanCueInput}
+                    onChange={(e) => setScanCueInput(e.currentTarget.value)}
+                  />
+                  <button type="submit" className={css.btn} data-testid="intuition-scan-btn">
+                    嗅探
+                  </button>
+                </form>
+
+                {scanHits !== null && (
+                  <div data-testid="intuition-scan-results">
+                    {scanHits.length === 0 ? (
+                      <p className={css.mutedText}>未发现高相关历史陷阱或疤痕，当前线索安全。</p>
+                    ) : (
+                      <ul className={css.compactList} aria-label="直觉嗅探命中结果">
+                        {scanHits.map((hit) => (
+                          <li key={hit.sourceId} className={css.compactListItem}>
+                            <div className={css.needRowTop}>
+                              <strong>{hit.title}</strong>
+                              <span className={css.scoreNum}>置信 {Math.round(hit.score * 100)}%</span>
+                            </div>
+                            <span className={css.mutedText}>{hit.caution}</span>
+                          </li>
+                        ))}
+                      </ul>
+                    )}
+                  </div>
+                )}
+              </section>
+
+              {creatingProspective && (
+                <form
                   className={css.card}
-                  data-memory-id={item.id}
-                  data-memory-kind={item.kind}
-                  data-pinned={item.pinned ? 'true' : 'false'}
+                  onSubmit={(e) => void handleCreateProspectiveSubmit(e)}
+                  data-testid="create-prospective-form"
                 >
-                  {isEditing ? (
-                    <form onSubmit={(e) => void handleEditMemorySubmit(e, item.id)} data-testid="edit-memory-form">
-                      <div className={css.needStack}>
-                        <label className={css.fieldLabel}>
-                          记忆类型
-                          <select
-                            className={css.fieldSelect}
-                            value={editKind}
-                            onChange={(e) => setEditKind(e.currentTarget.value as MemoryKind)}
-                          >
-                            {MEMORY_KINDS.map((k) => (
-                              <option key={k} value={k}>
-                                {MEMORY_KIND_LABELS[k]} ({k})
-                              </option>
-                            ))}
-                          </select>
-                        </label>
-                        <label className={css.fieldLabel}>
-                          标题
-                          <input
-                            type="text"
-                            className={css.fieldInput}
-                            required
-                            value={editTitle}
-                            onChange={(e) => setEditTitle(e.currentTarget.value)}
-                          />
-                        </label>
-                        <label className={css.fieldLabel}>
-                          详细内容
-                          <textarea
-                            className={css.fieldTextarea}
-                            required
-                            value={editContent}
-                            onChange={(e) => setEditContent(e.currentTarget.value)}
-                          />
-                        </label>
-                        <label className={css.fieldLabel}>
-                          标签（逗号分隔）
-                          <input
-                            type="text"
-                            className={css.fieldInput}
-                            value={editTags}
-                            onChange={(e) => setEditTags(e.currentTarget.value)}
-                          />
-                        </label>
-                        <label className={css.toggleRow}>
-                          <input
-                            type="checkbox"
-                            checked={editPinned}
-                            onChange={(e) => setEditPinned(e.currentTarget.checked)}
-                          />
-                          置顶（永不衰减）
-                        </label>
-                        <div className={css.actionRow}>
-                          <button type="submit" className={css.primaryBtn}>
-                            保存修改
-                          </button>
-                          <button type="button" className={css.btn} onClick={() => setEditingMemoryId(null)}>
-                            取消
-                          </button>
-                        </div>
-                      </div>
-                    </form>
-                  ) : (
+                  <label className={css.fieldLabel}>
+                    提醒标题
+                    <input
+                      type="text"
+                      className={css.fieldInput}
+                      required
+                      value={pmTitle}
+                      onChange={(e) => setPmTitle(e.currentTarget.value)}
+                      placeholder="例如：发版前核对包白名单"
+                    />
+                  </label>
+                  <label className={css.fieldLabel}>
+                    触发执行指令
+                    <textarea
+                      className={css.fieldTextarea}
+                      required
+                      value={pmInstruction}
+                      onChange={(e) => setPmInstruction(e.currentTarget.value)}
+                      placeholder="触发时提醒自己或模型执行的具体检查事项"
+                    />
+                  </label>
+                  <label className={css.fieldLabel}>
+                    触发方式
+                    <select
+                      className={css.fieldSelect}
+                      value={pmTriggerKind}
+                      onChange={(e) => setPmTriggerKind(e.currentTarget.value as ProspectiveTriggerKind)}
+                    >
+                      {PROSPECTIVE_TRIGGER_KINDS.map((tk) => (
+                        <option key={tk} value={tk}>
+                          {PROSPECTIVE_TRIGGER_LABELS[tk]} ({tk})
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+
+                  {pmTriggerKind === 'time' && (
+                    <label className={css.fieldLabel}>
+                      延迟分钟数
+                      <input
+                        type="number"
+                        min={1}
+                        max={43200}
+                        className={css.fieldInput}
+                        value={pmDelayMins}
+                        onChange={(e) => setPmDelayMins(e.currentTarget.value)}
+                      />
+                    </label>
+                  )}
+
+                  {pmTriggerKind === 'context' && (
                     <>
+                      <label className={css.fieldLabel}>
+                        工作区匹配词
+                        <input
+                          type="text"
+                          className={css.fieldInput}
+                          value={pmWorkspaceMatch}
+                          onChange={(e) => setPmWorkspaceMatch(e.currentTarget.value)}
+                          placeholder="例如 asi 或 demo-web"
+                        />
+                      </label>
+                      <label className={css.fieldLabel}>
+                        提示词或窗口关键词
+                        <input
+                          type="text"
+                          className={css.fieldInput}
+                          value={pmKeywordMatch}
+                          onChange={(e) => setPmKeywordMatch(e.currentTarget.value)}
+                          placeholder="逗号分隔，例如 release, 打包"
+                        />
+                      </label>
+                    </>
+                  )}
+
+                  {pmTriggerKind === 'event' && (
+                    <>
+                      <label className={css.fieldLabel}>
+                        监听事件
+                        <select
+                          className={css.fieldSelect}
+                          value={pmEventKind}
+                          onChange={(e) => setPmEventKind(e.currentTarget.value as ProspectiveEventKind)}
+                        >
+                          {PROSPECTIVE_EVENT_KINDS.map((ek) => (
+                            <option key={ek} value={ek}>
+                              {PROSPECTIVE_EVENT_LABELS[ek]} ({ek})
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                      <label className={css.fieldLabel}>
+                        目标过滤模式（可选）
+                        <input
+                          type="text"
+                          className={css.fieldInput}
+                          value={pmTargetPattern}
+                          onChange={(e) => setPmTargetPattern(e.currentTarget.value)}
+                          placeholder="例如 git push 或 wire-types"
+                        />
+                      </label>
+                    </>
+                  )}
+
+                  <label className={css.fieldLabel}>
+                    优先级
+                    <select
+                      className={css.fieldSelect}
+                      value={pmPriority}
+                      onChange={(e) => setPmPriority(e.currentTarget.value as ProspectivePriority)}
+                    >
+                      <option value="normal">普通 (normal)</option>
+                      <option value="high">高优 (high)</option>
+                    </select>
+                  </label>
+
+                  <div className={css.actionRow}>
+                    <button type="submit" className={css.primaryBtn}>
+                      保存前瞻
+                    </button>
+                    <button type="button" className={css.btn} onClick={() => setCreatingProspective(false)}>
+                      取消
+                    </button>
+                  </div>
+                </form>
+              )}
+
+              <section className={css.card} aria-label="前瞻记忆筛选">
+                <fieldset className={css.pillRow}>
+                  <legend className={css.srOnly}>前瞻记忆状态筛选</legend>
+                  <button
+                    type="button"
+                    data-testid="prospective-filter-active"
+                    className={`${css.filterPill} ${prospectiveFilter === 'active' ? css.filterPillActive : ''}`}
+                    aria-pressed={prospectiveFilter === 'active'}
+                    onClick={() => setProspectiveFilter('active')}
+                  >
+                    待办与守候 ({activeIntentions.length})
+                  </button>
+                  <button
+                    type="button"
+                    data-testid="prospective-filter-history"
+                    className={`${css.filterPill} ${prospectiveFilter === 'history' ? css.filterPillActive : ''}`}
+                    aria-pressed={prospectiveFilter === 'history'}
+                    onClick={() => setProspectiveFilter('history')}
+                  >
+                    已完成与历史 ({historyIntentions.length})
+                  </button>
+                </fieldset>
+              </section>
+
+              {(prospectiveFilter === 'active' ? activeIntentions : historyIntentions).length === 0 ? (
+                <div className={css.card}>
+                  <p className={css.mutedText} data-testid="empty-prospective-hint">
+                    {prospectiveFilter === 'active'
+                      ? '暂无待办前瞻提醒，可在对话中交代未来待办或点击上方新建。'
+                      : '暂无已完成或归档的前瞻记录。'}
+                  </p>
+                </div>
+              ) : (
+                (prospectiveFilter === 'active' ? activeIntentions : historyIntentions).map((item) => {
+                  const isActionable =
+                    item.status === 'surfaced' || item.status === 'pending' || item.status === 'snoozed';
+                  return (
+                    <article
+                      key={item.id}
+                      className={css.card}
+                      data-prospective-id={item.id}
+                      data-prospective-status={item.status}
+                    >
                       <div className={css.cardHeader}>
                         <span className={css.badgeGroup}>
-                          <span className={`${css.tagPill} ${css.tagPillAccent}`}>{MEMORY_KIND_LABELS[item.kind]}</span>
-                          {item.pinned && (
-                            <span className={css.tagPill} data-zone="comfortable">
-                              已置顶 · 永不衰减
+                          <span className={`${css.tagPill} ${css.tagPillAccent}`}>
+                            {PROSPECTIVE_TRIGGER_LABELS[item.trigger.kind]}
+                          </span>
+                          <span
+                            className={css.tagPill}
+                            data-zone={item.status === 'surfaced' ? 'uncomfortable' : 'comfortable'}
+                          >
+                            {PROSPECTIVE_STATUS_LABEL[item.status]}
+                          </span>
+                          {item.priority === 'high' && (
+                            <span className={css.tagPill} data-zone="critical">
+                              高优
                             </span>
                           )}
                         </span>
-                        <span className={css.scoreNum}>{formatRelativeAgo(item.updatedAt, sleepModel.now)}</span>
+                        <span className={css.scoreNum}>{formatRelativeAgo(item.updatedAt, intuitionModel.now)}</span>
                       </div>
 
                       <h2 className={css.itemHeading}>{item.title}</h2>
-                      <p className={css.mutedText}>
-                        {shownContent}{' '}
-                        {isLong && (
-                          <button
-                            type="button"
-                            className={css.textBtn}
-                            onClick={() => setExpandedMemoryIds((prev) => ({ ...prev, [item.id]: !expanded }))}
-                          >
-                            {expanded ? '收起' : '展开'}
-                          </button>
-                        )}
-                      </p>
-
-                      <div className={css.retentionRow}>
-                        <span className={css.retentionBar} aria-hidden="true">
-                          <i className={css.retentionFill} style={{ width: `${retentionPct}%` }} />
-                        </span>
-                        <span>
-                          {item.pinned
-                            ? '保留率 100%（已置顶锁定）'
-                            : `FSRS 保留 ${retentionPct}% · S=${item.fsrs.stability.toFixed(1)}d · 回忆 ${item.recallCount} 次`}
-                        </span>
-                      </div>
-
-                      {item.tags.length > 0 && (
-                        <ul className={css.tagChips} aria-label="记忆标签">
-                          {item.tags.map((tag) => (
-                            <li key={tag} className={css.tagChip}>
-                              #{tag}
-                            </li>
-                          ))}
-                        </ul>
-                      )}
+                      <p className={css.mutedText}>{item.instruction}</p>
+                      <p className={css.mutedText}>{item.triggerSummary}</p>
 
                       <div className={css.actionRow}>
-                        <button
-                          type="button"
-                          className={css.btn}
-                          aria-label={`${item.pinned ? '取消置顶' : '置顶'} ${item.title}`}
-                          onClick={() => void handleTogglePin(item.id, !item.pinned)}
-                        >
-                          {item.pinned ? '取消置顶' : '置顶'}
-                        </button>
-                        <button
-                          type="button"
-                          className={css.btn}
-                          aria-label={`编辑 ${item.title}`}
-                          onClick={() => beginEditMemory(item)}
-                        >
-                          编辑
-                        </button>
-                        <button
-                          type="button"
-                          className={css.btn}
-                          aria-label={`删除 ${item.title}`}
-                          onClick={() => void handleDeleteMemory(item.id)}
-                        >
-                          删除
-                        </button>
+                        {isActionable ? (
+                          <>
+                            <button
+                              type="button"
+                              className={css.primaryBtn}
+                              aria-label={`完成 ${item.title}`}
+                              onClick={() => void handleResolveProspective({ id: item.id, action: 'fulfill' })}
+                            >
+                              完成
+                            </button>
+                            <button
+                              type="button"
+                              className={css.btn}
+                              aria-label={`延后 30m ${item.title}`}
+                              onClick={() =>
+                                void handleResolveProspective({ id: item.id, action: 'snooze', snoozeMinutes: 30 })
+                              }
+                            >
+                              延后 30m
+                            </button>
+                            <button
+                              type="button"
+                              className={css.btn}
+                              aria-label={`取消 ${item.title}`}
+                              onClick={() => void handleResolveProspective({ id: item.id, action: 'cancel' })}
+                            >
+                              取消
+                            </button>
+                          </>
+                        ) : (
+                          <button
+                            type="button"
+                            className={css.btn}
+                            aria-label={`删除记录 ${item.title}`}
+                            onClick={() => void handleDeleteProspective(item.id)}
+                          >
+                            删除记录
+                          </button>
+                        )}
                       </div>
-                    </>
-                  )}
-                </article>
-              );
-            })
-          )}
-
-          {/* Collapsible Recent Sleep Journal */}
-          <details className={css.drawer} data-testid="drawer-sleep-journal">
-            <summary>
-              <span>最近睡眠整合日志（{sleepModel.recentConsolidations.length}）</span>
-              <span className={css.drawerChevron} aria-hidden="true">
-                ▸
-              </span>
-            </summary>
-            <div className={css.drawerBody}>
-              {sleepModel.recentConsolidations.length === 0 ? (
-                <p className={css.mutedText}>暂无睡眠整合记录。</p>
-              ) : (
-                <ul className={css.compactList} aria-label="最近睡眠整合记录">
-                  {sleepModel.recentConsolidations.slice(0, 5).map((rec) => (
-                    <li key={rec.id} className={css.compactListItem}>
-                      <div className={css.needRowTop}>
-                        <strong>{rec.trigger === 'manual' ? '手动整合' : '自动睡眠'}</strong>
-                        <span className={css.scoreNum}>{formatRelativeAgo(rec.at, sleepModel.now)}</span>
-                      </div>
-                      <span className={css.mutedText}>{rec.summary}</span>
-                    </li>
-                  ))}
-                </ul>
+                    </article>
+                  );
+                })
               )}
-            </div>
-          </details>
+
+              <details className={css.drawer} data-testid="drawer-intuition-flashbacks">
+                <summary>
+                  <span>近期直觉闪回与躯体标记（{intuitionModel.recentFlashbacks.length}）</span>
+                  <span className={css.drawerChevron} aria-hidden="true">
+                    ▸
+                  </span>
+                </summary>
+                <div className={css.drawerBody}>
+                  {intuitionModel.recentFlashbacks.length === 0 ? (
+                    <p className={css.mutedText}>暂无触发的直觉闪回记录。</p>
+                  ) : (
+                    <ul className={css.compactList} aria-label="近期直觉闪回记录">
+                      {intuitionModel.recentFlashbacks.slice(0, 8).map((fb) => (
+                        <li key={fb.id} className={css.compactListItem}>
+                          <div className={css.needRowTop}>
+                            <strong>{fb.title}</strong>
+                            <span className={css.scoreNum}>置信 {Math.round(fb.score * 100)}%</span>
+                          </div>
+                          <span className={css.mutedText}>{fb.caution}</span>
+                          <div className={css.actionRow}>
+                            <button
+                              type="button"
+                              className={css.btn}
+                              onClick={() => void handleFlashbackFeedback(fb.sourceId, 'helpful')}
+                            >
+                              有帮助
+                            </button>
+                            <button
+                              type="button"
+                              className={css.btn}
+                              onClick={() => void handleFlashbackFeedback(fb.sourceId, 'dismissed')}
+                            >
+                              降权
+                            </button>
+                            <button
+                              type="button"
+                              className={css.btn}
+                              onClick={() => void handleFlashbackFeedback(fb.sourceId, 'muted')}
+                            >
+                              静默此源
+                            </button>
+                          </div>
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                </div>
+              </details>
+            </>
+          ) : (
+            <>
+              {/* Compact Sleep Readiness Bar */}
+              <section className={css.card} aria-label="L2 睡眠整合状态">
+                <div className={css.cardHeader}>
+                  <span className={css.badgeGroup}>
+                    <span className={css.tierPill}>L2</span>
+                    <h2 className={css.sectionHeading}>睡眠记忆整合</h2>
+                    <span className={css.tagPill} data-zone={sleepModel.drive.zone}>
+                      {sleepModel.drive.suppressed ? '已挂起' : ZONE_WORD[sleepModel.drive.zone]}
+                    </span>
+                    {sleepModel.autoSleepPaused && (
+                      <span className={css.tagPill} data-zone="uncomfortable">
+                        自动睡眠已暂停
+                      </span>
+                    )}
+                  </span>
+                  <span className={css.scoreNum}>满足 {Math.round(sleepModel.drive.satisfaction)}%</span>
+                </div>
+
+                <p className={css.mutedText}>
+                  待整合 {sleepModel.drive.unconsolidatedTurns}/{sleepModel.drive.turnThreshold} 轮 · {sleepQuietText} ·
+                  今日自动 {sleepModel.drive.autoRunsToday}/{sleepModel.drive.dailyAutoQuota} 次 · 上次{' '}
+                  {formatRelativeAgo(sleepModel.drive.lastSleepAt, sleepModel.now)}
+                </p>
+
+                <div className={css.actionRow}>
+                  <button
+                    type="button"
+                    className={css.primaryBtn}
+                    data-testid="consolidate-now-btn"
+                    disabled={busyConsolidate || sleepModel.consolidating}
+                    onClick={() => void handleConsolidateNow()}
+                  >
+                    {busyConsolidate || sleepModel.consolidating ? '睡眠整合中…' : '立即睡眠整合'}
+                  </button>
+
+                  <button
+                    type="button"
+                    className={css.btn}
+                    data-testid="new-memory-btn"
+                    onClick={() => {
+                      setCreatingMemory((prev) => !prev);
+                      setEditingMemoryId(null);
+                    }}
+                  >
+                    {creatingMemory ? '收起新建' : '+ 新建记忆'}
+                  </button>
+
+                  <label className={css.toggleRow}>
+                    <input
+                      type="checkbox"
+                      data-testid="auto-sleep-pause-toggle"
+                      checked={sleepModel.autoSleepPaused}
+                      onChange={(e) => void handleToggleAutoSleepPaused(e.currentTarget.checked)}
+                    />
+                    暂停自动睡眠
+                  </label>
+                </div>
+
+                {sleepFeedback && (
+                  <div role="status" className={css.feedbackBanner} data-testid="sleep-feedback">
+                    <span>{sleepFeedback}</span>
+                    <button type="button" className={css.textBtn} onClick={() => setSleepFeedback(null)}>
+                      关闭
+                    </button>
+                  </div>
+                )}
+              </section>
+
+              {/* Search Input & Pill Filter Bar */}
+              <section className={css.card} aria-label="记忆检索与筛选">
+                <div className={css.searchBar}>
+                  <input
+                    type="search"
+                    className={css.fieldInput}
+                    aria-label="搜索记忆库"
+                    data-testid="memory-search-input"
+                    placeholder="搜索偏好、决策、踩坑、进展…"
+                    value={memQuery}
+                    onChange={(e) => setMemQuery(e.currentTarget.value)}
+                  />
+                  {memQuery && (
+                    <button type="button" className={css.btn} onClick={() => setMemQuery('')} aria-label="清空搜索词">
+                      清空
+                    </button>
+                  )}
+                </div>
+
+                <fieldset className={css.pillRow}>
+                  <legend className={css.srOnly}>记忆类型筛选</legend>
+                  <button
+                    type="button"
+                    className={`${css.filterPill} ${kindFilter === 'all' ? css.filterPillActive : ''}`}
+                    aria-pressed={kindFilter === 'all'}
+                    onClick={() => setKindFilter('all')}
+                  >
+                    全部 ({sleepModel.totalMemories})
+                  </button>
+                  {MEMORY_KINDS.map((k) => (
+                    <button
+                      key={k}
+                      type="button"
+                      className={`${css.filterPill} ${kindFilter === k ? css.filterPillActive : ''}`}
+                      aria-pressed={kindFilter === k}
+                      onClick={() => setKindFilter(k)}
+                    >
+                      {MEMORY_KIND_LABELS[k]} ({sleepModel.countsByKind[k] ?? 0})
+                    </button>
+                  ))}
+                </fieldset>
+              </section>
+
+              {creatingMemory && (
+                <form
+                  className={css.card}
+                  onSubmit={(e) => void handleCreateMemorySubmit(e)}
+                  data-testid="create-memory-form"
+                >
+                  <label className={css.fieldLabel}>
+                    记忆类型
+                    <select
+                      className={css.fieldSelect}
+                      value={createKind}
+                      onChange={(e) => setCreateKind(e.currentTarget.value as MemoryKind)}
+                    >
+                      {MEMORY_KINDS.map((k) => (
+                        <option key={k} value={k}>
+                          {MEMORY_KIND_LABELS[k]} ({k})
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <label className={css.fieldLabel}>
+                    标题
+                    <input
+                      type="text"
+                      className={css.fieldInput}
+                      required
+                      value={createTitle}
+                      onChange={(e) => setCreateTitle(e.currentTarget.value)}
+                      placeholder="简要概括记忆要点"
+                    />
+                  </label>
+                  <label className={css.fieldLabel}>
+                    详细内容
+                    <textarea
+                      className={css.fieldTextarea}
+                      required
+                      value={createContent}
+                      onChange={(e) => setCreateContent(e.currentTarget.value)}
+                      placeholder="结构化描述背景、结论或避坑细节"
+                    />
+                  </label>
+                  <label className={css.fieldLabel}>
+                    标签（逗号分隔）
+                    <input
+                      type="text"
+                      className={css.fieldInput}
+                      value={createTags}
+                      onChange={(e) => setCreateTags(e.currentTarget.value)}
+                      placeholder="例如 pnpm, typescript"
+                    />
+                  </label>
+                  <label className={css.toggleRow}>
+                    <input
+                      type="checkbox"
+                      checked={createPinned}
+                      onChange={(e) => setCreatePinned(e.currentTarget.checked)}
+                    />
+                    置顶（锁定保留率 100%，永不衰减）
+                  </label>
+                  <div className={css.actionRow}>
+                    <button type="submit" className={css.primaryBtn}>
+                      保存记忆
+                    </button>
+                    <button type="button" className={css.btn} onClick={() => setCreatingMemory(false)}>
+                      取消
+                    </button>
+                  </div>
+                </form>
+              )}
+
+              {/* Scannable Memory Cards */}
+              {filteredMemories.length === 0 ? (
+                <div className={css.card}>
+                  <p className={css.mutedText} data-testid="empty-memories-hint">
+                    {memQuery || kindFilter !== 'all'
+                      ? '没有匹配的记忆条目。'
+                      : '当前记忆库为空，可通过对话睡眠整合自动沉淀或手动新建。'}
+                  </p>
+                </div>
+              ) : (
+                filteredMemories.map((item) => {
+                  const retentionPct = Math.round(Math.max(0, Math.min(1, item.retention)) * 100);
+                  const isEditing = editingMemoryId === item.id;
+                  const isLong = item.content.length > 160;
+                  const expanded = Boolean(expandedMemoryIds[item.id]);
+                  const shownContent = isLong && !expanded ? `${item.content.slice(0, 158)}…` : item.content;
+
+                  return (
+                    <article
+                      key={item.id}
+                      className={css.card}
+                      data-memory-id={item.id}
+                      data-memory-kind={item.kind}
+                      data-pinned={item.pinned ? 'true' : 'false'}
+                    >
+                      {isEditing ? (
+                        <form onSubmit={(e) => void handleEditMemorySubmit(e, item.id)} data-testid="edit-memory-form">
+                          <div className={css.needStack}>
+                            <label className={css.fieldLabel}>
+                              记忆类型
+                              <select
+                                className={css.fieldSelect}
+                                value={editKind}
+                                onChange={(e) => setEditKind(e.currentTarget.value as MemoryKind)}
+                              >
+                                {MEMORY_KINDS.map((k) => (
+                                  <option key={k} value={k}>
+                                    {MEMORY_KIND_LABELS[k]} ({k})
+                                  </option>
+                                ))}
+                              </select>
+                            </label>
+                            <label className={css.fieldLabel}>
+                              标题
+                              <input
+                                type="text"
+                                className={css.fieldInput}
+                                required
+                                value={editTitle}
+                                onChange={(e) => setEditTitle(e.currentTarget.value)}
+                              />
+                            </label>
+                            <label className={css.fieldLabel}>
+                              详细内容
+                              <textarea
+                                className={css.fieldTextarea}
+                                required
+                                value={editContent}
+                                onChange={(e) => setEditContent(e.currentTarget.value)}
+                              />
+                            </label>
+                            <label className={css.fieldLabel}>
+                              标签（逗号分隔）
+                              <input
+                                type="text"
+                                className={css.fieldInput}
+                                value={editTags}
+                                onChange={(e) => setEditTags(e.currentTarget.value)}
+                              />
+                            </label>
+                            <label className={css.toggleRow}>
+                              <input
+                                type="checkbox"
+                                checked={editPinned}
+                                onChange={(e) => setEditPinned(e.currentTarget.checked)}
+                              />
+                              置顶（永不衰减）
+                            </label>
+                            <div className={css.actionRow}>
+                              <button type="submit" className={css.primaryBtn}>
+                                保存修改
+                              </button>
+                              <button type="button" className={css.btn} onClick={() => setEditingMemoryId(null)}>
+                                取消
+                              </button>
+                            </div>
+                          </div>
+                        </form>
+                      ) : (
+                        <>
+                          <div className={css.cardHeader}>
+                            <span className={css.badgeGroup}>
+                              <span className={`${css.tagPill} ${css.tagPillAccent}`}>
+                                {MEMORY_KIND_LABELS[item.kind]}
+                              </span>
+                              {item.pinned && (
+                                <span className={css.tagPill} data-zone="comfortable">
+                                  已置顶 · 永不衰减
+                                </span>
+                              )}
+                            </span>
+                            <span className={css.scoreNum}>{formatRelativeAgo(item.updatedAt, sleepModel.now)}</span>
+                          </div>
+
+                          <h2 className={css.itemHeading}>{item.title}</h2>
+                          <p className={css.mutedText}>
+                            {shownContent}{' '}
+                            {isLong && (
+                              <button
+                                type="button"
+                                className={css.textBtn}
+                                onClick={() => setExpandedMemoryIds((prev) => ({ ...prev, [item.id]: !expanded }))}
+                              >
+                                {expanded ? '收起' : '展开'}
+                              </button>
+                            )}
+                          </p>
+
+                          <div className={css.retentionRow}>
+                            <span className={css.retentionBar} aria-hidden="true">
+                              <i className={css.retentionFill} style={{ width: `${retentionPct}%` }} />
+                            </span>
+                            <span>
+                              {item.pinned
+                                ? '保留率 100%（已置顶锁定）'
+                                : `FSRS 保留 ${retentionPct}% · S=${item.fsrs.stability.toFixed(1)}d · 回忆 ${item.recallCount} 次`}
+                            </span>
+                          </div>
+
+                          {item.tags.length > 0 && (
+                            <ul className={css.tagChips} aria-label="记忆标签">
+                              {item.tags.map((tag) => (
+                                <li key={tag} className={css.tagChip}>
+                                  #{tag}
+                                </li>
+                              ))}
+                            </ul>
+                          )}
+
+                          <div className={css.actionRow}>
+                            <button
+                              type="button"
+                              className={css.btn}
+                              aria-label={`${item.pinned ? '取消置顶' : '置顶'} ${item.title}`}
+                              onClick={() => void handleTogglePin(item.id, !item.pinned)}
+                            >
+                              {item.pinned ? '取消置顶' : '置顶'}
+                            </button>
+                            <button
+                              type="button"
+                              className={css.btn}
+                              aria-label={`编辑 ${item.title}`}
+                              onClick={() => beginEditMemory(item)}
+                            >
+                              编辑
+                            </button>
+                            <button
+                              type="button"
+                              className={css.btn}
+                              aria-label={`删除 ${item.title}`}
+                              onClick={() => void handleDeleteMemory(item.id)}
+                            >
+                              删除
+                            </button>
+                          </div>
+                        </>
+                      )}
+                    </article>
+                  );
+                })
+              )}
+
+              {/* Collapsible Recent Sleep Journal */}
+              <details className={css.drawer} data-testid="drawer-sleep-journal">
+                <summary>
+                  <span>最近睡眠整合日志（{sleepModel.recentConsolidations.length}）</span>
+                  <span className={css.drawerChevron} aria-hidden="true">
+                    ▸
+                  </span>
+                </summary>
+                <div className={css.drawerBody}>
+                  {sleepModel.recentConsolidations.length === 0 ? (
+                    <p className={css.mutedText}>暂无睡眠整合记录。</p>
+                  ) : (
+                    <ul className={css.compactList} aria-label="最近睡眠整合记录">
+                      {sleepModel.recentConsolidations.slice(0, 5).map((rec) => (
+                        <li key={rec.id} className={css.compactListItem}>
+                          <div className={css.needRowTop}>
+                            <strong>{rec.trigger === 'manual' ? '手动整合' : '自动睡眠'}</strong>
+                            <span className={css.scoreNum}>{formatRelativeAgo(rec.at, sleepModel.now)}</span>
+                          </div>
+                          <span className={css.mutedText}>{rec.summary}</span>
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                </div>
+              </details>
+            </>
+          )}
         </div>
       )}
 

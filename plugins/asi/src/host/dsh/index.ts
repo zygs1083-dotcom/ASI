@@ -1,6 +1,11 @@
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import type { AsiDrivesServiceApi, AsiSenseServiceApi, AsiSleepServiceApi } from '@asi/sense-types';
+import type {
+  AsiDrivesServiceApi,
+  AsiIntuitionServiceApi,
+  AsiSenseServiceApi,
+  AsiSleepServiceApi,
+} from '@asi/sense-types';
 import type { Context } from '@deepseek-ai/cordis';
 import type {} from '@deepseek-ai/dsh-app-boot';
 import z from '@deepseek-ai/schemastery';
@@ -10,6 +15,10 @@ import { createCareRuntime } from '../../care/host/runtime.ts';
 import { createDshGrowthPorts, registerDshSkillBridge } from '../../growth/host/dsh/dsh-ports.ts';
 import { registerGrowthTools } from '../../growth/host/dsh/tools.ts';
 import { createGrowthRuntime } from '../../growth/host/runtime.ts';
+import { createDshIntuitionPorts } from '../../intuition/host/dsh/dsh-ports.ts';
+import { AsiIntuitionService } from '../../intuition/host/dsh/intuition-service.ts';
+import { registerIntuitionTools } from '../../intuition/host/dsh/tools.ts';
+import { createIntuitionRuntime } from '../../intuition/host/runtime.ts';
 import { migrateLegacyAsiData } from '../../migration/legacy-migration.ts';
 import { AsiDrivesService } from '../../needs/host/dsh/drives-service.ts';
 import { createDshNeedsPorts } from '../../needs/host/dsh/dsh-ports.ts';
@@ -32,10 +41,12 @@ declare module '@deepseek-ai/cordis' {
     asiSense: AsiSenseServiceApi;
     asiDrives: AsiDrivesServiceApi;
     asiSleep: AsiSleepServiceApi;
+    asiIntuition: AsiIntuitionServiceApi;
     asi: AsiRemote;
   }
 }
 
+export { AsiIntuitionService } from '../../intuition/host/dsh/intuition-service.ts';
 export { type LegacyMigrationReport, migrateLegacyAsiData } from '../../migration/legacy-migration.ts';
 export { AsiDrivesService } from '../../needs/host/dsh/drives-service.ts';
 export { AsiSenseService } from '../../sense/host/dsh/index.ts';
@@ -47,13 +58,20 @@ export type {
   JsonValue,
   WireArchivedSkillViewItem,
   WireAsiPanelModel,
+  WireFlashbackFeedback,
+  WireFlashbackMatch,
+  WireFlashbackRecord,
   WireGrowthPanelModel,
   WireGrowthSynthesisRecord,
+  WireIntuitionPanelModel,
   WireMemoryCreateInput,
   WireMemoryKind,
   WireMemoryUpdateInput,
   WireMemoryViewItem,
   WireNeedsPanelModel,
+  WireProspectiveCreateInput,
+  WireProspectiveIntention,
+  WireProspectiveResolveInput,
   WireSkillCreateDraftInput,
   WireSkillDraftViewItem,
   WireSkillExportResult,
@@ -108,6 +126,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   let sleepRuntime: ReturnType<typeof createSleepRuntime> | undefined;
   let careRuntime: ReturnType<typeof createCareRuntime> | undefined;
   let growthRuntime: ReturnType<typeof createGrowthRuntime> | undefined;
+  let intuitionRuntime: ReturnType<typeof createIntuitionRuntime> | undefined;
 
   let offSenseTools: (() => void) | undefined;
   let offNeedsTools: (() => void) | undefined;
@@ -117,9 +136,14 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   let offCareTools: (() => void) | undefined;
   let offGrowthTools: (() => void) | undefined;
   let offGrowthSkills: (() => void) | undefined;
+  let offIntuitionTools: (() => void) | undefined;
 
   const dispose = async () => {
     disposed = true;
+
+    offIntuitionTools?.();
+    offIntuitionTools = undefined;
+    await intuitionRuntime?.stop();
 
     offGrowthSkills?.();
     offGrowthSkills = undefined;
@@ -160,6 +184,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     const sleepRoot = join(config.storageRoot, 'sleep');
     const careRoot = join(config.storageRoot, 'care');
     const growthRoot = join(config.storageRoot, 'growth');
+    const intuitionRoot = join(config.storageRoot, 'intuition');
 
     // 1. L0 Pure Sensory Organ (`ctx.asiSense` + `env_state` / `env_detail`)
     const local = localPorts(ctx, senseRoot);
@@ -247,15 +272,31 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       return;
     }
 
-    // 6. Unified TypeRT Remote Service (`ctx.asi`) for the single unified sidebar panel
+    // 6. Prefrontal Gut-Feeling Somatic Markers & Prospective Memory (`ctx.asiIntuition` + `intuition_status` / `prospective_*`)
+    const intuitionPorts = createDshIntuitionPorts(ctx, intuitionRoot, {
+      excludedRoots: [needsRoot, sleepRoot, careRoot, senseRoot, growthRoot],
+      sleepRuntime,
+    });
+    intuitionRuntime = createIntuitionRuntime(intuitionPorts);
+    offIntuitionTools = registerIntuitionTools(ctx, intuitionRuntime);
+    await intuitionRuntime.start();
+    if (disposed) {
+      await dispose();
+      return;
+    }
+    new AsiIntuitionService(ctx, intuitionRuntime);
+
+    // 7. Unified TypeRT Remote Service (`ctx.asi`) for the single unified sidebar panel
     new AsiRemote(ctx, {
       needsActions: needsRuntime.actions,
       sleepActions: sleepRuntime.actions,
       growthActions: growthRuntime.actions,
+      intuitionActions: intuitionRuntime.actions,
       framesSource: createAsiFramesSource({
         needs: needsRuntime,
         sleep: sleepRuntime,
         growth: growthRuntime,
+        intuition: intuitionRuntime,
       }),
     });
   } catch (error) {

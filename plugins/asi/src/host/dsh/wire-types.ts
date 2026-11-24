@@ -12,6 +12,15 @@ import type {
   SkillViewItem,
 } from '../../growth/shared/types.ts';
 import type {
+  FlashbackFeedback,
+  FlashbackMatch,
+  FlashbackRecord,
+  IntuitionPanelModel,
+  ProspectiveCreateInput,
+  ProspectiveIntention,
+  ProspectiveResolveInput,
+} from '../../intuition/shared/types.ts';
+import type {
   MemoryCreateInput,
   MemoryKind,
   MemoryUpdateInput,
@@ -47,14 +56,24 @@ export type WireSkillExportResult = SkillExportResult;
 export type WireGrowthSynthesisRecord = GrowthSynthesisRecord;
 export type WireGrowthPanelModel = GrowthPanelModel;
 
+export type WireFlashbackFeedback = FlashbackFeedback;
+export type WireFlashbackMatch = FlashbackMatch;
+export type WireFlashbackRecord = FlashbackRecord;
+export type WireProspectiveCreateInput = ProspectiveCreateInput;
+export type WireProspectiveResolveInput = ProspectiveResolveInput;
+export type WireProspectiveIntention = ProspectiveIntention;
+export type WireIntuitionPanelModel = IntuitionPanelModel;
+
 export interface AsiPanelModel {
   needs: NeedsPanelModel;
   sleep: SleepPanelModel;
   growth: GrowthPanelModel;
+  intuition: IntuitionPanelModel;
 }
 
 export interface WireAsiPanelModel {
   needs: WireNeedsPanelModel;
   sleep: WireSleepPanelModel;
   growth: WireGrowthPanelModel;
+  intuition: WireIntuitionPanelModel;
 }

@@ -68,6 +68,7 @@ try {
         files: [
           'src/sleep/shared/types.ts',
           'src/growth/shared/types.ts',
+          'src/intuition/shared/types.ts',
           'src/host/dsh/remote.ts',
           'src/host/dsh/wire-types.ts',
           'src/client/css.d.ts',
