@@ -1,9 +1,9 @@
 {
   "name": "@asi/body-probe",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "private": true,
   "type": "module",
-  "description": "Periodic sampler for machine body vitals (CPU, memory, disks, battery, network, process, tokens) used by asi-sense.",
+  "description": "Periodic sampler for machine body vitals (CPU, memory, disks, battery, network, process, tokens) used by asi.",
   "exports": {
     ".": "./src/index.ts"
   },

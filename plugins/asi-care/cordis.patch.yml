@@ -1,5 +1,0 @@
-- insert:
-    - id: asi-care
-      name: asi-care
-      config:
-        storageRoot: !!js dshHomePath('data', 'asi-care')
