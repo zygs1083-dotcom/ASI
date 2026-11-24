@@ -1,6 +1,6 @@
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import type { AsiDrivesServiceApi, AsiSenseServiceApi, AsiSleepServiceApi } from '@asi/sense-types';
+import type { AsiDrivesServiceApi, AsiSenseServiceApi, AsiSleepServiceApi, AsiTomServiceApi } from '@asi/sense-types';
 import type { Context } from '@deepseek-ai/cordis';
 import type {} from '@deepseek-ai/dsh-app-boot';
 import z from '@deepseek-ai/schemastery';
@@ -24,6 +24,10 @@ import { buildExcludedInternalRoots, createDshSleepPorts } from '../../sleep/hos
 import { AsiSleepService } from '../../sleep/host/dsh/sleep-service.ts';
 import { registerSleepTools } from '../../sleep/host/dsh/tools.ts';
 import { createSleepRuntime } from '../../sleep/host/runtime.ts';
+import { createDshTomPorts } from '../../tom/host/dsh/dsh-ports.ts';
+import { AsiTomService } from '../../tom/host/dsh/tom-service.ts';
+import { registerTomTools } from '../../tom/host/dsh/tools.ts';
+import { createTomRuntime } from '../../tom/host/runtime.ts';
 import { createAsiFramesSource } from './frames.ts';
 import { AsiRemote } from './remote.ts';
 
@@ -32,6 +36,7 @@ declare module '@deepseek-ai/cordis' {
     asiSense: AsiSenseServiceApi;
     asiDrives: AsiDrivesServiceApi;
     asiSleep: AsiSleepServiceApi;
+    asiTom: AsiTomServiceApi;
     asi: AsiRemote;
   }
 }
@@ -40,6 +45,7 @@ export { type LegacyMigrationReport, migrateLegacyAsiData } from '../../migratio
 export { AsiDrivesService } from '../../needs/host/dsh/drives-service.ts';
 export { AsiSenseService } from '../../sense/host/dsh/index.ts';
 export { AsiSleepService } from '../../sleep/host/dsh/sleep-service.ts';
+export { AsiTomService } from '../../tom/host/dsh/tom-service.ts';
 export { AsiRemote } from './remote.ts';
 export type {
   AsiPanelModel,
@@ -54,6 +60,8 @@ export type {
   WireMemoryUpdateInput,
   WireMemoryViewItem,
   WireNeedsPanelModel,
+  WirePartnerOverrideInput,
+  WirePartnerStateKind,
   WireSkillCreateDraftInput,
   WireSkillDraftViewItem,
   WireSkillExportResult,
@@ -63,6 +71,7 @@ export type {
   WireSkillViewItem,
   WireSleepConsolidationRecord,
   WireSleepPanelModel,
+  WireTomPanelModel,
 } from './wire-types.ts';
 
 export const name = 'asi';
@@ -108,6 +117,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   let sleepRuntime: ReturnType<typeof createSleepRuntime> | undefined;
   let careRuntime: ReturnType<typeof createCareRuntime> | undefined;
   let growthRuntime: ReturnType<typeof createGrowthRuntime> | undefined;
+  let tomRuntime: ReturnType<typeof createTomRuntime> | undefined;
 
   let offSenseTools: (() => void) | undefined;
   let offNeedsTools: (() => void) | undefined;
@@ -117,23 +127,25 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   let offCareTools: (() => void) | undefined;
   let offGrowthTools: (() => void) | undefined;
   let offGrowthSkills: (() => void) | undefined;
+  let offTomTools: (() => void) | undefined;
 
   const dispose = async () => {
     disposed = true;
 
+    offTomTools?.();
+    offTomTools = undefined;
     offGrowthSkills?.();
     offGrowthSkills = undefined;
     offGrowthTools?.();
     offGrowthTools = undefined;
-    await growthRuntime?.stop();
-
     offCareTools?.();
     offCareTools = undefined;
-    await careRuntime?.stop();
-
     offSleepTools?.();
     offSleepTools = undefined;
-    await sleepRuntime?.stop();
+
+    // Kick off higher-order runtime stops synchronously in the same tick so all
+    // `stopped` flags & probe aborts take effect before Cordis tears down `ctx` proxies.
+    await Promise.allSettled([tomRuntime?.stop(), growthRuntime?.stop(), careRuntime?.stop(), sleepRuntime?.stop()]);
 
     offStream?.();
     offStream = undefined;
@@ -160,6 +172,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     const sleepRoot = join(config.storageRoot, 'sleep');
     const careRoot = join(config.storageRoot, 'care');
     const growthRoot = join(config.storageRoot, 'growth');
+    const tomRoot = join(config.storageRoot, 'tom');
 
     // 1. L0 Pure Sensory Organ (`ctx.asiSense` + `env_state` / `env_detail`)
     const local = localPorts(ctx, senseRoot);
@@ -247,15 +260,28 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       return;
     }
 
-    // 6. Unified TypeRT Remote Service (`ctx.asi`) for the single unified sidebar panel
+    // 6. Direction B: Theory of Mind — Partner State & Collaborative Tact (`ctx.asiTom` + `partner_state`)
+    const tomPorts = createDshTomPorts(ctx, tomRoot);
+    tomRuntime = createTomRuntime(tomPorts);
+    offTomTools = registerTomTools(ctx, tomRuntime);
+    await tomRuntime.start();
+    if (disposed) {
+      await dispose();
+      return;
+    }
+    new AsiTomService(ctx, tomRuntime);
+
+    // 7. Unified TypeRT Remote Service (`ctx.asi`) for the single unified sidebar panel
     new AsiRemote(ctx, {
       needsActions: needsRuntime.actions,
       sleepActions: sleepRuntime.actions,
       growthActions: growthRuntime.actions,
+      tomActions: tomRuntime.actions,
       framesSource: createAsiFramesSource({
         needs: needsRuntime,
         sleep: sleepRuntime,
         growth: growthRuntime,
+        tom: tomRuntime,
       }),
     });
   } catch (error) {

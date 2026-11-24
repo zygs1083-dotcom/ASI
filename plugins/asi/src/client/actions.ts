@@ -65,6 +65,10 @@ export function createAsiActions(api: Api, onNavigateSession?: (sessionId: strin
     onRestoreSkill: (name) => complete(() => api.restoreSkill(name)),
     onDeleteArchivedSkill: (name) => complete(() => api.deleteArchivedSkill(name)),
     onExportSkillToWorkspace: (name, ws) => complete(() => api.exportSkillToWorkspace(name, ws)),
+
+    onSetTomEnabled: (enabled) => complete(() => api.setTomEnabled(enabled)),
+    onSetPartnerOverride: (input) => complete(() => api.setPartnerOverride(input)),
+    onResetTomBaseline: () => complete(() => api.resetTomBaseline()),
   };
 
   return {

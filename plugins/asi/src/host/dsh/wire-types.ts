@@ -19,6 +19,7 @@ import type {
   SleepConsolidationRecord,
   SleepPanelModel,
 } from '../../sleep/shared/types.ts';
+import type { PartnerOverrideInput, PartnerStateKind, TomPanelModel } from '../../tom/shared/types.ts';
 
 export type JsonValue = string | number | boolean | null | JsonValue[] | JsonObject;
 export interface JsonObject {
@@ -47,14 +48,20 @@ export type WireSkillExportResult = SkillExportResult;
 export type WireGrowthSynthesisRecord = GrowthSynthesisRecord;
 export type WireGrowthPanelModel = GrowthPanelModel;
 
+export type WirePartnerStateKind = PartnerStateKind;
+export type WirePartnerOverrideInput = PartnerOverrideInput;
+export type WireTomPanelModel = TomPanelModel;
+
 export interface AsiPanelModel {
   needs: NeedsPanelModel;
   sleep: SleepPanelModel;
   growth: GrowthPanelModel;
+  tom: TomPanelModel;
 }
 
 export interface WireAsiPanelModel {
   needs: WireNeedsPanelModel;
   sleep: WireSleepPanelModel;
   growth: WireGrowthPanelModel;
+  tom: WireTomPanelModel;
 }
