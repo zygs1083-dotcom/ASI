@@ -7,7 +7,7 @@ import { createAssistantMessage, createUserMessage } from '@deepseek-ai/dsh-llm'
 import { createScope } from '@deepseek-ai/dsh-scope';
 import SessionStore, { SessionId } from '@deepseek-ai/dsh-session';
 import SkillRegistry from '@deepseek-ai/dsh-skill';
-import SystemPrompt from '@deepseek-ai/dsh-system-prompt';
+import SystemPrompt, { renderPrompt } from '@deepseek-ai/dsh-system-prompt';
 import { NativeToolExecutor } from '@deepseek-ai/dsh-tool-executor-native';
 import ToolsService from '@deepseek-ai/dsh-tools';
 import { createElement as h } from 'react';
@@ -31,7 +31,7 @@ afterEach(async () => {
 
 describe('方向 B · ToM 全栈 Cordis 集成、100% Prompt Cache 恒定保护与静默仲裁验证', () => {
   it('暴露 ctx.asiTom 与 partner_state 工具：跨状态跃迁时 systemPrompt 100% 字节恒定，高摩擦驱动绝不唤醒后台 LLM，且记忆偏好全链路脱敏', {
-    timeout: 30_000,
+    timeout: 45_000,
   }, async () => {
     const rootDir = await mkdtemp(join(tmpdir(), 'asi-tom-cordis-'));
     tempDirs.push(rootDir);
@@ -63,11 +63,32 @@ describe('方向 B · ToM 全栈 Cordis 集成、100% Prompt Cache 恒定保护�
     } as unknown as Agent & { ctx: Context };
     subAgent.ctx = createScope(root, subAgent).ctx;
 
+    const maintSession = root.sessions.create(SessionId('asi-maint-probe-1'), {
+      meta: { cwd: join(rootDir, 'data', 'asi', 'needs', 'sandbox'), isSeeded: false },
+    });
+    const maintAgent = {
+      id: maintSession.id,
+      status: 'idle' as const,
+      session: maintSession,
+    } as unknown as Agent & { ctx: Context };
+    maintAgent.ctx = createScope(root, maintAgent).ctx;
+
+    const secondChatSession = root.sessions.create(SessionId('sess-partner-2'), {
+      meta: { cwd: rootDir, isSeeded: false },
+    });
+    const secondUserAgent = {
+      id: secondChatSession.id,
+      status: 'idle' as const,
+      session: secondChatSession,
+    } as unknown as Agent & { ctx: Context };
+    secondUserAgent.ctx = createScope(root, secondUserAgent).ctx;
+
+    const archivedSessionIds: string[] = [];
     const createMaintSpy = vi.fn(async () => ({ sessionId: SessionId('asi-maint-should-not-run') }));
 
     root.provide('agents', {
-      list: () => [userAgent, subAgent],
-      get: (id: string) => [userAgent, subAgent].find((a) => a.id === id),
+      list: () => [userAgent, subAgent, maintAgent, secondUserAgent],
+      get: (id: string) => [userAgent, subAgent, maintAgent, secondUserAgent].find((a) => a.id === id),
       withoutInitiator: <T>(fn: () => T) => fn(),
     });
     root.provide('jobs', { list: () => [], kill: () => 'already-finished', events: { subscribe: () => () => {} } });
@@ -75,9 +96,11 @@ describe('方向 B · ToM 全栈 Cordis 集成、100% Prompt Cache 恒定保护�
     root.provide('sessionProjections', { snapshot: () => ({ values: {} }) });
     root.provide('tokenMeter', { contextPressure: () => ({}) });
     root.provide('workspaceRegistry', {
-      archivedSessionIds: [],
+      get archivedSessionIds() {
+        return archivedSessionIds;
+      },
       create: async () => ({}),
-      list: () => [{ id: 'ws-1', path: rootDir, sessionIds: [chatSession.id] }],
+      list: () => [{ id: 'ws-1', path: rootDir, sessionIds: [chatSession.id, secondChatSession.id] }],
     });
     root.provide('profileContext', {
       name: 'desktop',
@@ -112,6 +135,17 @@ describe('方向 B · ToM 全栈 Cordis 集成、100% Prompt Cache 恒定保护�
       const promptBefore = await root.systemPrompt.assemble({ agent: userAgent, scope: userAgent });
       const tomSectionBefore = promptBefore.sections.find((s) => s.name === 'asi-tom');
       expect(tomSectionBefore).toBeDefined();
+      expect(tomSectionBefore?.text.length).toBeGreaterThan(20);
+
+      // 两个不同普通会话共享 100% 恒定字节提示词；asi-maint-* 与 subagent 自动隔离返回空串，渲染后零 partner_state 引导
+      const promptSecondUser = await root.systemPrompt.assemble({ agent: secondUserAgent, scope: secondUserAgent });
+      expect(promptSecondUser.sections.find((s) => s.name === 'asi-tom')?.text).toBe(tomSectionBefore?.text);
+      const promptMaint = await root.systemPrompt.assemble({ agent: maintAgent, scope: maintAgent });
+      const promptSub = await root.systemPrompt.assemble({ agent: subAgent, scope: subAgent });
+      expect(promptMaint.sections.find((s) => s.name === 'asi-tom')?.text).toBe('');
+      expect(promptSub.sections.find((s) => s.name === 'asi-tom')?.text).toBe('');
+      expect(renderPrompt(promptMaint)).not.toContain('partner_state');
+      expect(renderPrompt(promptSub)).not.toContain('partner_state');
 
       // 注入一条含敏感 token 的长期协作偏好记忆，验证 partner_state 会联动读取并彻底打码
       const fakeKey = `${['sk', '-'].join('')}${'a9'.repeat(15)}`;
@@ -178,7 +212,7 @@ describe('方向 B · ToM 全栈 Cordis 集成、100% Prompt Cache 恒定保护�
       expect(JSON.stringify(toolOut)).not.toContain(fakeKey);
       expect(JSON.stringify(toolOut)).toContain('[redacted]');
 
-      // 子代理会话调用 partner_state 被严格拒绝
+      // 子代理、内部自维护会话与已归档会话调用 partner_state 均被严格拒绝
       await expect(
         partnerTool?.execute({}, {
           agent: subAgent,
@@ -186,6 +220,36 @@ describe('方向 B · ToM 全栈 Cordis 集成、100% Prompt Cache 恒定保护�
           callId: 'call_sub' as never,
         } as never),
       ).rejects.toThrow(/restricted to ordinary user sessions/);
+      await expect(
+        partnerTool?.execute({}, {
+          agent: maintAgent,
+          signal: new AbortController().signal,
+          callId: 'call_maint' as never,
+        } as never),
+      ).rejects.toThrow(/restricted to ordinary user sessions/);
+      archivedSessionIds.push(String(secondChatSession.id));
+      await expect(
+        partnerTool?.execute({}, {
+          agent: secondUserAgent,
+          signal: new AbortController().signal,
+          callId: 'call_archived' as never,
+        } as never),
+      ).rejects.toThrow(/restricted to ordinary user sessions/);
+      archivedSessionIds.length = 0;
+
+      // 全局暂停感知期间，ToM 严格冻结信号摄入与 EWMA 基线更新
+      await root.asiSense.setPaused(true);
+      const sampleCountBeforePause = root.asiTom.snapshot().baseline.sampleCount;
+      chatSession.append('turn/start', { turn: 3 });
+      chatSession.append(
+        'user/message',
+        createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text: '暂停期间测试消息' }] }),
+        { surfaceOp: 'append' },
+      );
+      chatSession.append('turn/end', { turn: 3, reason: { kind: 'completed' } });
+      await new Promise((r) => setTimeout(r, 25));
+      expect(root.asiTom.snapshot().baseline.sampleCount).toBe(sampleCountBeforePause);
+      await root.asiSense.setPaused(false);
 
       // 通过 AsiRemote RPC 一键校准锁定为 deep_focus -> 验证 shouldDeferProactiveWork() 与实时帧同步
       const overriddenModel = await root.asi.setPartnerOverride({ state: 'deep_focus', durationMinutes: 45 });

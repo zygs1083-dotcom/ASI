@@ -1,6 +1,7 @@
 import { createElement as h } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { describe, expect, it, vi } from 'vitest';
+import { AsiPanel } from '../../src/client/AsiPanel.tsx';
 import { createAsiActions } from '../../src/client/actions.ts';
 import css from '../../src/client/asi-panel.module.css';
 import { createFrameState, staleAsiPanelModel } from '../../src/client/frame-state.ts';
@@ -28,7 +29,18 @@ describe('统一客户端流状态机、动作封装与 Slot 包装渲染验证'
     expect(staled.growth.stale).toBe(true);
     expect(staled.intuition.stale).toBe(true);
     expect(staled.tom.stale).toBe(true);
+    expect(staled.dream.stale).toBe(true);
     expect(staled.needs.state.self.body.cpu.status).toBe('stale');
+
+    // 验证统一 6 域 AsiPanel 在 SSR 下（care 与 memory 两个主视图）均零异常渲染
+    const dummyActions = createAsiActions({} as Parameters<typeof createAsiActions>[0], () => {}).actions;
+    const careHtml = renderToStaticMarkup(h(AsiPanel, { model: hydrated, initialTab: 'care', ...dummyActions }));
+    expect(careHtml).toContain('tom-partner-card');
+    expect(careHtml).toContain('tom-capsule-badge');
+    const memoryHtml = renderToStaticMarkup(h(AsiPanel, { model: hydrated, initialTab: 'memory', ...dummyActions }));
+    expect(memoryHtml).toContain('memory-subtab-vault');
+    expect(memoryHtml).toContain('memory-subtab-intuition');
+    expect(memoryHtml).toContain('memory-subtab-insights');
   });
 
   it('createFrameState 在断线重连期间保留上次快照，dispose 后安全停止通知', async () => {

@@ -302,4 +302,108 @@ describe('DMN 仓库身份归一化、只读非源码画像与跨项目做梦引
     expect(hits.length).toBeGreaterThan(0);
     expect(hits[0]?.title).toContain('LLM 精炼');
   });
+
+  it('路径安全边界矩阵：$HOME、/tmp 容器根、无 .git 普通目录、~/.secrets 及指向 .secrets 的符号链接（含深层不存在子路径与符号链接 .git）一律返回 undefined 且零敏感读取；/tmp 子仓库与不存在子目录正常归一，且 decision-tension 严格脱敏', async () => {
+    const fakeHome = await mkdtemp(join(tmpdir(), 'asi-dream-sec-matrix-'));
+    tempDirs.push(fakeHome);
+
+    const secretToken = ['sk', '-', 'live', '9'.repeat(28)].join('');
+    const secretsDir = join(fakeHome, '.secrets');
+    await mkdir(join(secretsDir, '.git'), { recursive: true });
+    await writeFile(
+      join(secretsDir, 'package.json'),
+      JSON.stringify({ name: 'should-never-read-secret', description: secretToken }),
+    );
+
+    const plainNonGitDir = join(fakeHome, 'projects', 'plain-notes');
+    await mkdir(plainNonGitDir, { recursive: true });
+    await writeFile(join(plainNonGitDir, 'package.json'), JSON.stringify({ name: 'plain-notes' }));
+
+    const validTmpRepo = join(fakeHome, 'projects', 'clean-repo');
+    await mkdir(join(validTmpRepo, '.git'), { recursive: true });
+    await writeFile(join(validTmpRepo, 'package.json'), JSON.stringify({ name: 'clean-repo' }));
+
+    const repoWithSymlinkGit = join(fakeHome, 'projects', 'symlink-git-repo');
+    await mkdir(repoWithSymlinkGit, { recursive: true });
+    await symlink(join(secretsDir, '.git'), join(repoWithSymlinkGit, '.git'));
+
+    const sneakyLinkToSecrets = join(fakeHome, 'projects', 'sneaky-secrets-link');
+    await symlink(secretsDir, sneakyLinkToSecrets);
+
+    // 1. 容器根本身（$HOME、/tmp、/）与无 .git 普通目录必须返回 undefined
+    expect(await resolveCanonicalRepoIdentity(fakeHome, fakeHome)).toBeUndefined();
+    expect(await resolveCanonicalRepoIdentity('/tmp', fakeHome)).toBeUndefined();
+    expect(await resolveCanonicalRepoIdentity('/', fakeHome)).toBeUndefined();
+    expect(await resolveCanonicalRepoIdentity(plainNonGitDir, fakeHome)).toBeUndefined();
+    expect(await resolveCanonicalRepoIdentity(join(plainNonGitDir, 'missing', 'leaf'), fakeHome)).toBeUndefined();
+
+    // 2. ~/.secrets 及其符号链接（含深层不存在子路径与符号链接 .git）全部拦截
+    expect(await resolveCanonicalRepoIdentity(secretsDir, fakeHome)).toBeUndefined();
+    expect(await resolveCanonicalRepoIdentity(sneakyLinkToSecrets, fakeHome)).toBeUndefined();
+    expect(
+      await resolveCanonicalRepoIdentity(join(sneakyLinkToSecrets, 'deep', 'missing', 'sub'), fakeHome),
+    ).toBeUndefined();
+    expect(await resolveCanonicalRepoIdentity(repoWithSymlinkGit, fakeHome)).toBeUndefined();
+
+    // 3. 合法 /tmp 子目录 Git 仓库及不存在的深层子路径 join(repo, 'src', 'sub') 正常解析到 .git 根
+    const resolvedValid = await resolveCanonicalRepoIdentity(validTmpRepo, fakeHome);
+    const resolvedMissingLeaf = await resolveCanonicalRepoIdentity(join(validTmpRepo, 'src', 'sub'), fakeHome);
+    expect(resolvedValid?.repoKey).toBeDefined();
+    expect(resolvedMissingLeaf?.repoKey).toBe(resolvedValid?.repoKey);
+
+    const collected = await collectRepoProfiles(
+      [
+        fakeHome,
+        '/tmp',
+        plainNonGitDir,
+        secretsDir,
+        sneakyLinkToSecrets,
+        join(sneakyLinkToSecrets, 'deep', 'missing'),
+        repoWithSymlinkGit,
+        validTmpRepo,
+      ],
+      { homeDir: fakeHome },
+    );
+    expect(collected.profiles).toHaveLength(1);
+    expect(collected.profiles[0]?.repoName).toBe('clean-repo');
+    expect(JSON.stringify(collected)).not.toContain('should-never-read-secret');
+    expect(JSON.stringify(collected)).not.toContain(secretToken);
+
+    // 4. decision-tension 候选文本字段经过 sanitizeDreamText 脱敏，绝不残留凭据或未掩码主目录
+    const secondRepo = join(fakeHome, 'projects', 'second-repo');
+    await mkdir(join(secondRepo, '.git'), { recursive: true });
+    await writeFile(join(secondRepo, 'package.json'), JSON.stringify({ name: 'second-repo' }));
+    const pairCollected = await collectRepoProfiles([validTmpRepo, secondRepo], { homeDir: fakeHome });
+
+    const tensionBridges = discoverCandidateCrossRepoBridges({
+      repoProfiles: pairCollected.profiles,
+      cwdToRepoKey: pairCollected.cwdToRepoKey,
+      sessionWorkspaces: new Map([
+        ['s1', validTmpRepo],
+        ['s2', secondRepo],
+      ]),
+      memories: [
+        makeMem({
+          id: 'm_pnpm',
+          kind: 'preference',
+          title: `始终使用 pnpm 管理依赖 ${secretToken}`,
+          content: '本项目统一使用 pnpm workspace。',
+          sourceSessionIds: ['s1'],
+        }),
+        makeMem({
+          id: 'm_yarn',
+          kind: 'decision',
+          title: '统一采用 yarn 安装构建',
+          content: '仓库锁定使用 yarn 避免混装。',
+          sourceSessionIds: ['s2'],
+        }),
+      ],
+      turns: [],
+      homeDir: fakeHome,
+    });
+    const tension = tensionBridges.find((b) => b.kind === 'decision-tension');
+    expect(tension).toBeDefined();
+    expect(JSON.stringify(tension)).not.toContain(secretToken);
+    expect(tension?.deterministicSummary).toContain('[redacted]');
+  });
 });

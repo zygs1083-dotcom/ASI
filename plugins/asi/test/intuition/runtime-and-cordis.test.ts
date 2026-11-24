@@ -119,7 +119,27 @@ describe('前额叶直觉与前瞻记忆（src/intuition）全链路 Cordis / DS
     } as unknown as Agent & { ctx: Context };
     subAgent.ctx = createScope(root, subAgent).ctx;
 
-    const agentsList: Agent[] = [userAgent, subAgent];
+    const maintSession = root.sessions.create(SessionId('asi-maint-int-1'), {
+      meta: { cwd: join(rootDir, 'data', 'asi', 'needs', 'sandbox'), isSeeded: false },
+    });
+    const maintAgent = {
+      id: maintSession.id,
+      status: 'idle' as const,
+      session: maintSession,
+    } as unknown as Agent & { ctx: Context };
+    maintAgent.ctx = createScope(root, maintAgent).ctx;
+
+    const archivedSession = root.sessions.create(SessionId('sess-archived-user'), {
+      meta: { cwd: wsProject, isSeeded: false },
+    });
+    const archivedAgent = {
+      id: archivedSession.id,
+      status: 'idle' as const,
+      session: archivedSession,
+    } as unknown as Agent & { ctx: Context };
+    archivedAgent.ctx = createScope(root, archivedAgent).ctx;
+
+    const agentsList: Agent[] = [userAgent, subAgent, maintAgent, archivedAgent];
     let jobSubscriber:
       | ((ev: { type: string; job: { id: string; owner?: string; label: string; status: string } }) => void)
       | undefined;
@@ -145,7 +165,7 @@ describe('前额叶直觉与前瞻记忆（src/intuition）全链路 Cordis / DS
     root.provide('sessionProjections', { snapshot: () => ({ values: {} }) });
     root.provide('tokenMeter', { contextPressure: () => ({}) });
     root.provide('workspaceRegistry', {
-      archivedSessionIds: [],
+      archivedSessionIds: [archivedSession.id],
       create: async () => ({}),
       list: () => [{ id: 'ws-1', path: wsProject, sessionIds: [userSession.id] }],
     });
@@ -297,6 +317,62 @@ describe('前额叶直觉与前瞻记忆（src/intuition）全链路 Cordis / DS
       expect(coalescedText).toContain('长构建任务结束后检查产物大小');
       expect(coalescedText).toContain('新会话启动对齐分支状态');
 
+      // 验证取消/完成已驻留事件提醒时通过 inbox.remove 干净撤回 next-step 驻留消息（零残留）
+      expect(root.asiIntuition.snapshot().surfacedCount).toBeGreaterThanOrEqual(3);
+      const resolveForRetract = root.tools.executable('prospective_resolve', userAgent);
+      for (const surfacedItem of root.asiIntuition.listIntentions({ statuses: ['surfaced'] })) {
+        if (surfacedItem.id === createdCtxRes.intention.id) continue;
+        await resolveForRetract?.execute({ id: surfacedItem.id, action: 'cancel' }, {
+          callId: `call-retract-${surfacedItem.id}` as never,
+          agent: userAgent,
+          signal: new AbortController().signal,
+        } as never);
+      }
+      expect(injectedNextStep).toHaveLength(0);
+
+      // 再次驻留一条提醒后开启暂停 -> 立即通过 inbox.remove 撤回驻留消息，且暂停态工具失败不落疤痕
+      await rememberDef?.execute(
+        {
+          title: '暂停撤回验证提醒',
+          instruction: '验证暂停时自动撤回 next-step 驻留消息',
+          triggerKind: 'event',
+          eventKind: 'next_session',
+        },
+        {
+          callId: 'call-rem-pause' as never,
+          agent: userAgent,
+          signal: new AbortController().signal,
+        } as never,
+      );
+      emitAgentEvent(root, userAgent, 'agent/created', { source: 'resume' });
+      expect(injectedNextStep).toHaveLength(1);
+
+      await root.asi.setAutoIntuitionPaused(true);
+      expect(injectedNextStep).toHaveLength(0);
+
+      const pausedScarExec: ToolExecution = {
+        callId: 'tc-paused-scar' as never,
+        rootCallId: 'tc-paused-scar' as never,
+        token: Symbol() as never,
+        name: 'bash',
+        arguments: { command: 'pnpm --filter paused-pkg run test' },
+        agent: userAgent,
+        signal: new AbortController().signal,
+      };
+      root.emit('tools/result', pausedScarExec, {
+        content: [{ type: 'text', text: 'err1' }],
+        isError: true,
+        value: { kind: 'foreground', exitCode: 1 },
+      } as never);
+      root.emit('tools/result', pausedScarExec, {
+        content: [{ type: 'text', text: 'err2' }],
+        isError: true,
+        value: { kind: 'foreground', exitCode: 1 },
+      } as never);
+      await root.asi.setAutoIntuitionPaused(false);
+      await root.waterfall('tools/pre-execute', pausedScarExec, async () => ({ kind: 'allow' as const }));
+      expect(injectedNextStep).toHaveLength(0);
+
       // 5. 验证工具连续失败 2 次形成短期报错疤痕（SomaticScar），并在下次工具 pre-execute 时自动 inject 预警
       const fakeExec: ToolExecution = {
         callId: 'tc-scar' as never,
@@ -318,12 +394,33 @@ describe('前额叶直觉与前瞻记忆（src/intuition）全链路 Cordis / DS
         value: { kind: 'foreground', exitCode: 2 },
       } as never);
 
-      expect(root.asiIntuition.snapshot().surfacedCount).toBeGreaterThanOrEqual(2);
+      expect(root.asiIntuition.snapshot().surfacedCount).toBeGreaterThanOrEqual(1);
       await root.waterfall('tools/pre-execute', fakeExec, async () => ({ kind: 'allow' as const }));
-      expect(injectedNextStep.length).toBeGreaterThanOrEqual(2);
+      expect(injectedNextStep.length).toBeGreaterThanOrEqual(1);
       const latestInjected = injectedNextStep.at(-1);
       if (!latestInjected) throw new Error('expected injected step warning');
       expect(extractTextFromMessage(latestInjected)).toContain('本轮重复报错疤痕');
+
+      // 子代理、内部自维护会话与已归档会话调用全部 3 个 intuition 工具均被严格拦截
+      const statusToolGuard = root.tools.executable('intuition_status', userAgent);
+      for (const nonOrdinary of [subAgent, maintAgent, archivedAgent]) {
+        for (const [toolExec, sampleArgs] of [
+          [statusToolGuard, {}],
+          [rememberDef, { title: 'x', instruction: 'y', triggerKind: 'event', eventKind: 'next_session' }],
+          [resolveForRetract, { id: 'int_none', action: 'cancel' }],
+        ] as const) {
+          await expect(
+            toolExec?.execute(
+              sampleArgs as never,
+              {
+                callId: 'call-guard' as never,
+                agent: nonOrdinary,
+                signal: new AbortController().signal,
+              } as never,
+            ),
+          ).rejects.toThrow(/restricted to ordinary user sessions/);
+        }
+      }
 
       // 6. 调用 prospective_resolve 完成前瞻提醒并通过 intuition_status 自检核验
       const resolveDef = root.tools.executable('prospective_resolve', userAgent);

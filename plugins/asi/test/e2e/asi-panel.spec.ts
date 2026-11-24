@@ -53,11 +53,19 @@ test.describe('ASI 统一侧栏面板 320px 响应式、明暗双主题与 axe �
           await expect(page.getByTestId(`tabpanel-${tab}`)).toBeVisible();
           await expectNoOverflow(page);
           await axeCheck(page);
+
+          if (tab === 'memory') {
+            for (const subId of ['memory-subtab-intuition', 'memory-subtab-insights', 'memory-subtab-vault']) {
+              await page.getByTestId(subId).click();
+              await expectNoOverflow(page);
+              await axeCheck(page);
+            }
+          }
         }
 
-        // 切回「稳态看护」验证默认收起的三个低频抽屉展开后在 320px 下同样零溢出、零 axe 违规
+        // 切回「稳态看护」验证默认收起的四个折叠抽屉展开后在 320px 下同样零溢出、零 axe 违规
         await page.getByTestId('asi-main-tab-care').click();
-        for (const drawerId of ['drawer-ledger', 'drawer-body', 'drawer-env']) {
+        for (const drawerId of ['drawer-tom', 'drawer-ledger', 'drawer-body', 'drawer-env']) {
           const drawer = page.getByTestId(drawerId);
           await expect(drawer).not.toHaveAttribute('open', '');
           await drawer.locator('> summary').click();
@@ -75,8 +83,10 @@ test.describe('ASI 统一侧栏面板 320px 响应式、明暗双主题与 axe �
     await page.setViewportSize({ width: 340, height: 940 });
     await openUnifiedPanel(page, 'pending-approvals', 'dark', 'care');
 
-    // 1. 顶部全局状态胶囊与快捷设置弹出层
+    // 1. 顶部全局状态胶囊与快捷设置弹出层（含记忆库单数字角标防拥挤与全局暂停联动 ToM 徽章）
     await expect(page.getByTestId('global-status-capsule')).toBeVisible();
+    await expect(page.getByTestId('asi-main-tab-memory')).not.toContainText('+');
+    await expect(page.getByTestId('tom-capsule-badge')).toBeVisible();
     await page.getByTestId('quick-settings-btn').click();
     const popover = page.getByTestId('quick-settings-popover');
     await expect(popover).toBeVisible();
@@ -84,9 +94,21 @@ test.describe('ASI 统一侧栏面板 320px 响应式、明暗双主题与 axe �
 
     await page.getByTestId('global-pause-toggle').check();
     await expect(page.getByTestId('global-status-capsule')).toContainText('已暂停');
+    await expect(page.getByTestId('tom-capsule-badge')).toHaveCount(0);
+    await expect(page.getByTestId('tom-state-pill')).toContainText('随全局暂停');
     await page.getByTestId('global-pause-toggle').uncheck();
+    await expect(page.getByTestId('tom-capsule-badge')).toBeVisible();
 
-    // 2. 在「稳态看护」页：顶部焦点条自动提示跨 Tab 的「新技能草案待审」
+    // 2. 在「稳态看护」页：顶部焦点条按马斯洛优先级顺序呈现前瞻 -> 技能草案 -> 顿悟
+    const careSpotlightOrder = await page
+      .getByTestId('cross-tab-spotlight')
+      .locator('> div[data-testid]')
+      .evaluateAll((els) => els.map((el) => el.getAttribute('data-testid')));
+    expect(careSpotlightOrder).toEqual([
+      'spotlight-prospective-banner',
+      'spotlight-draft-banner',
+      'spotlight-insight-banner',
+    ]);
     await expect(page.getByTestId('spotlight-draft-banner')).toContainText('playwright-contrast-guard');
 
     // 3. 键盘方向键切换 Tab：care -> ArrowRight -> memory
@@ -332,6 +354,12 @@ test.describe('ASI 统一侧栏面板 320px 响应式、明暗双主题与 axe �
     await page.getByTestId('asi-main-tab-memory').click();
     await page.getByTestId('consolidate-now-btn').click();
     await expect(page.getByTestId('sleep-feedback')).toContainText('立即睡眠整合失败');
+
+    await page.getByTestId('memory-subtab-insights').click();
+    await page.getByTestId('dream-now-btn').click();
+    const dreamAlert = page.getByTestId('dream-feedback');
+    await expect(dreamAlert).toContainText('立即做梦联想失败');
+    await expect(dreamAlert).toHaveAttribute('role', 'alert');
 
     await page.getByTestId('asi-main-tab-skills').click();
     await page.getByTestId('synthesize-now-btn').click();
