@@ -3,6 +3,7 @@ import { makeGrowthScenario } from '../growth/mock-scenarios.ts';
 import type { AsiPanelModel } from '../host/dsh/wire-types.ts';
 import { makeIntuitionScenario } from '../intuition/mock-scenarios.ts';
 import { makeSleepScenario } from '../sleep/mock-scenarios.ts';
+import { makeTomScenario } from '../tom/mock-scenarios.ts';
 
 export const ASI_UNIFIED_SCENARIOS = [
   'homeostasis-healthy',
@@ -23,7 +24,8 @@ export function makeUnifiedScenario(name: AsiUnifiedScenarioName): AsiPanelModel
     const sleep = makeSleepScenario('sleepy-waiting');
     const growth = makeGrowthScenario('deep-quiet-waiting');
     const intuition = makeIntuitionScenario('intuition-surfaced');
-    return { needs, sleep, growth, intuition };
+    const tom = makeTomScenario('stuck-debugging', needs.now);
+    return { needs, sleep, growth, intuition, tom };
   }
 
   if (name === 'critical-suppressed') {
@@ -31,7 +33,8 @@ export function makeUnifiedScenario(name: AsiUnifiedScenarioName): AsiPanelModel
     const sleep = makeSleepScenario('suppressed-l1');
     const growth = makeGrowthScenario('suppressed-lower-tier');
     const intuition = makeIntuitionScenario('intuition-suppressed');
-    return { needs, sleep, growth, intuition };
+    const tom = makeTomScenario('suppressed-sprint', needs.now);
+    return { needs, sleep, growth, intuition, tom };
   }
 
   if (name === 'empty-clean') {
@@ -42,7 +45,8 @@ export function makeUnifiedScenario(name: AsiUnifiedScenarioName): AsiPanelModel
     const sleep = makeSleepScenario('empty-vault');
     const growth = makeGrowthScenario('empty-workshop');
     const intuition = makeIntuitionScenario('intuition-empty');
-    return { needs, sleep, growth, intuition };
+    const tom = makeTomScenario('steady-clean', needs.now);
+    return { needs, sleep, growth, intuition, tom };
   }
 
   const needs = makeScenario('healthy');
@@ -51,5 +55,6 @@ export function makeUnifiedScenario(name: AsiUnifiedScenarioName): AsiPanelModel
   growth.drafts = [];
   growth.draftCount = 0;
   const intuition = makeIntuitionScenario('intuition-healthy');
-  return { needs, sleep, growth, intuition };
+  const tom = makeTomScenario('deep-focus', needs.now);
+  return { needs, sleep, growth, intuition, tom };
 }

@@ -78,7 +78,13 @@
 
 1. **腹内侧前额叶躯体标记闪回（vmPFC Gut-Feeling）**：复用 `MiniSearch` 指纹索引与 FSRS 保留率权重，在 `<10ms` 纯本地零 Token 扫描 consolidated `pitfall`/`decision`/`preference` 记忆与本轮重复报错疤痕（`SomaticScar`），支持 `helpful` / `dismissed` / `muted` 反馈调节与同会话 30 分钟冷却防刷屏。
 2. **极前额叶前瞻记忆（BA10 Prospective Memory）**：支持 `time`（定时到期）、`context`（工作区/关键词/前台应用，严守 `sendTitles` 隐私门控）与 `event`（`next_session` / `tool_call` / `sleep_completed` / `job_finished` / `network_online`）三类触发器及 `pending -> surfaced -> fulfilled/snoozed/canceled/expired` 完整生命周期，持久化于 `<storageRoot>/intuition/`。
-3. **100% 保护前缀 Prompt Cache 的尾部触达与闭环工具**：绝不动态修改 `systemPrompt` 或唤醒空闲会话；空闲触发经 `agent.send(..., 'next-turn', false)` 与 `inbox.replace` 原位合并入队，新轮次入口经 `agent/pre-step`（`step === 1`）尾部追加 `<asi-intuition>`，向日常对话暴露 `intuition_status`、`prospective_remember`、`prospective_resolve` 并暴露 `ctx.asiIntuition` 服务。
+3. **100% 保护前缀 Prompt Cache 的尾部触达与闭环工具**：绝不动态修改 `systemPrompt` 或唤醒空闲会话；空闲触发经 `agent.send(..., 'next-step', false)` 与 `inbox.replace` / `inbox.remove` 原位合并或撤回入队，新轮次入口经 `agent/pre-step`（`step === 1`）尾部追加 `<asi-intuition>`，向日常对话暴露 `intuition_status`、`prospective_remember`、`prospective_resolve` 并暴露 `ctx.asiIntuition` 服务。
+
+## 6B. 心智理论——搭档状态感知与协作眼力见（`src/tom/`）
+
+1. **零 Token 确定性推断与个体节律 EWMA 基线**：纯本机融合 `ctx.asiSense` 注意力拓扑（应用类别驻留、5 分钟切换熵、锁屏/休眠）与普通会话交互动力学（发信间隔、指令精炼度、主动打断 `interrupted`、回合/命令非零退出、审批延迟），按个体 EWMA 节律基线归一化推断六种搭档认知状态（`deep_focus`、`rapid_sprint`、`stuck_debugging`、`exploring`、`steady_flow`、`away_resting`）及四维连续指标（`focus`、`friction`、`pace`、`presence`）；持久化于 `<storageRoot>/tom/state.json`，绝不存储对话原文、窗口标题或路径历史。
+2. **100% Prompt Cache 保护与默契适应处方（`TactGuidance`）**：对普通对话会话注册字节恒定的静态 `systemPrompt` 引导段（`asi-tom`，内部自维护会话与子代理返回空串隔离）与按需只读工具 `partner_state`（可选只读联动 `ctx.asiSleep` 高保留率协作偏好，全链路经 `sanitizeForModel` 脱敏），指导模型默契调整回复详略度、验证姿态与澄清问题预算，严禁生硬点破推断情绪。
+3. **静默马斯洛协同与透明一键校准**：暴露 `ctx.asiTom` 服务（含 `shouldDeferProactiveWork()` 免扰避让信号），并向 `ctx.asiDrives` 注册 `tier: 3` 静默社交驱动 `asi-tom:social_tact`（`autoMaintain: false`，零后台 LLM 唤醒、零 `<asi-cry>`）；在侧栏顶部状态胶囊与「稳态看护」独立卡片 `<TomCard />` 中支持 60 分钟手动覆写与在线校准偏置学习。
 
 ## 7. 统一侧栏界面（`id: 'asi'`，`order: 90`）
 

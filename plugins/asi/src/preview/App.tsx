@@ -26,6 +26,8 @@ import {
   type SleepConsolidationRecord,
   type SleepPanelModel,
 } from '../sleep/shared/types.ts';
+import { buildTactGuidance } from '../tom/host/evaluator.ts';
+import { PARTNER_STATE_LABELS, type TomPanelModel } from '../tom/shared/types.ts';
 
 type Theme = 'light' | 'dark';
 
@@ -912,6 +914,77 @@ export function App() {
               minScore: 0.45,
               limit: 4,
             });
+          }}
+          onSetTomEnabled={async (enabled) => {
+            if (initial.failActions) throw new Error('模拟连接中断：切换状态感知失败');
+            setModel((prev) => ({
+              ...prev,
+              tom: {
+                ...prev.tom,
+                enabled,
+                source: enabled ? (prev.tom.manualOverride ? 'manual_override' : 'inferred') : 'paused',
+              },
+            }));
+            setLastAction(enabled ? '已开启搭档状态感知' : '已关闭搭档状态感知');
+          }}
+          onSetPartnerOverride={async (input) => {
+            if (initial.failActions) throw new Error('模拟连接中断：搭档状态校准失败');
+            let nextTom: TomPanelModel | undefined;
+            setModel((prev) => {
+              const target = input.state;
+              if (target === null) {
+                nextTom = {
+                  ...prev.tom,
+                  source: prev.tom.enabled ? 'inferred' : 'paused',
+                  manualOverride: null,
+                  confidence: 0.85,
+                };
+              } else {
+                const durMs = (input.durationMinutes ?? 60) * 60_000;
+                const guidance = buildTactGuidance(target, prev.tom.dimensions);
+                nextTom = {
+                  ...prev.tom,
+                  state: target,
+                  source: 'manual_override',
+                  confidence: 1,
+                  guidance,
+                  manualOverride: {
+                    state: target,
+                    setAt: prev.tom.now,
+                    expiresAt: prev.tom.now + durMs,
+                  },
+                  reasons: [`已手动锁定为「${PARTNER_STATE_LABELS[target]}」（剩余 60 分钟自动恢复推断）。`],
+                  baseline: {
+                    ...prev.tom.baseline,
+                    calibrationCount: prev.tom.baseline.calibrationCount + 1,
+                  },
+                };
+              }
+              return { ...prev, tom: nextTom };
+            });
+            setLastAction(input.state ? `已校准搭档状态：${PARTNER_STATE_LABELS[input.state]}` : '已恢复自动状态感知');
+            return nextTom;
+          }}
+          onResetTomBaseline={async () => {
+            if (initial.failActions) throw new Error('模拟连接中断：重置基线失败');
+            let nextTom: TomPanelModel | undefined;
+            setModel((prev) => {
+              nextTom = {
+                ...prev.tom,
+                source: prev.tom.enabled ? 'inferred' : 'paused',
+                manualOverride: null,
+                baseline: {
+                  sampleCount: 0,
+                  avgCadenceSec: 65,
+                  avgPromptChars: 140,
+                  avgSwitchesPer5m: 4,
+                  calibrationCount: 0,
+                },
+              };
+              return { ...prev, tom: nextTom };
+            });
+            setLastAction('已重置搭档交互基线');
+            return nextTom;
           }}
         />
       </main>

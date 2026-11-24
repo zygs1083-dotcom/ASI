@@ -27,6 +27,7 @@ describe('统一客户端流状态机、动作封装与 Slot 包装渲染验证'
     expect(staled.sleep.stale).toBe(true);
     expect(staled.growth.stale).toBe(true);
     expect(staled.intuition.stale).toBe(true);
+    expect(staled.tom.stale).toBe(true);
     expect(staled.needs.state.self.body.cpu.status).toBe('stale');
   });
 

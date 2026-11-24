@@ -72,6 +72,10 @@ export function createAsiActions(api: Api, onNavigateSession?: (sessionId: strin
     onDeleteProspectiveIntention: (id) => complete(() => api.deleteProspectiveIntention(id)),
     onRecordFlashbackFeedback: (sourceId, feedback) => complete(() => api.recordFlashbackFeedback(sourceId, feedback)),
     onScanIntuitionFlashbacks: (cueText) => complete(() => api.scanIntuitionFlashbacks(cueText)),
+
+    onSetTomEnabled: (enabled) => complete(() => api.setTomEnabled(enabled)),
+    onSetPartnerOverride: (input) => complete(() => api.setPartnerOverride(input)),
+    onResetTomBaseline: () => complete(() => api.resetTomBaseline()),
   };
 
   return {

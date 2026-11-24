@@ -9,7 +9,8 @@
 3. **L2 睡眠与记忆整合（`src/sleep/`，`ctx.asiSleep`）**：在对话满 12 轮或满 6 小时产生困意，于 10 分钟空闲或锁屏且 L1 舒适时自动运行仿生 NREM+REM 双阶段睡眠整合（结合 `ts-fsrs` 遗忘衰减与 `MiniSearch` 中英检索，支持 `MEMORY.md` 双向对账），向日常对话暴露只读工具 `memory_recall` / `memory_profile`。
 4. **L3 工作区与项目看护（`src/care/`）**：零配置发现工作区并展开 Git 兄弟工作树，按 2 小时活跃豁免与三级安全护栏治理仓库卫生、孤儿开发端口与闲置构建产物，全程零 `<asi-cry>` 对话打断，向日常对话暴露只读工具 `care_status`。
 5. **L4 技能提炼与自进化（`src/growth/`，`ctx.skills.registerProvider`）**：在 L1–L3 舒适且深静默（空闲 `>= 20 分钟` 或锁屏）时从高保留率踩坑记忆与排障轨迹提炼标准纯文本 `agentskills` `SKILL.md` 草案（含 `v1 → v2+` 差异对比），经人工一键批准后热挂载至 `ctx.skills`（支持 `global`/`workspace` 作用域隔离、一键导出至 `.agents/skills/` 与 60 天代谢提醒），向日常对话暴露只读工具 `growth_status`。
-6. **前额叶直觉闪回与前瞻记忆（`src/intuition/`，`ctx.asiIntuition`）**：纯本地 `<10ms` 零 Token 匹配历史踩坑/关键决策躯体标记与工具重复报错疤痕，结合定时/情境/事件三类前瞻记忆触发器，以 `next-turn` 静默尾部合并入队与 `pre-step` 同轮尾部挂载触达（零唤醒空闲会话、100% 保护前缀 Prompt Cache），嵌入「记忆库 → 直觉与前瞻」子分区及跨页焦点条，开放 `intuition_status`、`prospective_remember`、`prospective_resolve` 闭环工具。
+6. **前额叶直觉闪回与前瞻记忆（`src/intuition/`，`ctx.asiIntuition`）**：纯本地 `<10ms` 零 Token 匹配历史踩坑/关键决策躯体标记与工具重复报错疤痕，结合定时/情境/事件三类前瞻记忆触发器，以 `next-step` 静默尾部合并/撤回入队与 `pre-step` 同轮尾部挂载触达（零唤醒空闲会话、100% 保护前缀 Prompt Cache），嵌入「记忆库 → 直觉与前瞻」子分区及跨页焦点条，开放 `intuition_status`、`prospective_remember`、`prospective_resolve` 闭环工具。
+7. **心智理论与协作眼力见（`src/tom/`，`ctx.asiTom`）**：零 Token 融合注意力拓扑与会话交互节律（个体 EWMA 基线归一化），实时推断搭档状态（`deep_focus` / `rapid_sprint` / `stuck_debugging` / `exploring` / `steady_flow` / `away_resting`）与四维指标，注册静默协作驱动 `asi-tom:social_tact`（`autoMaintain: false`）、静态提示词契约与按需只读工具 `partner_state`（100% 保护 Prompt Cache），并在统一侧栏提供透明一键校准闭环。
 
 ## 无损数据自动迁移（`0.5.0` → `0.6.0`）
 

@@ -58,7 +58,9 @@ import {
   type MemoryViewItem,
   type SleepConsolidationRecord,
 } from '../sleep/shared/types.ts';
+import type { PartnerOverrideInput, TomPanelModel } from '../tom/shared/types.ts';
 import css from './asi-panel.module.css';
+import { TomCapsuleBadge, TomCard } from './TomCard.tsx';
 
 export type AsiMainTab = 'care' | 'memory' | 'skills';
 
@@ -103,6 +105,11 @@ export interface AsiPanelActions {
   onDeleteProspectiveIntention?: (id: string) => Promise<void>;
   onRecordFlashbackFeedback?: (sourceId: string, feedback: FlashbackFeedback) => Promise<void>;
   onScanIntuitionFlashbacks?: (cueText: string) => Promise<FlashbackMatch[]>;
+
+  // Direction B: Theory of Mind (Partner State & Collaborative Tact)
+  onSetTomEnabled?: (enabled: boolean) => Promise<void> | undefined;
+  onSetPartnerOverride?: (input: PartnerOverrideInput) => Promise<TomPanelModel | undefined> | undefined;
+  onResetTomBaseline?: () => Promise<TomPanelModel | undefined> | undefined;
 }
 
 export interface AsiPanelProps extends AsiPanelActions {
@@ -166,6 +173,7 @@ const HIGHER_DRIVE_LABEL: Record<string, string> = {
   'asi-care:orphan_runtime': 'L3 僵尸进程与孤儿端口',
   'asi-care:workspace_bloat': 'L3 闲置工作树产物膨胀',
   'asi-intuition:prospective_sentinel': 'L3 前额叶直觉与前瞻',
+  'asi-tom:social_tact': 'L3 搭档协作默契',
   'asi-growth:skill_synthesis': 'L4 技能提炼与自进化',
 };
 
@@ -260,7 +268,8 @@ export function AsiPanel(props: AsiPanelProps) {
   const sleepModel = props.model.sleep;
   const growthModel = props.model.growth;
   const intuitionModel = props.model.intuition;
-  const isStale = Boolean(sleepModel.stale || growthModel.stale || intuitionModel.stale);
+  const tomModel = props.model.tom;
+  const isStale = Boolean(sleepModel.stale || growthModel.stale || intuitionModel.stale || tomModel?.stale);
 
   // ---- Global Navigation & Settings State ----
   const [activeTab, setActiveTab] = useState<AsiMainTab>(props.initialTab ?? 'care');
@@ -1085,6 +1094,7 @@ export function AsiPanel(props: AsiPanelProps) {
           </span>
         </div>
         <div className={css.capsuleRight}>
+          {tomModel && <TomCapsuleBadge tom={tomModel} onSelectCareTab={() => selectMainTab('care')} />}
           {needsModel.instinct.powerMode === 'eco' && <span className={`${css.metaChip} ${css.warnChip}`}>节能</span>}
           {needsModel.paused && <span className={`${css.metaChip} ${css.warnChip}`}>已暂停</span>}
           <span className={css.metaChip} title="观察、记忆与技能数据经脱敏仅留在本机">
@@ -1451,6 +1461,16 @@ export function AsiPanel(props: AsiPanelProps) {
               })}
             </div>
           </section>
+
+          {/* Direction B: Theory of Mind — Partner State & Collaborative Tact */}
+          {tomModel && (
+            <TomCard
+              tom={tomModel}
+              onSetTomEnabled={props.onSetTomEnabled}
+              onSetPartnerOverride={props.onSetPartnerOverride}
+              onResetTomBaseline={props.onResetTomBaseline}
+            />
+          )}
 
           {/* Maslow L2-L4 Status Summary & Compact Self-Maintenance Controls */}
           <section className={css.card} data-higher-drives aria-label="高阶需求仲裁与自维护">

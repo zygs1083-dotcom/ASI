@@ -1,0 +1,282 @@
+/* Standalone CSS Module for Theory of Mind (`TomCard.tsx`), consuming `--asi-*` tokens. */
+
+.capsuleBadge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 1px 7px;
+  border-radius: 999px;
+  border: 0.5px solid var(--asi-border-subtle);
+  background: var(--asi-surface-soft);
+  color: var(--asi-fg);
+  font: inherit;
+  font-size: 11px;
+  line-height: 1.4;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.capsuleBadge[data-tone="focus"] {
+  background: color-mix(in srgb, var(--asi-accent) 13%, var(--asi-surface));
+  border-color: color-mix(in srgb, var(--asi-accent) 36%, var(--asi-border-subtle));
+  color: var(--asi-ink-accent);
+}
+
+.capsuleBadge[data-tone="friction"] {
+  background: color-mix(in srgb, var(--asi-warn) 14%, var(--asi-surface));
+  border-color: color-mix(in srgb, var(--asi-warn) 38%, var(--asi-border-subtle));
+  color: var(--asi-ink-warn);
+}
+
+.tomCard {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px;
+  border-radius: 10px;
+  background: var(--asi-surface);
+  border: 0.5px solid var(--asi-border-subtle);
+  min-width: 0;
+}
+
+.headerRow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-width: 0;
+}
+
+.heading {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--asi-fg);
+}
+
+.statePill {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 1px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 500;
+  background: var(--asi-surface-soft);
+  border: 0.5px solid var(--asi-border-subtle);
+  color: var(--asi-fg);
+}
+
+.statePill[data-tone="focus"] {
+  background: color-mix(in srgb, var(--asi-accent) 13%, var(--asi-surface));
+  border-color: color-mix(in srgb, var(--asi-accent) 36%, var(--asi-border-subtle));
+  color: var(--asi-ink-accent);
+}
+
+.statePill[data-tone="friction"] {
+  background: color-mix(in srgb, var(--asi-warn) 14%, var(--asi-surface));
+  border-color: color-mix(in srgb, var(--asi-warn) 38%, var(--asi-border-subtle));
+  color: var(--asi-ink-warn);
+}
+
+.tactBox {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding: 7px 9px;
+  border-radius: 8px;
+  background: var(--asi-surface-soft);
+  min-width: 0;
+}
+
+.tactHeadline {
+  margin: 0;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--asi-fg);
+}
+
+.tactChips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  min-width: 0;
+}
+
+.tactChip {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 6px;
+  border-radius: 6px;
+  font-size: 11px;
+  background: var(--asi-surface);
+  border: 0.5px solid var(--asi-border-subtle);
+  color: var(--asi-fg-muted);
+}
+
+.dimGrid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px 10px;
+  min-width: 0;
+}
+
+.dimCell {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+
+.dimTop {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 4px;
+  font-size: 11px;
+  color: var(--asi-fg-muted);
+}
+
+.dimVal {
+  font-weight: 500;
+  color: var(--asi-fg);
+}
+
+.dimTrack {
+  height: 4px;
+  border-radius: 999px;
+  background: var(--asi-surface-soft);
+  overflow: hidden;
+}
+
+.dimFill {
+  display: block;
+  height: 100%;
+  border-radius: 999px;
+  background: var(--asi-accent);
+}
+
+.dimFill[data-tone="warn"] {
+  background: var(--asi-warn);
+}
+
+.reasonText {
+  margin: 0;
+  font-size: 12px;
+  color: var(--asi-fg-muted);
+}
+
+.calibrateGroup {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+  margin: 0;
+  padding: 0;
+  border: none;
+  min-width: 0;
+  min-inline-size: 0;
+}
+
+.calibrateBtn {
+  padding: 2px 7px;
+  border-radius: 999px;
+  border: 0.5px solid var(--asi-border-subtle);
+  background: var(--asi-surface-soft);
+  color: var(--asi-fg);
+  font: inherit;
+  font-size: 11px;
+  line-height: 1.4;
+  cursor: pointer;
+}
+
+.calibrateBtn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.calibrateBtnActive {
+  background: color-mix(in srgb, var(--asi-accent) 14%, var(--asi-surface));
+  border-color: color-mix(in srgb, var(--asi-accent) 42%, var(--asi-border-subtle));
+  color: var(--asi-ink-accent);
+  font-weight: 600;
+}
+
+.feedbackRow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  padding: 5px 8px;
+  border-radius: 7px;
+  font-size: 11px;
+  background: var(--asi-surface-soft);
+  color: var(--asi-fg);
+}
+
+.feedbackError {
+  background: color-mix(in srgb, var(--asi-crit) 11%, var(--asi-surface));
+  color: var(--asi-ink-crit);
+}
+
+.inlineTextBtn {
+  padding: 1px 5px;
+  border: none;
+  background: transparent;
+  color: var(--asi-ink-accent);
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.tomDrawer {
+  border-top: 0.5px solid var(--asi-border-subtle);
+  padding-top: 6px;
+  min-width: 0;
+}
+
+.tomDrawerSummary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--asi-fg-muted);
+  cursor: pointer;
+  list-style: none;
+}
+
+.tomDrawerSummary::-webkit-details-marker {
+  display: none;
+}
+
+.tomDrawerBody {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding-top: 6px;
+  font-size: 12px;
+  color: var(--asi-fg-muted);
+}
+
+.toggleRow {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--asi-fg);
+  cursor: pointer;
+}
+
+.secondaryBtn {
+  align-self: flex-start;
+  padding: 3px 9px;
+  border-radius: 7px;
+  border: 0.5px solid var(--asi-border-strong);
+  background: var(--asi-surface-soft);
+  color: var(--asi-fg);
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+}

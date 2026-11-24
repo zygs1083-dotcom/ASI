@@ -8,6 +8,8 @@ import {
   factStatusAt,
   NEED_KEYS,
   type NeedEvaluation,
+  PARTNER_STATE_KINDS,
+  type PartnerStateSnapshot,
   type SenseSettingsSnapshot,
   type SleepMemorySummary,
   sanitizeForModel,
@@ -17,6 +19,13 @@ import {
 describe('shared type exports', () => {
   it('exposes survival need keys, thermal ordinals, freshness helpers and credential sanitization', () => {
     expect(NEED_KEYS).toEqual(['energy', 'space', 'memory', 'mind', 'thermals']);
+    expect(PARTNER_STATE_KINDS).toContain('deep_focus');
+    expect(PARTNER_STATE_KINDS).toContain('stuck_debugging');
+    const tomCheck: Pick<PartnerStateSnapshot, 'state' | 'source'> = {
+      state: 'steady_flow',
+      source: 'inferred',
+    };
+    expect(tomCheck.state).toBe('steady_flow');
     expect(THERMAL_ORDINAL.critical).toBe(3);
 
     const settings: SenseSettingsSnapshot = {

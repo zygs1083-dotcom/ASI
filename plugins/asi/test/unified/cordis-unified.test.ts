@@ -253,6 +253,7 @@ describe('统一单插件 asi (0.6.0) 全栈 Cordis 集成与旧版数据零重�
           'intuition_status',
           'prospective_remember',
           'prospective_resolve',
+          'partner_state',
         ]),
       );
       expect(toolNames).not.toContain('needs_clean_cache');
@@ -268,6 +269,8 @@ describe('统一单插件 asi (0.6.0) 全栈 Cordis 集成与旧版数据零重�
       expect(firstFrame.value?.growth.activeCount).toBe(1);
       expect(firstFrame.value?.intuition.pendingCount).toBe(0);
       expect(root.asiIntuition).toBeDefined();
+      expect(firstFrame.value?.tom.enabled).toBe(true);
+      expect(root.asiTom.snapshot().state).toBeDefined();
 
       const createdDraft = await root.asi.createManualDraft({
         name: 'unified-panel-check',

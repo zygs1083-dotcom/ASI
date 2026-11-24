@@ -85,6 +85,19 @@ export type {
   SleepMemoryQueryOptions,
   SleepMemorySummary,
 } from './sleep.js';
+export {
+  type AsiTomServiceApi,
+  PARTNER_STATE_KINDS,
+  type PartnerBaselineSummary,
+  type PartnerDimensions,
+  type PartnerManualOverride,
+  type PartnerStateKind,
+  type PartnerStateSnapshot,
+  type PartnerStateSource,
+  type TactAutonomy,
+  type TactGuidance,
+  type TactVerbosity,
+} from './tom.js';
 
 /** Identifies a signal/fact producer: which source, via which API, on which host. */
 export interface SourceRef {

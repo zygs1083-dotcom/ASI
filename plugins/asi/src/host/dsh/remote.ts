@@ -15,6 +15,8 @@ import {
 import type { NeedsActions } from '../../needs/host/runtime.ts';
 import type { SleepActionsApi } from '../../sleep/host/runtime.ts';
 import { MEMORY_KINDS, type MemoryKind } from '../../sleep/shared/types.ts';
+import type { TomActionsApi } from '../../tom/host/runtime.ts';
+import { PARTNER_STATE_KINDS, type PartnerStateKind } from '../../tom/shared/types.ts';
 import type { AsiFramesSource } from './frames.ts';
 import { toWireAsiPanelModel } from './wire.ts';
 import type {
@@ -27,6 +29,7 @@ import type {
   WireMemoryKind,
   WireMemoryUpdateInput,
   WireMemoryViewItem,
+  WirePartnerOverrideInput,
   WireProspectiveCreateInput,
   WireProspectiveIntention,
   WireProspectiveResolveInput,
@@ -37,6 +40,7 @@ import type {
   WireSkillUpdateMarkdownInput,
   WireSkillViewItem,
   WireSleepConsolidationRecord,
+  WireTomPanelModel,
 } from './wire-types.ts';
 
 declare module '@deepseek-ai/cordis' {
@@ -73,11 +77,16 @@ function isFlashbackFeedback(value: unknown): value is FlashbackFeedback {
   return value === 'helpful' || value === 'dismissed' || value === 'muted';
 }
 
+function isPartnerStateKind(value: unknown): value is PartnerStateKind {
+  return typeof value === 'string' && (PARTNER_STATE_KINDS as readonly string[]).includes(value);
+}
+
 export interface AsiRemoteDeps {
   needsActions?: NeedsActions;
   sleepActions?: SleepActionsApi;
   growthActions?: GrowthActionsApi;
   intuitionActions?: IntuitionActionsApi;
+  tomActions?: TomActionsApi;
   framesSource?: AsiFramesSource;
 }
 
@@ -103,6 +112,10 @@ export class AsiRemote extends TypertRemoteService {
 
   bindIntuitionActions(actions: IntuitionActionsApi | undefined): void {
     this.deps.intuitionActions = actions;
+  }
+
+  bindTomActions(actions: TomActionsApi | undefined): void {
+    this.deps.tomActions = actions;
   }
 
   private checkUser(): void {
@@ -137,6 +150,13 @@ export class AsiRemote extends TypertRemoteService {
       throw new RemoteError('gateway/bad-request', 'Intuition actions unavailable', {});
     }
     return this.deps.intuitionActions;
+  }
+
+  private requireTom(): TomActionsApi {
+    if (!this.deps.tomActions) {
+      throw new RemoteError('gateway/bad-request', 'ToM actions unavailable', {});
+    }
+    return this.deps.tomActions;
   }
 
   private async userAction<T>(action: () => Promise<T>): Promise<T> {
@@ -553,6 +573,38 @@ export class AsiRemote extends TypertRemoteService {
       throw new RemoteError('gateway/bad-request', 'cueText must be a string', {});
     }
     return await this.requireIntuition().scanNow(cueText);
+  }
+
+  // ---- Direction B: Theory of Mind (Partner State & Tact) Actions ----
+
+  @Remote
+  async setTomEnabled(enabled: boolean): Promise<void> {
+    this.checkUser();
+    if (typeof enabled !== 'boolean') {
+      throw new RemoteError('gateway/bad-request', 'enabled must be a boolean', {});
+    }
+    await this.userAction(() => this.requireTom().setEnabled(enabled));
+  }
+
+  @Remote
+  async setPartnerOverride(input: WirePartnerOverrideInput): Promise<WireTomPanelModel> {
+    this.checkUser();
+    if (!isPlainRecord(input) || (input.state !== null && !isPartnerStateKind(input.state))) {
+      throw new RemoteError('gateway/bad-request', 'valid partner state or null is required', {});
+    }
+    if (
+      input.durationMinutes !== undefined &&
+      (typeof input.durationMinutes !== 'number' || !Number.isFinite(input.durationMinutes))
+    ) {
+      throw new RemoteError('gateway/bad-request', 'durationMinutes must be a finite number', {});
+    }
+    return await this.userAction(() => this.requireTom().setManualOverride(input));
+  }
+
+  @Remote
+  async resetTomBaseline(): Promise<WireTomPanelModel> {
+    this.checkUser();
+    return await this.userAction(() => this.requireTom().resetBaseline());
   }
 }
 
