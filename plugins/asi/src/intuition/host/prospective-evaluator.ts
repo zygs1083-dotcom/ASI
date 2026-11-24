@@ -81,7 +81,7 @@ export function reconcileProspectiveLifecycle(
   let changed = false;
   const updated = intentions.map((item) => {
     if (
-      (item.status === 'pending' || item.status === 'snoozed') &&
+      (item.status === 'pending' || item.status === 'snoozed' || item.status === 'surfaced') &&
       typeof item.expiresAt === 'number' &&
       now >= item.expiresAt
     ) {

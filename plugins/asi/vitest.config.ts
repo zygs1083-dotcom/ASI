@@ -6,7 +6,7 @@ export default defineConfig({
   test: {
     maxWorkers: 1,
     testTimeout: 30_000,
-    include: ['test/**/*.test.{ts,mjs}'],
+    include: ['test/**/*.test.{ts,mjs}', '../../packages/sense-types/test/**/*.test.ts'],
     exclude: ['test/e2e/**'],
     coverage: {
       provider: 'v8',

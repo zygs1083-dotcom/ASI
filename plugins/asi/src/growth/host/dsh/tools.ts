@@ -11,6 +11,12 @@ import type { Context } from '@deepseek-ai/cordis';
 import type { Agent } from '@deepseek-ai/dsh-agent';
 import { defineTool, ToolArgsError, ToolContextUnavailableError, type ToolRunContext } from '@deepseek-ai/dsh-tools';
 import type { JsonValue } from '@deepseek-ai/dsh-util-values';
+import type { WorkspaceRegistry } from '@deepseek-ai/dsh-workspace';
+import {
+  ASI_INTERNAL_CWD_RE,
+  buildUnifiedExcludedInternalRoots,
+  isInsideExcludedRoots,
+} from '../../../shared/internal-guards.js';
 import type { SkillScope } from '../../shared/types.js';
 import type { GrowthRuntime } from '../runtime.js';
 import { INTERNAL_SESSION_ID_RE } from './dsh-ports.js';
@@ -23,15 +29,32 @@ const output = {
   render: (_args: unknown, value: unknown) => [{ type: 'text' as const, text: JSON.stringify(value) }],
 };
 
-function requireAgent(exec: ToolRunContext): Agent {
+export interface GrowthToolGuardOptions {
+  excludedRoots?: readonly (string | undefined)[];
+  isArchived?: (sessionId: string) => boolean;
+}
+
+function requireAgent(exec: ToolRunContext, guard?: GrowthToolGuardOptions): Agent {
   if (!exec.agent) throw new ToolContextUnavailableError('asi-growth tools require an active agent');
   const sid = String(exec.agent.id ?? exec.agent.session?.id ?? '');
+  const header = exec.agent.session?.header as
+    | { origin?: string; delegationDepth?: number; parentId?: unknown; cwd?: string }
+    | undefined;
   if (
+    !sid ||
     INTERNAL_SESSION_ID_RE.test(sid) ||
-    exec.agent.session?.header?.origin === 'subagent' ||
-    (typeof exec.agent.session?.header?.delegationDepth === 'number' && exec.agent.session.header.delegationDepth > 0)
+    guard?.isArchived?.(sid) ||
+    header?.origin === 'subagent' ||
+    (typeof header?.delegationDepth === 'number' && header.delegationDepth > 0) ||
+    (header?.parentId !== undefined && header?.parentId !== null)
   ) {
     throw new ToolContextUnavailableError('growth_status is restricted to ordinary user sessions');
+  }
+  const cwd = header?.cwd;
+  if (typeof cwd === 'string' && cwd.trim()) {
+    if (ASI_INTERNAL_CWD_RE.test(cwd) || isInsideExcludedRoots(cwd, guard?.excludedRoots ?? [])) {
+      throw new ToolContextUnavailableError('growth_status is restricted to ordinary user sessions');
+    }
   }
   return exec.agent;
 }
@@ -60,7 +83,7 @@ export function sanitizeValueForModel(value: unknown): JsonValue {
   return null;
 }
 
-export function createGrowthStatusTool(runtime: GrowthRuntime) {
+export function createGrowthStatusTool(runtime: GrowthRuntime, guard?: GrowthToolGuardOptions) {
   return defineTool({
     name: 'growth_status',
     description:
@@ -79,7 +102,7 @@ export function createGrowthStatusTool(runtime: GrowthRuntime) {
     },
     output,
     async execute(args, exec) {
-      requireAgent(exec);
+      requireAgent(exec, guard);
       bounded(args);
       if (args.status !== undefined && !(STATUS_FILTERS as readonly string[]).includes(args.status)) {
         throw new ToolArgsError(['invalid status filter']);
@@ -97,6 +120,24 @@ export function createGrowthStatusTool(runtime: GrowthRuntime) {
   });
 }
 
-export function registerGrowthTools(ctx: Context, runtime: GrowthRuntime): () => void {
-  return ctx.tools.register(createGrowthStatusTool(runtime));
+export function registerGrowthTools(
+  ctx: Context,
+  runtime: GrowthRuntime,
+  excludedRoots?: readonly (string | undefined)[],
+): () => void {
+  const effectiveExcluded = buildUnifiedExcludedInternalRoots(ctx.asiSense?.storageRoot, ...(excludedRoots ?? []));
+  const guard: GrowthToolGuardOptions = {
+    excludedRoots: effectiveExcluded,
+    isArchived: (sessionId: string) => {
+      try {
+        const wr = (ctx as Context & { get(name: 'workspaceRegistry'): WorkspaceRegistry | undefined }).get(
+          'workspaceRegistry',
+        );
+        return Boolean(wr?.archivedSessionIds.some((id) => String(id) === sessionId));
+      } catch {
+        return false;
+      }
+    },
+  };
+  return ctx.tools.register(createGrowthStatusTool(runtime, guard));
 }
