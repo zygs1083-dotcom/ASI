@@ -287,31 +287,84 @@ describe('五插件全栈 Cordis 联合集成（asi-sense + asi-needs + asi-slee
         100,
       );
 
-      // 4. 通过 asi-sleep 写入同主题 3 条高保留率记忆（含测试凭据 + pitfall + decision + preference），验证 ctx.asiSleep -> L4 实时联动！
-      const fakeSecret = ['ghp', 'SecretForGrowthIntegration1234567890'].join('_');
-      await root.asiSleep.createMemory({
-        kind: 'pitfall',
-        topicKey: 'cordis-lifecycle',
-        title: 'Cordis 插件逆序卸载必须释放子监听器',
-        content: `卸载泄漏会导致悬空引用（附测试令牌 ${fakeSecret}）。`,
-        tags: ['cordis'],
-        pinned: true,
-      });
-      await root.asiSleep.createMemory({
-        kind: 'decision',
-        topicKey: 'cordis-lifecycle',
-        title: '统一在 ctx.effect 中清理定时器与订阅',
-        content: '所有后台定时器均调用 unref 并随插件生命周期销毁。',
-        tags: ['cordis'],
-      });
-      await root.asiSleep.createMemory({
-        kind: 'preference',
-        topicKey: 'cordis-lifecycle',
-        title: '偏好用逆序插件加载单测验证拓扑收敛',
-        content: '集成测试固定覆盖逆序挂载与逆序卸载。',
-        tags: ['cordis'],
-      });
+      // 4. 通过真实 asi-sleep NREM+REM 整合器测试跨插件 `${kind}:${topic}` 聚类与单工作区轨迹混合作用域推导！
+      // (4a) 先在 userSession (cwd = wsBeta) 写入 3 条完全无关主题的真实踩坑对话（package-manager / database / bundler），
+      //      执行 consolidateNow() 后，校验 3 条 `pitfall:*` 绝不误合并为名为 `pitfall` 的伪集群！
+      appendTurn(
+        userSession,
+        1,
+        '踩坑记录：排查发现 pnpm workspace 协议未剥离会使外部安装失败。',
+        '已在打包阶段自动转换依赖协议。',
+      );
+      appendTurn(
+        userSession,
+        2,
+        '踩坑记录：排查发现 sqlite 并发事务未开启 WAL 会引发锁等待超时。',
+        '已启用 WAL 模式与超时重试。',
+      );
+      appendTurn(
+        userSession,
+        3,
+        '踩坑记录：排查发现 esbuild 多面板样式未隔离前缀会造成选择器覆盖。',
+        '已为各面板 CSS Module 添加独立类名前缀。',
+      );
+      await root.asiSleep.consolidateNow();
+      const consolidatedPitfallKeys = root.asiSleep
+        .listMemories({ kinds: ['pitfall'] })
+        .map((m) => m.topicKey)
+        .sort();
+      expect(consolidatedPitfallKeys).toEqual(['pitfall:bundler', 'pitfall:database', 'pitfall:package-manager']);
 
+      await root.asiSense.refresh?.();
+      await new Promise((r) => setTimeout(r, 30));
+      expect(root.asiDrives.snapshot().drives.find((d) => d.key === 'asi-growth:skill_synthesis')?.satisfaction).toBe(
+        100,
+      );
+
+      // (4b) 再在同工作区 userSession (cwd = wsBeta) 补充 package-manager 的 decision + preference 对话（含测试凭据）
+      //      以及 1 条多步排障轨迹 -> 触发 `package-manager` 单一高证据簇，且保留 `workspace` (wsBeta) 作用域！
+      const fakeSecret = ['ghp', 'SecretForGrowthIntegration1234567890'].join('_');
+      appendTurn(
+        userSession,
+        4,
+        `架构决策：决定采用 pnpm workspace 统一管理包依赖（测试令牌 ${fakeSecret}）。`,
+        '已锁定 pnpm-lock.yaml 并接入发布校验。',
+      );
+      appendTurn(
+        userSession,
+        5,
+        '偏好配置：请始终优先使用 pnpm 执行子包过滤脚本。',
+        '明白，默认使用 pnpm --filter 执行脚本。',
+      );
+      userSession.append('turn/start', { turn: 6 });
+      userSession.append('step/start', { turn: 6, step: 1 });
+      userSession.append(
+        'user/message',
+        createUserMessage({
+          source: { kind: 'user' },
+          content: [{ type: 'text', text: '排查 pnpm workspace 锁文件冲突导致构建失败报错' }],
+        }),
+        { surfaceOp: 'append' },
+      );
+      userSession.append('tool/call', { callId: 'pm-call-1' as never, name: 'read_file', input: {} } as never);
+      userSession.append('tool/call', { callId: 'pm-call-2' as never, name: 'shell', input: {} } as never);
+      userSession.append(
+        'assistant/message',
+        {
+          turn: 6,
+          step: 1,
+          message: createAssistantMessage({
+            source: { provider: 'mock', model: 'mock-1' },
+            content: [{ type: 'text', text: '重新对齐 pnpm 依赖版本并重生成锁文件后恢复正常。' }],
+          }),
+          stream: [],
+        },
+        { surfaceOp: 'append' },
+      );
+      userSession.append('step/end', { turn: 6, step: 1 });
+      userSession.append('turn/end', { turn: 6, reason: { kind: 'completed' } });
+
+      await root.asiSleep.consolidateNow();
       await root.asiSense.refresh?.();
       await new Promise((r) => setTimeout(r, 30));
 
@@ -319,11 +372,13 @@ describe('五插件全栈 Cordis 联合集成（asi-sense + asi-needs + asi-slee
       expect(l4Drive?.tier).toBe(4);
       expect(l4Drive?.satisfaction).toBeLessThan(60);
       expect(l4Drive?.zone).toBe('uncomfortable');
+      expect(l4Drive?.evidence.readyClusters).toBe(1);
 
-      // 5. 手动立即提炼草案 -> 批准前 ctx.skills 为空 -> 批准后立即热挂载至 ctx.skills 且支持 global/workspace 隔离！
+      // 5. 手动立即提炼草案 -> 生成 `package-manager`（初始为 wsBeta 工作区作用域），切换 global/workspace 热挂载实时生效！
       const synRec = await root.asiGrowth.synthesizeNow();
       expect(synRec.draftsCreated).toBe(1);
       expect(await root.skills.list({ cwd: wsAlpha })).toHaveLength(0);
+      expect(await root.skills.list({ cwd: wsBeta })).toHaveLength(0);
 
       const statusTool = root.tools.executable('growth_status', userAgent);
       expect(statusTool).toBeDefined();
@@ -331,8 +386,10 @@ describe('五插件全栈 Cordis 联合集成（asi-sense + asi-needs + asi-slee
         agent: userAgent,
         signal: new AbortController().signal,
         callId: 'gs-1' as never,
-      } as never)) as { drafts: Array<{ id: string; name: string }> };
+      } as never)) as { drafts: Array<{ id: string; name: string; scope: string }> };
       expect(statusBeforeApprove.drafts).toHaveLength(1);
+      expect(statusBeforeApprove.drafts[0]?.name).toBe('package-manager');
+      expect(statusBeforeApprove.drafts[0]?.scope).toBe('workspace');
       expect(JSON.stringify(statusBeforeApprove)).not.toContain(fakeSecret);
 
       const firstDraft = statusBeforeApprove.drafts[0];
@@ -340,8 +397,13 @@ describe('五插件全栈 Cordis 联合集成（asi-sense + asi-needs + asi-slee
       const draftId = firstDraft?.id ?? '';
       const approved = await root.asiGrowth.approveDraft(draftId);
       expect(approved.status).toBe('active');
+      expect(approved.scope).toBe('workspace');
 
-      // 全局作用域下 wsAlpha 与 wsBeta 均可见，但 ASI 内部目录与子代理/内部会话严格不可见！
+      // 默认继承单工作区 wsBeta 作用域：wsBeta 可见，wsAlpha 不可见；切换为 global 后 wsAlpha 与 wsBeta 均可见（ASI 内部目录与子代理严格不可见）！
+      expect((await root.skills.list({ cwd: wsBeta })).map((s) => s.name)).toContain(approved.name);
+      expect((await root.skills.list({ cwd: wsAlpha })).map((s) => s.name)).not.toContain(approved.name);
+      await root.asiGrowth.setSkillScope(approved.name, { scope: 'global' });
+
       const alphaCatalogGlobal = await root.skills.list({ cwd: wsAlpha });
       expect(alphaCatalogGlobal.map((s) => s.name)).toContain(approved.name);
       expect(await root.skills.list({ cwd: join(dir, 'needs', 'sandbox') })).toEqual([]);
@@ -350,7 +412,7 @@ describe('五插件全栈 Cordis 联合集成（asi-sense + asi-needs + asi-slee
       expect(await root.skills.list({ cwd: wsBeta, scope: subagentScope })).toEqual([]);
       const loadedDef = await root.skills.get(approved.name, { cwd: wsAlpha });
       expect(loadedDef?.provider).toBe('asi-growth');
-      expect(loadedDef?.content).toContain('Cordis');
+      expect(loadedDef?.content).toContain('pnpm');
       expect(loadedDef?.content).not.toContain(fakeSecret);
 
       // 子代理与 asi-* 内部会话调用 growth_status 也被严格拒绝
@@ -427,16 +489,14 @@ describe('五插件全栈 Cordis 联合集成（asi-sense + asi-needs + asi-slee
       await new Promise((r) => setTimeout(r, 25));
     }
 
-    // 9. 强制校验三侧栏面板（asi-needs / asi-sleep / asi-growth）客户端 bundle 的 CSS Module 选择器两两 100% 零重叠！
+    // 9. 无条件重新构建并强制校验三侧栏面板（asi-needs / asi-sleep / asi-growth）客户端 bundle 的 CSS Module 选择器两两 100% 零重叠！
     const growthPkgDir = resolve(dirname(fileURLToPath(import.meta.url)), '..');
     const needsPkgDir = resolve(growthPkgDir, '../asi-needs');
     const sleepPkgDir = resolve(growthPkgDir, '../asi-sleep');
 
     for (const pkg of [needsPkgDir, sleepPkgDir, growthPkgDir]) {
-      if (!existsSync(join(pkg, 'lib/client.js'))) {
-        const built = spawnSync(process.execPath, ['scripts/build.mjs'], { cwd: pkg, encoding: 'utf8' });
-        expect(built.status, built.stderr || built.stdout).toBe(0);
-      }
+      const built = spawnSync(process.execPath, ['scripts/build.mjs'], { cwd: pkg, encoding: 'utf8' });
+      expect(built.status, built.stderr || built.stdout).toBe(0);
     }
 
     const [needsBundle, sleepBundle, growthBundle] = await Promise.all([
@@ -445,25 +505,17 @@ describe('五插件全栈 Cordis 联合集成（asi-sense + asi-needs + asi-slee
       readFile(join(growthPkgDir, 'lib/client.js'), 'utf8'),
     ]);
 
-    const extractCssClasses = (bundle: string): Set<string> => {
-      const match = /const __asi(?:Needs|Sleep|Growth)Styles=("(?:\\.|[^"\\])*");/.exec(bundle);
-      const cssText = match?.[1] ? (JSON.parse(match[1]) as string) : '';
-      return new Set(
-        [...cssText.matchAll(/\.([A-Za-z_][A-Za-z0-9_-]*)/g)].map((m) => m[1] ?? '').filter((cls) => cls.includes('_')),
-      );
+    const { assertPairwiseDisjointClientCss } = (await import('../scripts/release-audit.mjs' as string)) as {
+      assertPairwiseDisjointClientCss(input: { needsBundle: string; sleepBundle: string; growthBundle: string }): {
+        needsCount: number;
+        sleepCount: number;
+        growthCount: number;
+      };
     };
-
-    const needsClasses = extractCssClasses(needsBundle);
-    const sleepClasses = extractCssClasses(sleepBundle);
-    const growthClasses = extractCssClasses(growthBundle);
-
-    expect(needsClasses.size).toBeGreaterThan(10);
-    expect(sleepClasses.size).toBeGreaterThan(10);
-    expect(growthClasses.size).toBeGreaterThan(10);
-
-    expect([...growthClasses].filter((c) => needsClasses.has(c))).toEqual([]);
-    expect([...growthClasses].filter((c) => sleepClasses.has(c))).toEqual([]);
-    expect([...sleepClasses].filter((c) => needsClasses.has(c))).toEqual([]);
+    const cssStats = assertPairwiseDisjointClientCss({ needsBundle, sleepBundle, growthBundle });
+    expect(cssStats.needsCount).toBeGreaterThan(10);
+    expect(cssStats.sleepCount).toBeGreaterThan(10);
+    expect(cssStats.growthCount).toBeGreaterThan(10);
   });
 
   it('真实挂载 LlmRuntime + sessionQuery 冷会话水合：从冷会话复现轨迹触发 L4 并通过流式 LLM 提炼 SKILL.md', {

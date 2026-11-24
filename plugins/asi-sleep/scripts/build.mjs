@@ -19,7 +19,7 @@ async function atomicWrite(target, contents) {
 const pkg = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const lib = join(pkg, 'lib');
 await mkdir(lib, { recursive: true });
-if (!existsSync(join(lib, 'typert.host.js'))) {
+if (!existsSync(join(lib, 'typert.host.js')) || !existsSync(join(lib, 'typert.remote-client.js'))) {
   await import('./generate-typert.mjs');
 }
 

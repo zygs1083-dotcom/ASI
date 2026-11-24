@@ -44,6 +44,7 @@ import {
   DEEP_QUIET_IDLE_THRESHOLD_MS,
   detectLowerTierBlock,
   evaluateGrowthState,
+  isScreenLockedAt,
   ROLLING_DAY_WINDOW_MS,
 } from './evaluator.js';
 import { clusterHighEvidenceTopics, extractTroubleshootingTrajectories, HIGH_RETENTION_THRESHOLD } from './evidence.js';
@@ -275,6 +276,34 @@ export function createGrowthRuntime(ports: GrowthHostPorts): GrowthRuntime {
     }
     const trajectories = extractTroubleshootingTrajectories(rawTurns, ports.homeDir);
 
+    const sessionWorkspaces = new Map<string, string>();
+    if (ports.conversations.listSessionWorkspaces) {
+      try {
+        for (const [sid, ws] of ports.conversations.listSessionWorkspaces()) {
+          if (sid && ws?.trim() && !isExcludedInternalCwd(ws)) {
+            sessionWorkspaces.set(sid, resolve(ws.trim()));
+          }
+        }
+      } catch {
+        // Ignore optional session workspace lookup errors
+      }
+    }
+    for (const t of rawTurns) {
+      if (t.sessionId && t.cwd?.trim() && !isExcludedInternalCwd(t.cwd)) {
+        sessionWorkspaces.set(t.sessionId, resolve(t.cwd.trim()));
+      }
+    }
+
+    let knownWorkspaces: string[] = [];
+    try {
+      knownWorkspaces = ports.conversations
+        .listKnownWorkspaces()
+        .filter((w) => Boolean(w?.trim()) && !isExcludedInternalCwd(w))
+        .map((w) => resolve(w.trim()));
+    } catch {
+      knownWorkspaces = [];
+    }
+
     const existingSkillMap = new Map<
       string,
       {
@@ -325,6 +354,9 @@ export function createGrowthRuntime(ports: GrowthHostPorts): GrowthRuntime {
       existingSkills,
       existingDrafts,
       rejectedSignatures: rejectedSignatureSet,
+      sessionWorkspaces,
+      knownWorkspaces,
+      ...(ports.homeDir ? { homeDir: ports.homeDir } : {}),
     });
   }
 
@@ -389,16 +421,16 @@ export function createGrowthRuntime(ports: GrowthHostPorts): GrowthRuntime {
   function maybeAbortPreemptedAutoSynthesis(drivesOverride?: AsiDrivesSnapshot): void {
     if (!activeSynthesisAbort) return;
     if (activeSynthesisTrigger === 'manual') return;
+    const now = clock.wall();
     const senseSnap = ports.sense.snapshot();
     const senseSettings = ports.sense.getSettings();
     const drivesSnap = drivesOverride ?? ports.drives.snapshot();
     const block = detectLowerTierBlock(senseSnap, drivesSnap);
-    const screenLocked = senseSnap.state.env.system?.value?.locked === true;
+    const screenLocked = isScreenLockedAt(senseSnap, now);
+    const anyRunning = ports.conversations.anyOrdinarySessionRunning();
     const userBecameActive =
       activeSynthesisTrigger === 'auto' &&
-      !screenLocked &&
-      (ports.conversations.anyOrdinarySessionRunning() ||
-        clock.wall() - lastOrdinaryActivityAt < DEEP_QUIET_IDLE_THRESHOLD_MS);
+      (anyRunning || (!screenLocked && now - lastOrdinaryActivityAt < DEEP_QUIET_IDLE_THRESHOLD_MS));
 
     if (
       stopped ||
@@ -432,6 +464,13 @@ export function createGrowthRuntime(ports: GrowthHostPorts): GrowthRuntime {
         pollExternalTimer.unref?.();
       }
     }
+    let autoPreemptWatchdog: ReturnType<typeof setInterval> | undefined;
+    if (trigger === 'auto') {
+      autoPreemptWatchdog = setInterval(() => {
+        maybeAbortPreemptedAutoSynthesis();
+      }, 50);
+      autoPreemptWatchdog.unref?.();
+    }
 
     const startWall = clock.wall();
     const startMono = clock.mono();
@@ -446,6 +485,11 @@ export function createGrowthRuntime(ports: GrowthHostPorts): GrowthRuntime {
       try {
         await vault.syncExternalDiskEdits();
         const ev = computeEvaluated(ports.sense.snapshot());
+        if (trigger === 'auto' && !ev.canAutoDraft) {
+          const err = new Error('Skill synthesis preempted before drafting');
+          err.name = 'AbortError';
+          throw err;
+        }
         const clustersToProcess =
           trigger === 'auto'
             ? ev.evidence.readyClusters.slice(0, Math.max(0, DAILY_AUTO_DRAFT_QUOTA - ev.driveView.autoDraftsToday))
@@ -473,11 +517,18 @@ export function createGrowthRuntime(ports: GrowthHostPorts): GrowthRuntime {
           }
 
           if (trigger !== 'manual') {
+            const postNow = clock.wall();
             const postSense = ports.sense.snapshot();
             const postDrives = ports.drives.snapshot();
             const block = detectLowerTierBlock(postSense, postDrives);
-            if (block.suppressed || block.lowerTierBlocked || postSense.settings.paused) {
-              const err = new Error(block.lowerTierReason ?? 'Skill synthesis preempted by L1-L3 drive');
+            const postScreenLocked = isScreenLockedAt(postSense, postNow);
+            const autoQuietBroken =
+              trigger === 'auto' &&
+              (autoGrowthPaused ||
+                ports.conversations.anyOrdinarySessionRunning() ||
+                (!postScreenLocked && postNow - lastOrdinaryActivityAt < DEEP_QUIET_IDLE_THRESHOLD_MS));
+            if (block.suppressed || block.lowerTierBlocked || postSense.settings.paused || autoQuietBroken) {
+              const err = new Error(block.lowerTierReason ?? 'Skill synthesis preempted');
               err.name = 'AbortError';
               throw err;
             }
@@ -501,11 +552,18 @@ export function createGrowthRuntime(ports: GrowthHostPorts): GrowthRuntime {
         }
 
         if (trigger !== 'manual') {
+          const finalNow = clock.wall();
           const finalSense = ports.sense.snapshot();
           const finalDrives = ports.drives.snapshot();
           const block = detectLowerTierBlock(finalSense, finalDrives);
-          if (block.suppressed || block.lowerTierBlocked || finalSense.settings.paused) {
-            const err = new Error(block.lowerTierReason ?? 'Skill synthesis preempted by L1-L3 drive');
+          const finalScreenLocked = isScreenLockedAt(finalSense, finalNow);
+          const autoQuietBroken =
+            trigger === 'auto' &&
+            (autoGrowthPaused ||
+              ports.conversations.anyOrdinarySessionRunning() ||
+              (!finalScreenLocked && finalNow - lastOrdinaryActivityAt < DEEP_QUIET_IDLE_THRESHOLD_MS));
+          if (block.suppressed || block.lowerTierBlocked || finalSense.settings.paused || autoQuietBroken) {
+            const err = new Error(block.lowerTierReason ?? 'Skill synthesis preempted');
             err.name = 'AbortError';
             throw err;
           }
@@ -633,6 +691,7 @@ export function createGrowthRuntime(ports: GrowthHostPorts): GrowthRuntime {
         throw err;
       } finally {
         if (pollExternalTimer !== undefined) clearInterval(pollExternalTimer);
+        if (autoPreemptWatchdog !== undefined) clearInterval(autoPreemptWatchdog);
         if (activeSynthesisAbort === localAbort) {
           activeSynthesisAbort = undefined;
           activeSynthesisTrigger = null;
@@ -1129,7 +1188,9 @@ export function createGrowthRuntime(ports: GrowthHostPorts): GrowthRuntime {
               const force = args.force === true;
               if (!force && !ev.driveView.deepQuietWindow) {
                 return {
-                  summary: `等待 20 分钟深静默窗口（当前已空闲 ${Math.floor(ev.driveView.idleDurationMs / 60_000)}/20 分钟且未锁屏）`,
+                  summary: ev.anyRunning
+                    ? '普通对话运行中，等待回合结束并进入 20 分钟深静默窗口'
+                    : `等待 20 分钟深静默窗口（当前已空闲 ${Math.floor(ev.driveView.idleDurationMs / 60_000)}/20 分钟且未锁屏）`,
                 };
               }
               const rec = await executeSynthesis('sandbox', signal);

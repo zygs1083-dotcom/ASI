@@ -79,4 +79,66 @@ export function registryUrl(value = 'https://registry.npmjs.org/') {
   return url.href;
 }
 
+export function extractClientCssClasses(bundleText, bundleLabel = 'client.js') {
+  const match = /const __asi(?:Needs|Sleep|Growth)Styles=("(?:\\.|[^"\\])*");/.exec(bundleText);
+  if (!match?.[1]) {
+    throw new Error(`Missing embedded stylesheet constant in ${bundleLabel}`);
+  }
+  const cssText = JSON.parse(match[1]);
+  const sanitizedCss = cssText
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'/g, '""')
+    .replace(/@(?:-webkit-)?keyframes\s+[^{]+\{(?:[^{}]*\{[^{}]*\})*\s*\}/g, '');
+
+  const classes = new Set();
+  const blocks = sanitizedCss.split('{');
+  for (let i = 0; i < blocks.length - 1; i += 1) {
+    const rawBeforeBrace = blocks[i] ?? '';
+    const boundaryIdx = Math.max(rawBeforeBrace.lastIndexOf('}'), rawBeforeBrace.lastIndexOf(';'));
+    const prelude = rawBeforeBrace
+      .slice(boundaryIdx + 1)
+      .trim()
+      .replace(/\[[^\]]*\]/g, '');
+    if (!prelude || prelude.startsWith('@')) continue;
+    for (const cm of prelude.matchAll(/\.([A-Za-z_-][A-Za-z0-9_-]*)/g)) {
+      if (cm[1]) classes.add(cm[1]);
+    }
+  }
+  return classes;
+}
+
+export function assertPairwiseDisjointClientCss({ needsBundle, sleepBundle, growthBundle }) {
+  const needsClasses = extractClientCssClasses(needsBundle, 'asi-needs/lib/client.js');
+  const sleepClasses = extractClientCssClasses(sleepBundle, 'asi-sleep/lib/client.js');
+  const growthClasses = extractClientCssClasses(growthBundle, 'asi-growth/lib/client.js');
+
+  for (const [label, set] of [
+    ['asi-needs/lib/client.js', needsClasses],
+    ['asi-sleep/lib/client.js', sleepClasses],
+    ['asi-growth/lib/client.js', growthClasses],
+  ]) {
+    if (set.size <= 10) {
+      throw new Error(`Expected >10 CSS Module classes in ${label}, found ${set.size}`);
+    }
+  }
+
+  const pairs = [
+    ['asi-needs vs asi-sleep', needsClasses, sleepClasses],
+    ['asi-needs vs asi-growth', needsClasses, growthClasses],
+    ['asi-sleep vs asi-growth', sleepClasses, growthClasses],
+  ];
+  for (const [pairLabel, left, right] of pairs) {
+    const overlap = [...left].filter((cls) => right.has(cls));
+    if (overlap.length > 0) {
+      throw new Error(`CSS Module class overlap detected (${pairLabel}): ${overlap.join(', ')}`);
+    }
+  }
+
+  return {
+    needsCount: needsClasses.size,
+    sleepCount: sleepClasses.size,
+    growthCount: growthClasses.size,
+  };
+}
+
 export { allowed };

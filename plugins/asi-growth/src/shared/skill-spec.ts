@@ -152,7 +152,12 @@ export function isValidSkillName(name: string): boolean {
 }
 
 export function toValidSkillSlug(raw: string, fallbackPrefix = 'skill'): string {
-  const cleanSource = sanitizeForModel(raw || '').toLowerCase();
+  const cleanSource = sanitizeForModel(raw || '')
+    .trim()
+    .toLowerCase();
+  if (cleanSource.length >= 2 && !/^\d+(?:-\d+)*$/.test(cleanSource) && isValidSkillName(cleanSource)) {
+    return cleanSource;
+  }
   const asciiParts = cleanSource
     .replace(/[^a-z0-9]+/g, '-')
     .replace(/-+/g, '-')

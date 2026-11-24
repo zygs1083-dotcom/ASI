@@ -4,6 +4,7 @@ import { mkdir, mkdtemp, readdir, readFile, realpath, rm, stat, symlink, writeFi
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { assertPairwiseDisjointClientCss } from './release-audit.mjs';
 
 const pkg = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const source = JSON.parse(await readFile(join(pkg, 'package.json'), 'utf8'));
@@ -87,6 +88,23 @@ try {
   assert.deepEqual(await readdir(join(root, 'scripts')), ['dsh.sh']);
   assert.notEqual((await stat(launcher)).mode & 0o111, 0, 'DSH launcher is not executable');
   await verifyLauncher(launcher);
+
+  const needsPkg = resolve(pkg, '../asi-needs');
+  const sleepPkg = resolve(pkg, '../asi-sleep');
+  for (const siblingPkg of [needsPkg, sleepPkg]) {
+    const builtSibling = spawnSync(process.execPath, ['scripts/build.mjs'], {
+      cwd: siblingPkg,
+      encoding: 'utf8',
+    });
+    assert.equal(builtSibling.status, 0, builtSibling.stderr || builtSibling.stdout);
+  }
+  const [needsBundle, sleepBundle, growthBundle] = await Promise.all([
+    readFile(join(needsPkg, 'lib/client.js'), 'utf8'),
+    readFile(join(sleepPkg, 'lib/client.js'), 'utf8'),
+    readFile(join(root, 'lib/client.js'), 'utf8'),
+  ]);
+  assertPairwiseDisjointClientCss({ needsBundle, sleepBundle, growthBundle });
+
   console.log(`Distribution verified: ${(await stat(artifact)).size} bytes`);
 } finally {
   await rm(temp, { recursive: true, force: true });

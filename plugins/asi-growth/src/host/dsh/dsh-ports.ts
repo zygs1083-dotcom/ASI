@@ -281,6 +281,7 @@ export function createDshGrowthPorts(
 ): GrowthHostPorts {
   const excludedRoots = buildExcludedInternalRoots(storageRoot, ctx.asiSense?.storageRoot);
   const coldSessionTurns = new Map<string, OrdinaryTurnTrajectoryInput[]>();
+  const coldSessionCwds = new Map<string, string>();
   const coldSessionRoutes = new Map<string, { provider: string; model: string; createdAt: number }>();
   const sessionTitles = new Map<string, string>();
   const activeTurnSkillsBySession = new Map<string, Set<string>>();
@@ -403,6 +404,30 @@ export function createDshGrowthPorts(
         }
       }
       return [...found];
+    },
+
+    listSessionWorkspaces(): ReadonlyMap<string, string> {
+      const map = new Map<string, string>();
+      for (const [sid, cwd] of coldSessionCwds) {
+        if (!isArchived(sid) && !isInternalPath(cwd)) {
+          map.set(sid, cwd);
+        }
+      }
+      for (const s of ctx.sessions?.list() ?? []) {
+        const sid = String(s.id);
+        const cwd = s.header?.cwd;
+        if (cwd && !isArchived(sid) && isOrdinaryDshSession(s, excludedRoots) && !isInternalPath(cwd)) {
+          map.set(sid, cwd);
+        }
+      }
+      for (const a of ctx.agents?.list() ?? []) {
+        const sid = String(a.id);
+        const cwd = a.session?.header?.cwd;
+        if (cwd && isOrdinaryAgent(a) && !isInternalPath(cwd)) {
+          map.set(sid, cwd);
+        }
+      }
+      return map;
     },
 
     onOrdinaryActivity(listener: () => void): () => void {
@@ -552,10 +577,14 @@ export function createDshGrowthPorts(
 
       let inspected = 0;
       for (const rec of records) {
-        if (signal.aborted || inspected >= 20) break;
+        if (signal.aborted) break;
         const sid = String(rec.header.id);
-        if (rec.live || liveIds.has(sid) || isArchived(sid)) continue;
+        if (isArchived(sid)) continue;
         if (!isOrdinaryDshSession({ id: rec.header.id, header: rec.header }, excludedRoots)) continue;
+        if (rec.header.cwd && !isInternalPath(rec.header.cwd)) {
+          coldSessionCwds.set(sid, rec.header.cwd);
+        }
+        if (rec.live || liveIds.has(sid) || inspected >= 20) continue;
         inspected += 1;
         try {
           if (typeof sq.readTitle === 'function') {
@@ -569,6 +598,9 @@ export function createDshGrowthPorts(
           const route = extractRouteFromEvents(logSnap.events);
           if (route) {
             coldSessionRoutes.set(sid, { ...route, createdAt: logSnap.session.createdAt || 0 });
+          }
+          if (logSnap.session.cwd && !isInternalPath(logSnap.session.cwd)) {
+            coldSessionCwds.set(sid, logSnap.session.cwd);
           }
           if (ctx.sessions?.get?.(rec.header.id as SessionId)) continue;
           const inherited = Math.max(0, Number(logSnap.inheritedEventCount ?? 0));

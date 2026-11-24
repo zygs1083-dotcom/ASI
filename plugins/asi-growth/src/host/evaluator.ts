@@ -11,7 +11,7 @@
  *   3. Rolling 24-hour auto-draft quota `<= 2` drafts/day.
  */
 
-import type { AsiDrivesSnapshot, NeedZone, SenseSnapshot } from '@asi/sense-types';
+import { type AsiDrivesSnapshot, factStatusAt, type NeedZone, type SenseSnapshot } from '@asi/sense-types';
 import type { GrowthDriveView } from '../shared/types.js';
 
 export const DEEP_QUIET_IDLE_THRESHOLD_MS = 20 * 60_000;
@@ -76,11 +76,16 @@ export function detectLowerTierBlock(
   };
 }
 
+export function isScreenLockedAt(sense: SenseSnapshot, now: number): boolean {
+  const sysFact = sense.state.env.system;
+  return Boolean(sysFact && factStatusAt(sysFact, now) === 'ok' && sysFact.value?.locked === true);
+}
+
 export function evaluateGrowthState(input: EvaluateGrowthInput): EvaluatedGrowthState {
-  const screenLocked = input.sense.state.env.system?.value?.locked === true;
+  const screenLocked = isScreenLockedAt(input.sense, input.now);
   const idleDurationMs = input.anyOrdinarySessionRunning ? 0 : Math.max(0, input.now - input.lastOrdinaryActivityAt);
   const deepQuietWindow =
-    screenLocked || (!input.anyOrdinarySessionRunning && idleDurationMs >= DEEP_QUIET_IDLE_THRESHOLD_MS);
+    !input.anyOrdinarySessionRunning && (screenLocked || idleDurationMs >= DEEP_QUIET_IDLE_THRESHOLD_MS);
 
   const autoDraftsToday = input.autoDraftTimestamps.filter((ts) => input.now - ts < ROLLING_DAY_WINDOW_MS).length;
   const remainingAutoQuota = Math.max(0, DAILY_AUTO_DRAFT_QUOTA - autoDraftsToday);
@@ -117,7 +122,9 @@ export function evaluateGrowthState(input: EvaluateGrowthInput): EvaluatedGrowth
     summary = `今日自动提炼草案配额已满（${autoDraftsToday}/${DAILY_AUTO_DRAFT_QUOTA}），可手动点击立即提炼技能`;
   } else if (!deepQuietWindow) {
     const idleMins = Math.floor(idleDurationMs / 60_000);
-    summary = `已积累 ${input.readyClusters} 个高证据技能主题 · 等待 20 分钟深静默窗口（当前空闲 ${idleMins}/20 分钟）`;
+    summary = input.anyOrdinarySessionRunning
+      ? `已积累 ${input.readyClusters} 个高证据技能主题 · 普通对话运行中，等待回合结束并进入 20 分钟深静默窗口`
+      : `已积累 ${input.readyClusters} 个高证据技能主题 · 等待 20 分钟深静默窗口（当前空闲 ${idleMins}/20 分钟）`;
   } else {
     summary = `深静默就绪 · 准备将 ${input.readyClusters} 个高证据主题提炼为待审 SKILL.md 草案`;
   }

@@ -17,6 +17,7 @@ export interface GrowthConversationPort {
   listCompletedOrdinaryTurns(): OrdinaryTurnTrajectoryInput[];
   anyOrdinarySessionRunning(): boolean;
   listKnownWorkspaces(): string[];
+  listSessionWorkspaces?(): ReadonlyMap<string, string>;
   onOrdinaryActivity(listener: () => void): () => void;
   onSkillTurnCompleted?(listener: (ev: SkillTurnLifecycleEvent) => void): () => void;
   warmColdSessions?(signal: AbortSignal): Promise<void>;

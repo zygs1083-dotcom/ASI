@@ -19,9 +19,9 @@
  */
 
 import { createHash } from 'node:crypto';
-import { basename } from 'node:path';
-import type { SleepMemorySummary } from '@asi/sense-types';
-import { sanitizeSkillText, toValidSkillSlug } from '../shared/skill-spec.js';
+import { basename, isAbsolute, join, resolve } from 'node:path';
+import { type SleepMemorySummary, sanitizeForModel } from '@asi/sense-types';
+import { MAX_SKILL_NAME_LENGTH, sanitizeSkillText, toValidSkillSlug } from '../shared/skill-spec.js';
 import type { SkillScope } from '../shared/types.js';
 
 export const HIGH_RETENTION_THRESHOLD = 0.5;
@@ -144,17 +144,149 @@ function jaccardSimilarity(a: ReadonlySet<string>, b: ReadonlySet<string>): numb
   return inter / (a.size + b.size - inter);
 }
 
-export function normalizeTopicAnchor(rawTopicKey?: string, tags?: readonly string[], title?: string): string {
-  if (rawTopicKey && rawTopicKey.trim()) {
-    const root = rawTopicKey.trim().toLowerCase().split(/[:/]/)[0]?.trim() ?? '';
-    if (root.length >= 2) {
-      return toValidSkillSlug(root, 'topic');
+const MEMORY_KIND_TOPIC_PREFIX_RE = /^(?:preference|decision|pitfall|episode)\s*[:/]+\s*/i;
+const BARE_MEMORY_KINDS = new Set(['preference', 'decision', 'pitfall', 'episode']);
+const EXPLICIT_WORKSPACE_TAG_RE = /^(?:workspace|cwd|repo):(.+)$/i;
+
+const COMMON_TECH_TAGS = new Set([
+  'typescript',
+  'javascript',
+  'react',
+  'vitest',
+  'playwright',
+  'pnpm',
+  'npm',
+  'yarn',
+  'bun',
+  'biome',
+  'eslint',
+  'prettier',
+  'oxlint',
+  'esbuild',
+  'vite',
+  'webpack',
+  'rollup',
+  'tsdown',
+  'swift',
+  'macos',
+  'cordis',
+  'dsh',
+  'minisearch',
+  'fsrs',
+  'jsonl',
+  'markdown',
+  'css',
+  'axe',
+  'sqlite',
+  'postgres',
+  'postgresql',
+  'mysql',
+  'duckdb',
+  'git',
+  'docker',
+  'node',
+  'python',
+  'rust',
+  'go',
+]);
+
+const KNOWN_SLEEP_TOPIC_FAMILIES: ReadonlyArray<{ topic: string; pattern: RegExp }> = [
+  { topic: 'package-manager', pattern: /\b(?:pnpm|npm|yarn|bun)\b/i },
+  { topic: 'formatter-linter', pattern: /\b(?:biome|eslint|prettier|oxlint)\b/i },
+  { topic: 'test-runner', pattern: /\b(?:vitest|jest|playwright|mocha)\b/i },
+  { topic: 'bundler', pattern: /\b(?:esbuild|vite|webpack|rollup|tsdown)\b/i },
+  { topic: 'database', pattern: /\b(?:sqlite|postgres|postgresql|mysql|duckdb|jsonl)\b/i },
+  {
+    topic: 'language-style',
+    pattern: /(?:中文回复|英文回复|简体中文|quoteStyle|单引号|双引号|single\s+quote|double\s+quote)/i,
+  },
+  { topic: 'memory-search', pattern: /\b(?:minisearch|bm25|fsrs|ts-fsrs)\b/i },
+];
+
+function inferUnambiguousSleepTopicFamily(text: string): string | undefined {
+  let matched: string | undefined;
+  for (const fam of KNOWN_SLEEP_TOPIC_FAMILIES) {
+    if (fam.pattern.test(text)) {
+      if (matched && matched !== fam.topic) return undefined;
+      matched = fam.topic;
     }
+  }
+  return matched;
+}
+
+function sharesMultiSegmentAnchorPrefix(a: string, b: string): boolean {
+  if (!a || !b || a.startsWith('topic-') || b.startsWith('topic-')) return false;
+  const shorter = a.length <= b.length ? a : b;
+  const longer = a.length <= b.length ? b : a;
+  return shorter.length >= 6 && shorter.includes('-') && (longer === shorter || longer.startsWith(`${shorter}-`));
+}
+
+function normalizeWorkspacePath(raw: string, homeDir?: string, knownAbsoluteWorkspaces?: ReadonlySet<string>): string {
+  const trimmed = raw.trim();
+  if (!trimmed) return '';
+  if (trimmed === '~') {
+    return homeDir?.trim() ? resolve(homeDir.trim()) : '~';
+  }
+  if (trimmed.startsWith('~/') || trimmed.startsWith('~\\')) {
+    const rel = trimmed.slice(2).replace(/^[\\/]+|[\\/]+$/g, '');
+    if (!rel) return homeDir?.trim() ? resolve(homeDir.trim()) : '~';
+    if (homeDir?.trim()) {
+      return resolve(join(homeDir.trim(), rel));
+    }
+    if (knownAbsoluteWorkspaces && knownAbsoluteWorkspaces.size > 0) {
+      const suffix = `/${rel.replace(/\\/g, '/')}`;
+      const matches = [...knownAbsoluteWorkspaces].filter((ws) => ws.replace(/\\/g, '/').endsWith(suffix));
+      if (matches.length === 1 && matches[0]) return matches[0];
+    }
+    return `~/${rel.replace(/\\/g, '/')}`;
+  }
+  return isAbsolute(trimmed) ? resolve(trimmed) : trimmed.replace(/[\\/]+$/, '');
+}
+
+export function normalizeExplicitTopicKey(rawTopicKey?: string): string | undefined {
+  if (!rawTopicKey?.trim()) return undefined;
+  let body = rawTopicKey.trim();
+  while (MEMORY_KIND_TOPIC_PREFIX_RE.test(body)) {
+    body = body.replace(MEMORY_KIND_TOPIC_PREFIX_RE, '').trim();
+  }
+  body = body.replace(/^[:/\s-]+|[:/\s-]+$/g, '');
+  if ([...body].length < 2) return undefined;
+  const low = body.toLowerCase();
+  if (BARE_MEMORY_KINDS.has(low) || GENERIC_TAGS.has(low)) return undefined;
+
+  if (!/[\u4e00-\u9fff]/.test(body)) {
+    const asciiSlug = sanitizeForModel(body)
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, '-')
+      .replace(/-+/g, '-')
+      .replace(/^-|-$/g, '')
+      .slice(0, MAX_SKILL_NAME_LENGTH)
+      .replace(/-+$/g, '');
+    if (asciiSlug.length >= 2 && !/^\d+(?:-\d+)*$/.test(asciiSlug)) {
+      if (BARE_MEMORY_KINDS.has(asciiSlug) || GENERIC_TAGS.has(asciiSlug)) return undefined;
+      return asciiSlug;
+    }
+  }
+
+  return toValidSkillSlug(body, 'topic');
+}
+
+export function normalizeTopicAnchor(rawTopicKey?: string, tags?: readonly string[], title?: string): string {
+  const explicit = normalizeExplicitTopicKey(rawTopicKey);
+  if (explicit) {
+    return explicit;
   }
   if (tags && tags.length > 0) {
     for (const tag of tags) {
       const cleanTag = tag.trim().toLowerCase().replace(/^#+/, '');
-      if (cleanTag.length >= 2 && !GENERIC_TAGS.has(cleanTag)) {
+      if (
+        cleanTag.length >= 2 &&
+        !GENERIC_TAGS.has(cleanTag) &&
+        !BARE_MEMORY_KINDS.has(cleanTag) &&
+        !EXPLICIT_WORKSPACE_TAG_RE.test(cleanTag) &&
+        !cleanTag.startsWith('/') &&
+        !cleanTag.startsWith('~/')
+      ) {
         return toValidSkillSlug(cleanTag, 'topic');
       }
     }
@@ -215,7 +347,7 @@ export function computeEvidenceSignature(topicKey: string, evidenceIds: readonly
 
 interface RawTopicBucket {
   anchor: string;
-  hasExplicitTopic: boolean;
+  explicitTopic?: string;
   tokens: Set<string>;
   tags: Set<string>;
   memories: SleepMemorySummary[];
@@ -228,6 +360,9 @@ export function clusterHighEvidenceTopics(input: {
   existingSkills: readonly ExistingSkillTopicRef[];
   existingDrafts: readonly ExistingDraftTopicRef[];
   rejectedSignatures: ReadonlySet<string>;
+  sessionWorkspaces?: ReadonlyMap<string, string>;
+  knownWorkspaces?: readonly string[];
+  homeDir?: string;
 }): EvidenceEvaluationSummary {
   const eligibleMemories = input.memories.filter(
     (m) =>
@@ -235,7 +370,57 @@ export function clusterHighEvidenceTopics(input: {
       (m.pinned || m.retention >= HIGH_RETENTION_THRESHOLD),
   );
 
+  const knownAbsoluteWorkspaces = new Set<string>();
+  const collectAbsWorkspace = (rawWs: string | undefined) => {
+    const norm = rawWs ? normalizeWorkspacePath(rawWs, input.homeDir) : '';
+    if (norm && isAbsolute(norm)) knownAbsoluteWorkspaces.add(norm);
+  };
+  for (const ws of input.knownWorkspaces ?? []) collectAbsWorkspace(ws);
+  if (input.sessionWorkspaces) {
+    for (const ws of input.sessionWorkspaces.values()) collectAbsWorkspace(ws);
+  }
+  for (const traj of input.trajectories) collectAbsWorkspace(traj.cwd);
+
+  const sessionWsMap = new Map<string, string>();
+  if (input.sessionWorkspaces) {
+    for (const [sid, ws] of input.sessionWorkspaces) {
+      const norm = ws ? normalizeWorkspacePath(ws, input.homeDir, knownAbsoluteWorkspaces) : '';
+      if (sid && norm) sessionWsMap.set(sid, norm);
+    }
+  }
+  for (const traj of input.trajectories) {
+    const norm = traj.cwd ? normalizeWorkspacePath(traj.cwd, input.homeDir, knownAbsoluteWorkspaces) : '';
+    if (traj.sessionId && norm && !sessionWsMap.has(traj.sessionId)) {
+      sessionWsMap.set(traj.sessionId, norm);
+    }
+  }
+
+  const knownWsByBasename = new Map<string, string | 'ambiguous'>();
+  const registerKnownWorkspace = (rawWs: string | undefined) => {
+    const norm = rawWs ? normalizeWorkspacePath(rawWs, input.homeDir, knownAbsoluteWorkspaces) : '';
+    if (!norm) return;
+    const base = basename(norm).toLowerCase();
+    if (!base || base.length < 2 || GENERIC_TAGS.has(base)) return;
+    const prev = knownWsByBasename.get(base);
+    if (!prev) knownWsByBasename.set(base, norm);
+    else if (prev !== norm) knownWsByBasename.set(base, 'ambiguous');
+  };
+  for (const ws of input.knownWorkspaces ?? []) registerKnownWorkspace(ws);
+  for (const ws of sessionWsMap.values()) registerKnownWorkspace(ws);
+  for (const traj of input.trajectories) registerKnownWorkspace(traj.cwd);
+
+  const normalizeSkillOrDraftTopic = (rawKey: string): string =>
+    normalizeExplicitTopicKey(rawKey) ?? toValidSkillSlug(rawKey, 'topic');
+
   const buckets: RawTopicBucket[] = [];
+
+  const isSemanticTopicTag = (cleanTag: string): boolean => {
+    if (cleanTag.length < 2) return false;
+    if (GENERIC_TAGS.has(cleanTag) || BARE_MEMORY_KINDS.has(cleanTag)) return false;
+    if (EXPLICIT_WORKSPACE_TAG_RE.test(cleanTag) || cleanTag.startsWith('/') || cleanTag.startsWith('~/')) return false;
+    if (knownWsByBasename.has(cleanTag) && !COMMON_TECH_TAGS.has(cleanTag)) return false;
+    return true;
+  };
 
   const findOrCreateBucket = (
     explicitTopicKey: string | undefined,
@@ -243,40 +428,64 @@ export function clusterHighEvidenceTopics(input: {
     textForTokens: string,
     fallbackAnchor: string,
   ): RawTopicBucket => {
-    const cleanTags = rawTags
-      .map((t) => t.trim().toLowerCase().replace(/^#+/, ''))
-      .filter((t) => t.length >= 2 && !GENERIC_TAGS.has(t));
+    const cleanTags = rawTags.map((t) => t.trim().toLowerCase().replace(/^#+/, '')).filter(isSemanticTopicTag);
     const itemTokens = tokenizeTopicText(`${textForTokens} ${cleanTags.join(' ')}`);
-    const explicitSlug =
-      explicitTopicKey && explicitTopicKey.trim()
-        ? toValidSkillSlug(explicitTopicKey.trim().split(/[:/]/)[0] ?? explicitTopicKey, 'topic')
-        : undefined;
+    const explicitSlug = normalizeExplicitTopicKey(explicitTopicKey);
+    const unambiguousFamily = explicitSlug ? undefined : inferUnambiguousSleepTopicFamily(textForTokens);
 
     // 1. Exact explicit topic match always wins before any fuzzy/tag fallback
     if (explicitSlug) {
-      const exactBucket = buckets.find((b) => b.anchor === explicitSlug);
-      if (exactBucket) return exactBucket;
+      const exactBucket = buckets.find(
+        (b) => b.explicitTopic === explicitSlug || (!b.explicitTopic && b.anchor === explicitSlug),
+      );
+      if (exactBucket) {
+        if (!exactBucket.explicitTopic) {
+          exactBucket.explicitTopic = explicitSlug;
+          exactBucket.anchor = explicitSlug;
+        }
+        return exactBucket;
+      }
     }
 
     // 2. Tag / similarity matching only when explicit topic keys do not conflict
     for (const b of buckets) {
-      if (explicitSlug && b.hasExplicitTopic) continue;
-      if (cleanTags.some((t) => b.tags.has(t) || b.anchor === toValidSkillSlug(t, 'topic'))) return b;
-      if (!explicitSlug && (b.anchor === fallbackAnchor || jaccardSimilarity(b.tokens, itemTokens) >= 0.28)) return b;
+      if (explicitSlug && b.explicitTopic && b.explicitTopic !== explicitSlug) continue;
+      if (cleanTags.some((t) => b.tags.has(t) || b.anchor === toValidSkillSlug(t, 'topic'))) {
+        if (explicitSlug && !b.explicitTopic) {
+          b.explicitTopic = explicitSlug;
+          b.anchor = explicitSlug;
+        }
+        return b;
+      }
+      if (
+        !explicitSlug &&
+        (b.anchor === fallbackAnchor ||
+          (unambiguousFamily !== undefined && b.anchor === unambiguousFamily) ||
+          (!b.explicitTopic && sharesMultiSegmentAnchorPrefix(b.anchor, fallbackAnchor)) ||
+          (b.anchor.length >= 4 && !b.anchor.startsWith('topic-') && itemTokens.has(b.anchor)) ||
+          jaccardSimilarity(b.tokens, itemTokens) >= 0.28)
+      ) {
+        return b;
+      }
     }
 
-    // 3. Align anchor with an existing skill if tokens/tags match that skill's topicKey
+    // 3. Align anchor with an existing skill if tokens/tags/canonical family match that skill's topicKey
     let resolvedAnchor = explicitSlug ?? fallbackAnchor;
     for (const skill of input.existingSkills) {
-      if (explicitSlug && skill.topicKey !== explicitSlug) continue;
+      const skillTopic = normalizeSkillOrDraftTopic(skill.topicKey);
+      if (explicitSlug && skillTopic !== explicitSlug) continue;
       if (
-        skill.topicKey === resolvedAnchor ||
-        cleanTags.some((t) => toValidSkillSlug(t, 'topic') === skill.topicKey) ||
-        (!explicitSlug && jaccardSimilarity(tokenizeTopicText(`${skill.name} ${skill.topicKey}`), itemTokens) >= 0.34)
+        skillTopic === resolvedAnchor ||
+        (!explicitSlug && unambiguousFamily !== undefined && skillTopic === unambiguousFamily) ||
+        cleanTags.some((t) => toValidSkillSlug(t, 'topic') === skillTopic) ||
+        (!explicitSlug && jaccardSimilarity(tokenizeTopicText(`${skill.name} ${skillTopic}`), itemTokens) >= 0.34)
       ) {
-        resolvedAnchor = skill.topicKey;
+        resolvedAnchor = skillTopic;
         const existingBucket = buckets.find((b) => b.anchor === resolvedAnchor);
         if (existingBucket) {
+          if (explicitSlug && !existingBucket.explicitTopic) {
+            existingBucket.explicitTopic = explicitSlug;
+          }
           for (const t of cleanTags) existingBucket.tags.add(t);
           for (const tok of itemTokens) existingBucket.tokens.add(tok);
           return existingBucket;
@@ -287,7 +496,7 @@ export function clusterHighEvidenceTopics(input: {
 
     const created: RawTopicBucket = {
       anchor: resolvedAnchor,
-      hasExplicitTopic: Boolean(explicitSlug),
+      ...(explicitSlug ? { explicitTopic: explicitSlug } : {}),
       tokens: new Set(itemTokens),
       tags: new Set(cleanTags),
       memories: [],
@@ -297,12 +506,19 @@ export function clusterHighEvidenceTopics(input: {
     return created;
   };
 
-  for (const mem of eligibleMemories) {
-    const fallback = normalizeTopicAnchor(mem.topicKey, mem.tags, mem.title);
-    const bucket = findOrCreateBucket(mem.topicKey, mem.tags, `${mem.title} ${mem.content}`, fallback);
-    for (const tag of mem.tags) {
-      const ct = tag.trim().toLowerCase();
-      if (ct && !GENERIC_TAGS.has(ct)) bucket.tags.add(ct);
+  // Seed explicit-topic memories first so distinct explicit topics never get bridged via a tag-only memory
+  const orderedMemories = [
+    ...eligibleMemories.filter((m) => Boolean(normalizeExplicitTopicKey(m.topicKey))),
+    ...eligibleMemories.filter((m) => !normalizeExplicitTopicKey(m.topicKey)),
+  ];
+
+  for (const mem of orderedMemories) {
+    const semanticMemTags = mem.tags.filter((t) => isSemanticTopicTag(t.trim().toLowerCase().replace(/^#+/, '')));
+    const fallback = normalizeTopicAnchor(mem.topicKey, semanticMemTags, mem.title);
+    const bucket = findOrCreateBucket(mem.topicKey, semanticMemTags, `${mem.title} ${mem.content}`, fallback);
+    for (const tag of semanticMemTags) {
+      const ct = tag.trim().toLowerCase().replace(/^#+/, '');
+      if (ct) bucket.tags.add(ct);
     }
     for (const tok of tokenizeTopicText(mem.title)) bucket.tokens.add(tok);
     bucket.memories.push(mem);
@@ -310,7 +526,12 @@ export function clusterHighEvidenceTopics(input: {
 
   for (const traj of input.trajectories) {
     // Never pass generic toolNames (read_file, shell, etc.) as semantic topic tags
-    const bucket = findOrCreateBucket(undefined, [], `${traj.title} ${traj.problemSummary}`, traj.topicKey);
+    const bucket = findOrCreateBucket(
+      undefined,
+      [],
+      `${traj.title} ${traj.problemSummary} ${traj.resolutionSummary}`,
+      traj.topicKey,
+    );
     for (const tok of tokenizeTopicText(traj.title)) bucket.tokens.add(tok);
     bucket.trajectories.push(traj);
   }
@@ -324,22 +545,77 @@ export function clusterHighEvidenceTopics(input: {
 
   const skillsByTopic = new Map<string, ExistingSkillTopicRef>();
   for (const s of input.existingSkills) {
-    skillsByTopic.set(s.topicKey, s);
+    skillsByTopic.set(normalizeSkillOrDraftTopic(s.topicKey), s);
   }
 
   const readyClusters: ReadySkillCluster[] = [];
 
+  const collectMemoryWorkspaceRefs = (memories: readonly SleepMemorySummary[], singleTrajWs: string): Set<string> => {
+    const refs = new Set<string>([singleTrajWs]);
+    const singleTrajBase = basename(singleTrajWs).toLowerCase();
+
+    for (const mem of memories) {
+      for (const sid of mem.sourceSessionIds) {
+        const mappedWs = sessionWsMap.get(sid);
+        if (mappedWs) refs.add(mappedWs);
+      }
+      const allSessionsMapped =
+        mem.sourceSessionIds.length > 0 && mem.sourceSessionIds.every((sid) => sessionWsMap.has(sid));
+
+      for (const rawTag of mem.tags) {
+        const trimmed = rawTag.trim();
+        if (!trimmed) continue;
+        const wsTagMatch = EXPLICIT_WORKSPACE_TAG_RE.exec(trimmed);
+        if (wsTagMatch?.[1]) {
+          const val = wsTagMatch[1].trim();
+          if (!val) continue;
+          if (isAbsolute(val) || val === '~' || val.startsWith('~/') || val.startsWith('~\\')) {
+            const expanded = normalizeWorkspacePath(val, input.homeDir, knownAbsoluteWorkspaces);
+            if (expanded) refs.add(expanded);
+          } else {
+            const lowVal = val.toLowerCase();
+            const known = knownWsByBasename.get(lowVal);
+            if (known && known !== 'ambiguous') refs.add(known);
+            else if (lowVal !== singleTrajBase) refs.add(`tag:${lowVal}`);
+          }
+          continue;
+        }
+        if (trimmed.startsWith('/') || trimmed === '~' || trimmed.startsWith('~/') || trimmed.startsWith('~\\')) {
+          const expanded = normalizeWorkspacePath(trimmed, input.homeDir, knownAbsoluteWorkspaces);
+          if (expanded) refs.add(expanded);
+          continue;
+        }
+        if (!allSessionsMapped) {
+          const lowTag = trimmed.toLowerCase().replace(/^#+/, '');
+          if (!COMMON_TECH_TAGS.has(lowTag)) {
+            const known = knownWsByBasename.get(lowTag);
+            if (known && known !== 'ambiguous') {
+              refs.add(known);
+            }
+          }
+        }
+      }
+    }
+    return refs;
+  };
+
   for (const bucket of buckets) {
     const existingSkill = skillsByTopic.get(bucket.anchor);
     const hasOpenDraft = input.existingDrafts.some(
-      (d) => d.topicKey === bucket.anchor || (existingSkill && d.revisesSkillName === existingSkill.name),
+      (d) =>
+        normalizeSkillOrDraftTopic(d.topicKey) === bucket.anchor ||
+        (existingSkill && d.revisesSkillName === existingSkill.name),
     );
     if (hasOpenDraft) continue;
 
     const allEvidenceIds = [...bucket.memories.map((m) => m.id), ...bucket.trajectories.map((t) => t.id)];
 
     const distinctCwds = [
-      ...new Set(bucket.trajectories.map((t) => t.cwd?.trim()).filter((c): c is string => Boolean(c))),
+      ...new Set(
+        bucket.trajectories
+          .map((t) => (t.cwd ? normalizeWorkspacePath(t.cwd, input.homeDir, knownAbsoluteWorkspaces) : ''))
+          .filter(Boolean),
+      ),
     ];
 
     if (!existingSkill) {
@@ -351,7 +627,9 @@ export function clusterHighEvidenceTopics(input: {
       const sig = computeEvidenceSignature(bucket.anchor, allEvidenceIds);
       if (input.rejectedSignatures.has(sig)) continue;
 
-      const scope: SkillScope = distinctCwds.length === 1 && bucket.memories.length === 0 ? 'workspace' : 'global';
+      const singleWs = distinctCwds.length === 1 ? distinctCwds[0] : undefined;
+      const scope: SkillScope =
+        singleWs && collectMemoryWorkspaceRefs(bucket.memories, singleWs).size === 1 ? 'workspace' : 'global';
       const suggestedBase = toValidSkillSlug(bucket.anchor, 'skill');
 
       readyClusters.push({
