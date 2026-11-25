@@ -191,7 +191,7 @@ export function FloatingHud({
 
       <div
         className="floating-dock"
-        style={{ opacity: hovered || inputOpen || isSpeaking || state.privacy.microphoneEnabled ? 1 : 0.16 }}
+        style={{ opacity: hovered || inputOpen || isSpeaking || state.privacy.microphoneEnabled ? 1 : 0.88 }}
       >
         {state.privacy.microphoneEnabled && !state.privacy.physicalKillSwitch && (
           <div className="vad-meter-track" style={{ width: 160 }}>
@@ -218,11 +218,22 @@ export function FloatingHud({
           <button
             type="button"
             className="btn btn-icon"
-            title="粒子拆解/重组切换形态 (Cmd+Shift+M)"
+            title="切换雪儿形象（贾维斯核心 / Q版 / 真人）"
             onClick={() => void api.toggleAvatarForm()}
           >
-            {state.form === 'particle-face' ? '✦ 3D人形' : '◎ 粒子面孔'}
+            {state.form === 'jarvis-core' ? '◉ 核心' : state.form === 'chibi' ? '🐾 Q版' : '✨ 真人'}
           </button>
+
+          {state.form !== 'jarvis-core' && (
+            <button
+              type="button"
+              className={`btn btn-icon ${state.particleMode ? 'btn-primary' : ''}`}
+              title="切换粒子形态 / 实体形象 (Cmd+Shift+M)"
+              onClick={() => void api.toggleParticleMode()}
+            >
+              {state.particleMode ? '❖ 实体' : '✦ 粒子'}
+            </button>
+          )}
 
           <button
             type="button"

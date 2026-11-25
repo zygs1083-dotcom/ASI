@@ -7,6 +7,7 @@ export {
   createSilentVisemeFrame,
   type HologramSettings,
   HologramSettingsSchema,
+  normalizeAvatarForm,
   PRESENCE_ACTIVITIES,
   PRESENCE_EMOTIONS,
   type PresenceActivity,

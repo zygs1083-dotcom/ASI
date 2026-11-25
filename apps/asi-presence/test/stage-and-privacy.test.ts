@@ -1,16 +1,17 @@
-import { PRESENCE_EMOTIONS, VISUAL_THEMES } from '@asi/presence-protocol';
+import { normalizeAvatarForm, PRESENCE_EMOTIONS, VISUAL_THEMES } from '@asi/presence-protocol';
 import { describe, expect, it } from 'vitest';
 import { PrivacyGate } from '../src/main/privacy-gate.ts';
+import { createSnowPawTrayPngBuffer } from '../src/main/tray-icon.ts';
+import { generateJarvisCoreCloud, UNIFIED_PARTICLE_COUNT } from '../src/renderer/stage/jarvis-core.ts';
 import { resolveThemeColors } from '../src/renderer/stage/themes.ts';
-import { XueerHumanoidRig } from '../src/renderer/stage/xueer-humanoid-rig.ts';
-import { generateXueerParticleFaceData, XUEER_PARTICLE_COUNT } from '../src/renderer/stage/xueer-particle-face.ts';
 import { deriveVisionOverlayStatus } from '../src/renderer/vision/vision-controller.ts';
 
-describe('雪儿 3D Stage Geometry, Themes & Privacy Guardrails', () => {
-  it('generates 12,000 finite deterministic particle points spanning face, eyes, mouth, snowy canine ears, rings, and snowlight', () => {
-    const data = generateXueerParticleFaceData(XUEER_PARTICLE_COUNT);
-    expect(data.count).toBe(XUEER_PARTICLE_COUNT);
-    expect(data.positions.length).toBe(XUEER_PARTICLE_COUNT * 3);
+describe('雪儿 J.A.R.V.I.S. Core, Tray Icon, Themes & Privacy Guardrails', () => {
+  it('generates 26,000 finite deterministic Avengers J.A.R.V.I.S. neural core particles across all 5 shells', () => {
+    const data = generateJarvisCoreCloud(UNIFIED_PARTICLE_COUNT);
+    expect(data.count).toBe(UNIFIED_PARTICLE_COUNT);
+    expect(data.positions.length).toBe(UNIFIED_PARTICLE_COUNT * 3);
+    expect(data.colors.length).toBe(UNIFIED_PARTICLE_COUNT * 3);
 
     const regionCounts = new Map<number, number>();
     for (let i = 0; i < data.count; i += 1) {
@@ -19,27 +20,35 @@ describe('雪儿 3D Stage Geometry, Themes & Privacy Guardrails', () => {
       expect(Number.isFinite(data.positions[i * 3])).toBe(true);
       expect(Number.isFinite(data.positions[i * 3 + 1])).toBe(true);
       expect(Number.isFinite(data.positions[i * 3 + 2])).toBe(true);
+      expect(Number.isFinite(data.colors[i * 3])).toBe(true);
     }
 
-    // All 6 anatomical/holographic particle regions must be populated
-    for (const regionId of [0, 1, 2, 3, 4, 5]) {
-      expect(regionCounts.get(regionId) ?? 0).toBeGreaterThan(500);
+    // All 5 J.A.R.V.I.S. neural regions (core, arcs, synapse clusters, inner volume, outer embers) must be populated
+    for (const regionId of [0, 1, 2, 3, 4]) {
+      expect(regionCounts.get(regionId) ?? 0).toBeGreaterThan(1500);
     }
   });
 
-  it('samples finite morph target points from the built-in 3D 雪儿 cyber humanoid rig', () => {
-    const rig = new XueerHumanoidRig();
-    const pts = rig.sampleSurfacePoints(4096);
-    expect(pts.length).toBe(4096 * 3);
+  it('produces a valid non-empty 36x36 @2x Retina RGBA PNG buffer for macOS Menu Bar tray template icon', () => {
+    const png = createSnowPawTrayPngBuffer(36);
+    // PNG magic signature
+    expect(png.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))).toBe(true);
+    // IHDR chunk width/height = 36x36, bitDepth = 8, colorType = 6 (RGBA)
+    expect(png.subarray(12, 16).toString('ascii')).toBe('IHDR');
+    expect(png.readUInt32BE(16)).toBe(36);
+    expect(png.readUInt32BE(20)).toBe(36);
+    expect(png[24]).toBe(8);
+    expect(png[25]).toBe(6);
+    expect(png.byteLength).toBeGreaterThan(300);
+  });
 
-    let nonZero = 0;
-    for (let i = 0; i < pts.length; i += 1) {
-      const v = pts[i] ?? 0;
-      expect(Number.isFinite(v)).toBe(true);
-      if (Math.abs(v) > 0.01) nonZero += 1;
-    }
-    expect(nonZero).toBeGreaterThan(pts.length * 0.7);
-    rig.dispose();
+  it('normalizes legacy avatar forms seamlessly to the new jarvis-core / chibi / realistic trio', () => {
+    expect(normalizeAvatarForm('particle-face')).toBe('jarvis-core');
+    expect(normalizeAvatarForm('humanoid-3d')).toBe('chibi');
+    expect(normalizeAvatarForm('jarvis-core')).toBe('jarvis-core');
+    expect(normalizeAvatarForm('chibi')).toBe('chibi');
+    expect(normalizeAvatarForm('realistic')).toBe('realistic');
+    expect(normalizeAvatarForm('unknown-form', 'realistic')).toBe('realistic');
   });
 
   it('resolves valid RGB colors across all themes and emotions', () => {
@@ -61,7 +70,6 @@ describe('雪儿 3D Stage Geometry, Themes & Privacy Guardrails', () => {
     expect(initial.cameraEnabled).toBe(false);
     expect(initial.physicalKillSwitch).toBe(false);
 
-    // Screen capture refused while OFF
     let captureCalls = 0;
     const refused = await gate.captureScreenFrameInMemory({
       capturePrimaryPngBuffer: async () => {
@@ -72,7 +80,6 @@ describe('雪儿 3D Stage Geometry, Themes & Privacy Guardrails', () => {
     expect(refused).toBeNull();
     expect(captureCalls).toBe(0);
 
-    // Explicitly toggle screen ON -> capture succeeds strictly in memory and resets activeCapture.screen
     gate.update({ screenVisionEnabled: true, microphoneEnabled: true });
     const captured = await gate.captureScreenFrameInMemory({
       capturePrimaryPngBuffer: async () => {
@@ -84,7 +91,6 @@ describe('雪儿 3D Stage Geometry, Themes & Privacy Guardrails', () => {
     expect(captured).toBe(`data:image/png;base64,${Buffer.from('png-bytes').toString('base64')}`);
     expect(gate.getState().activeCapture.screen).toBe(false);
 
-    // Engage physical kill switch -> immediately turns everything off and blocks re-enabling
     const killed = gate.setPhysicalKillSwitch(true);
     expect(killed.physicalKillSwitch).toBe(true);
     expect(killed.microphoneEnabled).toBe(false);

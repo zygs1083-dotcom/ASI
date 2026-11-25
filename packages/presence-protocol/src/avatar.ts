@@ -5,9 +5,16 @@ export const PRESENCE_EMOTIONS = ['calm', 'focused', 'joyful', 'alert', 'tired',
 export const PresenceEmotionSchema = z.enum(PRESENCE_EMOTIONS);
 export type PresenceEmotion = z.infer<typeof PresenceEmotionSchema>;
 
-export const AVATAR_FORMS = ['particle-face', 'humanoid-3d'] as const;
+export const AVATAR_FORMS = ['jarvis-core', 'chibi', 'realistic'] as const;
 export const AvatarFormSchema = z.enum(AVATAR_FORMS);
 export type AvatarForm = z.infer<typeof AvatarFormSchema>;
+
+export function normalizeAvatarForm(raw: unknown, fallback: AvatarForm = 'jarvis-core'): AvatarForm {
+  if (raw === 'jarvis-core' || raw === 'chibi' || raw === 'realistic') return raw;
+  if (raw === 'particle-face') return 'jarvis-core';
+  if (raw === 'humanoid-3d') return 'chibi';
+  return fallback;
+}
 
 export const VISUAL_THEMES = ['snow-cyan', 'jarvis-amber', 'neon-violet'] as const;
 export const VisualThemeSchema = z.enum(VISUAL_THEMES);

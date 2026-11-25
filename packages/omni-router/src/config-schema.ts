@@ -1,4 +1,5 @@
 import {
+  type AvatarForm,
   AvatarFormSchema,
   DEFAULT_CALIBRATION_MODEL,
   DEFAULT_COMPANION_NAME,
@@ -10,12 +11,16 @@ import {
   DEFAULT_STT_LOCALE,
   DEFAULT_TYPESAFE_BASE_URL,
   DEFAULT_VISION_MODEL,
+  normalizeAvatarForm,
   STT_PROVIDERS,
   type SttProviderKind,
   SttProviderKindSchema,
   VisualThemeSchema,
 } from '@asi/presence-protocol';
 import { z } from 'zod';
+
+const compatAvatarForm = (fallback: AvatarForm) =>
+  z.preprocess((val) => (val === undefined ? undefined : normalizeAvatarForm(val, fallback)), AvatarFormSchema);
 
 export { STT_PROVIDERS, type SttProviderKind, SttProviderKindSchema };
 
@@ -51,8 +56,10 @@ export const PresenceConfigSchema = z.object({
   appearance: z
     .object({
       theme: VisualThemeSchema.default('snow-cyan'),
-      floatingForm: AvatarFormSchema.default('particle-face'),
-      stageForm: AvatarFormSchema.default('humanoid-3d'),
+      floatingForm: compatAvatarForm('jarvis-core').default('jarvis-core'),
+      stageForm: compatAvatarForm('chibi').default('chibi'),
+      floatingParticleMode: z.boolean().default(true),
+      stageParticleMode: z.boolean().default(false),
       hologramIntensity: z.number().min(0).max(1).default(0.72),
       scanlineDensity: z.number().min(0).max(1).default(0.48),
       particleGlow: z.number().min(0.2).max(1.5).default(1.0),
@@ -60,8 +67,10 @@ export const PresenceConfigSchema = z.object({
     })
     .default({
       theme: 'snow-cyan',
-      floatingForm: 'particle-face',
-      stageForm: 'humanoid-3d',
+      floatingForm: 'jarvis-core',
+      stageForm: 'chibi',
+      floatingParticleMode: true,
+      stageParticleMode: false,
       hologramIntensity: 0.72,
       scanlineDensity: 0.48,
       particleGlow: 1.0,

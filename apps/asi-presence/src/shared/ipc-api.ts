@@ -18,6 +18,7 @@ import type {
 export interface PresenceAppState {
   windowMode: WindowMode;
   form: AvatarForm;
+  particleMode: boolean;
   theme: VisualTheme;
   emotion: PresenceEmotion;
   activity: PresenceActivity;
@@ -88,6 +89,8 @@ export interface AsiPresenceBridgeApi {
   transcribeAudio(wavBase64: string, options?: SttTranscribeOptions): Promise<SttTranscribeResult>;
   setAvatarForm(form: AvatarForm): Promise<void>;
   toggleAvatarForm(): Promise<AvatarForm>;
+  setParticleMode(enabled: boolean): Promise<void>;
+  toggleParticleMode(): Promise<boolean>;
   setTheme(theme: VisualTheme): Promise<void>;
   updateVisualSettings(patch: {
     hologramIntensity?: number;

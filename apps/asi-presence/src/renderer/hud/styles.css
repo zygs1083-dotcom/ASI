@@ -89,12 +89,12 @@ body.stage-mode {
   gap: 6px;
   padding: 4px 11px;
   border-radius: 999px;
-  background: rgba(6, 16, 31, 0.68);
-  backdrop-filter: blur(12px);
-  border: 1px solid var(--border);
+  background: rgba(9, 16, 30, 0.86);
+  backdrop-filter: blur(14px);
+  border: 1px solid rgba(255, 255, 255, 0.16);
   font-size: 11px;
-  color: var(--text-primary);
-  box-shadow: 0 4px 20px var(--glow);
+  color: #f8fbff;
+  box-shadow: 0 4px 18px rgba(0, 0, 0, 0.34);
   pointer-events: auto;
   white-space: nowrap;
 }
@@ -106,12 +106,12 @@ body.stage-mode {
   margin-bottom: 8px;
   padding: 7px 12px;
   border-radius: 12px;
-  background: rgba(6, 16, 31, 0.78);
+  background: rgba(9, 16, 30, 0.88);
   backdrop-filter: blur(14px);
-  border: 1px solid var(--border);
+  border: 1px solid rgba(255, 255, 255, 0.16);
   font-size: 12px;
   line-height: 1.45;
-  color: var(--text-primary);
+  color: #f8fbff;
   text-align: center;
   box-shadow: 0 6px 22px rgba(0, 0, 0, 0.38);
   pointer-events: auto;
@@ -137,9 +137,9 @@ body.stage-mode {
   gap: 6px;
   padding: 5px 8px;
   border-radius: 999px;
-  background: rgba(6, 16, 31, 0.8);
+  background: rgba(10, 17, 30, 0.88);
   backdrop-filter: blur(16px);
-  border: 1px solid var(--border);
+  border: 1px solid rgba(255, 255, 255, 0.18);
   box-shadow: 0 6px 24px rgba(0, 0, 0, 0.42);
 }
 
@@ -480,6 +480,17 @@ body.stage-mode {
 
 .btn:active {
   transform: scale(0.98);
+}
+
+.floating-toolbar .btn {
+  background: rgba(24, 38, 62, 0.88);
+  border-color: rgba(255, 255, 255, 0.18);
+  color: #f8fbff;
+}
+
+.floating-toolbar .btn:hover {
+  background: rgba(34, 54, 86, 0.96);
+  border-color: var(--accent);
 }
 
 .btn-primary {

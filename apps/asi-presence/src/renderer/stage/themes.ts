@@ -26,12 +26,12 @@ export const THEME_PALETTES: Record<VisualTheme, ThemePalette> = {
   'jarvis-amber': {
     id: 'jarvis-amber',
     label: '琥珀金 · J.A.R.V.I.S.',
-    primaryHex: '#fff7ed',
-    secondaryHex: '#fbbf24',
-    accentHex: '#f59e0b',
+    primaryHex: '#fff9e6',
+    secondaryHex: '#ffad2e',
+    accentHex: '#ea580c',
     warmHex: '#fde047',
-    hudBorder: 'rgba(251, 191, 36, 0.38)',
-    hudGlow: 'rgba(245, 158, 11, 0.28)',
+    hudBorder: 'rgba(255, 173, 46, 0.42)',
+    hudGlow: 'rgba(234, 88, 12, 0.34)',
   },
   'neon-violet': {
     id: 'neon-violet',

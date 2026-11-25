@@ -29,8 +29,9 @@ function createBrowserPreviewApi(role: 'floating' | 'stage'): AsiPresenceBridgeA
   let cfg = createDefaultPresenceConfig();
   let state: PresenceAppState = {
     windowMode: role,
-    form: role === 'floating' ? 'particle-face' : 'humanoid-3d',
-    theme: 'snow-cyan',
+    form: role === 'floating' ? 'jarvis-core' : 'chibi',
+    particleMode: role === 'floating',
+    theme: role === 'floating' ? 'jarvis-amber' : 'snow-cyan',
     emotion: 'affectionate',
     activity: 'idle',
     hologramIntensity: 0.72,
@@ -99,12 +100,36 @@ function createBrowserPreviewApi(role: 'floating' | 'stage'): AsiPresenceBridgeA
     abortSpeech: async () => undefined,
     transcribeAudio: async () => ({ ok: false, text: '', providerUsed: 'off' }),
     setAvatarForm: async (form: AvatarForm) => {
-      state = { ...state, form };
+      state = {
+        ...state,
+        form,
+        particleMode: form === 'jarvis-core' ? true : state.form === 'jarvis-core' ? false : state.particleMode,
+      };
       emitState();
     },
     toggleAvatarForm: async () => {
-      const next: AvatarForm = state.form === 'particle-face' ? 'humanoid-3d' : 'particle-face';
-      state = { ...state, form: next };
+      const order: AvatarForm[] = ['jarvis-core', 'chibi', 'realistic'];
+      const next = order[(order.indexOf(state.form) + 1) % order.length] ?? 'jarvis-core';
+      state = { ...state, form: next, particleMode: next === 'jarvis-core' };
+      emitState();
+      return next;
+    },
+    setParticleMode: async (enabled: boolean) => {
+      if (state.form === 'jarvis-core' && !enabled) {
+        state = { ...state, form: 'chibi', particleMode: false };
+      } else {
+        state = { ...state, particleMode: state.form === 'jarvis-core' ? true : enabled };
+      }
+      emitState();
+    },
+    toggleParticleMode: async () => {
+      if (state.form === 'jarvis-core') {
+        state = { ...state, form: 'chibi', particleMode: false };
+        emitState();
+        return false;
+      }
+      const next = !state.particleMode;
+      state = { ...state, particleMode: next };
       emitState();
       return next;
     },
@@ -117,7 +142,7 @@ function createBrowserPreviewApi(role: 'floating' | 'stage'): AsiPresenceBridgeA
       emitState();
     },
     saveVrmFile: async (_buffer, fileName) => {
-      state = { ...state, vrmFileName: fileName, form: 'humanoid-3d' };
+      state = { ...state, vrmFileName: fileName, form: 'chibi', particleMode: false };
       emitState();
       return { ok: true, fileName };
     },
@@ -209,8 +234,9 @@ export function App() {
 
   const [state, setState] = useState<PresenceAppState>(() => ({
     windowMode: role,
-    form: role === 'floating' ? 'particle-face' : 'humanoid-3d',
-    theme: 'snow-cyan',
+    form: role === 'floating' ? 'jarvis-core' : 'chibi',
+    particleMode: role === 'floating',
+    theme: role === 'floating' ? 'jarvis-amber' : 'snow-cyan',
     emotion: 'calm',
     activity: 'idle',
     hologramIntensity: 0.72,
@@ -301,19 +327,28 @@ export function App() {
     };
   }, [api, role]);
 
-  // Sync state (including live TTS speaking persistence) into Three.js engine
+  // Sync state (including live TTS speaking persistence & DSH background work energy) into Three.js engine
   useEffect(() => {
+    const rawCpu = effectiveState.bridge.vitals.cpuUsage ?? 0;
+    const cpuPct = rawCpu <= 1 ? rawCpu * 100 : rawCpu;
+    const cpuWork = Math.min(1, Math.max(0, (cpuPct - 18) / 70));
+    const urgencyWork = Math.min(1, Math.max(0, effectiveState.bridge.needs.overallUrgency / 100));
+    const driveWork = effectiveState.bridge.needs.activeDrives.length > 0 ? 0.52 : 0;
+    const workEnergy = Math.max(cpuWork * 0.65, urgencyWork * 0.75, driveWork, vadRms * 0.8);
+
     sceneRef.current?.setState({
       form: effectiveState.form,
+      particleMode: effectiveState.particleMode,
       theme: effectiveState.theme,
       emotion: effectiveState.emotion,
       activity: effectiveState.activity,
+      workEnergy,
       hologramIntensity: effectiveState.hologramIntensity,
       scanlineDensity: effectiveState.scanlineDensity,
       particleGlow: effectiveState.particleGlow,
       quietDefer: effectiveState.bridge.tom.shouldDefer,
     });
-  }, [effectiveState]);
+  }, [effectiveState, vadRms]);
 
   // Subscribe to Electron Main IPC streams
   useEffect(() => {

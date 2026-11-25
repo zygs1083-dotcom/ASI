@@ -343,9 +343,47 @@ export function StageHud({
 
           {/* Bottom Morph & Appearance Control Deck */}
           <div className="stage-deck">
-            <button type="button" className="btn btn-primary" onClick={() => void api.toggleAvatarForm()}>
-              {state.form === 'particle-face' ? '✦ 粒子重组 → 3D 赛博人形' : '◎ 粒子拆解 → J.A.R.V.I.S. 虚拟面孔'}
+            <button
+              type="button"
+              className={`btn ${state.form === 'jarvis-core' ? 'btn-primary' : ''}`}
+              onClick={() => void api.setAvatarForm('jarvis-core')}
+              title="复仇者联盟 J.A.R.V.I.S. 风格纯粒子神经核心"
+            >
+              ◉ 贾维斯核心
             </button>
+            <button
+              type="button"
+              className={`btn ${state.form === 'chibi' && !state.vrmFileName ? 'btn-primary' : ''}`}
+              onClick={() => {
+                if (state.vrmFileName) onResetHumanoid();
+                void api.setAvatarForm('chibi');
+              }}
+              title="Q 版雪儿形象（支持一键切换粒子形态）"
+            >
+              🐾 Q版雪儿
+            </button>
+            <button
+              type="button"
+              className={`btn ${state.form === 'realistic' && !state.vrmFileName ? 'btn-primary' : ''}`}
+              onClick={() => {
+                if (state.vrmFileName) onResetHumanoid();
+                void api.setAvatarForm('realistic');
+              }}
+              title="真人雪儿形象（支持一键切换粒子形态）"
+            >
+              ✨ 真人雪儿
+            </button>
+
+            {state.form !== 'jarvis-core' && (
+              <button
+                type="button"
+                className={`btn ${state.particleMode ? 'btn-primary' : ''}`}
+                onClick={() => void api.toggleParticleMode()}
+                title="一键将当前形象在实体与跃动粒子形态间切换 (Cmd+Shift+M)"
+              >
+                {state.particleMode ? '❖ 切回实体形象' : '✦ 切换粒子形态'}
+              </button>
+            )}
 
             {VISUAL_THEMES.map((themeId) => (
               <button
@@ -383,10 +421,10 @@ export function StageHud({
                 className="btn"
                 onClick={() => {
                   onResetHumanoid();
-                  setVrmNotice('已切回内置雪儿 3D 全息人形');
+                  setVrmNotice('已切回雪儿内置形象');
                 }}
               >
-                恢复雪儿默认人形
+                移除 .vrm
               </button>
             )}
           </div>

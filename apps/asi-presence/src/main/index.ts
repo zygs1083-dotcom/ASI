@@ -54,14 +54,19 @@ let windowManager: PresenceWindowManager | null = null;
 let isQuitting = false;
 let currentConfig: PresenceConfig = createDefaultPresenceConfig();
 const windowForms: Record<'floating' | 'stage', AvatarForm> = {
-  floating: 'particle-face',
-  stage: 'humanoid-3d',
+  floating: 'jarvis-core',
+  stage: 'chibi',
+};
+const windowParticleModes: Record<'floating' | 'stage', boolean> = {
+  floating: true,
+  stage: false,
 };
 
 let appState: PresenceAppState = {
   windowMode: 'floating',
-  form: 'particle-face',
-  theme: 'snow-cyan',
+  form: 'jarvis-core',
+  particleMode: true,
+  theme: 'jarvis-amber',
   emotion: 'calm',
   activity: 'idle',
   hologramIntensity: 0.72,
@@ -275,18 +280,53 @@ function registerIpcHandlers(): void {
     },
   );
 
-  ipcMain.handle('presence:set-form', async (_ev, form: AvatarForm) => {
+  const applyForm = (form: AvatarForm) => {
+    const nextParticle =
+      form === 'jarvis-core' ? true : appState.form === 'jarvis-core' ? false : appState.particleMode;
     if (appState.windowMode === 'floating' || appState.windowMode === 'stage') {
       windowForms[appState.windowMode] = form;
+      windowParticleModes[appState.windowMode] = nextParticle;
     }
-    publishState({ form });
-  });
-  ipcMain.handle('presence:toggle-form', async () => {
-    const next: AvatarForm = appState.form === 'particle-face' ? 'humanoid-3d' : 'particle-face';
+    publishState({ form, particleMode: nextParticle });
+  };
+
+  const cycleForm = (): AvatarForm => {
+    const order: AvatarForm[] = ['jarvis-core', 'chibi', 'realistic'];
+    const idx = order.indexOf(appState.form);
+    const next = order[(idx + 1) % order.length] ?? 'jarvis-core';
+    applyForm(next);
+    return next;
+  };
+
+  const applyParticleMode = (enabled: boolean) => {
+    if (appState.form === 'jarvis-core') {
+      if (!enabled) {
+        applyForm('chibi');
+        return;
+      }
+      publishState({ particleMode: true });
+      return;
+    }
     if (appState.windowMode === 'floating' || appState.windowMode === 'stage') {
-      windowForms[appState.windowMode] = next;
+      windowParticleModes[appState.windowMode] = enabled;
     }
-    publishState({ form: next });
+    publishState({ particleMode: enabled });
+  };
+
+  ipcMain.handle('presence:set-form', async (_ev, form: AvatarForm) => {
+    applyForm(form);
+  });
+  ipcMain.handle('presence:toggle-form', async () => cycleForm());
+  ipcMain.handle('presence:set-particle-mode', async (_ev, enabled: boolean) => {
+    applyParticleMode(Boolean(enabled));
+  });
+  ipcMain.handle('presence:toggle-particle-mode', async () => {
+    if (appState.form === 'jarvis-core') {
+      applyForm('chibi');
+      return false;
+    }
+    const next = !appState.particleMode;
+    applyParticleMode(next);
     return next;
   });
   ipcMain.handle('presence:set-theme', async (_ev, theme: VisualTheme) => {
@@ -349,8 +389,9 @@ function registerIpcHandlers(): void {
     currentConfig = await secretsStore.saveConfig({
       appearance: { ...cfg.appearance, vrmFileName: cleanName },
     });
-    windowForms.stage = 'humanoid-3d';
-    publishState({ vrmFileName: cleanName, form: 'humanoid-3d' });
+    windowForms.stage = 'chibi';
+    windowParticleModes.stage = false;
+    publishState({ vrmFileName: cleanName, form: 'chibi', particleMode: false });
     windowManager?.broadcast('presence:config', currentConfig);
     windowManager?.broadcast('presence:vrm-updated', { fileName: cleanName });
     return { ok: true, fileName: cleanName };
@@ -447,10 +488,13 @@ async function bootstrap(): Promise<void> {
   currentConfig = cfg;
   windowForms.floating = cfg.appearance.floatingForm;
   windowForms.stage = cfg.appearance.stageForm;
+  windowParticleModes.floating = cfg.appearance.floatingParticleMode;
+  windowParticleModes.stage = cfg.appearance.stageParticleMode;
 
   appState = {
     ...appState,
     form: windowForms.floating,
+    particleMode: windowForms.floating === 'jarvis-core' ? true : windowParticleModes.floating,
     theme: cfg.appearance.theme,
     hologramIntensity: cfg.appearance.hologramIntensity,
     scanlineDensity: cfg.appearance.scanlineDensity,
@@ -500,11 +544,37 @@ async function bootstrap(): Promise<void> {
 
   windowManager = new PresenceWindowManager({
     onToggleForm: () => {
-      const next: AvatarForm = appState.form === 'particle-face' ? 'humanoid-3d' : 'particle-face';
+      const order: AvatarForm[] = ['jarvis-core', 'chibi', 'realistic'];
+      const next = order[(order.indexOf(appState.form) + 1) % order.length] ?? 'jarvis-core';
+      const nextParticle = next === 'jarvis-core';
       if (appState.windowMode === 'floating' || appState.windowMode === 'stage') {
         windowForms[appState.windowMode] = next;
+        windowParticleModes[appState.windowMode] = nextParticle;
       }
-      publishState({ form: next });
+      publishState({ form: next, particleMode: nextParticle });
+    },
+    onSelectForm: (form) => {
+      const nextParticle = form === 'jarvis-core';
+      if (appState.windowMode === 'floating' || appState.windowMode === 'stage') {
+        windowForms[appState.windowMode] = form;
+        windowParticleModes[appState.windowMode] = nextParticle;
+      }
+      publishState({ form, particleMode: nextParticle });
+    },
+    onToggleParticleMode: () => {
+      if (appState.form === 'jarvis-core') {
+        if (appState.windowMode === 'floating' || appState.windowMode === 'stage') {
+          windowForms[appState.windowMode] = 'chibi';
+          windowParticleModes[appState.windowMode] = false;
+        }
+        publishState({ form: 'chibi', particleMode: false });
+        return;
+      }
+      const nextParticle = !appState.particleMode;
+      if (appState.windowMode === 'floating' || appState.windowMode === 'stage') {
+        windowParticleModes[appState.windowMode] = nextParticle;
+      }
+      publishState({ particleMode: nextParticle });
     },
     onToggleKillSwitch: () => {
       const next = privacyGate.setPhysicalKillSwitch(!privacyGate.getState().physicalKillSwitch);
@@ -516,7 +586,13 @@ async function bootstrap(): Promise<void> {
     },
     onModeChanged: (mode) => {
       const nextForm = mode === 'floating' || mode === 'stage' ? windowForms[mode] : appState.form;
-      publishState({ windowMode: mode, form: nextForm });
+      const nextParticle =
+        nextForm === 'jarvis-core'
+          ? true
+          : mode === 'floating' || mode === 'stage'
+            ? windowParticleModes[mode]
+            : appState.particleMode;
+      publishState({ windowMode: mode, form: nextForm, particleMode: nextParticle });
     },
     onQuit: () => {
       isQuitting = true;

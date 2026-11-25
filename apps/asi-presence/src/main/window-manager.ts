@@ -1,11 +1,14 @@
 import { readFile } from 'node:fs/promises';
 import { dirname, extname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import type { WindowMode } from '@asi/presence-protocol';
+import type { AvatarForm, WindowMode } from '@asi/presence-protocol';
 import { BrowserWindow, globalShortcut, Menu, nativeImage, protocol, screen, Tray } from 'electron';
+import { createSnowPawTrayPngBuffer } from './tray-icon.ts';
 
 export interface WindowManagerCallbacks {
   onToggleForm: () => void;
+  onSelectForm: (form: AvatarForm) => void;
+  onToggleParticleMode: () => void;
   onToggleKillSwitch: () => void;
   onModeChanged: (mode: WindowMode) => void;
   onQuit: () => void;
@@ -72,18 +75,14 @@ export function registerPresenceAssetProtocol(): void {
 }
 
 function createSnowPawTrayIcon(): Electron.NativeImage {
-  // Minimal crisp 16x16 snow-cyan holographic crystal SVG data URL for macOS menu bar tray
-  const svg = [
-    '<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 18 18">',
-    '<circle cx="9" cy="10.2" r="4.3" fill="#e0f7ff" stroke="#38bdf8" stroke-width="1.3"/>',
-    '<path d="M5.2 6.8 L3.6 2.6 L7.4 5.2 Z" fill="#e0f7ff" stroke="#38bdf8" stroke-width="1"/>',
-    '<path d="M12.8 6.8 L14.4 2.6 L10.6 5.2 Z" fill="#e0f7ff" stroke="#38bdf8" stroke-width="1"/>',
-    '<circle cx="7.4" cy="9.8" r="0.8" fill="#0369a1"/>',
-    '<circle cx="10.6" cy="9.8" r="0.8" fill="#0369a1"/>',
-    '</svg>',
-  ].join('');
-  const img = nativeImage.createFromDataURL(`data:image/svg+xml;base64,${Buffer.from(svg).toString('base64')}`);
-  return img.resize({ width: 18, height: 18 });
+  // Real 36x36 (@2x Retina = 18x18pt) RGBA PNG template icon so macOS Menu Bar renders it crisply
+  // in both Light and Dark themes (Electron nativeImage does not rasterize SVG data URLs on macOS).
+  const pngBuffer = createSnowPawTrayPngBuffer(36);
+  const img = nativeImage.createFromBuffer(pngBuffer, { width: 36, height: 36, scaleFactor: 2.0 });
+  if (process.platform === 'darwin') {
+    img.setTemplateImage(true);
+  }
+  return img;
 }
 
 /**
@@ -264,7 +263,11 @@ export class PresenceWindowManager {
         { label: '展开全息舞台控制台', click: () => this.setMode('stage') },
         { label: '隐身待命', click: () => this.setMode('hidden') },
         { type: 'separator' },
-        { label: '粒子形态切换 (面孔 ↔ 3D人形)', click: () => this.callbacks.onToggleForm() },
+        { label: '◉ 贾维斯纯粒子核心', click: () => this.callbacks.onSelectForm('jarvis-core') },
+        { label: '🐾 Q 版雪儿', click: () => this.callbacks.onSelectForm('chibi') },
+        { label: '✨ 真人雪儿', click: () => this.callbacks.onSelectForm('realistic') },
+        { label: '✦ 切换粒子形态 (实体 ↔ 粒子)', click: () => this.callbacks.onToggleParticleMode() },
+        { type: 'separator' },
         { label: '物理级静音断眼开关', click: () => this.callbacks.onToggleKillSwitch() },
         { type: 'separator' },
         { label: '退出 ASI Presence', click: () => this.callbacks.onQuit() },
@@ -288,7 +291,7 @@ export class PresenceWindowManager {
         this.setMode(this.mode === 'stage' ? 'floating' : 'stage');
       });
       globalShortcut.register('CommandOrControl+Shift+M', () => {
-        this.callbacks.onToggleForm();
+        this.callbacks.onToggleParticleMode();
       });
       globalShortcut.register('CommandOrControl+Shift+X', () => {
         this.callbacks.onToggleKillSwitch();
