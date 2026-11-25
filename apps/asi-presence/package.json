@@ -1,0 +1,46 @@
+{
+  "name": "asi-presence",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "ASI Presence (雪儿) — Holographic dual-form 3D desktop companion (Electron + React + Three.js + @pixiv/three-vrm + Silero VAD + Edge-TTS) connected to DSH asi plugin.",
+  "main": "./dist/main/index.mjs",
+  "engines": {
+    "node": "^22.12.0 || ^24.0.0 || >=26.0.0"
+  },
+  "scripts": {
+    "build:main": "node scripts/build-main.mjs",
+    "build:renderer": "vite build",
+    "build": "pnpm run build:renderer && pnpm run build:main",
+    "dev:renderer": "vite --port 5179",
+    "start": "pnpm run build && electron .",
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "vitest run",
+    "check": "pnpm run typecheck && pnpm test"
+  },
+  "dependencies": {
+    "@asi/omni-router": "workspace:*",
+    "@asi/presence-protocol": "workspace:*",
+    "@pixiv/three-vrm": "3.6.0",
+    "@ricky0123/vad-web": "0.0.31",
+    "msedge-tts": "2.1.1",
+    "react": "18.3.1",
+    "react-dom": "18.3.1",
+    "three": "0.187.0",
+    "ws": "8.23.0",
+    "zod": "4.6.6"
+  },
+  "devDependencies": {
+    "@types/node": "26.6.6",
+    "@types/react": "18.3.31",
+    "@types/react-dom": "^18.3.7",
+    "@types/three": "0.187.0",
+    "@types/ws": "8.18.2",
+    "@vitejs/plugin-react": "5.1.4",
+    "electron": "45.5.0",
+    "esbuild": "0.28.2",
+    "typescript": "7.0.2",
+    "vite": "^7.3.8",
+    "vitest": "5.1.0"
+  }
+}

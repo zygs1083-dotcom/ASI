@@ -1,0 +1,29 @@
+{
+  "name": "@asi/omni-router",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Multi-brain cognitive routing engine (native TypeSafe AI Jev System One + magpie fallback + streaming LLM/VLM + 0600 local secrets store) for ASI Presence.",
+  "engines": {
+    "node": "^22.12.0 || ^24.0.0 || >=26.0.0"
+  },
+  "exports": {
+    ".": "./src/index.ts",
+    "./schema": "./src/config-schema.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "vitest run",
+    "check": "pnpm typecheck && pnpm test"
+  },
+  "dependencies": {
+    "@asi/presence-protocol": "workspace:*",
+    "@asi/sense-types": "workspace:*",
+    "zod": "4.6.6"
+  },
+  "devDependencies": {
+    "@types/node": "26.6.6",
+    "typescript": "7.0.2",
+    "vitest": "5.1.0"
+  }
+}

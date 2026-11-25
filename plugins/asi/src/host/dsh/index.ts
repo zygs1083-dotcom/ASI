@@ -10,7 +10,9 @@ import type {
 } from '@asi/sense-types';
 import type { Context } from '@deepseek-ai/cordis';
 import type {} from '@deepseek-ai/dsh-app-boot';
+import type { WorkspaceRegistry } from '@deepseek-ai/dsh-workspace';
 import z from '@deepseek-ai/schemastery';
+import { type PresenceBridgeHandle, startPresenceBridge } from '../../bridge/index.ts';
 import { createDshCarePorts } from '../../care/host/dsh/ports.ts';
 import { registerCareTools } from '../../care/host/dsh/tools.ts';
 import { createCareRuntime } from '../../care/host/runtime.ts';
@@ -59,6 +61,7 @@ declare module '@deepseek-ai/cordis' {
   }
 }
 
+export { type PresenceBridgeHandle, startPresenceBridge } from '../../bridge/index.ts';
 export { AsiDreamService } from '../../dream/host/dsh/dream-service.ts';
 export { AsiIntuitionService } from '../../intuition/host/dsh/intuition-service.ts';
 export { type LegacyMigrationReport, migrateLegacyAsiData } from '../../migration/legacy-migration.ts';
@@ -131,6 +134,8 @@ export interface Config {
   ignorePaths?: string[];
   fastIntervalMs?: number;
   slowIntervalMs?: number;
+  enablePresenceBridge?: boolean;
+  presenceBridgePort?: number;
 }
 
 export const Config: z<Config> = z.object({
@@ -142,6 +147,8 @@ export const Config: z<Config> = z.object({
   ignorePaths: z.array(z.string()),
   fastIntervalMs: z.number().min(5_000).max(3_600_000),
   slowIntervalMs: z.number().min(15_000).max(7_200_000),
+  enablePresenceBridge: z.boolean(),
+  presenceBridgePort: z.number().min(0).max(65535),
 });
 
 export async function apply(ctx: Context, config: Config): Promise<void> {
@@ -155,6 +162,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   let tomRuntime: ReturnType<typeof createTomRuntime> | undefined;
   let intuitionRuntime: ReturnType<typeof createIntuitionRuntime> | undefined;
   let dreamRuntime: ReturnType<typeof createDreamRuntime> | undefined;
+  let presenceBridge: PresenceBridgeHandle | undefined;
 
   let offSenseTools: (() => void) | undefined;
   let offNeedsTools: (() => void) | undefined;
@@ -170,6 +178,9 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
 
   const dispose = async () => {
     disposed = true;
+
+    await presenceBridge?.stop().catch(() => undefined);
+    presenceBridge = undefined;
 
     offDreamTools?.();
     offDreamTools = undefined;
@@ -371,6 +382,56 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         dream: dreamRuntime,
       }),
     });
+
+    // 10. Authenticated 127.0.0.1 Neural Bus Bridge for ASI Presence companion desktop app
+    if (config.enablePresenceBridge !== false) {
+      presenceBridge = await startPresenceBridge(
+        {
+          storageRoot: config.storageRoot,
+          sense: senseRuntime,
+          needs: needsRuntime,
+          sleep: sleepRuntime,
+          tom: tomRuntime,
+          intuition: intuitionRuntime,
+          dream: dreamRuntime,
+          listWorkspaces: () => {
+            const wr = (ctx as Context & { get(name: 'workspaceRegistry'): WorkspaceRegistry | undefined }).get(
+              'workspaceRegistry',
+            );
+            const dirs = new Set<string>();
+            for (const ws of wr?.list() ?? []) {
+              if (ws.path && !allInternalRoots.some((root) => ws.path.startsWith(root))) {
+                dirs.add(ws.path);
+              }
+            }
+            for (const s of ctx.sessions?.list() ?? []) {
+              const cwd = typeof s.header?.cwd === 'string' ? s.header.cwd : '';
+              if (cwd && !allInternalRoots.some((root) => cwd.startsWith(root))) {
+                dirs.add(cwd);
+              }
+            }
+            return [...dirs];
+          },
+        },
+        {
+          ...(config.presenceBridgePort !== undefined ? { port: config.presenceBridgePort } : {}),
+        },
+      );
+      if (disposed) {
+        await dispose();
+        return;
+      }
+      const bridgeHandle = presenceBridge;
+      ctx.effect(
+        () => async () => {
+          if (presenceBridge === bridgeHandle) {
+            presenceBridge = undefined;
+          }
+          await bridgeHandle.stop().catch(() => undefined);
+        },
+        'asi presence bridge',
+      );
+    }
   } catch (error) {
     await dispose();
     throw error;

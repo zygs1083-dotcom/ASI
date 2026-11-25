@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleIdentifier</key>
+  <string>ai.asi.speech-helper</string>
+  <key>CFBundleName</key>
+  <string>asi-speech-helper</string>
+  <key>CFBundleVersion</key>
+  <string>1</string>
+  <key>CFBundleShortVersionString</key>
+  <string>0.1.0</string>
+  <key>NSSpeechRecognitionUsageDescription</key>
+  <string>雪儿（ASI Presence）使用 macOS 本地语音识别将你的语音转为文字，音频仅在内存中处理，不会写入磁盘。</string>
+</dict>
+</plist>

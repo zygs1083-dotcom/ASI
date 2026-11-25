@@ -1,5 +1,26 @@
 packages:
   - "packages/*"
   - "plugins/*"
+  - "apps/*"
 allowBuilds:
   esbuild: true
+  electron: true
+  msedge-tts: false
+  protobufjs: false
+minimumReleaseAgeExclude:
+  - "@pixiv/three-vrm-core@3.6.0"
+  - "@pixiv/three-vrm-materials-hdr-emissive-multiplier@3.6.0"
+  - "@pixiv/three-vrm-materials-mtoon@3.6.0"
+  - "@pixiv/three-vrm-materials-v0compat@3.6.0"
+  - "@pixiv/three-vrm-node-constraint@3.6.0"
+  - "@pixiv/three-vrm-springbone@3.6.0"
+  - "@pixiv/three-vrm@3.6.0"
+  - "@pixiv/types-vrm-0.0@3.6.0"
+  - "@pixiv/types-vrmc-materials-hdr-emissive-multiplier-1.0@3.6.0"
+  - "@pixiv/types-vrmc-materials-mtoon-1.0@3.6.0"
+  - "@pixiv/types-vrmc-node-constraint-1.0@3.6.0"
+  - "@pixiv/types-vrmc-springbone-1.0@3.6.0"
+  - "@pixiv/types-vrmc-springbone-extended-collider-1.0@3.6.0"
+  - "@pixiv/types-vrmc-springbone-limit-1.0@3.6.0"
+  - "@pixiv/types-vrmc-vrm-1.0@3.6.0"
+  - electron@45.5.0

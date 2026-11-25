@@ -80,6 +80,7 @@
   },
   "dependencies": {
     "@asi/body-probe": "workspace:*",
+    "@asi/presence-protocol": "workspace:*",
     "@asi/sense-types": "workspace:*",
     "@asi/sense-ui": "workspace:*",
     "minisearch": "7.2.0",
