@@ -223,6 +223,10 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
 
   ctx.effect(() => dispose, 'asi unified runtime');
 
+  // Register unified TypeRT remote endpoint immediately before async runtime startups so DSH sidebar
+  // never hits `invocation-unavailable` during cold boot; bind actions & framesSource as soon as ready.
+  const asiRemote = new AsiRemote(ctx, {});
+
   try {
     // 0. Automatic non-destructive migration from legacy sibling `../asi-*` directories
     await migrateLegacyAsiData(config.storageRoot);
@@ -365,15 +369,15 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     }
     new AsiDreamService(ctx, dreamRuntime);
 
-    // 9. Unified TypeRT Remote Service (`ctx.asi`) for the single unified sidebar panel
-    new AsiRemote(ctx, {
-      needsActions: needsRuntime.actions,
-      sleepActions: sleepRuntime.actions,
-      growthActions: growthRuntime.actions,
-      intuitionActions: intuitionRuntime.actions,
-      tomActions: tomRuntime.actions,
-      dreamActions: dreamRuntime.actions,
-      framesSource: createAsiFramesSource({
+    // 9. Bind live L0–L5 actions and frames stream into the unified TypeRT Remote Service (`ctx.asi`)
+    asiRemote.bindNeedsActions(needsRuntime.actions);
+    asiRemote.bindSleepActions(sleepRuntime.actions);
+    asiRemote.bindGrowthActions(growthRuntime.actions);
+    asiRemote.bindIntuitionActions(intuitionRuntime.actions);
+    asiRemote.bindTomActions(tomRuntime.actions);
+    asiRemote.bindDreamActions(dreamRuntime.actions);
+    asiRemote.bindFramesSource(
+      createAsiFramesSource({
         needs: needsRuntime,
         sleep: sleepRuntime,
         growth: growthRuntime,
@@ -381,7 +385,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         tom: tomRuntime,
         dream: dreamRuntime,
       }),
-    });
+    );
 
     // 10. Authenticated 127.0.0.1 Neural Bus Bridge for ASI Presence companion desktop app
     if (config.enablePresenceBridge !== false) {

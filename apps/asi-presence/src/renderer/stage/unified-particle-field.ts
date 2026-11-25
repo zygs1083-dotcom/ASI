@@ -87,15 +87,15 @@ const UNIFIED_PARTICLE_VERTEX_SHADER = /* glsl */ `
         pos.y += sin(uTime * (1.6 + uWorkEnergy * 2.2) + aRandom.x * 6.2831) * (0.055 + uAudioRms * 0.12);
         pos.x += cos(uTime * (1.2 + uAudioRms * 2.4) + aRandom.y * 6.2831) * (0.04 + uWorkEnergy * 0.07);
       } else {
-        // Holographic acoustic ripple & work-activity shimmer across portrait particles
-        float scanWave = sin(pos.y * 8.5 - uTime * (4.0 + uWorkEnergy * 5.5 + uAudioRms * 6.0) + aRandom.x * 2.4);
-        float zDance = scanWave * (0.01 + uAudioRms * 0.065 + uWorkEnergy * 0.038);
-        float xyShimmer = cos(uTime * (3.2 + uHighBand * 8.0) + aRandom.y * 6.2831) * (0.0012 + uAudioRms * 0.009 + uWorkEnergy * 0.005);
-        // Keep face region (reg == 1) extra crisp so eyes & smile stay unmistakably clear
-        float clarity = reg > 0.5 && reg < 1.5 ? 0.35 : 1.0;
+        // Coherent holographic acoustic ripple & work-activity shimmer across structured portrait lattice
+        float scanWave = sin(pos.y * 8.5 - uTime * (4.0 + uWorkEnergy * 5.5 + uAudioRms * 6.0));
+        float zDance = scanWave * (0.008 + uAudioRms * 0.058 + uWorkEnergy * 0.032);
+        float xyShimmer = cos(uTime * (3.0 + uHighBand * 7.5) + pos.y * 12.0) * (0.0006 + uAudioRms * 0.0065 + uWorkEnergy * 0.0035);
+        // Keep face region (reg == 1) locked crystal-sharp while hair, dress, ears & tail dance gracefully!
+        float clarity = reg > 0.5 && reg < 1.5 ? 0.14 : 0.88;
         pos.z += zDance * clarity;
         pos.x += xyShimmer * clarity;
-        pos.y += sin(uTime * 4.5 + pos.x * 8.0) * (uMidBand * 0.014 + uWorkEnergy * 0.006) * clarity;
+        pos.y += sin(uTime * 4.2 + pos.x * 7.5) * (uMidBand * 0.011 + uWorkEnergy * 0.005) * clarity;
       }
 
       pos.xz = rot2(uGaze.x * 0.14) * pos.xz;
@@ -118,9 +118,9 @@ const UNIFIED_PARTICLE_VERTEX_SHADER = /* glsl */ `
     vec4 mvPos = modelViewMatrix * vec4(pos, 1.0);
     gl_Position = projectionMatrix * mvPos;
 
-    float sizeBoost = 1.0 + burst * 0.35 + uAudioRms * (0.24 + aRandom.z * 0.16) + uWorkEnergy * 0.12;
-    float maxPx = (uTargetIsCore > 0.5 ? 4.8 : 4.2) * uPixelRatio;
-    gl_PointSize = clamp(ptSize * uParticleGlow * sizeBoost * uPixelRatio * (3.2 / max(1.0, -mvPos.z)), 1.3 * uPixelRatio, maxPx);
+    float sizeBoost = 1.0 + burst * 0.34 + uAudioRms * (0.22 + aRandom.z * 0.14) + uWorkEnergy * 0.1;
+    float maxPx = (uTargetIsCore > 0.5 ? 4.4 : 3.6) * uPixelRatio;
+    gl_PointSize = clamp(ptSize * uParticleGlow * sizeBoost * uPixelRatio * (3.3 / max(1.0, -mvPos.z)), 1.4 * uPixelRatio, maxPx);
 
     vColor = col;
     vEnergy = liveDrive;
@@ -154,12 +154,13 @@ const UNIFIED_PARTICLE_FRAGMENT_SHADER = /* glsl */ `
     float dist = length(uv);
     if (dist > 0.5) discard;
 
-    // Smooth circular Gaussian dot (guaranteed round 1:1, zero square edges or hard-cut white clouds!)
-    float circleEdge = smoothstep(0.5, 0.14, dist);
+    // Crisp circular micro-gem dot for portraits & smooth Gaussian glow for neural core
+    float circleEdge = smoothstep(0.5, 0.2, dist);
+    float crispGem = smoothstep(0.48, 0.24, dist);
     float gaussian = exp(-dist * dist * 16.0);
     float softHalo = exp(-dist * dist * 5.8) * circleEdge;
 
-    // Gentle symmetric 1:1 star glint strictly on J.A.R.V.I.S. synapse nodes
+    // Gentle symmetric 1:1 star glint strictly on neural core synapse nodes
     float glintMask = vCoreBlend * vIsSynapse * smoothstep(0.46, 0.1, dist);
     float microGlint = glintMask * (
       exp(-abs(uv.x) * 20.0) * exp(-abs(uv.y) * 7.5) +
@@ -167,19 +168,22 @@ const UNIFIED_PARTICLE_FRAGMENT_SHADER = /* glsl */ `
     );
 
     vec3 col = vColor;
-    float energyFlash = clamp(vMorphBurst * 0.3 + vEnergy * (vCoreBlend > 0.5 ? 0.22 : 0.14), 0.0, 0.55);
-    col = mix(col, mix(uPrimaryColor, vec3(1.0), 0.35), energyFlash * (0.25 + softHalo * 0.45));
-    col += uSecondaryColor * microGlint * (0.28 + uAudioRms * 0.4 + uWorkEnergy * 0.2);
+    float energyFlash = clamp(vMorphBurst * 0.28 + vEnergy * (vCoreBlend > 0.5 ? 0.22 : 0.12), 0.0, 0.5);
+    col = mix(col, mix(uPrimaryColor, vec3(1.0), 0.35), energyFlash * (0.22 + softHalo * 0.42));
+    col += uSecondaryColor * microGlint * (0.26 + uAudioRms * 0.38 + uWorkEnergy * 0.18);
 
-    float twinkle = 0.86 + 0.14 * sin(uTime * (3.8 + uWorkEnergy * 4.5) + vRand * 18.84);
-    float scan = 0.92 + 0.08 * sin(gl_FragCoord.y * (0.2 + uScanlineDensity * 0.45) - uTime * 4.0);
+    float twinkle = vCoreBlend > 0.5
+      ? (0.86 + 0.14 * sin(uTime * (3.8 + uWorkEnergy * 4.5) + vRand * 18.84))
+      : (0.94 + 0.06 * sin(uTime * (3.2 + uWorkEnergy * 4.0) + vRand * 18.84));
+    float scan = 0.94 + 0.06 * sin(gl_FragCoord.y * (0.18 + uScanlineDensity * 0.38) - uTime * 3.8);
 
+    // Balanced additive alpha for 42k core particles; razor-crisp high-clarity gems for portrait particles
     float baseAlpha = vCoreBlend > 0.5
-      ? (gaussian * 0.44 + softHalo * 0.22 + microGlint * 0.18)
-      : (circleEdge * 0.78 + gaussian * 0.3);
+      ? (gaussian * 0.35 + softHalo * 0.17 + microGlint * 0.16)
+      : (crispGem * 0.88 + gaussian * 0.24);
 
     if (vIsSpark > 0.5) {
-      baseAlpha *= 0.52;
+      baseAlpha *= 0.5;
     }
 
     float alpha = baseAlpha * twinkle * scan * uOpacity;

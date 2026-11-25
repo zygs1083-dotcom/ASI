@@ -302,19 +302,19 @@ body.stage-mode {
 .stage-deck {
   position: absolute;
   left: 50%;
-  bottom: 14px;
+  bottom: 10px;
   transform: translateX(-50%);
   z-index: 6;
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 7px 12px;
-  border-radius: 16px;
+  gap: 6px;
+  padding: 6px 10px;
+  border-radius: 14px;
   background: var(--bg-panel);
   backdrop-filter: blur(16px);
   border: 1px solid var(--border);
   box-shadow: 0 8px 32px rgba(0, 0, 0, 0.45);
-  max-width: calc(100% - 28px);
+  max-width: calc(100% - 20px);
   flex-wrap: wrap;
   justify-content: center;
 }
@@ -491,6 +491,12 @@ body.stage-mode {
 .floating-toolbar .btn:hover {
   background: rgba(34, 54, 86, 0.96);
   border-color: var(--accent);
+}
+
+.stage-deck .btn {
+  padding: 4px 9px;
+  font-size: 11.5px;
+  border-radius: 9px;
 }
 
 .btn-primary {

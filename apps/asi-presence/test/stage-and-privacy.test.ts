@@ -6,8 +6,8 @@ import { generateJarvisCoreCloud, UNIFIED_PARTICLE_COUNT } from '../src/renderer
 import { resolveThemeColors } from '../src/renderer/stage/themes.ts';
 import { deriveVisionOverlayStatus } from '../src/renderer/vision/vision-controller.ts';
 
-describe('雪儿 J.A.R.V.I.S. Core, Tray Icon, Themes & Privacy Guardrails', () => {
-  it('generates 26,000 finite deterministic Avengers J.A.R.V.I.S. neural core particles across all 5 shells', () => {
+describe('雪儿 Core, Tray Icon, Themes & Privacy Guardrails', () => {
+  it('generates 42,000 finite deterministic neural core particles across all 5 shells', () => {
     const data = generateJarvisCoreCloud(UNIFIED_PARTICLE_COUNT);
     expect(data.count).toBe(UNIFIED_PARTICLE_COUNT);
     expect(data.positions.length).toBe(UNIFIED_PARTICLE_COUNT * 3);

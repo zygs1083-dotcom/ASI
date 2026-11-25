@@ -74,6 +74,40 @@ describe('统一客户端流状态机、动作封装与 Slot 包装渲染验证'
     await frames.dispose();
   });
 
+  it('createFrameState 在冷启动短暂失败后自动退避重连恢复 live，并支持手动 reconnect', async () => {
+    const sample = makeUnifiedScenario('empty-clean');
+    let attempts = 0;
+    let releaseHold: (() => void) | undefined;
+
+    const frames = createFrameState(
+      () => {
+        attempts += 1;
+        const attempt = attempts;
+        return {
+          async *[Symbol.asyncIterator]() {
+            if (attempt <= 2) {
+              throw new Error('invocation-unavailable');
+            }
+            yield { value: sample, accept: () => {} };
+            await new Promise<void>((resolve) => {
+              releaseHold = resolve;
+            });
+          },
+          dispose: () => {
+            releaseHold?.();
+          },
+        };
+      },
+      { retryDelaysMs: [10, 15, 20], backgroundRetryMs: 30 },
+    );
+
+    await new Promise((r) => setTimeout(r, 80));
+    expect(attempts).toBeGreaterThanOrEqual(3);
+    expect(frames.getSnapshot()).toEqual({ status: 'live', value: sample });
+
+    await frames.dispose();
+  });
+
   it('createAsiActions 传播远端错误并驱动会话跳转，且 AsiPanel 已挂载时外层不重复渲染裸错横幅', async () => {
     const navigated: string[] = [];
     const mockApi = {

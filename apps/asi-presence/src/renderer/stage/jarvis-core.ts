@@ -1,6 +1,6 @@
 import * as THREE from 'three';
 
-export const UNIFIED_PARTICLE_COUNT = 26_000;
+export const UNIFIED_PARTICLE_COUNT = 42_000;
 
 export interface ParticleCloudData {
   count: number;

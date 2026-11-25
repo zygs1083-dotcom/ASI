@@ -347,9 +347,9 @@ export function StageHud({
               type="button"
               className={`btn ${state.form === 'jarvis-core' ? 'btn-primary' : ''}`}
               onClick={() => void api.setAvatarForm('jarvis-core')}
-              title="复仇者联盟 J.A.R.V.I.S. 风格纯粒子神经核心"
+              title="纯粒子神经核心"
             >
-              ◉ 贾维斯核心
+              ◉ 核心
             </button>
             <button
               type="button"

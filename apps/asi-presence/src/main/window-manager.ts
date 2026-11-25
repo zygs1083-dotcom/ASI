@@ -263,7 +263,7 @@ export class PresenceWindowManager {
         { label: '展开全息舞台控制台', click: () => this.setMode('stage') },
         { label: '隐身待命', click: () => this.setMode('hidden') },
         { type: 'separator' },
-        { label: '◉ 贾维斯纯粒子核心', click: () => this.callbacks.onSelectForm('jarvis-core') },
+        { label: '◉ 核心', click: () => this.callbacks.onSelectForm('jarvis-core') },
         { label: '🐾 Q 版雪儿', click: () => this.callbacks.onSelectForm('chibi') },
         { label: '✨ 真人雪儿', click: () => this.callbacks.onSelectForm('realistic') },
         { label: '✦ 切换粒子形态 (实体 ↔ 粒子)', click: () => this.callbacks.onToggleParticleMode() },

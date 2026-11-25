@@ -411,8 +411,8 @@ export class PresenceSceneEngine {
     const useVrm = !isCore && this.vrmAvatar.isLoaded;
     const showChibi = !isCore && !useVrm && this.state.form === 'chibi';
     const showRealistic = !isCore && !useVrm && this.state.form === 'realistic';
-    // Delicate holographic projection under-veil ONLY in portrait Particle Mode so facial features stay razor-clear
-    const particleGhostVeil = wantPureParticles && !isCore ? 0.24 * this.entityDissolve : 0;
+    // Crisp holographic scan-beam core beneath the 42k lattice particles so portrait Particle Mode stays ultra-clear
+    const particleGhostVeil = wantPureParticles && !isCore ? 0.56 * this.entityDissolve : 0;
 
     this.chibiAvatar.update({
       elapsed: this.elapsed,

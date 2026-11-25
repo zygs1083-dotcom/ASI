@@ -25,7 +25,7 @@ export const THEME_PALETTES: Record<VisualTheme, ThemePalette> = {
   },
   'jarvis-amber': {
     id: 'jarvis-amber',
-    label: '琥珀金 · J.A.R.V.I.S.',
+    label: '琥珀金 · 温暖核心',
     primaryHex: '#fff9e6',
     secondaryHex: '#ffad2e',
     accentHex: '#ea580c',

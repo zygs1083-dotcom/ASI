@@ -11,16 +11,18 @@ interface LandmarkRegions {
   rightEarPivot: [number, number];
   tail: [number, number, number, number];
   tailPivot: [number, number];
-  faceBandV: [number, number];
+  faceBox: [number, number, number, number];
   planeHeight: number;
   aspect: number;
+  /** Linear-space studio fill exposure & shadow lift so realistic & chibi portraits glow vividly on dark stages */
+  exposure: number;
+  shadowLift: number;
 }
 
 /**
  * Exact QA-verified landmark boxes on our padded transparent RGBA PNGs:
  * - chibi:     768 x 1120 (aspect 0.6857)
  * - realistic: 640 x 1200 (aspect 0.5333)
- * Heights sized so head-to-shoes remain cleanly framed above bottom HUD decks in both Stage & Floating windows.
  */
 const AVATAR_SPECS: Record<LivingAvatarVariant, LandmarkRegions> = {
   chibi: {
@@ -30,9 +32,11 @@ const AVATAR_SPECS: Record<LivingAvatarVariant, LandmarkRegions> = {
     rightEarPivot: [0.66, 0.195],
     tail: [0.06, 0.26, 0.45, 0.7],
     tailPivot: [0.24, 0.62],
-    faceBandV: [0.22, 0.46],
+    faceBox: [0.26, 0.78, 0.2, 0.47],
     planeHeight: 1.88,
     aspect: 768 / 1120,
+    exposure: 1.05,
+    shadowLift: 0.03,
   },
   realistic: {
     leftEar: [0.4, 0.495, 0.03, 0.115],
@@ -41,9 +45,11 @@ const AVATAR_SPECS: Record<LivingAvatarVariant, LandmarkRegions> = {
     rightEarPivot: [0.585, 0.105],
     tail: [0.17, 0.355, 0.36, 0.52],
     tailPivot: [0.34, 0.47],
-    faceBandV: [0.08, 0.22],
+    faceBox: [0.36, 0.66, 0.075, 0.225],
     planeHeight: 1.92,
     aspect: 640 / 1200,
+    exposure: 1.24,
+    shadowLift: 0.16,
   },
 };
 
@@ -77,7 +83,6 @@ const LIVING_AVATAR_VERTEX_SHADER = /* glsl */ `
 
   void main() {
     vUv = uv;
-    // Convert Three.js bottom-origin UV to top-origin (u, vTop) to match landmark coordinates
     vec2 pTop = vec2(uv.x, 1.0 - uv.y);
     vec3 pos = position;
 
@@ -127,6 +132,8 @@ const LIVING_AVATAR_FRAGMENT_SHADER = /* glsl */ `
   uniform float uMouthOpen;
   uniform float uDissolve;
   uniform float uGhostVeil;
+  uniform float uExposure;
+  uniform float uShadowLift;
   uniform float uOpacity;
   uniform float uTime;
   uniform float uAudioRms;
@@ -143,31 +150,40 @@ const LIVING_AVATAR_FRAGMENT_SHADER = /* glsl */ `
     vec4 blinkSample = texture2D(uTexBlink, vUv);
     vec4 talkSample = texture2D(uTexTalk, vUv);
 
-    // Zero-jitter smooth micro-expression blending (base pixels outside eyes/mouth are bit-identical)
+    // Zero-jitter smooth micro-expression blending (textures are linear-decoded from SRGB8_ALPHA8)
     vec3 col = mix(baseSample.rgb, blinkSample.rgb, clamp(uBlink, 0.0, 1.0));
     col = mix(col, talkSample.rgb, clamp(uMouthOpen, 0.0, 1.0));
 
-    // Soft futuristic luminous rim along silhouette edge when speaking or working
-    float edgeSoftness = smoothstep(0.95, 0.18, baseSample.a);
-    float activityGlow = (0.1 + uAudioRms * 0.45 + uWorkEnergy * 0.3);
-    col += mix(uRimColor, uAccentColor, 0.4) * edgeSoftness * activityGlow * 0.42;
+    // Studio key-light exposure & soft-knee shadow lift so 真人雪儿 & Q版雪儿 look bright, radiant & never murky
+    col = mix(col, pow(max(col, vec3(0.0)), vec3(0.82)), uShadowLift);
+    col *= uExposure;
 
-    // Smooth silky energy-sweep fade between Entity <-> Particle Mode (ZERO blocky pixel mosaic!)
+    // Gentle luminous silhouette rim accent when speaking or working
+    float edgeSoftness = smoothstep(0.95, 0.18, baseSample.a);
+    float activityGlow = (0.14 + uAudioRms * 0.45 + uWorkEnergy * 0.3);
+    col += mix(uRimColor, uAccentColor, 0.4) * edgeSoftness * activityGlow * 0.35;
+
+    // Smooth silky energy-sweep transition between Entity <-> Particle Mode (zero blocky mosaic)
     float sweep = smoothstep(uDissolve * 1.25 - 0.25, uDissolve * 1.25 + 0.08, vUv.y);
     float entityAlpha = mix(1.0, sweep, smoothstep(0.0, 0.12, uDissolve)) * (1.0 - smoothstep(0.88, 1.0, uDissolve));
     float sweepLine = exp(-pow((vUv.y - uDissolve) * 14.0, 2.0)) * sin(clamp(uDissolve, 0.0, 1.0) * 3.14159265);
-    col = mix(col, mix(uRimColor, vec3(1.0), 0.5), sweepLine * 0.72);
+    col = mix(col, mix(uRimColor, vec3(1.0), 0.5), sweepLine * 0.65);
 
-    // Optional delicate holographic scanline veil behind the 26k particles in Particle Mode for sharp facial depth
-    float scanline = 0.78 + 0.22 * sin(vUv.y * 260.0 - uTime * 3.5);
-    float ghostAlpha = uGhostVeil * scanline;
-    vec3 ghostTint = mix(col, mix(col, uRimColor, 0.24), clamp(uGhostVeil * 3.5, 0.0, 0.35));
+    // Razor-sharp holographic projection core behind the 42k lattice particles in Particle Mode:
+    // Fine sci-fi scan-beam + crisp micro-dot holographic energy matrix so facial features stay 100% crisp!
+    float holoScan = 0.84 + 0.16 * sin(vUv.y * 320.0 - uTime * 3.8);
+    float holoWave = 0.92 + 0.08 * sin(vUv.y * 28.0 - uTime * (2.6 + uWorkEnergy * 3.5 + uAudioRms * 5.0));
+    float ghostAlpha = uGhostVeil * holoScan * holoWave;
+    vec3 ghostCol = col * (1.08 + uAudioRms * 0.16) + uRimColor * (edgeSoftness * 0.22 + 0.03);
 
     float combinedAlpha = max(entityAlpha, ghostAlpha);
     if (combinedAlpha < 0.005) discard;
 
-    vec3 outCol = mix(ghostTint, col, clamp(entityAlpha / max(0.001, combinedAlpha), 0.0, 1.0));
-    gl_FragColor = vec4(outCol, baseSample.a * combinedAlpha * uOpacity);
+    vec3 outCol = mix(ghostCol, col, clamp(entityAlpha / max(0.001, combinedAlpha), 0.0, 1.0));
+    gl_FragColor = vec4(clamp(outCol, 0.0, 1.5), baseSample.a * combinedAlpha * uOpacity);
+
+    // Essential linear -> sRGB output encoding so SRGB textures render at true bright photographic luminosity!
+    #include <colorspace_fragment>
   }
 `;
 
@@ -192,10 +208,11 @@ function createCrispTexture(img: HTMLImageElement): THREE.Texture {
 }
 
 /**
- * Samples `count` crisp, evenly-stratified RGB+3D particles directly from a transparent portrait PNG:
- * - ~86% stratified fine lattice across opaque pixels (eliminates Poisson clumps & noise holes!)
- * - ~11% high-contrast feature & edge emphasis (eyes, lashes, smile, blue bow, lace, ear outlines)
- * - ~3% delicate ambient stardust framing the silhouette
+ * Samples `count` (42,000) razor-sharp hexagonal-lattice holographic particles directly from a transparent portrait PNG:
+ * - Structured regular hexagonal micro-grid across the full body (eliminates noisy gray salt-and-pepper static!)
+ * - 2x denser zero-jitter lattice specifically on the facial box (eyes, lashes, smile, bangs stay crystal sharp!)
+ * - Luminous silhouette & Sobel contour sparkle pass
+ * - Only 2.5% delicate ambient stardust embers drifting cleanly off the edges
  */
 export function samplePortraitParticlesFromImage(
   img: HTMLImageElement,
@@ -203,7 +220,7 @@ export function samplePortraitParticlesFromImage(
   count = UNIFIED_PARTICLE_COUNT,
 ): ParticleCloudData {
   const spec = AVATAR_SPECS[variant];
-  const maxDim = 480;
+  const maxDim = 540;
   const scale = Math.min(1, maxDim / Math.max(img.width, img.height));
   const w = Math.max(16, Math.round(img.width * scale));
   const h = Math.max(16, Math.round(img.height * scale));
@@ -219,17 +236,12 @@ export function samplePortraitParticlesFromImage(
   ctx.drawImage(img, 0, 0, w, h);
   const rgba = ctx.getImageData(0, 0, w, h).data;
 
-  const [faceV1, faceV2] = spec.faceBandV;
+  const [faceU1, faceU2, faceV1, faceV2] = spec.faceBox;
   const positions = new Float32Array(count * 3);
   const colors = new Float32Array(count * 3);
   const sizes = new Float32Array(count);
   const regions = new Float32Array(count);
   const randoms = new Float32Array(count * 3);
-
-  const lumAt = (px: number, py: number): number => {
-    const idx = (py * w + px) * 4;
-    return ((rgba[idx] ?? 0) * 0.299 + (rgba[idx + 1] ?? 0) * 0.587 + (rgba[idx + 2] ?? 0) * 0.114) / 255;
-  };
 
   interface SamplePixel {
     u: number;
@@ -238,58 +250,109 @@ export function samplePortraitParticlesFromImage(
     g: number;
     b: number;
     reg: number;
-    contrast: number;
   }
 
-  const allPixels: SamplePixel[] = [];
-  const featurePixels: SamplePixel[] = [];
-
+  // Count opaque area first so we pick exact crisp hexagonal grid spacing
+  let opaqueCount = 0;
+  let faceOpaqueCount = 0;
   for (let py = 0; py < h; py += 1) {
     const vTop = py / h;
     for (let px = 0; px < w; px += 1) {
-      const idx = (py * w + px) * 4;
-      const a = rgba[idx + 3] ?? 0;
-      if (a < 64) continue;
-
+      const a = rgba[(py * w + px) * 4 + 3] ?? 0;
+      if (a < 80) continue;
+      opaqueCount += 1;
       const u = px / w;
-      const r = (rgba[idx] ?? 0) / 255;
-      const g = (rgba[idx + 1] ?? 0) / 255;
-      const b = (rgba[idx + 2] ?? 0) / 255;
-
-      let isEdge = false;
-      let contrast = 0;
-      if (px > 0 && px < w - 1 && py > 0 && py < h - 1) {
-        const aL = rgba[(py * w + (px - 1)) * 4 + 3] ?? 0;
-        const aR = rgba[(py * w + (px + 1)) * 4 + 3] ?? 0;
-        const aU = rgba[((py - 1) * w + px) * 4 + 3] ?? 0;
-        const aD = rgba[((py + 1) * w + px) * 4 + 3] ?? 0;
-        if (aL < 64 || aR < 64 || aU < 64 || aD < 64) {
-          isEdge = true;
-        }
-        const gx = Math.abs(lumAt(px + 1, py) - lumAt(px - 1, py));
-        const gy = Math.abs(lumAt(px, py + 1) - lumAt(px, py - 1));
-        contrast = gx + gy;
-      }
-
-      const inFace = vTop >= faceV1 && vTop <= faceV2 && u >= 0.28 && u <= 0.76;
-      const inTail = u >= spec.tail[0] && u <= spec.tail[1] && vTop >= spec.tail[2] && vTop <= spec.tail[3];
-      const inEar =
-        (u >= spec.leftEar[0] && u <= spec.leftEar[1] && vTop >= spec.leftEar[2] && vTop <= spec.leftEar[3]) ||
-        (u >= spec.rightEar[0] && u <= spec.rightEar[1] && vTop >= spec.rightEar[2] && vTop <= spec.rightEar[3]);
-
-      const reg = inFace ? 1 : inEar || inTail ? 2 : isEdge ? 3 : 0;
-      const item: SamplePixel = { u, vTop, r, g, b, reg, contrast };
-      allPixels.push(item);
-
-      // Eyes, eyebrows, mouth, blue bow, hair lines, and silhouette edges get extra crisp detail particles
-      if (inFace || isEdge || contrast > 0.14) {
-        featurePixels.push(item);
+      if (u >= faceU1 && u <= faceU2 && vTop >= faceV1 && vTop <= faceV2) {
+        faceOpaqueCount += 1;
       }
     }
   }
 
-  if (allPixels.length === 0) {
+  if (opaqueCount === 0) {
     return { count, positions, colors, sizes, regions, randoms };
+  }
+
+  const lumAt = (px: number, py: number): number => {
+    const idx = (py * w + px) * 4;
+    return ((rgba[idx] ?? 0) * 0.299 + (rgba[idx + 1] ?? 0) * 0.587 + (rgba[idx + 2] ?? 0) * 0.114) / 255;
+  };
+
+  const makePixel = (px: number, py: number, forceReg?: number): SamplePixel | null => {
+    const x = Math.max(0, Math.min(w - 1, Math.round(px)));
+    const y = Math.max(0, Math.min(h - 1, Math.round(py)));
+    const idx = (y * w + x) * 4;
+    if ((rgba[idx + 3] ?? 0) < 80) return null;
+    const u = x / w;
+    const vTop = y / h;
+    const r = (rgba[idx] ?? 0) / 255;
+    const g = (rgba[idx + 1] ?? 0) / 255;
+    const b = (rgba[idx + 2] ?? 0) / 255;
+
+    let reg = forceReg ?? 0;
+    if (forceReg === undefined) {
+      const inFace = u >= faceU1 && u <= faceU2 && vTop >= faceV1 && vTop <= faceV2;
+      const inTail = u >= spec.tail[0] && u <= spec.tail[1] && vTop >= spec.tail[2] && vTop <= spec.tail[3];
+      const inEar =
+        (u >= spec.leftEar[0] && u <= spec.leftEar[1] && vTop >= spec.leftEar[2] && vTop <= spec.leftEar[3]) ||
+        (u >= spec.rightEar[0] && u <= spec.rightEar[1] && vTop >= spec.rightEar[2] && vTop <= spec.rightEar[3]);
+      reg = inFace ? 1 : inEar || inTail ? 2 : 0;
+    }
+    return { u, vTop, r, g, b, reg };
+  };
+
+  // Budget allocation (out of 42,000):
+  // - 74% crisp structured hexagonal body lattice
+  // - 15% ultra-dense zero-jitter facial micro-lattice (makes eyes, lashes, nose & smile razor clear!)
+  // -  8.5% crisp silhouette & Sobel contrast contour highlights
+  // -  2.5% delicate floating stardust embers around the silhouette
+  const bodyBudget = Math.floor(count * 0.74);
+  const faceBudget = Math.floor(count * 0.15);
+  const contourBudget = Math.floor(count * 0.085);
+
+  const bodyStep = Math.max(1, Math.sqrt(opaqueCount / Math.max(1, bodyBudget)));
+  const bodySamples: SamplePixel[] = [];
+  for (let row = 0; row * bodyStep < h; row += 1) {
+    const py = row * bodyStep;
+    const xOff = (row % 2) * (bodyStep * 0.5);
+    for (let px = xOff; px < w; px += bodyStep) {
+      const sp = makePixel(px, py);
+      if (sp) bodySamples.push(sp);
+    }
+  }
+
+  // Ultra-fine face lattice (zero random speckle jitter!)
+  const faceStep = Math.max(1, Math.sqrt(Math.max(1, faceOpaqueCount) / Math.max(1, faceBudget)));
+  const faceSamples: SamplePixel[] = [];
+  const fMinY = Math.floor(faceV1 * h);
+  const fMaxY = Math.ceil(faceV2 * h);
+  const fMinX = Math.floor(faceU1 * w);
+  const fMaxX = Math.ceil(faceU2 * w);
+  for (let row = 0; fMinY + row * faceStep <= fMaxY; row += 1) {
+    const py = fMinY + row * faceStep;
+    const xOff = (row % 2) * (faceStep * 0.5);
+    for (let px = fMinX + xOff; px <= fMaxX; px += faceStep) {
+      const sp = makePixel(px, py, 1);
+      if (sp) faceSamples.push(sp);
+    }
+  }
+
+  // Crisp silhouette & high-contrast feature contour pass (eyes, bow, lace, ear outline, hair strands)
+  const contourSamples: SamplePixel[] = [];
+  for (let py = 1; py < h - 1; py += 1) {
+    for (let px = 1; px < w - 1; px += 1) {
+      const idx = (py * w + px) * 4;
+      if ((rgba[idx + 3] ?? 0) < 80) continue;
+      const aL = rgba[(py * w + (px - 1)) * 4 + 3] ?? 0;
+      const aR = rgba[(py * w + (px + 1)) * 4 + 3] ?? 0;
+      const aU = rgba[((py - 1) * w + px) * 4 + 3] ?? 0;
+      const aD = rgba[((py + 1) * w + px) * 4 + 3] ?? 0;
+      const isSilhouette = aL < 80 || aR < 80 || aU < 80 || aD < 80;
+      const grad = Math.abs(lumAt(px + 1, py) - lumAt(px - 1, py)) + Math.abs(lumAt(px, py + 1) - lumAt(px, py - 1));
+      if (isSilhouette || grad > 0.16) {
+        const sp = makePixel(px, py, isSilhouette ? 3 : undefined);
+        if (sp) contourSamples.push(sp);
+      }
+    }
   }
 
   const planeH = spec.planeHeight;
@@ -302,75 +365,69 @@ export function samplePortraitParticlesFromImage(
     return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
   };
 
-  const latticeBudget = Math.floor(count * 0.85);
-  const featureBudget = Math.floor(count * 0.12);
-  const bodyEnd = latticeBudget + featureBudget;
-
-  const writePixelParticle = (i: number, px: SamplePixel, isDetailPass: boolean) => {
+  const colorLift = variant === 'realistic' ? 1.18 : 1.09;
+  const writePixelParticle = (i: number, px: SamplePixel, mode: 'body' | 'face' | 'contour') => {
     const i3 = i * 3;
-    const jitter = isDetailPass ? 0.0016 : 0.0032;
-    const worldX = (px.u - 0.5) * planeW + (rand() - 0.5) * jitter;
-    const worldY = (0.5 - px.vTop) * planeH + (rand() - 0.5) * jitter;
+    // Zero jitter on face/contour so features stay photographically sharp in particle form!
+    const jitter = mode === 'body' ? 0.0012 : 0.0;
+    const worldX = (px.u - 0.5) * planeW + (jitter > 0 ? (rand() - 0.5) * jitter : 0);
+    const worldY = (0.5 - px.vTop) * planeH + (jitter > 0 ? (rand() - 0.5) * jitter : 0);
 
     const lum = px.r * 0.299 + px.g * 0.587 + px.b * 0.114;
-    const centerCurve = Math.max(0, 1 - Math.abs(px.u - 0.5) * 2.1);
-    const worldZ = centerCurve * 0.11 + (lum - 0.5) * 0.045 + (px.reg === 1 ? 0.045 : 0) + (rand() - 0.5) * 0.008;
+    const centerCurve = Math.max(0, 1 - Math.abs(px.u - 0.5) * 2.05);
+    const worldZ =
+      centerCurve * 0.11 + (lum - 0.5) * 0.04 + (px.reg === 1 ? 0.05 : 0) + (mode === 'contour' ? 0.015 : 0);
 
     positions[i3] = worldX;
     positions[i3 + 1] = worldY;
     positions[i3 + 2] = worldZ;
 
-    // Preserve authentic artwork colors (slight vibrancy lift without washing out dark eyes/blue ribbon)
-    const boost = lum < 0.32 ? 1.0 : 1.06;
-    colors[i3] = Math.min(1, px.r * boost + (lum > 0.35 ? 0.02 : 0));
-    colors[i3 + 1] = Math.min(1, px.g * boost + (lum > 0.35 ? 0.02 : 0));
-    colors[i3 + 2] = Math.min(1, px.b * boost + (lum > 0.35 ? 0.03 : 0));
+    // Vivid luminous sRGB color preservation with gentle studio lift (never murky gray!)
+    const shadowBoost = variant === 'realistic' && lum < 0.45 ? 1.12 : 1.0;
+    const gain = colorLift * shadowBoost;
+    colors[i3] = Math.min(1, px.r * gain + (lum > 0.2 ? 0.03 : 0.01));
+    colors[i3 + 1] = Math.min(1, px.g * gain + (lum > 0.2 ? 0.03 : 0.01));
+    colors[i3 + 2] = Math.min(1, px.b * gain + (lum > 0.2 ? 0.04 : 0.015));
 
-    // Fine delicate micro-particles (never chunky mosaic blobs!)
-    sizes[i] = isDetailPass
-      ? 1.55 + rand() * 0.55
-      : px.reg === 1
-        ? 1.65 + rand() * 0.55
-        : px.reg === 3
-          ? 2.05 + rand() * 0.65
-          : 1.95 + rand() * 0.7;
+    sizes[i] = mode === 'face' ? 1.85 + rand() * 0.35 : mode === 'contour' ? 2.15 + rand() * 0.55 : 2.25 + rand() * 0.5;
     regions[i] = px.reg;
     randoms[i3] = rand();
     randoms[i3 + 1] = rand();
     randoms[i3 + 2] = rand();
   };
 
-  // Pass 1: Evenly stratified sweep across all foreground pixels (eliminates gaps & clumpy noise)
-  const stride = allPixels.length / Math.max(1, latticeBudget);
-  for (let i = 0; i < latticeBudget; i += 1) {
-    const idx = Math.min(allPixels.length - 1, Math.floor((i + rand() * 0.85) * stride));
-    const px = allPixels[idx] ?? allPixels[0];
-    if (px) writePixelParticle(i, px, false);
-  }
+  let cursor = 0;
+  const fillFrom = (pool: SamplePixel[], budget: number, mode: 'body' | 'face' | 'contour') => {
+    if (pool.length === 0) return;
+    const stride = pool.length / Math.max(1, budget);
+    for (let k = 0; k < budget && cursor < count; k += 1) {
+      const idx = Math.min(pool.length - 1, Math.floor(k * stride));
+      const px = pool[idx] ?? pool[0];
+      if (px) {
+        writePixelParticle(cursor, px, mode);
+        cursor += 1;
+      }
+    }
+  };
 
-  // Pass 2: High-resolution detail pass for eyes, smile, lace, ribbon & edges
-  const featSource = featurePixels.length > 0 ? featurePixels : allPixels;
-  const featStride = featSource.length / Math.max(1, featureBudget);
-  for (let j = 0; j < featureBudget; j += 1) {
-    const idx = Math.min(featSource.length - 1, Math.floor((j + rand() * 0.85) * featStride));
-    const px = featSource[idx] ?? featSource[0];
-    if (px) writePixelParticle(latticeBudget + j, px, true);
-  }
+  fillFrom(bodySamples, bodyBudget, 'body');
+  fillFrom(faceSamples.length > 0 ? faceSamples : bodySamples, faceBudget, 'face');
+  fillFrom(contourSamples.length > 0 ? contourSamples : bodySamples, contourBudget, 'contour');
 
-  // Pass 3: Sparse delicate holographic stardust halo around the portrait (3% only, never clutters!)
-  for (let i = bodyEnd; i < count; i += 1) {
+  // Remaining ~2.5%: delicate glowing holographic embers orbiting cleanly around the portrait outline
+  for (let i = cursor; i < count; i += 1) {
     const i3 = i * 3;
     const ang = rand() * Math.PI * 2;
-    const rad = 0.68 + rand() * 0.38;
-    positions[i3] = Math.cos(ang) * rad * (planeW * 0.68);
+    const rad = 0.7 + rand() * 0.36;
+    positions[i3] = Math.cos(ang) * rad * (planeW * 0.72);
     positions[i3 + 1] = (rand() - 0.5) * planeH * 1.02;
-    positions[i3 + 2] = Math.sin(ang) * 0.28 - 0.12;
+    positions[i3 + 2] = Math.sin(ang) * 0.26 - 0.1;
 
-    colors[i3] = 0.84;
-    colors[i3 + 1] = 0.95;
+    colors[i3] = 0.86;
+    colors[i3 + 1] = 0.96;
     colors[i3 + 2] = 1.0;
 
-    sizes[i] = 1.25 + rand() * 1.1;
+    sizes[i] = 1.35 + rand() * 1.1;
     regions[i] = 4;
     randoms[i3] = rand();
     randoms[i3 + 1] = rand();
@@ -382,8 +439,8 @@ export function samplePortraitParticlesFromImage(
 
 /**
  * 2.5D living holographic portrait plane for both Q版雪儿 (`chibi`) and 真人雪儿 (`realistic`).
- * Renders the exact high-res transparent artwork with zero-jitter blinking, speech lip-sync,
- * breathing, subtle white-ear & snow-tail vertex sway, cursor 2.5D tilt, and silky transition.
+ * Renders true sRGB studio-lit transparent artwork with zero-jitter blinking, speech lip-sync,
+ * breathing, subtle white-ear & snow-tail vertex sway, cursor 2.5D tilt, and holographic projection veil.
  */
 export class LivingAvatarPlane {
   readonly root = new THREE.Group();
@@ -420,6 +477,8 @@ export class LivingAvatarPlane {
         uMouthOpen: { value: 0 },
         uDissolve: { value: 0 },
         uGhostVeil: { value: 0 },
+        uExposure: { value: spec.exposure },
+        uShadowLift: { value: spec.shadowLift },
         uOpacity: { value: 1.0 },
         uAudioRms: { value: 0 },
         uWorkEnergy: { value: 0 },
@@ -457,7 +516,7 @@ export class LivingAvatarPlane {
     if (typeof window === 'undefined' || typeof Image === 'undefined') return;
     const prefix = `./avatars/xueer-${this.variant}`;
     try {
-      // Stage 1: Load idle portrait first so 雪儿 renders crisply on the very first frame without delay!
+      // Stage 1: Load idle portrait first so 雪儿 renders crisply on frame 1 without delay
       const idleImg = await loadRgbaImage(`${prefix}-idle.png`);
       const texIdle = createCrispTexture(idleImg);
       this.textures.push(texIdle);
@@ -481,7 +540,7 @@ export class LivingAvatarPlane {
       (u.uTexTalk as THREE.IUniform<THREE.Texture>).value = texTalk;
       this.mesh.material.uniformsNeedUpdate = true;
 
-      // Stage 3: Sample 26k stratified portrait particles off the initial paint tick
+      // Stage 3: Sample 42k structured hexagonal portrait particles off the initial paint tick
       setTimeout(() => {
         try {
           this.particleCloud = samplePortraitParticlesFromImage(idleImg, this.variant, UNIFIED_PARTICLE_COUNT);

@@ -25,6 +25,7 @@ const en = {
   reconnecting: 'Connection lost. Showing cached snapshot; reconnecting…',
   ended: 'ASI updates stopped.',
   failed: 'ASI connection failed.',
+  retry: 'Reconnect',
   actionFailed: 'Action failed. Check current state and try again.',
   dismiss: 'Dismiss',
 };
@@ -35,6 +36,7 @@ const zh: typeof en = {
   reconnecting: '连接已断开，当前展示上次快照，正在重连…',
   ended: 'ASI 稳态更新已停止。',
   failed: 'ASI 稳态连接失败。',
+  retry: '重新连接',
   actionFailed: '操作失败，请检查当前状态后重试。',
   dismiss: '关闭',
 };
@@ -52,6 +54,7 @@ interface PanelInjection {
   hooks: { frames: FrameState; actionError: ActionState };
   actions: ActionState['actions'];
   clearError: () => void;
+  reconnect: () => void;
 }
 type PanelProps = PropsRuntime<'main'> & InjectFace<PanelInjection> & PropsLocale<typeof NS>;
 
@@ -73,7 +76,10 @@ function Panel(props: PanelProps) {
             role: snapshot.status === 'failed' ? 'alert' : 'status',
             className: snapshot.status === 'failed' ? css.slotAlertBanner : css.slotStatusBanner,
           },
-          props.t(snapshot.status),
+          h('span', null, props.t(snapshot.status)),
+          snapshot.status === 'failed' || snapshot.status === 'ended'
+            ? h('button', { type: 'button', className: css.textBtn, onClick: props.reconnect }, props.t('retry'))
+            : null,
         ),
     failed && !model
       ? h(
@@ -212,6 +218,7 @@ export function apply(ctx: Context): void {
                   hooks: { frames, actionError: actions },
                   actions: actions.actions,
                   clearError: actions.clear,
+                  reconnect: () => frames.reconnect(),
                 }),
               },
               Panel,

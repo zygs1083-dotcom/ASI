@@ -218,7 +218,7 @@ export function FloatingHud({
           <button
             type="button"
             className="btn btn-icon"
-            title="切换雪儿形象（贾维斯核心 / Q版 / 真人）"
+            title="切换雪儿形象（核心 / Q版 / 真人）"
             onClick={() => void api.toggleAvatarForm()}
           >
             {state.form === 'jarvis-core' ? '◉ 核心' : state.form === 'chibi' ? '🐾 Q版' : '✨ 真人'}

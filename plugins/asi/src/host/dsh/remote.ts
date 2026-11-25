@@ -109,11 +109,22 @@ export interface AsiRemoteDeps {
 }
 
 export class AsiRemote extends TypertRemoteService {
+  private framesWaiters: Array<() => void> = [];
+
   constructor(
     ctx: Context,
     private readonly deps: AsiRemoteDeps,
   ) {
     super(ctx, 'asi');
+  }
+
+  bindFramesSource(source: AsiFramesSource | undefined): void {
+    this.deps.framesSource = source;
+    if (source && this.framesWaiters.length > 0) {
+      const waiters = this.framesWaiters;
+      this.framesWaiters = [];
+      for (const resolve of waiters) resolve();
+    }
   }
 
   bindNeedsActions(actions: NeedsActions | undefined): void {
@@ -205,7 +216,22 @@ export class AsiRemote extends TypertRemoteService {
   @Remote({ mode: 'stream' })
   async *frames(signal: AbortSignal): AsyncIterable<WireAsiPanelModel> {
     this.checkUser();
-    if (!this.deps.framesSource) return;
+    if (!this.deps.framesSource && !signal.aborted) {
+      await new Promise<void>((resolve) => {
+        const onAbort = () => {
+          const idx = this.framesWaiters.indexOf(onReady);
+          if (idx >= 0) this.framesWaiters.splice(idx, 1);
+          resolve();
+        };
+        const onReady = () => {
+          signal.removeEventListener('abort', onAbort);
+          resolve();
+        };
+        signal.addEventListener('abort', onAbort, { once: true });
+        this.framesWaiters.push(onReady);
+      });
+    }
+    if (signal.aborted || !this.deps.framesSource) return;
     for await (const frame of this.deps.framesSource(signal)) {
       yield toWireAsiPanelModel(frame);
     }
