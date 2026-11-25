@@ -487,6 +487,17 @@ describe('ASI Presence 127.0.0.1 authenticated neural bus bridge', () => {
         expect(hello.snapshot.needs.openHelpCards).toHaveLength(0);
       }
 
+      const offTestSource = host.root.asiDrives.registerSource({
+        id: 'test-bridge-drive',
+        tier: 3,
+        label: 'Test Bridge Drive',
+        evaluate: () => [
+          { key: 'workspace_bloat', label: 'Bloat', satisfaction: 35, summary: 'active', autoMaintain: false },
+          { key: 'repo_hygiene', label: 'Hygiene', satisfaction: 35, summary: 'active', autoMaintain: false },
+        ],
+      });
+      host.root.asiDrives.notifySourceChanged('test-bridge-drive');
+
       const proposeHelpCard = host.root.asiDrives.proposeHelpCard?.bind(host.root.asiDrives);
       const resolveHelpCards = host.root.asiDrives.resolveHelpCards?.bind(host.root.asiDrives);
       expect(proposeHelpCard).toBeDefined();
@@ -494,7 +505,7 @@ describe('ASI Presence 127.0.0.1 authenticated neural bus bridge', () => {
       if (!proposeHelpCard || !resolveHelpCards) return;
 
       // Transition openHelpCards from 0 -> 1
-      const card1 = await proposeHelpCard('asi-care', {
+      const card1 = await proposeHelpCard('test-bridge-drive', {
         driveKey: 'workspace_bloat',
         severity: 'uncomfortable',
         title: '发现闲置构建产物可回收',
@@ -514,7 +525,7 @@ describe('ASI Presence 127.0.0.1 authenticated neural bus bridge', () => {
       }
 
       // Transition 1 -> 2 emits a second help_card event pointing to the newly added card
-      const card2 = await proposeHelpCard('asi-care', {
+      const card2 = await proposeHelpCard('test-bridge-drive', {
         driveKey: 'repo_hygiene',
         severity: 'uncomfortable',
         title: '存在可清理的已合入 worktree',
@@ -531,7 +542,7 @@ describe('ASI Presence 127.0.0.1 authenticated neural bus bridge', () => {
       }
 
       // Resolving card2 (2 -> 1) broadcasts updated snapshot but must NOT re-emit a spurious help_card alert
-      await resolveHelpCards('asi-care', { driveKey: 'repo_hygiene' });
+      await resolveHelpCards('test-bridge-drive', { driveKey: 'repo_hygiene' });
       const snapAfterResolve = await client.waitFor(
         (m) => m.type === 'snapshot' && m.snapshot.needs.openHelpCards.length === 1,
         4000,
@@ -549,6 +560,7 @@ describe('ASI Presence 127.0.0.1 authenticated neural bus bridge', () => {
       expect(rpcRes.type === 'rpc.response' && rpcRes.ok).toBe(true);
       expect(seenBetween.some((m) => m.type === 'event' && m.kind === 'help_card')).toBe(false);
 
+      offTestSource();
       client.close();
     } finally {
       await host.dispose();
@@ -585,6 +597,16 @@ describe('ASI Presence 127.0.0.1 authenticated neural bus bridge', () => {
         expect(hello1.snapshot.needs.openHelpCards).toHaveLength(0);
       }
 
+      const offTestSource = host.root.asiDrives.registerSource({
+        id: 'test-bridge-drive',
+        tier: 3,
+        label: 'Test Bridge Drive',
+        evaluate: () => [
+          { key: 'orphan_runtime', label: 'Orphan', satisfaction: 35, summary: 'active', autoMaintain: false },
+        ],
+      });
+      host.root.asiDrives.notifySourceChanged('test-bridge-drive');
+
       const proposeHelpCard = host.root.asiDrives.proposeHelpCard?.bind(host.root.asiDrives);
       expect(proposeHelpCard).toBeDefined();
       if (!proposeHelpCard) return;
@@ -598,7 +620,7 @@ describe('ASI Presence 127.0.0.1 authenticated neural bus bridge', () => {
           params: { state: 'deep_focus', durationMinutes: 20 },
         }),
       );
-      const card = await proposeHelpCard('asi-care', {
+      const card = await proposeHelpCard('test-bridge-drive', {
         driveKey: 'orphan_runtime',
         severity: 'uncomfortable',
         title: '发现孤儿开发服务端口',
@@ -659,6 +681,7 @@ describe('ASI Presence 127.0.0.1 authenticated neural bus bridge', () => {
       );
       expect(nextTom.type).toBe('event');
 
+      offTestSource();
       client1.close();
     } finally {
       await host.dispose();
@@ -678,12 +701,23 @@ describe('ASI Presence 127.0.0.1 authenticated neural bus bridge', () => {
 
     try {
       const discovery = BridgeDiscoverySchema.parse(JSON.parse(await readFile(discoveryPath, 'utf8')));
+      const offTestSource = host.root.asiDrives.registerSource({
+        id: 'test-bridge-drive',
+        tier: 3,
+        label: 'Test Bridge Drive',
+        evaluate: () => [
+          { key: 'workspace_bloat', label: 'Bloat', satisfaction: 35, summary: 'active', autoMaintain: false },
+          { key: 'repo_hygiene', label: 'Hygiene', satisfaction: 35, summary: 'active', autoMaintain: false },
+        ],
+      });
+      host.root.asiDrives.notifySourceChanged('test-bridge-drive');
+
       const proposeHelpCard = host.root.asiDrives.proposeHelpCard?.bind(host.root.asiDrives);
       expect(proposeHelpCard).toBeDefined();
       if (!proposeHelpCard) return;
 
       // Create a help card while ZERO clients are connected
-      const offlineCard = await proposeHelpCard('asi-care', {
+      const offlineCard = await proposeHelpCard('test-bridge-drive', {
         driveKey: 'workspace_bloat',
         severity: 'uncomfortable',
         title: '离线期间产生的求助卡',
@@ -733,7 +767,7 @@ describe('ASI Presence 127.0.0.1 authenticated neural bus bridge', () => {
       expect(seen.some((m) => m.type === 'event' && m.kind === 'help_card')).toBe(false);
 
       // Subsequent genuine new help card while connected MUST still emit help_card normally
-      const liveCard = await proposeHelpCard('asi-care', {
+      const liveCard = await proposeHelpCard('test-bridge-drive', {
         driveKey: 'repo_hygiene',
         severity: 'uncomfortable',
         title: '在线期间新产生的求助卡',
@@ -748,6 +782,7 @@ describe('ASI Presence 127.0.0.1 authenticated neural bus bridge', () => {
         expect(latest?.id).toBe(liveCard.id);
       }
 
+      offTestSource();
       client.close();
     } finally {
       await host.dispose();
