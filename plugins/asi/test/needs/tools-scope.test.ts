@@ -338,6 +338,10 @@ describe('工具作用域隔离：普通对话 vs 专用后台自维护会话', 
       await expect(ports.sessions.runMaintenanceTurn(sid, 'check', new AbortController().signal)).rejects.toThrow(
         'provider boom',
       );
+      // 5. 同路径沙盒工作区已存在时复用现有工作区，不重复创建；维护会话被用户归档后 hasSession 返回 false
+      await ports.sessions.createMaintenanceSession('asi-maint-rotated-2', join(storageRoot, 'sandbox'), 'ASI 自维护');
+      expect(createdWorkspaces).toHaveLength(1);
+      expect(ports.sessions.hasSession('archived-user')).toBe(false);
     } finally {
       offTools();
       await runtime.stop();

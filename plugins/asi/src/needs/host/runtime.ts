@@ -227,6 +227,7 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime & { read
   const activeTurnEffectiveNeeds = new Set<string>();
 
   let maintSessionId: string | undefined;
+  let persistedMaintSessionId: string | undefined;
   let maintStatus: MaintenanceSessionStatus['status'] = 'not-created';
   let maintTurnCount = 0;
   let maintTotalTurns = 0;
@@ -333,13 +334,14 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime & { read
   }
 
   function persistState(): Promise<void> {
+    const durableMaintSessionId = maintSessionId ?? persistedMaintSessionId;
     const payload: PersistedNeedsState = {
       helpCards: helpCards.slice(0, 30),
       records: records.slice(0, MAX_RECORDS),
       previousStates: structuredClone(previousStates),
       criedEpisodeSeverity: Object.fromEntries(criedEpisodeSeverity),
       handledEpisodeSeverity: Object.fromEntries(handledEpisodeSeverity),
-      ...(maintSessionId ? { maintSessionId } : {}),
+      ...(durableMaintSessionId ? { maintSessionId: durableMaintSessionId } : {}),
       maintTurnCount,
       maintTotalTurns,
       ...(maintLastRunAt !== undefined ? { maintLastRunAt } : {}),
@@ -466,6 +468,7 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime & { read
         registerMaintSession(createdId);
       }
       maintSessionId = createdId;
+      persistedMaintSessionId = createdId;
       maintTurnCount = 0;
       rotateMaintainerNext = false;
       if (maintStatus === 'not-created' || maintStatus === 'unavailable') {
@@ -495,12 +498,33 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime & { read
     }
   }
 
+  function rehydratePersistedMaintSession(): string | undefined {
+    if (maintSessionId && ports.sessions.hasSession(maintSessionId)) {
+      return maintSessionId;
+    }
+    if (persistedMaintSessionId && ports.sessions.hasSession(persistedMaintSessionId)) {
+      maintSessionId = persistedMaintSessionId;
+      if (maintStatus === 'not-created' || maintStatus === 'unavailable') {
+        maintStatus = 'idle';
+      }
+      return maintSessionId;
+    }
+    return undefined;
+  }
+
   async function ensureMaintenanceSession(forceRotate = false): Promise<string> {
     if (sessionCreationInFlight) {
       return await sessionCreationInFlight;
     }
-    if (!forceRotate && maintSessionId && ports.sessions.hasSession(maintSessionId)) {
-      return maintSessionId;
+    if (!forceRotate) {
+      const prevId = maintSessionId;
+      const existing = rehydratePersistedMaintSession();
+      if (existing) {
+        if (existing !== prevId) {
+          notify();
+        }
+        return existing;
+      }
     }
     const pending = createNewMaintenanceSession();
     sessionCreationInFlight = pending;
@@ -1512,6 +1536,12 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime & { read
     const settings = ports.sense.getSettings();
     const brokenNeeds = circuitBreaker.trippedNeeds();
     const drivesSnap = latestHigherOrder.snapshot;
+    const resolvedMaintId =
+      maintSessionId ??
+      (persistedMaintSessionId && ports.sessions.hasSession(persistedMaintSessionId)
+        ? persistedMaintSessionId
+        : undefined);
+    const resolvedMaintStatus = resolvedMaintId && maintStatus === 'not-created' ? 'idle' : maintStatus;
     return {
       now: latestEval.now,
       paused: settings.paused,
@@ -1524,9 +1554,9 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime & { read
       instinct: instinct.state(),
       helpCards: structuredClone(helpCards),
       maintenanceSession: {
-        ...(maintSessionId ? { sessionId: maintSessionId } : {}),
+        ...(resolvedMaintId ? { sessionId: resolvedMaintId } : {}),
         title: 'ASI 自维护',
-        status: maintStatus,
+        status: resolvedMaintStatus,
         turnCount: maintTotalTurns,
         ...(maintLastRunAt !== undefined ? { lastRunAt: maintLastRunAt } : {}),
         ...(brokenNeeds.length > 0 ? { circuitBrokenNeeds: brokenNeeds } : {}),
@@ -2364,6 +2394,7 @@ export function createNeedsRuntime(ports: NeedsHostPorts): NeedsRuntime & { read
           maintLastRunAt = parsed.maintLastRunAt;
         }
         if (typeof parsed.maintSessionId === 'string' && parsed.maintSessionId.trim()) {
+          persistedMaintSessionId = parsed.maintSessionId;
           registerMaintSession(parsed.maintSessionId);
           if (ports.sessions.hasSession(parsed.maintSessionId)) {
             maintSessionId = parsed.maintSessionId;

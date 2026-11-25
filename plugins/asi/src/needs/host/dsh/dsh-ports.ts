@@ -60,9 +60,10 @@ export function createDshNeedsPorts(ctx: Context, storageRoot: string, options?:
 
   const isKnownSession = (sessionId: string): boolean => {
     const sid = SessionId(sessionId);
+    const wr = getWorkspaceRegistry();
+    if (wr?.archivedSessionIds.includes(sid)) return false;
     if (resolveAgent(sessionId)) return true;
     if (ctx.sessions?.list().some((s) => s.id === sid)) return true;
-    const wr = getWorkspaceRegistry();
     return Boolean(wr?.list().some((ws) => ws.sessionIds.includes(sid)));
   };
 
@@ -133,7 +134,9 @@ export function createDshNeedsPorts(ctx: Context, storageRoot: string, options?:
       await mkdir(cwd, { recursive: true });
       const sid = SessionId(requestedId);
       const wr = getWorkspaceRegistry();
-      const ws = wr ? await wr.create(cwd, title).catch(() => undefined) : undefined;
+      const realCwd = safeRealpath(cwd);
+      const existingWs = wr?.list().find((w) => w.path === cwd || safeRealpath(w.path) === realCwd);
+      const ws = existingWs ?? (wr ? await wr.create(cwd, title).catch(() => undefined) : undefined);
       const created = await sc.create(ws ? { workspaceId: ws.id, sessionId: sid } : { cwd, sessionId: sid });
       const actualId = created.sessionId;
       await sc.rename({ sessionId: actualId, title }).catch(() => undefined);

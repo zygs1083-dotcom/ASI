@@ -1,4 +1,4 @@
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Context } from '@deepseek-ai/cordis';
@@ -406,6 +406,81 @@ describe('NeedsRuntime 自发维护闭环、冷却预算与啼哭求助生命周
       });
       await new Promise((r) => setTimeout(r, 20));
       expect(cries2).toHaveLength(0);
+    } finally {
+      await rt2.stop();
+    }
+  });
+
+  it('冷启动瞬间 workspaceRegistry 尚未就绪导致 hasSession 暂返回 false 时，不擦除已持久化的 maintSessionId，服务就绪后点击「查看自维护会话」直接复用旧会话而不新建重复项目', async () => {
+    const storageRoot = await mkdtemp(join(tmpdir(), 'asi-needs-lazy-rehydrate-'));
+    tempDirs.push(storageRoot);
+
+    const knownSessions = new Set<string>();
+    const snap = makeSnapshot({ now: T0, mono: 1_000 });
+    const sense1 = createMockSenseService(snap);
+    const rt1 = createNeedsRuntime({
+      storageRoot,
+      sense: sense1,
+      clock: { wall: () => T0, mono: () => 1_000 },
+      probeEndpoint: async () => true,
+      jobs: { listActiveJobs: () => [], hasLiveOwner: () => true, killJob: () => 'already-finished' },
+      compaction: { listIdleSessionIds: () => [], compactIdleSession: async () => ({ compacted: false }) },
+      sessions: {
+        createMaintenanceSession: async (id) => {
+          knownSessions.add(id);
+          return id;
+        },
+        hasSession: (id) => knownSessions.has(id),
+        runMaintenanceTurn: async () => {},
+        deliverCryToUserSession: async () => true,
+      },
+    });
+    await rt1.start();
+    const originalMaintId = await rt1.actions.openMaintenanceSession();
+    await rt1.stop();
+
+    // 模拟重启：start() 瞬间 workspaceRegistry 未就绪（hasSession 返回 false），且中间触发了一次持久化写入
+    let registryReady = false;
+    let createCalls = 0;
+    const sense2 = createMockSenseService(makeSnapshot({ now: T0 + 5_000, mono: 500 }));
+    const rt2 = createNeedsRuntime({
+      storageRoot,
+      sense: sense2,
+      clock: { wall: () => T0 + 5_000, mono: () => 500 },
+      probeEndpoint: async () => true,
+      jobs: { listActiveJobs: () => [], hasLiveOwner: () => true, killJob: () => 'already-finished' },
+      compaction: { listIdleSessionIds: () => [], compactIdleSession: async () => ({ compacted: false }) },
+      sessions: {
+        createMaintenanceSession: async (id) => {
+          createCalls += 1;
+          knownSessions.add(id);
+          return id;
+        },
+        hasSession: (id) => registryReady && knownSessions.has(id),
+        runMaintenanceTurn: async () => {},
+        deliverCryToUserSession: async () => true,
+      },
+    });
+    await rt2.start();
+    try {
+      // 启动阶段即使触发状态写盘（例如电池状态变更），也不能擦除磁盘上的 maintSessionId
+      sense2.emit((prev) => {
+        const next = structuredClone(prev);
+        next.state.self.body.battery = fact({ percent: 85, charging: true, powerState: 'charging' });
+        return next;
+      });
+      await new Promise((r) => setTimeout(r, 20));
+      const persisted = JSON.parse(await readFile(join(storageRoot, 'state.json'), 'utf8')) as {
+        maintSessionId?: string;
+      };
+      expect(persisted.maintSessionId).toBe(originalMaintId);
+
+      // 稍后 workspaceRegistry 就绪，再点击「查看自维护会话」应直接复用原会话
+      registryReady = true;
+      expect(rt2.snapshot().maintenanceSession.sessionId).toBe(originalMaintId);
+      const openedId = await rt2.actions.openMaintenanceSession();
+      expect(openedId).toBe(originalMaintId);
+      expect(createCalls).toBe(0);
     } finally {
       await rt2.stop();
     }
